@@ -2,6 +2,47 @@ import AppKit
 import CoreImage
 import SwiftUI
 
+enum RemoteControlPairingPayloadBuilder {
+    static func defaultHostName() -> String {
+        let candidates = [
+            Host.current().localizedName,
+            Host.current().name,
+            ProcessInfo.processInfo.hostName
+        ]
+        for candidate in candidates {
+            if let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return "RepoPrompt Host"
+    }
+
+    static func payload(
+        windowID: Int,
+        gatewayURL: String,
+        hostPublicKey: String,
+        hostFingerprint: String,
+        hostName: String = defaultHostName()
+    ) -> String {
+        let object: [String: Any] = [
+            "v": 1,
+            "kind": "repoprompt_remote_pairing",
+            "window_id": windowID,
+            "gateway_url": gatewayURL,
+            "host_public_key": hostPublicKey,
+            "host_fingerprint": hostFingerprint,
+            "host_name": hostName
+        ]
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+              let string = String(data: data, encoding: .utf8)
+        else {
+            return ""
+        }
+        return string
+    }
+}
+
 struct RemoteControlSettingsView: View {
     let windowID: Int
     var showFeedback: (String, Bool) -> Void
@@ -57,21 +98,12 @@ struct RemoteControlSettingsView: View {
     }
 
     private var pairingPayload: String {
-        let object: [String: Any] = [
-            "v": 1,
-            "kind": "repoprompt_remote_pairing",
-            "window_id": windowID,
-            "gateway_url": "https://\(globalSettings.mcpRemoteGatewayBindAddress()):\(globalSettings.mcpRemoteGatewayPort())",
-            "host_public_key": hostPublicKey,
-            "host_fingerprint": hostFingerprint
-        ]
-        guard JSONSerialization.isValidJSONObject(object),
-              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
-              let string = String(data: data, encoding: .utf8)
-        else {
-            return ""
-        }
-        return string
+        RemoteControlPairingPayloadBuilder.payload(
+            windowID: windowID,
+            gatewayURL: "https://\(globalSettings.mcpRemoteGatewayBindAddress()):\(globalSettings.mcpRemoteGatewayPort())",
+            hostPublicKey: hostPublicKey,
+            hostFingerprint: hostFingerprint
+        )
     }
 
     var body: some View {

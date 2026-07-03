@@ -14,6 +14,7 @@ public enum RemoteWireProtocol {
         "poll",
         "subscribe",
         "unsubscribe",
+        "list_agents",
         "list_sessions",
         "get_log",
         "ping",

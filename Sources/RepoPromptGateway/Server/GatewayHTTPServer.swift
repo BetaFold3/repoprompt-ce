@@ -14,6 +14,7 @@ final class GatewayHTTPServer: @unchecked Sendable {
     private let auditLog: RemoteAuditLog?
     private let pairingRelay: GatewayPairingRelay?
     private let vapidPublicKeyBase64URL: String?
+    private let hostName: String
     private let logger: Logger
     private let connectionRegistry = GatewayWebSocketConnectionRegistry()
     private var eventLoopGroup: MultiThreadedEventLoopGroup?
@@ -27,6 +28,7 @@ final class GatewayHTTPServer: @unchecked Sendable {
         auditLog: RemoteAuditLog? = nil,
         pairingRelay: GatewayPairingRelay? = nil,
         vapidPublicKeyBase64URL: String? = nil,
+        hostName: String = GatewayHTTPServer.defaultHostName(),
         logger: Logger = Logger(label: "com.repoprompt.gateway.http")
     ) {
         self.configuration = configuration
@@ -36,7 +38,22 @@ final class GatewayHTTPServer: @unchecked Sendable {
         self.auditLog = auditLog
         self.pairingRelay = pairingRelay
         self.vapidPublicKeyBase64URL = vapidPublicKeyBase64URL
+        self.hostName = hostName
         self.logger = logger
+    }
+
+    static func defaultHostName() -> String {
+        let candidates = [
+            Host.current().localizedName,
+            Host.current().name,
+            ProcessInfo.processInfo.hostName
+        ]
+        for candidate in candidates {
+            if let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        return "RepoPrompt Host"
     }
 
     var localAddress: SocketAddress? {
@@ -55,6 +72,7 @@ final class GatewayHTTPServer: @unchecked Sendable {
             let connectionRegistry = connectionRegistry
             let pairingRelay = pairingRelay
             let vapidPublicKeyBase64URL = vapidPublicKeyBase64URL
+            let hostName = hostName
             let logger = logger
             let upgrader = NIOWebSocketServerUpgrader(
                 shouldUpgrade: { channel, head in
@@ -75,6 +93,7 @@ final class GatewayHTTPServer: @unchecked Sendable {
                         auditLog: auditLog,
                         connectionRegistry: connectionRegistry,
                         vapidPublicKeyBase64URL: vapidPublicKeyBase64URL,
+                        hostName: hostName,
                         logger: logger
                     ))
                 }
@@ -480,6 +499,7 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
     private let auditLog: RemoteAuditLog?
     private let connectionRegistry: GatewayWebSocketConnectionRegistry
     private let vapidPublicKeyBase64URL: String?
+    private let hostName: String
     private let logger: Logger
     private let sinkID = UUID()
     private var sink: GatewayWebSocketFrameSink?
@@ -495,6 +515,7 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
         auditLog: RemoteAuditLog?,
         connectionRegistry: GatewayWebSocketConnectionRegistry,
         vapidPublicKeyBase64URL: String? = nil,
+        hostName: String,
         logger: Logger
     ) {
         self.configuration = configuration
@@ -504,6 +525,7 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
         self.auditLog = auditLog
         self.connectionRegistry = connectionRegistry
         self.vapidPublicKeyBase64URL = vapidPublicKeyBase64URL
+        self.hostName = hostName
         self.logger = logger
     }
 
@@ -721,7 +743,8 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
                 "device_id": .string(device.deviceID),
                 "auth": .string("ticket"),
                 "ticket_id": .string(device.ticketID.uuidString.lowercased()),
-                "scopes": .array(device.scopes.sorted().map(JSONValue.string))
+                "scopes": .array(device.scopes.sorted().map(JSONValue.string)),
+                "host_name": .string(hostName)
             ]
             if let vapidPublicKeyBase64URL {
                 helloAckPayload["vapid_public_key"] = .string(vapidPublicKeyBase64URL)
@@ -764,11 +787,13 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
         let runtime = runtime
         let sinkID = sinkID
         let vapidPublicKeyBase64URL = vapidPublicKeyBase64URL
+        let hostName = hostName
         Task {
             await runtime.registerSink(deviceID: deviceID, sinkID: sinkID, sink: sink)
             var helloAckPayload: [String: JSONValue] = [
                 "device_id": .string(deviceID),
                 "auth": .string("static_token"),
+                "host_name": .string(hostName),
                 "sig": .null
             ]
             if let vapidPublicKeyBase64URL {

@@ -128,6 +128,12 @@ struct RemoteCommandTranslator {
                 allowedPayloadKeys: Self.pollPayloadKeys,
                 requiresSessionID: frame.sessionID == nil && payload["session_ids"] == nil
             )
+        case "list_agents":
+            return try translateAgentManage(
+                op: "list_agents",
+                payload: payload,
+                allowedPayloadKeys: Self.listAgentsPayloadKeys
+            )
         case "list_sessions":
             return try translateAgentManage(
                 op: "list_sessions",
@@ -327,6 +333,8 @@ struct RemoteCommandTranslator {
         "session_ids",
         "timeout"
     ]
+
+    private static let listAgentsPayloadKeys: Set<String> = []
 
     private static let listSessionsPayloadKeys: Set<String> = [
         "agent",

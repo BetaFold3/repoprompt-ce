@@ -25,7 +25,7 @@ struct ScopeEnforcementError: Error, Equatable, CustomStringConvertible {
 ///
 /// | Frame | Required scope |
 /// |---|---|
-/// | subscribe, unsubscribe, poll, list_sessions, get_log | sessions:observe |
+/// | subscribe, unsubscribe, poll, list_agents, list_sessions, get_log | sessions:observe |
 /// | start, steer, cancel | sessions:operate |
 /// | respond | interactions:respond |
 /// | future workspace browsing/read-only context | workspace:read (reserved) |
@@ -41,7 +41,7 @@ enum ScopeEnforcer {
 
     static func requiredScope(forFrameType type: String) -> String? {
         switch type {
-        case "subscribe", "unsubscribe", "poll", "list_sessions", "get_log":
+        case "subscribe", "unsubscribe", "poll", "list_agents", "list_sessions", "get_log":
             GatewayRemoteScope.sessionsObserve
         case "push_subscribe", "push_unsubscribe":
             // Push wake registration is observation-adjacent: it only lets the

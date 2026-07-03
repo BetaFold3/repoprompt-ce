@@ -75,7 +75,8 @@ final class GatewayAuthE2EContractTests: XCTestCase {
             runtime: runtime,
             authenticator: authenticator,
             appLinkPool: pool,
-            auditLog: auditLog
+            auditLog: auditLog,
+            hostName: "Gateway Auth E2E Host"
         )
         try await server.start()
         guard let boundPort = server.localAddress?.port else {
@@ -165,6 +166,7 @@ final class GatewayAuthE2EContractTests: XCTestCase {
         XCTAssertEqual(helloAck.type, "hello_ack")
         XCTAssertEqual(helloAck.payload?.objectValue?["auth"]?.stringValue, "ticket")
         XCTAssertEqual(helloAck.payload?.objectValue?["device_id"]?.stringValue, device.deviceID)
+        XCTAssertEqual(helloAck.payload?.objectValue?["host_name"]?.stringValue, "Gateway Auth E2E Host")
 
         // 2. Observe-only operation succeeds through the per-device app link.
         let listFrame = try GatewayAuthTestSupport.signedFrameData(

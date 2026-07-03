@@ -38,6 +38,12 @@ final class RemoteCommandTranslatorTests: XCTestCase {
                 ["session_id": .string(sid)]
             ),
             (
+                RemoteClientFrame(type: "list_agents", requestID: "req-list-agents", payload: .object([:])),
+                "agent_manage",
+                "list_agents",
+                [:]
+            ),
+            (
                 RemoteClientFrame(type: "list_sessions", payload: .object(["limit": .int(5)])),
                 "agent_manage",
                 "list_sessions",
@@ -71,6 +77,20 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         )
         XCTAssertThrowsError(try RemoteCommandTranslator().translate(frame)) { error in
             XCTAssertEqual(error as? RemoteCommandTranslatorError, .arbitraryToolPassthroughRejected)
+        }
+    }
+
+    func testListAgentsRejectsRemotePayloadKeys() throws {
+        let frame = RemoteClientFrame(
+            type: "list_agents",
+            requestID: "req-list-agents",
+            payload: .object(["roles_only": .bool(true)])
+        )
+        XCTAssertThrowsError(try RemoteCommandTranslator().translate(frame)) { error in
+            XCTAssertEqual(
+                error as? RemoteCommandTranslatorError,
+                .unsupportedPayloadKey(operation: "list_agents", key: "roles_only")
+            )
         }
     }
 

@@ -42,6 +42,13 @@ final class RemoteWireProtocolTests: XCTestCase {
         }
     }
 
+    func testListAgentsFrameIsAcceptedWithoutRequestID() throws {
+        let data = #"{"v":1,"type":"list_agents","payload":{},"sig":null}"#.data(using: .utf8)!
+        let frame = try RemoteWireProtocol.decodeClientFrame(from: data)
+        XCTAssertEqual(frame.type, "list_agents")
+        XCTAssertNil(frame.requestID)
+    }
+
     func testUnknownServerFrameTypesDecodeForAdditiveEvolution() throws {
         let data = #"{"v":1,"type":"interaction_resolved","payload":{"ok":true}}"#.data(using: .utf8)!
         let frame = try RemoteWireProtocol.decodeServerFrame(from: data)

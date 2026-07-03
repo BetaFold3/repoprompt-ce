@@ -14,6 +14,7 @@ final class GatewayAuthScopeEnforcerTests: XCTestCase {
         ("subscribe", GatewayRemoteScope.sessionsObserve),
         ("unsubscribe", GatewayRemoteScope.sessionsObserve),
         ("poll", GatewayRemoteScope.sessionsObserve),
+        ("list_agents", GatewayRemoteScope.sessionsObserve),
         ("list_sessions", GatewayRemoteScope.sessionsObserve),
         ("get_log", GatewayRemoteScope.sessionsObserve),
         // M5: Web Push wake registration is observation-adjacent.
