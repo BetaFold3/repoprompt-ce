@@ -87,6 +87,8 @@ struct MCPSettingsView: View {
                 Divider()
                 remoteGatewaySection
                 Divider()
+                remoteHostsSection
+                Divider()
                 modelPresetsSection
                 Divider()
                 contextBuilderSection
@@ -236,6 +238,12 @@ struct MCPSettingsView: View {
 
     private var remoteGatewaySection: some View {
         RemoteControlSettingsView(windowID: windowID) { message, isError in
+            showFeedback(message, isError: isError)
+        }
+    }
+
+    private var remoteHostsSection: some View {
+        RemoteHostsSettingsView { message, isError in
             showFeedback(message, isError: isError)
         }
     }
