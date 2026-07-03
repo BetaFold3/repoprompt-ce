@@ -48,6 +48,7 @@ Sources/
     ThirdParty/                  # vendored SwiftPCRE2 wrapper
   RepoPromptShared/
     MCP/                         # shared app/client MCP control and bootstrap wire definitions
+  RepoPromptRemoteWire/          # dependency-free remote-control wire DTOs, canonical JSON, tickets, and signing helpers
   RepoPromptMCPClientKit/        # reusable bootstrap MCP client plumbing for CLI/gateway clients
   RepoPromptMCP/                 # MCP CLI implementation
   RepoPromptC/                   # C support target
@@ -90,7 +91,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
 - New generic extensions/helpers should prefer a narrow feature or infrastructure owner first; otherwise use `Sources/RepoPrompt/Infrastructure/Utilities`.
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
-- New app/client protocol definitions shared by multiple executables go under `Sources/RepoPromptShared`.
+- New app/client protocol definitions shared by multiple executables go under `Sources/RepoPromptShared`, except for the documented remote-control wire exception below.
 - MCP filesystem/product/build-flavor identity, bootstrap handshake wire DTOs, and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
 - New reusable bootstrap MCP client plumbing shared by the CLI and gateway clients goes under `Sources/RepoPromptMCPClientKit`.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
@@ -103,6 +104,13 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 ## Exception policy
 
 Exceptions must be explicit, narrow, and documented here before they become precedent.
+
+### Remote-control wire target
+
+- `Sources/RepoPromptRemoteWire` is a purpose-built sibling target for the native remote-client and gateway remote-control protocol. It owns dependency-free `RemoteClientFrame` / `RemoteServerFrame` DTOs, `JSONValue.canonicalString`, canonical frame hashing/signing payload helpers, `RemoteTicket`, `RemoteFrameSigner`, and `RemotePairingProof`.
+- The target may import only `Foundation` and `CryptoKit`; it must not import MCP, NIO, Logging, `RepoPrompt`, `RepoPromptGateway`, `RepoPromptMCP`, `RepoPromptMCPClientKit`, or `RepoPromptShared`. `Scripts/source_layout_guardrails.sh` enforces this import guardrail.
+- Gateway-only capabilities stay in `Sources/RepoPromptGateway/Wire` as extensions/adapters, including `RemoteWireProtocol.commandFingerprint(for:)`, `JSONValue`↔`MCP.Value` bridging, and `RemoteMCPToolResultCodec`.
+- Do not widen `RepoPromptShared` or link the app against `RepoPromptGateway` to share remote-control wire code.
 
 ### App-visible diagnostics retained in the RepoPromptApp target
 

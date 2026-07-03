@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptRemoteWire
 
 struct RemoteToolCall: Equatable {
     let toolName: String

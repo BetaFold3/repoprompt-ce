@@ -1,6 +1,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptRemoteWire
 
 enum AppLinkPoolError: Error, Equatable, CustomStringConvertible {
     /// The app rejected the per-device bootstrap connection because of connection

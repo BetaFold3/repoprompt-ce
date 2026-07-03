@@ -2,6 +2,7 @@ import Foundation
 import Logging
 import MCP
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 
 struct RecordedGatewayToolCall: Equatable {
     let name: String

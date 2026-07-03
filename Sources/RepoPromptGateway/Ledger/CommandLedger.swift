@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptRemoteWire
 
 actor CommandLedger {
     struct Key: Codable, Hashable {

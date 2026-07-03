@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 
 /// Shared helpers for M4 gateway ticket/signature/scope tests.
 enum GatewayAuthTestSupport {
@@ -53,9 +54,9 @@ enum GatewayAuthTestSupport {
         issuedAt: Date = Date(),
         ttlMs: Int64 = 30000,
         ticketID: UUID = UUID()
-    ) throws -> GatewayRemoteTicket {
+    ) throws -> RemoteTicket {
         let issuedAtMs = Int64((issuedAt.timeIntervalSince1970 * 1000).rounded(.down))
-        let unsigned = GatewayRemoteTicket(
+        let unsigned = RemoteTicket(
             ticketID: ticketID,
             deviceID: deviceID,
             scopes: scopes,
@@ -65,7 +66,7 @@ enum GatewayAuthTestSupport {
             hostSignature: Data()
         )
         let signature = try hostSigner.signature(for: unsigned.canonicalPayload).rawRepresentation
-        return GatewayRemoteTicket(
+        return RemoteTicket(
             ticketID: unsigned.ticketID,
             deviceID: unsigned.deviceID,
             scopes: unsigned.scopes,

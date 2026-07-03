@@ -1,5 +1,6 @@
 import MCP
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 import XCTest
 
 final class RemoteCommandTranslatorTests: XCTestCase {

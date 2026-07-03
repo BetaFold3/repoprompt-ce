@@ -3,6 +3,7 @@ import Foundation
 import Logging
 import MCP
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 import XCTest
 
 /// Connector double that records the clientName presented at bootstrap and can

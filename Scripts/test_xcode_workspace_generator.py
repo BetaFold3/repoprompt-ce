@@ -116,6 +116,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
                 "RepoPromptMCP",
                 "RepoPromptGateway",
                 "RepoPromptMCPClientKit",
+                "RepoPromptRemoteWire",
                 "RepoPromptShared",
             },
         )
@@ -125,6 +126,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         metadata = json.loads(self.outputs[Path("generation.json")])
         self.assertIn("RepoPrompt", metadata["package"]["targets"])
         self.assertIn("RepoPromptApp", metadata["package"]["targets"])
+        self.assertIn("RepoPromptRemoteWire", metadata["package"]["targets"])
 
     def test_project_has_exactly_four_convenience_targets(self) -> None:
         project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()
@@ -325,6 +327,15 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         target_map["RepoPromptApp"]["settings"] = []
         with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptApp must own"):
             generator.validate_manifest(missing_bridging_header_owner, generator.REPO_ROOT)
+
+        missing_remote_wire_target = deepcopy(self.manifest)
+        missing_remote_wire_target["targets"] = [
+            target
+            for target in missing_remote_wire_target["targets"]
+            if target["name"] != "RepoPromptRemoteWire"
+        ]
+        with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptRemoteWire'"):
+            generator.validate_manifest(missing_remote_wire_target, generator.REPO_ROOT)
 
         missing_gateway_target = deepcopy(self.manifest)
         missing_gateway_target["targets"] = [

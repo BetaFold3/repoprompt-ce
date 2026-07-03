@@ -1,6 +1,6 @@
 import Foundation
-import MCP
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 import XCTest
 
 /// M5 wake-only semantics: push fires ONLY for a disconnected device and ONLY on

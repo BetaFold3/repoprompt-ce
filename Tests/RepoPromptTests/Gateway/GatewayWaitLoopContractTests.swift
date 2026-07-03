@@ -2,6 +2,7 @@ import Foundation
 import Logging
 import MCP
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 import RepoPromptShared
 import XCTest
 

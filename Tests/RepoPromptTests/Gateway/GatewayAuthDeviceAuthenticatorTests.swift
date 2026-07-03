@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 @testable import RepoPromptApp
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 import XCTest
 
 final class GatewayAuthDeviceAuthenticatorTests: XCTestCase {
@@ -37,7 +38,7 @@ final class GatewayAuthDeviceAuthenticatorTests: XCTestCase {
     }
 
     private func signedHello(
-        ticket: GatewayRemoteTicket,
+        ticket: RemoteTicket,
         counter: UInt64 = 1,
         deviceKey: P256.Signing.PrivateKey? = nil,
         ticketJSON: JSONValue? = nil
@@ -57,7 +58,7 @@ final class GatewayAuthDeviceAuthenticatorTests: XCTestCase {
         authenticator: DeviceAuthenticator,
         scopes: Set<String> = [GatewayRemoteScope.sessionsObserve],
         connectionID: UUID = UUID()
-    ) async throws -> (device: DeviceAuthenticator.AuthenticatedDevice, ticket: GatewayRemoteTicket, connectionID: UUID) {
+    ) async throws -> (device: DeviceAuthenticator.AuthenticatedDevice, ticket: RemoteTicket, connectionID: UUID) {
         let ticket = try GatewayAuthTestSupport.mintTicket(
             hostSigner: hostSigner,
             deviceID: device.deviceID,
@@ -484,7 +485,7 @@ final class GatewayAuthDeviceAuthenticatorTests: XCTestCase {
         ])
 
         let authenticator = try makeAuthenticator(trust: defaultTrust())
-        let parsed = try GatewayRemoteTicket.parse(from: wireTicket)
+        let parsed = try RemoteTicket.parse(from: wireTicket)
         let hello = try signedHello(ticket: parsed, ticketJSON: wireTicket)
         let admitted = try await authenticator.admitHello(
             rawFrame: hello.data,

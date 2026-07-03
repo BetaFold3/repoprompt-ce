@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptRemoteWire
 
 enum GatewayPersistenceError: Error, Equatable, CustomStringConvertible {
     case pathIsNotRegularFile(String)

@@ -1,6 +1,6 @@
 import Foundation
-import MCP
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 import XCTest
 
 /// Plan §6.6: unbound multi-window connections get structured `binding_required`

@@ -1,6 +1,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptRemoteWire
 
 /// Relays the PWA's pairing and ticket bootstrap requests to the app-owned
 /// `remote_pairing` MCP tool over the gateway-principal app leg.

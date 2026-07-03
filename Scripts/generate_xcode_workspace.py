@@ -112,6 +112,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptMCP",
         "RepoPromptGateway",
         "RepoPromptMCPClientKit",
+        "RepoPromptRemoteWire",
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
@@ -155,6 +156,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptMCP",
         "RepoPromptGateway",
         "RepoPromptMCPClientKit",
+        "RepoPromptRemoteWire",
         "RepoPromptShared",
     }
     repo_prompt_tests = targets["RepoPromptTests"]
@@ -164,7 +166,8 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     ):
         raise GeneratorError(
             "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, "
-            "RepoPromptGateway, RepoPromptMCPClientKit, and RepoPromptShared"
+            "RepoPromptGateway, RepoPromptMCPClientKit, RepoPromptRemoteWire, "
+            "and RepoPromptShared"
         )
 
     unsafe_flags: list[list[str]] = []

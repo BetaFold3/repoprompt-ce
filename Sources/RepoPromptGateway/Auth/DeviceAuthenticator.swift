@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import MCP
+import RepoPromptRemoteWire
 
 // MARK: - Trust snapshot
 
@@ -75,100 +76,6 @@ enum GatewayTrustSynchronizer {
             throw DeviceAuthenticationError.invalidTrustSnapshot("remote_pairing list_devices failed.")
         }
         return try GatewayTrustSnapshot.parse(from: payload)
-    }
-}
-
-// MARK: - Ticket
-
-/// Gateway-side representation of an app-minted one-time connection ticket.
-///
-/// The canonical signing payload mirrors the app's `RemotePairingCrypto.canonicalTicketPayload`
-/// exactly; dates travel as canonical epoch milliseconds so signature verification never
-/// depends on floating-point date round-trips.
-struct GatewayRemoteTicket: Equatable {
-    static let canonicalContext = "RepoPromptRemoteConnectionTicketV1"
-    static let maximumTTLMilliseconds: Int64 = 60000
-
-    let ticketID: UUID
-    let deviceID: String
-    let scopes: Set<String>
-    let issuedAtMs: Int64
-    let expiresAtMs: Int64
-    let hostFingerprint: String
-    let hostSignature: Data
-
-    static func parse(from value: JSONValue) throws -> GatewayRemoteTicket {
-        guard let object = value.objectValue,
-              let ticketIDRaw = object["ticket_id"]?.stringValue,
-              let ticketID = UUID(uuidString: ticketIDRaw),
-              let deviceID = object["device_id"]?.stringValue, !deviceID.isEmpty,
-              let scopeValues = object["scopes"]?.arrayValue,
-              let hostFingerprint = object["host_fingerprint"]?.stringValue,
-              let signatureRaw = object["host_signature"]?.stringValue,
-              let hostSignature = Data(base64Encoded: signatureRaw)
-        else {
-            throw DeviceAuthenticationError.invalidTicket("Missing required ticket fields.")
-        }
-        let scopes = Set(scopeValues.compactMap(\.stringValue))
-        guard scopes.count == scopeValues.count, !scopes.isEmpty else {
-            throw DeviceAuthenticationError.invalidTicket("Ticket scopes must be non-empty strings.")
-        }
-        guard let issuedAtMs = milliseconds(object, msKey: "issued_at_ms", isoKey: "issued_at"),
-              let expiresAtMs = milliseconds(object, msKey: "expires_at_ms", isoKey: "expires_at")
-        else {
-            throw DeviceAuthenticationError.invalidTicket("Missing ticket issued/expiry timestamps.")
-        }
-        return GatewayRemoteTicket(
-            ticketID: ticketID,
-            deviceID: deviceID,
-            scopes: scopes,
-            issuedAtMs: issuedAtMs,
-            expiresAtMs: expiresAtMs,
-            hostFingerprint: hostFingerprint,
-            hostSignature: hostSignature
-        )
-    }
-
-    /// Mirrors `RemotePairingCrypto.canonicalTicketPayload` byte-for-byte.
-    var canonicalPayload: Data {
-        let lines = [
-            Self.canonicalContext,
-            ticketID.uuidString.lowercased(),
-            deviceID,
-            scopes.sorted().joined(separator: ","),
-            String(issuedAtMs),
-            String(expiresAtMs),
-            hostFingerprint
-        ]
-        return Data((lines.joined(separator: "\n") + "\n").utf8)
-    }
-
-    var jsonValue: JSONValue {
-        .object([
-            "ticket_id": .string(ticketID.uuidString.lowercased()),
-            "device_id": .string(deviceID),
-            "scopes": .array(scopes.sorted().map(JSONValue.string)),
-            "issued_at_ms": .int(Int(issuedAtMs)),
-            "expires_at_ms": .int(Int(expiresAtMs)),
-            "host_fingerprint": .string(hostFingerprint),
-            "host_signature": .string(hostSignature.base64EncodedString())
-        ])
-    }
-
-    private static func milliseconds(_ object: [String: JSONValue], msKey: String, isoKey: String) -> Int64? {
-        if let ms = object[msKey]?.intValue {
-            return Int64(ms)
-        }
-        guard let iso = object[isoKey]?.stringValue else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let date = formatter.date(from: iso) ?? {
-            let plain = ISO8601DateFormatter()
-            plain.formatOptions = [.withInternetDateTime]
-            return plain.date(from: iso)
-        }()
-        guard let date else { return nil }
-        return Int64((date.timeIntervalSince1970 * 1000).rounded(.down))
     }
 }
 
@@ -331,7 +238,12 @@ actor DeviceAuthenticator {
         guard let ticketValue = frame.payload?.objectValue?["ticket"] else {
             throw DeviceAuthenticationError.ticketRequired
         }
-        let ticket = try GatewayRemoteTicket.parse(from: ticketValue)
+        let ticket: RemoteTicket
+        do {
+            ticket = try RemoteTicket.parse(from: ticketValue)
+        } catch let error as RemoteTicketError {
+            throw Self.mapTicketError(error)
+        }
         guard let device = trust.devices[ticket.deviceID] else {
             throw DeviceAuthenticationError.unknownDevice(ticket.deviceID)
         }
@@ -340,25 +252,10 @@ actor DeviceAuthenticator {
         }
 
         let nowMs = Int64((now().timeIntervalSince1970 * 1000).rounded(.down))
-        guard ticket.expiresAtMs > nowMs else {
-            throw DeviceAuthenticationError.ticketExpired
-        }
-        guard ticket.expiresAtMs > ticket.issuedAtMs,
-              ticket.expiresAtMs - ticket.issuedAtMs <= GatewayRemoteTicket.maximumTTLMilliseconds
-        else {
-            throw DeviceAuthenticationError.invalidTicketLifetime
-        }
-
-        let hostPublicKey: P256.Signing.PublicKey
         do {
-            hostPublicKey = try P256.Signing.PublicKey(rawRepresentation: trust.hostPublicKeyRawRepresentation)
-        } catch {
-            throw DeviceAuthenticationError.invalidTrustSnapshot("Host public key is invalid.")
-        }
-        guard let hostSignature = try? P256.Signing.ECDSASignature(rawRepresentation: ticket.hostSignature),
-              hostPublicKey.isValidSignature(hostSignature, for: ticket.canonicalPayload)
-        else {
-            throw DeviceAuthenticationError.ticketSignatureInvalid
+            try ticket.verify(hostPublicKeyRaw: trust.hostPublicKeyRawRepresentation, nowMs: nowMs)
+        } catch let error as RemoteTicketError {
+            throw Self.mapTicketError(error)
         }
 
         let signature = try requireSignature(frame: frame)
@@ -455,6 +352,21 @@ actor DeviceAuthenticator {
 
     func endConnection(_ connectionID: UUID) {
         connections.removeValue(forKey: connectionID)
+    }
+
+    private static func mapTicketError(_ error: RemoteTicketError) -> DeviceAuthenticationError {
+        switch error {
+        case let .invalidTicket(message):
+            .invalidTicket(message)
+        case .invalidHostPublicKey:
+            .invalidTrustSnapshot("Host public key is invalid.")
+        case .ticketExpired:
+            .ticketExpired
+        case .invalidTicketLifetime:
+            .invalidTicketLifetime
+        case .invalidTicketSignature, .hostFingerprintMismatch:
+            .ticketSignatureInvalid
+        }
     }
 
     private func requireSignature(frame: RemoteClientFrame) throws -> RemoteFrameSignature {

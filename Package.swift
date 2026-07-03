@@ -48,6 +48,7 @@ var packageDependencies: [Package.Dependency] = [
 
 var repoPromptAppDependencies: [Target.Dependency] = [
     "RepoPromptShared",
+    "RepoPromptRemoteWire",
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
     "Sparkle",
     .product(name: "Logging", package: "swift-log"),
@@ -123,6 +124,11 @@ let package = Package(
             swiftSettings: repoPromptAppSwiftSettings
         ),
         .target(
+            name: "RepoPromptRemoteWire",
+            path: "Sources/RepoPromptRemoteWire",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .target(
             name: "RepoPromptMCPClientKit",
             dependencies: [
                 "RepoPromptShared",
@@ -151,6 +157,7 @@ let package = Package(
             dependencies: [
                 "RepoPromptMCPClientKit",
                 "RepoPromptShared",
+                "RepoPromptRemoteWire",
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "NIOCore", package: "swift-nio"),
@@ -178,7 +185,7 @@ let package = Package(
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",
-            dependencies: ["RepoPromptApp", "RepoPromptMCP", "RepoPromptGateway", "RepoPromptMCPClientKit", "RepoPromptShared"],
+            dependencies: ["RepoPromptApp", "RepoPromptMCP", "RepoPromptGateway", "RepoPromptMCPClientKit", "RepoPromptShared", "RepoPromptRemoteWire"],
             path: "Tests/RepoPromptTests",
             resources: [
                 .copy("CodeMap/Fixtures"),

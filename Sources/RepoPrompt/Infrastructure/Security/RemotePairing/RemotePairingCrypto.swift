@@ -203,6 +203,9 @@ enum RemotePairingCrypto {
         ])
     }
 
+    /// Byte-for-byte mirror of `RemotePairingProof.canonicalDeviceChallengePayload`
+    /// in `RepoPromptRemoteWire`. Keep both functions in lockstep when the v1
+    /// pairing proof contract changes.
     static func canonicalDeviceChallengePayload(_ payload: RemotePairingDeviceProofPayload) -> Data {
         canonicalLines([
             "RepoPromptRemotePairingDeviceChallengeV1",

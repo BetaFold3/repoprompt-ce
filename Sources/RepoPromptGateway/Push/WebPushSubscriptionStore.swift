@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptRemoteWire
 
 /// A browser `PushSubscription` registered by a paired device over its
 /// authenticated WebSocket connection.

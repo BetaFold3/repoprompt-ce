@@ -2,7 +2,9 @@ import CryptoKit
 import Foundation
 import Logging
 import NIOCore
+@testable import RepoPromptApp
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 import XCTest
 
 /// End-to-end M4 contract over a real loopback WebSocket:
@@ -132,7 +134,7 @@ final class GatewayAuthE2EContractTests: XCTestCase {
 
     private func performTicketHello(
         _ task: URLSessionWebSocketTask,
-        ticket: GatewayRemoteTicket,
+        ticket: RemoteTicket,
         deviceKey: P256.Signing.PrivateKey,
         counter: UInt64 = 1
     ) async throws -> RemoteServerFrame {

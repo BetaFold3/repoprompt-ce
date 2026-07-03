@@ -1,6 +1,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptRemoteWire
 
 protocol RemoteFrameSink: Sendable {
     func send(_ frame: RemoteServerFrame) async

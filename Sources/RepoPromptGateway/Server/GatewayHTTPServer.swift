@@ -4,6 +4,7 @@ import NIOCore
 import NIOHTTP1
 import NIOPosix
 import NIOWebSocket
+import RepoPromptRemoteWire
 
 final class GatewayHTTPServer: @unchecked Sendable {
     private let configuration: GatewayConfiguration

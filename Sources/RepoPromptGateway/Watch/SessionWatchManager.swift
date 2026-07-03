@@ -1,6 +1,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptRemoteWire
 
 private enum SessionWatchError: Error, Equatable, CustomStringConvertible {
     case pairedAppLinkUnavailable(String)

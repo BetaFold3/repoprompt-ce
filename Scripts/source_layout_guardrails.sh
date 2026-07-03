@@ -30,6 +30,7 @@ required_dirs=(
   "Sources/RepoPromptShared/MCP"
   "Sources/RepoPromptMCPClientKit"
   "Sources/RepoPromptGateway"
+  "Sources/RepoPromptRemoteWire"
   "Tests/RepoPromptTests"
 )
 for dir in "${required_dirs[@]}"; do
@@ -78,6 +79,11 @@ done
 if [[ -e "src/scanner.c" ]]; then
   fail "retired root src/scanner.c manifest-probe sentinel exists; use the tracked TreeSitterScannerSupport target instead"
 fi
+
+print_matches \
+  "RepoPromptRemoteWire imports forbidden app/gateway/MCP/NIO/logging modules" \
+  grep -R -n -E '^[[:space:]]*import[[:space:]]+(MCP|NIO[A-Za-z0-9_]*|Logging|RepoPrompt|RepoPromptGateway|RepoPromptMCP|RepoPromptMCPClientKit|RepoPromptShared)\b' \
+    Sources/RepoPromptRemoteWire --include='*.swift'
 
 tree_sitter_scanner_support_files=(
   "Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h"

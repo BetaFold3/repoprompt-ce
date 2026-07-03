@@ -1,6 +1,7 @@
 import CryptoKit
 import Foundation
 import Logging
+import RepoPromptRemoteWire
 
 typealias PushSender =
     P256.Signing.PrivateKey
