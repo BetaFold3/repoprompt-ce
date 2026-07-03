@@ -1,34 +1,53 @@
 import Foundation
 import RepoPromptShared
 
-struct MCPInitializeReplayPlan: Equatable {
-    let initializeFrame: Data
-    let initializeRequestID: JSONRPCBridgeID
-    let initializeResultFingerprint: String?
-    let initializedFrame: Data?
+public typealias MCPClientKitDebugLogHandler = @Sendable (String) -> Void
 
-    var shouldForwardInitializeResponseToHost: Bool {
+public struct MCPInitializeReplayPlan: Equatable, Sendable {
+    public let initializeFrame: Data
+    public let initializeRequestID: JSONRPCBridgeID
+    public let initializeResultFingerprint: String?
+    public let initializedFrame: Data?
+
+    public init(
+        initializeFrame: Data,
+        initializeRequestID: JSONRPCBridgeID,
+        initializeResultFingerprint: String?,
+        initializedFrame: Data?
+    ) {
+        self.initializeFrame = initializeFrame
+        self.initializeRequestID = initializeRequestID
+        self.initializeResultFingerprint = initializeResultFingerprint
+        self.initializedFrame = initializedFrame
+    }
+
+    public var shouldForwardInitializeResponseToHost: Bool {
         initializeResultFingerprint == nil
     }
 }
 
-enum MCPInitializeReplayUnavailableReason: String, Swift.Error, Equatable {
+public enum MCPInitializeReplayUnavailableReason: String, Swift.Error, Equatable, Sendable {
     case missingInitializeFrame = "mcp_session_resume_unsupported_missing_initialize_frame"
     case missingInitializeResponseFingerprint = "mcp_session_resume_unsupported_missing_initialize_response_fingerprint"
 
-    var terminalReason: String {
+    public var terminalReason: String {
         rawValue
     }
 }
 
-actor MCPInitializeReplayState {
+public actor MCPInitializeReplayState {
+    private let debugLog: MCPClientKitDebugLogHandler
     private var initializeFrame: Data?
     private var initializeRequestID: JSONRPCBridgeID?
     private var initializeResultFingerprint: String?
     private var initializedFrame: Data?
     private var initializeResponseDeliveredToHost = false
 
-    func recordForwardedClientFrame(_ frame: Data) {
+    public init(debugLog: @escaping MCPClientKitDebugLogHandler = { _ in }) {
+        self.debugLog = debugLog
+    }
+
+    public func recordForwardedClientFrame(_ frame: Data) {
         guard let object = Self.jsonObject(from: frame),
               let method = object["method"] as? String
         else {
@@ -54,7 +73,7 @@ actor MCPInitializeReplayState {
         }
     }
 
-    func recordDeliveredServerFrame(_ frame: Data) {
+    public func recordDeliveredServerFrame(_ frame: Data) {
         guard !initializeResponseDeliveredToHost,
               let initializeRequestID,
               let object = Self.jsonObject(from: frame),
@@ -72,7 +91,7 @@ actor MCPInitializeReplayState {
         debugLog("MCPInitializeReplayState: initialize response delivered to host id=\(id)")
     }
 
-    func replayPlan() -> Result<MCPInitializeReplayPlan, MCPInitializeReplayUnavailableReason> {
+    public func replayPlan() -> Result<MCPInitializeReplayPlan, MCPInitializeReplayUnavailableReason> {
         guard let initializeFrame, let initializeRequestID else {
             return .failure(.missingInitializeFrame)
         }
@@ -88,15 +107,15 @@ actor MCPInitializeReplayState {
         ))
     }
 
-    static func jsonObject(from frame: Data) -> [String: Any]? {
+    public static func jsonObject(from frame: Data) -> [String: Any]? {
         (try? JSONSerialization.jsonObject(with: frame)) as? [String: Any]
     }
 
-    static func jsonRPCID(from value: Any?) -> JSONRPCBridgeID? {
+    public static func jsonRPCID(from value: Any?) -> JSONRPCBridgeID? {
         JSONRPCBridgeID.parseJSONValue(value)
     }
 
-    static func canonicalJSONFingerprint(_ value: Any) -> String? {
+    public static func canonicalJSONFingerprint(_ value: Any) -> String? {
         guard JSONSerialization.isValidJSONObject(value),
               let data = try? JSONSerialization.data(
                   withJSONObject: value,
@@ -108,7 +127,7 @@ actor MCPInitializeReplayState {
         return MCPResponseDeliveryTracer.sha256Hex(data)
     }
 
-    static func initializeCompatibilityFingerprint(_ value: Any) -> String? {
+    public static func initializeCompatibilityFingerprint(_ value: Any) -> String? {
         guard let result = value as? [String: Any] else { return nil }
         return canonicalJSONFingerprint([
             "capabilities": result["capabilities"] ?? [String: Any](),
@@ -117,7 +136,8 @@ actor MCPInitializeReplayState {
     }
 }
 
-actor MCPOutstandingRequestReplayState {
+public actor MCPOutstandingRequestReplayState {
+    private let debugLog: MCPClientKitDebugLogHandler
     private struct EntryKey: Hashable {
         let id: JSONRPCBridgeID
         let ordinal: UInt64
@@ -132,7 +152,11 @@ actor MCPOutstandingRequestReplayState {
     private var nextFallbackOrdinal: UInt64 = 0
     private var entries: [EntryKey: Entry] = [:]
 
-    func recordForwardedClientFrame(
+    public init(debugLog: @escaping MCPClientKitDebugLogHandler = { _ in }) {
+        self.debugLog = debugLog
+    }
+
+    public func recordForwardedClientFrame(
         _ frame: Data,
         prepared: JSONRPCBridgePreparedFrame? = nil
     ) {
@@ -141,14 +165,14 @@ actor MCPOutstandingRequestReplayState {
     }
 
     @discardableResult
-    func recordPreparedClientRequestFrame(
+    public func recordPreparedClientRequestFrame(
         _ frame: Data,
         prepared: JSONRPCBridgePreparedFrame
     ) -> Bool {
         recordReplayableClientRequests(frame, prepared: prepared)
     }
 
-    func discardPreparedClientRequestFrame(
+    public func discardPreparedClientRequestFrame(
         _ frame: Data,
         prepared: JSONRPCBridgePreparedFrame
     ) {
@@ -166,7 +190,7 @@ actor MCPOutstandingRequestReplayState {
         }
     }
 
-    func recordDeliveredServerFrame(
+    public func recordDeliveredServerFrame(
         _ frame: Data,
         prepared: JSONRPCBridgePreparedFrame? = nil
     ) {
@@ -189,7 +213,7 @@ actor MCPOutstandingRequestReplayState {
         }
     }
 
-    func replayFrames() -> [Data] {
+    public func replayFrames() -> [Data] {
         entries.values
             .sorted { $0.ordinal < $1.ordinal }
             .map(\.frame)

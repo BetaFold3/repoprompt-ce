@@ -322,6 +322,8 @@ class GlobalSettingsStore: ObservableObject {
     private static let defaultFileEditFormatRaw = "Diff"
     private static let defaultComplexEditStrategyRaw = "Sequential split"
     private static let telemetryEnabledDefaultsKey = "telemetry.enabled"
+    private static let defaultRemoteGatewayBindAddress = "127.0.0.1"
+    private static let defaultRemoteGatewayPort = 47391
     private static let settingsWriteDiagnosticsLimit = 80
 
     private var settingsWriteDiagnostics: [GlobalSettingsWriteDiagnostic] = []
@@ -1012,6 +1014,58 @@ class GlobalSettingsStore: ObservableObject {
         updateMCPScalar(commit: commit) { settings in
             settings.temporarilyDisablePresets = enabled
         }
+    }
+
+    func mcpRemoteGatewayEnabled() -> Bool {
+        scalarPreferences.mcp?.remoteGatewayEnabled ?? false
+    }
+
+    func setMCPRemoteGatewayEnabled(_ enabled: Bool, commit: Bool = true) {
+        updateMCPScalar(commit: commit) { settings in
+            settings.remoteGatewayEnabled = enabled
+        }
+    }
+
+    func mcpRemoteGatewayBindAddress() -> String {
+        normalizedRemoteGatewayBindAddress(scalarPreferences.mcp?.remoteGatewayBindAddress)
+    }
+
+    func setMCPRemoteGatewayBindAddress(_ address: String, commit: Bool = true) {
+        let normalized = normalizedRemoteGatewayBindAddress(address)
+        updateMCPScalar(commit: commit) { settings in
+            settings.remoteGatewayBindAddress = normalized
+        }
+    }
+
+    func mcpRemoteGatewayPort() -> Int {
+        normalizedRemoteGatewayPort(scalarPreferences.mcp?.remoteGatewayPort)
+    }
+
+    func setMCPRemoteGatewayPort(_ port: Int, commit: Bool = true) {
+        let normalized = normalizedRemoteGatewayPort(port)
+        updateMCPScalar(commit: commit) { settings in
+            settings.remoteGatewayPort = normalized
+        }
+    }
+
+    func remoteControlShowPairingDetails() -> Bool {
+        scalarPreferences.mcp?.remoteControlShowPairingDetails ?? true
+    }
+
+    func setRemoteControlShowPairingDetails(_ enabled: Bool, commit: Bool = true) {
+        updateMCPScalar(commit: commit) { settings in
+            settings.remoteControlShowPairingDetails = enabled
+        }
+    }
+
+    private func normalizedRemoteGatewayBindAddress(_ address: String?) -> String {
+        let trimmed = address?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? Self.defaultRemoteGatewayBindAddress : trimmed
+    }
+
+    private func normalizedRemoteGatewayPort(_ port: Int?) -> Int {
+        guard let port, (1 ... 65535).contains(port) else { return Self.defaultRemoteGatewayPort }
+        return port
     }
 
     func respectRepoIgnore() -> Bool {

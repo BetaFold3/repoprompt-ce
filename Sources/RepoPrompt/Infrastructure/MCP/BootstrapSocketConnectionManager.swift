@@ -40,6 +40,38 @@ private let bootstrapLog: Logger = {
 /// Connection manager for bootstrap socket connections.
 /// Unlike FileSystemMCPConnectionManager, this doesn't use filesystem folders or meta.json.
 actor BootstrapSocketConnectionManager: MCPServerConnection {
+    private static let gatewayKeepaliveSeconds = 15
+
+    #if DEBUG
+        static func debugResolvedKeepaliveSecondsForTesting(clientName: String?, configuredSeconds: Int) -> Int {
+            resolvedKeepaliveSeconds(clientName: clientName, configuredSeconds: configuredSeconds)
+        }
+
+        static func debugResolvedHealthMonitorSleepSecondsForTesting(clientName: String?, configuredSeconds: Int) -> Int {
+            let keepaliveSeconds = resolvedKeepaliveSeconds(
+                clientName: clientName,
+                configuredSeconds: configuredSeconds
+            )
+            return resolvedHealthMonitorSleepSeconds(keepaliveSeconds: keepaliveSeconds)
+        }
+    #endif
+
+    private static func resolvedKeepaliveSeconds(clientName: String?, configuredSeconds: Int) -> Int {
+        if configuredSeconds > 0 {
+            return configuredSeconds
+        }
+        guard let clientName else { return 0 }
+        if clientName == "repoprompt-gateway" || clientName.hasPrefix("remote:") {
+            return gatewayKeepaliveSeconds
+        }
+        return 0
+    }
+
+    private static func resolvedHealthMonitorSleepSeconds(keepaliveSeconds: Int) -> Int {
+        guard keepaliveSeconds > 0 else { return 30 }
+        return min(30, max(1, keepaliveSeconds))
+    }
+
     private let connectionID: UUID
     private let sessionToken: String
     private let clientPid: Int
@@ -194,7 +226,11 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         healthMonitoringTask?.cancel()
         healthMonitoringTask = Task { [self] in
             let hardIdleSec = UserDefaults.standard.integer(forKey: "mcp.idleConnectionSeconds")
-            let keepaliveSec = UserDefaults.standard.integer(forKey: "mcp.keepaliveSeconds")
+            let keepaliveSec = Self.resolvedKeepaliveSeconds(
+                clientName: _clientName,
+                configuredSeconds: UserDefaults.standard.integer(forKey: "mcp.keepaliveSeconds")
+            )
+            let healthMonitorSleepSec = Self.resolvedHealthMonitorSleepSeconds(keepaliveSeconds: keepaliveSec)
             var lastKeepaliveAt: Date? = nil
             while !Task.isCancelled {
                 guard await parentManager.isRunning() else { break }
@@ -222,7 +258,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
                     }
                 }
                 do {
-                    try await Task.sleep(for: .seconds(30))
+                    try await Task.sleep(for: .seconds(healthMonitorSleepSec))
                 } catch {
                     break
                 }
@@ -345,6 +381,26 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
             try await transport.send(data)
         } catch {
             bootstrapLog.debug("Failed to send terminate notification: \(error)")
+        }
+    }
+
+    /// Sends a `channel_closing` control notification (plan §6.3) announcing an
+    /// imminent server teardown. Unlike `terminate`, this does not close the
+    /// connection — the subsequent shutdown path does.
+    func sendChannelClosing(reason: TerminationReason, message: String?) async {
+        guard !isClosing, handshakeComplete else { return }
+        let notification = RepoPromptControlNotification<RepoPromptChannelClosingParams>.channelClosing(
+            reason: reason,
+            message: message
+        )
+        guard let data = notification.encodedJSONLine() else {
+            bootstrapLog.warning("Failed to encode channel_closing notification")
+            return
+        }
+        do {
+            try await transport.send(data)
+        } catch {
+            bootstrapLog.debug("Failed to send channel_closing notification: \(error)")
         }
     }
 

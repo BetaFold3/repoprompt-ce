@@ -810,7 +810,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
                 relativeTo: root
             )
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 
@@ -831,7 +831,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             let root = try RepoRoot.url()
             let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 
@@ -868,18 +868,18 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
     func testAppAndCLIReadersPreserveOneShotTerminalCancellationOwnership() throws {
         do {
-            let caseLabel = "testAppAndCLIReadersShareFairOneShotTerminalCancellationLifecycle"
+            let caseLabel = "testAppAndClientKitReadersShareFairOneShotTerminalCancellationLifecycle"
             let root = try RepoRoot.url()
             let appReader = try Self.sourceText(
                 "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift",
                 relativeTo: root
             )
-            let cliReader = try Self.sourceText(
-                "Sources/RepoPromptMCP/Shared/NewlineDelimitedSocketReader.swift",
+            let clientKitReader = try Self.sourceText(
+                "Sources/RepoPromptMCPClientKit/Shared/NewlineDelimitedSocketReader.swift",
                 relativeTo: root
             )
 
-            XCTAssertEqual(appReader, cliReader, caseLabel)
+            XCTAssertEqual(appReader, clientKitReader, caseLabel)
             Self.assertSourceContains(
                 [
                     "public enum NewlineDelimitedSocketReaderTerminal: @unchecked Sendable",
@@ -901,10 +901,10 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         }
 
         do {
-            let caseLabel = "testNonImportableCLITransportClaimsEarlyAndDelayedReaderCancellationExactlyOnce"
+            let caseLabel = "testClientKitTransportClaimsEarlyAndDelayedReaderCancellationExactlyOnce"
             let root = try RepoRoot.url()
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 

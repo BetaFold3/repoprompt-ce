@@ -111,6 +111,7 @@ for path in [
     root / ".build" / "release" / "RepoPrompt-artifact-manifest.json",
     app / "Contents" / "MacOS" / "RepoPrompt",
     app / "Contents" / "MacOS" / "repoprompt-mcp",
+    app / "Contents" / "MacOS" / "repoprompt-gateway",
 ]:
     require_regular_file(path)
 
@@ -122,6 +123,8 @@ if top_level != expected_top_level:
 cli_links = {
     app / "Contents" / "Resources" / "repoprompt-mcp": "../MacOS/repoprompt-mcp",
     app / "Contents" / "Resources" / "bin" / "repoprompt-mcp": "../../MacOS/repoprompt-mcp",
+    app / "Contents" / "Resources" / "repoprompt-gateway": "../MacOS/repoprompt-gateway",
+    app / "Contents" / "Resources" / "bin" / "repoprompt-gateway": "../../MacOS/repoprompt-gateway",
 }
 sparkle = app / "Contents" / "Frameworks" / "Sparkle.framework"
 resolved_sparkle = sparkle.resolve(strict=False)

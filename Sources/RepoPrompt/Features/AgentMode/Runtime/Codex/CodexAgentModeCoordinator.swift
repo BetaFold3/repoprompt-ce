@@ -7859,6 +7859,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .permissionsResponseSubmitted)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.recordMCPInteractionResolution(for: session, interactionID: request.id)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
             await controller.respondToServerRequest(id: request.requestID, result: result)
@@ -7888,6 +7889,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         handleRunInteractionStateChange(for: session, reason: .mcpElicitationResponseSubmitted)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         viewModel?.publishMCPStateChange(for: session)
+        viewModel?.recordMCPInteractionResolution(for: session, interactionID: request.id)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
             await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)

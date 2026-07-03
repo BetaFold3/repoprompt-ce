@@ -10,6 +10,7 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
     case git
     case contextBuilder
     case askUser
+    case remotePairing
     case agentControl
     case agentSessionControl
     case history
@@ -49,6 +50,8 @@ enum MCPWindowToolGroup: CaseIterable, Hashable {
             [MCPWindowToolName.contextBuilder]
         case .askUser:
             [MCPWindowToolName.askUser]
+        case .remotePairing:
+            [MCPWindowToolName.remotePairing]
         case .agentControl:
             [
                 MCPWindowToolName.agentExplore,

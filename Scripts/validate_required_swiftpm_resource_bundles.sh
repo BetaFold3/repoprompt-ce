@@ -20,6 +20,8 @@ app = Path(sys.argv[1])
 label = sys.argv[2]
 required_bundles = ["KeyboardShortcuts_KeyboardShortcuts.bundle"]
 patch_marker = b"RepoPromptKeyboardShortcutsResourceLookupV1"
+gateway_bundle_name = "RepoPromptCE_RepoPromptGateway.bundle"
+gateway_pwa_assets = ["index.html", "app.js", "sw.js", "manifest.webmanifest"]
 
 
 def fail(message: str) -> None:
@@ -56,6 +58,20 @@ for bundle_name in required_bundles:
     require_real_directory(bundle)
     require_regular_file(bundle / "Contents" / "Info.plist")
     require_regular_file(bundle / "Contents" / "Resources" / "en.lproj" / "Localizable.strings")
+
+# Gateway PWA resource bundle (M5): the packaged gateway must be able to serve
+# every PWA asset. SwiftPM emits a flat bundle layout; normalization may move
+# resources under Contents/Resources — accept either layout, exactly one.
+gateway_bundle = app / "Contents" / "Resources" / gateway_bundle_name
+require_real_directory(gateway_bundle)
+flat_pwa = gateway_bundle / "pwa"
+nested_pwa = gateway_bundle / "Contents" / "Resources" / "pwa"
+if flat_pwa.is_dir() and nested_pwa.is_dir():
+    fail(f"gateway PWA assets present in both flat and nested layouts: {gateway_bundle}")
+pwa_dir = flat_pwa if flat_pwa.is_dir() else nested_pwa
+require_real_directory(pwa_dir)
+for asset in gateway_pwa_assets:
+    require_regular_file(pwa_dir / asset)
 
 executable = app / "Contents" / "MacOS" / "RepoPrompt"
 require_regular_file(executable)

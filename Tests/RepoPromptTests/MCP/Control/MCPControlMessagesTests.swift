@@ -93,6 +93,33 @@ final class MCPControlMessagesTests: XCTestCase {
         }
     }
 
+    func testChannelClosingNotificationJSONLineRoundTrips() throws {
+        let notification = RepoPromptControlNotification.channelClosing(
+            reason: .serverShutdown,
+            message: "The RepoPrompt MCP server is shutting down."
+        )
+
+        let data = try XCTUnwrap(notification.encodedJSONLine())
+        XCTAssertEqual(data.last, 10, "encodedJSONLine() must preserve the trailing newline transport delimiter")
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("repoprompt/control/channel_closing"))
+        XCTAssertFalse(String(decoding: data, as: UTF8.self).contains("repoprompt\\/control\\/channel_closing"))
+
+        let envelope = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(envelope["jsonrpc"] as? String, "2.0")
+        XCTAssertEqual(envelope["method"] as? String, RepoPromptControlMethod.channelClosing)
+        XCTAssertNil(envelope["id"], "Control messages are JSON-RPC notifications, not requests")
+
+        let parsed = try XCTUnwrap(RepoPromptControlDetection.parseChannelClosingParams(from: data))
+        XCTAssertEqual(parsed.reason, .serverShutdown)
+        XCTAssertEqual(parsed.message, "The RepoPrompt MCP server is shutting down.")
+        XCTAssertFalse(parsed.announcedAt.isEmpty, "announcedAt carries an ISO8601 timestamp string")
+
+        let decoder = JSONDecoder()
+        let reEncoded = try JSONEncoder().encode(parsed)
+        let reDecoded = try decoder.decode(RepoPromptChannelClosingParams.self, from: reEncoded)
+        XCTAssertEqual(reDecoded, parsed)
+    }
+
     func testKillSignalPayloadPathAndJSONRoundTrip() throws {
         let directory = URL(fileURLWithPath: "/tmp/MCPKillSignals-CE-D-7", isDirectory: true)
         let url = MCPKillSignal.signalFileURL(forSessionToken: "session-token", directory: directory)

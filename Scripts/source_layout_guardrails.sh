@@ -28,6 +28,8 @@ required_dirs=(
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
   "Sources/RepoPromptShared/MCP"
+  "Sources/RepoPromptMCPClientKit"
+  "Sources/RepoPromptGateway"
   "Tests/RepoPromptTests"
 )
 for dir in "${required_dirs[@]}"; do
@@ -62,6 +64,7 @@ shared_mcp_required_files=(
   "Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
   "Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift"
   "Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift"
+  "Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift"
 )
 for file in "${shared_mcp_required_files[@]}"; do
   if [[ ! -f "$file" ]]; then
@@ -260,6 +263,12 @@ if [[ "$mcp_event_declarations" != "Sources/RepoPromptShared/MCP/MCPExternalClie
   printf '%s\n' "$mcp_event_declarations" >&2
 fi
 
+mcp_bootstrap_declarations="$(grep -R -l -E '^(public )?(enum MCPBootstrapProtocol|enum MCPBootstrapTiming|struct MCPBootstrapRequest|struct MCPBootstrapResponse|enum MCPBootstrapErrorCode)' Sources --include='*.swift' | sort || true)"
+if [[ "$mcp_bootstrap_declarations" != "Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift" ]]; then
+  fail "MCP bootstrap handshake DTOs must be declared only under RepoPromptShared"
+  printf '%s\n' "$mcp_bootstrap_declarations" >&2
+fi
+
 # 4. Parser fixtures and sample parser inputs must not live in app source.
 print_matches \
   "parser fixture/test directory found under app syntax parsing source" \
@@ -335,8 +344,10 @@ allowed_tracked_docs=(
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
+  "docs/designs/remote-relay-contract.md"
   "docs/open-source-readiness.md"
   "docs/privacy/telemetry.md"
+  "docs/technical_implementation_reports/remote-control-gateway.md"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"

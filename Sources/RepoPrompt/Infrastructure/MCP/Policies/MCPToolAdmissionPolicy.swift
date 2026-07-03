@@ -62,6 +62,7 @@ enum MCPToolAdmissionPolicy {
         MCPWindowToolName.manageWorktree: .exclusive,
         MCPWindowToolName.contextBuilder: .control,
         MCPWindowToolName.askUser: .control,
+        MCPWindowToolName.remotePairing: .control,
         MCPWindowToolName.agentExplore: .control,
         MCPWindowToolName.agentRun: .control,
         MCPWindowToolName.agentManage: .control,

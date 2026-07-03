@@ -147,8 +147,20 @@ extension AgentModeViewModel {
         }
 
         var isMCPInstructionDispatchInProgress: Bool = false
-        /// Whether this session was originally created by an MCP client.
-        var isMCPOriginated: Bool = false
+        /// Session provenance (plan §6.4). `.user` unless MCP control created or
+        /// claimed this session.
+        var origin: AgentSessionOrigin = .user
+        /// Whether this session was originally created by an MCP client (derived from `origin`).
+        var isMCPOriginated: Bool {
+            origin.isMCPOriginated
+        }
+
+        /// Most recent resolved interaction (id + attribution), surfaced through MCP
+        /// snapshots as `interaction_resolved` metadata on wait/poll responses.
+        var lastInteractionResolution: AgentRunMCPSnapshot.InteractionResolution?
+        /// Staged `resolved_by` attribution for an in-flight MCP `respond` call.
+        /// Consumed by `recordMCPInteractionResolution`; `nil` means user-local.
+        var pendingInteractionResolutionAttribution: String?
         /// Persisted logical-root to worktree bindings for this Agent session.
         var worktreeBindings: [AgentSessionWorktreeBinding] = []
         /// Persisted resumable worktree-merge operations for this Agent session.

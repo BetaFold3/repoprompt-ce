@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 
@@ -110,7 +111,13 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertEqual(targets["RepoPromptApp"]["path"], "Sources/RepoPrompt")
         self.assertEqual(
             set(generator._by_name_dependencies(targets["RepoPromptTests"])),
-            {"RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"},
+            {
+                "RepoPromptApp",
+                "RepoPromptMCP",
+                "RepoPromptGateway",
+                "RepoPromptMCPClientKit",
+                "RepoPromptShared",
+            },
         )
         self.assertNotIn("RepoPrompt", generator._by_name_dependencies(targets["RepoPromptTests"]))
 
@@ -119,16 +126,17 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertIn("RepoPrompt", metadata["package"]["targets"])
         self.assertIn("RepoPromptApp", metadata["package"]["targets"])
 
-    def test_project_has_exactly_three_convenience_targets(self) -> None:
+    def test_project_has_exactly_four_convenience_targets(self) -> None:
         project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()
-        self.assertEqual(project.count("isa = PBXLegacyTarget;"), 3)
+        self.assertEqual(project.count("isa = PBXLegacyTarget;"), 4)
         self.assertIn(generator.APP_SCHEME, project)
         self.assertIn(generator.MCP_SCHEME, project)
+        self.assertIn(generator.GATEWAY_SCHEME, project)
         self.assertIn(generator.TEST_SCHEME, project)
 
     def test_convenience_targets_do_not_pass_xcode_build_settings(self) -> None:
         project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()
-        self.assertEqual(project.count("passBuildSettingsInEnvironment = 0;"), 3)
+        self.assertEqual(project.count("passBuildSettingsInEnvironment = 0;"), 4)
         self.assertNotIn("passBuildSettingsInEnvironment = 1;", project)
 
     def test_app_scheme_has_runnable_markers_and_prepare_action(self) -> None:
@@ -178,6 +186,39 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         path = Path(generator.PROJECT_NAME) / f"xcshareddata/xcschemes/{generator.MCP_SCHEME}.xcscheme"
         self.assertIn(".build/debug/repoprompt-mcp", self.outputs[path].decode())
 
+    def test_gateway_scheme_points_at_debug_executable(self) -> None:
+        path = Path(generator.PROJECT_NAME) / f"xcshareddata/xcschemes/{generator.GATEWAY_SCHEME}.xcscheme"
+        self.assertIn(".build/debug/repoprompt-gateway", self.outputs[path].decode())
+
+    def test_xcodebuild_list_requires_native_gateway_scheme(self) -> None:
+        convenience_schemes = [
+            generator.APP_SCHEME,
+            generator.MCP_SCHEME,
+            generator.GATEWAY_SCHEME,
+            generator.TEST_SCHEME,
+            "RepoPrompt",
+        ]
+        missing_gateway = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"workspace": {"schemes": convenience_schemes}}),
+            stderr="",
+        )
+        with patch.object(generator.subprocess, "run", return_value=missing_gateway):
+            with self.assertRaisesRegex(generator.GeneratorError, "repoprompt-gateway"):
+                generator.validate_xcodebuild_list(Path("/tmp/generated-xcode"))
+
+        discovered_gateway = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "workspace": {"schemes": [*convenience_schemes, "repoprompt-gateway"]}
+            }),
+            stderr="",
+        )
+        with patch.object(generator.subprocess, "run", return_value=discovered_gateway):
+            generator.validate_xcodebuild_list(Path("/tmp/generated-xcode"))
+
     def test_check_detects_corruption(self) -> None:
         temporary, destination = self.generate_in_temporary_directory()
         self.addCleanup(temporary.cleanup)
@@ -222,6 +263,13 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(generator.GeneratorError, "executable product 'RepoPrompt'"):
             generator.validate_manifest(missing_product, generator.REPO_ROOT)
+
+        missing_gateway_product = deepcopy(self.manifest)
+        missing_gateway_product["products"] = [
+            product for product in missing_gateway_product["products"] if product["name"] != "repoprompt-gateway"
+        ]
+        with self.assertRaisesRegex(generator.GeneratorError, "executable product 'repoprompt-gateway'"):
+            generator.validate_manifest(missing_gateway_product, generator.REPO_ROOT)
 
         missing_target = deepcopy(self.manifest)
         missing_target["targets"] = [
@@ -277,6 +325,13 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         target_map["RepoPromptApp"]["settings"] = []
         with self.assertRaisesRegex(generator.GeneratorError, "RepoPromptApp must own"):
             generator.validate_manifest(missing_bridging_header_owner, generator.REPO_ROOT)
+
+        missing_gateway_target = deepcopy(self.manifest)
+        missing_gateway_target["targets"] = [
+            target for target in missing_gateway_target["targets"] if target["name"] != "RepoPromptGateway"
+        ]
+        with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptGateway'"):
+            generator.validate_manifest(missing_gateway_target, generator.REPO_ROOT)
 
         bad_resources = deepcopy(self.manifest)
         for target in bad_resources["targets"]:

@@ -1,8 +1,8 @@
 import Foundation
 
-struct DeviceIdentity {
-    static let shared = DeviceIdentity()
-    let id: String
+public struct DeviceIdentity {
+    public static let shared = DeviceIdentity()
+    public let id: String
 
     private init() {
         let fm = FileManager.default

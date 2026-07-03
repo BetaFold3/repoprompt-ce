@@ -19,6 +19,8 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/swiftlang/swift-markdown", exact: "0.6.0"),
     .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.8.0"),
     .package(url: "https://github.com/apple/swift-system.git", exact: "1.6.4"),
+    .package(url: "https://github.com/apple/swift-nio.git", exact: "2.99.0"),
+    .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.37.0"),
     .package(url: "https://github.com/provencher/swift-sdk.git", revision: "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"),
     .package(url: "https://github.com/ChimeHQ/SwiftTreeSitter.git", exact: "0.8.0"),
     .package(url: "https://github.com/tree-sitter/tree-sitter-c", revision: "3efee11f784605d44623d7dadd6cd12a0f73ea92"),
@@ -104,7 +106,8 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "RepoPrompt", targets: ["RepoPrompt"]),
-        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"])
+        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"]),
+        .executable(name: "repoprompt-gateway", targets: ["RepoPromptGateway"])
     ],
     dependencies: packageDependencies,
     targets: [
@@ -119,10 +122,47 @@ let package = Package(
             path: "Sources/RepoPrompt",
             swiftSettings: repoPromptAppSwiftSettings
         ),
+        .target(
+            name: "RepoPromptMCPClientKit",
+            dependencies: [
+                "RepoPromptShared",
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "SystemPackage", package: "swift-system")
+            ],
+            path: "Sources/RepoPromptMCPClientKit",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
         .executableTarget(
             name: "RepoPromptMCP",
-            dependencies: ["RepoPromptShared", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: [
+                "RepoPromptShared",
+                "RepoPromptMCPClientKit",
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"),
+                .product(name: "SystemPackage", package: "swift-system")
+            ],
             path: "Sources/RepoPromptMCP",
+            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
+        ),
+        .executableTarget(
+            name: "RepoPromptGateway",
+            dependencies: [
+                "RepoPromptMCPClientKit",
+                "RepoPromptShared",
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "NIOHTTP1", package: "swift-nio"),
+                .product(name: "NIOWebSocket", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl")
+            ],
+            path: "Sources/RepoPromptGateway",
+            resources: [
+                .copy("Resources/pwa")
+            ],
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .target(
@@ -138,7 +178,7 @@ let package = Package(
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",
-            dependencies: ["RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"],
+            dependencies: ["RepoPromptApp", "RepoPromptMCP", "RepoPromptGateway", "RepoPromptMCPClientKit", "RepoPromptShared"],
             path: "Tests/RepoPromptTests",
             resources: [
                 .copy("CodeMap/Fixtures"),

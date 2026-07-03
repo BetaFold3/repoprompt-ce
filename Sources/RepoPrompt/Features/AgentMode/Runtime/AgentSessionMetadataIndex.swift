@@ -59,6 +59,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var autoEditEnabled: Bool
     var parentSessionID: UUID?
     var isMCPOriginated: Bool
+    /// Session provenance (plan §6.4); `nil` for legacy records that predate
+    /// origin tracking. Use `effectiveOrigin` for a normalized value.
+    var origin: AgentSessionOrigin?
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
     var serializationVersion: Int?
@@ -108,6 +111,12 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && toolCallCount == 0
     }
 
+    /// Origin with legacy fallback: records without an explicit `origin` derive
+    /// it from the legacy `isMCPOriginated` flag.
+    var effectiveOrigin: AgentSessionOrigin {
+        origin ?? AgentSessionOrigin(legacyIsMCPOriginated: isMCPOriginated)
+    }
+
     init(
         id: UUID,
         filename: String,
@@ -126,6 +135,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         autoEditEnabled: Bool,
         parentSessionID: UUID?,
         isMCPOriginated: Bool,
+        origin: AgentSessionOrigin? = nil,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
         activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = [],
         serializationVersion: Int?,
@@ -156,6 +166,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.autoEditEnabled = autoEditEnabled
         self.parentSessionID = parentSessionID
         self.isMCPOriginated = isMCPOriginated
+        self.origin = origin
         self.worktreeBindingSummaries = worktreeBindingSummaries
         self.activeWorktreeMergeSummaries = activeWorktreeMergeSummaries
         self.serializationVersion = serializationVersion
@@ -188,6 +199,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case autoEditEnabled
         case parentSessionID
         case isMCPOriginated
+        case origin
         case worktreeBindingSummaries
         case activeWorktreeMergeSummaries
         case serializationVersion
@@ -221,6 +233,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
+        origin = try container.decodeIfPresent(AgentSessionOrigin.self, forKey: .origin)
         worktreeBindingSummaries = try container.decodeIfPresent([AgentSessionWorktreeBindingSummary].self, forKey: .worktreeBindingSummaries) ?? []
         activeWorktreeMergeSummaries = try container.decodeIfPresent([AgentSessionWorktreeMergeSummary].self, forKey: .activeWorktreeMergeSummaries) ?? []
         serializationVersion = try container.decodeIfPresent(Int.self, forKey: .serializationVersion)
@@ -251,7 +264,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             autoEditEnabled: autoEditEnabled,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
-            isMCPOriginated: isMCPOriginated,
+            isMCPOriginated: effectiveOrigin.isMCPOriginated,
+            origin: effectiveOrigin,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
         )
@@ -268,7 +282,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentModel: agentModelRaw,
             lastRunState: lastRunStateRaw,
             parentSessionID: parentSessionID,
-            isMCPOriginated: isMCPOriginated,
+            isMCPOriginated: effectiveOrigin.isMCPOriginated,
+            origin: effectiveOrigin,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
         )
@@ -291,7 +306,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
             && parentSessionID == other.parentSessionID
-            && isMCPOriginated == other.isMCPOriginated
+            && effectiveOrigin.isMCPOriginated == other.effectiveOrigin.isMCPOriginated
+            && effectiveOrigin == other.effectiveOrigin
             && worktreeBindingSummaries == other.worktreeBindingSummaries
             && activeWorktreeMergeSummaries == other.activeWorktreeMergeSummaries
             && serializationVersion == other.serializationVersion
@@ -336,6 +352,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             autoEditEnabled: session.autoEditEnabled,
             parentSessionID: session.parentSessionID,
             isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
             serializationVersion: session.serializationVersion,

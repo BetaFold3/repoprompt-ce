@@ -86,10 +86,12 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
         var properties: OrderedDictionary<String, JSONSchema> = [
             "op": .string(description: "Operation.", enum: ["start", "poll", "wait", "cancel", "steer", "respond"]),
             "message": .string(description: messageDescription),
+            "request_id": .string(description: "[start, steer, respond] Optional idempotency key. Duplicate calls with the same request_id and identical arguments return the recorded outcome instead of re-executing (a duplicate start returns the original session_id; a duplicate steer does not enqueue a second instruction; a duplicate respond returns the recorded resolution). Reusing a request_id with different arguments is rejected as a conflict."),
             "model_id": .string(description: "[start] Role label from agent_manage.list_agents task_labels (explore, engineer, pair, design — resolved via global role defaults), or an explicit compound model_id from agents[].models[].model_id to pin an exact target. Defaults to pair when omitted."),
             "session_id": .string(description: "[poll, wait, cancel, steer, respond] Session UUID returned by a prior start/steer response. Do not fabricate it. Not accepted by start — use steer to continue an existing session."),
             "session_ids": .array(description: "[wait, poll] Array of session UUIDs. For wait: returns when first session reaches interesting state. For poll: returns all current snapshots. Mutually exclusive with session_id.", items: .string()),
             "session_name": .string(description: "[start] Display name for a new session."),
+            "workspace_id": .string(description: "[start] Optional workspace UUID guard. The start fails with workspace_mismatch when the resolved target window's active workspace differs; combine with the hidden _windowID routing override to target a specific window explicitly."),
             "workflow_id": .string(description: "[start, steer, respond] Workflow ID. Mutually exclusive with workflow_name."),
             "workflow_name": .string(description: "[start, steer, respond] Workflow name. Mutually exclusive with workflow_id."),
             "detach": .boolean(description: "[start] Return immediately instead of waiting. Default false."),
@@ -142,6 +144,8 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
 
             **session_id lifecycle**: `start` creates a new session and returns `session_id` in the response. All subsequent operations on that run require passing the same `session_id` back. Do NOT invent session IDs — always use the value returned by `start`.
 
+            **Snapshot output notes**: `poll`/`wait` first report live control snapshots, then terminal snapshots retained by the short in-memory MCP cursor, then archived snapshots from the active workspace's hydrated session index. Archived/indexed snapshots do not have a live control handle; non-terminal indexed raw states such as `running`, `idle`, or `waitingForUser` are surfaced as `completed` so clients render them as archived/non-actionable, with the original raw state preserved in `status_text`. Sessions visible only from persisted disk metadata (for example, returned by `agent_manage.list_sessions` before or outside active workspace index hydration) may still poll as `expired`; use `agent_manage.get_log` for transcript catch-up when a listed session has no poll snapshot.
+
             **Sub-agent spawning**: MCP-started `orchestrate` runs can dispatch sub-agents. Sub-agents cannot recursively start additional agent runs.
 
             **Parallel agents**: When launching multiple agents in parallel, always use `detach: true` so each `start` returns immediately without blocking. You can then `wait` or `poll` each `session_id` independently.
@@ -158,6 +162,8 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 **cancel**: session_id (required)
                 **steer**: session_id (required, from a prior `start`/`steer` response), message (required), wait?, timeout_seconds?, workflow_id|workflow_name?
                 **respond**: session_id (required), interaction_id (required), response?, answers?, amendment?, content?, meta?
+
+                start/steer/respond also accept an optional `request_id` idempotency key; duplicates return the recorded outcome instead of re-executing.
                 """,
                 properties: properties,
                 required: ["op"]

@@ -1013,7 +1013,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         source.hasLoadedPersistedState = true
         source.worktreeBindings = [parentBinding]
         source.mcpControlContext = nil
-        source.isMCPOriginated = false
+        source.origin = .user
 
         let service = makeAgentRunStartService(window: window, sourceTabID: sourceTabID)
         let value = try await service.execute(args: [
@@ -1056,7 +1056,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         source.hasLoadedPersistedState = true
         source.worktreeBindings = [parentBinding]
         source.mcpControlContext = nil
-        source.isMCPOriginated = true
+        source.origin = .mcp(clientID: nil)
 
         let service = makeAgentRunStartService(window: window, sourceTabID: sourceTabID)
         let value = try await service.execute(args: [

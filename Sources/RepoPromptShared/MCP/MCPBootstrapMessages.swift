@@ -3,11 +3,7 @@
 //  RepoPrompt
 //
 //  Shared bootstrap socket handshake message types.
-//  Used by both the app (BootstrapSocketServer) and CLI (repoprompt-mcp).
-//
-//  IMPORTANT: This file must be included in both targets:
-//  - RepoPrompt (app)
-//  - repoprompt-mcp (CLI)
+//  Used by the app bootstrap server and bootstrap MCP clients.
 //
 
 import Foundation
@@ -52,17 +48,24 @@ public struct MCPBootstrapRequest: Codable, Sendable {
     /// Protocol version for compatibility checking.
     public let protocolVersion: Int
 
+    /// Optional launch-scoped credential proving this bootstrap client is the app-spawned gateway.
+    /// This is intentionally transported inside the local UNIX-socket handshake and must never be
+    /// passed through command-line arguments.
+    public let gatewayCredential: String?
+
     public init(
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
-        protocolVersion: Int = MCPBootstrapProtocol.currentVersion
+        protocolVersion: Int = MCPBootstrapProtocol.currentVersion,
+        gatewayCredential: String? = nil
     ) {
         type = "connect"
         self.sessionToken = sessionToken
         self.clientPid = clientPid
         self.clientName = clientName
         self.protocolVersion = protocolVersion
+        self.gatewayCredential = gatewayCredential
     }
 }
 

@@ -214,7 +214,7 @@ struct MCPStatusView: View {
                 Text(conn.activeToolName ?? "Unknown")
                     .font(.subheadline.weight(.medium))
 
-                Text(conn.clientName)
+                Text(conn.displayClientName)
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -300,7 +300,7 @@ struct MCPStatusView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text(conn.clientName)
+                    Text(conn.displayClientName)
                         .font(.subheadline.weight(.medium))
 
                     connectionStateBadge(conn.state)

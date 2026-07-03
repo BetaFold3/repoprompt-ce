@@ -218,6 +218,7 @@ struct AgentModeSidebarSessionBuilder {
             parentSessionID: entry.parentSessionID,
             hasUnknownConversationContent: entry.hasUnknownConversationContent,
             isMCPOriginated: entry.isMCPOriginated,
+            origin: entry.origin,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,
             activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries
         )

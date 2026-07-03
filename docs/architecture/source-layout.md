@@ -47,7 +47,8 @@ Sources/
       WorkspaceContext/          # context store, indexing, path lookup, slices, search, token accounting
     ThirdParty/                  # vendored SwiftPCRE2 wrapper
   RepoPromptShared/
-    MCP/                         # shared app/CLI MCP control protocol definitions
+    MCP/                         # shared app/client MCP control and bootstrap wire definitions
+  RepoPromptMCPClientKit/        # reusable bootstrap MCP client plumbing for CLI/gateway clients
   RepoPromptMCP/                 # MCP CLI implementation
   RepoPromptC/                   # C support target
   CSwiftPCRE2/                   # C PCRE2 target
@@ -89,8 +90,9 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
 - New generic extensions/helpers should prefer a narrow feature or infrastructure owner first; otherwise use `Sources/RepoPrompt/Infrastructure/Utilities`.
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
-- New app/CLI protocol definitions shared by both executables go under `Sources/RepoPromptShared`.
-- MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
+- New app/client protocol definitions shared by multiple executables go under `Sources/RepoPromptShared`.
+- MCP filesystem/product/build-flavor identity, bootstrap handshake wire DTOs, and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
+- New reusable bootstrap MCP client plumbing shared by the CLI and gateway clients goes under `Sources/RepoPromptMCPClientKit`.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
 - New CLI-only implementation code goes under `Sources/RepoPromptMCP`.
 - New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.

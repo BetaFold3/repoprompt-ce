@@ -1,8 +1,8 @@
 //
 //  BootstrapSocketMCPTransport.swift
-//  repoprompt-mcp
+//  RepoPromptMCPClientKit
 //
-//  CLI-side MCP Transport implementation over an already-connected UNIX socket FD.
+//  Bootstrap MCP transport implementation over an already-connected UNIX socket FD.
 //  Uses DispatchSourceRead for event-driven I/O to avoid blocking the actor executor.
 //
 
@@ -57,7 +57,7 @@ import SystemPackage
     }
 #endif
 
-/// MCP Transport implementation for CLI that wraps an already-connected UNIX socket FD.
+/// MCP transport implementation that wraps an already-connected UNIX socket FD.
 /// This is used after the bootstrap handshake completes to run MCP.Client over the socket.
 public actor BootstrapSocketMCPTransport: Transport {
     private let socketFD: Int32

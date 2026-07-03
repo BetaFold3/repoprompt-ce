@@ -3961,7 +3961,7 @@ final class AgentModeViewModel: ObservableObject {
         )
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
-        session.isMCPOriginated = agentSession.isMCPOriginated
+        session.origin = agentSession.origin
         session.worktreeBindings = agentSession.worktreeBindings
         session.worktreeMergeOperations = agentSession.worktreeMergeOperations
         session.nextSequenceIndex = payload.transcript.nextSequenceIndex
@@ -4575,6 +4575,54 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    /// Records that a pending interaction was resolved and wakes current MCP waiters
+    /// with an `interaction_resolved` event. `resolved_by` attribution is staged by
+    /// `mcpResolvePendingInteraction` for MCP-driven resolutions (for example
+    /// `remote:<device8>` or a CLI client identity); it falls back to
+    /// `fallbackResolvedBy` (`"user"`) for app-local resolutions.
+    func recordMCPInteractionResolution(
+        for session: TabSession,
+        interactionID: UUID,
+        fallbackResolvedBy: String = "user"
+    ) {
+        let resolvedBy = session.pendingInteractionResolutionAttribution ?? fallbackResolvedBy
+        session.pendingInteractionResolutionAttribution = nil
+        session.lastInteractionResolution = AgentRunMCPSnapshot.InteractionResolution(
+            interactionID: interactionID,
+            resolvedBy: resolvedBy,
+            resolvedAt: Date()
+        )
+        guard session.mcpControlContext != nil else { return }
+        wakeCurrentMCPWaitersForInteractionResolutionFireAndForget(for: session)
+    }
+
+    private func wakeCurrentMCPWaitersForInteractionResolutionFireAndForget(for session: TabSession) {
+        guard let snapshot = mcpSnapshot(for: session),
+              let context = session.mcpControlContext
+        else {
+            Self.steeringDebugLog("[AgentRunInteractionResolvedWake] skip wake: missing snapshot/control context tab=\(session.tabID) runState=\(session.runState.rawValue)")
+            return
+        }
+        let tabID = session.tabID
+        Task { @MainActor [weak self] in
+            guard self?.mcpControlContextMatches(
+                tabID: tabID,
+                sessionID: snapshot.sessionID,
+                activationID: context.activationID,
+                registration: context.registration
+            ) == true else {
+                Self.steeringDebugLog("[AgentRunInteractionResolvedWake] skip wake: control context mismatch sessionID=\(snapshot.sessionID) tab=\(tabID)")
+                return
+            }
+            Self.steeringDebugLog("[AgentRunInteractionResolvedWake] waking current agent_run waiters reason=interaction_resolved sessionID=\(snapshot.sessionID) tab=\(tabID)")
+            await AgentRunSessionStore.wakeCurrentWaiters(
+                snapshot,
+                cursor: .init(registration: context.registration, epoch: context.currentEpoch),
+                reason: .interactionResolved
+            )
+        }
+    }
+
     private func mcpControlContextMatches(
         tabID: UUID,
         sessionID: UUID,
@@ -4956,7 +5004,8 @@ final class AgentModeViewModel: ObservableObject {
             parentSessionID: session.parentSessionID,
             failureReason: failureReason,
             worktreeBindings: session.worktreeBindings.map { AgentRunMCPSnapshot.WorktreeBinding(binding: $0) },
-            activeWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+            activeWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
+            lastInteractionResolution: session.lastInteractionResolution
         )
     }
 
@@ -5964,6 +6013,7 @@ final class AgentModeViewModel: ObservableObject {
                 parentSessionID: parentSessionID,
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
+                origin: AgentSessionOrigin.merged(existingEntry.origin, session.origin),
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
                 activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries
             )
@@ -5984,7 +6034,8 @@ final class AgentModeViewModel: ObservableObject {
             agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
             autoEditEnabled: session.autoEditEnabled,
             parentSessionID: parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin
         )
     }
 
@@ -6398,6 +6449,7 @@ final class AgentModeViewModel: ObservableObject {
         forTabID tabID: UUID,
         sessionID: UUID,
         originatingConnectionID: UUID?,
+        origin: AgentSessionOrigin? = nil,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         startPending: Bool = false,
         markSessionAsMCPOriginated: Bool = true,
@@ -6475,8 +6527,12 @@ final class AgentModeViewModel: ObservableObject {
         session.mcpFollowUpRunPending = startPending
         mcpControlledTabIDs.insert(tabID)
         if markSessionAsMCPOriginated {
-            // Mark session as MCP-originated so cleanup can scope to MCP sessions only.
-            session.isMCPOriginated = true
+            // Record provenance so cleanup can scope to MCP/remote sessions only.
+            // The first non-user attribution wins; re-activations by a different
+            // client keep the original creator attribution.
+            if session.origin == .user {
+                session.origin = origin ?? .mcp(clientID: nil)
+            }
         }
         // MCP-controlled sessions use the sub-agent permission policy, even when
         // they are top-level MCP starts without a parent session.
@@ -6934,7 +6990,8 @@ final class AgentModeViewModel: ObservableObject {
         sessionID: UUID,
         interactionID: UUID,
         payload: MCPInteractionResponsePayload,
-        workflow: AgentWorkflowDefinition? = nil
+        workflow: AgentWorkflowDefinition? = nil,
+        resolvedBy: String? = nil
     ) async throws -> MCPInstructionDispatch? {
         guard let session = mcpControlledSession(sessionID: sessionID) else {
             throw MCPError.invalidParams("The requested agent run is no longer active.")
@@ -6948,6 +7005,14 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("The pending interaction no longer matches interaction_id.")
         }
         let kind = currentInteraction.kind
+        // Stage `resolved_by` attribution for the resolution funnels; they consume it
+        // synchronously via `recordMCPInteractionResolution`. The defer clears any
+        // leftover staging when a branch throws before resolving, so a later
+        // user-local resolution is not misattributed to this MCP client.
+        if kind != .instruction {
+            session.pendingInteractionResolutionAttribution = resolvedBy
+        }
+        defer { session.pendingInteractionResolutionAttribution = nil }
         switch kind {
         case .instruction:
             let expectedID = session.instructionWaitID ?? session.mcpControlContext?.sessionID
@@ -9736,6 +9801,7 @@ final class AgentModeViewModel: ObservableObject {
         parentSessionID: UUID? = nil,
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
+        origin: AgentSessionOrigin? = nil,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
         activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = []
     ) {
@@ -9754,6 +9820,7 @@ final class AgentModeViewModel: ObservableObject {
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
+            origin: origin,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
         ))
@@ -10993,6 +11060,7 @@ final class AgentModeViewModel: ObservableObject {
             pendingHandoffSourceItemID: session.pendingHandoff.sourceItemID,
             pendingHandoffDefersProviderLockUntilSend: session.pendingHandoff.defersProviderLockUntilSend,
             isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin,
             worktreeBindings: session.worktreeBindings,
             worktreeMergeOperations: session.worktreeMergeOperations
         )
@@ -11037,6 +11105,7 @@ final class AgentModeViewModel: ObservableObject {
                 autoEditEnabled: agentSession.autoEditEnabled,
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
+                origin: agentSession.origin,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
                 activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
             )
@@ -15008,6 +15077,7 @@ final class AgentModeViewModel: ObservableObject {
         session.askUserContinuation = nil
         reconcileInteractiveRunState(session)
         updateBindingsFromSession(session)
+        recordMCPInteractionResolution(for: session, interactionID: interactionID)
 
         // Note: We don't append a .user item here - the response will be shown
         // via the ask_user tool_result.
@@ -15050,6 +15120,7 @@ final class AgentModeViewModel: ObservableObject {
         if !session.queuedUserInputRequests.isEmpty {
             session.pendingUserInputRequest = session.queuedUserInputRequests.removeFirst()
         }
+        recordMCPInteractionResolution(for: session, interactionID: request.id)
         reconcileInteractiveRunState(session)
         publishRunInteractionStateChange(for: session, reason: .userInputResponseSubmitted)
         updateBindingsFromSession(session)

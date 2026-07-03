@@ -70,6 +70,20 @@ final actor ServerController: ObservableObject {
     private var powerActivity: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
+    private struct RemoteGatewayLaunchConfiguration: Equatable {
+        let bindHost: String
+        let port: Int
+        let staticToken: String
+        let appSupportRoot: String
+    }
+
+    private var remoteGatewayProcess: Process?
+    private var remoteGatewayLaunchConfiguration: RemoteGatewayLaunchConfiguration?
+    private var remoteGatewayLaunchDate: Date?
+    private var remoteGatewayRestartAttempts = 0
+    private static let remoteGatewayMaxRestartAttempts = 6
+    private static let remoteGatewayStableUptimeSeconds: TimeInterval = 60
+
     /// Set the approval callback
     func setApprovalCallback(_ callback: @escaping (String) async -> Void) {
         onApprovalRequest = callback
@@ -125,37 +139,52 @@ final actor ServerController: ObservableObject {
                     return false
                 }
 
-                // Global auto-approve: skip UI for all new clients
-                if await autoApproveAllClients {
+                let route = await Self.connectionApprovalRoute(
+                    clientName: client.name,
+                    autoApproveAllClients: autoApproveAllClients,
+                    // The app-spawned gateway (and every per-device `remote:<device8>` app
+                    // link it carries) is trusted only through the bootstrap principal
+                    // established by a launch-scoped environment credential. Pairing
+                    // consent is the authorization event; never trust the client-asserted
+                    // name alone and never prompt per connection or reconnect.
+                    isGatewayPrincipal: networkManager.isGatewayPrincipalConnection(connectionID),
+                    isVerifiedBundledRepoPromptCLI: {
+                        await self.isBundledRepoPromptCLIConnection(connectionID: connectionID)
+                    },
+                    isAllowListed: {
+                        await self.isClientAlwaysAllowed(clientID: client.name)
+                    }
+                )
+
+                switch route {
+                case .autoApproveAllClients:
                     serverControllerDebugLog("Auto-approving '\(client.name)' (global auto-approve enabled)")
                     if let service = await mcpService {
                         await service.clientConnectedSuccessfully(name: client.name)
                     }
                     return true
-                }
-
-                // Built-in auto-approve for RepoPrompt's own CLI clients requires
-                // executable verification. Do not consult the generic allow-list for these
-                // spoofable client names.
-                let isRepoCLI = Self.isRepoPromptCLIClientName(client.name)
-                if isRepoCLI, await isBundledRepoPromptCLIConnection(connectionID: connectionID) {
+                case .autoApproveGatewayPrincipal:
+                    serverControllerDebugLog("Auto-approving '\(client.name)' (verified gateway principal)")
+                    if let service = await mcpService {
+                        await service.clientConnectedSuccessfully(name: client.name)
+                    }
+                    return true
+                case .autoApproveVerifiedRepoPromptCLI:
                     serverControllerDebugLog("Auto-approving '\(client.name)' (RepoPrompt bundled CLI verified)")
                     if let service = await mcpService {
                         await service.clientConnectedSuccessfully(name: client.name)
                     }
                     return true
-                } else if isRepoCLI {
-                    log.warning("RepoPrompt CLI name matched but executable path verification failed for connectionID=\(connectionID)")
-                }
-
-                // Per-client auto-approve when whitelisted. RepoPrompt CLI names are handled
-                // above and intentionally never bypass executable verification through this list.
-                if !isRepoCLI, await isClientAlwaysAllowed(clientID: client.name) {
+                case .autoApproveAllowListed:
                     serverControllerDebugLog("Auto-approving '\(client.name)' (in allow-list)")
                     if let service = await mcpService {
                         await service.clientConnectedSuccessfully(name: client.name)
                     }
                     return true
+                case .promptUserUnverifiedRepoPromptCLI:
+                    log.warning("RepoPrompt CLI name matched but executable path verification failed for connectionID=\(connectionID)")
+                case .promptUser:
+                    break
                 }
 
                 // Otherwise request approval through the callback
@@ -182,6 +211,8 @@ final actor ServerController: ObservableObject {
                 }
                 return approved
         }
+
+        await applyRemoteGatewaySettings()
 
         // Register wake observer if not already registered
         guard wakeObserver == nil else { return }
@@ -250,6 +281,50 @@ final actor ServerController: ObservableObject {
 
     private static func isRepoPromptCLIClientName(_ value: String) -> Bool {
         value.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("RepoPrompt CLI")
+    }
+
+    /// Connection-approval decision for a new MCP client connection.
+    ///
+    /// Ordering contract:
+    /// 1. Global auto-approve skips UI for everyone.
+    /// 2. A verified gateway principal (launch-scoped credential; includes every
+    ///    per-device `remote:<device8>` app link the gateway carries) auto-admits with
+    ///    no per-connection prompt — pairing consent is the authorization event.
+    /// 3. RepoPrompt CLI names require executable verification and never consult the
+    ///    generic allow-list.
+    /// 4. Allow-listed clients auto-approve.
+    /// 5. Everything else prompts the user.
+    enum ConnectionApprovalRoute: Equatable {
+        case autoApproveAllClients
+        case autoApproveGatewayPrincipal
+        case autoApproveVerifiedRepoPromptCLI
+        case promptUserUnverifiedRepoPromptCLI
+        case autoApproveAllowListed
+        case promptUser
+    }
+
+    static func connectionApprovalRoute(
+        clientName: String,
+        autoApproveAllClients: Bool,
+        isGatewayPrincipal: Bool,
+        isVerifiedBundledRepoPromptCLI: () async -> Bool,
+        isAllowListed: () async -> Bool
+    ) async -> ConnectionApprovalRoute {
+        if autoApproveAllClients {
+            return .autoApproveAllClients
+        }
+        if isGatewayPrincipal {
+            return .autoApproveGatewayPrincipal
+        }
+        if isRepoPromptCLIClientName(clientName) {
+            return await isVerifiedBundledRepoPromptCLI()
+                ? .autoApproveVerifiedRepoPromptCLI
+                : .promptUserUnverifiedRepoPromptCLI
+        }
+        if await isAllowListed() {
+            return .autoApproveAllowListed
+        }
+        return .promptUser
     }
 
     #if DEBUG
@@ -386,6 +461,193 @@ final actor ServerController: ObservableObject {
 
     // MARK: – public API –
 
+    func applyRemoteGatewaySettings() async {
+        let settings = await MainActor.run { () -> (enabled: Bool, bindHost: String, port: Int) in
+            let store = GlobalSettingsStore.shared
+            return (
+                enabled: store.mcpRemoteGatewayEnabled(),
+                bindHost: store.mcpRemoteGatewayBindAddress(),
+                port: store.mcpRemoteGatewayPort()
+            )
+        }
+
+        guard settings.enabled else {
+            await stopRemoteGateway()
+            return
+        }
+
+        do {
+            let staticToken = try RemoteGatewayTokenStore.shared.ensureToken()
+            let appSupportRoot = MCPFilesystemConstants.identity.applicationSupportRootURL().path
+            let launchConfiguration = RemoteGatewayLaunchConfiguration(
+                bindHost: settings.bindHost,
+                port: settings.port,
+                staticToken: staticToken,
+                appSupportRoot: appSupportRoot
+            )
+            try await startRemoteGatewayIfNeeded(launchConfiguration)
+        } catch {
+            log.error("Failed to apply remote gateway settings: \(String(describing: error))")
+            await stopRemoteGateway()
+        }
+    }
+
+    private func startRemoteGatewayIfNeeded(_ launchConfiguration: RemoteGatewayLaunchConfiguration) async throws {
+        if let process = remoteGatewayProcess,
+           process.isRunning,
+           remoteGatewayLaunchConfiguration == launchConfiguration
+        {
+            return
+        }
+
+        await stopRemoteGateway()
+
+        guard let executableURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-gateway") else {
+            log.error("Cannot start remote gateway: bundled repoprompt-gateway executable not found")
+            return
+        }
+        await stopOrphanedRemoteGatewayIfNeeded(launchConfiguration, executableURL: executableURL)
+
+        let launchCredential = try RemoteGatewayTokenStore.generateToken()
+        await networkManager.setGatewayLaunchCredential(launchCredential)
+
+        let process = Process()
+        process.executableURL = executableURL
+        var environment = ProcessInfo.processInfo.environment
+        environment["REPOPROMPT_GATEWAY_BIND_HOST"] = launchConfiguration.bindHost
+        environment["REPOPROMPT_GATEWAY_PORT"] = String(launchConfiguration.port)
+        environment["REPOPROMPT_GATEWAY_STATIC_TOKEN"] = launchConfiguration.staticToken
+        environment["REPOPROMPT_GATEWAY_APP_SUPPORT_ROOT"] = launchConfiguration.appSupportRoot
+        environment["REPOPROMPT_GATEWAY_BOOTSTRAP_TOKEN"] = "gateway-\(UUID().uuidString)"
+        environment["REPOPROMPT_GATEWAY_APP_LEG_CREDENTIAL"] = launchCredential
+        environment["REPOPROMPT_GATEWAY_PARENT_PID"] = String(getpid())
+        environment["REPOPROMPT_GATEWAY_PROCESS_LEASE_FILE"] = remoteGatewayProcessLeaseFileURL(for: launchConfiguration).path
+        environment["REPOPROMPT_GATEWAY_APP_LINK_MAX_RECONNECT_ATTEMPTS"] = "24"
+        process.environment = environment
+        process.terminationHandler = { [weak self] process in
+            Task { await self?.remoteGatewayDidTerminate(pid: process.processIdentifier) }
+        }
+
+        do {
+            try process.run()
+            remoteGatewayProcess = process
+            remoteGatewayLaunchConfiguration = launchConfiguration
+            remoteGatewayLaunchDate = Date()
+            serverControllerDebugLog("Started repoprompt-gateway pid=\(process.processIdentifier)")
+            serverControllerDebugLog("Started repoprompt-gateway pid=\(process.processIdentifier)")
+        } catch {
+            await networkManager.setGatewayLaunchCredential(nil)
+            throw error
+        }
+    }
+
+    private func stopRemoteGateway() async {
+        let process = remoteGatewayProcess
+        let launchConfiguration = remoteGatewayLaunchConfiguration
+        remoteGatewayProcess = nil
+        remoteGatewayLaunchConfiguration = nil
+        await networkManager.setGatewayLaunchCredential(nil)
+        guard let process, process.isRunning else { return }
+        process.terminate()
+        try? await Task.sleep(for: .seconds(2))
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+        if let launchConfiguration {
+            RemoteGatewayProcessLeaseFile.removeIfOwned(
+                fileURL: remoteGatewayProcessLeaseFileURL(for: launchConfiguration),
+                pid: process.processIdentifier
+            )
+        }
+    }
+
+    private func stopOrphanedRemoteGatewayIfNeeded(
+        _ launchConfiguration: RemoteGatewayLaunchConfiguration,
+        executableURL: URL
+    ) async {
+        let leaseFileURL = remoteGatewayProcessLeaseFileURL(for: launchConfiguration)
+        guard let lease = try? RemoteGatewayProcessLeaseFile.read(from: leaseFileURL),
+              lease.matches(
+                  bindHost: launchConfiguration.bindHost,
+                  port: launchConfiguration.port,
+                  appSupportRoot: launchConfiguration.appSupportRoot,
+                  executablePath: executableURL.path
+              ),
+              isProcessRunning(pid: lease.pid)
+        else { return }
+
+        let expectedExecutablePath = executableURL.standardizedFileURL.path
+        guard let actualExecutablePath = executablePath(forPID: lease.pid),
+              URL(fileURLWithPath: actualExecutablePath).standardizedFileURL.path == expectedExecutablePath
+        else {
+            log.warning("Remote gateway process lease exists but pid \(lease.pid) no longer resolves to bundled gateway; leaving it untouched")
+            return
+        }
+
+        log.notice("Stopping orphaned repoprompt-gateway pid=\(lease.pid) before relaunch")
+        kill(lease.pid, SIGTERM)
+        try? await Task.sleep(for: .seconds(2))
+        if isProcessRunning(pid: lease.pid) {
+            kill(lease.pid, SIGKILL)
+        }
+        RemoteGatewayProcessLeaseFile.removeIfOwned(fileURL: leaseFileURL, pid: lease.pid)
+    }
+
+    private func remoteGatewayProcessLeaseFileURL(for launchConfiguration: RemoteGatewayLaunchConfiguration) -> URL {
+        RemoteGatewayProcessLeaseFile.defaultURL(appSupportRoot: URL(fileURLWithPath: launchConfiguration.appSupportRoot))
+    }
+
+    private func isProcessRunning(pid: Int32) -> Bool {
+        kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    private func executablePath(forPID pid: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        let result = buffer.withUnsafeMutableBufferPointer { pointer in
+            proc_pidpath(pid, pointer.baseAddress, UInt32(pointer.count))
+        }
+        guard result > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
+    private func remoteGatewayDidTerminate(pid: Int32) async {
+        guard let process = remoteGatewayProcess,
+              process.processIdentifier == pid else { return }
+        remoteGatewayProcess = nil
+        remoteGatewayLaunchConfiguration = nil
+        let launchDate = remoteGatewayLaunchDate
+        remoteGatewayLaunchDate = nil
+        await networkManager.setGatewayLaunchCredential(nil)
+        let shouldRestart = await MainActor.run {
+            GlobalSettingsStore.shared.mcpRemoteGatewayEnabled()
+        }
+        guard shouldRestart else {
+            remoteGatewayRestartAttempts = 0
+            return
+        }
+        if let launchDate, Date().timeIntervalSince(launchDate) >= Self.remoteGatewayStableUptimeSeconds {
+            // A stable run resets the crash-loop budget; this exit is treated as the first failure.
+            remoteGatewayRestartAttempts = 0
+        }
+        remoteGatewayRestartAttempts += 1
+        guard remoteGatewayRestartAttempts <= Self.remoteGatewayMaxRestartAttempts else {
+            log.error(
+                """
+                repoprompt-gateway exited \(Self.remoteGatewayMaxRestartAttempts) times without a stable run; \
+                pausing automatic restarts until remote gateway settings are re-applied
+                """
+            )
+            return
+        }
+        let backoffSeconds = min(pow(2.0, Double(remoteGatewayRestartAttempts - 1)), 30.0)
+        serverControllerDebugLog(
+            "repoprompt-gateway pid=\(pid) exited; restart attempt \(remoteGatewayRestartAttempts)/"
+                + "\(Self.remoteGatewayMaxRestartAttempts) in \(backoffSeconds)s"
+        )
+        try? await Task.sleep(for: .seconds(backoffSeconds))
+        await applyRemoteGatewaySettings()
+    }
+
     /// Request to start (or re-enable) the MCP listener.
     func startServer() async {
         if await networkManager.isRunning() {
@@ -402,6 +664,7 @@ final actor ServerController: ObservableObject {
     /// Disable the listener.
     func stopServer() async {
         await networkManager.setEnabled(false)
+        await stopRemoteGateway()
         endPowerActivity()
         updateServerStatus("Disabled")
     }
@@ -409,6 +672,7 @@ final actor ServerController: ObservableObject {
     /// Completely shut down the listener.
     func fullShutdown() async {
         await networkManager.stop()
+        await stopRemoteGateway()
         endPowerActivity()
         updateServerStatus("Stopped")
     }

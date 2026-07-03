@@ -279,11 +279,12 @@ APP_SIGN_ARGS=(){app_signing_body}
         self.assertIn('--arch "$arch"', source)
         self.assertIn('--product RepoPrompt', source)
         self.assertIn('--product repoprompt-mcp', source)
+        self.assertIn('--product repoprompt-gateway', source)
         self.assertIn('compare_swiftpm_release_resources.py', source)
         architecture_loop = source.split('for arch in arm64 x86_64; do', 1)[1]
         self.assertLess(source.index('run rm -rf "$SCRATCH_ROOT"'), source.index('for arch in arm64 x86_64; do'))
         self.assertLess(architecture_loop.index('"$KEYBOARD_SHORTCUTS_PATCH_HELPER"'), architecture_loop.index("swift build"))
-        self.assertEqual(source.count('"$LIPO" -create'), 2)
+        self.assertEqual(source.count('"$LIPO" -create'), 3)
         self.assertNotIn("codesign", source)
 
     def test_universal_builder_cleans_stale_resources_by_default_and_patches_each_fresh_scratch(self) -> None:
@@ -324,6 +325,7 @@ bin="$scratch/release"
 mkdir -p "$bin/Current.bundle"
 printf '%s\\n' "$arch" > "$bin/RepoPrompt"
 printf '%s\\n' "$arch" > "$bin/repoprompt-mcp"
+printf '%s\\n' "$arch" > "$bin/repoprompt-gateway"
 printf 'current\\n' > "$bin/Current.bundle/value.txt"
 if (( show )); then printf '%s\\n' "$bin"; fi
 """,
@@ -465,7 +467,7 @@ printf 'arm64 x86_64\\n' > "$output"
             capture_output=True,
         )
         self.assertNotEqual(rejected.returncode, 0)
-        self.assertIn("matching app/helper architectures", rejected.stderr)
+        self.assertIn("matching app/helper/gateway architectures", rejected.stderr)
 
     def test_artifact_manifest_is_deterministic_external_and_detects_binary_drift(self) -> None:
         app, fake_lipo = self.make_universal_architecture_fixture()
@@ -831,12 +833,17 @@ esac
             for line in codesign_capture.read_text(encoding="utf-8").splitlines()
             if any(argument.startswith("--extract-certificates=") for argument in line.split("\t"))
         ]
-        self.assertEqual(len(extraction_calls), 3)
+        self.assertEqual(len(extraction_calls), 4)
         for arguments in extraction_calls:
             self.assertEqual(arguments[:2], ["-d", next(item for item in arguments if item.startswith("--extract-certificates="))])
             self.assertNotIn("--extract-certificates", arguments)
 
-        covered_paths = [app / "Contents" / "MacOS" / "RepoPrompt", app / "Contents" / "MacOS" / "repoprompt-mcp", app]
+        covered_paths = [
+            app / "Contents" / "MacOS" / "RepoPrompt",
+            app / "Contents" / "MacOS" / "repoprompt-mcp",
+            app / "Contents" / "MacOS" / "repoprompt-gateway",
+            app,
+        ]
         for index, covered_path in enumerate(covered_paths):
             with self.subTest(covered_path=covered_path):
                 failure_env = env | {"FAKE_MISSING_CERTIFICATE_FOR": str(covered_path)}
@@ -1084,7 +1091,7 @@ SIGNING_TEAM_ID=648A27MST5
         result = self.run_layout_validation(app)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("matches the embedded MCP helper layout policy", result.stdout)
+        self.assertIn("matches the embedded helper layout policy", result.stdout)
 
     def test_embedded_mcp_helper_layout_validator_rejects_invalid_metadata(self) -> None:
         def helper_symlink(app: Path) -> None:
@@ -1436,6 +1443,8 @@ fi
         for relative, alternate_target in (
             ("Contents/Resources/repoprompt-mcp", "../MacOS/RepoPrompt"),
             ("Contents/Resources/bin/repoprompt-mcp", "../../MacOS/RepoPrompt"),
+            ("Contents/Resources/repoprompt-gateway", "../MacOS/RepoPrompt"),
+            ("Contents/Resources/bin/repoprompt-gateway", "../../MacOS/RepoPrompt"),
         ):
             with self.subTest(relative=relative):
                 temp_dir = Path(tempfile.mkdtemp())
@@ -1461,6 +1470,8 @@ fi
         for relative, alternate_target in (
             ("Contents/Resources/repoprompt-mcp", "../MacOS/RepoPrompt"),
             ("Contents/Resources/bin/repoprompt-mcp", "../../MacOS/RepoPrompt"),
+            ("Contents/Resources/repoprompt-gateway", "../MacOS/RepoPrompt"),
+            ("Contents/Resources/bin/repoprompt-gateway", "../../MacOS/RepoPrompt"),
         ):
             with self.subTest(relative=relative):
                 approved, staged, scripts = self.make_staged_release_fixture()
@@ -2188,7 +2199,7 @@ validate_generated_tip_appcast""",
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_script)
-        self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 4)
+        self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 5)
         self.assertIn(
             '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"',
             package_script,
@@ -2448,6 +2459,7 @@ validate_generated_tip_appcast""",
         paths = [
             app / "Contents" / "MacOS" / "RepoPrompt",
             app / "Contents" / "MacOS" / "repoprompt-mcp",
+            app / "Contents" / "MacOS" / "repoprompt-gateway",
             app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Sparkle",
             app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Autoupdate",
             app
@@ -2512,11 +2524,12 @@ fi
         macos.mkdir(parents=True)
         resources_bin.mkdir(parents=True)
         (macos / "RepoPrompt").write_text("RepoPrompt\n", encoding="utf-8")
-        helper = macos / "repoprompt-mcp"
-        helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        helper.chmod(0o755)
-        (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
-        (resources_bin / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
+        for helper_name in ("repoprompt-mcp", "repoprompt-gateway"):
+            helper = macos / helper_name
+            helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            helper.chmod(0o755)
+            (app / "Contents" / "Resources" / helper_name).symlink_to(f"../MacOS/{helper_name}")
+            (resources_bin / helper_name).symlink_to(f"../../MacOS/{helper_name}")
         return app
 
     def start_unix_listener(self, socket_path: Path) -> subprocess.Popen[str]:
@@ -2714,7 +2727,7 @@ SIGNING_TEAM_ID=648A27MST5
         }.items():
             template = template.replace(key, value)
         (app / "Contents" / "Info.plist").write_text(template, encoding="utf-8")
-        for name in ("RepoPrompt", "repoprompt-mcp"):
+        for name in ("RepoPrompt", "repoprompt-mcp", "repoprompt-gateway"):
             executable = app / "Contents" / "MacOS" / name
             content = "RepoPromptKeyboardShortcutsResourceLookupV1\n" if name == "RepoPrompt" else name
             executable.write_text(content, encoding="utf-8")
@@ -2730,9 +2743,11 @@ SIGNING_TEAM_ID=648A27MST5
             executable.parent.mkdir(parents=True, exist_ok=True)
             executable.write_text(executable.name, encoding="utf-8")
             executable.chmod(0o755)
-        (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
-        (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
+        for helper_name in ("repoprompt-mcp", "repoprompt-gateway"):
+            (app / "Contents" / "Resources" / helper_name).symlink_to(f"../MacOS/{helper_name}")
+            (app / "Contents" / "Resources" / "bin" / helper_name).symlink_to(f"../../MacOS/{helper_name}")
         self.write_keyboard_shortcuts_bundle(app / "Contents" / "Resources" / "KeyboardShortcuts_KeyboardShortcuts.bundle")
+        self.write_gateway_pwa_bundle(app / "Contents" / "Resources" / "RepoPromptCE_RepoPromptGateway.bundle")
         legal = app / "Contents" / "Resources" / "Legal"
         shutil.copy2(staged / "LICENSE", legal / "LICENSE")
         shutil.copy2(staged / "THIRD_PARTY_NOTICES.md", legal / "THIRD_PARTY_NOTICES.md")
@@ -2785,6 +2800,13 @@ esac
         (resources / "en.lproj").mkdir(parents=True, exist_ok=True)
         (bundle / "Contents" / "Info.plist").write_text("<plist/>\n", encoding="utf-8")
         (resources / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
+
+    @staticmethod
+    def write_gateway_pwa_bundle(bundle: Path) -> None:
+        pwa = bundle / "pwa"
+        pwa.mkdir(parents=True, exist_ok=True)
+        for asset in ("index.html", "app.js", "sw.js", "manifest.webmanifest"):
+            (pwa / asset).write_text(f"fixture {asset}\n", encoding="utf-8")
 
     @staticmethod
     def run_staged_validation(approved: Path, staged: Path, scripts: Path) -> subprocess.CompletedProcess[str]:

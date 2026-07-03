@@ -239,6 +239,9 @@ else
     phase "Building repoprompt-mcp ($CONF, host-native)"
     run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
 
+    phase "Building repoprompt-gateway ($CONF, host-native)"
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-gateway
+
     phase "Resolving build artifact paths"
     echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path
     BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path)"
@@ -252,7 +255,8 @@ else
 fi
 COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
 CLI_PATH="$BUILD_DIR/repoprompt-mcp"
-printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
+GATEWAY_PATH="$BUILD_DIR/repoprompt-gateway"
+printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nGATEWAY_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$GATEWAY_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
 
 generate_sentry_debug_symbols(){
     sentry_linking_enabled || return 0
@@ -275,13 +279,15 @@ if [[ "$APP_BUNDLE_MATCHES_COMPAT" != "1" ]]; then
     run rm -rf "$COMPAT_APP_BUNDLE"
 fi
 run mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/bin" "$APP_BUNDLE/Contents/Frameworks"
-for exe in "$APP_NAME" repoprompt-mcp; do
+for exe in "$APP_NAME" repoprompt-mcp repoprompt-gateway; do
     [[ -x "$BUILD_DIR/$exe" ]] || fail "Missing built executable: $BUILD_DIR/$exe"
     run cp "$BUILD_DIR/$exe" "$APP_BUNDLE/Contents/MacOS/$exe"
     run chmod +x "$APP_BUNDLE/Contents/MacOS/$exe"
 done
 run ln -sf ../MacOS/repoprompt-mcp "$APP_BUNDLE/Contents/Resources/repoprompt-mcp"
 run ln -sf ../../MacOS/repoprompt-mcp "$APP_BUNDLE/Contents/Resources/bin/repoprompt-mcp"
+run ln -sf ../MacOS/repoprompt-gateway "$APP_BUNDLE/Contents/Resources/repoprompt-gateway"
+run ln -sf ../../MacOS/repoprompt-gateway "$APP_BUNDLE/Contents/Resources/bin/repoprompt-gateway"
 run mkdir -p "$APP_BUNDLE/Contents/Resources/Legal"
 run cp "$ROOT_DIR/LICENSE" "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$APP_BUNDLE/Contents/Resources/Legal/"
 run cp -R "$ROOT_DIR/ThirdPartyLicenses" "$APP_BUNDLE/Contents/Resources/Legal/"
@@ -457,6 +463,7 @@ verify_signed_app_identity(){
 }
 if [[ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]]; then sign_sparkle_framework "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"; fi
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
+sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-gateway"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 APP_SIGN_ARGS=()
 if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then

@@ -8,6 +8,7 @@ extension AgentModeViewModel {
         else {
             return
         }
+        let interactionID = request.id
         switch request.requestID {
         case .codex:
             codexCoordinator.submitApprovalDecision(session: session, decision: decision)
@@ -22,6 +23,11 @@ extension AgentModeViewModel {
             Task { [controller = session.acpController] in
                 await controller?.respondToPermissionRequest(id: requestID, decision: decision)
             }
+        }
+        // The provider coordinators clear `pendingApproval` synchronously only when
+        // their guards pass; emit the resolution event only for an actual resolution.
+        if session.pendingApproval?.id != interactionID {
+            recordMCPInteractionResolution(for: session, interactionID: interactionID)
         }
     }
 

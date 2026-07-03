@@ -15,6 +15,9 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var parentSessionID: UUID?
     var hasUnknownConversationContent: Bool
     var isMCPOriginated: Bool
+    /// Session provenance (plan §6.4); `nil` for entries built from legacy
+    /// records that only carried `isMCPOriginated`.
+    var origin: AgentSessionOrigin?
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
 }

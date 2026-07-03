@@ -13,7 +13,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let sessionID = UUID()
         let session = await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
-        session.isMCPOriginated = false
+        session.origin = .user
         session.runState = .completed
 
         var service = makeService(window: window)
@@ -63,7 +63,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let sessionID = UUID()
         let session = await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
-        session.isMCPOriginated = false
+        session.origin = .user
         session.runState = .completed
 
         var service = makeService(window: window)
@@ -100,7 +100,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let sessionID = UUID()
         let session = await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
-        session.isMCPOriginated = false
+        session.origin = .user
         session.runState = .completed
 
         var replacementActivationID: UUID?
@@ -190,7 +190,7 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         let sessionID = UUID()
         let session = await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
-        session.isMCPOriginated = false
+        session.origin = .user
         session.runState = .running
 
         var service = makeService(window: window)

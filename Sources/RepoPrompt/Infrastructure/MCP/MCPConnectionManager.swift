@@ -73,6 +73,15 @@ public enum MCPRunPurpose: String, Sendable, Codable {
     case unknown // No policy or unspecified
 }
 
+/// App-verified trust principal for a bootstrap MCP connection.
+///
+/// Gateway-only authorization must key off `.gateway`, never off the client-asserted
+/// `MCPBootstrapRequest.clientName` / MCP initialize `clientInfo.name` strings.
+enum MCPConnectionPrincipal: String, Codable, Equatable {
+    case standard
+    case gateway
+}
+
 /// Dispatcher-validated provenance for a one-shot hidden `_windowID` tool argument.
 /// This value is request-scoped only and must never be synthesized from sticky,
 /// persisted, or automatically selected window affinity.
@@ -280,6 +289,7 @@ struct IdentityContextSnapshot {
     let capabilityToken: String?
     let source: Source
     let hasHandshake: Bool
+    let principal: MCPConnectionPrincipal
     let lastUpdated: Date
 }
 
@@ -1567,11 +1577,15 @@ actor ServerNetworkManager {
         var capabilityToken: String?
         var source: Source
         var hasHandshake: Bool
+        var principal: MCPConnectionPrincipal
         var lastUpdated: Date
     }
 
     /// Identity context per connection
     private var identityContextByConnection: [UUID: ConnectionIdentityContext] = [:]
+
+    /// Launch-scoped credential expected from the app-spawned gateway bootstrap client.
+    private var gatewayLaunchCredential: String?
 
     /// Identity failure escalation tracking
     private var identityFailureWindowStart: Date?
@@ -1586,6 +1600,47 @@ actor ServerNetworkManager {
     /// Sets the identity escalation callback
     func setOnIdentityEscalation(_ handler: @escaping IdentityEscalationHandler) {
         identityEscalationHandler = handler
+    }
+
+    func setGatewayLaunchCredential(_ credential: String?) {
+        let trimmed = credential?.trimmingCharacters(in: .whitespacesAndNewlines)
+        gatewayLaunchCredential = trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    func isGatewayPrincipalConnection(_ connectionID: UUID) -> Bool {
+        identityContextByConnection[connectionID]?.principal == .gateway
+    }
+
+    private enum GatewayPrincipalDecision: Equatable {
+        case standard
+        case gateway
+        case invalid
+
+        var principal: MCPConnectionPrincipal {
+            switch self {
+            case .gateway: .gateway
+            case .standard, .invalid: .standard
+            }
+        }
+    }
+
+    private func gatewayPrincipalDecision(forCredential credential: String?) -> GatewayPrincipalDecision {
+        let trimmed = credential?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmed, !trimmed.isEmpty else { return .standard }
+        guard let expected = gatewayLaunchCredential, !expected.isEmpty else { return .invalid }
+        return Self.constantTimeEquals(trimmed, expected) ? .gateway : .invalid
+    }
+
+    private nonisolated static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
+        let lhsBytes = Array(lhs.utf8)
+        let rhsBytes = Array(rhs.utf8)
+        var difference = lhsBytes.count ^ rhsBytes.count
+        for index in 0 ..< max(lhsBytes.count, rhsBytes.count) {
+            let left = index < lhsBytes.count ? lhsBytes[index] : 0
+            let right = index < rhsBytes.count ? rhsBytes[index] : 0
+            difference |= Int(left ^ right)
+        }
+        return difference == 0
     }
 
     /// Sets a hook for dashboard updates (tool ownership, connection changes, etc.)
@@ -4146,7 +4201,7 @@ actor ServerNetworkManager {
             #if DEBUG
                 print("[MCPStartup] calling BootstrapSocketServer.start socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
-            try await server.start { [weak self, weak server] clientFD, sessionToken, clientPid, clientName async -> BootstrapSocketServer.Admission in
+            try await server.start { [weak self, weak server] clientFD, sessionToken, clientPid, clientName, gatewayCredential async -> BootstrapSocketServer.Admission in
                 guard let self, let server else {
                     return .reject(.rejected(reason: "Server unavailable", errorCode: "server_unavailable"))
                 }
@@ -4156,7 +4211,8 @@ actor ServerNetworkManager {
                     clientFD: clientFD,
                     sessionToken: sessionToken,
                     clientPid: clientPid,
-                    clientName: clientName
+                    clientName: clientName,
+                    gatewayCredential: gatewayCredential
                 )
             }
             guard isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration) else {
@@ -4203,11 +4259,22 @@ actor ServerNetworkManager {
         clientFD: Int32,
         sessionToken: String,
         clientPid: Int,
-        clientName: String?
+        clientName: String?,
+        gatewayCredential: String?
     ) async -> BootstrapSocketServer.Admission {
         let connectionID = UUID()
         connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
         mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") pid=\(clientPid)")
+
+        let principalDecision = gatewayPrincipalDecision(forCredential: gatewayCredential)
+        switch principalDecision {
+        case .invalid:
+            log.warning("Rejecting bootstrap connection \(connectionID) - invalid gateway credential")
+            return .reject(.rejected(reason: "Invalid gateway credential", errorCode: MCPBootstrapErrorCode.approvalDenied.rawValue))
+        case .standard, .gateway:
+            break
+        }
+        let principal = principalDecision.principal
 
         guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
@@ -4311,7 +4378,8 @@ actor ServerNetworkManager {
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
             clientPid: clientPid,
-            clientName: clientName
+            clientName: clientName,
+            principal: principal
         )
     }
 
@@ -4382,7 +4450,8 @@ actor ServerNetworkManager {
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
         clientPid: Int,
-        clientName: String?
+        clientName: String?,
+        principal: MCPConnectionPrincipal
     ) -> BootstrapSocketServer.Admission {
         guard reserveBootstrapSlot(
             connectionID: connectionID,
@@ -4415,7 +4484,8 @@ actor ServerNetworkManager {
                     lifecycleGeneration: admissionLifecycleGeneration,
                     sessionToken: sessionToken,
                     clientPid: clientPid,
-                    clientName: clientName
+                    clientName: clientName,
+                    principal: principal
                 )
             },
             onAcceptAborted: { [self] in
@@ -4433,7 +4503,8 @@ actor ServerNetworkManager {
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
         clientPid: Int,
-        clientName: String?
+        clientName: String?,
+        principal: MCPConnectionPrincipal
     ) async {
         guard let reservation = bootstrapReservations[connectionID],
               reservation.lifecycleGeneration == admissionLifecycleGeneration,
@@ -4482,6 +4553,7 @@ actor ServerNetworkManager {
                 sessionToken: sessionToken,
                 clientPid: clientPid,
                 clientName: clientName,
+                principal: principal,
                 clientFD: committedFD
             )
         } catch {
@@ -4570,6 +4642,7 @@ actor ServerNetworkManager {
             sessionToken: sessionToken,
             clientPid: clientPid,
             clientName: clientName,
+            principal: principal,
             manager: preparedConnection
         ) else {
             if let committedPredecessorRemoval {
@@ -4725,7 +4798,8 @@ actor ServerNetworkManager {
                 lifecycleGeneration: lifecycleGeneration,
                 sessionToken: sessionToken,
                 clientPid: clientPid,
-                clientName: clientName
+                clientName: clientName,
+                principal: .standard
             )
             guard admission.publishTransferredFD?(clientFD) == true else {
                 await rollbackBootstrapReservation(
@@ -4756,6 +4830,7 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
+        principal _: MCPConnectionPrincipal,
         clientFD: Int32
     ) throws -> BootstrapSocketConnectionManager {
         let purpose = purposeForNewBootstrapConnection(
@@ -4788,6 +4863,7 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
+        principal: MCPConnectionPrincipal,
         manager: BootstrapSocketConnectionManager
     ) -> Bool {
         guard isRunningState, self.lifecycleGeneration == lifecycleGeneration else {
@@ -4800,6 +4876,7 @@ actor ServerNetworkManager {
             capabilityToken: sessionToken,
             source: .handshake,
             hasHandshake: false,
+            principal: principal,
             lastUpdated: Date()
         )
         identityContextByConnection[connectionID] = identityContext
@@ -5158,6 +5235,19 @@ actor ServerNetworkManager {
 
         Task { [weak self] in
             await self?.startBootstrapSocketServer(lifecycleGeneration: replacementLifecycleGeneration)
+        }
+    }
+
+    /// Broadcasts a `channel_closing` control notification (plan §6.3) to all
+    /// bootstrap-socket clients (including the remote gateway app leg) ahead of a
+    /// full server shutdown, so downstream remote channels can surface a graceful
+    /// close before the transport drops.
+    func broadcastChannelClosing(reason: TerminationReason, message: String? = nil) async {
+        let bootstrapConnections = connections.values.compactMap { $0 as? BootstrapSocketConnectionManager }
+        guard !bootstrapConnections.isEmpty else { return }
+        connectionLog("Broadcasting channel_closing (\(reason.rawValue)) to \(bootstrapConnections.count) bootstrap connection(s)")
+        for connection in bootstrapConnections {
+            await connection.sendChannelClosing(reason: reason, message: message)
         }
     }
 
@@ -7406,6 +7496,7 @@ actor ServerNetworkManager {
                         "client_name": identity?.clientName ?? NSNull(),
                         "source": identity?.source.rawValue ?? "unknown",
                         "has_handshake": identity?.hasHandshake ?? false,
+                        "principal": identity?.principal.rawValue ?? MCPConnectionPrincipal.standard.rawValue,
                         "session_key_present": identity?.capabilityToken != nil,
                         "session_fingerprint": debugSessionFingerprint(forToken: identity?.capabilityToken) ?? NSNull()
                     ] as [String: Any]
@@ -8539,6 +8630,34 @@ actor ServerNetworkManager {
 
             func debugConnectionIDForSessionTokenForTesting(_ sessionToken: String) -> UUID? {
                 connectionIDBySessionToken[sessionToken]
+            }
+
+            func debugSetGatewayLaunchCredentialForTesting(_ credential: String?) {
+                setGatewayLaunchCredential(credential)
+            }
+
+            func debugGatewayPrincipalDecisionForTesting(gatewayCredential: String?) -> MCPConnectionPrincipal? {
+                let decision = gatewayPrincipalDecision(forCredential: gatewayCredential)
+                return decision == .invalid ? nil : decision.principal
+            }
+
+            func debugInstallIdentityContextForTesting(
+                connectionID: UUID,
+                clientName: String?,
+                principal: MCPConnectionPrincipal
+            ) {
+                identityContextByConnection[connectionID] = ConnectionIdentityContext(
+                    clientName: clientName,
+                    capabilityToken: "debug-\(connectionID.uuidString)",
+                    source: .handshake,
+                    hasHandshake: true,
+                    principal: principal,
+                    lastUpdated: Date()
+                )
+            }
+
+            func debugConnectionPrincipalForTesting(_ connectionID: UUID) -> MCPConnectionPrincipal? {
+                identityContextByConnection[connectionID]?.principal
             }
 
             func debugSetAfterDirectAdmissionPendingPublishedForTesting(
@@ -12114,6 +12233,7 @@ actor ServerNetworkManager {
                 capabilityToken: ctx.capabilityToken,
                 source: source,
                 hasHandshake: ctx.hasHandshake,
+                principal: ctx.principal,
                 lastUpdated: ctx.lastUpdated
             )
         }.sorted { $0.lastUpdated < $1.lastUpdated }
@@ -12135,6 +12255,7 @@ actor ServerNetworkManager {
             capabilityToken: ctx.capabilityToken,
             source: source,
             hasHandshake: ctx.hasHandshake,
+            principal: ctx.principal,
             lastUpdated: ctx.lastUpdated
         )
     }

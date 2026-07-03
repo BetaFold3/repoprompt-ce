@@ -435,6 +435,300 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         XCTAssertEqual(completions[0].pendingSessionIDs, [fixture.sessionID])
     }
 
+    // MARK: - Plan §6.2: interaction_resolved wake/metadata
+
+    func testSingleWaitWakesWithInteractionResolvedMetadata() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        let service = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder
+        )
+
+        let waitTask = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.sessionID.uuidString),
+                "timeout": .double(2)
+            ])
+        }
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
+
+        let resolution = AgentRunMCPSnapshot.InteractionResolution(
+            interactionID: UUID(),
+            resolvedBy: "remote:aaaa1111",
+            resolvedAt: Date()
+        )
+        let resolvedSnapshot = makeSnapshot(
+            sessionID: fixture.sessionID,
+            status: .running,
+            lastInteractionResolution: resolution
+        )
+        await liveSnapshots.set(resolvedSnapshot)
+        await AgentRunSessionStore.wakeCurrentWaiters(
+            resolvedSnapshot,
+            cursor: fixture.cursor,
+            reason: .interactionResolved
+        )
+
+        let value = try await waitTask.value
+        let object = try XCTUnwrap(value.objectValue)
+        let meta = try XCTUnwrap(object["_meta"]?.objectValue)
+        XCTAssertEqual(
+            meta["wake_reason"]?.stringValue,
+            AgentRunSessionStore.WakeReason.interactionResolved.rawValue
+        )
+        let resolvedMeta = try XCTUnwrap(meta["interaction_resolved"]?.objectValue)
+        XCTAssertEqual(resolvedMeta["interaction_id"]?.stringValue, resolution.interactionID.uuidString)
+        XCTAssertEqual(resolvedMeta["resolved_by"]?.stringValue, "remote:aaaa1111")
+        XCTAssertNotNil(resolvedMeta["resolved_at"]?.stringValue)
+        let wait = try XCTUnwrap(object["wait"]?.objectValue)
+        XCTAssertEqual(wait["result"]?.stringValue, "interaction_resolved")
+
+        let registrationRemainsActive = await AgentRunSessionStore.hasActiveRegistration(
+            sessionID: fixture.sessionID
+        )
+        XCTAssertTrue(registrationRemainsActive)
+
+        let completions = await recorder.completions()
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions[0].reason, .snapshotReady)
+        XCTAssertEqual(completions[0].result, "interaction_resolved")
+        XCTAssertEqual(completions[0].winnerSessionID, fixture.sessionID)
+    }
+
+    func testMultiWaitSnapshotsCarryInteractionResolvedMetadata() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let first = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        let second = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer {
+            Task {
+                await AgentRunSessionStore.cleanup(registration: first.registration)
+                await AgentRunSessionStore.cleanup(registration: second.registration)
+            }
+        }
+        let service = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder
+        )
+
+        let waitTask = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("wait"),
+                "session_ids": .array([
+                    .string(first.sessionID.uuidString),
+                    .string(second.sessionID.uuidString)
+                ]),
+                "timeout": .double(2)
+            ])
+        }
+        try await waitForAgentRunSessionStoreWaiter(registration: first.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: second.registration)
+
+        let resolution = AgentRunMCPSnapshot.InteractionResolution(
+            interactionID: UUID(),
+            resolvedBy: "remote:aaaa1111",
+            resolvedAt: Date()
+        )
+        let resolvedSnapshot = makeSnapshot(
+            sessionID: second.sessionID,
+            status: .running,
+            lastInteractionResolution: resolution
+        )
+        await liveSnapshots.set(resolvedSnapshot)
+        await AgentRunSessionStore.wakeCurrentWaiters(
+            resolvedSnapshot,
+            cursor: second.cursor,
+            reason: .interactionResolved
+        )
+
+        let value = try await waitTask.value
+        let object = try XCTUnwrap(value.objectValue)
+        let snapshots = try XCTUnwrap(object["snapshots"]?.arrayValue)
+        let secondSnapshot = try XCTUnwrap(snapshots.first { snapshot in
+            snapshot.objectValue?["session_id"]?.stringValue == second.sessionID.uuidString
+        })
+        let meta = try XCTUnwrap(secondSnapshot.objectValue?["_meta"]?.objectValue)
+        let resolvedMeta = try XCTUnwrap(meta["interaction_resolved"]?.objectValue)
+        XCTAssertEqual(resolvedMeta["interaction_id"]?.stringValue, resolution.interactionID.uuidString)
+        XCTAssertEqual(resolvedMeta["resolved_by"]?.stringValue, "remote:aaaa1111")
+        XCTAssertNotNil(resolvedMeta["resolved_at"]?.stringValue)
+    }
+
+    func testPollSerializesInteractionResolvedMetadata() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        let service = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder
+        )
+
+        let resolution = AgentRunMCPSnapshot.InteractionResolution(
+            interactionID: UUID(),
+            resolvedBy: "repoprompt-cli",
+            resolvedAt: Date()
+        )
+        await liveSnapshots.set(makeSnapshot(
+            sessionID: fixture.sessionID,
+            status: .running,
+            lastInteractionResolution: resolution
+        ))
+
+        let value = try await service.execute(args: [
+            "op": .string("poll"),
+            "session_id": .string(fixture.sessionID.uuidString)
+        ])
+        let meta = try XCTUnwrap(value.objectValue?["_meta"]?.objectValue)
+        let resolvedMeta = try XCTUnwrap(meta["interaction_resolved"]?.objectValue)
+        XCTAssertEqual(resolvedMeta["interaction_id"]?.stringValue, resolution.interactionID.uuidString)
+        XCTAssertEqual(resolvedMeta["resolved_by"]?.stringValue, "repoprompt-cli")
+    }
+
+    func testPollForIndexedSessionWithoutLiveRegistrationDoesNotReturnExpired() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let service = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder
+        )
+        let sessionID = UUID()
+        let tabID = UUID()
+        let savedAt = Date(timeIntervalSince1970: 1_787_000_000)
+        let workspace = WorkspaceModel(name: "Indexed Agent Sessions", repoPaths: [])
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        viewModel.test_installSessionIndexSnapshot(
+            [
+                sessionID: AgentSessionIndexEntry(
+                    id: sessionID,
+                    tabID: tabID,
+                    name: "Indexed Remote Session",
+                    lastUserMessageAt: savedAt,
+                    savedAt: savedAt,
+                    lastRunStateRaw: AgentSessionRunState.running.rawValue,
+                    itemCount: 7,
+                    agentKindRaw: AgentProviderKind.codexExec.rawValue,
+                    agentModelRaw: "codex",
+                    agentReasoningEffortRaw: "medium",
+                    autoEditEnabled: false,
+                    parentSessionID: nil,
+                    hasUnknownConversationContent: false,
+                    isMCPOriginated: false,
+                    origin: nil,
+                    worktreeBindingSummaries: [],
+                    activeWorktreeMergeSummaries: []
+                )
+            ],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+
+        let value = try await service.execute(args: [
+            "op": .string("poll"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        let object = try XCTUnwrap(value.objectValue)
+
+        XCTAssertEqual(object["session_id"]?.stringValue, sessionID.uuidString)
+        XCTAssertNotEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.expired.rawValue)
+        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
+        XCTAssertEqual(object["session"]?.objectValue?["name"]?.stringValue, "Indexed Remote Session")
+        XCTAssertEqual(object["transcript_item_count"]?.intValue, 7)
+        XCTAssertTrue(object["status_text"]?.stringValue?.contains("no active control handle") == true)
+        let waitScopes = await recorder.beginRecords()
+        XCTAssertTrue(waitScopes.isEmpty)
+    }
+
+    func testRecordMCPInteractionResolutionConsumesStagedAttribution() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let interactionID = UUID()
+
+        session.pendingInteractionResolutionAttribution = "remote:aaaa1111"
+        viewModel.recordMCPInteractionResolution(for: session, interactionID: interactionID)
+
+        let recorded = try XCTUnwrap(session.lastInteractionResolution)
+        XCTAssertEqual(recorded.interactionID, interactionID)
+        XCTAssertEqual(recorded.resolvedBy, "remote:aaaa1111")
+        XCTAssertNil(session.pendingInteractionResolutionAttribution, "Attribution is single-use")
+    }
+
+    func testRecordMCPInteractionResolutionFallsBackToUserAttribution() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let interactionID = UUID()
+
+        viewModel.recordMCPInteractionResolution(for: session, interactionID: interactionID)
+
+        let recorded = try XCTUnwrap(session.lastInteractionResolution)
+        XCTAssertEqual(recorded.resolvedBy, "user", "App-local resolutions attribute to user")
+    }
+
+    func testStaleRespondStillThrowsAtVMLevelWithoutLeakingAttribution() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        let session = try XCTUnwrap(viewModel.sessions.values.first { $0.activeAgentSessionID == fixture.sessionID })
+
+        do {
+            _ = try await viewModel.mcpResolvePendingInteraction(
+                sessionID: fixture.sessionID,
+                interactionID: UUID(),
+                payload: .init(
+                    text: "yes",
+                    skip: false,
+                    decisionRaw: nil,
+                    amendment: nil,
+                    answersByQuestionID: [:]
+                ),
+                resolvedBy: "remote:aaaa1111"
+            )
+            XCTFail("Stale respond must throw at the VM level")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).localizedCaseInsensitiveContains("interaction"),
+                "VM fencing stays strict: \(error)"
+            )
+        }
+        XCTAssertNil(
+            session.pendingInteractionResolutionAttribution,
+            "A failed MCP respond must not leave attribution behind for a later user-local resolution"
+        )
+        XCTAssertNil(session.lastInteractionResolution)
+    }
+
     private func makeWindow() -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -534,7 +828,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         runID: UUID? = nil,
         status: AgentRunMCPSnapshot.Status,
         statusText: String? = nil,
-        latestAssistantPreview: String? = nil
+        latestAssistantPreview: String? = nil,
+        lastInteractionResolution: AgentRunMCPSnapshot.InteractionResolution? = nil
     ) -> AgentRunMCPSnapshot {
         AgentRunMCPSnapshot(
             sessionID: sessionID,
@@ -554,7 +849,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             parentSessionID: nil,
             failureReason: nil,
             worktreeBindings: [],
-            activeWorktreeMerges: []
+            activeWorktreeMerges: [],
+            lastInteractionResolution: lastInteractionResolution
         )
     }
 }

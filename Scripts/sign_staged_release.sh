@@ -91,6 +91,7 @@ sign_sparkle_framework() {
 
 sign_sparkle_framework "$STAGED_SPARKLE_FRAMEWORK"
 sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
+sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-gateway"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"

@@ -50,6 +50,7 @@ struct AgentManageMCPToolService {
         let tabID: UUID?
         let isLive: Bool
         let isMCPOriginated: Bool
+        let origin: AgentSessionOrigin?
         let runStateRaw: String?
         let isEffectivelyActive: Bool
     }
@@ -186,7 +187,8 @@ struct AgentManageMCPToolService {
                 stateRaw: meta.lastRunState,
                 isLive: false,
                 parentSessionID: meta.parentSessionID,
-                isMCPOriginated: meta.isMCPOriginated
+                isMCPOriginated: meta.isMCPOriginated,
+                origin: meta.origin
             )
         }
 
@@ -201,7 +203,8 @@ struct AgentManageMCPToolService {
                 stateRaw: entry.lastRunStateRaw,
                 isLive: agentModeVM.sessions[entry.tabID] != nil,
                 parentSessionID: entry.parentSessionID,
-                isMCPOriginated: entry.isMCPOriginated
+                isMCPOriginated: entry.isMCPOriginated,
+                origin: entry.origin
             )
         }
 
@@ -218,7 +221,8 @@ struct AgentManageMCPToolService {
                 stateRaw: session.runState.rawValue,
                 isLive: true,
                 parentSessionID: session.parentSessionID,
-                isMCPOriginated: session.isMCPOriginated
+                isMCPOriginated: session.isMCPOriginated,
+                origin: session.origin
             )
         }
 
@@ -457,6 +461,7 @@ struct AgentManageMCPToolService {
                 forTabID: target.tabID,
                 sessionID: sessionID,
                 originatingConnectionID: metadata.connectionID,
+                origin: AgentSessionOrigin.fromClientIdentity(metadata.clientName),
                 taskLabelKind: selection.taskLabelKind,
                 startPending: false
             )
@@ -479,7 +484,8 @@ struct AgentManageMCPToolService {
             stateRaw: session.runState.rawValue,
             isLive: true,
             parentSessionID: session.parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin
         ))
     }
 
@@ -520,6 +526,7 @@ struct AgentManageMCPToolService {
                     forTabID: target.tabID,
                     sessionID: sessionID,
                     originatingConnectionID: metadata.connectionID,
+                    origin: AgentSessionOrigin.fromClientIdentity(metadata.clientName),
                     taskLabelKind: selection.taskLabelKind,
                     startPending: false
                 )
@@ -556,7 +563,8 @@ struct AgentManageMCPToolService {
             stateRaw: session.runState.rawValue,
             isLive: true,
             parentSessionID: session.parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin
         ))
     }
 
@@ -652,6 +660,7 @@ struct AgentManageMCPToolService {
                     tabID: liveSession.tabID,
                     isLive: true,
                     isMCPOriginated: liveSession.isMCPOriginated,
+                    origin: liveSession.origin,
                     runStateRaw: liveSession.runState.rawValue,
                     isEffectivelyActive: isEffectivelyActive
                 )
@@ -663,6 +672,7 @@ struct AgentManageMCPToolService {
                     tabID: indexEntry.tabID,
                     isLive: agentModeVM.sessions[indexEntry.tabID] != nil,
                     isMCPOriginated: indexEntry.isMCPOriginated,
+                    origin: indexEntry.origin,
                     runStateRaw: indexEntry.lastRunStateRaw,
                     isEffectivelyActive: runState?.isActive == true
                 )
@@ -695,6 +705,7 @@ struct AgentManageMCPToolService {
                         tabID: meta.composeTabID,
                         isLive: false,
                         isMCPOriginated: meta.isMCPOriginated,
+                        origin: meta.origin,
                         runStateRaw: meta.lastRunState,
                         isEffectivelyActive: runState?.isActive == true
                     )
@@ -712,7 +723,10 @@ struct AgentManageMCPToolService {
                 continue
             }
 
-            guard candidate.isMCPOriginated else {
+            // Plan §6.4: cleanup eligibility is provenance-scoped — `.mcp` and
+            // `.remote` sessions are eligible, `.user` sessions never are.
+            let candidateOrigin = candidate.origin ?? AgentSessionOrigin(legacyIsMCPOriginated: candidate.isMCPOriginated)
+            guard candidateOrigin.isMCPOriginated else {
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name),
@@ -950,7 +964,8 @@ struct AgentManageMCPToolService {
         stateRaw: String?,
         isLive: Bool,
         parentSessionID: UUID? = nil,
-        isMCPOriginated: Bool = false
+        isMCPOriginated: Bool = false,
+        origin: AgentSessionOrigin? = nil
     ) -> [String: Value] {
         let publicState = publicSessionState(raw: stateRaw)
         var obj: [String: Value] = [
@@ -977,6 +992,9 @@ struct AgentManageMCPToolService {
         }
         if isMCPOriginated {
             obj["is_mcp_originated"] = .bool(true)
+        }
+        if let origin {
+            obj["origin"] = .string(origin.summaryString)
         }
         return obj
     }

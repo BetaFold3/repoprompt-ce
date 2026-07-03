@@ -266,6 +266,8 @@ struct AgentRunMCPToolService {
     #endif
     var vcsService: VCSService = .shared
     var gitTargetResolver: GitRepoTargetResolver = .init()
+    /// App-side request_id idempotency (plan §6.1). Injectable for tests.
+    var idempotencyRegistry: MCPRequestIdempotencyRegistry = .shared
 
     private var startWorktreeCoordinator: AgentMCPStartWorktreeCoordinator {
         AgentMCPStartWorktreeCoordinator(
@@ -286,21 +288,101 @@ struct AgentRunMCPToolService {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
         }
         switch op {
-        case "start":
-            return try await executeStart(args: args)
+        case "start", "steer", "respond":
+            if let requestID = normalizedString(args["request_id"]) {
+                return try await executeIdempotentMutation(op: op, requestID: requestID, args: args)
+            }
+            return try await executeMutationCore(op: op, args: args)
         case "poll":
             return try await executeWait(args: args, forcePoll: true)
         case "wait":
             return try await executeWait(args: args)
         case "cancel":
             return try await executeCancel(args: args)
+        default:
+            throw MCPError.invalidParams("Unsupported agent_run op '\(op)'. Use start, poll, wait, cancel, steer, or respond.")
+        }
+    }
+
+    private func executeMutationCore(op: String, args: [String: Value]) async throws -> Value {
+        switch op {
+        case "start":
+            return try await executeStart(args: args)
         case "steer":
             return try await executeSteer(args: args)
         case "respond":
             return try await executeRespond(args: args)
         default:
-            throw MCPError.invalidParams("Unsupported agent_run op '\(op)'. Use start, poll, wait, cancel, steer, or respond.")
+            throw MCPError.invalidParams("Unsupported agent_run mutating op '\(op)'.")
         }
+    }
+
+    /// Optional app-side idempotency (plan §6.1): a `request_id` on start/steer/
+    /// respond makes duplicate calls return the recorded outcome instead of
+    /// re-executing. `mcpResolvePendingInteraction` fencing is untouched — a
+    /// duplicate respond is absorbed here before it can reach the view model.
+    private func executeIdempotentMutation(
+        op: String,
+        requestID: String,
+        args: [String: Value]
+    ) async throws -> Value {
+        let metadata = await captureRequestMetadata()
+        let clientID = MCPClientIdentity.storageKey(metadata.clientName)
+            ?? metadata.connectionID?.uuidString
+            ?? "unknown-client"
+        let key = MCPRequestIdempotencyRegistry.Key(clientID: clientID, requestID: requestID)
+        let fingerprint = MCPRequestIdempotencyRegistry.Fingerprint(
+            operation: op,
+            payloadHashSHA256: MCPRequestIdempotencyRegistry.payloadHashHex(args: args)
+        )
+        switch await idempotencyRegistry.begin(key: key, fingerprint: fingerprint) {
+        case .new:
+            break
+        case let .duplicate(outcome):
+            switch outcome {
+            case let .success(value):
+                return Self.idempotentReplayValue(value, requestID: requestID)
+            case let .failure(code, message):
+                throw MCPError.invalidParams(
+                    "request_id '\(requestID)' already failed (\(code)): \(message)"
+                )
+            }
+        case .inFlight:
+            throw MCPError.invalidParams(
+                "request_id '\(requestID)' is still in flight; poll for state instead of retrying."
+            )
+        case let .conflict(existing):
+            throw MCPError.invalidParams(
+                "request_id_conflict: request_id '\(requestID)' was already used for a different \(existing.operation) payload."
+            )
+        }
+        do {
+            let value = try await executeMutationCore(op: op, args: args)
+            await idempotencyRegistry.complete(key: key, outcome: .success(value))
+            return value
+        } catch {
+            let code = if error is CancellationError {
+                "cancelled"
+            } else if case MCPError.invalidParams = error {
+                "invalid_params"
+            } else {
+                "internal_error"
+            }
+            await idempotencyRegistry.complete(key: key, outcome: .failure(
+                code: code,
+                message: String(describing: error)
+            ))
+            throw error
+        }
+    }
+
+    private nonisolated static func idempotentReplayValue(_ value: Value, requestID: String) -> Value {
+        guard var object = value.objectValue else { return value }
+        var meta = object["_meta"]?.objectValue ?? [:]
+        meta["request_id_replay"] = .bool(true)
+        meta["request_id"] = .string(requestID)
+        object["_meta"] = .object(meta)
+        return .object(object)
     }
 
     private func executeStart(args: [String: Value]) async throws -> Value {
@@ -327,6 +409,19 @@ struct AgentRunMCPToolService {
         }
         guard workspace.isSystemWorkspace == false else {
             throw MCPError.invalidParams("Cannot start an agent run from the default system workspace. Open or select a project workspace and try again.")
+        }
+        // Plan §6.6: explicit workspace selector — validated against the resolved
+        // target window's active workspace. A mismatch is a structured failure
+        // (no fallback resolution) so remote callers re-target explicitly.
+        if let requestedWorkspaceID = normalizedString(args["workspace_id"]) {
+            guard let requestedUUID = UUID(uuidString: requestedWorkspaceID) else {
+                throw MCPError.invalidParams("workspace_id must be a workspace UUID.")
+            }
+            guard workspace.id == requestedUUID else {
+                throw MCPError.invalidParams(
+                    "workspace_mismatch: the target window's active workspace is '\(workspace.name)' (\(workspace.id.uuidString)), not \(requestedUUID.uuidString). Pass the window_id of a window showing that workspace, or omit workspace_id."
+                )
+            }
         }
 
         let agentModeVM = targetWindow.agentModeViewModel
@@ -1115,11 +1210,17 @@ struct AgentRunMCPToolService {
         let interactionID = try requireUUID(args["interaction_id"], name: "interaction_id")
         let workflow = try resolveWorkflow(args: args)
         let payload = try parseResponsePayload(args: args)
+        let metadata = await captureRequestMetadata()
+        // Attribute `resolved_by` to the resolving MCP client identity. Remote gateway
+        // devices connect through per-device app links named `remote:<device8>`, so
+        // their storage key already carries the remote namespace.
+        let resolvedBy = MCPClientIdentity.storageKey(metadata.clientName) ?? "mcp"
         let dispatch = try await agentModeVM.mcpResolvePendingInteraction(
             sessionID: sessionID,
             interactionID: interactionID,
             payload: payload,
-            workflow: workflow
+            workflow: workflow,
+            resolvedBy: resolvedBy
         )
         await Task.yield()
         return await decoratedRunValue(
@@ -1207,6 +1308,16 @@ struct AgentRunMCPToolService {
                                 errorDescription: nil
                             ))
                             return Self.steeringInterruptedSingleWaitValue(triggeringSnapshot)
+                        }
+                        if reason == .interactionResolved {
+                            completionBox.set(AgentRunWaitScopeCompletion(
+                                reason: .snapshotReady,
+                                result: "interaction_resolved",
+                                winnerSessionID: sessionID,
+                                pendingSessionIDs: [],
+                                errorDescription: nil
+                            ))
+                            return Self.interactionResolvedSingleWaitValue(triggeringSnapshot)
                         }
                         continue
                     case let .epochAdvanced(epoch, transitionKind):
@@ -1333,6 +1444,20 @@ struct AgentRunMCPToolService {
         object["_meta"] = .object([
             "wake_reason": .string(AgentRunSessionStore.WakeReason.steeringRequested.rawValue)
         ])
+        return .object(object)
+    }
+
+    private nonisolated static func interactionResolvedSingleWaitValue(
+        _ snapshot: AgentRunMCPSnapshot
+    ) -> Value {
+        var object = snapshot.asObject()
+        var meta: [String: Value] = [
+            "wake_reason": .string(AgentRunSessionStore.WakeReason.interactionResolved.rawValue)
+        ]
+        if let resolution = snapshot.lastInteractionResolution {
+            meta["interaction_resolved"] = .object(resolution.asObject())
+        }
+        object["_meta"] = .object(meta)
         return .object(object)
     }
 
@@ -1929,6 +2054,11 @@ struct AgentRunMCPToolService {
                 "instruction": .string(agentRunSteeringWakeNote)
             ])
         }
+        if wakeReason == .interactionResolved {
+            object["wait"] = .object([
+                "result": .string("interaction_resolved")
+            ])
+        }
         return .object(object)
     }
 
@@ -1954,7 +2084,7 @@ struct AgentRunMCPToolService {
             "instruction": .null
         ])
         if let snapshots {
-            object["snapshots"] = .array(snapshots.map { .object($0.asObject()) })
+            object["snapshots"] = .array(snapshots.map { .object(multiSnapshotObject($0)) })
         }
         return .object(object)
     }
@@ -1995,8 +2125,18 @@ struct AgentRunMCPToolService {
                 "running_session_ids": .array(runningIDs.map { .string($0.uuidString) }),
                 "terminal_session_ids": .array(terminalIDs.map { .string($0.uuidString) })
             ]),
-            "snapshots": .array(snapshots.map { .object($0.asObject()) })
+            "snapshots": .array(snapshots.map { .object(multiSnapshotObject($0)) })
         ])
+    }
+
+    private nonisolated func multiSnapshotObject(_ snapshot: AgentRunMCPSnapshot) -> [String: Value] {
+        var object = snapshot.asObject()
+        if let resolution = snapshot.lastInteractionResolution {
+            var metadata = object["_meta"]?.objectValue ?? [:]
+            metadata["interaction_resolved"] = .object(resolution.asObject())
+            object["_meta"] = .object(metadata)
+        }
+        return object
     }
 
     private func metadataObject(
@@ -2013,6 +2153,9 @@ struct AgentRunMCPToolService {
             case .startedRun:
                 break
             }
+        }
+        if let resolution = snapshot.lastInteractionResolution {
+            metadata["interaction_resolved"] = .object(resolution.asObject())
         }
         if let wakeReason {
             metadata["wake_reason"] = .string(wakeReason.rawValue)
@@ -2240,6 +2383,9 @@ struct AgentRunMCPToolService {
             return providedSnapshot
         }
         guard let registration else {
+            if let indexedSnapshot = indexedSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+                return indexedSnapshot
+            }
             return Self.agentRunExpiredSnapshot(sessionID: sessionID)
         }
         if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
@@ -2248,7 +2394,78 @@ struct AgentRunMCPToolService {
         if let storedSnapshot {
             return storedSnapshot
         }
+        if let indexedSnapshot = indexedSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+            return indexedSnapshot
+        }
         return Self.agentRunExpiredSnapshot(sessionID: sessionID)
+    }
+
+    private func indexedSessionSnapshot(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel
+    ) -> AgentRunMCPSnapshot? {
+        guard let entry = agentModeVM.sessionIndex[sessionID] else { return nil }
+        let indexedStatus = indexedSessionStatus(from: entry.lastRunStateRaw)
+        let statusText = indexedSessionStatusText(rawState: entry.lastRunStateRaw, status: indexedStatus)
+        return AgentRunMCPSnapshot(
+            sessionID: entry.id,
+            tabID: entry.tabID,
+            sessionName: entry.name,
+            agentRaw: entry.agentKindRaw,
+            agentDisplayName: entry.agentKindRaw.flatMap { AgentProviderKind(rawValue: $0)?.displayName },
+            modelRaw: entry.agentModelRaw,
+            reasoningEffortRaw: entry.agentReasoningEffortRaw,
+            status: indexedStatus,
+            statusText: statusText,
+            latestAssistantPreview: nil,
+            interaction: nil,
+            transcriptItemCount: entry.itemCount,
+            updatedAt: entry.savedAt,
+            parentSessionID: entry.parentSessionID,
+            failureReason: AgentRunMCPSnapshot.FailureReason.classify(status: indexedStatus, statusText: statusText),
+            worktreeBindings: [],
+            activeWorktreeMerges: entry.activeWorktreeMergeSummaries
+        )
+    }
+
+    private func indexedSessionStatus(from rawState: String?) -> AgentRunMCPSnapshot.Status {
+        guard let rawState = rawState?.trimmingCharacters(in: .whitespacesAndNewlines), !rawState.isEmpty else {
+            return .completed
+        }
+        if let runState = AgentSessionRunState(rawValue: rawState) {
+            switch runState {
+            case .completed:
+                return .completed
+            case .failed:
+                return .failed
+            case .cancelled:
+                return .cancelled
+            case .waitingForUser, .waitingForQuestion, .waitingForApproval, .running, .idle:
+                return .completed
+            }
+        }
+        if let snapshotStatus = AgentRunMCPSnapshot.Status(rawValue: rawState) {
+            switch snapshotStatus {
+            case .expired:
+                return .completed
+            case .running, .waitingForInput:
+                return .completed
+            case .completed, .failed, .cancelled:
+                return snapshotStatus
+            }
+        }
+        return .completed
+    }
+
+    private func indexedSessionStatusText(rawState: String?, status: AgentRunMCPSnapshot.Status) -> String? {
+        guard let rawState = rawState?.trimmingCharacters(in: .whitespacesAndNewlines), !rawState.isEmpty else {
+            return "Session exists but no active control handle is available."
+        }
+        let normalized = rawState.lowercased()
+        if status.rawValue == normalized {
+            return nil
+        }
+        return "Session exists but no active control handle is available (last recorded state: \(rawState))."
     }
 
     private func resolveSessionID(reference: String?, workspace: WorkspaceModel, agentModeVM: AgentModeViewModel) async throws -> UUID? {
@@ -2590,6 +2807,8 @@ private extension AgentRunSessionStore.WakeReason {
         switch self {
         case .instructionDelivered, .steeringRequested:
             true
+        case .interactionResolved:
+            false
         }
     }
 }

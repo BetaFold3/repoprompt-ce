@@ -190,7 +190,13 @@ struct AgentSession: Codable, Identifiable {
 
     /// Whether this session was originally created by an MCP client (vs the user in the UI).
     /// Used to scope cleanup operations to MCP-originated sessions only.
+    /// Legacy compatibility flag — derived from `origin` and kept serialized so
+    /// older builds keep decoding it (plan §6.4).
     var isMCPOriginated: Bool
+
+    /// Session provenance (plan §6.4): `.user`, `.mcp(clientID:)`, or
+    /// `.remote(deviceID:)`. Source of truth for `isMCPOriginated`.
+    var origin: AgentSessionOrigin
 
     /// Persisted per-session logical-root to worktree bindings.
     /// Runtime cwd/path projection is resolved by downstream worktree-system layers.
@@ -241,6 +247,7 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffSourceItemID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
         isMCPOriginated: Bool = false,
+        origin: AgentSessionOrigin? = nil,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
         worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
     ) {
@@ -276,7 +283,9 @@ struct AgentSession: Codable, Identifiable {
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
-        self.isMCPOriginated = isMCPOriginated
+        let resolvedOrigin = origin ?? AgentSessionOrigin(legacyIsMCPOriginated: isMCPOriginated)
+        self.origin = resolvedOrigin
+        self.isMCPOriginated = resolvedOrigin.isMCPOriginated
         self.worktreeBindings = worktreeBindings
         self.worktreeMergeOperations = worktreeMergeOperations
     }
@@ -315,6 +324,7 @@ struct AgentSession: Codable, Identifiable {
         case pendingHandoffSourceItemID
         case pendingHandoffDefersProviderLockUntilSend
         case isMCPOriginated
+        case origin
         case worktreeBindings
         case worktreeMergeOperations
     }
@@ -355,7 +365,11 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
-        isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
+        let legacyIsMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
+        let decodedOrigin = try container.decodeIfPresent(AgentSessionOrigin.self, forKey: .origin)
+            ?? AgentSessionOrigin(legacyIsMCPOriginated: legacyIsMCPOriginated)
+        origin = decodedOrigin
+        isMCPOriginated = decodedOrigin.isMCPOriginated
         worktreeBindings = try container.decodeIfPresent([AgentSessionWorktreeBinding].self, forKey: .worktreeBindings) ?? []
         worktreeMergeOperations = try container.decodeIfPresent([AgentSessionWorktreeMergeOperation].self, forKey: .worktreeMergeOperations) ?? []
     }

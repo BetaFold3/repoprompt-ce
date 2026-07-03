@@ -24,6 +24,9 @@ struct AgentSessionMeta {
     let lastRunState: String?
     let parentSessionID: UUID?
     let isMCPOriginated: Bool
+    /// Session provenance (plan §6.4); `nil` only when built from legacy data
+    /// that predates origin tracking.
+    let origin: AgentSessionOrigin?
     let worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     let activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
 }
@@ -165,6 +168,7 @@ actor AgentSessionDataService {
         let pendingHandoffSourceItemID: UUID?
         let pendingHandoffDefersProviderLockUntilSend: Bool?
         let isMCPOriginated: Bool?
+        let origin: AgentSessionOrigin?
     }
 
     private func computeLastUserMessageAt(in items: [AgentChatItemPersist]) -> Date? {
@@ -1090,6 +1094,7 @@ actor AgentSessionDataService {
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
                 pendingHandoffDefersProviderLockUntilSend: header.pendingHandoffDefersProviderLockUntilSend ?? false,
                 isMCPOriginated: header.isMCPOriginated ?? false,
+                origin: header.origin,
                 worktreeBindings: header.worktreeBindings ?? [],
                 worktreeMergeOperations: header.worktreeMergeOperations ?? []
             )
@@ -1147,6 +1152,7 @@ actor AgentSessionDataService {
                         lastRunState: session.lastRunState,
                         parentSessionID: session.parentSessionID,
                         isMCPOriginated: session.isMCPOriginated,
+                        origin: session.origin,
                         worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
                         activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
                     )
@@ -1201,6 +1207,7 @@ actor AgentSessionDataService {
                             lastRunState: session.lastRunState,
                             parentSessionID: session.parentSessionID,
                             isMCPOriginated: session.isMCPOriginated,
+                            origin: session.origin,
                             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
                             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
                         )

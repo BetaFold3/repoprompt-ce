@@ -259,6 +259,25 @@ struct AgentRunMCPSnapshot: Equatable {
         }
     }
 
+    /// Metadata describing the most recent interaction resolution for the session.
+    /// `resolvedBy` distinguishes the resolving actor: an MCP client identity storage
+    /// key (for example `remote:<device8>` for gateway devices or a CLI client
+    /// identity), `"user"` for app-local resolutions, or `"system"` for automatic
+    /// resolutions such as review timeouts.
+    struct InteractionResolution: Equatable {
+        let interactionID: UUID
+        let resolvedBy: String
+        let resolvedAt: Date
+
+        func asObject() -> [String: Value] {
+            [
+                "interaction_id": .string(interactionID.uuidString),
+                "resolved_by": .string(resolvedBy),
+                "resolved_at": .string(AgentMCPToolHelpers.timestampFormatter.string(from: resolvedAt))
+            ]
+        }
+    }
+
     // MARK: - Failure reason classification
 
     enum FailureReason: String, Equatable {
@@ -321,6 +340,9 @@ struct AgentRunMCPSnapshot: Equatable {
     let failureReason: FailureReason?
     let worktreeBindings: [WorktreeBinding]
     let activeWorktreeMerges: [AgentSessionWorktreeMergeSummary]
+    /// Most recent interaction resolution, serialized into `_meta.interaction_resolved`
+    /// by the agent_run tool surface. Not part of `asObject()` itself.
+    let lastInteractionResolution: InteractionResolution?
 
     init(
         sessionID: UUID,
@@ -340,7 +362,8 @@ struct AgentRunMCPSnapshot: Equatable {
         parentSessionID: UUID?,
         failureReason: FailureReason?,
         worktreeBindings: [WorktreeBinding],
-        activeWorktreeMerges: [AgentSessionWorktreeMergeSummary]
+        activeWorktreeMerges: [AgentSessionWorktreeMergeSummary],
+        lastInteractionResolution: InteractionResolution? = nil
     ) {
         self.sessionID = sessionID
         self.runID = runID
@@ -360,6 +383,7 @@ struct AgentRunMCPSnapshot: Equatable {
         self.failureReason = failureReason
         self.worktreeBindings = worktreeBindings
         self.activeWorktreeMerges = activeWorktreeMerges
+        self.lastInteractionResolution = lastInteractionResolution
     }
 
     var isActionableForMCPWait: Bool {

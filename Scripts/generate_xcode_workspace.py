@@ -32,6 +32,7 @@ WORKSPACE_NAME = "RepoPromptCE.xcworkspace"
 PROJECT_NAME = "RepoPromptCE.xcodeproj"
 APP_SCHEME = "RepoPrompt CE App"
 MCP_SCHEME = "RepoPrompt CE MCP"
+GATEWAY_SCHEME = "RepoPrompt CE Gateway"
 TEST_SCHEME = "RepoPrompt CE Tests"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DESTINATION = REPO_ROOT / ".build/xcode"
@@ -95,7 +96,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         raise GeneratorError("Package.swift must define package 'RepoPromptCE'")
 
     products = {product.get("name"): product for product in manifest.get("products", [])}
-    for name in ("RepoPrompt", "repoprompt-mcp"):
+    for name in ("RepoPrompt", "repoprompt-mcp", "repoprompt-gateway"):
         product = products.get(name)
         if product is None or "executable" not in product.get("type", {}):
             raise GeneratorError(f"Package.swift must retain executable product '{name}'")
@@ -109,6 +110,8 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPrompt",
         "RepoPromptApp",
         "RepoPromptMCP",
+        "RepoPromptGateway",
+        "RepoPromptMCPClientKit",
         "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
@@ -147,14 +150,21 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
         )
 
-    expected_test_dependencies = {"RepoPromptApp", "RepoPromptMCP", "RepoPromptShared"}
+    expected_test_dependencies = {
+        "RepoPromptApp",
+        "RepoPromptMCP",
+        "RepoPromptGateway",
+        "RepoPromptMCPClientKit",
+        "RepoPromptShared",
+    }
     repo_prompt_tests = targets["RepoPromptTests"]
     if (
         len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
         or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
     ):
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, and RepoPromptShared"
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, "
+            "RepoPromptGateway, RepoPromptMCPClientKit, and RepoPromptShared"
         )
 
     unsafe_flags: list[list[str]] = []
@@ -233,10 +243,12 @@ def render_project(repository_relative_path: str) -> str:
     repository_group_id = stable_id("group:repository")
     app_target_id = stable_id("target:app")
     mcp_target_id = stable_id("target:mcp")
+    gateway_target_id = stable_id("target:gateway")
     test_target_id = stable_id("target:test")
     project_config_list_id = stable_id("config-list:project")
     app_config_list_id = stable_id("config-list:app")
     mcp_config_list_id = stable_id("config-list:mcp")
+    gateway_config_list_id = stable_id("config-list:gateway")
     test_config_list_id = stable_id("config-list:test")
     project_debug_id = stable_id("config:project:debug")
     project_release_id = stable_id("config:project:release")
@@ -244,6 +256,8 @@ def render_project(repository_relative_path: str) -> str:
     app_release_id = stable_id("config:app:release")
     mcp_debug_id = stable_id("config:mcp:debug")
     mcp_release_id = stable_id("config:mcp:release")
+    gateway_debug_id = stable_id("config:gateway:debug")
+    gateway_release_id = stable_id("config:gateway:release")
     test_debug_id = stable_id("config:test:debug")
     test_release_id = stable_id("config:test:release")
 
@@ -346,6 +360,20 @@ def render_project(repository_relative_path: str) -> str:
 \t\t\tpassBuildSettingsInEnvironment = 0;
 \t\t\tproductName = \"{MCP_SCHEME}\";
 \t\t}};
+\t\t{gateway_target_id} /* {GATEWAY_SCHEME} */ = {{
+\t\t\tisa = PBXLegacyTarget;
+\t\t\tbuildArgumentsString = gateway;
+\t\t\tbuildConfigurationList = {gateway_config_list_id} /* Build configuration list for PBXLegacyTarget \"{GATEWAY_SCHEME}\" */;
+\t\t\tbuildPhases = (
+\t\t\t);
+\t\t\tbuildToolPath = \"$(SRCROOT)/{repository_relative_path}/Scripts/xcode_developer_workflow.sh\";
+\t\t\tbuildWorkingDirectory = \"$(SRCROOT)/{repository_relative_path}\";
+\t\t\tdependencies = (
+\t\t\t);
+\t\t\tname = \"{GATEWAY_SCHEME}\";
+\t\t\tpassBuildSettingsInEnvironment = 0;
+\t\t\tproductName = \"{GATEWAY_SCHEME}\";
+\t\t}};
 \t\t{test_target_id} /* {TEST_SCHEME} */ = {{
 \t\t\tisa = PBXLegacyTarget;
 \t\t\tbuildArgumentsString = test;
@@ -386,6 +414,7 @@ def render_project(repository_relative_path: str) -> str:
 \t\t\ttargets = (
 \t\t\t\t{app_target_id} /* {APP_SCHEME} */,
 \t\t\t\t{mcp_target_id} /* {MCP_SCHEME} */,
+\t\t\t\t{gateway_target_id} /* {GATEWAY_SCHEME} */,
 \t\t\t\t{test_target_id} /* {TEST_SCHEME} */,
 \t\t\t);
 \t\t}};
@@ -398,6 +427,8 @@ def render_project(repository_relative_path: str) -> str:
 \t\t{app_release_id} /* Release */ = {{isa = XCBuildConfiguration; buildSettings = {{PRODUCT_NAME = \"{APP_SCHEME}\"; }}; name = Release; }};
 \t\t{mcp_debug_id} /* Debug */ = {{isa = XCBuildConfiguration; buildSettings = {{PRODUCT_NAME = \"{MCP_SCHEME}\"; }}; name = Debug; }};
 \t\t{mcp_release_id} /* Release */ = {{isa = XCBuildConfiguration; buildSettings = {{PRODUCT_NAME = \"{MCP_SCHEME}\"; }}; name = Release; }};
+\t\t{gateway_debug_id} /* Debug */ = {{isa = XCBuildConfiguration; buildSettings = {{PRODUCT_NAME = \"{GATEWAY_SCHEME}\"; }}; name = Debug; }};
+\t\t{gateway_release_id} /* Release */ = {{isa = XCBuildConfiguration; buildSettings = {{PRODUCT_NAME = \"{GATEWAY_SCHEME}\"; }}; name = Release; }};
 \t\t{test_debug_id} /* Debug */ = {{isa = XCBuildConfiguration; buildSettings = {{PRODUCT_NAME = \"{TEST_SCHEME}\"; }}; name = Debug; }};
 \t\t{test_release_id} /* Release */ = {{isa = XCBuildConfiguration; buildSettings = {{PRODUCT_NAME = \"{TEST_SCHEME}\"; }}; name = Release; }};
 /* End XCBuildConfiguration section */
@@ -418,6 +449,12 @@ def render_project(repository_relative_path: str) -> str:
 \t\t{mcp_config_list_id} /* Build configuration list for PBXLegacyTarget \"{MCP_SCHEME}\" */ = {{
 \t\t\tisa = XCConfigurationList;
 \t\t\tbuildConfigurations = ({mcp_debug_id} /* Debug */, {mcp_release_id} /* Release */);
+\t\t\tdefaultConfigurationIsVisible = 0;
+\t\t\tdefaultConfigurationName = Debug;
+\t\t}};
+\t\t{gateway_config_list_id} /* Build configuration list for PBXLegacyTarget \"{GATEWAY_SCHEME}\" */ = {{
+\t\t\tisa = XCConfigurationList;
+\t\t\tbuildConfigurations = ({gateway_debug_id} /* Debug */, {gateway_release_id} /* Release */);
 \t\t\tdefaultConfigurationIsVisible = 0;
 \t\t\tdefaultConfigurationName = Debug;
 \t\t}};
@@ -527,6 +564,7 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
 
 - `RepoPrompt CE App` builds and runs the canonical packaged debug app through conductor.
 - `RepoPrompt CE MCP` builds the MCP executable through conductor.
+- `RepoPrompt CE Gateway` builds the remote gateway executable through conductor.
 - `RepoPrompt CE Tests` builds the authoritative XCTest suite through conductor. Set
   `REPOPROMPT_XCODE_TEST_FILTER` before building to run a focused filter.
 
@@ -604,6 +642,14 @@ def render_outputs(
             repository_relative_path=relative_repo,
             working_directory=repo_root,
         ).encode(),
+        Path(PROJECT_NAME) / f"xcshareddata/xcschemes/{GATEWAY_SCHEME}.xcscheme": render_scheme(
+            GATEWAY_SCHEME,
+            "target:gateway",
+            f"$(PROJECT_DIR)/{relative_repo}/.build/debug/repoprompt-gateway",
+            app=False,
+            repository_relative_path=relative_repo,
+            working_directory=repo_root,
+        ).encode(),
         Path("README.md"): render_generated_readme().encode(),
         OWNERSHIP_MARKER: f"{GENERATOR_ID}\n".encode(),
         Path("generation.json"): render_generation_manifest(
@@ -671,13 +717,13 @@ def validate_structure(destination: Path) -> None:
         raise GeneratorError("generated workspace does not reference the project and root package")
 
     project_text = (destination / PROJECT_NAME / "project.pbxproj").read_text()
-    if project_text.count("isa = PBXLegacyTarget;") != 3:
-        raise GeneratorError("generated project must contain exactly three convenience targets")
-    for name in (APP_SCHEME, MCP_SCHEME, TEST_SCHEME):
+    if project_text.count("isa = PBXLegacyTarget;") != 4:
+        raise GeneratorError("generated project must contain exactly four convenience targets")
+    for name in (APP_SCHEME, MCP_SCHEME, GATEWAY_SCHEME, TEST_SCHEME):
         if name not in project_text:
             raise GeneratorError(f"generated project is missing target '{name}'")
 
-    for name in (APP_SCHEME, MCP_SCHEME):
+    for name in (APP_SCHEME, MCP_SCHEME, GATEWAY_SCHEME):
         scheme_path = destination / PROJECT_NAME / f"xcshareddata/xcschemes/{name}.xcscheme"
         try:
             ET.parse(scheme_path)
@@ -887,7 +933,14 @@ def validate_xcodebuild_list(destination: Path) -> None:
     except json.JSONDecodeError as error:
         raise GeneratorError(f"xcodebuild -list returned invalid JSON: {error}") from error
     schemes = set(payload.get("workspace", {}).get("schemes", []))
-    required = {APP_SCHEME, MCP_SCHEME, TEST_SCHEME, "RepoPrompt"}
+    required = {
+        APP_SCHEME,
+        MCP_SCHEME,
+        GATEWAY_SCHEME,
+        TEST_SCHEME,
+        "RepoPrompt",
+        "repoprompt-gateway",
+    }
     missing = sorted(required - schemes)
     if missing:
         available = ", ".join(sorted(schemes)) or "none"
