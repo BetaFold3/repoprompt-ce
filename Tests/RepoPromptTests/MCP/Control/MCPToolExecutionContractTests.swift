@@ -98,6 +98,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
             XCTAssertEqual(names(for: .interactiveCancellable), [
                 MCPWindowToolName.applyEdits,
                 MCPWindowToolName.askUser,
+                MCPWindowToolName.remotePairing,
                 MCPWindowToolName.waitForNextInstruction
             ], caseLabel)
             assertNoWatchdogDeadline(for: names(for: .interactiveCancellable), label: caseLabel)

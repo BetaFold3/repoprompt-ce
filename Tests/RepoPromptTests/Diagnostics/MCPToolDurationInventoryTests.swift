@@ -66,6 +66,7 @@ import XCTest
                     [
                         MCPWindowToolName.applyEdits,
                         MCPWindowToolName.askUser,
+                        MCPWindowToolName.remotePairing,
                         MCPWindowToolName.waitForNextInstruction
                     ],
                     caseLabel
@@ -199,6 +200,7 @@ import XCTest
                     [
                         MCPWindowToolName.applyEdits,
                         MCPWindowToolName.askUser,
+                        MCPWindowToolName.remotePairing,
                         MCPWindowToolName.waitForNextInstruction
                     ],
                     caseLabel

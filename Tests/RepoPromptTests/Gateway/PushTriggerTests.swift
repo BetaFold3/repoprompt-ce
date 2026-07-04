@@ -177,15 +177,23 @@ final class PushTriggerTests: XCTestCase {
     ) async throws -> (SessionWatchManager, RecordingPushNotifier) {
         let root = try GatewayTestHelpers.temporaryRoot()
         let config = try GatewayTestHelpers.configuration(root: root)
+        let connector = StaticAppLinkConnector(connection: connection)
         let appLink = AppLinkSession(
             config: config,
-            connector: StaticAppLinkConnector(connection: connection),
+            connector: connector,
             sleep: { _ in }
         )
         try await appLink.connect()
+        let appLinkPool = AppLinkPool(
+            configuration: config,
+            connector: connector,
+            bindingProbe: { _ in .bound }
+        )
+        _ = try await appLinkPool.ensureLink(forDevice: device)
         let notifier = RecordingPushNotifier(eligibleDevices: eligible ? [device] : [])
         let manager = SessionWatchManager(
             appLink: appLink,
+            appLinkPool: appLinkPool,
             pushNotifier: notifier,
             waitTimeoutSeconds: 0.2,
             pollRefreshSeconds: 0.2
