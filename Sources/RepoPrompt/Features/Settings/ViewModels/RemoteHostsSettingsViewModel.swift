@@ -112,10 +112,12 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
     @Published private(set) var pairingState: RemoteHostsSettingsPairingState = .idle
     @Published private(set) var errorMessage: String?
     @Published private(set) var statusMessage: String?
+    @Published private(set) var testingConnectionHostIDs: Set<String> = []
 
     private let registry: RemoteHostsRegistryManaging
     private let keyStore: RemoteHostsClientKeyDeleting
     private let pairingClient: any RemoteHostsPairingClientProtocol
+    private let connectionTester: (any RemoteHostsConnectionTesting)?
     private let clientDisplayName: @MainActor () -> String
     private var parsedPayload: RemotePairingPayload?
 
@@ -123,11 +125,13 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         registry: RemoteHostsRegistryManaging = RemoteHostRegistry.shared,
         keyStore: RemoteHostsClientKeyDeleting = RemoteClientKeyStore.shared,
         pairingClient: any RemoteHostsPairingClientProtocol = RemoteHostPairingClient(),
+        connectionTester: (any RemoteHostsConnectionTesting)? = nil,
         clientDisplayName: @escaping @MainActor () -> String = RemoteHostsSettingsViewModel.defaultClientDisplayName
     ) {
         self.registry = registry
         self.keyStore = keyStore
         self.pairingClient = pairingClient
+        self.connectionTester = connectionTester
         self.clientDisplayName = clientDisplayName
         refreshHosts()
     }
@@ -155,6 +159,10 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
             hostRows = []
             errorMessage = Self.message(for: error)
         }
+    }
+
+    func isTestingConnection(hostID: String) -> Bool {
+        testingConnectionHostIDs.contains(hostID)
     }
 
     func resetPairing() {
@@ -263,11 +271,42 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         do {
             try keyStore.deleteKey(forHostID: id)
             _ = try registry.removeHost(id: id)
+            Task { await RemoteHostConnectionManager.shared.teardown(hostID: id) }
             refreshHosts()
             statusMessage = "Forgot remote host. The host may still list this device until it is revoked there."
             return true
         } catch {
             errorMessage = Self.message(for: error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func testConnection(id: String) async -> Bool {
+        guard !testingConnectionHostIDs.contains(id) else { return false }
+        testingConnectionHostIDs.insert(id)
+        statusMessage = "Testing remote host connection…"
+        errorMessage = nil
+        defer {
+            testingConnectionHostIDs.remove(id)
+        }
+
+        do {
+            let tester = connectionTester ?? RemoteHostConnectionManager.shared
+            let result = try await tester.testConnection(hostID: id)
+            refreshHosts()
+            let hostName = result.hostName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayName = hostName?.isEmpty == false
+                ? hostName!
+                : (hostRows.first { $0.id == id }?.displayName ?? "remote host")
+            statusMessage = "Connected to \(displayName)."
+            errorMessage = nil
+            return true
+        } catch {
+            refreshHosts()
+            let message = Self.message(for: error)
+            statusMessage = nil
+            errorMessage = message
             return false
         }
     }
@@ -337,6 +376,8 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
             return "Stored remote host device key is invalid."
         case let RemoteClientKeyStoreError.keychainUnavailable(message):
             return "Remote host device keychain is unavailable: \(message)"
+        case let remoteError as RemoteClientError:
+            return remoteError.errorDescription ?? "Remote host connection failed."
         default:
             return error.localizedDescription
         }

@@ -81,6 +81,64 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
         XCTAssertTrue(viewModel.hostRows.isEmpty)
     }
 
+    func testConnectionActionUsesTesterRefreshesRowsAndReportsStatus() async throws {
+        let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
+        let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
+        let record = try RemoteHostTestSupport.hostRecord(displayName: "Studio")
+        try registry.upsertHost(record)
+        let tester = RecordingRemoteHostsConnectionTester(result: RemoteHostConnectionTestResult(
+            hostID: record.id,
+            hostName: "Studio Live",
+            scopes: record.grantedScopes,
+            pongPayload: .object(["probe": .string("settings_test_connection")])
+        ))
+        tester.onTest = { hostID in
+            _ = try registry.updateLastConnected(hostID: hostID, at: Date(timeIntervalSince1970: 1_800_000_321))
+        }
+        let viewModel = RemoteHostsSettingsViewModel(
+            registry: registry,
+            keyStore: RemoteClientKeyStore(
+                keychain: InMemoryRemoteClientKeychain(),
+                accessMode: .nonInteractive(reason: .test)
+            ),
+            pairingClient: ImmediateRemoteHostsPairingClient(),
+            connectionTester: tester
+        )
+
+        let succeeded = await viewModel.testConnection(id: record.id)
+
+        XCTAssertTrue(succeeded)
+        XCTAssertEqual(tester.hostIDs, [record.id])
+        XCTAssertEqual(viewModel.statusMessage, "Connected to Studio Live.")
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertFalse(viewModel.isTestingConnection(hostID: record.id))
+        XCTAssertEqual(viewModel.hostRows.first?.lastConnectedAt, Date(timeIntervalSince1970: 1_800_000_321))
+    }
+
+    func testConnectionActionSurfacesRemoteClientError() async throws {
+        let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
+        let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
+        let record = try RemoteHostTestSupport.hostRecord(displayName: "Studio")
+        try registry.upsertHost(record)
+        let tester = RecordingRemoteHostsConnectionTester(error: RemoteClientError.timeout(operation: "ping", seconds: 5))
+        let viewModel = RemoteHostsSettingsViewModel(
+            registry: registry,
+            keyStore: RemoteClientKeyStore(
+                keychain: InMemoryRemoteClientKeychain(),
+                accessMode: .nonInteractive(reason: .test)
+            ),
+            pairingClient: ImmediateRemoteHostsPairingClient(),
+            connectionTester: tester
+        )
+
+        let succeeded = await viewModel.testConnection(id: record.id)
+
+        XCTAssertFalse(succeeded)
+        XCTAssertEqual(tester.hostIDs, [record.id])
+        XCTAssertEqual(viewModel.errorMessage, "Remote ping timed out after 5 seconds.")
+        XCTAssertNil(viewModel.statusMessage)
+    }
+
     func testRenameAndRevokedBannerRowLogic() throws {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
         let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
@@ -190,5 +248,26 @@ private struct ImmediateRemoteHostsPairingClient: RemoteHostsPairingClientProtoc
         scopes _: Set<String>
     ) async throws -> PairedHostRecord {
         try RemoteHostsSettingsViewModelTests.record(from: payload)
+    }
+}
+
+@MainActor
+private final class RecordingRemoteHostsConnectionTester: RemoteHostsConnectionTesting {
+    private let result: Result<RemoteHostConnectionTestResult, Error>
+    var hostIDs: [String] = []
+    var onTest: ((String) throws -> Void)?
+
+    init(result: RemoteHostConnectionTestResult) {
+        self.result = .success(result)
+    }
+
+    init(error: Error) {
+        result = .failure(error)
+    }
+
+    func testConnection(hostID: String) async throws -> RemoteHostConnectionTestResult {
+        hostIDs.append(hostID)
+        try onTest?(hostID)
+        return try result.get()
     }
 }

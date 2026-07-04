@@ -204,10 +204,29 @@ struct RemoteHostsSettingsView: View {
                 Spacer(minLength: 8)
 
                 VStack(alignment: .trailing, spacing: 6) {
-                    Button("Test Connection") {}
-                        .buttonStyle(CustomButtonStyle())
-                        .disabled(true)
-                        .hoverTooltip("Available after the N3 remote host connection layer ships.")
+                    Button {
+                        Task {
+                            let success = await viewModel.testConnection(id: row.id)
+                            if success {
+                                showFeedback(viewModel.statusMessage ?? "Remote host connection succeeded", false)
+                            } else if let message = viewModel.errorMessage {
+                                showFeedback(message, true)
+                            }
+                        }
+                    } label: {
+                        if viewModel.isTestingConnection(hostID: row.id) {
+                            HStack(spacing: 5) {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Testing…")
+                            }
+                        } else {
+                            Text("Test Connection")
+                        }
+                    }
+                    .buttonStyle(CustomButtonStyle())
+                    .disabled(row.isRevokedByHost || viewModel.isTestingConnection(hostID: row.id))
+                    .hoverTooltip("Mint a one-time ticket, open a signed WebSocket, ping the host, then disconnect.")
                     Button("Rename") {
                         renameDraft = RemoteHostsRenameDraft(id: row.id, displayName: row.displayName)
                     }
