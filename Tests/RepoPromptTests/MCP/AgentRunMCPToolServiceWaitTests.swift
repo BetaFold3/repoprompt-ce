@@ -637,6 +637,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                     autoEditEnabled: false,
                     parentSessionID: nil,
                     hasUnknownConversationContent: false,
+                    remoteHostID: nil,
+                    remoteHostName: nil,
                     isMCPOriginated: false,
                     origin: nil,
                     worktreeBindingSummaries: [],

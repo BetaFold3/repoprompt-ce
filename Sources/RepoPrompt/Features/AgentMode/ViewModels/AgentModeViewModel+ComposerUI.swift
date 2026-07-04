@@ -19,6 +19,11 @@ extension AgentModeViewModel {
             return makeRunCancelTarget(tabID: tabID, session: session)
         }()
         let submitTarget = makeComposerSubmitTarget(tabID: tabID, session: session)
+        let remoteCatalog = remoteHostCatalogSnapshot(for: session)
+        let isRemoteSession = session?.remoteHost != nil
+        let selectedModelRawForProps = session?.selectedModelRaw ?? selectedModelRaw
+        let selectedModelDisplayNameForProps = remoteCatalog?.displayName(forModelID: selectedModelRawForProps)
+            ?? selectedModelDisplayName
         return AgentComposerProps(
             currentTabID: tabID,
             submitTarget: submitTarget,
@@ -36,12 +41,15 @@ extension AgentModeViewModel {
             areModelControlsDisabled: isMCPControlled,
             providerControls: activeProviderControlsBinding,
             isCodexRunActive: isCodexRunActive,
-            hasAvailableAgentProviders: hasAvailableAgentProviders,
-            canSendWithCurrentProvider: canSendWithCurrentProvider,
-            unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
-            selectedAgent: selectedAgent,
-            selectedModelRaw: selectedModelRaw,
-            selectedModelDisplayName: selectedModelDisplayName,
+            hasAvailableAgentProviders: isRemoteSession ? true : hasAvailableAgentProviders,
+            canSendWithCurrentProvider: isRemoteSession ? true : canSendWithCurrentProvider,
+            unavailableSelectedAgentMessage: isRemoteSession ? nil : unavailableSelectedAgentMessage,
+            runLocation: runLocationSelection(for: session),
+            runLocationHostDisplayName: session?.remoteHost?.hostDisplayName,
+            remoteHostCatalog: remoteCatalog,
+            selectedAgent: session?.selectedAgent ?? selectedAgent,
+            selectedModelRaw: selectedModelRawForProps,
+            selectedModelDisplayName: selectedModelDisplayNameForProps,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
             availableAgents: availableAgents,

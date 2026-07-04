@@ -25,6 +25,7 @@ struct AgentComposerActions {
     let modelOptions: (_ agent: AgentProviderKind, _ includeClaudeEffortVariants: Bool) -> [AgentModelOption]
     let canSelectAgentInCurrentChat: (_ agent: AgentProviderKind) -> Bool
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
+    let selectRemoteAgentModel: (_ rawModel: String) -> Void
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
     let setAutoEditEnabled: (_ enabled: Bool) -> Void
@@ -134,6 +135,9 @@ struct AgentInputBar: View {
             selectAgentModel: { agent, rawModel in
                 agentModeVM.selectedAgent = agent
                 agentModeVM.selectModel(rawModel: rawModel)
+            },
+            selectRemoteAgentModel: { rawModel in
+                agentModeVM.selectRemoteAgentModel(rawModel: rawModel)
             },
             reasoningEffortOptionsForCurrentSelection: { agentModeVM.reasoningEffortOptionsForCurrentSelection() },
             selectReasoningEffort: { effort in agentModeVM.selectReasoningEffort(effort) },
@@ -732,13 +736,17 @@ struct AgentComposerView: View, Equatable {
         let modelDisplayName = inputBarSelectedModelDisplayName
         let truncatedModelName = String.truncateModelName(
             modelDisplayName,
-            maxLength: 28
+            maxLength: 24
         )
+        if props.remoteHostCatalog != nil {
+            return "Remote · \(truncatedModelName)"
+        }
         return "\(props.selectedAgent.displayName) · \(truncatedModelName)"
     }
 
     private var isSelectedCodexFastModel: Bool {
-        AgentModelSelectionWarningVisuals.showsWarning(
+        guard props.remoteHostCatalog == nil else { return false }
+        return AgentModelSelectionWarningVisuals.showsWarning(
             agent: props.selectedAgent,
             rawModel: props.selectedModelRaw
         )
@@ -793,7 +801,7 @@ struct AgentComposerView: View, Equatable {
             onOpen: captureModelMenuSnapshot
         ) {
             HStack(spacing: 4) {
-                Image(systemName: props.selectedAgent.iconName)
+                Image(systemName: providerChipIconName)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 if isSelectedCodexFastModel {
                     Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
@@ -824,7 +832,17 @@ struct AgentComposerView: View, Equatable {
         .fixedSize(horizontal: true, vertical: false)
     }
 
+    private var providerChipIconName: String {
+        if props.remoteHostCatalog != nil {
+            return RemoteHostAgentCatalog.agentKind(forModelID: props.selectedModelRaw)?.iconName ?? "network"
+        }
+        return props.selectedAgent.iconName
+    }
+
     private func agentProviderModelMenuItems() -> [StableMenuItem] {
+        if let remoteCatalog = props.remoteHostCatalog {
+            return remoteHostModelMenuItems(remoteCatalog)
+        }
         var items: [StableMenuItem] = []
         if let lockedMessage = props.lockedAgentSelectionMessage {
             items.append(.message(lockedMessage))
@@ -851,6 +869,52 @@ struct AgentComposerView: View, Equatable {
             availableAgents: props.availableAgents
         )
         return items
+    }
+
+    private func remoteHostModelMenuItems(_ catalog: RemoteHostAgentCatalog) -> [StableMenuItem] {
+        var items: [StableMenuItem] = []
+        if let hostName = props.runLocationHostDisplayName {
+            items.append(.header("Model on \(hostName)"))
+        } else {
+            items.append(.header("Remote model"))
+        }
+        items.append(remoteHostModelMenuItem(
+            title: RemoteHostAgentCatalog.hostDefaultDisplayName,
+            rawModel: RemoteHostAgentCatalog.hostDefaultModelID,
+            imageSystemName: "network"
+        ))
+        let selectableAgents = catalog.selectableAgents
+        if !selectableAgents.isEmpty {
+            items.append(.separator)
+            for agent in selectableAgents {
+                let modelItems = agent.models.map { model in
+                    remoteHostModelMenuItem(
+                        title: model.name,
+                        rawModel: model.modelID,
+                        imageSystemName: RemoteHostAgentCatalog.agentKind(forModelID: model.modelID)?.iconName
+                    )
+                }
+                items.append(.submenu(agent.name, items: modelItems))
+            }
+        } else if catalog.isDegraded {
+            items.append(.message("Using the host default because this host did not expose a model catalog."))
+        }
+        return items
+    }
+
+    private func remoteHostModelMenuItem(
+        title: String,
+        rawModel: String,
+        imageSystemName: String?
+    ) -> StableMenuItem {
+        StableMenuItem.action(
+            title,
+            isEnabled: true,
+            isSelected: props.selectedModelRaw == rawModel,
+            imageSystemName: imageSystemName
+        ) {
+            actions.selectRemoteAgentModel(rawModel)
+        }
     }
 
     private func inputBarModelMenuItems(for agent: AgentProviderKind) -> [StableMenuItem] {
@@ -915,6 +979,7 @@ struct AgentComposerView: View, Equatable {
 
     @MainActor
     private func captureModelMenuSnapshot() {
+        guard props.remoteHostCatalog == nil else { return }
         modelMenuSnapshotReleaseTask?.cancel()
         var snapshot: [AgentProviderKind: [AgentModelOption]] = [:]
         for agent in props.availableAgents {
@@ -930,7 +995,7 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var reasoningEffortPicker: some View {
-        if props.selectedAgent == .codexExec {
+        if props.remoteHostCatalog == nil, props.selectedAgent == .codexExec {
             let efforts = actions.reasoningEffortOptionsForCurrentSelection()
             Menu {
                 ForEach(efforts, id: \.rawValue) { effort in
@@ -967,7 +1032,8 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var claudeEffortPicker: some View {
-        if props.selectedAgent.usesClaudeTooling,
+        if props.remoteHostCatalog == nil,
+           props.selectedAgent.usesClaudeTooling,
            let claudeTools = props.providerControls?.claudeTools
         {
             let efforts = AgentModelCatalog.supportedClaudeEfforts(
@@ -1009,7 +1075,7 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var codexToolsButton: some View {
-        if props.selectedAgent == .codexExec {
+        if props.remoteHostCatalog == nil, props.selectedAgent == .codexExec {
             HStack(spacing: 4) {
                 Image(systemName: "slider.horizontal.3")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -1037,7 +1103,7 @@ struct AgentComposerView: View, Equatable {
 
     @ViewBuilder
     private var claudeToolsButton: some View {
-        if props.selectedAgent.usesClaudeTooling {
+        if props.remoteHostCatalog == nil, props.selectedAgent.usesClaudeTooling {
             HStack(spacing: 4) {
                 Image(systemName: "slider.horizontal.3")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))

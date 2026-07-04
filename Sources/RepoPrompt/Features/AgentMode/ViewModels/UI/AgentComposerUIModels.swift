@@ -194,6 +194,9 @@ struct AgentComposerProps: Equatable {
     let hasAvailableAgentProviders: Bool
     let canSendWithCurrentProvider: Bool
     let unavailableSelectedAgentMessage: String?
+    let runLocation: AgentRunLocation?
+    let runLocationHostDisplayName: String?
+    let remoteHostCatalog: RemoteHostAgentCatalog?
     let selectedAgent: AgentProviderKind
     let selectedModelRaw: String
     let selectedModelDisplayName: String
@@ -226,6 +229,9 @@ struct AgentComposerProps: Equatable {
         hasAvailableAgentProviders: false,
         canSendWithCurrentProvider: false,
         unavailableSelectedAgentMessage: nil,
+        runLocation: nil,
+        runLocationHostDisplayName: nil,
+        remoteHostCatalog: nil,
         selectedAgent: .claudeCode,
         selectedModelRaw: AgentModel.defaultModel.rawValue,
         selectedModelDisplayName: AgentModel.defaultModel.displayName,

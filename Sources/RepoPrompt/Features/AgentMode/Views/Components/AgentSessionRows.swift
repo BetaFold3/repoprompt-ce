@@ -14,6 +14,7 @@ struct AgentSessionRow: View {
     /// that survives re-renders until the session is selected/resumed or the
     /// user dismisses the badge explicitly.
     var attentionRunState: AgentSessionRunState?
+    var remoteHostName: String?
     /// Bound-worktree visual identity for this session (Item 10). When non-nil,
     /// a small colored dot/ring is overlaid at the bottom-right of the status
     /// plate without shifting the title — see `worktreeMarker`.
@@ -187,6 +188,10 @@ struct AgentSessionRow: View {
                         mergeAttentionBadge(for: attention)
                     }
 
+                    if let remoteHostName {
+                        remoteHostBadge(hostName: remoteHostName)
+                    }
+
                     if isThreadCollapsed, hiddenThreadDescendantCount > 0 {
                         hiddenCountChip
                     }
@@ -329,6 +334,24 @@ struct AgentSessionRow: View {
     /// an active worktree merge operation in `awaiting_approval`,
     /// `conflicted`, or `awaiting_commit` state. Sized to match the existing
     /// pin glyph so layout does not jitter when attention attaches/detaches.
+    private func remoteHostBadge(hostName: String) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: "network")
+                .font(.system(size: pinFontSize - 1, weight: .semibold))
+            Text(hostName)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(Color.accentColor)
+        .padding(.horizontal, chipHorizontalPadding)
+        .padding(.vertical, chipVerticalPadding)
+        .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+        .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 0.75))
+        .hoverTooltip("Running on \(hostName)")
+        .accessibilityLabel("Running on \(hostName)")
+    }
+
     private func mergeAttentionBadge(for attention: AgentWorktreeMergeAttention) -> some View {
         let tint: Color = switch attention.kind {
         case .conflicted: .orange
@@ -624,10 +647,17 @@ struct AgentSessionRow: View {
     /// (`statusPlateTooltip`) with the bound-worktree identity line so a
     /// single hover surfaces both. Either portion may be absent.
     private var plateTooltip: String? {
-        let status = statusPlateTooltip
-        guard let worktreeTooltip = worktree?.tooltipText else { return status }
-        guard let status else { return worktreeTooltip }
-        return status + "\n" + worktreeTooltip
+        var parts: [String] = []
+        if let status = statusPlateTooltip {
+            parts.append(status)
+        }
+        if let remoteHostName {
+            parts.append("Running on \(remoteHostName)")
+        }
+        if let worktreeTooltip = worktree?.tooltipText {
+            parts.append(worktreeTooltip)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n")
     }
 
     /// Run-state / MCP portion of the plate tooltip, before worktree identity

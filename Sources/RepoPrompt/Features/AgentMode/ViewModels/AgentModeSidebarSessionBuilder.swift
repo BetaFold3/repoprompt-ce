@@ -298,6 +298,7 @@ struct AgentModeSidebarSessionBuilder {
             parentSessionID: resolvedParentSessionID,
             depth: 0,
             isMCPControlled: isMCPControlled,
+            remoteHostName: metadataLiveSession?.remoteHost?.hostDisplayName ?? entry?.remoteHostName,
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
             searchFields: searchFields
@@ -725,6 +726,7 @@ struct AgentModeSidebarSessionBuilder {
             parentSessionID: session.parentSessionID,
             depth: depth,
             isMCPControlled: session.isMCPControlled,
+            remoteHostName: session.remoteHostName,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
             searchFields: session.searchFields

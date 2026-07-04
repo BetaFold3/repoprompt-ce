@@ -1,6 +1,6 @@
 import CryptoKit
 import Foundation
-@testable import RepoPrompt
+@testable import RepoPromptApp
 @testable import RepoPromptGateway
 import RepoPromptRemoteWire
 import XCTest

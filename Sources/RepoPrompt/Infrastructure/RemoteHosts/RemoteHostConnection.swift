@@ -159,6 +159,14 @@ actor RemoteHostConnection {
         return try await sendConnectedCommand(frame, timeout: timeout)
     }
 
+    func supportsAgentCatalog() async throws -> Bool {
+        // The catalog capability is learned from hello_ack.host_name, so this is
+        // intentionally connect-on-demand. Empty/whitespace names degrade with
+        // older hosts instead of attempting an uncorrelatable list_agents probe.
+        try await ensureConnected()
+        return connectedHostName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
     func subscribe(sessionIDs: [String]) async throws {
         let normalized = Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
         guard !normalized.isEmpty else { return }

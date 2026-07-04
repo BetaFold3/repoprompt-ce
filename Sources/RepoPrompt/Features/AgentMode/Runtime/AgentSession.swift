@@ -9,6 +9,7 @@ enum AgentSessionError: Error, LocalizedError {
     case loadFailed(Error)
     case noActiveWorkspace
     case invalidHandoffCutoff
+    case remoteManaged(String)
 
     var localizedDescription: String {
         switch self {
@@ -24,6 +25,8 @@ enum AgentSessionError: Error, LocalizedError {
             "No active workspace for agent session"
         case .invalidHandoffCutoff:
             "The selected handoff point is no longer available in this session transcript."
+        case let .remoteManaged(reason):
+            reason
         }
     }
 

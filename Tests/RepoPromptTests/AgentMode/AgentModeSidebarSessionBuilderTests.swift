@@ -508,7 +508,8 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         tabID: UUID,
         parentSessionID: UUID? = nil,
         lastUserMessageAt: Date?,
-        savedAt: Date? = nil
+        savedAt: Date? = nil,
+        remoteHostName: String? = nil
     ) -> AgentSessionIndexEntry {
         AgentSessionIndexEntry(
             id: sessionID,
@@ -524,7 +525,10 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             autoEditEnabled: false,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: false,
+            remoteHostID: remoteHostName == nil ? nil : "host-1",
+            remoteHostName: remoteHostName,
             isMCPOriginated: false,
+            origin: nil,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: []
         )

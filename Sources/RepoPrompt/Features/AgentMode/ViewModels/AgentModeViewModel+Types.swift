@@ -674,6 +674,7 @@ extension AgentModeViewModel {
         let parentSessionID: UUID?
         let depth: Int
         let isMCPControlled: Bool
+        let remoteHostName: String?
         /// Bound-worktree visual identity for this session (Item 10). Nil when
         /// the session has no worktree bindings. Carries the representative
         /// (first) binding when a session is bound to multiple roots.
@@ -705,6 +706,7 @@ extension AgentModeViewModel {
             parentSessionID: UUID?,
             depth: Int,
             isMCPControlled: Bool,
+            remoteHostName: String? = nil,
             worktree: AgentWorktreeIndicator? = nil,
             worktreeMergeAttention: AgentWorktreeMergeAttention? = nil,
             threadKey: AgentSidebarThreadKey? = nil,
@@ -725,6 +727,7 @@ extension AgentModeViewModel {
             self.parentSessionID = parentSessionID
             self.depth = depth
             self.isMCPControlled = isMCPControlled
+            self.remoteHostName = remoteHostName
             self.worktree = worktree
             self.worktreeMergeAttention = worktreeMergeAttention
             self.threadKey = threadKey
@@ -838,12 +841,14 @@ extension AgentModeViewModel {
         let imageAttachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let initialStartLocation: InitialStartLocation
+        let remoteHost: AgentSessionRemoteHostBinding?
 
         var isEmpty: Bool {
             workflow == nil
                 && imageAttachments.isEmpty
                 && taggedFileAttachments.isEmpty
                 && initialStartLocation == .local
+                && remoteHost == nil
         }
     }
 

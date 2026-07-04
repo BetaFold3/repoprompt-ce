@@ -263,6 +263,7 @@ final class AgentModeViewModel: ObservableObject {
     @Published var pendingImageAttachments: [AgentImageAttachment] = []
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     @Published var draftRestorationEvent: DraftRestorationEvent? = nil
+    @Published var pendingRemoteStartWindowPicker: RemoteStartWindowPickerState? = nil
     @Published private(set) var codexDynamicModels: [CodexAppServerClient.RemoteModel] = []
     @Published private(set) var acpDynamicModelRevision: Int = 0
     @Published private(set) var availableAgents: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
@@ -391,7 +392,10 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     var selectedModelDisplayName: String {
-        inputBarModelDisplayName(rawModel: selectedModelRaw, agentKind: selectedAgent)
+        if selectedModelRaw == RemoteHostAgentCatalog.hostDefaultModelID {
+            return RemoteHostAgentCatalog.hostDefaultDisplayName
+        }
+        return inputBarModelDisplayName(rawModel: selectedModelRaw, agentKind: selectedAgent)
     }
 
     var selectedReasoningEffortDisplayName: String {
@@ -573,6 +577,8 @@ final class AgentModeViewModel: ObservableObject {
     let codexCoordinator: CodexAgentModeCoordinator
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let remoteCoordinator: RemoteAgentModeCoordinator
+    let remoteHostRegistry: RemoteHostRegistry
+    let remoteHostCatalog: RemoteHostCatalog
     let providerBindingService: AgentModeProviderBindingService
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
     private let shouldManageCodexTooling: Bool
@@ -582,6 +588,13 @@ final class AgentModeViewModel: ObservableObject {
     private lazy var runService: AgentModeRunService = makeRunService()
 
     private var isRestoringState = false
+
+    func setSelectedModelRawDuringStateRestore(_ rawModel: String) {
+        isRestoringState = true
+        selectedModelRaw = rawModel
+        isRestoringState = false
+    }
+
     private var activeUISyncSuppressionDepth = 0
     private var isActiveUISyncSuppressed: Bool {
         activeUISyncSuppressionDepth > 0
@@ -602,6 +615,7 @@ final class AgentModeViewModel: ObservableObject {
     private var uiRefreshTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
+    private var remoteCatalogLoadTasksByHostID: [String: Task<Void, Never>] = [:]
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     let sessionIndexStore = AgentWorkspaceSessionIndexStore()
@@ -1030,6 +1044,55 @@ final class AgentModeViewModel: ObservableObject {
         selectedModelRaw = rawModel
     }
 
+    func selectRemoteAgentModel(rawModel: String) {
+        guard let session = activeSession,
+              session.remoteHost != nil
+        else {
+            selectModel(rawModel: rawModel)
+            return
+        }
+        let agent = RemoteHostAgentCatalog.agentKind(forModelID: rawModel) ?? session.selectedAgent
+        let reasoningEffort = remoteHostCatalog.cachedCatalog(for: session.remoteHost?.hostID ?? "")?
+            .reasoningEffort(forModelID: rawModel)
+        isRestoringState = true
+        selectedAgent = agent
+        selectedModelRaw = rawModel
+        selectedReasoningEffortRaw = reasoningEffort
+        isRestoringState = false
+        session.selectedAgent = agent
+        session.selectedModelRaw = rawModel
+        session.selectedReasoningEffortRaw = reasoningEffort
+        session.isDirty = true
+        updatePermissionBindingState(from: session)
+        scheduleSave(for: session.tabID)
+        syncComposerUIState(tabID: session.tabID)
+        syncRuntimeMetricsUIState()
+        syncRunInteractionUIState()
+    }
+
+    func remoteHostCatalogSnapshot(for session: TabSession?) -> RemoteHostAgentCatalog? {
+        guard let hostID = session?.remoteHost?.hostID else { return nil }
+        guard remoteHostRegistry.hasHosts else { return nil }
+        if let cached = remoteHostCatalog.cachedCatalog(for: hostID) {
+            return cached
+        }
+        loadRemoteHostCatalogIfNeeded(hostID: hostID)
+        return .degraded
+    }
+
+    func loadRemoteHostCatalogIfNeeded(hostID: String) {
+        guard remoteHostRegistry.hasHosts,
+              remoteHostCatalog.cachedCatalog(for: hostID) == nil,
+              remoteCatalogLoadTasksByHostID[hostID] == nil
+        else { return }
+        remoteCatalogLoadTasksByHostID[hostID] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            _ = await remoteHostCatalog.catalog(for: hostID)
+            remoteCatalogLoadTasksByHostID[hostID] = nil
+            syncComposerUIState()
+        }
+    }
+
     /// Persist the last-used model for a given agent to UserDefaults.
     private static func persistModelForAgent(agentRaw: String, modelRaw: String) {
         var dict = UserDefaults.standard.dictionary(forKey: lastUsedModelsByAgentKey) as? [String: String] ?? [:]
@@ -1401,7 +1464,9 @@ final class AgentModeViewModel: ObservableObject {
         oracleViewModel: OracleViewModel? = nil,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared,
         clearConsumedAttachmentsAfterProviderConsumption: Bool = true,
-        skillCatalog: AgentSkillCatalog? = nil
+        skillCatalog: AgentSkillCatalog? = nil,
+        remoteHostRegistry: RemoteHostRegistry = .shared,
+        remoteHostCatalog: RemoteHostCatalog = .shared
     ) {
         self.windowID = windowID
         self.promptManager = promptManager
@@ -1411,6 +1476,8 @@ final class AgentModeViewModel: ObservableObject {
         self.oracleViewModel = oracleViewModel
         self.applyEditsApprovalStore = applyEditsApprovalStore
         self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
+        self.remoteHostRegistry = remoteHostRegistry
+        self.remoteHostCatalog = remoteHostCatalog
         let codexWorkspacePathProvider = { [weak workspaceManager] in
             workspaceManager?.activeWorkspace?.repoPaths.first
         }
@@ -1628,7 +1695,9 @@ final class AgentModeViewModel: ObservableObject {
             testCodexStallWatchdogRecoveryThreshold: TimeInterval? = nil,
             testCodexStallWatchdogInactivityThreshold: TimeInterval? = nil,
             testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
-            testUsesProductionAgentDefaultsAndModelPolling: Bool = false
+            testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
+            remoteHostRegistry: RemoteHostRegistry = .shared,
+            remoteHostCatalog: RemoteHostCatalog = .shared
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -1637,6 +1706,8 @@ final class AgentModeViewModel: ObservableObject {
             mcpServer = testMCPServer
             self.applyEditsApprovalStore = applyEditsApprovalStore
             self.skillCatalog = skillCatalog ?? AgentSkillCatalog()
+            self.remoteHostRegistry = remoteHostRegistry
+            self.remoteHostCatalog = remoteHostCatalog
             attachmentWorkspaceDirectoryProvider = {
                 if let testWorkspaceDirectory {
                     return testWorkspaceDirectory
@@ -1771,6 +1842,10 @@ final class AgentModeViewModel: ObservableObject {
         uiRefreshTask?.cancel()
         openCodeModelsSubscriptionTask?.cancel()
         cursorModelsSubscriptionTask?.cancel()
+        for task in remoteCatalogLoadTasksByHostID.values {
+            task.cancel()
+        }
+        remoteCatalogLoadTasksByHostID.removeAll()
         skillCatalogDeltaObservationTask?.cancel()
         skillCatalogRefreshDebounceTask?.cancel()
         initialSystemWorkspaceSessionListRefreshDeferralFallbackTask?.cancel()
@@ -2570,7 +2645,8 @@ final class AgentModeViewModel: ObservableObject {
             workflow: session?.selectedWorkflow,
             imageAttachments: session?.pendingImageAttachments ?? [],
             taggedFileAttachments: session?.pendingTaggedFileAttachments ?? [],
-            initialStartLocation: session?.pendingInitialStartLocation ?? .local
+            initialStartLocation: session?.pendingInitialStartLocation ?? .local,
+            remoteHost: session?.remoteHost
         )
     }
 
@@ -2587,6 +2663,7 @@ final class AgentModeViewModel: ObservableObject {
         destinationSession.pendingImageAttachments = pendingState.imageAttachments
         destinationSession.pendingTaggedFileAttachments = pendingState.taggedFileAttachments
         destinationSession.pendingInitialStartLocation = pendingState.initialStartLocation
+        destinationSession.remoteHost = pendingState.remoteHost
     }
 
     private func clearPendingUserTurnState(on session: TabSession?) {
@@ -2594,6 +2671,7 @@ final class AgentModeViewModel: ObservableObject {
         session?.pendingImageAttachments.removeAll()
         session?.pendingTaggedFileAttachments.removeAll()
         session?.pendingInitialStartLocation = .local
+        session?.remoteHost = nil
     }
 
     private func revalidateSelectedCustomWorkflows() {
@@ -5655,6 +5733,9 @@ final class AgentModeViewModel: ObservableObject {
         for tabID: UUID,
         confirmedChange: ExecutionLocationChangeConfirmation? = nil
     ) async -> ExecutionLocationChangeResult {
+        if sessions[tabID]?.remoteHost != nil {
+            return .blocked(Self.remoteWorktreeManagedReason)
+        }
         if isEligibleForInitialStartLocation(tabID: tabID, session: sessions[tabID]) {
             selectInitialStartLocation(choice, for: tabID)
             return .applied
@@ -5727,6 +5808,9 @@ final class AgentModeViewModel: ObservableObject {
     ) async throws -> [AgentSessionWorktreeBinding] {
         guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
+        }
+        if let remoteReason = localSessionMutationDisabledReason(for: session) {
+            throw MCPError.invalidParams(remoteReason)
         }
         guard !session.worktreeBindingTransitionInProgress else {
             throw ExecutionLocationTransitionError.stale
@@ -11525,6 +11609,7 @@ final class AgentModeViewModel: ObservableObject {
         let imageAttachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let initialStartLocation: InitialStartLocation
+        let remoteHost: AgentSessionRemoteHostBinding?
 
         init(
             session: TabSession?,
@@ -11542,6 +11627,7 @@ final class AgentModeViewModel: ObservableObject {
             imageAttachments = session?.pendingImageAttachments ?? []
             taggedFileAttachments = session?.pendingTaggedFileAttachments ?? []
             initialStartLocation = session?.pendingInitialStartLocation ?? .local
+            remoteHost = session?.remoteHost
         }
 
         func matches(_ session: TabSession?) -> Bool {
@@ -11555,6 +11641,7 @@ final class AgentModeViewModel: ObservableObject {
                 && imageAttachments == session.pendingImageAttachments
                 && taggedFileAttachments == session.pendingTaggedFileAttachments
                 && initialStartLocation == session.pendingInitialStartLocation
+                && remoteHost == session.remoteHost
         }
 
         func applySessionSettings(to session: TabSession) {
@@ -11583,8 +11670,10 @@ final class AgentModeViewModel: ObservableObject {
         guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty else {
             return .blocked(message: "")
         }
-        guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
-            return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
+        if session.remoteHost == nil {
+            guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
+                return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
+            }
         }
         let workflow = session.selectedWorkflow
         if let nativeSlashCommand = resolvedNativeSlashCommand(in: trimmedText, session: session),
@@ -11809,8 +11898,10 @@ final class AgentModeViewModel: ObservableObject {
         guard !trimmedText.isEmpty || !attachmentsToSend.isEmpty || !taggedFilesToSend.isEmpty else {
             return .blocked(message: "")
         }
-        guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
-            return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
+        if session.remoteHost == nil {
+            guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
+                return .blocked(message: unavailableAgentMessage(for: session.selectedAgent))
+            }
         }
 
         scheduleSkillCatalogRefresh()
@@ -11923,6 +12014,99 @@ final class AgentModeViewModel: ObservableObject {
             nativePreparedTurn: nativePreparedTurn,
             codexAttemptID: codexAttemptID
         )
+    }
+
+    private func presentRemoteStartWindowPickerIfPossible(
+        error: Error,
+        session: TabSession,
+        message: String,
+        modelSelectionRaw: String?,
+        sessionName: String?,
+        workspaceID: String?,
+        optimisticUserItemID: UUID
+    ) -> Bool {
+        guard let pending = RemoteStartWindowPickerState(
+            error: error,
+            tabID: session.tabID,
+            hostName: session.remoteHost?.hostDisplayName ?? "remote host",
+            message: message,
+            modelSelectionRaw: modelSelectionRaw,
+            sessionName: sessionName,
+            workspaceID: workspaceID,
+            optimisticUserItemID: optimisticUserItemID
+        ) else {
+            return false
+        }
+        pendingRemoteStartWindowPicker = pending
+        session.runState = .waitingForUser
+        session.setRunningStatus("Choose a window on \(pending.hostName)…", source: .transport)
+        requestUIRefresh(tabID: session.tabID, urgent: true)
+        scheduleSave(for: session.tabID)
+        return true
+    }
+
+    private func failRemoteSend(
+        session: TabSession,
+        tabID: UUID,
+        optimisticUserItemID: UUID,
+        prefix: String,
+        error: Error
+    ) {
+        session.pendingRemoteOptimisticUserItemIDs.remove(optimisticUserItemID)
+        session.runState = .failed
+        session.appendItem(.error("\(prefix): \(RemoteAgentModeCoordinator.describe(error))"))
+        requestUIRefresh(tabID: tabID, urgent: true)
+        scheduleSave(for: tabID)
+    }
+
+    func selectRemoteStartWindow(_ option: RemoteStartWindowOption) {
+        guard let pending = pendingRemoteStartWindowPicker,
+              let session = sessions[pending.tabID]
+        else { return }
+        pendingRemoteStartWindowPicker = nil
+        Task { [weak self, weak session] in
+            guard let self, let session else { return }
+            do {
+                try await remoteCoordinator.startRemoteSession(
+                    session: session,
+                    message: pending.message,
+                    modelSelectionRaw: pending.modelSelectionRaw,
+                    sessionName: pending.sessionName,
+                    windowID: option.windowID,
+                    workspaceID: option.workspaceID ?? pending.workspaceID
+                )
+            } catch {
+                if presentRemoteStartWindowPickerIfPossible(
+                    error: error,
+                    session: session,
+                    message: pending.message,
+                    modelSelectionRaw: pending.modelSelectionRaw,
+                    sessionName: pending.sessionName,
+                    workspaceID: option.workspaceID ?? pending.workspaceID,
+                    optimisticUserItemID: pending.optimisticUserItemID
+                ) {
+                    return
+                }
+                failRemoteSend(
+                    session: session,
+                    tabID: pending.tabID,
+                    optimisticUserItemID: pending.optimisticUserItemID,
+                    prefix: "Remote start failed",
+                    error: error
+                )
+            }
+        }
+    }
+
+    func cancelRemoteStartWindowPicker() {
+        guard let pending = pendingRemoteStartWindowPicker else { return }
+        pendingRemoteStartWindowPicker = nil
+        guard let session = sessions[pending.tabID] else { return }
+        session.pendingRemoteOptimisticUserItemIDs.remove(pending.optimisticUserItemID)
+        session.runState = .failed
+        session.appendItem(.error("Remote start cancelled. Send again and choose a host window to start remotely."))
+        requestUIRefresh(tabID: pending.tabID, urgent: true)
+        scheduleSave(for: pending.tabID)
     }
 
     private func submitUserTurnAfterHydration(
@@ -12118,6 +12302,9 @@ final class AgentModeViewModel: ObservableObject {
         if session.remoteHost != nil {
             session.pendingRemoteOptimisticUserItemIDs.insert(userItem.id)
             let shouldStartRemote = !session.runState.isActive || session.remoteHost?.remoteSessionID.isEmpty == true
+            let modelSelectionRaw = RemoteHostAgentCatalog.modelIDForStart(session.selectedModelRaw)
+            let sessionName = resolvedSessionDisplayName(for: tabID)
+            let workspaceID = workspaceManager?.activeWorkspace?.id.uuidString
             Task { [weak self, weak session] in
                 guard let self, let session else { return }
                 do {
@@ -12125,20 +12312,35 @@ final class AgentModeViewModel: ObservableObject {
                         try await remoteCoordinator.startRemoteSession(
                             session: session,
                             message: wrappedText,
-                            modelSelectionRaw: session.selectedModelRaw,
-                            sessionName: resolvedSessionDisplayName(for: tabID),
+                            modelSelectionRaw: modelSelectionRaw,
+                            sessionName: sessionName,
                             windowID: nil,
-                            workspaceID: workspaceManager?.activeWorkspace?.id.uuidString
+                            workspaceID: workspaceID
                         )
                     } else {
                         try await remoteCoordinator.steer(session: session, text: wrappedText)
                     }
                 } catch {
-                    session.pendingRemoteOptimisticUserItemIDs.remove(userItem.id)
-                    session.runState = .failed
-                    session.appendItem(.error("Remote send failed: \(RemoteAgentModeCoordinator.describe(error))"))
-                    requestUIRefresh(tabID: tabID, urgent: true)
-                    scheduleSave(for: tabID)
+                    if shouldStartRemote,
+                       presentRemoteStartWindowPickerIfPossible(
+                           error: error,
+                           session: session,
+                           message: wrappedText,
+                           modelSelectionRaw: modelSelectionRaw,
+                           sessionName: sessionName,
+                           workspaceID: workspaceID,
+                           optimisticUserItemID: userItem.id
+                       )
+                    {
+                        return
+                    }
+                    failRemoteSend(
+                        session: session,
+                        tabID: tabID,
+                        optimisticUserItemID: userItem.id,
+                        prefix: "Remote send failed",
+                        error: error
+                    )
                 }
             }
             return UserTurnSubmissionResult.submitted
@@ -16057,6 +16259,7 @@ final class AgentModeViewModel: ObservableObject {
     var canForkCurrentSession: Bool {
         guard let tabID = currentTabID,
               let session = sessions[tabID] else { return false }
+        guard session.remoteHost == nil else { return false }
         if session.transcript.turns.contains(where: { $0.request != nil }) {
             return true
         }
@@ -16223,6 +16426,10 @@ final class AgentModeViewModel: ObservableObject {
               let sourceSession = sessions[sourceTabID]
         else {
             throw AgentSessionError.noActiveWorkspace
+        }
+
+        if let remoteReason = localSessionMutationDisabledReason(for: sourceSession) {
+            throw AgentSessionError.remoteManaged(remoteReason)
         }
 
         guard let sourceTranscript = resolvedHandoffSourceTranscript(

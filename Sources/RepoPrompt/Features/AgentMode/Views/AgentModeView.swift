@@ -140,6 +140,22 @@ struct AgentModeView: View {
                 toggleAgentSessionSidebar()
             }
         }
+        .sheet(
+            item: Binding(
+                get: { agentModeVM.pendingRemoteStartWindowPicker },
+                set: { newValue in
+                    if newValue == nil, agentModeVM.pendingRemoteStartWindowPicker != nil {
+                        agentModeVM.cancelRemoteStartWindowPicker()
+                    }
+                }
+            )
+        ) { state in
+            RemoteStartWindowPickerSheet(
+                state: state,
+                onSelect: { option in agentModeVM.selectRemoteStartWindow(option) },
+                onCancel: { agentModeVM.cancelRemoteStartWindowPicker() }
+            )
+        }
     }
 
     private func toggleAgentSessionSidebar() {

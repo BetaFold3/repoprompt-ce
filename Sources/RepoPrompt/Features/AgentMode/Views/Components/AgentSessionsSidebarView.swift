@@ -134,6 +134,9 @@ struct AgentModeSessionsSidebarView: View {
                     },
                     isAgentRunActive: {
                         agentModeVM.isAgentRunActive(tabID: currentTabID)
+                    },
+                    disabledReason: {
+                        agentModeVM.localSessionMutationDisabledReason(tabID: currentTabID)
                     }
                 )
             )
@@ -395,6 +398,7 @@ struct AgentModeSessionsListView: View {
                                 runState: agentModeVM.runState(for: session.tabID),
                                 isWaiting: agentModeVM.isTabWaiting(session.tabID),
                                 attentionRunState: sidebarUI.snapshot.attentionRunStateByTabID[session.tabID],
+                                remoteHostName: session.remoteHostName,
                                 worktree: session.worktree,
                                 worktreeMergeAttention: session.worktreeMergeAttention,
                                 threadDepth: session.depth,

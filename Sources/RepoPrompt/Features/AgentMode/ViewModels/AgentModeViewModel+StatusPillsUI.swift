@@ -11,6 +11,7 @@ extension AgentModeViewModel {
             runState: runState,
             autoEditEnabled: autoEditEnabled,
             interviewFirst: interviewFirst,
+            runLocation: runLocationProps(tabID: currentTabID),
             executionLocation: executionLocationProps(tabID: currentTabID),
             activeAgentSessionID: activeSession?.activeAgentSessionID,
             activeRunID: activeSession?.runID
@@ -19,6 +20,56 @@ extension AgentModeViewModel {
 
     func syncStatusPillsUIState() {
         ui.statusPills.update(makeStatusPillsSnapshot())
+    }
+
+    func runLocationProps(tabID: UUID?) -> AgentRunLocationProps? {
+        guard let tabID,
+              workspaceManager?.activeWorkspace?.isSystemWorkspace != true,
+              remoteHostRegistry.hasHosts
+        else {
+            return nil
+        }
+        let hostOptions = (try? remoteHostRegistry.listHosts())?
+            .filter { !$0.isRevokedByHost }
+            .map { AgentRunLocationHostOption(id: $0.id, displayName: $0.displayName) } ?? []
+        guard !hostOptions.isEmpty else { return nil }
+
+        let session = sessions[tabID]
+        let selection = runLocationSelection(for: session)
+        let selectedHostDisplayName: String? = {
+            if case let .host(hostID) = selection {
+                return hostOptions.first(where: { $0.id == hostID })?.displayName
+                    ?? session?.remoteHost?.hostDisplayName
+            }
+            return nil
+        }()
+        let disabledReason: String? = if let session,
+                                         let remoteReason = localSessionMutationDisabledReason(for: session),
+                                         !isEligibleForInitialRunLocation(tabID: tabID, session: session)
+        {
+            remoteReason
+        } else if isEligibleForInitialRunLocation(tabID: tabID, session: session) {
+            nil
+        } else {
+            "Run location can only be changed before the first message."
+        }
+        return AgentRunLocationProps(
+            tabID: tabID,
+            selection: selection,
+            selectedHostDisplayName: selectedHostDisplayName,
+            hostOptions: hostOptions,
+            isEnabled: disabledReason == nil,
+            disabledReason: disabledReason
+        )
+    }
+
+    func runLocationSelection(for session: TabSession?) -> AgentRunLocation {
+        guard let remoteHost = session?.remoteHost else { return .thisMac }
+        return .host(hostID: remoteHost.hostID)
+    }
+
+    func isEligibleForInitialRunLocation(tabID: UUID, session: TabSession?) -> Bool {
+        isEligibleForInitialStartLocation(tabID: tabID, session: session)
     }
 
     /// Persistent projection for the primary execution root. The initial intent
@@ -33,15 +84,16 @@ extension AgentModeViewModel {
         if isEligibleForInitialStartLocation(tabID: tabID, session: sessions[tabID]) {
             let session = sessions[tabID]
             let busy = session?.isPreparingInitialWorktree == true
+            let remoteWorktreeReason = session?.remoteHost == nil ? nil : Self.remoteWorktreeManagedReason
             return AgentExecutionLocationProps(
                 tabID: tabID,
-                selection: session?.pendingInitialStartLocation ?? .local,
+                selection: session?.remoteHost == nil ? (session?.pendingInitialStartLocation ?? .local) : .local,
                 indicator: nil,
                 isInitialSelection: true,
-                isEnabled: !busy,
+                isEnabled: remoteWorktreeReason == nil && !busy,
                 isOperationInProgress: busy,
                 requiresActiveRunConfirmation: false,
-                disabledReason: busy ? "Preparing the selected worktree…" : nil
+                disabledReason: busy ? "Preparing the selected worktree…" : remoteWorktreeReason
             )
         }
 
@@ -72,7 +124,7 @@ extension AgentModeViewModel {
             )
         } ?? .local
         let busy = session.isChangingExecutionLocation
-        let disabledReason = executionLocationMutationDisabledReason(for: session)
+        let disabledReason = session.remoteHost == nil ? executionLocationMutationDisabledReason(for: session) : Self.remoteWorktreeManagedReason
         return AgentExecutionLocationProps(
             tabID: tabID,
             selection: selection,
@@ -112,6 +164,20 @@ extension AgentModeViewModel {
             && session.transcript.turns.isEmpty
     }
 
+    static let remoteWorktreeManagedReason = "Worktrees are managed on the host for remote sessions."
+
+    func localSessionMutationDisabledReason(tabID: UUID?) -> String? {
+        guard let tabID,
+              let session = sessions[tabID]
+        else { return nil }
+        return localSessionMutationDisabledReason(for: session)
+    }
+
+    func localSessionMutationDisabledReason(for session: TabSession) -> String? {
+        guard let remoteHost = session.remoteHost else { return nil }
+        return "Managed on \(remoteHost.hostDisplayName)"
+    }
+
     private func executionLocationMutationDisabledReason(for session: TabSession) -> String? {
         if !session.hasLoadedPersistedState {
             return "Load this thread before changing its execution location."
@@ -132,12 +198,53 @@ extension AgentModeViewModel {
             return
         }
         let session = session(for: tabID)
-        guard !session.isPreparingInitialWorktree,
+        guard session.remoteHost == nil,
+              !session.isPreparingInitialWorktree,
               session.pendingInitialStartLocation != selection
         else {
             return
         }
         session.pendingInitialStartLocation = selection
+        syncComposerUIState(tabID: tabID)
+        syncStatusPillsUIState()
+    }
+
+    func selectRunLocation(_ selection: AgentRunLocation, for tabID: UUID) {
+        guard tabID == currentTabID,
+              let props = runLocationProps(tabID: tabID),
+              props.isEnabled,
+              props.selection != selection
+        else { return }
+        let session = session(for: tabID)
+        switch selection {
+        case .thisMac:
+            if session.remoteHost != nil {
+                remoteCoordinator.stop(tabID: tabID)
+            }
+            session.remoteHost = nil
+            if session.selectedModelRaw == RemoteHostAgentCatalog.hostDefaultModelID {
+                let fallback = defaultModelRaw(for: session.selectedAgent)
+                session.selectedModelRaw = fallback
+                if tabID == currentTabID {
+                    setSelectedModelRawDuringStateRestore(fallback)
+                }
+            }
+        case let .host(hostID):
+            guard let host = try? remoteHostRegistry.host(id: hostID) else { return }
+            session.remoteHost = AgentSessionRemoteHostBinding(
+                hostID: host.id,
+                hostDisplayName: host.displayName,
+                remoteSessionID: ""
+            )
+            session.pendingInitialStartLocation = .local
+            session.selectedModelRaw = RemoteHostAgentCatalog.hostDefaultModelID
+            if tabID == currentTabID {
+                setSelectedModelRawDuringStateRestore(RemoteHostAgentCatalog.hostDefaultModelID)
+            }
+            loadRemoteHostCatalogIfNeeded(hostID: host.id)
+        }
+        session.isDirty = true
+        scheduleSave(for: tabID)
         syncComposerUIState(tabID: tabID)
         syncStatusPillsUIState()
     }

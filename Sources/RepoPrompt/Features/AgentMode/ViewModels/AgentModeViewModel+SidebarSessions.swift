@@ -658,6 +658,7 @@ extension AgentModeViewModel {
             parentSessionID: row.parentSessionID,
             depth: row.depth,
             isMCPControlled: row.isMCPControlled,
+            remoteHostName: row.remoteHostName,
             worktree: row.worktree,
             worktreeMergeAttention: row.worktreeMergeAttention,
             threadKey: threadKey,

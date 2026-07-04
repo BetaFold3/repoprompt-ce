@@ -1474,7 +1474,10 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             autoEditEnabled: false,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: false,
+            remoteHostID: nil,
+            remoteHostName: nil,
             isMCPOriginated: false,
+            origin: nil,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
         )
