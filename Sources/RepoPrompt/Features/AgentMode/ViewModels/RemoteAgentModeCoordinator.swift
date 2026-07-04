@@ -14,6 +14,7 @@ final class RemoteAgentModeCoordinator {
     private var eventTasksByTabID: [UUID: Task<Void, Never>] = [:]
     private var hostIDByTabID: [UUID: String] = [:]
     private var connectionTasksByHostID: [String: HostConnectionTasks] = [:]
+    private var surfacedChannelReasonsByTabID: [UUID: Set<String>] = [:]
 
     init(
         connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared }
@@ -118,6 +119,7 @@ final class RemoteAgentModeCoordinator {
 
     func stop(tabID: UUID) {
         eventTasksByTabID.removeValue(forKey: tabID)?.cancel()
+        surfacedChannelReasonsByTabID.removeValue(forKey: tabID)
         let controller = controllersByTabID.removeValue(forKey: tabID)
         if let hostID = hostIDByTabID.removeValue(forKey: tabID) {
             stopConnectionFanoutIfUnused(hostID: hostID)
@@ -343,15 +345,19 @@ final class RemoteAgentModeCoordinator {
     private func applyChannel(_ state: RemoteChannelState, to session: AgentModeViewModel.TabSession) {
         switch state.kind {
         case .connected:
+            surfacedChannelReasonsByTabID[session.tabID] = []
             if session.runState.isActive {
                 session.setRunningStatus("Connected to \(session.remoteHost?.hostDisplayName ?? "remote host")", source: .transport)
             }
         case let .degraded(reason):
-            session.setRunningStatus("Remote reconnecting (\(reason))…", source: .reconnect)
+            let displayReason = Self.displayChannelReason(reason)
+            session.setRunningStatus("Remote reconnecting (\(displayReason))…", source: .reconnect)
+            surfaceChannelReasonIfNeeded(displayReason, to: session)
         case .revoked:
+            surfacedChannelReasonsByTabID.removeValue(forKey: session.tabID)
             session.runState = .failed
             clearPendingInteractions(session)
-            appendSystemMessage("Remote host revoked this device. Forget and pair again to restore access.", tabID: session.tabID)
+            appendSystemMessage("Remote host revoked this device. Forget and pair again to restore access.", to: session)
         }
     }
 
@@ -403,11 +409,22 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
+    private func surfaceChannelReasonIfNeeded(_ reason: String, to session: AgentModeViewModel.TabSession) {
+        var reasons = surfacedChannelReasonsByTabID[session.tabID, default: []]
+        guard reasons.insert(reason).inserted else { return }
+        surfacedChannelReasonsByTabID[session.tabID] = reasons
+        appendSystemMessage("Remote channel degraded: \(reason). Reconnecting…", to: session)
+    }
+
     private func appendSystemMessage(_ message: String, tabID: UUID) {
         guard let session = viewModel?.sessions[tabID] else { return }
+        appendSystemMessage(message, to: session)
+    }
+
+    private func appendSystemMessage(_ message: String, to session: AgentModeViewModel.TabSession) {
         session.appendItem(.system(message))
-        viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
-        viewModel?.scheduleSave(for: tabID)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
     }
 
     private func updateSessionIndex(for session: AgentModeViewModel.TabSession) {
@@ -441,6 +458,11 @@ final class RemoteAgentModeCoordinator {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static func displayChannelReason(_ reason: String) -> String {
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "channel_closing" : trimmed
+    }
+
     private static func interactionMatches(
         _ id: UUID?,
         remoteInteractionID: String?,
@@ -458,6 +480,33 @@ final class RemoteAgentModeCoordinator {
         }
         return nil
     }
+
+    #if DEBUG
+        func test_applyChannel(_ state: RemoteChannelState, to session: AgentModeViewModel.TabSession) {
+            applyChannel(state, to: session)
+        }
+
+        func test_attachController(
+            tabID: UUID,
+            hostID: String,
+            controller: RemoteAgentSessionController,
+            connection: RemoteHostConnection
+        ) {
+            controllersByTabID[tabID] = controller
+            hostIDByTabID[tabID] = hostID
+            startEventTask(for: tabID, controller: controller)
+            startConnectionFanoutIfNeeded(hostID: hostID, connection: connection)
+        }
+
+        func test_lifecycleCounts() -> (controllers: Int, eventTasks: Int, hostFanoutTasks: Int, tabHostBindings: Int) {
+            (
+                controllers: controllersByTabID.count,
+                eventTasks: eventTasksByTabID.count,
+                hostFanoutTasks: connectionTasksByHostID.count,
+                tabHostBindings: hostIDByTabID.count
+            )
+        }
+    #endif
 
     static func describe(_ error: Error) -> String {
         if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {

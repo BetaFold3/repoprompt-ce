@@ -79,12 +79,14 @@ struct RemoteHostsSettingsView: View {
         ) {
             Button("Forget \(forgetDraft?.displayName ?? "Remote Host")", role: .destructive) {
                 guard let draft = forgetDraft else { return }
-                if viewModel.forgetHost(id: draft.id) {
-                    showFeedback("Forgot remote host", false)
-                } else if let message = viewModel.errorMessage {
-                    showFeedback(message, true)
+                Task { @MainActor in
+                    if await viewModel.forgetHost(id: draft.id) {
+                        showFeedback(viewModel.statusMessage ?? "Forgot remote host", false)
+                    } else if let message = viewModel.errorMessage {
+                        showFeedback(message, true)
+                    }
+                    forgetDraft = nil
                 }
-                forgetDraft = nil
             }
             Button("Cancel", role: .cancel) {
                 forgetDraft = nil

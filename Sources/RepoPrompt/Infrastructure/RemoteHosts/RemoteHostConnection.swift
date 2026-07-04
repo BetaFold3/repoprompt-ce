@@ -64,6 +64,7 @@ actor RemoteHostConnection {
     static let commandTimeout: TimeInterval = 30
     static let initialReconnectBackoff: TimeInterval = 0.5
     static let maximumReconnectBackoff: TimeInterval = 30
+    static let counterWriteCoalescingDelay: TimeInterval = 0.25
 
     nonisolated let inboundFrames: AsyncStream<RemoteServerFrame>
     nonisolated let stateEvents: AsyncStream<State>
@@ -74,6 +75,9 @@ actor RemoteHostConnection {
     private let keyStore: RemoteClientKeyStore
     private let httpTransport: any RemoteHostConnectionHTTPTransport
     private let webSocketSession: URLSession
+    private let counterWriteCoalescingDelay: TimeInterval
+    private let initialReconnectBackoff: TimeInterval
+    private let maximumReconnectBackoff: TimeInterval
     private let now: @Sendable () -> Date
 
     private let inboundContinuation: AsyncStream<RemoteServerFrame>.Continuation
@@ -89,7 +93,12 @@ actor RemoteHostConnection {
     private var desiredSubscriptions: Set<String> = []
     private var connectedHostName: String?
     private var connectedScopes: Set<String> = []
-    private var reconnectBackoff = RemoteHostConnection.initialReconnectBackoff
+    private var reconnectBackoff: TimeInterval
+    private var pendingCounterWrite: UInt64?
+    private var counterWriteTask: Task<Void, Never>?
+    #if DEBUG
+        private var reconnectScheduleCount = 0
+    #endif
 
     init(
         hostID: String,
@@ -97,6 +106,9 @@ actor RemoteHostConnection {
         keyStore: RemoteClientKeyStore = .shared,
         httpTransport: any RemoteHostConnectionHTTPTransport = URLSessionRemoteHostConnectionHTTPTransport(),
         webSocketSession: URLSession = .shared,
+        counterWriteCoalescingDelay: TimeInterval = RemoteHostConnection.counterWriteCoalescingDelay,
+        initialReconnectBackoff: TimeInterval = RemoteHostConnection.initialReconnectBackoff,
+        maximumReconnectBackoff: TimeInterval = RemoteHostConnection.maximumReconnectBackoff,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.hostID = hostID
@@ -104,7 +116,11 @@ actor RemoteHostConnection {
         self.keyStore = keyStore
         self.httpTransport = httpTransport
         self.webSocketSession = webSocketSession
+        self.counterWriteCoalescingDelay = counterWriteCoalescingDelay
+        self.initialReconnectBackoff = initialReconnectBackoff
+        self.maximumReconnectBackoff = maximumReconnectBackoff
         self.now = now
+        reconnectBackoff = initialReconnectBackoff
 
         let inbound = AsyncStream.makeStream(of: RemoteServerFrame.self)
         inboundFrames = inbound.stream
@@ -117,10 +133,15 @@ actor RemoteHostConnection {
     }
 
     deinit {
+        if let counter = pendingCounterWrite {
+            _ = try? registry.updateLastCounter(hostID: hostID, counter: counter)
+        }
         inboundContinuation.finish()
         stateContinuation.finish()
         readTask?.cancel()
         reconnectTask?.cancel()
+        connectTask?.cancel()
+        counterWriteTask?.cancel()
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
     }
 
@@ -136,7 +157,11 @@ actor RemoteHostConnection {
             throw RemoteClientError.hostRevoked(hostID)
         }
         if let connectTask {
-            try await connectTask.value
+            do {
+                try await connectTask.value
+            } catch is CancellationError {
+                throw RemoteClientError.connectionClosed
+            }
             return
         }
 
@@ -148,6 +173,9 @@ actor RemoteHostConnection {
         do {
             try await task.value
             connectTask = nil
+        } catch is CancellationError {
+            connectTask = nil
+            throw RemoteClientError.connectionClosed
         } catch {
             connectTask = nil
             throw error
@@ -207,8 +235,11 @@ actor RemoteHostConnection {
     func disconnect() async {
         reconnectTask?.cancel()
         reconnectTask = nil
+        connectTask?.cancel()
+        connectTask = nil
         readTask?.cancel()
         readTask = nil
+        flushPendingCounter()
         webSocketTask?.cancel(with: .normalClosure, reason: nil)
         webSocketTask = nil
         signer = nil
@@ -221,6 +252,22 @@ actor RemoteHostConnection {
     #if DEBUG
         func handleServerFrameForTesting(_ frame: RemoteServerFrame) async {
             await handleIncomingFrame(frame)
+        }
+
+        func persistCounterForTesting(_ counter: UInt64) {
+            persistCounter(counter)
+        }
+
+        func flushPendingCounterForTesting() {
+            flushPendingCounter()
+        }
+
+        func reconnectScheduleCountForTesting() -> Int {
+            reconnectScheduleCount
+        }
+
+        func hasReconnectTaskForTesting() -> Bool {
+            reconnectTask != nil
         }
     #endif
 
@@ -293,7 +340,7 @@ actor RemoteHostConnection {
             deviceSigner: signingMaterial,
             ticketID: ticket.ticketID,
             deviceID: ticket.deviceID,
-            lastCounter: record.lastCounter
+            lastCounter: counterFloor(for: record)
         )
         let webSocketURL = try Self.webSocketURL(for: record.gatewayURL)
         let task = webSocketSession.webSocketTask(with: webSocketURL)
@@ -358,7 +405,7 @@ actor RemoteHostConnection {
         signer = localSigner
         connectedScopes = scopes
         connectedHostName = payload["host_name"]?.stringValue
-        reconnectBackoff = Self.initialReconnectBackoff
+        reconnectBackoff = initialReconnectBackoff
         _ = try? registry.updateLastConnected(hostID: record.id, at: now())
         transition(to: .connected(scopes: scopes))
         startReadLoop(for: task)
@@ -599,7 +646,13 @@ actor RemoteHostConnection {
                 markRevoked()
             } else {
                 let code = error.commandError?.code ?? "channel_closing"
-                transition(to: .degraded(code: code, retryAt: now().addingTimeInterval(reconnectBackoff)))
+                webSocketTask?.cancel(with: .goingAway, reason: nil)
+                webSocketTask = nil
+                signer = nil
+                connectedScopes = []
+                connectedHostName = nil
+                readTask?.cancel()
+                readTask = nil
                 scheduleReconnectIfNeeded(reason: code)
             }
             failAllPending(with: error)
@@ -651,7 +704,10 @@ actor RemoteHostConnection {
     private func scheduleReconnectIfNeeded(reason: String) {
         guard reconnectTask == nil, !desiredSubscriptions.isEmpty else { return }
         let delay = reconnectBackoff
-        reconnectBackoff = min(reconnectBackoff * 2, Self.maximumReconnectBackoff)
+        reconnectBackoff = min(reconnectBackoff * 2, maximumReconnectBackoff)
+        #if DEBUG
+            reconnectScheduleCount += 1
+        #endif
         transition(to: .degraded(code: reason, retryAt: now().addingTimeInterval(delay)))
         reconnectTask = Task { [weak self] in
             do {
@@ -684,6 +740,9 @@ actor RemoteHostConnection {
         _ = try? registry.markRevokedByHost(hostID: hostID, at: now())
         reconnectTask?.cancel()
         reconnectTask = nil
+        connectTask?.cancel()
+        connectTask = nil
+        flushPendingCounter()
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
         signer = nil
@@ -693,7 +752,32 @@ actor RemoteHostConnection {
         transition(to: .revoked)
     }
 
+    private func counterFloor(for record: PairedHostRecord) -> UInt64 {
+        max(record.lastCounter, pendingCounterWrite ?? 0)
+    }
+
     private func persistCounter(_ counter: UInt64) {
+        pendingCounterWrite = max(pendingCounterWrite ?? 0, counter)
+        scheduleCounterFlushIfNeeded()
+    }
+
+    private func scheduleCounterFlushIfNeeded() {
+        guard counterWriteTask == nil else { return }
+        counterWriteTask = Task { [weak self] in
+            do {
+                try await Self.sleep(seconds: counterWriteCoalescingDelay)
+            } catch {
+                return
+            }
+            await self?.flushPendingCounter()
+        }
+    }
+
+    private func flushPendingCounter() {
+        counterWriteTask?.cancel()
+        counterWriteTask = nil
+        guard let counter = pendingCounterWrite else { return }
+        pendingCounterWrite = nil
         _ = try? registry.updateLastCounter(hostID: hostID, counter: counter)
     }
 

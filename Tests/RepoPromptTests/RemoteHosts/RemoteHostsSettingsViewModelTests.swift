@@ -53,7 +53,7 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(try registry.host(id: record.id)?.gatewayURL.absoluteString, "https://studio.tailnet.example:8765")
     }
 
-    func testForgetRemovesRegistryRecordAndClientKey() throws {
+    func testForgetRemovesRegistryRecordAndClientKey() async throws {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
         let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
         let keychain = InMemoryRemoteClientKeychain()
@@ -65,20 +65,78 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
         try registry.upsertHost(record)
         try keyStore.save(P256.Signing.PrivateKey(), forHostID: record.id)
         let account = try RemoteClientKeyStore.account(forHostID: record.id)
+        let connectionManager = RecordingRemoteHostsConnectionManager()
         let viewModel = RemoteHostsSettingsViewModel(
             registry: registry,
             keyStore: keyStore,
-            pairingClient: ImmediateRemoteHostsPairingClient()
+            pairingClient: ImmediateRemoteHostsPairingClient(),
+            connectionManager: connectionManager
         )
 
         XCTAssertNotNil(keychain.value(for: account))
         XCTAssertEqual(viewModel.hostRows.map(\.id), [record.id])
 
-        XCTAssertTrue(viewModel.forgetHost(id: record.id))
+        let forgetSucceeded = await viewModel.forgetHost(id: record.id)
 
+        XCTAssertTrue(forgetSucceeded)
+        XCTAssertEqual(connectionManager.teardownHostIDs, [record.id])
         XCTAssertNil(keychain.value(for: account))
         XCTAssertFalse(registry.hasHosts)
         XCTAssertTrue(viewModel.hostRows.isEmpty)
+    }
+
+    func testForgetDisconnectsBeforeRegistryRemovalAndKeychainDeletion() async throws {
+        let recorder = RemoteHostsForgetOrderRecorder()
+        let record = try RemoteHostTestSupport.hostRecord(displayName: "Studio")
+        let registry = RecordingRemoteHostsRegistry(record: record, recorder: recorder)
+        let keyStore = RecordingRemoteHostsClientKeyDeleter(recorder: recorder)
+        let connectionManager = RecordingRemoteHostsConnectionManager(recorder: recorder)
+        let viewModel = RemoteHostsSettingsViewModel(
+            registry: registry,
+            keyStore: keyStore,
+            pairingClient: ImmediateRemoteHostsPairingClient(),
+            connectionManager: connectionManager
+        )
+
+        let forgetSucceeded = await viewModel.forgetHost(id: record.id)
+
+        XCTAssertTrue(forgetSucceeded)
+        XCTAssertEqual(recorder.events, [
+            "disconnect:\(record.id)",
+            "registry.remove:\(record.id)",
+            "keychain.delete:\(record.id)"
+        ])
+        XCTAssertEqual(viewModel.statusMessage, "Forgot remote host. The host may still list this device until it is revoked there.")
+        XCTAssertFalse(viewModel.hasHosts)
+    }
+
+    func testForgetReportsKeyDeletionWarningAfterRegistryRemoval() async throws {
+        let recorder = RemoteHostsForgetOrderRecorder()
+        let record = try RemoteHostTestSupport.hostRecord(displayName: "Studio")
+        let registry = RecordingRemoteHostsRegistry(record: record, recorder: recorder)
+        let keyStore = RecordingRemoteHostsClientKeyDeleter(
+            recorder: recorder,
+            error: RemoteClientKeyStoreError.keychainUnavailable("locked")
+        )
+        let connectionManager = RecordingRemoteHostsConnectionManager(recorder: recorder)
+        let viewModel = RemoteHostsSettingsViewModel(
+            registry: registry,
+            keyStore: keyStore,
+            pairingClient: ImmediateRemoteHostsPairingClient(),
+            connectionManager: connectionManager
+        )
+
+        let forgetSucceeded = await viewModel.forgetHost(id: record.id)
+
+        XCTAssertTrue(forgetSucceeded)
+        XCTAssertFalse(viewModel.hasHosts)
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertEqual(recorder.events, [
+            "disconnect:\(record.id)",
+            "registry.remove:\(record.id)",
+            "keychain.delete:\(record.id)"
+        ])
+        XCTAssertTrue(try XCTUnwrap(viewModel.statusMessage).contains("device key could not be deleted"))
     }
 
     func testConnectionActionUsesTesterRefreshesRowsAndReportsStatus() async throws {
@@ -248,6 +306,88 @@ private struct ImmediateRemoteHostsPairingClient: RemoteHostsPairingClientProtoc
         scopes _: Set<String>
     ) async throws -> PairedHostRecord {
         try RemoteHostsSettingsViewModelTests.record(from: payload)
+    }
+}
+
+private final class RemoteHostsForgetOrderRecorder {
+    var events: [String] = []
+
+    func record(_ event: String) {
+        events.append(event)
+    }
+}
+
+private final class RecordingRemoteHostsRegistry: RemoteHostsRegistryManaging {
+    private var record: PairedHostRecord?
+    private let recorder: RemoteHostsForgetOrderRecorder
+
+    init(record: PairedHostRecord, recorder: RemoteHostsForgetOrderRecorder) {
+        self.record = record
+        self.recorder = recorder
+    }
+
+    var hasHosts: Bool {
+        record != nil
+    }
+
+    func listHosts() throws -> [PairedHostRecord] {
+        record.map { [$0] } ?? []
+    }
+
+    func upsertHost(_ record: PairedHostRecord) throws {
+        self.record = record
+    }
+
+    @discardableResult
+    func removeHost(id: String) throws -> PairedHostRecord? {
+        recorder.record("registry.remove:\(id)")
+        guard record?.id == id else { return nil }
+        defer { record = nil }
+        return record
+    }
+
+    @discardableResult
+    func renameHost(id _: String, displayName _: String) throws -> PairedHostRecord {
+        throw RemoteHostRegistryError.hostNotFound("unused")
+    }
+}
+
+private final class RecordingRemoteHostsClientKeyDeleter: RemoteHostsClientKeyDeleting {
+    private let recorder: RemoteHostsForgetOrderRecorder
+    private let error: Error?
+
+    init(recorder: RemoteHostsForgetOrderRecorder, error: Error? = nil) {
+        self.recorder = recorder
+        self.error = error
+    }
+
+    func deleteKey(forHostID hostID: String) throws {
+        recorder.record("keychain.delete:\(hostID)")
+        if let error { throw error }
+    }
+}
+
+@MainActor
+private final class RecordingRemoteHostsConnectionManager: RemoteHostsConnectionManaging {
+    private let recorder: RemoteHostsForgetOrderRecorder?
+    var teardownHostIDs: [String] = []
+
+    init(recorder: RemoteHostsForgetOrderRecorder? = nil) {
+        self.recorder = recorder
+    }
+
+    func teardown(hostID: String) async {
+        recorder?.record("disconnect:\(hostID)")
+        teardownHostIDs.append(hostID)
+    }
+
+    func testConnection(hostID: String) async throws -> RemoteHostConnectionTestResult {
+        RemoteHostConnectionTestResult(
+            hostID: hostID,
+            hostName: nil,
+            scopes: [],
+            pongPayload: .object([:])
+        )
     }
 }
 

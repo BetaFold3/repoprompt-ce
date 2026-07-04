@@ -209,6 +209,83 @@ final class RemoteHostConnectionTests: XCTestCase {
         XCTAssertEqual(frame.sessionID, "session-a")
     }
 
+    @MainActor
+    func testManagerReusesSingleConnectionPerHost() throws {
+        let record = try upsertClientRecord()
+        let manager = RemoteHostConnectionManager(registry: registry, keyStore: keyStore)
+
+        let first = try manager.connection(for: record.id)
+        let second = try manager.connection(for: record.id)
+
+        XCTAssertTrue(first === second)
+    }
+
+    func testCounterPersistenceCoalescesUntilFlush() async throws {
+        let record = try upsertClientRecord()
+        let connection = RemoteHostConnection(
+            hostID: record.id,
+            registry: registry,
+            keyStore: keyStore,
+            counterWriteCoalescingDelay: 60
+        )
+
+        await connection.persistCounterForTesting(10)
+        await connection.persistCounterForTesting(7)
+        await connection.persistCounterForTesting(25)
+
+        XCTAssertEqual(try registry.host(id: record.id)?.lastCounter, 0)
+        await connection.flushPendingCounterForTesting()
+        XCTAssertEqual(try registry.host(id: record.id)?.lastCounter, 25)
+    }
+
+    func testDisconnectFlushesPendingCounterWrite() async throws {
+        let record = try upsertClientRecord()
+        let connection = RemoteHostConnection(
+            hostID: record.id,
+            registry: registry,
+            keyStore: keyStore,
+            counterWriteCoalescingDelay: 60
+        )
+
+        await connection.persistCounterForTesting(33)
+        await connection.disconnect()
+
+        XCTAssertEqual(try registry.host(id: record.id)?.lastCounter, 33)
+    }
+
+    func testChannelClosingSchedulesSingleReconnectLoopForMultipleSubscriptions() async throws {
+        let record = try upsertClientRecord()
+        await enqueueTicket()
+        let connection = RemoteHostConnection(
+            hostID: record.id,
+            registry: registry,
+            keyStore: keyStore,
+            initialReconnectBackoff: 60
+        )
+
+        try await connection.subscribe(sessionIDs: ["session-a", "session-b"])
+        await connection.handleServerFrameForTesting(RemoteServerFrame(
+            type: "channel_closing",
+            payload: .object([
+                "reason": .string("app_link_unavailable"),
+                "message": .string("App link unavailable")
+            ])
+        ))
+        await connection.handleServerFrameForTesting(RemoteServerFrame(
+            type: "channel_closing",
+            payload: .object([
+                "reason": .string("app_link_unavailable"),
+                "message": .string("App link unavailable")
+            ])
+        ))
+
+        let reconnectScheduleCount = await connection.reconnectScheduleCountForTesting()
+        let hasReconnectTask = await connection.hasReconnectTaskForTesting()
+        XCTAssertEqual(reconnectScheduleCount, 1)
+        XCTAssertTrue(hasReconnectTask)
+        await connection.disconnect()
+    }
+
     @discardableResult
     private func upsertClientRecord(
         scopes: Set<String> = [GatewayRemoteScope.sessionsObserve, GatewayRemoteScope.sessionsOperate]

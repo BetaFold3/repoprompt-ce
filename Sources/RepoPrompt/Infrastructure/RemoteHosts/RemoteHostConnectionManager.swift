@@ -6,7 +6,12 @@ protocol RemoteHostsConnectionTesting: AnyObject {
 }
 
 @MainActor
-final class RemoteHostConnectionManager: RemoteHostsConnectionTesting {
+protocol RemoteHostsConnectionManaging: RemoteHostsConnectionTesting {
+    func teardown(hostID: String) async
+}
+
+@MainActor
+final class RemoteHostConnectionManager: RemoteHostsConnectionManaging {
     static let shared = RemoteHostConnectionManager()
 
     private let registry: RemoteHostRegistry

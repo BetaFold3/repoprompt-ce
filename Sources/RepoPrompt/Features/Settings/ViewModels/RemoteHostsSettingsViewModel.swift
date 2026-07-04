@@ -118,6 +118,7 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
     private let keyStore: RemoteHostsClientKeyDeleting
     private let pairingClient: any RemoteHostsPairingClientProtocol
     private let connectionTester: (any RemoteHostsConnectionTesting)?
+    private let connectionManagerProvider: @MainActor () -> any RemoteHostsConnectionManaging
     private let clientDisplayName: @MainActor () -> String
     private var parsedPayload: RemotePairingPayload?
 
@@ -126,12 +127,18 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         keyStore: RemoteHostsClientKeyDeleting = RemoteClientKeyStore.shared,
         pairingClient: any RemoteHostsPairingClientProtocol = RemoteHostPairingClient(),
         connectionTester: (any RemoteHostsConnectionTesting)? = nil,
+        connectionManager: (any RemoteHostsConnectionManaging)? = nil,
         clientDisplayName: @escaping @MainActor () -> String = RemoteHostsSettingsViewModel.defaultClientDisplayName
     ) {
         self.registry = registry
         self.keyStore = keyStore
         self.pairingClient = pairingClient
         self.connectionTester = connectionTester
+        if let connectionManager {
+            connectionManagerProvider = { connectionManager }
+        } else {
+            connectionManagerProvider = { RemoteHostConnectionManager.shared }
+        }
         self.clientDisplayName = clientDisplayName
         refreshHosts()
     }
@@ -267,15 +274,25 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
     }
 
     @discardableResult
-    func forgetHost(id: String) -> Bool {
+    func forgetHost(id: String) async -> Bool {
         do {
-            try keyStore.deleteKey(forHostID: id)
+            statusMessage = "Forgetting remote host…"
+            await connectionManagerProvider().teardown(hostID: id)
             _ = try registry.removeHost(id: id)
-            Task { await RemoteHostConnectionManager.shared.teardown(hostID: id) }
+            do {
+                try keyStore.deleteKey(forHostID: id)
+            } catch {
+                refreshHosts()
+                errorMessage = nil
+                statusMessage = "Forgot remote host, but the device key could not be deleted: \(Self.message(for: error))"
+                return true
+            }
             refreshHosts()
             statusMessage = "Forgot remote host. The host may still list this device until it is revoked there."
             return true
         } catch {
+            refreshHosts()
+            statusMessage = nil
             errorMessage = Self.message(for: error)
             return false
         }
@@ -292,7 +309,7 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         }
 
         do {
-            let tester = connectionTester ?? RemoteHostConnectionManager.shared
+            let tester = connectionTester ?? connectionManagerProvider()
             let result = try await tester.testConnection(hostID: id)
             refreshHosts()
             let hostName = result.hostName?.trimmingCharacters(in: .whitespacesAndNewlines)
