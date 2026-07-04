@@ -23,6 +23,8 @@ struct AgentSessionMeta {
     let agentModel: String?
     let lastRunState: String?
     let parentSessionID: UUID?
+    let remoteHostID: String?
+    let remoteHostName: String?
     let isMCPOriginated: Bool
     /// Session provenance (plan §6.4); `nil` only when built from legacy data
     /// that predates origin tracking.
@@ -151,6 +153,7 @@ actor AgentSessionDataService {
         let agentReasoningEffort: String?
         let lastRunState: String?
         let providerSessionID: String?
+        let remoteHost: AgentSessionRemoteHostBinding?
         let autoEditEnabled: Bool
         let codexConversationID: String?
         let codexRolloutPath: String?
@@ -1079,6 +1082,7 @@ actor AgentSessionDataService {
                 agentReasoningEffort: header.agentReasoningEffort,
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
                 providerSessionID: header.providerSessionID,
+                remoteHost: header.remoteHost,
                 autoEditEnabled: header.autoEditEnabled,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
@@ -1151,6 +1155,8 @@ actor AgentSessionDataService {
                         agentModel: session.agentModel,
                         lastRunState: session.lastRunState,
                         parentSessionID: session.parentSessionID,
+                        remoteHostID: session.remoteHost?.hostID,
+                        remoteHostName: session.remoteHost?.hostDisplayName,
                         isMCPOriginated: session.isMCPOriginated,
                         origin: session.origin,
                         worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
@@ -1206,6 +1212,8 @@ actor AgentSessionDataService {
                             agentModel: session.agentModel,
                             lastRunState: session.lastRunState,
                             parentSessionID: session.parentSessionID,
+                            remoteHostID: session.remoteHost?.hostID,
+                            remoteHostName: session.remoteHost?.hostDisplayName,
                             isMCPOriginated: session.isMCPOriginated,
                             origin: session.origin,
                             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,

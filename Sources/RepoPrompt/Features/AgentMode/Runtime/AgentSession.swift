@@ -121,6 +121,30 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     }
 }
 
+// MARK: - Remote Session Binding
+
+struct AgentSessionRemoteHostBinding: Codable, Equatable {
+    var hostID: String
+    var hostDisplayName: String
+    var remoteSessionID: String
+    var lastAppliedSeq: UInt64
+    var nextLogOffset: Int
+
+    init(
+        hostID: String,
+        hostDisplayName: String,
+        remoteSessionID: String,
+        lastAppliedSeq: UInt64 = 0,
+        nextLogOffset: Int = 0
+    ) {
+        self.hostID = hostID
+        self.hostDisplayName = hostDisplayName
+        self.remoteSessionID = remoteSessionID
+        self.lastAppliedSeq = lastAppliedSeq
+        self.nextLogOffset = nextLogOffset
+    }
+}
+
 // MARK: - Agent Session
 
 /// Persisted agent mode session containing the chat transcript and configuration
@@ -167,6 +191,10 @@ struct AgentSession: Codable, Identifiable {
     /// Provider-specific resumable session identifier (e.g., Claude CLI session_id)
     /// Used to resume conversations with --resume instead of replaying history
     var providerSessionID: String?
+
+    /// Remote host/session binding for client-projected gateway sessions.
+    var remoteHost: AgentSessionRemoteHostBinding?
+
     var autoEditEnabled: Bool
 
     /// Persisted per-turn token usage for non-Codex providers.
@@ -231,6 +259,7 @@ struct AgentSession: Codable, Identifiable {
         agentReasoningEffort: String? = nil,
         lastRunState: String? = nil,
         providerSessionID: String? = nil,
+        remoteHost: AgentSessionRemoteHostBinding? = nil,
         autoEditEnabled: Bool = true,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
@@ -268,6 +297,7 @@ struct AgentSession: Codable, Identifiable {
         self.agentReasoningEffort = agentReasoningEffort
         self.lastRunState = lastRunState
         self.providerSessionID = providerSessionID
+        self.remoteHost = remoteHost
         self.autoEditEnabled = autoEditEnabled
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
@@ -308,6 +338,7 @@ struct AgentSession: Codable, Identifiable {
         case agentReasoningEffort
         case lastRunState
         case providerSessionID
+        case remoteHost
         case autoEditEnabled
         case providerTokenUsageByTurn
         case codexConversationID
@@ -350,6 +381,7 @@ struct AgentSession: Codable, Identifiable {
         agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
+        remoteHost = try container.decodeIfPresent(AgentSessionRemoteHostBinding.self, forKey: .remoteHost)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)

@@ -217,6 +217,8 @@ struct AgentModeSidebarSessionBuilder {
             autoEditEnabled: entry.autoEditEnabled,
             parentSessionID: entry.parentSessionID,
             hasUnknownConversationContent: entry.hasUnknownConversationContent,
+            remoteHostID: entry.remoteHostID,
+            remoteHostName: entry.remoteHostName,
             isMCPOriginated: entry.isMCPOriginated,
             origin: entry.origin,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,

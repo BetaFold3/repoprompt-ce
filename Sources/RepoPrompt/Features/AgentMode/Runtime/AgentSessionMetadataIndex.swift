@@ -58,6 +58,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var lastRunStateRaw: String?
     var autoEditEnabled: Bool
     var parentSessionID: UUID?
+    var remoteHostID: String?
+    var remoteHostName: String?
     var isMCPOriginated: Bool
     /// Session provenance (plan §6.4); `nil` for legacy records that predate
     /// origin tracking. Use `effectiveOrigin` for a normalized value.
@@ -134,6 +136,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         lastRunStateRaw: String?,
         autoEditEnabled: Bool,
         parentSessionID: UUID?,
+        remoteHostID: String? = nil,
+        remoteHostName: String? = nil,
         isMCPOriginated: Bool,
         origin: AgentSessionOrigin? = nil,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
@@ -165,6 +169,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.lastRunStateRaw = lastRunStateRaw
         self.autoEditEnabled = autoEditEnabled
         self.parentSessionID = parentSessionID
+        self.remoteHostID = remoteHostID
+        self.remoteHostName = remoteHostName
         self.isMCPOriginated = isMCPOriginated
         self.origin = origin
         self.worktreeBindingSummaries = worktreeBindingSummaries
@@ -198,6 +204,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case lastRunStateRaw
         case autoEditEnabled
         case parentSessionID
+        case remoteHostID
+        case remoteHostName
         case isMCPOriginated
         case origin
         case worktreeBindingSummaries
@@ -232,6 +240,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
+        remoteHostID = try container.decodeIfPresent(String.self, forKey: .remoteHostID)
+        remoteHostName = try container.decodeIfPresent(String.self, forKey: .remoteHostName)
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
         origin = try container.decodeIfPresent(AgentSessionOrigin.self, forKey: .origin)
         worktreeBindingSummaries = try container.decodeIfPresent([AgentSessionWorktreeBindingSummary].self, forKey: .worktreeBindingSummaries) ?? []
@@ -264,6 +274,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             autoEditEnabled: autoEditEnabled,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
+            remoteHostID: remoteHostID,
+            remoteHostName: remoteHostName,
             isMCPOriginated: effectiveOrigin.isMCPOriginated,
             origin: effectiveOrigin,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -282,6 +294,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentModel: agentModelRaw,
             lastRunState: lastRunStateRaw,
             parentSessionID: parentSessionID,
+            remoteHostID: remoteHostID,
+            remoteHostName: remoteHostName,
             isMCPOriginated: effectiveOrigin.isMCPOriginated,
             origin: effectiveOrigin,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -306,6 +320,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
             && parentSessionID == other.parentSessionID
+            && remoteHostID == other.remoteHostID
+            && remoteHostName == other.remoteHostName
             && effectiveOrigin.isMCPOriginated == other.effectiveOrigin.isMCPOriginated
             && effectiveOrigin == other.effectiveOrigin
             && worktreeBindingSummaries == other.worktreeBindingSummaries
@@ -351,6 +367,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             lastRunStateRaw: session.lastRunState,
             autoEditEnabled: session.autoEditEnabled,
             parentSessionID: session.parentSessionID,
+            remoteHostID: session.remoteHost?.hostID,
+            remoteHostName: session.remoteHost?.hostDisplayName,
             isMCPOriginated: session.isMCPOriginated,
             origin: session.origin,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,

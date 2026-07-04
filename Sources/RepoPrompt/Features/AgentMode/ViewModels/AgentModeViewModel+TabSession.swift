@@ -161,6 +161,11 @@ extension AgentModeViewModel {
         /// Staged `resolved_by` attribution for an in-flight MCP `respond` call.
         /// Consumed by `recordMCPInteractionResolution`; `nil` means user-local.
         var pendingInteractionResolutionAttribution: String?
+        /// Remote host/session binding for gateway-projected sessions.
+        var remoteHost: AgentSessionRemoteHostBinding?
+        /// Optimistic local user rows awaiting replacement by host-projected transcript rows.
+        var pendingRemoteOptimisticUserItemIDs: Set<UUID> = []
+
         /// Persisted logical-root to worktree bindings for this Agent session.
         var worktreeBindings: [AgentSessionWorktreeBinding] = []
         /// Persisted resumable worktree-merge operations for this Agent session.

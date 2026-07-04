@@ -572,6 +572,7 @@ final class AgentModeViewModel: ObservableObject {
     private let mcpRunToolCanceller: MCPRunToolCanceller
     let codexCoordinator: CodexAgentModeCoordinator
     let claudeCoordinator: ClaudeAgentModeCoordinator
+    let remoteCoordinator: RemoteAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
     private let shouldManageCodexTooling: Bool
@@ -1524,6 +1525,7 @@ final class AgentModeViewModel: ObservableObject {
                 mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
             }
         )
+        remoteCoordinator = RemoteAgentModeCoordinator()
         self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
         workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
             codexCoordinator: codexCoordinator,
@@ -1543,6 +1545,7 @@ final class AgentModeViewModel: ObservableObject {
         }
         codexCoordinator.attach(viewModel: self)
         claudeCoordinator.attach(viewModel: self)
+        remoteCoordinator.attach(viewModel: self)
         runInteractionStateObserver = codexCoordinator
         mcpServer.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
             guard let self else { return .unavailable }
@@ -1720,6 +1723,7 @@ final class AgentModeViewModel: ObservableObject {
                     testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
                 }
             )
+            remoteCoordinator = RemoteAgentModeCoordinator()
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
             workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
                 codexCoordinator: codexCoordinator,
@@ -1728,6 +1732,7 @@ final class AgentModeViewModel: ObservableObject {
             providerBindingService = AgentModeProviderBindingService()
             codexCoordinator.attach(viewModel: self)
             claudeCoordinator.attach(viewModel: self)
+            remoteCoordinator.attach(viewModel: self)
             runInteractionStateObserver = codexCoordinator
             testMCPServer?.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
                 guard let self else { return .unavailable }
@@ -2779,6 +2784,7 @@ final class AgentModeViewModel: ObservableObject {
         await session.disposeProviderIfPresent()
         await codexCoordinator.shutdownCodexSession(session)
         await claudeCoordinator.shutdownClaudeSession(session)
+        remoteCoordinator.stop(tabID: session.tabID)
         let sessionID = boundSessionID(for: session.tabID)
         await cleanupMCPRunRoutingIfPresent(
             boundSessionID: sessionID,
@@ -2863,10 +2869,10 @@ final class AgentModeViewModel: ObservableObject {
             workspaceSwitchInFlight = false
             applySessionToBindings(session)
             activeSessionLoadInProgressTabID = nil
-            if session.selectedAgent == .codexExec, session.runState.isActive {
+            if session.remoteHost == nil, session.selectedAgent == .codexExec, session.runState.isActive {
                 await codexCoordinator.ensureCodexNativeSession(session: session)
             }
-            if session.selectedAgent.usesClaudeNativeRuntime, session.runState.isActive {
+            if session.remoteHost == nil, session.selectedAgent.usesClaudeNativeRuntime, session.runState.isActive {
                 await claudeCoordinator.ensureClaudeNativeSession(session: session)
             }
         }
@@ -3962,6 +3968,7 @@ final class AgentModeViewModel: ObservableObject {
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.origin = agentSession.origin
+        session.remoteHost = agentSession.remoteHost
         session.worktreeBindings = agentSession.worktreeBindings
         session.worktreeMergeOperations = agentSession.worktreeMergeOperations
         session.nextSequenceIndex = payload.transcript.nextSequenceIndex
@@ -4032,6 +4039,9 @@ final class AgentModeViewModel: ObservableObject {
             scheduleSave(for: session.tabID)
         }
         session.hasLoadedPersistedState = true
+        if session.remoteHost != nil {
+            remoteCoordinator.attachPersistedSessionIfNeeded(session)
+        }
 
         let autoEditEnabled = agentSession.autoEditEnabled
         let tabID = session.tabID
@@ -4075,10 +4085,10 @@ final class AgentModeViewModel: ObservableObject {
             applySessionToBindings(session)
         }
 
-        if reconnectActiveProviders, session.selectedAgent == .codexExec, session.runState.isActive {
+        if reconnectActiveProviders, session.remoteHost == nil, session.selectedAgent == .codexExec, session.runState.isActive {
             await codexCoordinator.ensureCodexNativeSession(session: session)
         }
-        if reconnectActiveProviders, session.selectedAgent.usesClaudeNativeRuntime, session.runState.isActive {
+        if reconnectActiveProviders, session.remoteHost == nil, session.selectedAgent.usesClaudeNativeRuntime, session.runState.isActive {
             await claudeCoordinator.ensureClaudeNativeSession(session: session)
         }
 
@@ -4245,6 +4255,8 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingTurnRuntimeAnchors.removeAll()
         session.agentMessageRuntimeFootersByItemID.removeAll()
         session.providerSessionID = nil
+        remoteCoordinator.stop(tabID: session.tabID)
+        session.remoteHost = nil
         session.providerTokenUsageByTurn.removeAll()
         session.lastUserMessageAt = nil
         session.isDirty = false
@@ -5966,6 +5978,8 @@ final class AgentModeViewModel: ObservableObject {
         }
         await claudeCoordinator.shutdownClaudeSessionIfNeeded(session)
         session.providerSessionID = nil
+        remoteCoordinator.stop(tabID: session.tabID)
+        session.remoteHost = nil
         session.contextUsageSnapshot = nil
         session.activeNonCodexTurnTokenAccumulator = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)
@@ -6012,6 +6026,8 @@ final class AgentModeViewModel: ObservableObject {
                 autoEditEnabled: existingEntry.autoEditEnabled,
                 parentSessionID: parentSessionID,
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
+                remoteHostID: existingEntry.remoteHostID ?? session.remoteHost?.hostID,
+                remoteHostName: existingEntry.remoteHostName ?? session.remoteHost?.hostDisplayName,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
                 origin: AgentSessionOrigin.merged(existingEntry.origin, session.origin),
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
@@ -6590,6 +6606,7 @@ final class AgentModeViewModel: ObservableObject {
                 removeSessionIndex(sessionID: sessionID)
             }
         }
+        remoteCoordinator.stop(tabID: target.tabID)
         sessions.removeValue(forKey: target.tabID)
         tabsWithActiveAgentRun.remove(target.tabID)
         mcpControlledTabIDs.remove(target.tabID)
@@ -7112,7 +7129,7 @@ final class AgentModeViewModel: ObservableObject {
                     meta: payload.elicitationMeta
                 )
             }
-            codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
+            submitMCPElicitationResponse(tabID: session.tabID, requestID: request.id, response: response)
             handleObservedMCPStateChange(for: session)
             return nil
         case .userInput:
@@ -9741,7 +9758,7 @@ final class AgentModeViewModel: ObservableObject {
         return lowered == "request_user_input" || lowered == "requestuserinput" || lowered.hasSuffix(".requestuserinput")
     }
 
-    private func resolvedSessionDisplayName(for tabID: UUID) -> String {
+    func resolvedSessionDisplayName(for tabID: UUID) -> String {
         normalizedSessionTitle(workspaceManager?.composeTabName(with: tabID))
     }
 
@@ -9803,6 +9820,8 @@ final class AgentModeViewModel: ObservableObject {
         isMCPOriginated: Bool = false,
         origin: AgentSessionOrigin? = nil,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
+        remoteHostID: String? = nil,
+        remoteHostName: String? = nil,
         activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = []
     ) {
         applyLocalSessionIndexUpsert(AgentSessionIndexEntry(
@@ -9819,6 +9838,8 @@ final class AgentModeViewModel: ObservableObject {
             autoEditEnabled: autoEditEnabled,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
+            remoteHostID: remoteHostID,
+            remoteHostName: remoteHostName,
             isMCPOriginated: isMCPOriginated,
             origin: origin,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -9965,6 +9986,7 @@ final class AgentModeViewModel: ObservableObject {
         if let runID = session.runID {
             _ = mcpRunToolCanceller(runID, "workspace_switch")
         }
+        remoteCoordinator.stop(tabID: session.tabID)
         return target
     }
 
@@ -10680,6 +10702,7 @@ final class AgentModeViewModel: ObservableObject {
 
             switch reason {
             case .stash:
+                remoteCoordinator.stop(tabID: tabID)
                 sessions.removeValue(forKey: tabID)
                 tabsWithActiveAgentRun.remove(tabID)
             case .close:
@@ -10689,6 +10712,7 @@ final class AgentModeViewModel: ObservableObject {
                 removeSessionIndex(forTabID: tabID)
                 tabDraftText.removeValue(forKey: tabID)
                 sessionIndexStore.removeSortDate(forTabID: tabID)
+                remoteCoordinator.stop(tabID: tabID)
                 sessions.removeValue(forKey: tabID)
                 tabsWithActiveAgentRun.remove(tabID)
             case .deleteStashed:
@@ -10698,6 +10722,7 @@ final class AgentModeViewModel: ObservableObject {
                 removeSessionIndex(forTabID: tabID)
                 tabDraftText.removeValue(forKey: tabID)
                 sessionIndexStore.removeSortDate(forTabID: tabID)
+                remoteCoordinator.stop(tabID: tabID)
                 sessions.removeValue(forKey: tabID)
                 tabsWithActiveAgentRun.remove(tabID)
             }
@@ -11052,6 +11077,7 @@ final class AgentModeViewModel: ObservableObject {
             agentReasoningEffort: session.selectedReasoningEffortRaw,
             lastRunState: session.runState.rawValue,
             providerSessionID: session.providerSessionID,
+            remoteHost: session.remoteHost,
             autoEditEnabled: session.autoEditEnabled,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
             parentSessionID: session.parentSessionID,
@@ -11107,6 +11133,8 @@ final class AgentModeViewModel: ObservableObject {
                 isMCPOriginated: agentSession.isMCPOriginated,
                 origin: agentSession.origin,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
+                remoteHostID: agentSession.remoteHost?.hostID,
+                remoteHostName: agentSession.remoteHost?.hostDisplayName,
                 activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
             )
             #if DEBUG
@@ -11761,6 +11789,7 @@ final class AgentModeViewModel: ObservableObject {
         if promptManager?.currentComposeTabs.contains(where: { $0.id == tabID }) == true {
             await promptManager?.closeComposeTab(tabID)
         } else {
+            remoteCoordinator.stop(tabID: tabID)
             sessions.removeValue(forKey: tabID)
             sessionIndexStore.removeSortDate(forTabID: tabID)
             removePendingUIRefresh(for: tabID)
@@ -12084,6 +12113,35 @@ final class AgentModeViewModel: ObservableObject {
 
         if shouldSignalMCPInstructionDeliveredAfterOptimisticSubmit(for: session) {
             signalMCPInstructionDeliveredFireAndForget(for: session)
+        }
+
+        if session.remoteHost != nil {
+            session.pendingRemoteOptimisticUserItemIDs.insert(userItem.id)
+            let shouldStartRemote = !session.runState.isActive || session.remoteHost?.remoteSessionID.isEmpty == true
+            Task { [weak self, weak session] in
+                guard let self, let session else { return }
+                do {
+                    if shouldStartRemote {
+                        try await remoteCoordinator.startRemoteSession(
+                            session: session,
+                            message: wrappedText,
+                            modelSelectionRaw: session.selectedModelRaw,
+                            sessionName: resolvedSessionDisplayName(for: tabID),
+                            windowID: nil,
+                            workspaceID: workspaceManager?.activeWorkspace?.id.uuidString
+                        )
+                    } else {
+                        try await remoteCoordinator.steer(session: session, text: wrappedText)
+                    }
+                } catch {
+                    session.pendingRemoteOptimisticUserItemIDs.remove(userItem.id)
+                    session.runState = .failed
+                    session.appendItem(.error("Remote send failed: \(RemoteAgentModeCoordinator.describe(error))"))
+                    requestUIRefresh(tabID: tabID, urgent: true)
+                    scheduleSave(for: tabID)
+                }
+            }
+            return UserTurnSubmissionResult.submitted
         }
 
         if session.selectedAgent == .codexExec {
@@ -14379,6 +14437,16 @@ final class AgentModeViewModel: ObservableObject {
     ) async {
         guard let session = sessions[tabID] else { return }
         cancelPendingInstruction(for: session)
+        if session.remoteHost != nil {
+            do {
+                try await remoteCoordinator.cancel(session: session)
+            } catch {
+                session.appendItem(.error("Remote cancel failed: \(RemoteAgentModeCoordinator.describe(error))"))
+                requestUIRefresh(tabID: tabID, urgent: true)
+                scheduleSave(for: tabID)
+            }
+            return
+        }
         await runService.cancelRun(tabID: tabID, session: session, completion: completion)
     }
 
@@ -14393,6 +14461,24 @@ final class AgentModeViewModel: ObservableObject {
             logRejectedCancelTarget(target, session: nil, reason: "missing_session")
             resyncAfterRejectedCancelTarget(target)
             return false
+        }
+        if session.remoteHost != nil {
+            if let expectedSessionID = target.expectedActiveAgentSessionID,
+               session.activeAgentSessionID != expectedSessionID
+            {
+                logRejectedCancelTarget(target, session: session, reason: "agent_session_id_mismatch")
+                resyncAfterRejectedCancelTarget(target)
+                return false
+            }
+            cancelPendingInstruction(for: session)
+            do {
+                try await remoteCoordinator.cancel(session: session)
+            } catch {
+                session.appendItem(.error("Remote cancel failed: \(RemoteAgentModeCoordinator.describe(error))"))
+                requestUIRefresh(tabID: target.tabID, urgent: true)
+                scheduleSave(for: target.tabID)
+            }
+            return true
         }
         if let rejectionReason = cancelTargetRejectionReason(target, session: session) {
             logRejectedCancelTarget(target, session: session, reason: rejectionReason)
@@ -15035,7 +15121,11 @@ final class AgentModeViewModel: ObservableObject {
     func submitAskUserResponse(tabID: UUID, interactionID: UUID) {
         guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
         do {
-            try resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
+            if session.remoteHost != nil {
+                try resolveRemoteAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
+            } else {
+                try resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
+            }
         } catch {
             return
         }
@@ -15048,12 +15138,20 @@ final class AgentModeViewModel: ObservableObject {
         else { return }
         pending.draftsByQuestionID = draftsByQuestionID
         session.pendingAskUser = pending
-        try resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
+        if session.remoteHost != nil {
+            try resolveRemoteAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
+        } else {
+            try resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: false)
+        }
     }
 
     func skipAskUser(tabID: UUID, interactionID: UUID) {
         guard let session = sessions[tabID], session.pendingAskUser?.interaction.id == interactionID else { return }
-        try? resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
+        if session.remoteHost != nil {
+            try? resolveRemoteAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
+        } else {
+            try? resolveAskUserResponse(for: session, interactionID: interactionID, skipAll: true)
+        }
     }
 
     private func resolveAskUserResponse(for session: TabSession, interactionID: UUID, skipAll: Bool) throws {
@@ -15062,15 +15160,7 @@ final class AgentModeViewModel: ObservableObject {
               let continuation = session.askUserContinuation
         else { return }
 
-        let elapsedSeconds = max(0, Int(Date().timeIntervalSince(pending.interaction.askedAt)))
-        let response = if skipAll {
-            pending.interaction.buildSkippedResponse(elapsedSeconds: elapsedSeconds)
-        } else {
-            try pending.interaction.buildSubmittedResponse(
-                drafts: pending.draftsByQuestionID,
-                elapsedSeconds: elapsedSeconds
-            )
-        }
+        let response = try buildAskUserResponse(from: pending, skipAll: skipAll)
 
         invalidatePendingAskUserTimeout(for: session)
         session.pendingAskUser = nil
@@ -15082,6 +15172,33 @@ final class AgentModeViewModel: ObservableObject {
         // Note: We don't append a .user item here - the response will be shown
         // via the ask_user tool_result.
         continuation.resume(returning: response)
+    }
+
+    private func resolveRemoteAskUserResponse(for session: TabSession, interactionID: UUID, skipAll: Bool) throws {
+        guard let pending = session.pendingAskUser,
+              pending.interaction.id == interactionID
+        else { return }
+
+        let response = try buildAskUserResponse(from: pending, skipAll: skipAll)
+        let remoteInteractionID = pending.interaction.remoteInteractionID ?? interactionID.uuidString
+        remoteCoordinator.submitAskUserResponse(
+            session: session,
+            interactionID: remoteInteractionID,
+            response: response
+        )
+        recordMCPInteractionResolution(for: session, interactionID: interactionID)
+        updateBindingsFromSession(session)
+    }
+
+    private func buildAskUserResponse(from pending: AgentAskUserPendingState, skipAll: Bool) throws -> AgentAskUserResponse {
+        let elapsedSeconds = max(0, Int(Date().timeIntervalSince(pending.interaction.askedAt)))
+        if skipAll {
+            return pending.interaction.buildSkippedResponse(elapsedSeconds: elapsedSeconds)
+        }
+        return try pending.interaction.buildSubmittedResponse(
+            drafts: pending.draftsByQuestionID,
+            elapsedSeconds: elapsedSeconds
+        )
     }
 
     /// Legacy single-question UI shim retained for tests and old call sites during migration.
@@ -15113,6 +15230,14 @@ final class AgentModeViewModel: ObservableObject {
               let request = session.pendingUserInputRequest,
               request.requestID == requestID
         else {
+            return
+        }
+        if session.remoteHost != nil {
+            remoteCoordinator.submitUserInputResponse(session: session, request: request, response: response)
+            recordMCPInteractionResolution(for: session, interactionID: request.id)
+            publishRunInteractionStateChange(for: session, reason: .userInputResponseSubmitted)
+            updateBindingsFromSession(session)
+            requestUIRefresh(tabID: tabID, urgent: true)
             return
         }
         codexCoordinator.submitUserInputResponse(session: session, requestID: requestID, response: response)
@@ -15710,6 +15835,7 @@ final class AgentModeViewModel: ObservableObject {
                 liveSession: session,
                 reason: reason
             )
+            remoteCoordinator.stop(tabID: tabID)
             sessions.removeValue(forKey: tabID)
         }
 
@@ -15798,6 +15924,7 @@ final class AgentModeViewModel: ObservableObject {
             removeSessionIndex(forTabID: tabID)
         }
         tabDraftText.removeValue(forKey: tabID)
+        remoteCoordinator.stop(tabID: tabID)
         sessions.removeValue(forKey: tabID)
         tabsWithActiveAgentRun.remove(tabID)
         mcpControlledTabIDs.remove(tabID)

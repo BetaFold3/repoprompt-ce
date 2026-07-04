@@ -14,6 +14,12 @@ extension AgentModeViewModel {
             codexCoordinator.submitApprovalDecision(session: session, decision: decision)
         case .claudeControl:
             claudeCoordinator.submitApprovalDecision(session: session, decision: decision)
+        case let .remoteGateway(remoteInteractionID):
+            remoteCoordinator.submitApprovalDecision(
+                session: session,
+                interactionID: remoteInteractionID,
+                decision: decision
+            )
         case let .acp(requestID):
             session.pendingApproval = nil
             if session.runState == .waitingForApproval {
@@ -40,6 +46,11 @@ extension AgentModeViewModel {
               let request = session.pendingMCPElicitationRequest,
               request.id == requestID
         else {
+            return
+        }
+        if session.remoteHost != nil {
+            remoteCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
+            recordMCPInteractionResolution(for: session, interactionID: request.id)
             return
         }
         codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
