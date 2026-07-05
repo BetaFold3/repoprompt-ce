@@ -31,6 +31,33 @@ final class GatewayWaitLoopContractTests: XCTestCase {
         })
     }
 
+    func testResolvedWindowWaitPartitionsUseHiddenWindowID() async throws {
+        let s1 = "11111111-1111-1111-1111-111111111111"
+        let s2 = "22222222-2222-2222-2222-222222222222"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: s1, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: s2, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: s1, status: "waiting_for_input"))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: s2, status: "waiting_for_input")))
+        ])
+        let (manager, _) = try await makeManager(
+            connection: connection,
+            windowResolver: { _, sessionID in
+                sessionID == s1 ? 1 : 2
+            }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [s1, s2])
+        let calls = await waitForCalls(connection, minimum: 4, timeoutMilliseconds: 1500)
+        await manager.shutdown()
+
+        let waitCalls = calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("wait") }
+        XCTAssertEqual(Set(waitCalls.compactMap { $0.arguments["_windowID"]?.intValue }), Set([1, 2]))
+        XCTAssertTrue(waitCalls.contains { $0.arguments["session_id"] == .string(s1) })
+        XCTAssertTrue(waitCalls.contains { $0.arguments["session_id"] == .string(s2) })
+    }
+
     func testTerminalSnapshotEmitsSessionTerminal() async throws {
         let s1 = "11111111-1111-1111-1111-111111111111"
         let connection = RecordingAppLinkConnection(responses: [
@@ -355,6 +382,7 @@ final class GatewayWaitLoopContractTests: XCTestCase {
 
     private func makeManager(
         connection: RecordingAppLinkConnection,
+        windowResolver: SessionWatchManager.WindowResolver? = nil,
         waitTimeoutSeconds: TimeInterval = 0.2,
         pollRefreshSeconds: TimeInterval = 0.2
     ) async throws -> (SessionWatchManager, AppLinkSession) {
@@ -368,6 +396,7 @@ final class GatewayWaitLoopContractTests: XCTestCase {
         try await appLink.connect()
         let manager = SessionWatchManager(
             appLink: appLink,
+            windowResolver: windowResolver,
             waitTimeoutSeconds: waitTimeoutSeconds,
             pollRefreshSeconds: pollRefreshSeconds
         )

@@ -509,6 +509,9 @@ final class RemoteAgentModeCoordinator {
     #endif
 
     static func describe(_ error: Error) -> String {
+        if (error as? RemoteClientError)?.commandError?.code == "binding_required" {
+            return "The host couldn't route this message to its window. Try again — if it keeps failing, the session's window may have been closed on the host."
+        }
         if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {
             return localized
         }

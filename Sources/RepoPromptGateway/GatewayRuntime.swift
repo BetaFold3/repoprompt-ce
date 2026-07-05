@@ -15,11 +15,13 @@ actor RemoteGatewayRuntime {
     private let appLinkPool: AppLinkPool?
     private let ledger: CommandLedger
     private let watchManager: SessionWatchManager
+    private let sessionWindowAffinity: GatewaySessionWindowAffinity
     private let auditLog: RemoteAuditLog?
     private let logger: Logger
     private let defaultBindingState: RemoteGatewayBindingState
     private let pushSubscriptionStore: WebPushSubscriptionStore?
     private let now: @Sendable () -> Date
+    private var lastEligibleWindowDetailsByDevice: [String: JSONValue] = [:]
 
     init(
         appLink: AppLinkSession,
@@ -30,12 +32,14 @@ actor RemoteGatewayRuntime {
         bindingState: RemoteGatewayBindingState = .bound,
         appLinkPool: AppLinkPool? = nil,
         pushSubscriptionStore: WebPushSubscriptionStore? = nil,
+        sessionWindowAffinity: GatewaySessionWindowAffinity = GatewaySessionWindowAffinity(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.appLink = appLink
         self.appLinkPool = appLinkPool
         self.ledger = ledger
         self.watchManager = watchManager
+        self.sessionWindowAffinity = sessionWindowAffinity
         self.auditLog = auditLog
         self.logger = logger
         defaultBindingState = bindingState
@@ -97,7 +101,7 @@ actor RemoteGatewayRuntime {
         // M6.6: subscription is an observation op — an unbound multi-window
         // connection must get a structured binding_required, not a silent
         // per-session failure from the catch-up poll.
-        if let bindingError = await observationBindingError(deviceID: deviceID) {
+        if let bindingError = await observationBindingError(deviceID: deviceID, frame: frame) {
             audit(frame: frame, deviceID: deviceID, outcome: "failure", code: bindingError.code)
             return await .commandError(
                 requestID: frame.requestID,
@@ -138,7 +142,7 @@ actor RemoteGatewayRuntime {
     }
 
     private func handleUnsubscribe(_ frame: RemoteClientFrame, deviceID: String) async -> RemoteServerFrame {
-        if let bindingError = await observationBindingError(deviceID: deviceID) {
+        if let bindingError = await observationBindingError(deviceID: deviceID, frame: frame) {
             audit(frame: frame, deviceID: deviceID, outcome: "failure", code: bindingError.code)
             return .commandError(
                 requestID: frame.requestID,
@@ -318,6 +322,7 @@ actor RemoteGatewayRuntime {
         let outcome: CommandLedger.RecordedOutcome
         do {
             let payload = try await callTranslatedTool(for: frame, deviceID: deviceID)
+            await recordExplicitStartAffinityIfNeeded(frame: frame, payload: payload)
             outcome = .success(payload)
             await ledger.complete(key: key, outcome: outcome)
             audit(frame: frame, deviceID: deviceID, outcome: "success")
@@ -348,8 +353,62 @@ actor RemoteGatewayRuntime {
 
     private func callTranslatedTool(for frame: RemoteClientFrame, deviceID: String) async throws -> JSONValue {
         let (link, bindingState) = try await resolveAppLink(deviceID: deviceID)
+        if frame.type == "poll",
+           let requestedSessionIDs = try? sessionIDs(from: frame),
+           requestedSessionIDs.count > 1
+        {
+            return try await callPartitionedPoll(
+                frame: frame,
+                deviceID: deviceID,
+                link: link,
+                bindingState: bindingState,
+                sessionIDs: requestedSessionIDs
+            )
+        }
+        return try await callTranslatedToolSingle(
+            for: frame,
+            deviceID: deviceID,
+            link: link,
+            bindingState: bindingState,
+            allowCorrectiveRetry: true
+        )
+    }
+
+    private func callTranslatedToolSingle(
+        for frame: RemoteClientFrame,
+        deviceID: String,
+        link: AppLinkSession,
+        bindingState: RemoteGatewayBindingState,
+        allowCorrectiveRetry: Bool
+    ) async throws -> JSONValue {
+        let sessionID = singleSessionIDIfSessionAddressed(frame)
+        let resolvedWindowID = await resolvedWindowID(
+            forSession: sessionID,
+            deviceID: deviceID,
+            bindingState: bindingState
+        )
+        return try await executeTranslatedTool(
+            frame: frame,
+            deviceID: deviceID,
+            link: link,
+            bindingState: bindingState,
+            resolvedWindowID: resolvedWindowID,
+            retrySessionID: sessionID,
+            allowCorrectiveRetry: allowCorrectiveRetry
+        )
+    }
+
+    private func executeTranslatedTool(
+        frame: RemoteClientFrame,
+        deviceID: String,
+        link: AppLinkSession,
+        bindingState: RemoteGatewayBindingState,
+        resolvedWindowID: Int?,
+        retrySessionID: String?,
+        allowCorrectiveRetry: Bool
+    ) async throws -> JSONValue {
         let translator = RemoteCommandTranslator(bindingState: bindingState)
-        let toolCall = try translator.translate(frame)
+        let toolCall = try translator.translate(frame, resolvedWindowID: resolvedWindowID)
         let result = try await link.callTool(
             name: toolCall.toolName,
             arguments: toolCall.arguments,
@@ -361,9 +420,98 @@ actor RemoteGatewayRuntime {
             if runtimeError.code(frame: frame) == "binding_required" {
                 await appLinkPool?.refreshBindingState(forDevice: deviceID)
             }
+            if allowCorrectiveRetry,
+               Self.isCorrectiveSessionWindowRoutingError(runtimeError, frame: frame),
+               let retrySessionID,
+               let resolvedWindowID,
+               let rediscovered = await rediscoverWindowIDAfterToolError(
+                   sessionID: retrySessionID,
+                   deviceID: deviceID
+               ),
+               rediscovered != resolvedWindowID
+            {
+                return try await executeTranslatedTool(
+                    frame: frame,
+                    deviceID: deviceID,
+                    link: link,
+                    bindingState: bindingState,
+                    resolvedWindowID: rediscovered,
+                    retrySessionID: nil,
+                    allowCorrectiveRetry: false
+                )
+            }
             throw runtimeError
         }
         return payload
+    }
+
+    private static func isCorrectiveSessionWindowRoutingError(
+        _ error: RemoteGatewayRuntimeError,
+        frame: RemoteClientFrame
+    ) -> Bool {
+        guard case .appToolError = error else { return false }
+        switch error.code(frame: frame) {
+        case "binding_required", "ambiguous_start_target", "session_expired":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func callPartitionedPoll(
+        frame: RemoteClientFrame,
+        deviceID: String,
+        link: AppLinkSession,
+        bindingState: RemoteGatewayBindingState,
+        sessionIDs: [String]
+    ) async throws -> JSONValue {
+        var byWindow: [Int: [String]] = [:]
+        var legacy: [String] = []
+        for sessionID in sessionIDs {
+            if let windowID = await resolvedWindowID(forSession: sessionID, deviceID: deviceID, bindingState: bindingState) {
+                byWindow[windowID, default: []].append(sessionID)
+            } else if bindingState == .bound {
+                legacy.append(sessionID)
+            } else {
+                throw RemoteCommandTranslatorError.bindingRequired(bindingRequiredMessage(bindingState))
+            }
+        }
+
+        var partitions: [(windowID: Int?, sessionIDs: [String])] = byWindow
+            .keys
+            .sorted()
+            .map { ($0, byWindow[$0] ?? []) }
+        if !legacy.isEmpty {
+            partitions.append((nil, legacy))
+        }
+        guard !partitions.isEmpty else {
+            return .object(["snapshots": .array([])])
+        }
+        if partitions.count == 1, partitions[0].windowID == nil {
+            return try await callTranslatedToolSingle(
+                for: frame,
+                deviceID: deviceID,
+                link: link,
+                bindingState: bindingState,
+                allowCorrectiveRetry: false
+            )
+        }
+
+        var snapshots: [JSONValue] = []
+        for partition in partitions {
+            let partitionFrame = pollFrame(from: frame, sessionIDs: partition.sessionIDs)
+            let payload = try await executeTranslatedTool(
+                frame: partitionFrame,
+                deviceID: deviceID,
+                link: link,
+                bindingState: bindingState,
+                resolvedWindowID: partition.windowID,
+                retrySessionID: nil,
+                allowCorrectiveRetry: false
+            )
+            snapshots.append(contentsOf: RemoteSessionSnapshot.extractSnapshots(from: payload).map(\.payload))
+        }
+        return .object(["snapshots": .array(snapshots)])
     }
 
     /// Paired devices route through their own bootstrap app leg (`remote:<device8>`)
@@ -384,9 +532,79 @@ actor RemoteGatewayRuntime {
         throw RemoteGatewayRuntimeError.deviceAppLinkUnavailable(deviceID: deviceID)
     }
 
+    func resolveSessionWindowForObservation(deviceID: String, sessionID: String) async -> Int? {
+        guard let (_, bindingState) = try? await resolveAppLink(deviceID: deviceID) else { return nil }
+        return await resolvedWindowID(forSession: sessionID, deviceID: deviceID, bindingState: bindingState)
+    }
+
+    private func resolvedWindowID(
+        forSession sessionID: String?,
+        deviceID: String,
+        bindingState: RemoteGatewayBindingState
+    ) async -> Int? {
+        guard let sessionID = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines), !sessionID.isEmpty else {
+            return nil
+        }
+        if let cached = await sessionWindowAffinity.windowID(forSession: sessionID) {
+            return cached
+        }
+        guard bindingState != .bound else {
+            return nil
+        }
+        return await sessionWindowAffinity.resolvingWindowID(forSession: sessionID) {
+            await self.discoverSessionWindow(sessionID: sessionID, deviceID: deviceID)
+        }
+    }
+
+    private func rediscoverWindowIDAfterToolError(sessionID: String, deviceID: String) async -> Int? {
+        await sessionWindowAffinity.invalidate(sessionID: sessionID)
+        return await sessionWindowAffinity.resolvingWindowID(forSession: sessionID) {
+            await self.discoverSessionWindow(sessionID: sessionID, deviceID: deviceID)
+        }
+    }
+
+    private func discoverSessionWindow(sessionID targetSessionID: String, deviceID: String) async -> Int? {
+        guard let (link, _) = try? await resolveAppLink(deviceID: deviceID) else { return nil }
+        guard let eligible = await eligibleStartTargetWindowInfo(deviceID: deviceID), !eligible.windowIDs.isEmpty else {
+            return nil
+        }
+
+        var hit: Int?
+        for windowID in eligible.windowIDs.sorted() {
+            let sessions = await Self.listSessionIDs(link: link, windowID: windowID)
+            for sessionID in sessions {
+                await sessionWindowAffinity.record(sessionID: sessionID, windowID: windowID)
+                if sessionID == targetSessionID {
+                    hit = windowID
+                }
+            }
+        }
+        return hit
+    }
+
+    private static func listSessionIDs(link: AppLinkSession, windowID: Int) async -> [String] {
+        guard let result = try? await link.callTool(
+            name: "agent_manage",
+            arguments: [
+                "op": .string("list_sessions"),
+                "limit": .int(500),
+                "_windowID": .int(windowID),
+                "_rawJSON": .bool(true)
+            ],
+            timeout: 10
+        ), result.isError != true,
+        let payload = try? RemoteMCPToolResultCodec.jsonValue(from: result),
+        let sessions = payload.objectValue?["sessions"]?.arrayValue
+        else { return [] }
+        return sessions.compactMap { value in
+            value.objectValue?["session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        .filter { !$0.isEmpty }
+    }
+
     /// M6.6: observation ops (subscribe/unsubscribe and the wait/poll they arm)
     /// on an unbound multi-window connection fail with `binding_required`.
-    private func observationBindingError(deviceID: String) async -> RemoteCommandTranslatorError? {
+    private func observationBindingError(deviceID: String, frame: RemoteClientFrame) async -> RemoteCommandTranslatorError? {
         let resolved: (AppLinkSession, RemoteGatewayBindingState)
         do {
             resolved = try await resolveAppLink(deviceID: deviceID)
@@ -400,10 +618,30 @@ actor RemoteGatewayRuntime {
         case .bound:
             return nil
         case let .bindingRequired(message):
+            if await observationSessionsAreResolvable(frame: frame, deviceID: deviceID, bindingState: bindingState) {
+                return nil
+            }
             return .bindingRequired(message)
         case let .ambiguousStartTarget(message):
+            if await observationSessionsAreResolvable(frame: frame, deviceID: deviceID, bindingState: bindingState) {
+                return nil
+            }
             return .bindingRequired(message)
         }
+    }
+
+    private func observationSessionsAreResolvable(
+        frame: RemoteClientFrame,
+        deviceID: String,
+        bindingState: RemoteGatewayBindingState
+    ) async -> Bool {
+        guard let ids = try? sessionIDs(from: frame), !ids.isEmpty else { return false }
+        for sessionID in ids {
+            guard await resolvedWindowID(forSession: sessionID, deviceID: deviceID, bindingState: bindingState) != nil else {
+                return false
+            }
+        }
+        return true
     }
 
     /// M6.6: enriches binding errors with the eligible windows so remote clients
@@ -412,13 +650,20 @@ actor RemoteGatewayRuntime {
     /// plain error without details.
     private func bindingErrorDetails(code: String, existing: JSONValue?, deviceID: String) async -> JSONValue? {
         guard code == "binding_required" || code == "ambiguous_start_target" else { return existing }
-        guard let windows = await eligibleStartTargetWindows(deviceID: deviceID) else { return existing }
+        let windows: JSONValue
+        if let windowInfo = await eligibleStartTargetWindowInfo(deviceID: deviceID) {
+            windows = windowInfo.details
+        } else if let cached = lastEligibleWindowDetailsByDevice[deviceID] {
+            windows = cached
+        } else {
+            return existing
+        }
         var object = existing?.objectValue ?? [:]
         object["windows"] = windows
         return .object(object)
     }
 
-    private func eligibleStartTargetWindows(deviceID: String) async -> JSONValue? {
+    private func eligibleStartTargetWindowInfo(deviceID: String) async -> (details: JSONValue, windowIDs: [Int])? {
         guard let (link, _) = try? await resolveAppLink(deviceID: deviceID) else { return nil }
         guard let result = try? await link.callTool(
             name: "bind_context",
@@ -428,9 +673,14 @@ actor RemoteGatewayRuntime {
         let payload = try? RemoteMCPToolResultCodec.jsonValue(from: result),
         let windows = payload.objectValue?["windows"]?.arrayValue
         else { return nil }
+        var windowIDs: [Int] = []
         let summaries: [JSONValue] = windows.compactMap { window in
-            guard let object = window.objectValue, let windowID = object["window_id"] else { return nil }
-            var summary: [String: JSONValue] = ["window_id": windowID]
+            guard let object = window.objectValue,
+                  let windowIDValue = object["window_id"],
+                  let windowID = windowIDValue.intValue
+            else { return nil }
+            windowIDs.append(windowID)
+            var summary: [String: JSONValue] = ["window_id": windowIDValue]
             if let workspace = object["workspace"]?.objectValue {
                 if let workspaceID = workspace["id"] { summary["workspace_id"] = workspaceID }
                 if let workspaceName = workspace["name"] { summary["workspace_name"] = workspaceName }
@@ -438,7 +688,9 @@ actor RemoteGatewayRuntime {
             return .object(summary)
         }
         guard !summaries.isEmpty else { return nil }
-        return .array(summaries)
+        let details = JSONValue.array(summaries)
+        lastEligibleWindowDetailsByDevice[deviceID] = details
+        return (details, windowIDs)
     }
 
     private func responseFrame(for outcome: CommandLedger.RecordedOutcome, frame: RemoteClientFrame) -> RemoteServerFrame {
@@ -541,6 +793,53 @@ actor RemoteGatewayRuntime {
             if !ids.isEmpty { return ids }
         }
         throw RemoteCommandTranslatorError.missingSessionID(frame.type)
+    }
+
+    private func singleSessionIDIfSessionAddressed(_ frame: RemoteClientFrame) -> String? {
+        guard ["steer", "respond", "cancel", "get_log", "poll"].contains(frame.type) else { return nil }
+        guard let ids = try? sessionIDs(from: frame), ids.count == 1 else { return nil }
+        return ids[0]
+    }
+
+    private func pollFrame(from frame: RemoteClientFrame, sessionIDs: [String]) -> RemoteClientFrame {
+        var payload = frame.payload?.objectValue ?? [:]
+        payload.removeValue(forKey: "session_id")
+        if sessionIDs.count == 1 {
+            payload.removeValue(forKey: "session_ids")
+            return RemoteClientFrame(
+                type: "poll",
+                requestID: frame.requestID,
+                sessionID: sessionIDs[0],
+                payload: payload.isEmpty ? nil : .object(payload)
+            )
+        }
+        payload["session_ids"] = .array(sessionIDs.map(JSONValue.string))
+        return RemoteClientFrame(type: "poll", requestID: frame.requestID, payload: .object(payload))
+    }
+
+    private func bindingRequiredMessage(_ state: RemoteGatewayBindingState) -> String {
+        switch state {
+        case .bound:
+            "The app link is not bound to a window."
+        case let .bindingRequired(message), let .ambiguousStartTarget(message):
+            message
+        }
+    }
+
+    private func recordExplicitStartAffinityIfNeeded(frame: RemoteClientFrame, payload: JSONValue) async {
+        guard frame.type == "start",
+              let windowID = explicitStartWindowID(frame),
+              let sessionID = payload.objectValue?["session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionID.isEmpty
+        else { return }
+        await sessionWindowAffinity.record(sessionID: sessionID, windowID: windowID)
+    }
+
+    private func explicitStartWindowID(_ frame: RemoteClientFrame) -> Int? {
+        guard frame.type == "start", let value = frame.payload?.objectValue?["window_id"] else { return nil }
+        if let intValue = value.intValue { return intValue }
+        if let stringValue = value.stringValue { return Int(stringValue) }
+        return nil
     }
 
     private func audit(

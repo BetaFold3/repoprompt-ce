@@ -176,6 +176,9 @@ do {
         appLinkPool: appLinkPool,
         pushSubscriptionStore: pushSubscriptionStore
     )
+    await watchManager.setWindowResolver { deviceID, sessionID in
+        await runtime.resolveSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+    }
 
     let pairingRelay = GatewayPairingRelay(appLink: appLink, auditLog: auditLog, logger: logger)
 

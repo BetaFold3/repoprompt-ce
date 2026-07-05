@@ -72,10 +72,10 @@ struct RemoteCommandTranslator {
         self.bindingState = bindingState
     }
 
-    func translate(_ frame: RemoteClientFrame) throws -> RemoteToolCall {
+    func translate(_ frame: RemoteClientFrame, resolvedWindowID: Int? = nil) throws -> RemoteToolCall {
         let payload = try payloadObject(frame.payload)
         try rejectPassthroughKeys(payload)
-        try enforceBinding(for: frame.type, payload: payload)
+        try enforceBinding(for: frame.type, payload: payload, resolvedWindowID: resolvedWindowID)
 
         switch frame.type {
         case "start":
@@ -84,7 +84,8 @@ struct RemoteCommandTranslator {
                 op: "start",
                 payload: payload,
                 allowedPayloadKeys: Self.startPayloadKeys,
-                requiresSessionID: false
+                requiresSessionID: false,
+                resolvedWindowID: nil
             )
         case "steer":
             return try translateAgentRun(
@@ -92,7 +93,8 @@ struct RemoteCommandTranslator {
                 op: "steer",
                 payload: payload,
                 allowedPayloadKeys: Self.steerPayloadKeys,
-                requiresSessionID: true
+                requiresSessionID: true,
+                resolvedWindowID: resolvedWindowID
             )
         case "respond":
             return try translateAgentRun(
@@ -100,7 +102,8 @@ struct RemoteCommandTranslator {
                 op: "respond",
                 payload: payload,
                 allowedPayloadKeys: Self.respondPayloadKeys,
-                requiresSessionID: true
+                requiresSessionID: true,
+                resolvedWindowID: resolvedWindowID
             )
         case "cancel":
             return try translateAgentRun(
@@ -108,7 +111,8 @@ struct RemoteCommandTranslator {
                 op: "cancel",
                 payload: payload,
                 allowedPayloadKeys: Self.cancelPayloadKeys,
-                requiresSessionID: true
+                requiresSessionID: true,
+                resolvedWindowID: resolvedWindowID
             )
         case "poll":
             return try translateAgentRun(
@@ -116,7 +120,8 @@ struct RemoteCommandTranslator {
                 op: "poll",
                 payload: payload,
                 allowedPayloadKeys: Self.pollPayloadKeys,
-                requiresSessionID: frame.sessionID == nil && payload["session_ids"] == nil
+                requiresSessionID: frame.sessionID == nil && payload["session_ids"] == nil,
+                resolvedWindowID: resolvedWindowID
             )
         case "subscribe", "unsubscribe":
             // Subscriptions are gateway-owned observation state, but their immediate
@@ -126,7 +131,8 @@ struct RemoteCommandTranslator {
                 op: "poll",
                 payload: payload,
                 allowedPayloadKeys: Self.pollPayloadKeys,
-                requiresSessionID: frame.sessionID == nil && payload["session_ids"] == nil
+                requiresSessionID: frame.sessionID == nil && payload["session_ids"] == nil,
+                resolvedWindowID: resolvedWindowID
             )
         case "list_agents":
             return try translateAgentManage(
@@ -146,14 +152,15 @@ struct RemoteCommandTranslator {
                 op: "get_log",
                 payload: payload,
                 allowedPayloadKeys: Self.getLogPayloadKeys,
-                requiresSessionID: true
+                requiresSessionID: true,
+                resolvedWindowID: resolvedWindowID
             )
         default:
             throw RemoteCommandTranslatorError.unsupportedFrameType(frame.type)
         }
     }
 
-    private func enforceBinding(for operation: String, payload: [String: JSONValue]) throws {
+    private func enforceBinding(for operation: String, payload: [String: JSONValue], resolvedWindowID: Int?) throws {
         switch bindingState {
         case .bound:
             return
@@ -162,11 +169,13 @@ struct RemoteCommandTranslator {
             // proceed on an unbound multi-window connection. Observation and
             // session-addressed operations still require binding.
             if operation == "start", hasExplicitStartTarget(payload) { return }
+            if resolvedWindowID != nil, Self.sessionAddressedOperations.contains(operation) { return }
             throw RemoteCommandTranslatorError.bindingRequired(message)
         case .ambiguousStartTarget where operation == "start":
             if hasExplicitStartTarget(payload) { return }
             throw RemoteCommandTranslatorError.ambiguousStartTarget
         case let .ambiguousStartTarget(message):
+            if resolvedWindowID != nil, Self.sessionAddressedOperations.contains(operation) { return }
             throw RemoteCommandTranslatorError.bindingRequired(message)
         }
     }
@@ -180,7 +189,8 @@ struct RemoteCommandTranslator {
         op: String,
         payload: [String: JSONValue],
         allowedPayloadKeys: Set<String>,
-        requiresSessionID: Bool
+        requiresSessionID: Bool,
+        resolvedWindowID: Int?
     ) throws -> RemoteToolCall {
         try validateAllowedPayloadKeys(payload, operation: frame.type, allowed: allowedPayloadKeys)
         var arguments = commonArguments(op: op)
@@ -221,6 +231,9 @@ struct RemoteCommandTranslator {
                 arguments[key] = value.mcpValue
             }
         }
+        if let resolvedWindowID, Self.sessionAddressedAgentRunOps.contains(op) {
+            arguments["_windowID"] = .int(resolvedWindowID)
+        }
         return RemoteToolCall(toolName: "agent_run", arguments: arguments, timeout: nil)
     }
 
@@ -229,7 +242,8 @@ struct RemoteCommandTranslator {
         op: String,
         payload: [String: JSONValue],
         allowedPayloadKeys: Set<String>,
-        requiresSessionID: Bool = false
+        requiresSessionID: Bool = false,
+        resolvedWindowID: Int? = nil
     ) throws -> RemoteToolCall {
         try validateAllowedPayloadKeys(payload, operation: frame?.type ?? op, allowed: allowedPayloadKeys)
         var arguments = commonArguments(op: op)
@@ -240,6 +254,9 @@ struct RemoteCommandTranslator {
         }
         for (key, value) in payload {
             arguments[key] = value.mcpValue
+        }
+        if let resolvedWindowID, Self.sessionAddressedAgentManageOps.contains(op) {
+            arguments["_windowID"] = .int(resolvedWindowID)
         }
         return RemoteToolCall(toolName: "agent_manage", arguments: arguments, timeout: nil)
     }
@@ -345,5 +362,26 @@ struct RemoteCommandTranslator {
     private static let getLogPayloadKeys: Set<String> = [
         "offset",
         "limit"
+    ]
+
+    private static let sessionAddressedOperations: Set<String> = [
+        "steer",
+        "respond",
+        "cancel",
+        "poll",
+        "subscribe",
+        "unsubscribe",
+        "get_log"
+    ]
+
+    private static let sessionAddressedAgentRunOps: Set<String> = [
+        "steer",
+        "respond",
+        "cancel",
+        "poll"
+    ]
+
+    private static let sessionAddressedAgentManageOps: Set<String> = [
+        "get_log"
     ]
 }

@@ -184,6 +184,22 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testBindingRequiredErrorUsesFriendlyRemoteCopy() {
+        let error = RemoteClientError.fromCommandError(
+            code: "binding_required",
+            message: "Call bind_context with {\"op\":\"bind\"} before using agent_run."
+        )
+
+        let description = RemoteAgentModeCoordinator.describe(error)
+
+        XCTAssertEqual(
+            description,
+            "The host couldn't route this message to its window. Try again — if it keeps failing, the session's window may have been closed on the host."
+        )
+        XCTAssertFalse(description.contains("bind_context"))
+    }
+
+    @MainActor
     func testStoppingLastRemoteTabsReleasesControllersAndFanoutTasks() async throws {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
         let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))

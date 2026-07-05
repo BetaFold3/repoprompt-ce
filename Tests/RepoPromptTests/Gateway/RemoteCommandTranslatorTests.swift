@@ -244,6 +244,31 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         }
     }
 
+    func testResolvedWindowBypassesBindingRequiredForSessionAddressedOps() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let translator = RemoteCommandTranslator(bindingState: .bindingRequired("bind first"))
+
+        let steer = try translator.translate(
+            RemoteClientFrame(type: "steer", requestID: "r1", sessionID: sid, payload: .object(["message": .string("next")])),
+            resolvedWindowID: 9
+        )
+        XCTAssertEqual(steer.arguments["_windowID"], .int(9))
+        XCTAssertEqual(steer.arguments["session_id"], .string(sid))
+
+        let getLog = try translator.translate(
+            RemoteClientFrame(type: "get_log", sessionID: sid, payload: .object([:])),
+            resolvedWindowID: 9
+        )
+        XCTAssertEqual(getLog.toolName, "agent_manage")
+        XCTAssertEqual(getLog.arguments["_windowID"], .int(9))
+
+        XCTAssertThrowsError(try translator.translate(
+            RemoteClientFrame(type: "steer", requestID: "r2", sessionID: sid, payload: .object(["message": .string("next")]))
+        )) { error in
+            XCTAssertEqual(error as? RemoteCommandTranslatorError, .bindingRequired("bind first"))
+        }
+    }
+
     func testAmbiguousStartTargetRefusesNonStartOpsWithBindingRequired() throws {
         let translator = RemoteCommandTranslator(bindingState: .ambiguousStartTarget("multiple windows"))
         let frame = RemoteClientFrame(type: "list_sessions")

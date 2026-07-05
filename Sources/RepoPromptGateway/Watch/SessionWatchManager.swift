@@ -18,6 +18,8 @@ private enum SessionWatchError: Error, Equatable, CustomStringConvertible {
 }
 
 actor SessionWatchManager {
+    typealias WindowResolver = @Sendable (_ deviceID: String, _ sessionID: String) async -> Int?
+
     private struct DeviceState {
         var sinks: [UUID: any RemoteFrameSink] = [:]
         var watchedSessionIDs: Set<String> = []
@@ -35,6 +37,7 @@ actor SessionWatchManager {
     private let logger: Logger
     private let waitTimeoutSeconds: TimeInterval
     private let pollRefreshSeconds: TimeInterval
+    private var windowResolver: WindowResolver?
     private var devices: [String: DeviceState] = [:]
     private var seqByDeviceSession: [String: UInt64] = [:]
     /// Last wake kind pushed per (device, session); prevents duplicate pushes for
@@ -50,6 +53,7 @@ actor SessionWatchManager {
         appLink: AppLinkSession,
         appLinkPool: AppLinkPool? = nil,
         pushNotifier: (any RemotePushNotifying)? = nil,
+        windowResolver: WindowResolver? = nil,
         logger: Logger = Logger(label: "com.repoprompt.gateway.watch"),
         waitTimeoutSeconds: TimeInterval = 30,
         pollRefreshSeconds: TimeInterval = 5
@@ -57,9 +61,14 @@ actor SessionWatchManager {
         self.appLink = appLink
         self.appLinkPool = appLinkPool
         self.pushNotifier = pushNotifier
+        self.windowResolver = windowResolver
         self.logger = logger
         self.waitTimeoutSeconds = waitTimeoutSeconds
         self.pollRefreshSeconds = pollRefreshSeconds
+    }
+
+    func setWindowResolver(_ resolver: WindowResolver?) {
+        windowResolver = resolver
     }
 
     /// Paired devices observe through their own bootstrap app leg when one exists.
@@ -299,14 +308,17 @@ actor SessionWatchManager {
             else { return }
             let sessionIDs = state.activeWaitSessionIDs.sorted()
             do {
-                let value = try await callAgentRunWait(deviceID: deviceID, sessionIDs: sessionIDs)
-                let snapshots = RemoteSessionSnapshot.extractSnapshots(from: value)
-                if snapshots.isEmpty {
+                let waitResult = try await waitAndHandlePartitions(
+                    deviceID: deviceID,
+                    sessionIDs: sessionIDs,
+                    taskID: taskID
+                )
+                if waitResult == .paused {
+                    return
+                }
+                if waitResult == .empty {
                     try await Task.sleep(for: .milliseconds(Int64((pollRefreshSeconds * 1000).rounded(.up))))
                     continue
-                }
-                for snapshot in snapshots {
-                    await handleWaitSnapshot(deviceID: deviceID, snapshot: snapshot)
                 }
             } catch is CancellationError {
                 return
@@ -413,20 +425,101 @@ actor SessionWatchManager {
         return RemoteSessionSnapshot.extractSnapshots(from: value)
     }
 
-    private func callAgentRunPoll(deviceID: String, sessionIDs: [String]) async throws -> JSONValue {
-        let args: [String: Value] = if sessionIDs.count == 1 {
-            [
-                "op": .string("poll"),
-                "_rawJSON": .bool(true),
-                "session_id": .string(sessionIDs[0])
-            ]
-        } else {
-            [
-                "op": .string("poll"),
-                "_rawJSON": .bool(true),
-                "session_ids": .array(sessionIDs.map(Value.string))
-            ]
+    private enum WaitPartitionResult: Equatable {
+        case snapshots
+        case empty
+        case paused
+    }
+
+    private struct SessionWindowPartition {
+        let windowID: Int?
+        let sessionIDs: [String]
+    }
+
+    private enum WaitGroupOutcome {
+        case success(sessionIDs: [String], payload: JSONValue)
+        case toolError(sessionIDs: [String], message: String)
+    }
+
+    private func waitAndHandlePartitions(
+        deviceID: String,
+        sessionIDs: [String],
+        taskID: UUID
+    ) async throws -> WaitPartitionResult {
+        let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
+        var sawSnapshot = false
+        var paused = false
+
+        try await withThrowingTaskGroup(of: WaitGroupOutcome.self) { group in
+            for partition in partitions {
+                group.addTask {
+                    do {
+                        let payload = try await self.callAgentRunWaitPartition(
+                            deviceID: deviceID,
+                            sessionIDs: partition.sessionIDs,
+                            windowID: partition.windowID
+                        )
+                        return .success(sessionIDs: partition.sessionIDs, payload: payload)
+                    } catch let error as SessionWatchError {
+                        return .toolError(sessionIDs: partition.sessionIDs, message: error.description)
+                    }
+                }
+            }
+
+            while let outcome = try await group.next() {
+                guard devices[deviceID]?.waitTaskID == taskID else {
+                    group.cancelAll()
+                    return
+                }
+                switch outcome {
+                case let .success(_, payload):
+                    let snapshots = RemoteSessionSnapshot.extractSnapshots(from: payload)
+                    if !snapshots.isEmpty {
+                        sawSnapshot = true
+                    }
+                    for snapshot in snapshots {
+                        await handleWaitSnapshot(deviceID: deviceID, snapshot: snapshot)
+                    }
+                case let .toolError(sessionIDs, message):
+                    paused = true
+                    for sessionID in sessionIDs {
+                        await pauseObservationAfterToolError(
+                            deviceID: deviceID,
+                            sessionID: sessionID,
+                            error: SessionWatchError.toolCallFailed(message)
+                        )
+                    }
+                }
+            }
         }
+
+        if paused { return .paused }
+        return sawSnapshot ? .snapshots : .empty
+    }
+
+    private func callAgentRunPoll(deviceID: String, sessionIDs: [String]) async throws -> JSONValue {
+        let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
+        if partitions.count == 1 {
+            return try await callAgentRunPollPartition(
+                deviceID: deviceID,
+                sessionIDs: partitions[0].sessionIDs,
+                windowID: partitions[0].windowID
+            )
+        }
+        var snapshots: [JSONValue] = []
+        for partition in partitions {
+            let payload = try await callAgentRunPollPartition(
+                deviceID: deviceID,
+                sessionIDs: partition.sessionIDs,
+                windowID: partition.windowID
+            )
+            snapshots.append(contentsOf: RemoteSessionSnapshot.extractSnapshots(from: payload).map(\.payload))
+        }
+        return .object(["snapshots": .array(snapshots)])
+    }
+
+    private func callAgentRunPollPartition(deviceID: String, sessionIDs: [String], windowID: Int?) async throws -> JSONValue {
+        var args = agentRunSessionArgs(op: "poll", sessionIDs: sessionIDs, windowID: windowID)
         let result = try await appLink(forDevice: deviceID).callTool(name: "agent_run", arguments: args, timeout: 15)
         let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
         if result.isError == true {
@@ -437,21 +530,35 @@ actor SessionWatchManager {
     }
 
     private func callAgentRunWait(deviceID: String, sessionIDs: [String]) async throws -> JSONValue {
-        let args: [String: Value] = if sessionIDs.count == 1 {
-            [
-                "op": .string("wait"),
-                "_rawJSON": .bool(true),
-                "session_id": .string(sessionIDs[0]),
-                "timeout": .double(waitTimeoutSeconds)
-            ]
-        } else {
-            [
-                "op": .string("wait"),
-                "_rawJSON": .bool(true),
-                "session_ids": .array(sessionIDs.map(Value.string)),
-                "timeout": .double(waitTimeoutSeconds)
-            ]
+        let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
+        if partitions.count == 1 {
+            return try await callAgentRunWaitPartition(
+                deviceID: deviceID,
+                sessionIDs: partitions[0].sessionIDs,
+                windowID: partitions[0].windowID
+            )
         }
+        var snapshots: [JSONValue] = []
+        try await withThrowingTaskGroup(of: JSONValue.self) { group in
+            for partition in partitions {
+                group.addTask {
+                    try await self.callAgentRunWaitPartition(
+                        deviceID: deviceID,
+                        sessionIDs: partition.sessionIDs,
+                        windowID: partition.windowID
+                    )
+                }
+            }
+            for try await payload in group {
+                snapshots.append(contentsOf: RemoteSessionSnapshot.extractSnapshots(from: payload).map(\.payload))
+            }
+        }
+        return .object(["snapshots": .array(snapshots)])
+    }
+
+    private func callAgentRunWaitPartition(deviceID: String, sessionIDs: [String], windowID: Int?) async throws -> JSONValue {
+        var args = agentRunSessionArgs(op: "wait", sessionIDs: sessionIDs, windowID: windowID)
+        args["timeout"] = .double(waitTimeoutSeconds)
         let result = try await appLink(forDevice: deviceID)
             .callTool(name: "agent_run", arguments: args, timeout: waitTimeoutSeconds + 5)
         let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
@@ -460,6 +567,42 @@ actor SessionWatchManager {
             throw SessionWatchError.toolCallFailed(Self.toolErrorMessage(from: payload))
         }
         return payload
+    }
+
+    private func partitions(deviceID: String, sessionIDs: [String]) async -> [SessionWindowPartition] {
+        guard let windowResolver else {
+            return [SessionWindowPartition(windowID: nil, sessionIDs: sessionIDs)]
+        }
+        var byWindow: [Int: [String]] = [:]
+        var legacy: [String] = []
+        for sessionID in sessionIDs {
+            if let windowID = await windowResolver(deviceID, sessionID) {
+                byWindow[windowID, default: []].append(sessionID)
+            } else {
+                legacy.append(sessionID)
+            }
+        }
+        var result = byWindow.keys.sorted().map { SessionWindowPartition(windowID: $0, sessionIDs: byWindow[$0] ?? []) }
+        if !legacy.isEmpty {
+            result.append(SessionWindowPartition(windowID: nil, sessionIDs: legacy))
+        }
+        return result
+    }
+
+    private func agentRunSessionArgs(op: String, sessionIDs: [String], windowID: Int?) -> [String: Value] {
+        var args: [String: Value] = [
+            "op": .string(op),
+            "_rawJSON": .bool(true)
+        ]
+        if sessionIDs.count == 1 {
+            args["session_id"] = .string(sessionIDs[0])
+        } else {
+            args["session_ids"] = .array(sessionIDs.map(Value.string))
+        }
+        if let windowID {
+            args["_windowID"] = .int(windowID)
+        }
+        return args
     }
 
     private static func toolErrorMessage(from payload: JSONValue) -> String {

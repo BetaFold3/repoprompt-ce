@@ -33,6 +33,21 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         ]))
     }
 
+    private func sessionListResponse(_ ids: [String]) -> MCPToolResult {
+        GatewayTestHelpers.toolResult(json: .object([
+            "sessions": .array(ids.map { id in
+                .object([
+                    "session_id": .string(id),
+                    "name": .string("Session \(id.prefix(4))"),
+                    "last_modified": .string("2026-07-02T00:00:00.000Z"),
+                    "item_count": .int(1),
+                    "state": .string("running"),
+                    "is_live": .bool(true)
+                ])
+            })
+        ]))
+    }
+
     private func makeRuntime(
         connection: RecordingAppLinkConnection,
         bindingState: RemoteGatewayBindingState
@@ -50,13 +65,17 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             waitTimeoutSeconds: 0.2,
             pollRefreshSeconds: 0.2
         )
-        return try RemoteGatewayRuntime(
+        let runtime = try RemoteGatewayRuntime(
             appLink: appLink,
             ledger: CommandLedger(),
             watchManager: watchManager,
             auditLog: nil,
             bindingState: bindingState
         )
+        await watchManager.setWindowResolver { deviceID, sessionID in
+            await runtime.resolveSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+        }
+        return runtime
     }
 
     func testSubscribeOnUnboundConnectionReturnsBindingRequiredWithWindows() async throws {
@@ -124,6 +143,29 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(frame.payload?.objectValue?["code"]?.stringValue, "binding_required")
     }
 
+    func testSubscribeOnUnboundConnectionProceedsWhenSessionWindowResolves() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([sessionID])),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let sink = RecordingFrameSink()
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "subscribe", requestID: "r1", sessionID: sessionID),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        let calls = await connection.calls
+        let poll = try XCTUnwrap(calls.last { $0.name == "agent_run" && $0.arguments["op"] == .string("poll") })
+        XCTAssertEqual(poll.arguments["_windowID"], .int(2))
+    }
+
     func testStartWithoutSelectorOnAmbiguousConnectionReturnsStructuredErrorWithWindows() async throws {
         let connection = RecordingAppLinkConnection(responses: [
             .result(windowListResponse())
@@ -178,6 +220,174 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(start.arguments["_windowID"], .int(2))
         XCTAssertEqual(start.arguments["request_id"], .string("r1"))
         XCTAssertNil(start.arguments["window_id"])
+    }
+
+    func testExplicitStartRecordsAffinityForNextSteer() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(sessionID),
+                "status": .string("running")
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+        let sink = RecordingFrameSink()
+
+        _ = await runtime.handle(
+            RemoteClientFrame(type: "start", requestID: "r1", payload: .object(["message": .string("go"), "window_id": .int(2)])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+        let steer = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r2", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        XCTAssertEqual(steer?.type, "command_result")
+        let calls = await connection.calls
+        let steerCall = try XCTUnwrap(calls.last)
+        XCTAssertEqual(steerCall.arguments["op"], .string("steer"))
+        XCTAssertEqual(steerCall.arguments["_windowID"], .int(2))
+    }
+
+    func testDiscoveryResolvesUnknownSessionAndBulkLearnsSibling() async throws {
+        let sibling = "22222222-2222-2222-2222-222222222222"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([sessionID, sibling])),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sibling, status: "running")))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let sink = RecordingFrameSink()
+
+        _ = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r1", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+        _ = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r2", sessionID: sibling, payload: .object(["message": .string("again")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        let calls = await connection.calls
+        XCTAssertEqual(calls.count(where: { $0.name == "bind_context" }), 1)
+        let steerCalls = calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
+        XCTAssertEqual(steerCalls.count, 2)
+        XCTAssertTrue(steerCalls.allSatisfy { $0.arguments["_windowID"] == .int(2) })
+    }
+
+    func testDiscoveryMissReturnsBindingRequiredWithoutSessionExpired() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([]))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let sink = RecordingFrameSink()
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r1", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "binding_required")
+        XCTAssertNotEqual(response?.payload?.objectValue?["code"]?.stringValue, "session_expired")
+        let calls = await connection.calls
+        XCTAssertFalse(calls.contains { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") })
+    }
+
+    func testToolErrorInvalidatesRediscoversDifferentWindowAndRetriesOnce() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([sessionID])),
+            .result(sessionListResponse([])),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "code": .string("session_expired"),
+                "error": .string("Session not found")
+            ]), isError: true)),
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([sessionID])),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let sink = RecordingFrameSink()
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r1", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        let steerCalls = await connection.calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
+        XCTAssertEqual(steerCalls.count, 2)
+        XCTAssertEqual(steerCalls[0].arguments["_windowID"], .int(1))
+        XCTAssertEqual(steerCalls[1].arguments["_windowID"], .int(2))
+    }
+
+    func testNonRoutingToolErrorDoesNotRetryAcrossRediscoveredWindow() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([sessionID])),
+            .result(sessionListResponse([])),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "code": .string("provider_failed"),
+                "error": .string("Provider failed before accepting the message")
+            ]), isError: true))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let sink = RecordingFrameSink()
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r1", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "provider_failed")
+        let calls = await connection.calls
+        XCTAssertEqual(calls.count(where: { $0.name == "bind_context" }), 1)
+        let steerCalls = calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
+        XCTAssertEqual(steerCalls.count, 1)
+    }
+
+    func testAppLinkLostDoesNotRetryAndReturnsInDoubt() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([sessionID])),
+            .result(sessionListResponse([])),
+            .appLinkLost("restart")
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let sink = RecordingFrameSink()
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r1", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "in_doubt")
+        let steerCalls = await connection.calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
+        XCTAssertEqual(steerCalls.count, 1)
     }
 
     func testSubscribeOnBoundConnectionSucceeds() async throws {
