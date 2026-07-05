@@ -74,6 +74,18 @@ final class RemoteHostCatalogTests: XCTestCase {
         XCTAssertEqual(RemoteHostAgentCatalog.modelIDForStart(" codexExec:gpt-5.5-low "), "codexExec:gpt-5.5-low")
     }
 
+    func testModelIDForStartRejectsStaleLocalAndUnknownSelections() {
+        XCTAssertNil(RemoteHostAgentCatalog.modelIDForStart("gpt-5.5"))
+        XCTAssertNil(RemoteHostAgentCatalog.modelIDForStart("gpt-5.5-low"))
+        XCTAssertNil(RemoteHostAgentCatalog.modelIDForStart("sonnet"))
+        XCTAssertNil(RemoteHostAgentCatalog.modelIDForStart("nope:model"))
+
+        for labelKind in AgentModelCatalog.TaskLabelKind.allCases {
+            XCTAssertEqual(RemoteHostAgentCatalog.modelIDForStart(labelKind.rawValue), labelKind.rawValue)
+        }
+        XCTAssertEqual(RemoteHostAgentCatalog.modelIDForStart(" codexExec:gpt-5.5-low "), "codexExec:gpt-5.5-low")
+    }
+
     @MainActor
     func testDegradedCatalogIsServedFromCacheWithinTTL() async {
         let clock = RemoteHostCatalogTestClock(Date(timeIntervalSince1970: 1_800_000_000))

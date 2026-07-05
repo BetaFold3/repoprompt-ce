@@ -1,6 +1,20 @@
 import Foundation
 import RepoPromptRemoteWire
 
+protocol RemoteAgentSessionConnection: Sendable {
+    func command(_ frame: RemoteClientFrame, timeout: TimeInterval) async throws -> JSONValue
+    func ensureConnected() async throws
+    func subscribe(sessionIDs: [String]) async throws
+}
+
+extension RemoteAgentSessionConnection {
+    func command(_ frame: RemoteClientFrame) async throws -> JSONValue {
+        try await command(frame, timeout: RemoteHostConnection.commandTimeout)
+    }
+}
+
+extension RemoteHostConnection: RemoteAgentSessionConnection {}
+
 struct RemoteChannelState: Equatable {
     enum Kind: Equatable {
         case connected
@@ -28,17 +42,19 @@ actor RemoteAgentSessionController {
 
     private let hostID: String
     private let hostDisplayName: String
-    private let connection: RemoteHostConnection
+    private let connection: any RemoteAgentSessionConnection
     private let eventsContinuation: AsyncStream<RemoteSessionEvent>.Continuation
     private var remoteSessionID: String?
     private var lastAppliedSeq: UInt64
     private var nextLogOffset: Int
     private var projector: RemoteTranscriptProjector?
+    private var scheduledLogCatchUpTask: Task<Void, Never>?
+    private var scheduledLogCatchUpDirty = false
     private var isShutdown = false
 
     init(
         binding: AgentSessionRemoteHostBinding,
-        connection: RemoteHostConnection
+        connection: any RemoteAgentSessionConnection
     ) {
         hostID = binding.hostID
         hostDisplayName = binding.hostDisplayName
@@ -63,6 +79,7 @@ actor RemoteAgentSessionController {
     func shutdown() {
         guard !isShutdown else { return }
         isShutdown = true
+        scheduledLogCatchUpTask?.cancel()
         eventsContinuation.finish()
     }
 
@@ -93,6 +110,11 @@ actor RemoteAgentSessionController {
         )
         let response = try await commandWithTransportRetry(frame, operation: "start", mayRetryTransportLoss: true)
         let sessionID = try Self.remoteSessionID(from: response)
+        if sessionID != remoteSessionID {
+            lastAppliedSeq = 0
+            nextLogOffset = 0
+            scheduledLogCatchUpDirty = false
+        }
         remoteSessionID = sessionID
         projector = RemoteTranscriptProjector(remoteSessionID: sessionID)
         emitBinding()
@@ -185,10 +207,12 @@ actor RemoteAgentSessionController {
         case "session_update":
             if let payload = frame.payload {
                 applySnapshot(payload, frameType: frame.type)
+                scheduleLogCatchUp()
             }
         case "session_terminal":
             if let payload = frame.payload {
                 applySnapshot(payload, frameType: frame.type)
+                scheduleLogCatchUp()
             }
         case "session_expired":
             eventsContinuation.yield(.sessionExpired)
@@ -260,6 +284,12 @@ actor RemoteAgentSessionController {
             return
         }
 
+        try await pageLogsFromHost()
+    }
+
+    private func pageLogsFromHost() async throws {
+        try ensureNotShutdown()
+        guard let sessionID = remoteSessionID else { return }
         var keepPaging = true
         while keepPaging {
             try ensureNotShutdown()
@@ -286,6 +316,19 @@ actor RemoteAgentSessionController {
             if page.returnedTurnCount > 0, nextLogOffset <= previousOffset {
                 eventsContinuation.yield(.systemMessage("Remote log page did not advance; stopped catch-up paging."))
             }
+        }
+    }
+
+    private func scheduleLogCatchUp() {
+        guard !isShutdown, remoteSessionID != nil else { return }
+        scheduledLogCatchUpDirty = true
+        guard scheduledLogCatchUpTask == nil else { return }
+        scheduledLogCatchUpTask = Task {
+            while self.scheduledLogCatchUpDirty, !self.isShutdown {
+                self.scheduledLogCatchUpDirty = false
+                try? await self.pageLogsFromHost()
+            }
+            self.scheduledLogCatchUpTask = nil
         }
     }
 

@@ -78,7 +78,13 @@ struct RemoteHostAgentCatalog: Codable, Equatable {
         guard let rawModelID else { return nil }
         let trimmed = rawModelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != hostDefaultModelID else { return nil }
-        return trimmed
+        if agentKind(forModelID: trimmed) != nil {
+            return trimmed
+        }
+        if AgentModelCatalog.TaskLabelKind.allCases.contains(where: { $0.rawValue == trimmed }) {
+            return trimmed
+        }
+        return nil
     }
 
     static func agentKind(forModelID rawModelID: String?) -> AgentProviderKind? {

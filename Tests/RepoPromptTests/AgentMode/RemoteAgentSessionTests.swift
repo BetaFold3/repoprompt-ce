@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import RepoPromptRemoteWire
 import XCTest
 
 final class RemoteAgentSessionTests: XCTestCase {
@@ -161,6 +162,136 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertNil(record.agentSessionMeta().remoteHostName)
     }
 
+    func testStartWithNewRemoteSessionResetsCountersAndAcceptsSeqOne() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "start": [Self.snapshotPayload(sessionID: "remote-session-new")],
+            "poll": [Self.snapshotPayload()],
+            "get_log": [
+                Self.logPayload(offset: 0, returned: 0, total: 0, xml: "<transcript/>")
+            ]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "remote-session-old"),
+            connection: connection
+        )
+
+        let sessionID = try await controller.start(
+            message: "hello",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: nil,
+            workspaceID: nil
+        )
+
+        XCTAssertEqual(sessionID, "remote-session-new")
+        let logOffsets = await connection.getLogOffsets()
+        XCTAssertEqual(logOffsets.first, 0)
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-new",
+            seq: 1,
+            payload: Self.snapshotPayload()
+        ))
+        await waitForRemoteAgentSessionCondition {
+            await (controller.currentBinding())?.lastAppliedSeq == 1
+        }
+
+        let currentBinding = await controller.currentBinding()
+        let binding = try XCTUnwrap(currentBinding)
+        XCTAssertEqual(binding.lastAppliedSeq, 1)
+        XCTAssertEqual(binding.nextLogOffset, 0)
+    }
+
+    func testContiguousSessionUpdateTriggersLogFetch() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "get_log": [Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<assistant>Remote reply</assistant>")]
+        ])
+        let controller = RemoteAgentSessionController(binding: makeBinding(lastAppliedSeq: 0, nextLogOffset: 0), connection: connection)
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-abc",
+            seq: 1,
+            payload: Self.snapshotPayload()
+        ))
+
+        await waitForRemoteAgentSessionCondition {
+            await recorder.firstTranscriptRows() != nil
+        }
+        let firstRows = await recorder.firstTranscriptRows()
+        let rows = try XCTUnwrap(firstRows)
+        XCTAssertEqual(rows.map(\.text), ["Remote reply"])
+        let getLogCount = await connection.commandCount(type: "get_log")
+        XCTAssertEqual(getLogCount, 1)
+    }
+
+    func testRapidSessionUpdatesCoalesceLogCatchUpWork() async {
+        let connection = RecordingRemoteAgentSessionConnection(getLogDelayNanoseconds: 50_000_000)
+        let controller = RemoteAgentSessionController(binding: makeBinding(lastAppliedSeq: 0, nextLogOffset: 0), connection: connection)
+        defer { Task { await controller.shutdown() } }
+
+        for seq in UInt64(1) ... UInt64(10) {
+            await controller.handleInboundFrame(RemoteServerFrame(
+                type: "session_update",
+                sessionID: "remote-session-abc",
+                seq: seq,
+                payload: Self.snapshotPayload()
+            ))
+        }
+
+        await waitForRemoteAgentSessionCondition {
+            await connection.commandCount(type: "get_log") >= 1
+        }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        let getLogCount = await connection.commandCount(type: "get_log")
+        XCTAssertGreaterThanOrEqual(getLogCount, 1)
+        XCTAssertLessThanOrEqual(getLogCount, 2)
+    }
+
+    func testSessionTerminalTriggersFinalLogFetch() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "get_log": [Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<assistant>Final reply</assistant>")]
+        ])
+        let controller = RemoteAgentSessionController(binding: makeBinding(lastAppliedSeq: 0, nextLogOffset: 0), connection: connection)
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_terminal",
+            sessionID: "remote-session-abc",
+            seq: 1,
+            payload: Self.snapshotPayload(status: "completed")
+        ))
+
+        await waitForRemoteAgentSessionCondition {
+            await recorder.firstTranscriptRows() != nil
+        }
+        let firstRows = await recorder.firstTranscriptRows()
+        let rows = try XCTUnwrap(firstRows)
+        XCTAssertEqual(rows.map(\.text), ["Final reply"])
+        let getLogCount = await connection.commandCount(type: "get_log")
+        XCTAssertEqual(getLogCount, 1)
+    }
+
     @MainActor
     func testChannelClosingReasonSurfacesAsBannerAndDedupedSystemRows() {
         let coordinator = RemoteAgentModeCoordinator()
@@ -288,14 +419,16 @@ final class RemoteAgentSessionTests: XCTestCase {
 
     private func makeBinding(
         hostID: String = "host-abc",
-        remoteSessionID: String = "remote-session-abc"
+        remoteSessionID: String = "remote-session-abc",
+        lastAppliedSeq: UInt64 = 42,
+        nextLogOffset: Int = 7
     ) -> AgentSessionRemoteHostBinding {
         AgentSessionRemoteHostBinding(
             hostID: hostID,
             hostDisplayName: "Studio Mac",
             remoteSessionID: remoteSessionID,
-            lastAppliedSeq: 42,
-            nextLogOffset: 7
+            lastAppliedSeq: lastAppliedSeq,
+            nextLogOffset: nextLogOffset
         )
     }
 
@@ -304,6 +437,116 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         init(_ value: Value?) {
             self.value = value
+        }
+    }
+
+    private static func snapshotPayload(status: String = "running", sessionID: String? = nil) -> JSONValue {
+        var payload: [String: JSONValue] = ["status": .string(status)]
+        if let sessionID {
+            payload["session_id"] = .string(sessionID)
+        }
+        return .object(payload)
+    }
+
+    private static func logPayload(offset: Int, returned: Int, total: Int, xml: String) -> JSONValue {
+        .object([
+            "turn_offset": .int(offset),
+            "returned_turn_count": .int(returned),
+            "total_turns": .int(total),
+            "transcript_xml": .string(xml)
+        ])
+    }
+
+    private func waitForRemoteAgentSessionCondition(
+        _ predicate: @escaping () async -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0 ..< 100 {
+            if await predicate() { return }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let finalResult = await predicate()
+        XCTAssertTrue(finalResult, "Timed out waiting for remote agent session condition", file: file, line: line)
+    }
+
+    private actor RemoteSessionEventRecorder {
+        private var transcriptRows: [[AgentChatItem]] = []
+
+        func record(_ event: RemoteSessionEvent) {
+            if case let .transcriptRows(rows) = event {
+                transcriptRows.append(rows)
+            }
+        }
+
+        func firstTranscriptRows() -> [AgentChatItem]? {
+            transcriptRows.first
+        }
+    }
+
+    private actor RecordingRemoteAgentSessionConnection: RemoteAgentSessionConnection {
+        private var responses: [String: [JSONValue]]
+        private let getLogDelayNanoseconds: UInt64
+        private var frames: [RemoteClientFrame] = []
+        private var subscribedSessionIDs: [[String]] = []
+        private var ensureConnectedCallCount = 0
+
+        init(
+            responses: [String: [JSONValue]] = [:],
+            getLogDelayNanoseconds: UInt64 = 0
+        ) {
+            self.responses = responses
+            self.getLogDelayNanoseconds = getLogDelayNanoseconds
+        }
+
+        func command(_ frame: RemoteClientFrame, timeout _: TimeInterval) async throws -> JSONValue {
+            frames.append(frame)
+            if frame.type == "get_log", getLogDelayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: getLogDelayNanoseconds)
+            }
+            if var queued = responses[frame.type], !queued.isEmpty {
+                let response = queued.removeFirst()
+                responses[frame.type] = queued
+                return response
+            }
+            return defaultResponse(for: frame)
+        }
+
+        func ensureConnected() async throws {
+            ensureConnectedCallCount += 1
+        }
+
+        func subscribe(sessionIDs: [String]) async throws {
+            subscribedSessionIDs.append(sessionIDs)
+        }
+
+        func commandCount(type: String) -> Int {
+            frames.count { $0.type == type }
+        }
+
+        func getLogOffsets() -> [Int] {
+            frames.compactMap { frame in
+                guard frame.type == "get_log" else { return nil }
+                return frame.payload?.objectValue?["offset"]?.intValue
+            }
+        }
+
+        private func defaultResponse(for frame: RemoteClientFrame) -> JSONValue {
+            switch frame.type {
+            case "start":
+                RemoteAgentSessionTests.snapshotPayload(sessionID: "remote-session-abc")
+            case "poll":
+                RemoteAgentSessionTests.snapshotPayload()
+            case "get_log":
+                RemoteAgentSessionTests.logPayload(
+                    offset: frame.payload?.objectValue?["offset"]?.intValue ?? 0,
+                    returned: 0,
+                    total: 0,
+                    xml: "<transcript/>"
+                )
+            default:
+                .object([:])
+            }
         }
     }
 

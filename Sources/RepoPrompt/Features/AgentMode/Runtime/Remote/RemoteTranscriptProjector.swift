@@ -173,7 +173,15 @@ struct RemoteTranscriptProjector: Equatable {
             }
         }
         if rows.isEmpty {
-            return [XMLRow(kind: .system, text: xml, toolName: nil)]
+            var fallback = xml.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard fallback != "<transcript/>" else { return [] }
+            if fallback.hasPrefix("<transcript>"), fallback.hasSuffix("</transcript>") {
+                fallback.removeFirst("<transcript>".count)
+                fallback.removeLast("</transcript>".count)
+            }
+            fallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !fallback.isEmpty else { return [] }
+            return [XMLRow(kind: .system, text: fallback, toolName: nil)]
         }
         return rows
     }

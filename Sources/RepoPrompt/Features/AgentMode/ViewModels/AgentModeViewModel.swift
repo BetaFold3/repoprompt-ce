@@ -12307,6 +12307,19 @@ final class AgentModeViewModel: ObservableObject {
             session.pendingRemoteOptimisticUserItemIDs.insert(userItem.id)
             let shouldStartRemote = !session.runState.isActive || session.remoteHost?.remoteSessionID.isEmpty == true
             let modelSelectionRaw = RemoteHostAgentCatalog.modelIDForStart(session.selectedModelRaw)
+            let selectedModelRaw = session.selectedModelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if modelSelectionRaw == nil,
+               !selectedModelRaw.isEmpty,
+               selectedModelRaw != RemoteHostAgentCatalog.hostDefaultModelID
+            {
+                session.selectedModelRaw = RemoteHostAgentCatalog.hostDefaultModelID
+                if tabID == currentTabID {
+                    setSelectedModelRawDuringStateRestore(RemoteHostAgentCatalog.hostDefaultModelID)
+                }
+                scheduleSave(for: tabID)
+                syncComposerUIState(tabID: tabID)
+                syncStatusPillsUIState()
+            }
             let sessionName = resolvedSessionDisplayName(for: tabID)
             Task { [weak self, weak session] in
                 guard let self, let session else { return }
