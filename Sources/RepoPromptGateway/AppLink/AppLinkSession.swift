@@ -94,6 +94,17 @@ protocol AppLinkConnecting: Sendable {
     ) async throws -> any AppLinkConnection
 }
 
+/// Derives the app-side bootstrap session token used by each gateway app link.
+/// Stable per (gateway launch, link identity) and distinct across links: same-link
+/// reconnects keep their token so the app's stale-predecessor replacement still
+/// applies within that link. Device links use the accepted 8-character device
+/// prefix, so two full device IDs with the same prefix intentionally collide here.
+enum AppLinkSessionToken {
+    static func derive(bootstrapToken: String, clientName: String) -> String {
+        "\(bootstrapToken):\(clientName)"
+    }
+}
+
 extension AppLinkConnecting {
     func connect(
         configuration: GatewayConfiguration,
@@ -314,7 +325,10 @@ struct GatewayBootstrapMCPConnector: AppLinkConnecting {
     ) async throws -> any AppLinkConnection {
         let connectedFD = try await BootstrapHandshake.connectAndHandshake(
             socketURL: configuration.bootstrapSocketURL,
-            sessionToken: configuration.bootstrapToken,
+            sessionToken: AppLinkSessionToken.derive(
+                bootstrapToken: configuration.bootstrapToken,
+                clientName: clientName
+            ),
             clientName: clientName,
             gatewayCredential: configuration.appLegCredential,
             logger: logger

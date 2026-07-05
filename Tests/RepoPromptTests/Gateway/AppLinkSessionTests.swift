@@ -6,6 +6,37 @@ import RepoPromptShared
 import XCTest
 
 final class AppLinkSessionTests: XCTestCase {
+    func testDerivedSessionTokenIsStablePerGatewayLaunchAndLinkIdentity() {
+        let bootstrapToken = "gateway-bootstrap-token"
+
+        let phase0 = AppLinkSessionToken.derive(
+            bootstrapToken: bootstrapToken,
+            clientName: "repoprompt-gateway"
+        )
+        let deviceA = AppLinkSessionToken.derive(
+            bootstrapToken: bootstrapToken,
+            clientName: "remote:aaaa1111"
+        )
+        let deviceB = AppLinkSessionToken.derive(
+            bootstrapToken: bootstrapToken,
+            clientName: "remote:bbbb2222"
+        )
+
+        XCTAssertEqual(
+            phase0,
+            AppLinkSessionToken.derive(
+                bootstrapToken: bootstrapToken,
+                clientName: "repoprompt-gateway"
+            )
+        )
+        XCTAssertNotEqual(phase0, deviceA)
+        XCTAssertNotEqual(phase0, deviceB)
+        XCTAssertNotEqual(deviceA, deviceB)
+        XCTAssertTrue(phase0.hasPrefix("\(bootstrapToken):"))
+        XCTAssertTrue(deviceA.hasPrefix("\(bootstrapToken):"))
+        XCTAssertTrue(deviceB.hasPrefix("\(bootstrapToken):"))
+    }
+
     func testStubBootstrapAcceptEmitsConnected() async throws {
         let connector = StubAppLinkConnector(outcomes: [.success(StubAppLinkConnection())])
         let session = try AppLinkSession(
@@ -86,6 +117,38 @@ final class AppLinkSessionTests: XCTestCase {
         await session.shutdown()
     }
 
+    func testReconnectAttemptsUseSameConfigurationAndClientName() async throws {
+        let connector = StubAppLinkConnector(outcomes: [
+            .failure(StubAppLinkError.rejected),
+            .success(StubAppLinkConnection())
+        ])
+        let configuration = try GatewayConfiguration.parse(
+            arguments: [],
+            environment: [
+                GatewayConfiguration.EnvironmentKey.bootstrapToken: "gateway-bootstrap-token"
+            ]
+        )
+        let session = AppLinkSession(
+            config: configuration,
+            clientName: "remote:aaaa1111",
+            connector: connector,
+            sleep: { _ in },
+            initialReconnectBackoff: 0.001,
+            maximumReconnectBackoff: 0.001
+        )
+        var events = session.stateEvents.makeAsyncIterator()
+
+        await session.start()
+        _ = await events.next()
+        _ = await events.next()
+
+        let attempts = await connector.recordedAttempts
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertEqual(attempts.map(\.configuration), [configuration, configuration])
+        XCTAssertEqual(attempts.map(\.clientName), ["remote:aaaa1111", "remote:aaaa1111"])
+        await session.shutdown()
+    }
+
     func testReconnectEmitsFailedAfterConfiguredAttemptBudget() async throws {
         let connector = StubAppLinkConnector(outcomes: [
             .failure(StubAppLinkError.rejected),
@@ -147,17 +210,28 @@ private enum StubAppLinkError: Error, CustomStringConvertible {
 }
 
 private actor StubAppLinkConnector: AppLinkConnecting {
+    struct Attempt: Equatable {
+        let configuration: GatewayConfiguration
+        let clientName: String
+    }
+
     private var outcomes: [Result<StubAppLinkConnection, Error>]
+    private var attempts: [Attempt] = []
 
     init(outcomes: [Result<StubAppLinkConnection, Error>]) {
         self.outcomes = outcomes
     }
 
+    var recordedAttempts: [Attempt] {
+        attempts
+    }
+
     func connect(
-        configuration _: GatewayConfiguration,
-        clientName _: String,
+        configuration: GatewayConfiguration,
+        clientName: String,
         logger _: Logger
     ) async throws -> any AppLinkConnection {
+        attempts.append(Attempt(configuration: configuration, clientName: clientName))
         guard !outcomes.isEmpty else { return StubAppLinkConnection() }
         return try outcomes.removeFirst().get()
     }
