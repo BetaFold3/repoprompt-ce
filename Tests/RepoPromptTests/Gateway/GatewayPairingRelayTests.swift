@@ -30,6 +30,26 @@ final class GatewayPairingRelayTests: XCTestCase {
         XCTAssertEqual(calls.count, GatewayPairingRelay.rateLimitMaximumRequests)
     }
 
+    func testAppLinkFailureResponseIncludesUnavailableCode() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let connection = RecordingAppLinkConnection(responses: [.appLinkLost("restart")])
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let relay = GatewayPairingRelay(appLink: appLink)
+
+        let response = await relay.handle(path: GatewayPairingRelay.completePairingPath, body: Data())
+
+        XCTAssertEqual(response.status, 503)
+        XCTAssertEqual(response.body.objectValue?["code"]?.stringValue, "app_link_unavailable")
+        XCTAssertTrue(response.body.objectValue?["error"]?.stringValue?.contains("The app link is unavailable") == true)
+    }
+
     func testRelayedPairingCallsRequestRawJSONToolOutput() async throws {
         let root = try GatewayTestHelpers.temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

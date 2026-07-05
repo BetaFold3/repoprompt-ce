@@ -84,6 +84,75 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
         XCTAssertNil(stored.revokedAt)
     }
 
+    func testRecompletePairingPreservesExistingCounterFloor() async throws {
+        let directory = try RemotePairingTestSupport.temporaryDirectory(testCase: self)
+        let store = makeStore(url: RemotePairingTestSupport.registryURL(in: directory))
+        let manager = RemoteDeviceApprovalManager(bringWindowToFront: { _ in })
+        let challengeStore = RemotePairingChallengeStore(challengeGenerator: { UUID().uuidString })
+        let deps = makeDependencies(
+            identityStore: store,
+            approvalManager: manager,
+            challengeStore: challengeStore
+        )
+        let context = MCPWindowToolContext(toolName: MCPWindowToolName.remotePairing, windowID: 7)
+        let deviceKey = P256.Signing.PrivateKey()
+        let deviceID = try RemotePairingCrypto.deviceID(forRawPublicKey: deviceKey.publicKey.rawRepresentation)
+        let requestedScopes: Set<RemoteScope> = [.sessionsObserve, .interactionsRespond]
+
+        func completePairing(displayName: String) async throws -> Value {
+            let begin = try await MCPRemotePairingToolProvider.execute(
+                args: ["op": .string(RemotePairingOperation.beginPairing.rawValue)],
+                context: context,
+                dependencies: deps
+            )
+            let beginObject = try XCTUnwrap(begin.objectValue)
+            let pairingID = try XCTUnwrap(try UUID(uuidString: XCTUnwrap(beginObject["pairing_id"]?.stringValue)))
+            let challenge = try XCTUnwrap(beginObject["challenge"]?.stringValue)
+            let proofPayload = RemotePairingDeviceProofPayload(
+                pairingID: pairingID,
+                challenge: challenge,
+                deviceID: deviceID,
+                displayName: displayName,
+                publicKeyRawRepresentation: deviceKey.publicKey.rawRepresentation,
+                scopes: requestedScopes
+            )
+            let proof = try RemotePairingCrypto.signDeviceChallenge(payload: proofPayload, deviceSigner: deviceKey)
+            let completeTask = Task { @MainActor () throws -> Value in
+                try await MCPRemotePairingToolProvider.execute(
+                    args: [
+                        "op": .string(RemotePairingOperation.completePairing.rawValue),
+                        "pairing_id": .string(pairingID.uuidString),
+                        "display_name": .string(displayName),
+                        "device_id": .string(deviceID),
+                        "public_key": .string(deviceKey.publicKey.rawRepresentation.base64EncodedString()),
+                        "proof": .string(proof.base64EncodedString()),
+                        "scopes": .array(requestedScopes.sorted().map { .string($0.rawValue) })
+                    ],
+                    context: context,
+                    dependencies: deps
+                )
+            }
+            await waitUntil { manager.pendingRequest?.displayName == displayName }
+            manager.resolveApproval(allow: true, grantedScopes: [.sessionsObserve])
+            return try await completeTask.value
+        }
+
+        _ = try await completePairing(displayName: "Test Phone")
+        var firstRecord = try XCTUnwrap(try store.device(id: deviceID))
+        firstRecord.counterFloor = 123
+        try store.upsertDevice(firstRecord)
+
+        let secondResult = try await completePairing(displayName: "Test Phone Again")
+        XCTAssertEqual(secondResult.objectValue?["device"]?.objectValue?["counter_floor"]?.intValue, 123)
+
+        let devices = try store.listDevices()
+        XCTAssertEqual(devices.map(\.id), [deviceID])
+        let stored = try XCTUnwrap(devices.first)
+        XCTAssertEqual(stored.displayName, "Test Phone Again")
+        XCTAssertEqual(stored.counterFloor, 123)
+        XCTAssertNil(stored.revokedAt)
+    }
+
     func testRevokeMarksDeviceRevokedAndClearsPushMetadata() async throws {
         let directory = try RemotePairingTestSupport.temporaryDirectory(testCase: self)
         let store = makeStore(url: RemotePairingTestSupport.registryURL(in: directory))

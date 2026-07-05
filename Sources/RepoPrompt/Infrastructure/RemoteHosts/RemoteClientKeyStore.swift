@@ -58,6 +58,24 @@ final class RemoteClientKeyStore: @unchecked Sendable {
         try privateKey(forHostID: hostID).publicKey
     }
 
+    /// Loads the stored device key for a host or creates and saves one when missing.
+    ///
+    /// The key intentionally persists across failed or abandoned pairing attempts so
+    /// the deviceID stays stable across retries; `deleteKey` (forgetHost) is the
+    /// cleanup path.
+    @discardableResult
+    func loadOrCreateKey(forHostID hostID: String) throws -> P256.Signing.PrivateKey {
+        try withLock {
+            do {
+                return try privateKey(forHostID: hostID)
+            } catch RemoteClientKeyStoreError.missingKey {
+                let key = P256.Signing.PrivateKey()
+                try save(key, forHostID: hostID)
+                return key
+            }
+        }
+    }
+
     func save(_ privateKey: P256.Signing.PrivateKey, forHostID hostID: String) throws {
         try withLock {
             let account = try Self.account(forHostID: hostID)

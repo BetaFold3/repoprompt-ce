@@ -367,7 +367,9 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         case let RemoteHostPairingError.consentDenied(message):
             return message
         case RemoteHostPairingError.timeout:
-            return "Timed out waiting for approval on the host."
+            return "Timed out contacting the host's gateway."
+        case let RemoteHostPairingError.completionUnconfirmed(reason):
+            return "Pairing wasn't confirmed: \(reason). The host may have already added this device. It's safe to retry — this Mac kept its device key — or you can revoke the device in the host's Remote Control settings."
         case let RemoteHostPairingError.httpError(statusCode, code, message):
             let suffix = message ?? code ?? "HTTP \(statusCode)"
             return "Pairing failed: \(suffix)."

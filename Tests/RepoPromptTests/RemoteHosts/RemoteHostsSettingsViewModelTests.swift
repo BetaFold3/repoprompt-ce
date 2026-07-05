@@ -224,6 +224,18 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.errorMessage, "Host name cannot be empty.")
     }
 
+    func testPairingErrorMessagesIncludeCompletionUnconfirmedGuidance() {
+        let completionMessage = RemoteHostsSettingsViewModel.message(for: RemoteHostPairingError.completionUnconfirmed("x"))
+        XCTAssertTrue(completionMessage.contains("Pairing wasn't confirmed: x"))
+        XCTAssertTrue(completionMessage.contains("It's safe to retry"))
+        XCTAssertTrue(completionMessage.contains("kept its device key"))
+        XCTAssertTrue(completionMessage.contains("revoke the device"))
+        XCTAssertEqual(
+            RemoteHostsSettingsViewModel.message(for: RemoteHostPairingError.timeout),
+            "Timed out contacting the host's gateway."
+        )
+    }
+
     func testInvalidPairingPayloadSurfacesFriendlyError() throws {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
         let viewModel = RemoteHostsSettingsViewModel(

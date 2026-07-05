@@ -163,7 +163,8 @@ actor GatewayPairingRelay {
             audit(op: auditOp, outcome: "failure", code: "app_link_error")
             logger.debug("Pairing relay \(op) failed: \(String(describing: error))")
             return RelayResponse(status: 503, body: .object([
-                "error": .string("The app link is unavailable: \(String(describing: error))")
+                "error": .string("The app link is unavailable: \(String(describing: error))"),
+                "code": .string("app_link_unavailable")
             ]))
         }
     }

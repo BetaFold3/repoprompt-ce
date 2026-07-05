@@ -109,6 +109,20 @@ final class RemotePairingIdentityStore: @unchecked Sendable {
     }
 
     @discardableResult
+    func upsertDevicePreservingCounterFloor(_ record: PairedDeviceRecord) throws -> PairedDeviceRecord {
+        try withLock {
+            var registry = try registry()
+            let existingCounterFloor = registry.devices.first { $0.id == record.id }?.counterFloor ?? 0
+            var updated = record
+            updated.counterFloor = max(existingCounterFloor, record.counterFloor)
+            registry.devices.removeAll { $0.id == record.id }
+            registry.devices.append(updated)
+            try save(registry)
+            return updated
+        }
+    }
+
+    @discardableResult
     func revokeDevice(id: String, revokedAt: Date = Date()) throws -> PairedDeviceRecord {
         try withLock {
             var registry = try registry()

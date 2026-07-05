@@ -196,17 +196,22 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
             throw MCPError.invalidRequest("Remote device pairing was denied by the user.")
         }
 
+        let existingDevice = try dependencies.identityStore.device(id: deviceID)
+        // deviceID is the pubkey fingerprint, so a re-pair reuses the same key;
+        // resetting the anti-replay counterFloor would open a replay window for
+        // previously captured signed frames.
         let record = PairedDeviceRecord(
             id: deviceID,
             displayName: displayName,
             publicKeyRawRepresentation: publicKeyRaw,
             scopes: grantedScopes,
-            createdAt: dependencies.now()
+            createdAt: dependencies.now(),
+            counterFloor: existingDevice?.counterFloor ?? 0
         )
-        try dependencies.identityStore.upsertDevice(record)
+        let savedRecord = try dependencies.identityStore.upsertDevicePreservingCounterFloor(record)
         return .object([
             "ok": .bool(true),
-            "device": deviceValue(record)
+            "device": deviceValue(savedRecord)
         ])
     }
 

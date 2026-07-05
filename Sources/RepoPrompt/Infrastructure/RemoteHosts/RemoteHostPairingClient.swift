@@ -48,6 +48,7 @@ enum RemoteHostPairingError: Error, Equatable {
     case hostIdentityMismatch(String)
     case consentDenied(String)
     case timeout
+    case completionUnconfirmed(String)
     case httpError(statusCode: Int, code: String?, message: String?)
     case transport(String)
 }
@@ -90,7 +91,7 @@ struct RemoteHostPairingClient {
         let begin = try await beginPairing(payload: payload)
         try verifyBeginResponse(begin, against: payload)
 
-        let deviceKey = P256.Signing.PrivateKey()
+        let deviceKey = try keyStore.loadOrCreateKey(forHostID: payload.hostFingerprint)
         let publicKeyRaw = deviceKey.publicKey.rawRepresentation
         let deviceID = try RemotePairingCrypto.deviceID(forRawPublicKey: publicKeyRaw)
         let proofPayload = RemotePairingDeviceChallengeV1(
@@ -112,21 +113,20 @@ struct RemoteHostPairingClient {
             proof: proof,
             requestedScopes: requestedScopes
         )
-        let record = try record(
+        return try record(
             from: complete,
             payload: payload,
             expectedDeviceID: deviceID,
             expectedPublicKeyRaw: publicKeyRaw
         )
-        try keyStore.save(deviceKey, forHostID: payload.hostFingerprint)
-        return record
     }
 
     private func beginPairing(payload: RemotePairingPayload) async throws -> BeginPairingResponse {
         let data = try await post(
             endpoint(base: payload.gatewayURL, pathComponents: ["api", "pair", "begin"]),
             body: [:],
-            timeout: Self.beginTimeout
+            timeout: Self.beginTimeout,
+            phase: .begin
         )
         do {
             return try JSONDecoder().decode(BeginPairingResponse.self, from: data)
@@ -154,7 +154,8 @@ struct RemoteHostPairingClient {
                 "proof": .string(proof.base64EncodedString()),
                 "scopes": .array(requestedScopes.sorted().map(JSONValue.string))
             ],
-            timeout: Self.completeTimeout
+            timeout: Self.completeTimeout,
+            phase: .complete
         )
         do {
             return try JSONDecoder().decode(CompletePairingResponse.self, from: data)
@@ -163,20 +164,40 @@ struct RemoteHostPairingClient {
         }
     }
 
-    private func post(_ url: URL, body: [String: JSONValue], timeout: TimeInterval) async throws -> Data {
+    private enum PairingPhase {
+        case begin
+        case complete
+    }
+
+    private func post(
+        _ url: URL,
+        body: [String: JSONValue],
+        timeout: TimeInterval,
+        phase: PairingPhase
+    ) async throws -> Data {
         let response: RemoteHostPairingHTTPResponse
         do {
             response = try await transport.postJSON(to: url, body: body, timeout: timeout)
         } catch let error as RemoteHostPairingError {
             throw error
         } catch let error as URLError where error.code == .timedOut {
-            throw RemoteHostPairingError.timeout
+            switch phase {
+            case .begin:
+                throw RemoteHostPairingError.timeout
+            case .complete:
+                throw RemoteHostPairingError.completionUnconfirmed(error.localizedDescription)
+            }
         } catch {
-            throw RemoteHostPairingError.transport(error.localizedDescription)
+            switch phase {
+            case .begin:
+                throw RemoteHostPairingError.transport(error.localizedDescription)
+            case .complete:
+                throw RemoteHostPairingError.completionUnconfirmed(error.localizedDescription)
+            }
         }
 
         guard (200 ..< 300).contains(response.statusCode) else {
-            throw error(for: response)
+            throw error(for: response, phase: phase)
         }
         return response.data
     }
@@ -261,7 +282,7 @@ struct RemoteHostPairingClient {
         }
     }
 
-    private func error(for response: RemoteHostPairingHTTPResponse) -> RemoteHostPairingError {
+    private func error(for response: RemoteHostPairingHTTPResponse, phase: PairingPhase) -> RemoteHostPairingError {
         let object = try? JSONDecoder().decode(JSONValue.self, from: response.data).objectValue
         let message = object?["error"]?.stringValue
             ?? object?["message"]?.stringValue
@@ -272,6 +293,9 @@ struct RemoteHostPairingClient {
            message.localizedCaseInsensitiveContains("denied") || message.localizedCaseInsensitiveContains("rejected")
         {
             return .consentDenied(message)
+        }
+        if phase == .complete, (500 ..< 600).contains(response.statusCode) {
+            return .completionUnconfirmed(message ?? "HTTP \(response.statusCode)")
         }
         return .httpError(statusCode: response.statusCode, code: code, message: message)
     }
