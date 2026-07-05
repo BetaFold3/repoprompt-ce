@@ -382,11 +382,18 @@ actor RemoteGatewayRuntime {
         allowCorrectiveRetry: Bool
     ) async throws -> JSONValue {
         let sessionID = singleSessionIDIfSessionAddressed(frame)
-        let resolvedWindowID = await resolvedWindowID(
+        var resolvedWindowID = await resolvedWindowID(
             forSession: sessionID,
             deviceID: deviceID,
             bindingState: bindingState
         )
+        if frame.type == "list_agents",
+           resolvedWindowID == nil,
+           bindingState != .bound,
+           let fallbackWindowID = await eligibleStartTargetWindowInfo(deviceID: deviceID)?.windowIDs.first
+        {
+            resolvedWindowID = fallbackWindowID
+        }
         return try await executeTranslatedTool(
             frame: frame,
             deviceID: deviceID,
@@ -419,6 +426,10 @@ actor RemoteGatewayRuntime {
             let runtimeError = RemoteGatewayRuntimeError.appToolError(payload: payload)
             if runtimeError.code(frame: frame) == "binding_required" {
                 await appLinkPool?.refreshBindingState(forDevice: deviceID)
+            }
+            if Self.isStartRoutingTargetError(runtimeError, frame: frame) {
+                await appLinkPool?.refreshBindingState(forDevice: deviceID)
+                throw RemoteCommandTranslatorError.ambiguousStartTarget
             }
             if allowCorrectiveRetry,
                Self.isCorrectiveSessionWindowRoutingError(runtimeError, frame: frame),
@@ -456,6 +467,16 @@ actor RemoteGatewayRuntime {
         default:
             return false
         }
+    }
+
+    private static func isStartRoutingTargetError(
+        _ error: RemoteGatewayRuntimeError,
+        frame: RemoteClientFrame
+    ) -> Bool {
+        guard frame.type == "start", case .appToolError = error else { return false }
+        let normalized = error.message.lowercased()
+        return normalized.contains("requires either an explicit tab context")
+            || normalized.contains("window-only connection") && normalized.contains("bound to the target window")
     }
 
     private func callPartitionedPoll(

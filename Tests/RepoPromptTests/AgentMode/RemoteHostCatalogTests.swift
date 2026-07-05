@@ -142,6 +142,26 @@ final class RemoteHostCatalogTests: XCTestCase {
         XCTAssertEqual(loader.loadCount, 2)
     }
 
+    @MainActor
+    func testCancelledCatalogLoadDoesNotPopulateCache() async {
+        let loader = RemoteHostCatalogSuspendingLoader()
+        let catalog = RemoteHostCatalog(catalogLoader: loader.load)
+        let loadTask = Task { @MainActor in
+            await catalog.catalog(for: "host-d")
+        }
+
+        while loader.loadCount == 0 {
+            await Task.yield()
+        }
+        loadTask.cancel()
+        loader.resume(with: .degraded)
+
+        let result = await loadTask.value
+
+        XCTAssertTrue(result.isDegraded)
+        XCTAssertNil(catalog.cachedCatalog(for: "host-d"))
+    }
+
     private func healthyCatalog(modelID: String) -> RemoteHostAgentCatalog {
         RemoteHostAgentCatalog(
             agents: [
@@ -190,5 +210,23 @@ private final class RemoteHostCatalogTestLoader {
         loadCount += 1
         guard !responses.isEmpty else { return .degraded }
         return responses.removeFirst()
+    }
+}
+
+@MainActor
+private final class RemoteHostCatalogSuspendingLoader {
+    private var continuation: CheckedContinuation<RemoteHostAgentCatalog, Never>?
+    private(set) var loadCount = 0
+
+    func load(hostID _: String) async -> RemoteHostAgentCatalog {
+        loadCount += 1
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func resume(with catalog: RemoteHostAgentCatalog) {
+        continuation?.resume(returning: catalog)
+        continuation = nil
     }
 }

@@ -209,13 +209,18 @@ do {
     // Trust sync: the gateway holds only the host public key and paired-device
     // public keys/tickets; revocations tear down per-device app links.
     let trustSyncTask = Task {
+        var revokedTransitionTracker = GatewayRevokedDeviceTransitionTracker()
         while !Task.isCancelled {
             do {
                 let snapshot = try await GatewayTrustSynchronizer.fetchSnapshot(appLink: appLink)
                 let revokedDeviceIDs = await authenticator.updateTrust(snapshot)
                 let tornDown = await appLinkPool.applyTrustSnapshot(snapshot)
-                let teardownDeviceIDs = Set(revokedDeviceIDs).union(tornDown)
-                for deviceID in teardownDeviceIDs.sorted() {
+                let teardownDeviceIDs = revokedTransitionTracker.devicesRequiringTeardown(
+                    revoked: Set(revokedDeviceIDs),
+                    tornDown: Set(tornDown),
+                    snapshot: snapshot
+                )
+                for deviceID in teardownDeviceIDs {
                     let code = snapshot.devices[deviceID]?.isRevoked == true ? "device_revoked" : "device_unpaired"
                     await runtime.teardownRevokedDevice(deviceID: deviceID, reason: code)
                     httpServer.closeConnections(forDevice: deviceID)

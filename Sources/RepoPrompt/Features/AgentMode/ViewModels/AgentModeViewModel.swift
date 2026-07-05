@@ -1084,6 +1084,18 @@ final class AgentModeViewModel: ObservableObject {
         return .degraded
     }
 
+    /// Called when a remote host connection transitions to connected: a degraded
+    /// catalog cached before the connection existed (e.g. list_agents refused or
+    /// unreachable) is stale the moment the channel is up — drop it and reload so
+    /// the remote model picker populates without waiting for the TTL.
+    func refreshRemoteHostCatalogAfterConnect(hostID: String) {
+        remoteCatalogLoadTasksByHostID.removeValue(forKey: hostID)?.cancel()
+        if remoteHostCatalog.cachedCatalog(for: hostID)?.isDegraded == true {
+            remoteHostCatalog.invalidate(hostID: hostID)
+        }
+        loadRemoteHostCatalogIfNeeded(hostID: hostID)
+    }
+
     func loadRemoteHostCatalogIfNeeded(hostID: String) {
         guard remoteHostRegistry.hasHosts,
               remoteHostCatalog.cachedCatalog(for: hostID) == nil,
@@ -1092,6 +1104,7 @@ final class AgentModeViewModel: ObservableObject {
         remoteCatalogLoadTasksByHostID[hostID] = Task { @MainActor [weak self] in
             guard let self else { return }
             _ = await remoteHostCatalog.catalog(for: hostID)
+            guard !Task.isCancelled else { return }
             remoteCatalogLoadTasksByHostID[hostID] = nil
             syncComposerUIState()
         }

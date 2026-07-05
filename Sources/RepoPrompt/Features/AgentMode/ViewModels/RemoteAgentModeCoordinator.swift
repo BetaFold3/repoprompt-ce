@@ -207,6 +207,9 @@ final class RemoteAgentModeCoordinator {
     }
 
     private func deliver(_ state: RemoteHostConnection.State, hostID: String) async {
+        if case .connected = state {
+            viewModel?.refreshRemoteHostCatalogAfterConnect(hostID: hostID)
+        }
         let controllers = controllersByTabID.compactMap { tabID, controller in
             hostIDByTabID[tabID] == hostID ? controller : nil
         }

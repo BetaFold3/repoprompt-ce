@@ -14,6 +14,47 @@ struct RemoteToolCall: Equatable {
     }
 }
 
+enum AppLinkCallTimeoutPolicy {
+    static let fast: TimeInterval = 60
+    static let grace: TimeInterval = 30
+    static let cap: TimeInterval = 900
+
+    /// Mirrors AgentRunMCPToolService.defaultWaitTimeoutSeconds /
+    /// MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds without importing app code
+    /// into the gateway target.
+    private static let appAgentLifecycleDefaultWaitSeconds: TimeInterval = 120
+
+    static func timeout(op: String, payload: [String: JSONValue]) -> TimeInterval {
+        switch op {
+        case "start":
+            return clamp((seconds(from: payload["timeout"]) ?? appAgentLifecycleDefaultWaitSeconds) + grace)
+        case "poll":
+            return clamp((seconds(from: payload["timeout"]) ?? 0) + grace)
+        case "steer":
+            guard payload["wait"]?.boolValue == true else { return fast }
+            return clamp((seconds(from: payload["timeout_seconds"]) ?? appAgentLifecycleDefaultWaitSeconds) + grace)
+        default:
+            return fast
+        }
+    }
+
+    private static func clamp(_ value: TimeInterval) -> TimeInterval {
+        min(max(value, fast), cap)
+    }
+
+    private static func seconds(from value: JSONValue?) -> TimeInterval? {
+        guard let value else { return nil }
+        switch value {
+        case let .int(seconds):
+            return TimeInterval(seconds)
+        case let .double(seconds):
+            return seconds
+        default:
+            return nil
+        }
+    }
+}
+
 enum RemoteGatewayBindingState: Equatable {
     case bound
     case bindingRequired(String)
@@ -138,7 +179,8 @@ struct RemoteCommandTranslator {
             return try translateAgentManage(
                 op: "list_agents",
                 payload: payload,
-                allowedPayloadKeys: Self.listAgentsPayloadKeys
+                allowedPayloadKeys: Self.listAgentsPayloadKeys,
+                resolvedWindowID: resolvedWindowID
             )
         case "list_sessions":
             return try translateAgentManage(
@@ -170,12 +212,14 @@ struct RemoteCommandTranslator {
             // session-addressed operations still require binding.
             if operation == "start", hasExplicitStartTarget(payload) { return }
             if resolvedWindowID != nil, Self.sessionAddressedOperations.contains(operation) { return }
+            if operation == "list_agents", resolvedWindowID != nil { return }
             throw RemoteCommandTranslatorError.bindingRequired(message)
         case .ambiguousStartTarget where operation == "start":
             if hasExplicitStartTarget(payload) { return }
             throw RemoteCommandTranslatorError.ambiguousStartTarget
         case let .ambiguousStartTarget(message):
             if resolvedWindowID != nil, Self.sessionAddressedOperations.contains(operation) { return }
+            if operation == "list_agents", resolvedWindowID != nil { return }
             throw RemoteCommandTranslatorError.bindingRequired(message)
         }
     }
@@ -239,7 +283,11 @@ struct RemoteCommandTranslator {
         if let resolvedWindowID, Self.sessionAddressedAgentRunOps.contains(op) {
             arguments["_windowID"] = .int(resolvedWindowID)
         }
-        return RemoteToolCall(toolName: "agent_run", arguments: arguments, timeout: nil)
+        return RemoteToolCall(
+            toolName: "agent_run",
+            arguments: arguments,
+            timeout: AppLinkCallTimeoutPolicy.timeout(op: op, payload: payload)
+        )
     }
 
     private func translateAgentManage(
@@ -260,10 +308,14 @@ struct RemoteCommandTranslator {
         for (key, value) in payload {
             arguments[key] = value.mcpValue
         }
-        if let resolvedWindowID, Self.sessionAddressedAgentManageOps.contains(op) {
+        if let resolvedWindowID, Self.sessionAddressedAgentManageOps.contains(op) || op == "list_agents" {
             arguments["_windowID"] = .int(resolvedWindowID)
         }
-        return RemoteToolCall(toolName: "agent_manage", arguments: arguments, timeout: nil)
+        return RemoteToolCall(
+            toolName: "agent_manage",
+            arguments: arguments,
+            timeout: AppLinkCallTimeoutPolicy.timeout(op: op, payload: payload)
+        )
     }
 
     private func commonArguments(op: String) -> [String: Value] {

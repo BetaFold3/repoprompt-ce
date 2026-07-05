@@ -323,4 +323,89 @@ final class RemoteCommandTranslatorTests: XCTestCase {
             XCTAssertEqual(error as? RemoteCommandTranslatorError, .bindingRequired("multiple windows"))
         }
     }
+
+    func testListAgentsWithResolvedWindowBypassesBindingGateAndInjectsWindowID() throws {
+        let frame = RemoteClientFrame(type: "list_agents", requestID: "req-list-agents")
+
+        for bindingState in [
+            RemoteGatewayBindingState.bindingRequired("bind first"),
+            RemoteGatewayBindingState.ambiguousStartTarget("multiple windows")
+        ] {
+            let translator = RemoteCommandTranslator(bindingState: bindingState)
+            let call = try translator.translate(frame, resolvedWindowID: 7)
+
+            XCTAssertEqual(call.toolName, "agent_manage")
+            XCTAssertEqual(call.arguments["op"], .string("list_agents"))
+            XCTAssertEqual(call.arguments["_windowID"], .int(7))
+        }
+    }
+
+    func testListAgentsWithoutResolvedWindowStillRequiresBinding() throws {
+        let frame = RemoteClientFrame(type: "list_agents", requestID: "req-list-agents")
+
+        XCTAssertThrowsError(try RemoteCommandTranslator(bindingState: .bindingRequired("bind first")).translate(frame)) { error in
+            XCTAssertEqual(error as? RemoteCommandTranslatorError, .bindingRequired("bind first"))
+        }
+        XCTAssertThrowsError(try RemoteCommandTranslator(bindingState: .ambiguousStartTarget("multiple windows")).translate(frame)) { error in
+            XCTAssertEqual(error as? RemoteCommandTranslatorError, .bindingRequired("multiple windows"))
+        }
+    }
+
+    func testTranslatedToolCallsCarryAppLinkTimeoutPolicy() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let translator = RemoteCommandTranslator()
+
+        let fastFrames = [
+            RemoteClientFrame(type: "cancel", sessionID: sid, payload: .object([:])),
+            RemoteClientFrame(type: "get_log", sessionID: sid, payload: .object([:])),
+            RemoteClientFrame(type: "list_agents", payload: .object([:])),
+            RemoteClientFrame(type: "list_sessions", payload: .object([:]))
+        ]
+        for frame in fastFrames {
+            XCTAssertEqual(try translator.translate(frame).timeout, 60, frame.type)
+        }
+
+        XCTAssertEqual(
+            try translator.translate(
+                RemoteClientFrame(type: "poll", sessionID: sid, payload: .object(["timeout": .int(120)]))
+            ).timeout,
+            150
+        )
+        XCTAssertEqual(
+            try translator.translate(RemoteClientFrame(type: "poll", sessionID: sid, payload: .object([:]))).timeout,
+            60
+        )
+        XCTAssertEqual(
+            try translator.translate(
+                RemoteClientFrame(
+                    type: "steer",
+                    sessionID: sid,
+                    payload: .object(["message": .string("next"), "wait": .bool(true), "timeout_seconds": .int(300)])
+                )
+            ).timeout,
+            330
+        )
+        XCTAssertEqual(
+            try translator.translate(
+                RemoteClientFrame(type: "steer", sessionID: sid, payload: .object(["message": .string("next")]))
+            ).timeout,
+            60
+        )
+        XCTAssertEqual(
+            try translator.translate(
+                RemoteClientFrame(type: "start", payload: .object(["message": .string("go"), "timeout": .int(60)]))
+            ).timeout,
+            90
+        )
+        XCTAssertEqual(
+            try translator.translate(RemoteClientFrame(type: "start", payload: .object(["message": .string("go")]))).timeout,
+            150
+        )
+        XCTAssertEqual(
+            try translator.translate(
+                RemoteClientFrame(type: "start", payload: .object(["message": .string("go"), "timeout": .int(10000)]))
+            ).timeout,
+            900
+        )
+    }
 }

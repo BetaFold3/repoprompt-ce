@@ -233,6 +233,7 @@ final class RemoteHostCatalog {
             return cached
         }
         let catalog = await loadCatalog(for: hostID)
+        guard !Task.isCancelled else { return catalog }
         cache[hostID] = CacheEntry(catalog: catalog, loadedAt: now())
         return catalog
     }

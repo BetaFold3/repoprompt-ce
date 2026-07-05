@@ -1,7 +1,48 @@
 import Foundation
+import Logging
 @testable import RepoPromptGateway
 import RepoPromptRemoteWire
 import XCTest
+
+private final class BindingRuntimeConnector: AppLinkConnecting, @unchecked Sendable {
+    let connection: RecordingAppLinkConnection
+
+    init(connection: RecordingAppLinkConnection) {
+        self.connection = connection
+    }
+
+    func connect(
+        configuration _: GatewayConfiguration,
+        clientName _: String,
+        logger _: Logger
+    ) async throws -> any AppLinkConnection {
+        connection
+    }
+}
+
+private final class BindingProbeRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var states: [RemoteGatewayBindingState]
+    private(set) var callCount = 0
+
+    init(_ states: [RemoteGatewayBindingState]) {
+        self.states = states
+    }
+
+    func next() -> RemoteGatewayBindingState {
+        lock.lock()
+        defer { lock.unlock() }
+        callCount += 1
+        if states.isEmpty { return .ambiguousStartTarget("multiple windows") }
+        return states.removeFirst()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return callCount
+    }
+}
 
 /// Plan §6.6: unbound multi-window connections get structured `binding_required`
 /// on observation ops, binding errors carry eligible start-target windows, and
@@ -388,6 +429,101 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "in_doubt")
         let steerCalls = await connection.calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") }
         XCTAssertEqual(steerCalls.count, 1)
+    }
+
+    func testStartRoutingAppErrorReturnsAmbiguousStartTargetWithWindowsAndRefreshesBinding() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "code": .string("invalid_params"),
+                "error": .string("agent_run.start requires either an explicit tab context, an exact run-scoped tab, or a window-only connection bound to the target window.")
+            ]), isError: true)),
+            .result(windowListResponse())
+        ])
+        let root = try GatewayTestHelpers.temporaryRoot()
+        let config = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let probe = BindingProbeRecorder([
+            .bound,
+            .ambiguousStartTarget("multiple windows"),
+            .ambiguousStartTarget("multiple windows")
+        ])
+        let pool = AppLinkPool(
+            configuration: config,
+            connector: BindingRuntimeConnector(connection: connection),
+            bindingProbe: { _ in probe.next() }
+        )
+        _ = try await pool.ensureLink(forDevice: deviceID)
+
+        let defaultAppLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: RecordingAppLinkConnection())
+        )
+        try await defaultAppLink.connect()
+        let runtime = try RemoteGatewayRuntime(
+            appLink: defaultAppLink,
+            ledger: CommandLedger(),
+            watchManager: SessionWatchManager(appLink: defaultAppLink, appLinkPool: pool),
+            auditLog: nil,
+            appLinkPool: pool
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "start", requestID: "r1", payload: .object(["message": .string("go")])),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        let frame = try XCTUnwrap(response)
+        XCTAssertEqual(frame.type, "command_error")
+        let payload = try XCTUnwrap(frame.payload?.objectValue)
+        XCTAssertEqual(payload["code"]?.stringValue, "ambiguous_start_target")
+        let windows = try XCTUnwrap(payload["details"]?.objectValue?["windows"]?.arrayValue)
+        XCTAssertEqual(windows.count, 2)
+        XCTAssertGreaterThanOrEqual(probe.count, 2, "Start routing app errors should refresh stale bound state")
+    }
+
+    func testListAgentsOnAmbiguousConnectionUsesFallbackWindow() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "agents": .array([.object(["id": .string("pair"), "name": .string("Pair")])])
+            ])))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_agents", requestID: "r1"),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context", "agent_manage"])
+        let listAgents = try XCTUnwrap(calls.last)
+        XCTAssertEqual(listAgents.arguments["op"], .string("list_agents"))
+        XCTAssertEqual(listAgents.arguments["_windowID"], .int(1))
+    }
+
+    func testListAgentsFallsBackToBindingRequiredWhenWindowDiscoveryFails() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object(["error": .string("no windows")]), isError: true))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_agents", requestID: "r1"),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "binding_required")
+        let calls = await connection.calls
+        XCTAssertFalse(calls.contains { $0.name == "agent_manage" })
     }
 
     func testSubscribeOnBoundConnectionSucceeds() async throws {
