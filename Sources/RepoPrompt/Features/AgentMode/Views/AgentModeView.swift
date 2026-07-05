@@ -8,6 +8,7 @@ struct AgentModeView: View {
     let agentModeVM: AgentModeViewModel
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject private var workspaceManager: WorkspaceManagerViewModel
+    @ObservedObject private var remoteStartPicker: AgentRemoteStartPickerUIStore
 
     @StateObject private var navigationController: AgentModeNavigationController
     @StateObject private var rootsSidebarStore: AgentWorkspaceRootsSidebarStore
@@ -30,6 +31,7 @@ struct AgentModeView: View {
         self.agentModeVM = agentModeVM
         self.promptManager = promptManager
         _workspaceManager = ObservedObject(wrappedValue: windowState.workspaceManager)
+        _remoteStartPicker = ObservedObject(wrappedValue: agentModeVM.ui.remoteStartPicker)
 
         let isSystem = windowState.workspaceManager.activeWorkspace?.isSystemWorkspace ?? true
         _navigationController = StateObject(wrappedValue: AgentModeNavigationController(isSystemWorkspaceMode: isSystem))
@@ -142,9 +144,9 @@ struct AgentModeView: View {
         }
         .sheet(
             item: Binding(
-                get: { agentModeVM.pendingRemoteStartWindowPicker },
+                get: { remoteStartPicker.pending },
                 set: { newValue in
-                    if newValue == nil, agentModeVM.pendingRemoteStartWindowPicker != nil {
+                    if newValue == nil, remoteStartPicker.pending != nil {
                         agentModeVM.cancelRemoteStartWindowPicker()
                     }
                 }

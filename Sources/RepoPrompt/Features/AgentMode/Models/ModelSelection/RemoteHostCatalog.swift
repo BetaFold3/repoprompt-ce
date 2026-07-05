@@ -191,6 +191,9 @@ struct RemoteHostTaskLabel: Codable, Equatable, Identifiable {
 final class RemoteHostCatalog {
     static let shared = RemoteHostCatalog()
 
+    private static let degradedEntryTTL: TimeInterval = 20
+    private static let healthyEntryTTL: TimeInterval = 300
+
     private struct CacheEntry {
         var catalog: RemoteHostAgentCatalog
         var loadedAt: Date
@@ -198,18 +201,21 @@ final class RemoteHostCatalog {
 
     private let connectionManagerProvider: @MainActor () -> RemoteHostConnectionManager
     private let now: () -> Date
+    private let catalogLoader: (@MainActor (String) async -> RemoteHostAgentCatalog)?
     private var cache: [String: CacheEntry] = [:]
 
     init(
         connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared },
-        now: @escaping () -> Date = { Date() }
+        now: @escaping () -> Date = { Date() },
+        catalogLoader: (@MainActor (String) async -> RemoteHostAgentCatalog)? = nil
     ) {
         self.connectionManagerProvider = connectionManagerProvider
         self.now = now
+        self.catalogLoader = catalogLoader
     }
 
     func cachedCatalog(for hostID: String) -> RemoteHostAgentCatalog? {
-        cache[hostID]?.catalog
+        cachedEntry(for: hostID, at: now())?.catalog
     }
 
     func invalidate(hostID: String) {
@@ -217,7 +223,7 @@ final class RemoteHostCatalog {
     }
 
     func catalog(for hostID: String) async -> RemoteHostAgentCatalog {
-        if let cached = cache[hostID]?.catalog {
+        if let cached = cachedEntry(for: hostID, at: now())?.catalog {
             return cached
         }
         let catalog = await loadCatalog(for: hostID)
@@ -225,7 +231,24 @@ final class RemoteHostCatalog {
         return catalog
     }
 
+    private func cachedEntry(for hostID: String, at date: Date) -> CacheEntry? {
+        guard let entry = cache[hostID] else { return nil }
+        if isExpired(entry, at: date) {
+            cache.removeValue(forKey: hostID)
+            return nil
+        }
+        return entry
+    }
+
+    private func isExpired(_ entry: CacheEntry, at date: Date) -> Bool {
+        let ttl = entry.catalog.isDegraded ? Self.degradedEntryTTL : Self.healthyEntryTTL
+        return date.timeIntervalSince(entry.loadedAt) > ttl
+    }
+
     private func loadCatalog(for hostID: String) async -> RemoteHostAgentCatalog {
+        if let catalogLoader {
+            return await catalogLoader(hostID)
+        }
         do {
             let connection = try connectionManagerProvider().connection(for: hostID)
             guard try await connection.supportsAgentCatalog() else {

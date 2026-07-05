@@ -263,7 +263,11 @@ final class AgentModeViewModel: ObservableObject {
     @Published var pendingImageAttachments: [AgentImageAttachment] = []
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     @Published var draftRestorationEvent: DraftRestorationEvent? = nil
-    @Published var pendingRemoteStartWindowPicker: RemoteStartWindowPickerState? = nil
+    var pendingRemoteStartWindowPicker: RemoteStartWindowPickerState? {
+        get { ui.remoteStartPicker.pending }
+        set { ui.remoteStartPicker.pending = newValue }
+    }
+
     @Published private(set) var codexDynamicModels: [CodexAppServerClient.RemoteModel] = []
     @Published private(set) var acpDynamicModelRevision: Int = 0
     @Published private(set) var availableAgents: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
@@ -12062,6 +12066,7 @@ final class AgentModeViewModel: ObservableObject {
               let session = sessions[pending.tabID]
         else { return }
         pendingRemoteStartWindowPicker = nil
+        requestUIRefresh(tabID: pending.tabID, urgent: true)
         Task { [weak self, weak session] in
             guard let self, let session else { return }
             do {
