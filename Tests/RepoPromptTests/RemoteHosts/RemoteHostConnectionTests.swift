@@ -106,6 +106,22 @@ final class RemoteHostConnectionTests: XCTestCase {
         XCTAssertGreaterThan(persisted.lastCounter, 0)
     }
 
+    func testTicketMintDoesNotSendVolatileHostWindowID() async throws {
+        let record = try upsertClientRecord()
+        await enqueueTicket()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+
+        let result = try await connection.testConnection(timeout: 5)
+
+        XCTAssertEqual(result.hostID, record.id)
+        let calls = await appConnection.calls
+        let ticketCall = try XCTUnwrap(calls.first { call in
+            call.name == "remote_pairing" && call.arguments["op"]?.stringValue == "mint_ticket"
+        })
+        XCTAssertNil(ticketCall.arguments["_windowID"])
+        XCTAssertNil(ticketCall.arguments["window_id"])
+    }
+
     func testUsedTicketAtHelloRetriesWithFreshTicket() async throws {
         let record = try upsertClientRecord()
         let firstTicket = await enqueueTicket()

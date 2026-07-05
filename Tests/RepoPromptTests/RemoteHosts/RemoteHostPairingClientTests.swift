@@ -16,7 +16,7 @@ final class RemoteHostPairingClientTests: XCTestCase {
         let stub = StubRemoteHostPairingTransport(handlers: [
             { url, body, timeout in
                 XCTAssertEqual(url.path, "/api/pair/begin")
-                XCTAssertEqual(body, [:])
+                XCTAssertEqual(body["window_id"], .int(7))
                 XCTAssertEqual(timeout, RemoteHostPairingClient.beginTimeout)
                 return try Self.response([
                     "ok": true,
@@ -30,6 +30,7 @@ final class RemoteHostPairingClientTests: XCTestCase {
             { url, body, timeout in
                 XCTAssertEqual(url.path, "/api/pair/complete")
                 XCTAssertEqual(timeout, RemoteHostPairingClient.completeTimeout)
+                XCTAssertEqual(body["window_id"], .int(7))
                 let publicKey = try XCTUnwrap(body["public_key"]?.stringValue)
                 let deviceID = try XCTUnwrap(body["device_id"]?.stringValue)
                 let scopes = try XCTUnwrap(body["scopes"]?.arrayValue?.compactMap(\.stringValue))

@@ -536,6 +536,7 @@ actor ServerNetworkManager {
     /// scope `op=list` to a single window instead of returning all windows.
     nonisolated static func isAppWideTool(_ toolName: String) -> Bool {
         toolName == AppSettingsMCPService.toolName
+            || toolName == MCPWindowToolName.remotePairing
     }
 
     nonisolated static func shouldAutoInjectPublicWindowID(for toolName: String) -> Bool {

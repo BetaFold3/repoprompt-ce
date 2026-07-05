@@ -587,6 +587,14 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertTrue(ServerNetworkManager.shouldBypassLogicalContextPreResolution(for: "bind_context"))
     }
 
+    func testRemotePairingBypassesWindowRoutingForGatewayPrincipalRelay() {
+        XCTAssertTrue(ServerNetworkManager.shouldBypassWindowRouting(for: MCPWindowToolName.remotePairing))
+        XCTAssertFalse(ServerNetworkManager.shouldAutoInjectPublicWindowID(for: MCPWindowToolName.remotePairing))
+        XCTAssertFalse(ServerNetworkManager.shouldPersistResolvedLogicalContextWindowMapping(for: MCPWindowToolName.remotePairing))
+        XCTAssertTrue(ServerNetworkManager.isWindowSelectionExempt(toolName: MCPWindowToolName.remotePairing, args: ["op": .string("mint_ticket")]))
+        XCTAssertTrue(ServerNetworkManager.shouldBypassLogicalContextPreResolution(for: MCPWindowToolName.remotePairing))
+    }
+
     func testMigratedToolContextPreResolutionPersistsWindowAffinity() {
         XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "workspace_context"))
         XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "manage_selection"))

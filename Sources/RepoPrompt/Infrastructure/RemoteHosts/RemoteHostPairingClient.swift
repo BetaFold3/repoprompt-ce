@@ -124,7 +124,7 @@ struct RemoteHostPairingClient {
     private func beginPairing(payload: RemotePairingPayload) async throws -> BeginPairingResponse {
         let data = try await post(
             endpoint(base: payload.gatewayURL, pathComponents: ["api", "pair", "begin"]),
-            body: [:],
+            body: pairingRelayBody(payload: payload),
             timeout: Self.beginTimeout,
             phase: .begin
         )
@@ -144,16 +144,16 @@ struct RemoteHostPairingClient {
         proof: Data,
         requestedScopes: Set<String>
     ) async throws -> CompletePairingResponse {
+        var body = pairingRelayBody(payload: payload)
+        body["pairing_id"] = .string(begin.pairingID.uuidString)
+        body["display_name"] = .string(displayName)
+        body["device_id"] = .string(deviceID)
+        body["public_key"] = .string(publicKeyRaw.base64EncodedString())
+        body["proof"] = .string(proof.base64EncodedString())
+        body["scopes"] = .array(requestedScopes.sorted().map(JSONValue.string))
         let data = try await post(
             endpoint(base: payload.gatewayURL, pathComponents: ["api", "pair", "complete"]),
-            body: [
-                "pairing_id": .string(begin.pairingID.uuidString),
-                "display_name": .string(displayName),
-                "device_id": .string(deviceID),
-                "public_key": .string(publicKeyRaw.base64EncodedString()),
-                "proof": .string(proof.base64EncodedString()),
-                "scopes": .array(requestedScopes.sorted().map(JSONValue.string))
-            ],
+            body: body,
             timeout: Self.completeTimeout,
             phase: .complete
         )
@@ -274,6 +274,11 @@ struct RemoteHostPairingClient {
             throw RemoteHostPairingError.invalidRequest("Remote client pairing can request only v1 session operation scopes.")
         }
         return trimmed
+    }
+
+    private func pairingRelayBody(payload: RemotePairingPayload) -> [String: JSONValue] {
+        guard let windowID = payload.windowID else { return [:] }
+        return ["window_id": .int(windowID)]
     }
 
     private func endpoint(base: URL, pathComponents: [String]) -> URL {

@@ -11,6 +11,86 @@ enum RemotePairingOperation: String, Codable, CaseIterable {
     case listDevices = "list_devices"
 }
 
+fileprivate enum MCPRemotePairingToolDefinition {
+    static let description = """
+    Gateway-only remote-control pairing authority.
+
+    This tool is only callable by the app-spawned gateway connection carrying the verified gateway principal. It never authorizes by clientName. Pairing begins with a short-lived challenge, completes only after device-proof verification and user consent, and tickets are host-signed by the app-owned P256 key.
+
+    Operations:
+    - `begin_pairing`: create a ≤60s challenge. Does not persist trust.
+    - `complete_pairing`: verify device proof, show consent UI, persist after approval.
+    - `mint_ticket`: mint a one-time ≤60s host-signed ticket for a paired non-revoked device. Scopes are clamped to the device record.
+    - `revoke_device`: mark a device revoked and clear push metadata.
+    - `list_devices`: list paired devices and host fingerprint.
+    """
+
+    static let inputSchema: JSONSchema = .object(
+        properties: [
+            "op": .string(
+                description: "Remote pairing operation.",
+                enum: ["begin_pairing", "complete_pairing", "mint_ticket", "revoke_device", "list_devices"]
+            ),
+            "window_id": .integer(description: "Host window ID from the pairing payload. Required for complete_pairing approval routing."),
+            "pairing_id": .string(description: "Pairing UUID from begin_pairing, required by complete_pairing."),
+            "display_name": .string(description: "Human-readable device name for complete_pairing."),
+            "device_id": .string(description: "Device ID, usually remote:<fingerprint8>. Required for ticket/revoke; optional for complete_pairing when derivable from public_key."),
+            "public_key": .string(description: "Base64 P256.Signing public-key rawRepresentation for complete_pairing."),
+            "proof": .string(description: "Base64 P256 signature over the canonical device challenge payload."),
+            "scopes": .array(description: "Requested/granted scope raw values.", items: .string()),
+            "ttl_seconds": .integer(description: "Requested challenge/ticket TTL in seconds. Clamped to 60."),
+            "include_revoked": .boolean(description: "Whether list_devices includes revoked devices. Default true.")
+        ],
+        required: ["op"]
+    )
+
+    static func contextForAppWideExecution(args: [String: Value]) throws -> MCPWindowToolContext {
+        let operation = RemotePairingOperation(rawValue: args["op"]?.stringValue ?? "")
+        if operation == .completePairing {
+            guard let windowID = args["window_id"]?.intValue, windowID > 0 else {
+                throw MCPError.invalidParams("window_id is required for complete_pairing approval routing.")
+            }
+            return MCPWindowToolContext(toolName: MCPWindowToolName.remotePairing, windowID: windowID)
+        }
+        return MCPWindowToolContext(
+            toolName: MCPWindowToolName.remotePairing,
+            windowID: args["window_id"]?.intValue ?? 0
+        )
+    }
+}
+
+@MainActor
+final class MCPRemotePairingToolService: Service {
+    private let executionDependencies: MCPRemotePairingToolProvider.ExecutionDependencies
+
+    init(
+        executionDependencies: MCPRemotePairingToolProvider.ExecutionDependencies = .liveGatewayDependencies()
+    ) {
+        self.executionDependencies = executionDependencies
+    }
+
+    var tools: [Tool] {
+        get async { [remotePairingTool()] }
+    }
+
+    private func remotePairingTool() -> Tool {
+        Tool(
+            name: MCPWindowToolName.remotePairing,
+            description: MCPRemotePairingToolDefinition.description,
+            inputSchema: MCPRemotePairingToolDefinition.inputSchema,
+            annotations: .repoPromptLocalEphemeralState,
+            returnsValue: { [executionDependencies] args in
+                let context = try MCPRemotePairingToolDefinition.contextForAppWideExecution(args: args)
+                return try await MCPRemotePairingToolProvider.execute(
+                    args: args,
+                    context: context,
+                    dependencies: executionDependencies
+                )
+            }
+        )
+    }
+}
+
 @MainActor
 final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
     let group: MCPWindowToolGroup = .remotePairing
@@ -37,6 +117,23 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
             self.approvalManager = approvalManager
             self.challengeStore = challengeStore
             self.now = now
+        }
+
+        @MainActor
+        static func liveGatewayDependencies() -> ExecutionDependencies {
+            ExecutionDependencies(
+                captureRequestMetadata: {
+                    MCPServerViewModel.RequestMetadata(
+                        connectionID: ServerNetworkManager.currentConnectionID,
+                        clientName: nil,
+                        windowID: nil
+                    )
+                },
+                isGatewayPrincipalConnection: { connectionID in
+                    await ServerNetworkManager.shared.isGatewayPrincipalConnection(connectionID)
+                },
+                approvalManager: .shared
+            )
         }
     }
 
@@ -65,36 +162,9 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
         runtime.tool(
             name: MCPWindowToolName.remotePairing,
             freshnessPolicy: .none,
-            description: """
-            Gateway-only remote-control pairing authority.
-
-            This tool is only callable by the app-spawned gateway connection carrying the verified gateway principal. It never authorizes by clientName. Pairing begins with a short-lived challenge, completes only after device-proof verification and user consent, and tickets are host-signed by the app-owned P256 key.
-
-            Operations:
-            - `begin_pairing`: create a ≤60s challenge. Does not persist trust.
-            - `complete_pairing`: verify device proof, show consent UI, persist after approval.
-            - `mint_ticket`: mint a one-time ≤60s host-signed ticket for a paired non-revoked device. Scopes are clamped to the device record.
-            - `revoke_device`: mark a device revoked and clear push metadata.
-            - `list_devices`: list paired devices and host fingerprint.
-            """,
+            description: MCPRemotePairingToolDefinition.description,
             annotations: .repoPromptLocalEphemeralState,
-            inputSchema: .object(
-                properties: [
-                    "op": .string(
-                        description: "Remote pairing operation.",
-                        enum: ["begin_pairing", "complete_pairing", "mint_ticket", "revoke_device", "list_devices"]
-                    ),
-                    "pairing_id": .string(description: "Pairing UUID from begin_pairing, required by complete_pairing."),
-                    "display_name": .string(description: "Human-readable device name for complete_pairing."),
-                    "device_id": .string(description: "Device ID, usually remote:<fingerprint8>. Required for ticket/revoke; optional for complete_pairing when derivable from public_key."),
-                    "public_key": .string(description: "Base64 P256.Signing public-key rawRepresentation for complete_pairing."),
-                    "proof": .string(description: "Base64 P256 signature over the canonical device challenge payload."),
-                    "scopes": .array(description: "Requested/granted scope raw values.", items: .string()),
-                    "ttl_seconds": .integer(description: "Requested challenge/ticket TTL in seconds. Clamped to 60."),
-                    "include_revoked": .boolean(description: "Whether list_devices includes revoked devices. Default true.")
-                ],
-                required: ["op"]
-            )
+            inputSchema: MCPRemotePairingToolDefinition.inputSchema
         ) { [executionDependencies] context, args in
             try await Self.execute(args: args, context: context, dependencies: executionDependencies)
         }

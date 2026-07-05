@@ -75,6 +75,7 @@ actor GatewayPairingRelay {
         switch path {
         case Self.beginPairingPath:
             var arguments: [String: Value] = [:]
+            copyWindowRouting(payload, into: &arguments)
             copyInt(payload, key: "ttl_seconds", into: &arguments)
             return await callPairing(
                 op: "begin_pairing",
@@ -84,6 +85,7 @@ actor GatewayPairingRelay {
             )
         case Self.completePairingPath:
             var arguments: [String: Value] = [:]
+            copyWindowRouting(payload, into: &arguments)
             copyString(payload, key: "pairing_id", into: &arguments)
             copyString(payload, key: "display_name", into: &arguments)
             copyString(payload, key: "public_key", into: &arguments)
@@ -98,6 +100,7 @@ actor GatewayPairingRelay {
             )
         case Self.mintTicketPath:
             var arguments: [String: Value] = [:]
+            copyWindowRouting(payload, into: &arguments)
             copyString(payload, key: "device_id", into: &arguments)
             copyStringArray(payload, key: "scopes", into: &arguments)
             copyInt(payload, key: "ttl_seconds", into: &arguments)
@@ -167,6 +170,10 @@ actor GatewayPairingRelay {
                 "code": .string("app_link_unavailable")
             ]))
         }
+    }
+
+    private func copyWindowRouting(_ payload: [String: JSONValue], into arguments: inout [String: Value]) {
+        copyInt(payload, key: "window_id", into: &arguments)
     }
 
     private func copyString(_ payload: [String: JSONValue], key: String, into arguments: inout [String: Value]) {

@@ -50,6 +50,63 @@ final class GatewayPairingRelayTests: XCTestCase {
         XCTAssertTrue(response.body.objectValue?["error"]?.stringValue?.contains("The app link is unavailable") == true)
     }
 
+    func testRelayedCallsForwardWindowIDAsPublicPairingContext() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let connection = RecordingAppLinkConnection()
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let relay = GatewayPairingRelay(appLink: appLink)
+        let requests: [(path: String, op: String, body: [String: Any])] = [
+            (
+                GatewayPairingRelay.beginPairingPath,
+                "begin_pairing",
+                ["window_id": 7]
+            ),
+            (
+                GatewayPairingRelay.completePairingPath,
+                "complete_pairing",
+                [
+                    "window_id": 7,
+                    "pairing_id": UUID().uuidString,
+                    "display_name": "Client MacBook",
+                    "device_id": "remote:feedface",
+                    "public_key": "public-key",
+                    "proof": "proof",
+                    "scopes": ["sessions.observe"]
+                ]
+            ),
+            (
+                GatewayPairingRelay.mintTicketPath,
+                "mint_ticket",
+                [
+                    "window_id": 7,
+                    "device_id": "remote:feedface"
+                ]
+            )
+        ]
+
+        for request in requests {
+            let body = try JSONSerialization.data(withJSONObject: request.body)
+            let response = await relay.handle(path: request.path, body: body)
+            XCTAssertEqual(response.status, 200, request.op)
+        }
+
+        let calls = await connection.calls
+        XCTAssertEqual(calls.count, requests.count)
+        for (call, request) in zip(calls, requests) {
+            XCTAssertEqual(call.name, "remote_pairing", request.op)
+            XCTAssertEqual(call.arguments["op"]?.stringValue, request.op)
+            XCTAssertEqual(call.arguments["window_id"], .int(7), request.op)
+            XCTAssertNil(call.arguments["_windowID"], request.op)
+        }
+    }
+
     func testRelayedPairingCallsRequestRawJSONToolOutput() async throws {
         let root = try GatewayTestHelpers.temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
