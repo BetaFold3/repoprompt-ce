@@ -11,7 +11,7 @@ enum RemotePairingOperation: String, Codable, CaseIterable {
     case listDevices = "list_devices"
 }
 
-fileprivate enum MCPRemotePairingToolDefinition {
+private enum MCPRemotePairingToolDefinition {
     static let description = """
     Gateway-only remote-control pairing authority.
 
@@ -63,9 +63,11 @@ fileprivate enum MCPRemotePairingToolDefinition {
 final class MCPRemotePairingToolService: Service {
     private let executionDependencies: MCPRemotePairingToolProvider.ExecutionDependencies
 
-    init(
-        executionDependencies: MCPRemotePairingToolProvider.ExecutionDependencies = .liveGatewayDependencies()
-    ) {
+    init() {
+        executionDependencies = .liveGatewayDependencies()
+    }
+
+    init(executionDependencies: MCPRemotePairingToolProvider.ExecutionDependencies) {
         self.executionDependencies = executionDependencies
     }
 
