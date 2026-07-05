@@ -48,7 +48,6 @@ struct RemoteStartWindowPickerState: Identifiable, Equatable {
     let message: String
     let modelSelectionRaw: String?
     let sessionName: String?
-    let workspaceID: String?
     let optimisticUserItemID: UUID
     let windows: [RemoteStartWindowOption]
 
@@ -59,7 +58,6 @@ struct RemoteStartWindowPickerState: Identifiable, Equatable {
         message: String,
         modelSelectionRaw: String?,
         sessionName: String?,
-        workspaceID: String?,
         optimisticUserItemID: UUID,
         windows: [RemoteStartWindowOption]
     ) {
@@ -69,7 +67,6 @@ struct RemoteStartWindowPickerState: Identifiable, Equatable {
         self.message = message
         self.modelSelectionRaw = modelSelectionRaw
         self.sessionName = sessionName
-        self.workspaceID = workspaceID
         self.optimisticUserItemID = optimisticUserItemID
         self.windows = windows
     }
@@ -81,7 +78,6 @@ struct RemoteStartWindowPickerState: Identifiable, Equatable {
         message: String,
         modelSelectionRaw: String?,
         sessionName: String?,
-        workspaceID: String?,
         optimisticUserItemID: UUID
     ) {
         guard let remoteError = error as? RemoteClientError else { return nil }
@@ -101,7 +97,6 @@ struct RemoteStartWindowPickerState: Identifiable, Equatable {
             message: message,
             modelSelectionRaw: modelSelectionRaw,
             sessionName: sessionName,
-            workspaceID: workspaceID,
             optimisticUserItemID: optimisticUserItemID,
             windows: windows
         )

@@ -58,6 +58,11 @@ struct RemoteHostAgentCatalog: Codable, Equatable {
         if let model = agents.lazy.flatMap(\.models).first(where: { $0.modelID == rawModelID }) {
             return model.name
         }
+        // Role labels (explore/engineer/pair/design) are host-portable start
+        // selectors resolved on the host at start time.
+        if let taskLabel = taskLabels.first(where: { $0.label == rawModelID }) {
+            return taskLabel.name
+        }
         if let taskLabel = taskLabels.first(where: { $0.modelID == rawModelID }) {
             return taskLabel.name
         }

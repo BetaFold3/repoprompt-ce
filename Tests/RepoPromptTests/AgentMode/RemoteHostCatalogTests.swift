@@ -25,6 +25,35 @@ final class RemoteHostCatalogTests: XCTestCase {
         XCTAssertEqual(exploreLabel.modelID, "codexExec:gpt-5.5-medium")
         XCTAssertEqual(catalog.displayName(forModelID: exploreLabel.modelID), "Codex CLI GPT-5.5 Medium")
         XCTAssertEqual(RemoteHostAgentCatalog.modelIDForStart("  \(exploreLabel.modelID)  "), exploreLabel.modelID)
+
+        // Role labels are valid host-portable selections: display resolves via
+        // task_labels and the raw label passes through to agent_run.start.
+        XCTAssertEqual(catalog.displayName(forModelID: "explore"), exploreLabel.name)
+        XCTAssertEqual(RemoteHostAgentCatalog.modelIDForStart("explore"), "explore")
+    }
+
+    func testRoleLabelOnlyCatalogExposesTaskLabelsWithoutAgents() throws {
+        // Hosts with restricted discovery (or roles_only) omit `agents` but
+        // always return `task_labels` — the catalog is not degraded.
+        let json = """
+        {
+          "task_labels": [
+            {"label": "pair", "model_id": "claudeCode:claude-fable-5", "name": "Claude Fable 5"},
+            {"label": "explore", "model_id": "codexExec:gpt-5.5-medium", "name": "Codex CLI GPT-5.5 Medium"}
+          ]
+        }
+        """
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(json.utf8))
+
+        XCTAssertFalse(catalog.isDegraded)
+        XCTAssertTrue(catalog.selectableAgents.isEmpty)
+        XCTAssertEqual(catalog.taskLabels.count, 2)
+        XCTAssertEqual(catalog.displayName(forModelID: "pair"), "Claude Fable 5")
+        XCTAssertEqual(catalog.displayName(forModelID: "explore"), "Codex CLI GPT-5.5 Medium")
+        // Label matches resolve by label first, then by task-label model_id.
+        XCTAssertEqual(catalog.displayName(forModelID: "claudeCode:claude-fable-5"), "Claude Fable 5")
+        XCTAssertEqual(RemoteHostAgentCatalog.modelIDForStart("pair"), "pair")
+        XCTAssertEqual(RemoteHostAgentCatalog.agentKind(forModelID: "claudeCode:claude-fable-5"), .claudeCode)
     }
 
     func testDegradedCatalogUsesHostDefaultAndOmitsStartModelID() {

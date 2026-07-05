@@ -12022,7 +12022,6 @@ final class AgentModeViewModel: ObservableObject {
         message: String,
         modelSelectionRaw: String?,
         sessionName: String?,
-        workspaceID: String?,
         optimisticUserItemID: UUID
     ) -> Bool {
         guard let pending = RemoteStartWindowPickerState(
@@ -12032,7 +12031,6 @@ final class AgentModeViewModel: ObservableObject {
             message: message,
             modelSelectionRaw: modelSelectionRaw,
             sessionName: sessionName,
-            workspaceID: workspaceID,
             optimisticUserItemID: optimisticUserItemID
         ) else {
             return false
@@ -12073,7 +12071,9 @@ final class AgentModeViewModel: ObservableObject {
                     modelSelectionRaw: pending.modelSelectionRaw,
                     sessionName: pending.sessionName,
                     windowID: option.windowID,
-                    workspaceID: option.workspaceID ?? pending.workspaceID
+                    // Guard only against the host-reported workspace of the chosen
+                    // window — never a client-local workspace UUID.
+                    workspaceID: option.workspaceID
                 )
             } catch {
                 if presentRemoteStartWindowPickerIfPossible(
@@ -12082,7 +12082,6 @@ final class AgentModeViewModel: ObservableObject {
                     message: pending.message,
                     modelSelectionRaw: pending.modelSelectionRaw,
                     sessionName: pending.sessionName,
-                    workspaceID: option.workspaceID ?? pending.workspaceID,
                     optimisticUserItemID: pending.optimisticUserItemID
                 ) {
                     return
@@ -12304,18 +12303,21 @@ final class AgentModeViewModel: ObservableObject {
             let shouldStartRemote = !session.runState.isActive || session.remoteHost?.remoteSessionID.isEmpty == true
             let modelSelectionRaw = RemoteHostAgentCatalog.modelIDForStart(session.selectedModelRaw)
             let sessionName = resolvedSessionDisplayName(for: tabID)
-            let workspaceID = workspaceManager?.activeWorkspace?.id.uuidString
             Task { [weak self, weak session] in
                 guard let self, let session else { return }
                 do {
                     if shouldStartRemote {
+                        // No workspace hint on first send: the client's local
+                        // workspace UUID is meaningless on the host (v1 has no
+                        // workspace:read). Host workspace IDs only arrive via the
+                        // window-picker details and are sent on picker retry.
                         try await remoteCoordinator.startRemoteSession(
                             session: session,
                             message: wrappedText,
                             modelSelectionRaw: modelSelectionRaw,
                             sessionName: sessionName,
                             windowID: nil,
-                            workspaceID: workspaceID
+                            workspaceID: nil
                         )
                     } else {
                         try await remoteCoordinator.steer(session: session, text: wrappedText)
@@ -12328,7 +12330,6 @@ final class AgentModeViewModel: ObservableObject {
                            message: wrappedText,
                            modelSelectionRaw: modelSelectionRaw,
                            sessionName: sessionName,
-                           workspaceID: workspaceID,
                            optimisticUserItemID: userItem.id
                        )
                     {

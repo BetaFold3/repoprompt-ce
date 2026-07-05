@@ -883,6 +883,19 @@ struct AgentComposerView: View, Equatable {
             rawModel: RemoteHostAgentCatalog.hostDefaultModelID,
             imageSystemName: "network"
         ))
+        if !catalog.taskLabels.isEmpty {
+            items.append(.separator)
+            items.append(.header("Host roles"))
+            for taskLabel in catalog.taskLabels {
+                // Select by host-portable role label — the host resolves it
+                // against its current role defaults at start time.
+                items.append(remoteHostModelMenuItem(
+                    title: taskLabel.name,
+                    rawModel: taskLabel.label,
+                    imageSystemName: RemoteHostAgentCatalog.agentKind(forModelID: taskLabel.modelID)?.iconName ?? "network"
+                ))
+            }
+        }
         let selectableAgents = catalog.selectableAgents
         if !selectableAgents.isEmpty {
             items.append(.separator)

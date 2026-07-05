@@ -181,7 +181,12 @@ struct RemoteCommandTranslator {
     }
 
     private func hasExplicitStartTarget(_ payload: [String: JSONValue]) -> Bool {
-        payload["window_id"] != nil || payload["workspace_id"] != nil
+        // Only `window_id` names a resolvable target. `workspace_id` is an
+        // app-side validation guard against the resolved window's active
+        // workspace — alone it cannot route, so it must not suppress the
+        // structured binding_required/ambiguous_start_target errors that
+        // carry `details.windows` and drive client window pickers.
+        payload["window_id"] != nil
     }
 
     private func translateAgentRun(
