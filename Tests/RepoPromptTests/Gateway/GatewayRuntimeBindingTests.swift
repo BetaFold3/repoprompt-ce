@@ -409,6 +409,39 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(record["completed_turn_count"] as? Int, 8)
     }
 
+    func testStartBindingFailureAuditIncludesWorkspaceSelectorDiagnostics() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(duplicateWorkspaceWindowListResponse())
+        ])
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .ambiguousStartTarget("multiple windows"),
+            auditLog: auditLog
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "start-r1",
+                payload: .object(["message": .string("go"), "workspace_name": .string("Shared Workspace")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        let record = try await waitForAuditRecord(in: auditDirectory, op: "start")
+        XCTAssertEqual(record["code"] as? String, "ambiguous_start_target")
+        XCTAssertEqual(record["has_workspace_name"] as? Bool, true)
+        XCTAssertEqual(record["has_workspace_id"] as? Bool, false)
+        XCTAssertEqual(record["workspace_match_count"] as? Int, 2)
+    }
+
     func testAutoRoutedStartAuditIncludesMatchedWindowID() async throws {
         let root = try GatewayTestHelpers.temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }

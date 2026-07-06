@@ -1985,6 +1985,72 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    private static let maxDeliveredMCPFallbackAttemptIDs = 32
+
+    private func recordDeliveredMCPFallbackAttempt(
+        _ attemptID: UUID,
+        session: AgentModeViewModel.TabSession
+    ) {
+        guard session.codexDeliveredMCPFallbackAttemptIDs.insert(attemptID).inserted else { return }
+        session.codexDeliveredMCPFallbackAttemptOrder.append(attemptID)
+        while session.codexDeliveredMCPFallbackAttemptOrder.count > Self.maxDeliveredMCPFallbackAttemptIDs {
+            let expired = session.codexDeliveredMCPFallbackAttemptOrder.removeFirst()
+            session.codexDeliveredMCPFallbackAttemptIDs.remove(expired)
+        }
+    }
+
+    @discardableResult
+    private func removeQueuedCodexFallbackForDeliveredAttempt(
+        _ attemptID: UUID,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        recordDeliveredMCPFallbackAttempt(attemptID, session: session)
+        guard let index = session.codexFallbackQueue.firstIndex(where: { entry in
+            if case let .mcp(entryAttemptID) = entry.origin {
+                return entryAttemptID == attemptID
+            }
+            return false
+        }) else { return false }
+        let removed = session.codexFallbackQueue.remove(at: index)
+        if session.codexFallbackQueue.isEmpty, session.codexFallbackDispatchInFlight == nil {
+            session.codexFallbackPumpTask?.cancel()
+            session.codexFallbackPumpTask = nil
+            session.codexFallbackSuccessorRetryTask?.cancel()
+            session.codexFallbackSuccessorRetryTask = nil
+            session.mcpFollowUpRunPending = false
+        }
+        logCodex("[AgentModeVM] sendCodexNativeMessage: removed queued Codex fallback after provider accepted attempt \(attemptID) queueID=\(removed.id)")
+        session.isDirty = true
+        viewModel?.publishMCPStateChange(for: session)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+        return true
+    }
+
+    @discardableResult
+    private func dropDeliveredClaimedCodexFallbackIfNeeded(
+        _ head: AgentModeViewModel.TabSession.CodexFallbackQueueEntry,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        guard case let .mcp(attemptID) = head.origin,
+              session.codexDeliveredMCPFallbackAttemptIDs.contains(attemptID)
+        else { return false }
+        if session.codexFallbackDispatchInFlight?.id == head.id {
+            session.codexFallbackDispatchInFlight = nil
+        }
+        viewModel?.finalizeAttachmentsForTurn(
+            for: session,
+            reservationID: head.attachmentReservationID,
+            disposition: .keepFiles
+        )
+        session.codexSteerAckTracker.resolve(attemptID: attemptID, state: .startAccepted)
+        logCodex("[AgentModeVM] dispatchClaimedCodexFallback: dropped queued fallback \(head.id) because provider already accepted MCP attempt \(attemptID)")
+        viewModel?.publishMCPStateChange(for: session)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+        return true
+    }
+
     private func enqueueCodexFallback(
         session: AgentModeViewModel.TabSession,
         context: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext?,
@@ -2180,6 +2246,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ head: AgentModeViewModel.TabSession.CodexFallbackQueueEntry,
         session: AgentModeViewModel.TabSession
     ) async {
+        if dropDeliveredClaimedCodexFallbackIfNeeded(head, session: session) {
+            return
+        }
         guard let controller = session.codexController,
               ObjectIdentifier(controller) == head.originControllerInstanceID
         else {
@@ -4295,6 +4364,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             wasRunAlreadyActive: wasRunAlreadyActive,
             session: session
         )
+        let sendThreadID = session.codexConversationID
         if case let .fallback(decision) = dispatchPlan {
             clearCodexPendingAuthRetryTurn(session)
             return enqueueCodexFallback(
@@ -4404,6 +4474,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   Self.sameCodexControllerInstance(activeController, controller)
             else {
                 if case let .mcp(attemptID) = fallbackContext?.origin {
+                    if sendThreadID == session.codexConversationID {
+                        removeQueuedCodexFallbackForDeliveredAttempt(attemptID, session: session)
+                    } else {
+                        logCodex("[AgentModeVM] sendCodexNativeMessage: keeping queued fallback after stale-controller acceptance because the accepted Codex thread is no longer the persisted session thread")
+                    }
                     let state: CodexSteerAckTracker.TerminalState = switch dispatchPlan {
                     case .start:
                         .startAccepted
@@ -4429,6 +4504,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 attachmentReservationID: attachmentReservationID
             )
             if case let .mcp(attemptID) = fallbackContext?.origin {
+                removeQueuedCodexFallbackForDeliveredAttempt(attemptID, session: session)
                 let state: CodexSteerAckTracker.TerminalState = switch dispatchPlan {
                 case .start:
                     .startAccepted
@@ -6922,6 +6998,33 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: AgentModeViewModel.TabSession
         ) async {
             await handleCodexNativeEvent(event, session: session)
+        }
+
+        @_spi(TestSupport)
+        public func test_claimCodexFallbackHead(
+            session: AgentModeViewModel.TabSession,
+            expectedQueueID: UUID,
+            beginsSuccessorAttempt: Bool
+        ) -> Bool {
+            claimCodexFallbackHead(
+                session: session,
+                expectedQueueID: expectedQueueID,
+                beginsSuccessorAttempt: beginsSuccessorAttempt
+            ) != nil
+        }
+
+        @_spi(TestSupport)
+        public func test_recordDeliveredCodexFallbackAttempt(
+            _ attemptID: UUID,
+            session: AgentModeViewModel.TabSession
+        ) {
+            removeQueuedCodexFallbackForDeliveredAttempt(attemptID, session: session)
+        }
+
+        @_spi(TestSupport)
+        public func test_dispatchClaimedCodexFallback(session: AgentModeViewModel.TabSession) async {
+            guard let head = session.codexFallbackDispatchInFlight else { return }
+            await dispatchClaimedCodexFallback(head, session: session)
         }
 
         @_spi(TestSupport)

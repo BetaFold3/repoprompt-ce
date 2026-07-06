@@ -36,6 +36,7 @@ actor RemoteGatewayRuntime {
     private let now: @Sendable () -> Date
     private var lastEligibleWindowDetailsByDevice: [String: JSONValue] = [:]
     private var autoRoutedStartWindowIDByCommandKey: [String: Int] = [:]
+    private var workspaceStartMatchCountByCommandKey: [String: Int] = [:]
 
     init(
         appLink: AppLinkSession,
@@ -415,10 +416,13 @@ actor RemoteGatewayRuntime {
            explicitStartWindowID(frame) == nil,
            bindingState != .bound,
            let payload = frame.payload?.objectValue,
-           let matchedWindow = await uniqueWorkspaceStartWindow(payload: payload, deviceID: deviceID)
+           let match = await workspaceStartWindowMatch(payload: payload, deviceID: deviceID)
         {
-            effectiveFrame = startFrame(frame, routedTo: matchedWindow)
-            rememberAutoRoutedStart(frame: frame, deviceID: deviceID, windowID: matchedWindow.windowID)
+            rememberWorkspaceStartMatchCount(frame: frame, deviceID: deviceID, count: match.matchCount)
+            if let matchedWindow = match.summary {
+                effectiveFrame = startFrame(frame, routedTo: matchedWindow)
+                rememberAutoRoutedStart(frame: frame, deviceID: deviceID, windowID: matchedWindow.windowID)
+            }
         }
         let payload = try await executeTranslatedTool(
             frame: effectiveFrame,
@@ -436,7 +440,10 @@ actor RemoteGatewayRuntime {
         return payload
     }
 
-    private func uniqueWorkspaceStartWindow(payload: [String: JSONValue], deviceID: String) async -> EligibleStartTargetWindowSummary? {
+    private func workspaceStartWindowMatch(
+        payload: [String: JSONValue],
+        deviceID: String
+    ) async -> (summary: EligibleStartTargetWindowSummary?, matchCount: Int)? {
         let rawWorkspaceID = payload["workspace_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let rawWorkspaceName = payload["workspace_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let requestedWorkspaceID = rawWorkspaceID?.isEmpty == false ? rawWorkspaceID : nil
@@ -451,8 +458,7 @@ actor RemoteGatewayRuntime {
             let nameMatches = normalizedName.map { requested in summary.workspaceName?.lowercased() == requested } ?? true
             return idMatches && nameMatches
         }
-        guard matches.count == 1 else { return nil }
-        return matches[0]
+        return (summary: matches.count == 1 ? matches[0] : nil, matchCount: matches.count)
     }
 
     private func startFrame(_ frame: RemoteClientFrame, routedTo summary: EligibleStartTargetWindowSummary) -> RemoteClientFrame {
@@ -975,6 +981,16 @@ actor RemoteGatewayRuntime {
         return autoRoutedStartWindowIDByCommandKey.removeValue(forKey: "\(deviceID)|\(requestID)")
     }
 
+    private func rememberWorkspaceStartMatchCount(frame: RemoteClientFrame, deviceID: String, count: Int) {
+        guard frame.type == "start", let requestID = frame.requestID else { return }
+        workspaceStartMatchCountByCommandKey["\(deviceID)|\(requestID)"] = count
+    }
+
+    private func takeWorkspaceStartMatchCount(frame: RemoteClientFrame, deviceID: String) -> Int? {
+        guard frame.type == "start", let requestID = frame.requestID else { return nil }
+        return workspaceStartMatchCountByCommandKey.removeValue(forKey: "\(deviceID)|\(requestID)")
+    }
+
     private func audit(
         frame: RemoteClientFrame,
         deviceID: String,
@@ -985,6 +1001,16 @@ actor RemoteGatewayRuntime {
         let requestPayload = frame.payload?.objectValue ?? [:]
         let responseObject = responsePayload?.objectValue ?? [:]
         let autoRoutedWindowID = takeAutoRoutedStartWindowID(frame: frame, deviceID: deviceID)
+        let workspaceMatchCount = takeWorkspaceStartMatchCount(frame: frame, deviceID: deviceID)
+        let isStartBindingFailure = frame.type == "start"
+            && outcome == "failure"
+            && (code == "binding_required" || code == "ambiguous_start_target")
+        let hasWorkspaceName = requestPayload["workspace_name"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
+        let hasWorkspaceID = requestPayload["workspace_id"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
         auditLog?.recordBestEffort(RemoteAuditRecord(
             deviceID: deviceID,
             requestID: frame.requestID,
@@ -996,7 +1022,10 @@ actor RemoteGatewayRuntime {
             limit: frame.type == "get_log" ? requestPayload["limit"]?.intValue : nil,
             returnedTurnCount: frame.type == "get_log" ? responseObject["returned_turn_count"]?.intValue : nil,
             completedTurnCount: frame.type == "get_log" ? responseObject["completed_turn_count"]?.intValue : nil,
-            autoRoutedWindowID: autoRoutedWindowID
+            autoRoutedWindowID: autoRoutedWindowID,
+            hasWorkspaceName: isStartBindingFailure ? hasWorkspaceName : nil,
+            hasWorkspaceID: isStartBindingFailure ? hasWorkspaceID : nil,
+            workspaceMatchCount: isStartBindingFailure ? workspaceMatchCount : nil
         ))
     }
 }

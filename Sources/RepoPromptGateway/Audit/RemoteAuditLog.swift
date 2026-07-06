@@ -13,6 +13,9 @@ struct RemoteAuditRecord: Codable, Equatable {
     let returnedTurnCount: Int?
     let completedTurnCount: Int?
     let autoRoutedWindowID: Int?
+    let hasWorkspaceName: Bool?
+    let hasWorkspaceID: Bool?
+    let workspaceMatchCount: Int?
 
     init(
         date: Date = Date(),
@@ -26,7 +29,10 @@ struct RemoteAuditRecord: Codable, Equatable {
         limit: Int? = nil,
         returnedTurnCount: Int? = nil,
         completedTurnCount: Int? = nil,
-        autoRoutedWindowID: Int? = nil
+        autoRoutedWindowID: Int? = nil,
+        hasWorkspaceName: Bool? = nil,
+        hasWorkspaceID: Bool? = nil,
+        workspaceMatchCount: Int? = nil
     ) {
         ts = RemoteAuditLog.timestampFormatter.string(from: date)
         self.deviceID = deviceID
@@ -40,6 +46,9 @@ struct RemoteAuditRecord: Codable, Equatable {
         self.returnedTurnCount = returnedTurnCount
         self.completedTurnCount = completedTurnCount
         self.autoRoutedWindowID = autoRoutedWindowID
+        self.hasWorkspaceName = hasWorkspaceName
+        self.hasWorkspaceID = hasWorkspaceID
+        self.workspaceMatchCount = workspaceMatchCount
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -55,6 +64,9 @@ struct RemoteAuditRecord: Codable, Equatable {
         case returnedTurnCount = "returned_turn_count"
         case completedTurnCount = "completed_turn_count"
         case autoRoutedWindowID = "auto_routed_window_id"
+        case hasWorkspaceName = "has_workspace_name"
+        case hasWorkspaceID = "has_workspace_id"
+        case workspaceMatchCount = "workspace_match_count"
     }
 }
 

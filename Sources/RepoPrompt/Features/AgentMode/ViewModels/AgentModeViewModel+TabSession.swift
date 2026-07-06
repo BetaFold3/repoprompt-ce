@@ -420,6 +420,8 @@ extension AgentModeViewModel {
         var codexPendingSteerLifecycleReconciliation: CodexPendingSteerLifecycleReconciliation?
         var codexFallbackQueue: [CodexFallbackQueueEntry] = []
         var codexFallbackDispatchInFlight: CodexFallbackQueueEntry?
+        var codexDeliveredMCPFallbackAttemptIDs: Set<UUID> = []
+        var codexDeliveredMCPFallbackAttemptOrder: [UUID] = []
         var codexFallbackPumpTask: Task<Void, Never>?
         var codexFallbackSuccessorRetryTask: Task<Void, Never>?
         let codexDispatchSerialGate = CodexDispatchSerialGate()

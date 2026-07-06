@@ -771,6 +771,184 @@ final class CodexFallbackFIFOTests: XCTestCase {
         XCTAssertTrue(failedSession.codexFallbackQueue.isEmpty)
     }
 
+    func testLateAcceptedMCPStartRemovesQueuedFallbackBeforeReplay() async throws {
+        let startGate = FallbackStartGate()
+        let controller = FallbackFIFOController(
+            steerResults: [],
+            startGate: startGate
+        )
+        let (viewModel, session) = makeRunningSession(controller: controller)
+        session.runState = .idle
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        let attemptID = session.codexSteerAckTracker.beginAttempt()
+        let queueID = UUID()
+        let context = fallbackContext(
+            queueID: queueID,
+            origin: .mcp(attemptID: attemptID),
+            text: "slow start"
+        )
+
+        let sendTask = Task { @MainActor in
+            await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+                session: session,
+                text: "slow start",
+                attachments: [],
+                fallbackContext: context
+            )
+        }
+        let didStart = await startGate.waitUntilWaiting()
+        XCTAssertTrue(didStart, "Expected turn/start to be in flight")
+
+        let terminalState = await session.codexSteerAckTracker.awaitTerminalState(
+            attemptID: attemptID,
+            timeoutSeconds: 0.1
+        )
+        XCTAssertEqual(terminalState, .timedOut)
+
+        let fallbackOutcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "slow start",
+            attachments: [],
+            fallbackContext: context
+        )
+        guard case let .queuedFallback(fallbackQueueID, .activeWithoutAuthoritativeIdentity) = fallbackOutcome else {
+            return XCTFail("Expected fallback for the timed-out MCP attempt, got \(fallbackOutcome)")
+        }
+        XCTAssertEqual(fallbackQueueID, queueID)
+        XCTAssertEqual(session.codexFallbackQueue.map(\.id), [queueID])
+
+        await startGate.release()
+        let sendOutcome = await sendTask.value
+        XCTAssertEqual(sendOutcome, .sent)
+        try await waitUntil { session.codexFallbackQueue.isEmpty }
+        XCTAssertNil(session.codexFallbackDispatchInFlight)
+        XCTAssertEqual(controller.startCount, 1)
+
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(controller.startCount, 1, "Removed fallback must not replay after the late provider success")
+    }
+
+    func testLateAcceptedMCPAttemptDropsAlreadyClaimedFallbackBeforeProviderReplay() async throws {
+        let controller = FallbackFIFOController(steerResults: [])
+        let (viewModel, session) = makeRunningSession(controller: controller)
+        let attemptID = session.codexSteerAckTracker.beginAttempt()
+        let queueID = UUID()
+        _ = try await controller.startUserTurn(
+            text: "original delivery",
+            images: [],
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil
+        )
+        XCTAssertEqual(controller.startCount, 1)
+        session.codexFallbackQueue = [
+            fallbackQueueEntry(
+                queueID: queueID,
+                origin: .mcp(attemptID: attemptID),
+                text: "claimed fallback",
+                session: session,
+                controller: controller
+            )
+        ]
+
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_claimCodexFallbackHead(
+            session: session,
+            expectedQueueID: queueID,
+            beginsSuccessorAttempt: false
+        ))
+        XCTAssertEqual(session.codexFallbackDispatchInFlight?.id, queueID)
+
+        viewModel.test_codexCoordinator.test_recordDeliveredCodexFallbackAttempt(attemptID, session: session)
+        await viewModel.test_codexCoordinator.test_dispatchClaimedCodexFallback(session: session)
+
+        XCTAssertNil(session.codexFallbackDispatchInFlight)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertEqual(controller.startCount, 1, "Claimed fallback must not re-dispatch after the original attempt is delivered")
+    }
+
+    func testRemovingQueuedDeliveredSiblingDoesNotCancelInFlightFallbackOrPendingMask() async {
+        let controller = FallbackFIFOController(steerResults: [])
+        let (viewModel, session) = makeRunningSession(controller: controller)
+        let claimedAttemptID = session.codexSteerAckTracker.beginAttempt()
+        let queuedAttemptID = session.codexSteerAckTracker.beginAttempt()
+        let claimedQueueID = UUID()
+        let queuedQueueID = UUID()
+        session.codexFallbackQueue = [
+            fallbackQueueEntry(
+                queueID: claimedQueueID,
+                origin: .mcp(attemptID: claimedAttemptID),
+                text: "claimed",
+                session: session,
+                controller: controller
+            ),
+            fallbackQueueEntry(
+                queueID: queuedQueueID,
+                origin: .mcp(attemptID: queuedAttemptID),
+                text: "queued sibling",
+                session: session,
+                controller: controller
+            )
+        ]
+
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_claimCodexFallbackHead(
+            session: session,
+            expectedQueueID: claimedQueueID,
+            beginsSuccessorAttempt: false
+        ))
+        session.mcpFollowUpRunPending = true
+
+        viewModel.test_codexCoordinator.test_recordDeliveredCodexFallbackAttempt(queuedAttemptID, session: session)
+
+        XCTAssertEqual(session.codexFallbackDispatchInFlight?.id, claimedQueueID)
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        XCTAssertTrue(session.mcpFollowUpRunPending)
+
+        await viewModel.test_codexCoordinator.test_dispatchClaimedCodexFallback(session: session)
+        XCTAssertEqual(controller.startCount, 1)
+    }
+
+    func testDefinitiveMCPProviderFailureKeepsFallbackReplayExactlyOnce() async throws {
+        let failure = CodexTurnSteerError.activeTurnNotSteerable(
+            turnKind: "review",
+            failure: requestFailure(message: "cannot steer a review turn")
+        )
+        let controller = FallbackFIFOController(steerResults: [.failure(failure)])
+        let (viewModel, session) = makeRunningSession(controller: controller)
+        let attemptID = session.codexSteerAckTracker.beginAttempt()
+        let queueID = UUID()
+        let context = fallbackContext(
+            queueID: queueID,
+            origin: .mcp(attemptID: attemptID),
+            text: "replay after failure"
+        )
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "replay after failure",
+            attachments: [],
+            fallbackContext: context
+        )
+        guard case let .queuedFallback(queuedID, .activeTurnNotSteerable) = outcome else {
+            return XCTFail("Expected durable fallback after provider rejection, got \(outcome)")
+        }
+        XCTAssertEqual(queuedID, queueID)
+        let terminalState = await session.codexSteerAckTracker.awaitTerminalState(
+            attemptID: attemptID,
+            timeoutSeconds: 0.1
+        )
+        XCTAssertEqual(terminalState, .durablyQueued(queueID: queueID))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+        try await waitUntil { controller.startCount == 1 }
+        XCTAssertTrue(session.codexFallbackQueue.isEmpty)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(controller.startCount, 1, "Definitive provider failure should replay exactly once")
+    }
+
     func testManualFallbackKeepsSingleOptimisticBubbleAndDoesNotRestoreDraft() async throws {
         let controller = FallbackFIFOController(
             steerResults: [
@@ -976,6 +1154,36 @@ final class CodexFallbackFIFOTests: XCTestCase {
             optimisticUserItemID: nil,
             origin: origin,
             dispatchTicket: nil
+        )
+    }
+
+    private func fallbackQueueEntry(
+        queueID: UUID,
+        origin: AgentModeViewModel.TabSession.CodexFallbackOrigin,
+        text: String,
+        session: AgentModeViewModel.TabSession,
+        controller: any CodexSessionControlling
+    ) -> AgentModeViewModel.TabSession.CodexFallbackQueueEntry {
+        .init(
+            id: queueID,
+            providerText: text,
+            images: [],
+            taggedFileAttachments: [],
+            model: nil,
+            reasoningEffort: nil,
+            serviceTier: nil,
+            attachmentReservationID: nil,
+            optimisticUserItemID: nil,
+            draftText: text,
+            origin: origin,
+            fallbackReason: .activeWithoutAuthoritativeIdentity,
+            originThreadID: session.codexConversationID ?? "thread",
+            originControllerInstanceID: ObjectIdentifier(controller),
+            originControllerGeneration: session.codexControllerGeneration,
+            originRunID: session.runID!,
+            originRunAttemptID: session.activeRunAttemptID!,
+            blockingTurn: nil,
+            state: .queued
         )
     }
 
