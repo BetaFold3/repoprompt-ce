@@ -11,6 +11,19 @@ protocol RemoteFrameSink: Sendable {
 actor RemoteGatewayRuntime {
     static let phase0DeviceID = "phase0:static-token"
 
+    private struct EligibleStartTargetWindowSummary {
+        let windowID: Int
+        let workspaceID: String?
+        let workspaceName: String?
+        let details: JSONValue
+    }
+
+    private struct EligibleStartTargetWindowInfo {
+        let details: JSONValue
+        let windowIDs: [Int]
+        let summaries: [EligibleStartTargetWindowSummary]
+    }
+
     private let appLink: AppLinkSession
     private let appLinkPool: AppLinkPool?
     private let ledger: CommandLedger
@@ -394,14 +407,63 @@ actor RemoteGatewayRuntime {
         {
             resolvedWindowID = fallbackWindowID
         }
-        return try await executeTranslatedTool(
-            frame: frame,
+        var effectiveFrame = frame
+        if frame.type == "start",
+           explicitStartWindowID(frame) == nil,
+           bindingState != .bound,
+           let payload = frame.payload?.objectValue,
+           let matchedWindow = await uniqueWorkspaceStartWindow(payload: payload, deviceID: deviceID)
+        {
+            effectiveFrame = startFrame(frame, routedTo: matchedWindow)
+        }
+        let payload = try await executeTranslatedTool(
+            frame: effectiveFrame,
             deviceID: deviceID,
             link: link,
             bindingState: bindingState,
             resolvedWindowID: resolvedWindowID,
             retrySessionID: sessionID,
             allowCorrectiveRetry: allowCorrectiveRetry
+        )
+        if effectiveFrame != frame {
+            await recordExplicitStartAffinityIfNeeded(frame: effectiveFrame, payload: payload)
+        }
+        return payload
+    }
+
+    private func uniqueWorkspaceStartWindow(payload: [String: JSONValue], deviceID: String) async -> EligibleStartTargetWindowSummary? {
+        let rawWorkspaceID = payload["workspace_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawWorkspaceName = payload["workspace_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedWorkspaceID = rawWorkspaceID?.isEmpty == false ? rawWorkspaceID : nil
+        let requestedWorkspaceName = rawWorkspaceName?.isEmpty == false ? rawWorkspaceName : nil
+        guard requestedWorkspaceID != nil || requestedWorkspaceName != nil,
+              let windowInfo = await eligibleStartTargetWindowInfo(deviceID: deviceID)
+        else { return nil }
+
+        let normalizedName = requestedWorkspaceName?.lowercased()
+        let matches = windowInfo.summaries.filter { summary in
+            let idMatches = requestedWorkspaceID.map { requested in summary.workspaceID == requested } ?? true
+            let nameMatches = normalizedName.map { requested in summary.workspaceName?.lowercased() == requested } ?? true
+            return idMatches && nameMatches
+        }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
+    }
+
+    private func startFrame(_ frame: RemoteClientFrame, routedTo summary: EligibleStartTargetWindowSummary) -> RemoteClientFrame {
+        var payload = frame.payload?.objectValue ?? [:]
+        payload["window_id"] = .int(summary.windowID)
+        if let workspaceID = summary.workspaceID, !workspaceID.isEmpty {
+            payload["workspace_id"] = .string(workspaceID)
+        }
+        return RemoteClientFrame(
+            v: frame.v,
+            type: frame.type,
+            requestID: frame.requestID,
+            sessionID: frame.sessionID,
+            payload: .object(payload),
+            clientTime: frame.clientTime,
+            sig: frame.sig
         )
     }
 
@@ -684,7 +746,7 @@ actor RemoteGatewayRuntime {
         return .object(object)
     }
 
-    private func eligibleStartTargetWindowInfo(deviceID: String) async -> (details: JSONValue, windowIDs: [Int])? {
+    private func eligibleStartTargetWindowInfo(deviceID: String) async -> EligibleStartTargetWindowInfo? {
         guard let (link, _) = try? await resolveAppLink(deviceID: deviceID) else { return nil }
         guard let result = try? await link.callTool(
             name: "bind_context",
@@ -695,23 +757,36 @@ actor RemoteGatewayRuntime {
         let windows = payload.objectValue?["windows"]?.arrayValue
         else { return nil }
         var windowIDs: [Int] = []
-        let summaries: [JSONValue] = windows.compactMap { window in
+        let summaries: [EligibleStartTargetWindowSummary] = windows.compactMap { window in
             guard let object = window.objectValue,
                   let windowIDValue = object["window_id"],
                   let windowID = windowIDValue.intValue
             else { return nil }
             windowIDs.append(windowID)
             var summary: [String: JSONValue] = ["window_id": windowIDValue]
+            var workspaceID: String?
+            var workspaceName: String?
             if let workspace = object["workspace"]?.objectValue {
-                if let workspaceID = workspace["id"] { summary["workspace_id"] = workspaceID }
-                if let workspaceName = workspace["name"] { summary["workspace_name"] = workspaceName }
+                if let id = workspace["id"] {
+                    summary["workspace_id"] = id
+                    workspaceID = id.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if let name = workspace["name"] {
+                    summary["workspace_name"] = name
+                    workspaceName = name.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
             }
-            return .object(summary)
+            return EligibleStartTargetWindowSummary(
+                windowID: windowID,
+                workspaceID: workspaceID,
+                workspaceName: workspaceName,
+                details: .object(summary)
+            )
         }
         guard !summaries.isEmpty else { return nil }
-        let details = JSONValue.array(summaries)
+        let details = JSONValue.array(summaries.map(\.details))
         lastEligibleWindowDetailsByDevice[deviceID] = details
-        return (details, windowIDs)
+        return EligibleStartTargetWindowInfo(details: details, windowIDs: windowIDs, summaries: summaries)
     }
 
     private func responseFrame(for outcome: CommandLedger.RecordedOutcome, frame: RemoteClientFrame) -> RemoteServerFrame {

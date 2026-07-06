@@ -225,11 +225,11 @@ struct RemoteCommandTranslator {
     }
 
     private func hasExplicitStartTarget(_ payload: [String: JSONValue]) -> Bool {
-        // Only `window_id` names a resolvable target. `workspace_id` is an
-        // app-side validation guard against the resolved window's active
-        // workspace — alone it cannot route, so it must not suppress the
-        // structured binding_required/ambiguous_start_target errors that
-        // carry `details.windows` and drive client window pickers.
+        // Only `window_id` names a resolvable target at translation time.
+        // `workspace_id` and `workspace_name` are matching/validation hints;
+        // alone they cannot route here, so they must not suppress structured
+        // binding_required/ambiguous_start_target errors that carry
+        // `details.windows` and drive client window pickers.
         payload["window_id"] != nil
     }
 
@@ -270,6 +270,9 @@ struct RemoteCommandTranslator {
             } else if key == "workspace_id" {
                 // Validated app-side against the resolved window's active workspace.
                 arguments["workspace_id"] = value.mcpValue
+            } else if key == "workspace_name" {
+                // Gateway-only routing hint; the app agent_run payload has no matching field.
+                continue
             } else if key == "interaction_id" || key == "message" || key == "response" || key == "answers"
                 || key == "content" || key == "meta" || key == "_meta" || key == "amendment"
                 || key == "workflow_id" || key == "workflow_name" || key == "model_id"
@@ -375,9 +378,10 @@ struct RemoteCommandTranslator {
         "detach",
         "workflow_id",
         "workflow_name",
-        // M6.6 explicit multi-window start selectors.
+        // M6.6 explicit multi-window start selectors plus gateway-only matching hints.
         "window_id",
-        "workspace_id"
+        "workspace_id",
+        "workspace_name"
     ]).union(commonWorktreePayloadKeys)
 
     private static let steerPayloadKeys: Set<String> = [

@@ -273,6 +273,7 @@ struct AgentManageMCPToolService {
             agentModeVM: agentModeVM
         )
         let totalTurns = transcriptInfo.transcript.turns.count
+        let completedTurnCount = completedTurnCount(in: transcriptInfo.transcript)
         let slicedTurns = Array(transcriptInfo.transcript.turns.dropFirst(offset).prefix(limit))
         let slicedTranscript = AgentTranscript(
             version: transcriptInfo.transcript.version,
@@ -287,6 +288,7 @@ struct AgentManageMCPToolService {
             "turn_limit": .int(limit),
             "returned_turn_count": .int(slicedTurns.count),
             "total_turns": .int(totalTurns),
+            "completed_turn_count": .int(completedTurnCount),
             "transcript_xml": .string(
                 AgentTranscriptIO.buildSpartanLogXML(from: slicedTranscript)
             )
@@ -295,6 +297,11 @@ struct AgentManageMCPToolService {
             result["name"] = .string(name)
         }
         return .object(result)
+    }
+
+    private func completedTurnCount(in transcript: AgentTranscript) -> Int {
+        guard let finalTurn = transcript.turns.last else { return 0 }
+        return max(0, transcript.turns.count - 1) + (finalTurn.isCompleted ? 1 : 0)
     }
 
     private func executeExtractHandoff(args: [String: Value]) async throws -> Value {

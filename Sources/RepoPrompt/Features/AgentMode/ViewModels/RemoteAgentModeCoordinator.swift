@@ -48,7 +48,8 @@ final class RemoteAgentModeCoordinator {
         modelSelectionRaw: String?,
         sessionName: String?,
         windowID: Int?,
-        workspaceID: String?
+        workspaceID: String?,
+        workspaceName: String? = nil
     ) async throws {
         let controller = try controller(for: session)
         session.runState = .running
@@ -59,7 +60,8 @@ final class RemoteAgentModeCoordinator {
             modelSelectionRaw: modelSelectionRaw,
             sessionName: sessionName,
             windowID: windowID,
-            workspaceID: workspaceID
+            workspaceID: workspaceID,
+            workspaceName: workspaceName
         )
         if var binding = session.remoteHost {
             binding.remoteSessionID = remoteSessionID

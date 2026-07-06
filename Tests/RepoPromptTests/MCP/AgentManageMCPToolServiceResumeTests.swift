@@ -88,6 +88,81 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         )
     }
 
+    func testGetLogReportsOnlyLeadingCompletedTurns() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        let service = makeService(window: window, connectionID: UUID())
+
+        session.runState = .running
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [.user("Prompt", sequenceIndex: 0)],
+            terminalState: .running,
+            compact: false
+        )
+        let runningResult = try await service.execute(args: [
+            "op": .string("get_log"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        XCTAssertEqual(runningResult.objectValue?["completed_turn_count"]?.intValue, 0)
+        XCTAssertEqual(runningResult.objectValue?["returned_turn_count"]?.intValue, 1)
+
+        session.runState = .completed
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("Prompt", sequenceIndex: 0),
+                .assistant("Reply", sequenceIndex: 1)
+            ],
+            terminalState: .completed,
+            compact: false
+        )
+        let completedResult = try await service.execute(args: [
+            "op": .string("get_log"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        XCTAssertEqual(completedResult.objectValue?["completed_turn_count"]?.intValue, 1)
+        XCTAssertEqual(completedResult.objectValue?["returned_turn_count"]?.intValue, 1)
+
+        session.runState = .running
+        var staleMiddleTranscript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("Prompt", sequenceIndex: 0),
+                .assistant("Reply", sequenceIndex: 1),
+                .user("Follow-up", sequenceIndex: 2)
+            ],
+            terminalState: .running,
+            compact: false
+        )
+        staleMiddleTranscript.turns[0].terminalState = .running
+        session.transcript = staleMiddleTranscript
+        let staleMiddleResult = try await service.execute(args: [
+            "op": .string("get_log"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        XCTAssertEqual(staleMiddleResult.objectValue?["completed_turn_count"]?.intValue, 1)
+        XCTAssertEqual(staleMiddleResult.objectValue?["returned_turn_count"]?.intValue, 2)
+
+        session.runState = .waitingForUser
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("Prompt", sequenceIndex: 0),
+                .assistant("Need input", sequenceIndex: 1)
+            ],
+            terminalState: .waitingForUser,
+            compact: false
+        )
+        let waitingResult = try await service.execute(args: [
+            "op": .string("get_log"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        XCTAssertEqual(waitingResult.objectValue?["completed_turn_count"]?.intValue, 0)
+        XCTAssertEqual(waitingResult.objectValue?["returned_turn_count"]?.intValue, 1)
+    }
+
     private func makeWindow() async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

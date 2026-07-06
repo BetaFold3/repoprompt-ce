@@ -12354,21 +12354,23 @@ final class AgentModeViewModel: ObservableObject {
                 syncStatusPillsUIState()
             }
             let sessionName = resolvedSessionDisplayName(for: tabID)
+            let workspaceName = workspaceManager?.activeWorkspace?.name
             Task { [weak self, weak session] in
                 guard let self, let session else { return }
                 do {
                     if shouldStartRemote {
-                        // No workspace hint on first send: the client's local
-                        // workspace UUID is meaningless on the host (v1 has no
-                        // workspace:read). Host workspace IDs only arrive via the
-                        // window-picker details and are sent on picker retry.
+                        // First send cannot use the client-local workspace UUID as a
+                        // host selector, but the workspace name can disambiguate a
+                        // single matching host window. Picker retries still use
+                        // host-reported window/workspace identifiers.
                         try await remoteCoordinator.startRemoteSession(
                             session: session,
                             message: wrappedText,
                             modelSelectionRaw: modelSelectionRaw,
                             sessionName: sessionName,
                             windowID: nil,
-                            workspaceID: nil
+                            workspaceID: nil,
+                            workspaceName: workspaceName
                         )
                     } else {
                         try await remoteCoordinator.steer(session: session, text: wrappedText)

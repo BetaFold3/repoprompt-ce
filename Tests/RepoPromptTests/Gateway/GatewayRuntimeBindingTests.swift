@@ -74,6 +74,28 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         ]))
     }
 
+    private func duplicateWorkspaceWindowListResponse() -> MCPToolResult {
+        GatewayTestHelpers.toolResult(json: .object([
+            "windows": .array([
+                .object([
+                    "window_id": .int(1),
+                    "workspace": .object([
+                        "id": .string("44444444-4444-4444-4444-444444444444"),
+                        "name": .string("Shared Workspace")
+                    ])
+                ]),
+                .object([
+                    "window_id": .int(2),
+                    "workspace": .object([
+                        "id": .string("55555555-5555-5555-5555-555555555555"),
+                        "name": .string("Shared Workspace")
+                    ])
+                ])
+            ]),
+            "binding": .object(["state": .string("unbound")])
+        ]))
+    }
+
     private func sessionListResponse(_ ids: [String]) -> MCPToolResult {
         GatewayTestHelpers.toolResult(json: .object([
             "sessions": .array(ids.map { id in
@@ -230,6 +252,98 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         // No fallback guessing: the only app call is the gateway-internal window list.
         let calls = await connection.calls
         XCTAssertEqual(calls.map(\.name), ["bind_context"])
+    }
+
+    func testStartWithUniqueWorkspaceNameAutoRoutesAndRecordsAffinity() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(sessionID),
+                "status": .string("running")
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+        let sink = RecordingFrameSink()
+
+        let startResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "r1",
+                payload: .object(["message": .string("go"), "workspace_name": .string(" workspace b ")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+        XCTAssertEqual(startResponse?.type, "command_result")
+
+        _ = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r2", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context", "agent_run", "agent_run"])
+        let startCall = try XCTUnwrap(calls.first { $0.arguments["op"] == .string("start") })
+        XCTAssertEqual(startCall.arguments["_windowID"], .int(2))
+        XCTAssertEqual(startCall.arguments["workspace_id"], .string("55555555-5555-5555-5555-555555555555"))
+        XCTAssertNil(startCall.arguments["workspace_name"])
+        XCTAssertNil(startCall.arguments["window_id"])
+        let steerCall = try XCTUnwrap(calls.first { $0.arguments["op"] == .string("steer") })
+        XCTAssertEqual(steerCall.arguments["_windowID"], .int(2))
+    }
+
+    func testStartWithNonMatchingWorkspaceNameStillReturnsAmbiguousStartTargetWithWindows() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse())
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "r1",
+                payload: .object(["message": .string("go"), "workspace_name": .string("Missing")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        let payload = try XCTUnwrap(response?.payload?.objectValue)
+        XCTAssertEqual(payload["code"]?.stringValue, "ambiguous_start_target")
+        let windows = try XCTUnwrap(payload["details"]?.objectValue?["windows"]?.arrayValue)
+        XCTAssertEqual(windows.count, 2)
+        let calls = await connection.calls
+        XCTAssertFalse(calls.contains { $0.name == "agent_run" })
+    }
+
+    func testStartWithDuplicateWorkspaceNameStillReturnsAmbiguousStartTargetWithWindows() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(duplicateWorkspaceWindowListResponse())
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "r1",
+                payload: .object(["message": .string("go"), "workspace_name": .string("shared workspace")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        let payload = try XCTUnwrap(response?.payload?.objectValue)
+        XCTAssertEqual(payload["code"]?.stringValue, "ambiguous_start_target")
+        let windows = try XCTUnwrap(payload["details"]?.objectValue?["windows"]?.arrayValue)
+        XCTAssertEqual(windows.count, 2)
+        let calls = await connection.calls
+        XCTAssertFalse(calls.contains { $0.name == "agent_run" })
     }
 
     func testStartWithExplicitWindowSelectorProceedsOnAmbiguousConnection() async throws {

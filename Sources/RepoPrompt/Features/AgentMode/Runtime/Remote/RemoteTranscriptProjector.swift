@@ -8,11 +8,17 @@ struct RemoteProjectedLogPage: Equatable {
     var turnLimit: Int
     var returnedTurnCount: Int
     var totalTurns: Int
+    var completedTurnCount: Int?
     var transcriptXML: String
     var items: [AgentChatItem]
 
     var nextLogOffset: Int {
         turnOffset + returnedTurnCount
+    }
+
+    var consumableOffset: Int {
+        guard let completedTurnCount else { return nextLogOffset }
+        return min(completedTurnCount, nextLogOffset)
     }
 }
 
@@ -37,6 +43,7 @@ struct RemoteTranscriptProjector: Equatable {
         let turnLimit = object["turn_limit"]?.intValue ?? 0
         let returnedTurnCount = object["returned_turn_count"]?.intValue ?? 0
         let totalTurns = object["total_turns"]?.intValue ?? 0
+        let completedTurnCount = object["completed_turn_count"]?.intValue
         let transcriptXML = object["transcript_xml"]?.stringValue ?? ""
         let rows = Self.parseTranscriptXML(transcriptXML)
         let items = rows.enumerated().map { index, row in
@@ -48,6 +55,7 @@ struct RemoteTranscriptProjector: Equatable {
             turnLimit: turnLimit,
             returnedTurnCount: returnedTurnCount,
             totalTurns: totalTurns,
+            completedTurnCount: completedTurnCount,
             transcriptXML: transcriptXML,
             items: items
         )

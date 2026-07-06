@@ -201,6 +201,34 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         XCTAssertEqual(call.arguments["workspace_id"], .string("33333333-3333-3333-3333-333333333333"))
     }
 
+    func testStartWorkspaceNameIsAcceptedButConsumedByGateway() throws {
+        let translator = RemoteCommandTranslator()
+        let call = try translator.translate(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "r1",
+                payload: .object([
+                    "message": .string("go"),
+                    "workspace_name": .string("Workspace A")
+                ])
+            )
+        )
+        XCTAssertNil(call.arguments["workspace_name"])
+        XCTAssertNil(call.arguments["_windowID"])
+
+        let ambiguousTranslator = RemoteCommandTranslator(bindingState: .ambiguousStartTarget("multiple windows"))
+        XCTAssertThrowsError(try ambiguousTranslator.translate(RemoteClientFrame(
+            type: "start",
+            requestID: "r2",
+            payload: .object([
+                "message": .string("go"),
+                "workspace_name": .string("Workspace A")
+            ])
+        ))) { error in
+            XCTAssertEqual(error as? RemoteCommandTranslatorError, .ambiguousStartTarget)
+        }
+    }
+
     func testWorkspaceSelectorAloneDoesNotBypassAmbiguousStartTarget() throws {
         let translator = RemoteCommandTranslator(bindingState: .ambiguousStartTarget("multiple windows"))
         let frame = RemoteClientFrame(
