@@ -111,6 +111,22 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         ]))
     }
 
+    private func auditRecords(in directory: URL, op: String) -> [[String: Any]] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        return files
+            .filter { $0.pathExtension == "jsonl" }
+            .flatMap { fileURL -> [[String: Any]] in
+                let text = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+                return text.split(separator: "\n").compactMap { rawLine in
+                    guard let data = rawLine.data(using: .utf8),
+                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          object["op"] as? String == op
+                    else { return nil }
+                    return object
+                }
+            }
+    }
+
     private func waitForAuditRecord(
         in directory: URL,
         op: String,
@@ -118,21 +134,31 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         line: UInt = #line
     ) async throws -> [String: Any] {
         for _ in 0 ..< 100 {
-            let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
-            for fileURL in files where fileURL.pathExtension == "jsonl" {
-                let text = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
-                for rawLine in text.split(separator: "\n") {
-                    guard let data = rawLine.data(using: .utf8),
-                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                          object["op"] as? String == op
-                    else { continue }
-                    return object
-                }
+            if let record = auditRecords(in: directory, op: op).first {
+                return record
             }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTFail("Timed out waiting for audit record", file: file, line: line)
         return [:]
+    }
+
+    private func waitForAuditRecords(
+        in directory: URL,
+        op: String,
+        minimumCount: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> [[String: Any]] {
+        for _ in 0 ..< 100 {
+            let records = auditRecords(in: directory, op: op)
+            if records.count >= minimumCount {
+                return records
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Timed out waiting for \(minimumCount) audit records", file: file, line: line)
+        return []
     }
 
     private func makeRuntime(
@@ -510,6 +536,60 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertNil(record["workspace_match_count"])
         XCTAssertNil(record["workspace_match_skipped"])
         XCTAssertEqual(record["workspace_match_unavailable_reason"] as? String, "app_tool_error")
+    }
+
+    func testInFlightDuplicateStartAuditDoesNotConsumeOriginalRoutingDiagnostics() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let gate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .gated(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(sessionID),
+                "status": .string("running")
+            ])), gate)
+        ])
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .ambiguousStartTarget("multiple windows"),
+            auditLog: auditLog
+        )
+        let frame = RemoteClientFrame(
+            type: "start",
+            requestID: "start-r1",
+            payload: .object(["message": .string("go"), "workspace_name": .string("Workspace B")])
+        )
+
+        let original = Task {
+            await runtime.handle(
+                frame,
+                deviceID: "device",
+                sinkID: UUID(),
+                sink: RecordingFrameSink()
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let duplicate = await runtime.handle(
+            frame,
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(duplicate?.type, "command_result")
+        XCTAssertEqual(duplicate?.payload?.objectValue?["status"]?.stringValue, "in_flight")
+
+        await gate.release()
+        let originalResponse = await original.value
+        XCTAssertEqual(originalResponse?.type, "command_result")
+
+        let records = try await waitForAuditRecords(in: auditDirectory, op: "start", minimumCount: 2)
+        let inFlightRecord = try XCTUnwrap(records.first { $0["outcome"] as? String == "in_flight" })
+        let successRecord = try XCTUnwrap(records.first { $0["outcome"] as? String == "success" })
+        XCTAssertNil(inFlightRecord["auto_routed_window_id"])
+        XCTAssertEqual(successRecord["auto_routed_window_id"] as? Int, 2)
     }
 
     func testAutoRoutedStartAuditIncludesMatchedWindowID() async throws {

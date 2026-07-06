@@ -1521,13 +1521,33 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             try XCTUnwrap(exactReadPersistentMCPTestEndpoint)
         }
 
-        func makeAdditionalEndpoint(label: String) async throws -> PersistentMCPTestEndpoint {
+        func makeAdditionalEndpoint(
+            label: String,
+            clientName: String? = nil,
+            sessionToken: String? = nil,
+            principal: MCPConnectionPrincipal = .standard,
+            clearPersistedRoutingState: Bool = true,
+            requiredToolNames: Set<String> = [
+                MCPWindowToolName.readFile,
+                MCPWindowToolName.search,
+                "bind_context"
+            ]
+        ) async throws -> PersistentMCPTestEndpoint {
             let endpoint = try await PersistentMCPTestEndpoint.make(
                 label: label,
-                networkManager: networkManager
+                networkManager: networkManager,
+                clientName: clientName,
+                sessionToken: sessionToken,
+                principal: principal,
+                clearPersistedRoutingState: clearPersistedRoutingState,
+                requiredToolNames: requiredToolNames
             )
             additionalPersistentMCPTestEndpoints.append(endpoint)
             return endpoint
+        }
+
+        func forgetAdditionalEndpoint(_ endpoint: PersistentMCPTestEndpoint) {
+            additionalPersistentMCPTestEndpoints.removeAll { $0.connectionID == endpoint.connectionID }
         }
 
         func endpoints() throws -> [PersistentMCPTestEndpoint] {
@@ -1799,6 +1819,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             label: String,
             networkManager: ServerNetworkManager,
             clientName overrideClientName: String? = nil,
+            sessionToken overrideSessionToken: String? = nil,
+            principal: MCPConnectionPrincipal = .standard,
+            clearPersistedRoutingState: Bool = true,
             requiredToolNames: Set<String> = [
                 MCPWindowToolName.readFile,
                 MCPWindowToolName.search,
@@ -1806,9 +1829,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             ]
         ) async throws -> PersistentMCPTestEndpoint {
             let connectionID = UUID()
-            let sessionToken = "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
+            let sessionToken = overrideSessionToken ?? "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
             let clientName = overrideClientName ?? "persistent-mcp-distinct-\(label)-\(UUID().uuidString)"
-            await networkManager.debugClearPersistedRoutingState(for: clientName)
+            if clearPersistedRoutingState {
+                await networkManager.debugClearPersistedRoutingState(for: clientName)
+            }
             var socketFDs = [Int32](repeating: -1, count: 2)
             guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
                 throw PersistentMCPTestSocketClient.ClientError.posix(operation: "socketpair", code: errno)
@@ -1849,6 +1874,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 connection: manager,
                 clientName: clientName,
                 sessionToken: sessionToken
+            )
+            await networkManager.debugInstallIdentityContextForTesting(
+                connectionID: connectionID,
+                clientName: clientName,
+                principal: principal
             )
             let startTask = Task {
                 try await manager.start { clientInfo in

@@ -86,6 +86,70 @@ final class RemoteHostCatalogTests: XCTestCase {
         XCTAssertEqual(RemoteHostAgentCatalog.modelIDForStart(" codexExec:gpt-5.5-low "), "codexExec:gpt-5.5-low")
     }
 
+    func testStructuredCatalogGroupsModelsByCLIBaseModelAndEffort() throws {
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(structuredCatalogJSON.utf8))
+
+        XCTAssertTrue(catalog.supportsStructuredModelGroups)
+        let agent = try XCTUnwrap(catalog.structuredAgentGroups.first)
+        XCTAssertEqual(agent.name, "Claude Code")
+        XCTAssertEqual(agent.agentKind, .claudeCode)
+
+        let fable = try XCTUnwrap(agent.models.first { $0.baseModelID == "claude-fable-5" })
+        XCTAssertEqual(fable.displayName, "Fable 5")
+        XCTAssertEqual(fable.options.map(\.modelID), [
+            "claudeCode:claude-fable-5:low",
+            "claudeCode:claude-fable-5:medium",
+            "claudeCode:claude-fable-5:high"
+        ])
+        XCTAssertEqual(fable.effortOptions.map(\.displayName), ["Low", "Medium", "High"])
+        XCTAssertEqual(fable.preferredModelID, "claudeCode:claude-fable-5:high")
+        XCTAssertEqual(catalog.modelID(forEffort: "low", selectedModelID: fable.preferredModelID), "claudeCode:claude-fable-5:low")
+        XCTAssertEqual(catalog.reasoningEffort(forModelID: "claudeCode:claude-fable-5:high"), "high")
+        XCTAssertEqual(catalog.effortDisplayName(forModelID: "claudeCode:claude-fable-5:high"), "High")
+        XCTAssertEqual(catalog.chipTitle(forModelID: "claudeCode:claude-fable-5:high"), "Claude Code · Fable 5")
+        XCTAssertEqual(
+            RemoteHostAgentCatalog.modelIDForStart(fable.preferredModelID),
+            "claudeCode:claude-fable-5:high"
+        )
+    }
+
+    func testStructuredCatalogFallsBackToMiddleEffortWhenHostDefaultIsAbsent() throws {
+        let json = structuredCatalogJSON.replacingOccurrences(of: #""is_default": true"#, with: #""is_default": false"#)
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(json.utf8))
+        let fable = try XCTUnwrap(catalog.structuredAgentGroups.first?.models.first { $0.baseModelID == "claude-fable-5" })
+
+        XCTAssertEqual(fable.preferredModelID, "claudeCode:claude-fable-5:medium")
+        XCTAssertEqual(catalog.modelID(forEffort: "high", selectedModelID: fable.preferredModelID), "claudeCode:claude-fable-5:high")
+    }
+
+    func testUnenrichedCatalogKeepsLegacyFlatFallbackWithoutEffortPicker() throws {
+        let json = """
+        {
+          "agents": [
+            {
+              "name": "Codex CLI",
+              "available": true,
+              "models": [
+                {"model_id": "codexExec:gpt-5.5-low", "name": "Codex CLI GPT-5.5 Low", "reasoning_effort": "low"}
+              ],
+              "capabilities": []
+            }
+          ],
+          "task_labels": [
+            {"label": "explore", "model_id": "codexExec:gpt-5.5-low", "name": "Codex CLI GPT-5.5 Low"}
+          ]
+        }
+        """
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(json.utf8))
+
+        XCTAssertFalse(catalog.supportsStructuredModelGroups)
+        XCTAssertTrue(catalog.structuredAgentGroups.isEmpty)
+        XCTAssertEqual(catalog.selectableAgents.first?.models.first?.name, "Codex CLI GPT-5.5 Low")
+        XCTAssertEqual(catalog.displayName(forModelID: "codexExec:gpt-5.5-low"), "Codex CLI GPT-5.5 Low")
+        XCTAssertEqual(catalog.reasoningEffort(forModelID: "codexExec:gpt-5.5-low"), "low")
+        XCTAssertTrue(catalog.effortOptions(forModelID: "codexExec:gpt-5.5-low").isEmpty)
+    }
+
     @MainActor
     func testDegradedCatalogIsServedFromCacheWithinTTL() async {
         let clock = RemoteHostCatalogTestClock(Date(timeIntervalSince1970: 1_800_000_000))
@@ -179,6 +243,54 @@ final class RemoteHostCatalogTests: XCTestCase {
                 )
             ]
         )
+    }
+
+    private var structuredCatalogJSON: String {
+        """
+        {
+          "agents": [
+            {
+              "name": "Claude Code",
+              "available": true,
+              "default_model_id": "claudeCode:claude-fable-5:high",
+              "models": [
+                {
+                  "model_id": "claudeCode:claude-fable-5:low",
+                  "name": "Claude Code Fable 5 Low",
+                  "agent_id": "claudeCode",
+                  "base_model_id": "claude-fable-5",
+                  "model_display_name": "Fable 5",
+                  "effort": "low",
+                  "effort_display_name": "Low"
+                },
+                {
+                  "model_id": "claudeCode:claude-fable-5:medium",
+                  "name": "Claude Code Fable 5 Medium",
+                  "agent_id": "claudeCode",
+                  "base_model_id": "claude-fable-5",
+                  "model_display_name": "Fable 5",
+                  "effort": "medium",
+                  "effort_display_name": "Medium"
+                },
+                {
+                  "model_id": "claudeCode:claude-fable-5:high",
+                  "name": "Claude Code Fable 5 High",
+                  "agent_id": "claudeCode",
+                  "base_model_id": "claude-fable-5",
+                  "model_display_name": "Fable 5",
+                  "effort": "high",
+                  "effort_display_name": "High",
+                  "is_default": true
+                }
+              ],
+              "capabilities": ["agent_conversation_send"]
+            }
+          ],
+          "task_labels": [
+            {"label": "pair", "model_id": "claudeCode:claude-fable-5:high", "name": "Claude Code Fable 5 High"}
+          ]
+        }
+        """
     }
 
     private func fixtureURL() -> URL {

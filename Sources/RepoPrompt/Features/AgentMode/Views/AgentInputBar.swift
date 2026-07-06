@@ -632,6 +632,7 @@ struct AgentComposerView: View, Equatable {
                     }
                     if props.hasAvailableAgentProviders {
                         agentProviderModelPicker
+                        remoteReasoningEffortPicker
                         reasoningEffortPicker
                         claudeEffortPicker
                         codexToolsButton
@@ -738,8 +739,9 @@ struct AgentComposerView: View, Equatable {
             modelDisplayName,
             maxLength: 24
         )
-        if props.remoteHostCatalog != nil {
-            return "Remote · \(truncatedModelName)"
+        if let remoteCatalog = props.remoteHostCatalog {
+            let remoteTitle = remoteCatalog.chipTitle(forModelID: props.selectedModelRaw)
+            return String.truncateModelName(remoteTitle, maxLength: 30)
         }
         return "\(props.selectedAgent.displayName) · \(truncatedModelName)"
     }
@@ -883,33 +885,36 @@ struct AgentComposerView: View, Equatable {
             rawModel: RemoteHostAgentCatalog.hostDefaultModelID,
             imageSystemName: "network"
         ))
-        if !catalog.taskLabels.isEmpty {
+        let structuredGroups = catalog.structuredAgentGroups
+        if !structuredGroups.isEmpty {
             items.append(.separator)
-            items.append(.header("Host roles"))
-            for taskLabel in catalog.taskLabels {
-                // Select by host-portable role label — the host resolves it
-                // against its current role defaults at start time.
-                items.append(remoteHostModelMenuItem(
-                    title: taskLabel.name,
-                    rawModel: taskLabel.label,
-                    imageSystemName: RemoteHostAgentCatalog.agentKind(forModelID: taskLabel.modelID)?.iconName ?? "network"
-                ))
-            }
-        }
-        let selectableAgents = catalog.selectableAgents
-        if !selectableAgents.isEmpty {
-            items.append(.separator)
-            for agent in selectableAgents {
-                let modelItems = agent.models.map { model in
-                    remoteHostModelMenuItem(
-                        title: model.name,
-                        rawModel: model.modelID,
-                        imageSystemName: RemoteHostAgentCatalog.agentKind(forModelID: model.modelID)?.iconName
+            for agent in structuredGroups {
+                let modelItems = agent.models.compactMap { modelGroup in
+                    remoteHostBaseModelMenuItem(
+                        modelGroup,
+                        imageSystemName: agent.agentKind?.iconName
                     )
                 }
+                guard !modelItems.isEmpty else { continue }
                 items.append(.submenu(agent.name, items: modelItems))
             }
-        } else if catalog.isDegraded {
+        } else {
+            let selectableAgents = catalog.selectableAgents
+            if !selectableAgents.isEmpty {
+                items.append(.separator)
+                for agent in selectableAgents {
+                    let modelItems = agent.models.map { model in
+                        remoteHostModelMenuItem(
+                            title: model.name,
+                            rawModel: model.modelID,
+                            imageSystemName: RemoteHostAgentCatalog.agentKind(forModelID: model.modelID)?.iconName
+                        )
+                    }
+                    items.append(.submenu(agent.name, items: modelItems))
+                }
+            }
+        }
+        if catalog.selectableAgents.isEmpty, catalog.isDegraded {
             items.append(.message("Using the host default because this host did not expose a model catalog."))
         }
         return items
@@ -924,6 +929,21 @@ struct AgentComposerView: View, Equatable {
             title,
             isEnabled: true,
             isSelected: props.selectedModelRaw == rawModel,
+            imageSystemName: imageSystemName
+        ) {
+            actions.selectRemoteAgentModel(rawModel)
+        }
+    }
+
+    private func remoteHostBaseModelMenuItem(
+        _ modelGroup: RemoteHostBaseModelGroup,
+        imageSystemName: String?
+    ) -> StableMenuItem? {
+        guard let rawModel = modelGroup.preferredModelID else { return nil }
+        return StableMenuItem.action(
+            modelGroup.displayName,
+            isEnabled: true,
+            isSelected: modelGroup.containsModelID(props.selectedModelRaw),
             imageSystemName: imageSystemName
         ) {
             actions.selectRemoteAgentModel(rawModel)
@@ -1003,6 +1023,45 @@ struct AgentComposerView: View, Equatable {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             modelMenuSnapshotByAgent = nil
             modelMenuSnapshotReleaseTask = nil
+        }
+    }
+
+    @ViewBuilder
+    private var remoteReasoningEffortPicker: some View {
+        if let remoteCatalog = props.remoteHostCatalog {
+            let efforts = remoteCatalog.effortOptions(forModelID: props.selectedModelRaw)
+            if !efforts.isEmpty {
+                Menu {
+                    ForEach(efforts) { option in
+                        Button {
+                            actions.selectRemoteAgentModel(option.modelID)
+                        } label: {
+                            HStack {
+                                Text(option.displayName)
+                                if props.selectedModelRaw == option.modelID {
+                                    Spacer()
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(remoteCatalog.effortDisplayName(forModelID: props.selectedModelRaw) ?? "Effort")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    }
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(pickerChipColor)
+                    .cornerRadius(4)
+                }
+                .menuStyle(.borderlessButton)
+                .disabled(modelControlsDisabled)
+                .opacity(modelControlsDisabled ? 0.55 : 1.0)
+                .hoverTooltip(modelControlsDisabled ? modelControlsDisabledTooltip : "Remote reasoning effort")
+                .fixedSize()
+            }
         }
     }
 

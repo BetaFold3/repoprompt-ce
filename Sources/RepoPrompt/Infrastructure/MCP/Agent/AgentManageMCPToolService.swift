@@ -100,18 +100,26 @@ struct AgentManageMCPToolService {
             for model in entry.models {
                 if model.hasMultipleTargets {
                     for target in model.startTargets {
-                        var obj: [String: Value] = [
-                            "model_id": .string(target.selectionID.rawValue),
-                            "name": .string(target.name)
-                        ]
-                        if let effort = target.reasoningEffort {
-                            obj["reasoning_effort"] = .string(effort.rawValue)
-                        }
-                        modelObjects.append(.object(obj))
+                        modelObjects.append(.object(listAgentsModelObject(
+                            agent: entry.agent,
+                            model: model,
+                            target: target,
+                            legacyName: target.name
+                        )))
                     }
+                } else if let target = model.startTargets.first {
+                    modelObjects.append(.object(listAgentsModelObject(
+                        agent: entry.agent,
+                        model: model,
+                        target: target,
+                        legacyName: model.name
+                    )))
                 } else {
                     var obj: [String: Value] = [
-                        "name": .string(model.name)
+                        "name": .string(model.name),
+                        "agent_id": .string(entry.agent.rawValue),
+                        "base_model_id": .string(model.id),
+                        "model_display_name": .string(model.name)
                     ]
                     if let modelID = model.modelID {
                         obj["model_id"] = .string(modelID)
@@ -160,6 +168,42 @@ struct AgentManageMCPToolService {
             result["agents"] = .array(agents)
         }
         return .object(result)
+    }
+
+    private func listAgentsModelObject(
+        agent: AgentProviderKind,
+        model: AgentModelCatalog.DiscoveryModel,
+        target: AgentModelCatalog.DiscoveryStartTarget,
+        legacyName: String
+    ) -> [String: Value] {
+        var obj: [String: Value] = [
+            "model_id": .string(target.selectionID.rawValue),
+            "name": .string(legacyName),
+            "agent_id": .string(agent.rawValue),
+            "base_model_id": .string(model.id),
+            "model_display_name": .string(model.name),
+            "is_default": .bool(target.isDefault)
+        ]
+        if let effort = listAgentsEffortRaw(agent: agent, modelRaw: target.modelRaw, fallback: target.reasoningEffort) {
+            obj["effort"] = .string(effort)
+            obj["effort_display_name"] = .string(RemoteHostAgentCatalog.displayName(forEffort: effort))
+            obj["reasoning_effort"] = .string(effort)
+        }
+        return obj
+    }
+
+    private func listAgentsEffortRaw(
+        agent: AgentProviderKind,
+        modelRaw: String,
+        fallback: CodexReasoningEffort?
+    ) -> String? {
+        if agent.usesClaudeTooling {
+            return ClaudeModelSpecifier(raw: modelRaw).effortLevel?.rawValue
+        }
+        if agent == .codexExec {
+            return CodexModelSpecifier(raw: modelRaw).reasoningEffort?.rawValue ?? fallback?.rawValue
+        }
+        return fallback?.rawValue
     }
 
     private func executeListSessions(args: [String: Value]) async throws -> Value {

@@ -36,6 +36,10 @@ actor RemoteGatewayRuntime {
         case emptyWindowList = "empty_window_list"
     }
 
+    private enum WorkspaceMatchSkippedReason: String {
+        case bound
+    }
+
     private let appLink: AppLinkSession
     private let appLinkPool: AppLinkPool?
     private let ledger: CommandLedger
@@ -432,7 +436,7 @@ actor RemoteGatewayRuntime {
            hasWorkspaceStartSelector(payload)
         {
             if bindingState == .bound {
-                rememberWorkspaceStartMatchSkipped(frame: frame, deviceID: deviceID, reason: "bound")
+                rememberWorkspaceStartMatchSkipped(frame: frame, deviceID: deviceID, reason: .bound)
             } else if let match = await workspaceStartWindowMatch(payload: payload, frame: frame, deviceID: deviceID) {
                 rememberWorkspaceStartMatchCount(frame: frame, deviceID: deviceID, count: match.matchCount)
                 if let matchedWindow = match.summary {
@@ -1049,9 +1053,9 @@ actor RemoteGatewayRuntime {
         return workspaceStartMatchCountByCommandKey.removeValue(forKey: key)
     }
 
-    private func rememberWorkspaceStartMatchSkipped(frame: RemoteClientFrame, deviceID: String, reason: String) {
+    private func rememberWorkspaceStartMatchSkipped(frame: RemoteClientFrame, deviceID: String, reason: WorkspaceMatchSkippedReason) {
         guard frame.type == "start", let key = commandKey(frame: frame, deviceID: deviceID) else { return }
-        workspaceStartMatchSkippedByCommandKey[key] = reason
+        workspaceStartMatchSkippedByCommandKey[key] = reason.rawValue
     }
 
     private func takeWorkspaceStartMatchSkipped(frame: RemoteClientFrame, deviceID: String) -> String? {
@@ -1078,10 +1082,11 @@ actor RemoteGatewayRuntime {
     ) {
         let requestPayload = frame.payload?.objectValue ?? [:]
         let responseObject = responsePayload?.objectValue ?? [:]
-        let autoRoutedWindowID = takeAutoRoutedStartWindowID(frame: frame, deviceID: deviceID)
-        let workspaceMatchCount = takeWorkspaceStartMatchCount(frame: frame, deviceID: deviceID)
-        let workspaceMatchSkipped = takeWorkspaceStartMatchSkipped(frame: frame, deviceID: deviceID)
-        let workspaceMatchUnavailableReason = takeWorkspaceStartUnavailableReason(frame: frame, deviceID: deviceID)
+        let shouldConsumeStartDiagnostics = outcome != "duplicate" && outcome != "in_flight" && outcome != "conflict"
+        let autoRoutedWindowID = shouldConsumeStartDiagnostics ? takeAutoRoutedStartWindowID(frame: frame, deviceID: deviceID) : nil
+        let workspaceMatchCount = shouldConsumeStartDiagnostics ? takeWorkspaceStartMatchCount(frame: frame, deviceID: deviceID) : nil
+        let workspaceMatchSkipped = shouldConsumeStartDiagnostics ? takeWorkspaceStartMatchSkipped(frame: frame, deviceID: deviceID) : nil
+        let workspaceMatchUnavailableReason = shouldConsumeStartDiagnostics ? takeWorkspaceStartUnavailableReason(frame: frame, deviceID: deviceID) : nil
         let isStartBindingFailure = frame.type == "start"
             && outcome == "failure"
             && (code == "binding_required" || code == "ambiguous_start_target")

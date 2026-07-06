@@ -2736,6 +2736,9 @@ extension MCPServerViewModel {
 
         let hasValidatedExplicitWindowRoute: Bool
         if let explicitWindowRoutingHint {
+            // Check 4 (`hint.windowID == metadata.windowID`) is satisfied by construction
+            // when dispatch installs `currentEffectiveWindowID`; keep it as defense-in-depth
+            // for direct/test paths that do not install the TaskLocal envelope.
             guard explicitWindowRoutingHint.connectionID == metadata.connectionID,
                   explicitWindowRoutingHint.toolName == "agent_run",
                   explicitWindowRoutingHint.provenance == .hiddenWindowArgument,

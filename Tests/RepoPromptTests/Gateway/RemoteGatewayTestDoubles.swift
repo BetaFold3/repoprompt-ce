@@ -10,9 +10,40 @@ struct RecordedGatewayToolCall: Equatable {
     let timeout: TimeInterval?
 }
 
+actor RecordingAppLinkResponseGate {
+    private var entered = false
+    private var released = false
+    private var enterWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { continuation in
+            enterWaiters.append(continuation)
+        }
+    }
+
+    func enterAndWaitForRelease() async {
+        entered = true
+        enterWaiters.forEach { $0.resume() }
+        enterWaiters.removeAll()
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        releaseWaiters.forEach { $0.resume() }
+        releaseWaiters.removeAll()
+    }
+}
+
 actor RecordingAppLinkConnection: AppLinkConnection {
     enum Response {
         case result(MCPToolResult)
+        case gated(MCPToolResult, RecordingAppLinkResponseGate)
         case appLinkLost(String)
         case timeout(TimeInterval)
         case failure(String)
@@ -43,6 +74,9 @@ actor RecordingAppLinkConnection: AppLinkConnection {
         }
         switch responses.removeFirst() {
         case let .result(result):
+            return result
+        case let .gated(result, gate):
+            await gate.enterAndWaitForRelease()
             return result
         case let .appLinkLost(reason):
             throw AppLinkError.appLinkLost(reason)

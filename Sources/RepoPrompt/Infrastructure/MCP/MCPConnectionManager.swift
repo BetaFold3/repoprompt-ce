@@ -2656,12 +2656,19 @@ actor ServerNetworkManager {
             let effective = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
             return (windows, effective)
         }
+        let isGatewayPrincipal = isGatewayPrincipalConnection(connectionID)
 
-        // Single MCP-enabled window → unambiguous binding
+        // Single MCP-enabled window → unambiguous routing. Gateway-principal connections
+        // may use the single window for this request/list operation, but must not seed a
+        // default binding that would later make multi-window probes report false `.bound`.
         if mcpEnabledWindows.count == 1, let window = mcpEnabledWindows.first {
             let windowID = window.windowID
-            setConnectionWindowMapping(connectionID, windowID: windowID)
-            connectionLog("\(reason): auto-bound connection \(connectionID) to single MCP-enabled window \(windowID)")
+            if isGatewayPrincipal {
+                connectionLog("\(reason): routed gateway connection \(connectionID) to single MCP-enabled window \(windowID) (default binding unchanged)")
+            } else {
+                setConnectionWindowMapping(connectionID, windowID: windowID)
+                connectionLog("\(reason): auto-bound connection \(connectionID) to single MCP-enabled window \(windowID)")
+            }
             return windowID
         }
 
@@ -2677,12 +2684,17 @@ actor ServerNetworkManager {
                 connectionLog("\(reason): missing connection-time window count for \(connectionID); treating as multi-window")
             }
         }
-        if connectedDuringSingleWindow || !multiWindowEffective {
+        let shouldUseSingleWindowFallback = !multiWindowEffective || (connectedDuringSingleWindow && !isGatewayPrincipal)
+        if shouldUseSingleWindowFallback {
             if let firstWindow = await WindowStatesManager.shared.firstMCPEnabledWindow() {
                 let windowID = firstWindow.windowID
-                setConnectionWindowMapping(connectionID, windowID: windowID)
                 let bindReason = connectedDuringSingleWindow ? "single-window-at-connect" : "single-window-mode"
-                connectionLog("\(reason): auto-bound connection \(connectionID) to window \(windowID) (\(bindReason))")
+                if isGatewayPrincipal {
+                    connectionLog("\(reason): routed gateway connection \(connectionID) to window \(windowID) (\(bindReason), default binding unchanged)")
+                } else {
+                    setConnectionWindowMapping(connectionID, windowID: windowID)
+                    connectionLog("\(reason): auto-bound connection \(connectionID) to window \(windowID) (\(bindReason))")
+                }
                 return windowID
             }
         }
@@ -8931,6 +8943,17 @@ actor ServerNetworkManager {
                 }
             }
 
+            func debugSetConnectionWindowCountAtConnectionTimeForTesting(
+                connectionID: UUID,
+                count: Int?
+            ) {
+                if let count {
+                    windowCountAtConnectionTime[connectionID] = count
+                } else {
+                    windowCountAtConnectionTime.removeValue(forKey: connectionID)
+                }
+            }
+
             func debugSetToolExecutionWatchdogEnvironment(_ environment: MCPToolExecutionWatchdogEnvironment) {
                 toolExecutionWatchdogEnvironment = environment
             }
@@ -9335,6 +9358,10 @@ actor ServerNetworkManager {
         }
 
         guard let clientName = clientIdentifier(forConnection: connectionID) else { return false }
+        guard !isGatewayPrincipalConnection(connectionID) else {
+            mcpPolicyLog("skipping persisted policy hydration for gateway-principal connection=\(connectionID) reason=\(reason) client=\(clientName)")
+            return false
+        }
         let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
         if let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
             guard shouldAllowPersistedAgentModeRestore(clientName: clientName, purpose: liveAffinity.purpose) else {
@@ -9394,6 +9421,11 @@ actor ServerNetworkManager {
         } else {
             mcpRoutingLog("No pending policy for client=\(clientName) connectionID=\(connectionID)")
             mcpPolicyLog("no pending policy client=\(clientName) connection=\(connectionID)")
+        }
+
+        guard !isGatewayPrincipalConnection(connectionID) else {
+            mcpRoutingLog("Skipping routing fallback for gateway-principal connection=\(connectionID) client=\(clientName)")
+            return
         }
 
         let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
@@ -10954,6 +10986,7 @@ actor ServerNetworkManager {
                                     let existingMapping = bypassWindowRouting ? nil : await self.connectionWindowMap[connectionID]
                                     chosenID = bypassWindowRouting ? nil : capturedPreResolvedWindowID
                                     let preassigned = await self.preassignedConnections.contains(connectionID)
+                                    let isGatewayPrincipal = bypassWindowRouting ? false : await self.isGatewayPrincipalConnection(connectionID)
                                     if let cid = existingMapping {
                                         mcpRoutingLog("Tool=\(toolName) conn=\(connectionID) has existingWindow=\(cid) preassigned=\(preassigned)")
                                     }
@@ -10978,7 +11011,7 @@ actor ServerNetworkManager {
 
                                         chosenID = requestedWindowID
                                         if existingMapping == nil {
-                                            if await self.isGatewayPrincipalConnection(connectionID) {
+                                            if isGatewayPrincipal {
                                                 connectionLog("Tool call: routed gateway connection \(connectionID) to window \(requestedWindowID) via one-shot _windowID (default binding unchanged)")
                                             } else {
                                                 await self.setConnectionWindowMapping(connectionID, windowID: requestedWindowID)
@@ -11001,6 +11034,7 @@ actor ServerNetworkManager {
 
                                     // PRIORITY 2: Use clientName to find existing window assignment (for same client, new connection)
                                     if !bypassWindowRouting,
+                                       !isGatewayPrincipal,
                                        chosenID == nil,
                                        let clientName = await self.clientIdentifier(forConnection: connectionID),
                                        let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName)
@@ -11012,6 +11046,7 @@ actor ServerNetworkManager {
 
                                     // PRIORITY 2b: Same-process live run affinity, then persisted window affinity.
                                     if !bypassWindowRouting,
+                                       !isGatewayPrincipal,
                                        chosenID == nil,
                                        let clientName = await self.clientIdentifier(forConnection: connectionID)
                                     {
@@ -11037,7 +11072,10 @@ actor ServerNetworkManager {
 
                                     // PRIORITY 3: Auto-route to active window when:
                                     // - Currently in single-window mode, OR
-                                    // - Connection was established during single-window mode (stays bound even when more windows open)
+                                    // - Non-gateway connection was established during single-window mode (stays bound even when more windows open)
+                                    // Gateway-principal connections may use the current single-window route per call, but
+                                    // must not seed a default mapping or keep using single-window-at-connect after a
+                                    // second window appears; otherwise AppLink binding probes report false `.bound`.
                                     let connectedDuringSingleWindow: Bool
                                     if let recordedWindowCount = await self.windowCountAtConnectionTime[connectionID] {
                                         connectedDuringSingleWindow = recordedWindowCount == 1
@@ -11049,7 +11087,7 @@ actor ServerNetworkManager {
                                     }
                                     let shouldAutoRouteToActiveWindow = !bypassWindowRouting
                                         && chosenID == nil
-                                        && (!multiWindowModeEffective || connectedDuringSingleWindow)
+                                        && (!multiWindowModeEffective || (connectedDuringSingleWindow && !isGatewayPrincipal))
                                     if shouldAutoRouteToActiveWindow {
                                         // Find the window with active MCP tools
                                         let activeWindowID = await WindowStatesManager.shared.firstMCPEnabledWindow()?.windowID
@@ -11059,8 +11097,12 @@ actor ServerNetworkManager {
                                                 : "no policy"
                                             mcpRoutingLog("Auto-routing conn=\(connectionID) to active window=\(activeID) (\(reason))")
                                             chosenID = activeID
-                                            // Store the mapping for this connection
-                                            await self.setConnectionWindowMapping(connectionID, windowID: activeID)
+                                            if isGatewayPrincipal {
+                                                connectionLog("Tool call: routed gateway connection \(connectionID) to window \(activeID) via PRIORITY 3 \(reason) (default binding unchanged)")
+                                            } else {
+                                                // Store the mapping for ordinary clients.
+                                                await self.setConnectionWindowMapping(connectionID, windowID: activeID)
+                                            }
                                         }
                                     }
 
@@ -11789,6 +11831,14 @@ actor ServerNetworkManager {
                                             explicitWindowID: capturedWindowID,
                                             authorization: dispatchAuthorization
                                         )
+                                        #if DEBUG
+                                            if let explicitWindowRoutingHint {
+                                                assert(
+                                                    explicitWindowRoutingHint.windowID == ownershipWindowID,
+                                                    "Explicit _windowID routing hint must match the dispatch ownership window."
+                                                )
+                                            }
+                                        #endif
                                         do {
                                             return try await self.withWindowToolOwnership(
                                                 windowID: ownershipWindowID,
@@ -11800,6 +11850,9 @@ actor ServerNetworkManager {
                                             ) {
                                                 try await Self.$currentToolDispatchAuthorization.withValue(dispatchAuthorization) {
                                                     let value = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
+                                                        // A non-nil hint is built only from dispatch authorization captured for
+                                                        // ownershipWindowID, so hint.windowID == ownershipWindowID by construction.
+                                                        // Keep the effective-window override nil for non-explicit calls.
                                                         try await Self.$currentEffectiveWindowID.withValue(explicitWindowRoutingHint?.windowID) {
                                                             try await EditFlowPerf.measure(
                                                                 EditFlowPerf.Stage.MCPToolCall.dispatch,
