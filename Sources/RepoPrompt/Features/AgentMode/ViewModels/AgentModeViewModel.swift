@@ -31,6 +31,23 @@ final class AgentModeViewModel: ObservableObject {
         #endif
     }
 
+    nonisolated static func shouldStartRemoteTurn(
+        runState: AgentSessionRunState,
+        remoteSessionID: String?
+    ) -> Bool {
+        guard let remoteSessionID,
+              !remoteSessionID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return true
+        }
+        switch runState {
+        case .failed, .cancelled:
+            return true
+        case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval, .completed:
+            return false
+        }
+    }
+
     private static let taggedFileTrailingTrimSet = CharacterSet(charactersIn: ").,;:!?]}")
     private static let taggedFileTerminatingScalars = CharacterSet.whitespacesAndNewlines
     private static let taggedFileContentsTokenBudget = 12000
@@ -12318,7 +12335,10 @@ final class AgentModeViewModel: ObservableObject {
 
         if session.remoteHost != nil {
             session.pendingRemoteOptimisticUserItemIDs.insert(userItem.id)
-            let shouldStartRemote = !session.runState.isActive || session.remoteHost?.remoteSessionID.isEmpty == true
+            let shouldStartRemote = Self.shouldStartRemoteTurn(
+                runState: session.runState,
+                remoteSessionID: session.remoteHost?.remoteSessionID
+            )
             let modelSelectionRaw = RemoteHostAgentCatalog.modelIDForStart(session.selectedModelRaw)
             let selectedModelRaw = session.selectedModelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
             if modelSelectionRaw == nil,

@@ -1973,6 +1973,82 @@ final class TabContextRoutingTests: XCTestCase {
         }
 
         @MainActor
+        func testAgentRunExplicitWindowRouteOverridesStickyTabContextBinding() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            let workspaceID = UUID()
+            let activeTabID = UUID()
+            let staleTabID = UUID()
+            let activeSelection = StoredSelection(
+                selectedPaths: ["/tmp/active-explicit-window-source.swift"],
+                codemapAutoEnabled: false
+            )
+            let staleSelection = StoredSelection(
+                selectedPaths: ["/tmp/stale-bound-tab-source.swift"],
+                codemapAutoEnabled: false
+            )
+            let workspace = WorkspaceModel(
+                id: workspaceID,
+                name: "Explicit window overrides sticky binding",
+                repoPaths: [],
+                ephemeralFlag: true,
+                composeTabs: [
+                    ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
+                    ComposeTabState(id: staleTabID, name: "Stale", selection: staleSelection)
+                ],
+                activeComposeTabID: activeTabID
+            )
+            window.workspaceManager.workspaces = [workspace]
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "explicitWindowOverridesStickyBindingTest"
+            )
+            try window.promptManager.loadComposeTabsFromWorkspace(
+                XCTUnwrap(window.workspaceManager.activeWorkspace),
+                syncPromptText: true
+            )
+            let connectionID = UUID()
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "sticky-tab-agent-run",
+                tabID: staleTabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID
+            )
+            XCTAssertEqual(
+                window.mcpServer.connectionBindingSnapshot(forConnection: connectionID).bindingKind,
+                .tabContext
+            )
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "sticky-tab-agent-run",
+                windowID: window.windowID,
+                runPurpose: .unknown,
+                explicitWindowRoutingHint: MCPExplicitWindowRoutingHint(
+                    connectionID: connectionID,
+                    toolName: "agent_run",
+                    windowID: window.windowID,
+                    windowStateIdentity: ObjectIdentifier(window),
+                    serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
+                    provenance: .hiddenWindowArgument
+                )
+            )
+
+            let snapshot = try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                metadata: metadata,
+                targetWindow: window
+            )
+
+            XCTAssertEqual(snapshot.route, .windowOnlyActiveCompose)
+            XCTAssertEqual(snapshot.tabID, activeTabID)
+            XCTAssertNotEqual(snapshot.tabID, staleTabID)
+            XCTAssertEqual(snapshot.workspaceID, workspaceID)
+        }
+
+        @MainActor
         func testAgentRunExplicitLaunchSourceIsExactAndDoesNotUseActiveTabCompatibility() async throws {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

@@ -292,6 +292,76 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(getLogCount, 1)
     }
 
+    func testCompletedDetachedStartStillFetchesInitialReplyLog() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "start": [Self.snapshotPayload(status: "completed", sessionID: "remote-session-done")],
+            "get_log": [Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<assistant>Initial reply</assistant>")]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: connection
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        let sessionID = try await controller.start(
+            message: "Halo",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: 2,
+            workspaceID: nil
+        )
+
+        XCTAssertEqual(sessionID, "remote-session-done")
+        await waitForRemoteAgentSessionCondition {
+            await recorder.firstTranscriptRows() != nil
+        }
+        let firstRows = await recorder.firstTranscriptRows()
+        let rows = try XCTUnwrap(firstRows)
+        XCTAssertEqual(rows.map(\.text), ["Initial reply"])
+        let getLogCount = await connection.commandCount(type: "get_log")
+        XCTAssertEqual(getLogCount, 1)
+    }
+
+    func testRemoteTurnPolicySteersCompletedSessionWhenRemoteSessionIDExists() {
+        XCTAssertFalse(AgentModeViewModel.shouldStartRemoteTurn(
+            runState: .completed,
+            remoteSessionID: "remote-session-abc"
+        ))
+        XCTAssertFalse(AgentModeViewModel.shouldStartRemoteTurn(
+            runState: .idle,
+            remoteSessionID: "remote-session-abc"
+        ))
+        XCTAssertFalse(AgentModeViewModel.shouldStartRemoteTurn(
+            runState: .waitingForQuestion,
+            remoteSessionID: "remote-session-abc"
+        ))
+        XCTAssertTrue(AgentModeViewModel.shouldStartRemoteTurn(
+            runState: .completed,
+            remoteSessionID: nil
+        ))
+        XCTAssertTrue(AgentModeViewModel.shouldStartRemoteTurn(
+            runState: .completed,
+            remoteSessionID: "  \n"
+        ))
+        XCTAssertTrue(AgentModeViewModel.shouldStartRemoteTurn(
+            runState: .failed,
+            remoteSessionID: "remote-session-abc"
+        ))
+        XCTAssertTrue(AgentModeViewModel.shouldStartRemoteTurn(
+            runState: .cancelled,
+            remoteSessionID: "remote-session-abc"
+        ))
+    }
+
     @MainActor
     func testChannelClosingReasonSurfacesAsBannerAndDedupedSystemRows() {
         let coordinator = RemoteAgentModeCoordinator()
