@@ -2116,6 +2116,8 @@ actor ServerNetworkManager {
     static var currentToolDispatchAuthorization: ToolDispatchAuthorization?
     @TaskLocal
     static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
+    @TaskLocal
+    static var currentEffectiveWindowID: Int?
 
     nonisolated static func explicitWindowRoutingHint(
         connectionID: UUID,
@@ -2704,6 +2706,9 @@ actor ServerNetworkManager {
     }
 
     func currentConnectionWindowID() -> Int? {
+        if let effectiveWindowID = Self.currentEffectiveWindowID {
+            return effectiveWindowID
+        }
         guard let connectionID = Self.currentConnectionID else { return nil }
         return connectionWindowMap[connectionID]
     }
@@ -10973,8 +10978,12 @@ actor ServerNetworkManager {
 
                                         chosenID = requestedWindowID
                                         if existingMapping == nil {
-                                            await self.setConnectionWindowMapping(connectionID, windowID: requestedWindowID)
-                                            connectionLog("Tool call: bound unassigned connection \(connectionID) to window \(requestedWindowID) via _windowID")
+                                            if await self.isGatewayPrincipalConnection(connectionID) {
+                                                connectionLog("Tool call: routed gateway connection \(connectionID) to window \(requestedWindowID) via one-shot _windowID (default binding unchanged)")
+                                            } else {
+                                                await self.setConnectionWindowMapping(connectionID, windowID: requestedWindowID)
+                                                connectionLog("Tool call: bound unassigned connection \(connectionID) to window \(requestedWindowID) via _windowID")
+                                            }
                                         } else if let prev = existingMapping, prev != requestedWindowID {
                                             connectionLog("Tool call: applying per-call _windowID override \(prev) → \(requestedWindowID) for connection \(connectionID) (default binding unchanged)")
                                         } else {
@@ -11791,11 +11800,13 @@ actor ServerNetworkManager {
                                             ) {
                                                 try await Self.$currentToolDispatchAuthorization.withValue(dispatchAuthorization) {
                                                     let value = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
-                                                        try await EditFlowPerf.measure(
-                                                            EditFlowPerf.Stage.MCPToolCall.dispatch,
-                                                            EditFlowPerf.Dimensions(toolName: toolName)
-                                                        ) {
-                                                            try await dispatchResolvedProvider(resolvedOperation)
+                                                        try await Self.$currentEffectiveWindowID.withValue(explicitWindowRoutingHint?.windowID) {
+                                                            try await EditFlowPerf.measure(
+                                                                EditFlowPerf.Stage.MCPToolCall.dispatch,
+                                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                                            ) {
+                                                                try await dispatchResolvedProvider(resolvedOperation)
+                                                            }
                                                         }
                                                     }
                                                     releaseResourceAdmissionLeases(outcome: "provider_success")

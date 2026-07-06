@@ -16,6 +16,8 @@ struct RemoteAuditRecord: Codable, Equatable {
     let hasWorkspaceName: Bool?
     let hasWorkspaceID: Bool?
     let workspaceMatchCount: Int?
+    let workspaceMatchSkipped: String?
+    let workspaceMatchUnavailableReason: String?
 
     init(
         date: Date = Date(),
@@ -32,7 +34,9 @@ struct RemoteAuditRecord: Codable, Equatable {
         autoRoutedWindowID: Int? = nil,
         hasWorkspaceName: Bool? = nil,
         hasWorkspaceID: Bool? = nil,
-        workspaceMatchCount: Int? = nil
+        workspaceMatchCount: Int? = nil,
+        workspaceMatchSkipped: String? = nil,
+        workspaceMatchUnavailableReason: String? = nil
     ) {
         ts = RemoteAuditLog.timestampFormatter.string(from: date)
         self.deviceID = deviceID
@@ -49,6 +53,8 @@ struct RemoteAuditRecord: Codable, Equatable {
         self.hasWorkspaceName = hasWorkspaceName
         self.hasWorkspaceID = hasWorkspaceID
         self.workspaceMatchCount = workspaceMatchCount
+        self.workspaceMatchSkipped = workspaceMatchSkipped
+        self.workspaceMatchUnavailableReason = workspaceMatchUnavailableReason
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -67,6 +73,8 @@ struct RemoteAuditRecord: Codable, Equatable {
         case hasWorkspaceName = "has_workspace_name"
         case hasWorkspaceID = "has_workspace_id"
         case workspaceMatchCount = "workspace_match_count"
+        case workspaceMatchSkipped = "workspace_match_skipped"
+        case workspaceMatchUnavailableReason = "workspace_match_unavailable_reason"
     }
 }
 

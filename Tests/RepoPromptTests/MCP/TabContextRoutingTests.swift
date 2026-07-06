@@ -2049,6 +2049,87 @@ final class TabContextRoutingTests: XCTestCase {
         }
 
         @MainActor
+        func testExplicitWindowIDOverrideUsesPerCallWindowWhenConnectionHasStaleDefaultMapping() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let windowA = WindowState()
+            let windowB = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(windowA)
+            WindowStatesManager.shared.registerWindowState(windowB)
+            defer {
+                WindowStatesManager.shared.unregisterWindowState(windowA)
+                WindowStatesManager.shared.unregisterWindowState(windowB)
+            }
+
+            let root = try makeTemporaryDirectory(named: "explicit-window-per-call-override")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            let workspace = windowB.workspaceManager.createWorkspace(
+                name: "Explicit window per-call override",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await windowB.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "explicitWindowPerCallOverride"
+            )
+            let activeWorkspace = try XCTUnwrap(windowB.workspaceManager.activeWorkspace)
+            windowB.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            let connectionID = UUID()
+            try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await ServerNetworkManager.shared.setActiveWindowForCurrentConnection(windowA.windowID)
+            }
+            let initialStickyWindow = await ServerNetworkManager.shared.selectedWindow(for: connectionID)
+            XCTAssertEqual(initialStickyWindow, windowA.windowID)
+
+            let hint = MCPExplicitWindowRoutingHint(
+                connectionID: connectionID,
+                toolName: "agent_run",
+                windowID: windowB.windowID,
+                windowStateIdentity: ObjectIdentifier(windowB),
+                serverViewModelIdentity: ObjectIdentifier(windowB.mcpServer),
+                provenance: .hiddenWindowArgument
+            )
+            var dispatchCount = 0
+            var effectiveWindowDuringDispatch: Int?
+            windowB.mcpServer.setAgentRunDispatchOverrideForTesting {
+                _, _, message, _, _ in
+                dispatchCount += 1
+                XCTAssertEqual(message, "start in window b")
+                let metadata = await windowB.mcpServer.captureRequestMetadata()
+                effectiveWindowDuringDispatch = metadata.windowID
+                return .startedRun
+            }
+            defer {
+                windowB.mcpServer.setAgentRunDispatchOverrideForTesting(nil)
+                windowB.mcpServer.setRequestMetadataOverrideForTesting(nil)
+            }
+
+            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await ServerNetworkManager.$currentExplicitWindowRoutingHint.withValue(hint) {
+                    try await ServerNetworkManager.$currentEffectiveWindowID.withValue(windowB.windowID) {
+                        let metadata = await windowB.mcpServer.captureRequestMetadata()
+                        XCTAssertEqual(metadata.windowID, windowB.windowID)
+                        XCTAssertEqual(metadata.explicitWindowRoutingHint, hint)
+                        return try await windowB.mcpServer.executeAgentRunForTesting(args: [
+                            "op": .string("start"),
+                            "message": .string("start in window b")
+                        ])
+                    }
+                }
+            }
+
+            XCTAssertEqual(dispatchCount, 1)
+            XCTAssertEqual(effectiveWindowDuringDispatch, windowB.windowID)
+            let finalStickyWindow = await ServerNetworkManager.shared.selectedWindow(for: connectionID)
+            XCTAssertEqual(finalStickyWindow, windowA.windowID)
+            try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await ServerNetworkManager.shared.clearActiveWindowForCurrentConnection()
+            }
+        }
+
+        @MainActor
         func testAgentRunExplicitLaunchSourceIsExactAndDoesNotUseActiveTabCompatibility() async throws {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

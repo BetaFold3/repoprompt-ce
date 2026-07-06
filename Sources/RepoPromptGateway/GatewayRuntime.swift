@@ -24,6 +24,18 @@ actor RemoteGatewayRuntime {
         let summaries: [EligibleStartTargetWindowSummary]
     }
 
+    private enum EligibleStartTargetWindowInfoLookupResult {
+        case available(EligibleStartTargetWindowInfo)
+        case unavailable(WorkspaceMatchUnavailableReason)
+    }
+
+    private enum WorkspaceMatchUnavailableReason: String {
+        case appLinkUnavailable = "app_link_unavailable"
+        case appToolError = "app_tool_error"
+        case decodeFailure = "decode_failure"
+        case emptyWindowList = "empty_window_list"
+    }
+
     private let appLink: AppLinkSession
     private let appLinkPool: AppLinkPool?
     private let ledger: CommandLedger
@@ -37,6 +49,8 @@ actor RemoteGatewayRuntime {
     private var lastEligibleWindowDetailsByDevice: [String: JSONValue] = [:]
     private var autoRoutedStartWindowIDByCommandKey: [String: Int] = [:]
     private var workspaceStartMatchCountByCommandKey: [String: Int] = [:]
+    private var workspaceStartMatchSkippedByCommandKey: [String: String] = [:]
+    private var workspaceStartMatchUnavailableReasonByCommandKey: [String: String] = [:]
 
     init(
         appLink: AppLinkSession,
@@ -414,14 +428,17 @@ actor RemoteGatewayRuntime {
         var effectiveFrame = frame
         if frame.type == "start",
            explicitStartWindowID(frame) == nil,
-           bindingState != .bound,
            let payload = frame.payload?.objectValue,
-           let match = await workspaceStartWindowMatch(payload: payload, deviceID: deviceID)
+           hasWorkspaceStartSelector(payload)
         {
-            rememberWorkspaceStartMatchCount(frame: frame, deviceID: deviceID, count: match.matchCount)
-            if let matchedWindow = match.summary {
-                effectiveFrame = startFrame(frame, routedTo: matchedWindow)
-                rememberAutoRoutedStart(frame: frame, deviceID: deviceID, windowID: matchedWindow.windowID)
+            if bindingState == .bound {
+                rememberWorkspaceStartMatchSkipped(frame: frame, deviceID: deviceID, reason: "bound")
+            } else if let match = await workspaceStartWindowMatch(payload: payload, frame: frame, deviceID: deviceID) {
+                rememberWorkspaceStartMatchCount(frame: frame, deviceID: deviceID, count: match.matchCount)
+                if let matchedWindow = match.summary {
+                    effectiveFrame = startFrame(frame, routedTo: matchedWindow)
+                    rememberAutoRoutedStart(frame: frame, deviceID: deviceID, windowID: matchedWindow.windowID)
+                }
             }
         }
         let payload = try await executeTranslatedTool(
@@ -442,15 +459,22 @@ actor RemoteGatewayRuntime {
 
     private func workspaceStartWindowMatch(
         payload: [String: JSONValue],
+        frame: RemoteClientFrame,
         deviceID: String
     ) async -> (summary: EligibleStartTargetWindowSummary?, matchCount: Int)? {
         let rawWorkspaceID = payload["workspace_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let rawWorkspaceName = payload["workspace_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let requestedWorkspaceID = rawWorkspaceID?.isEmpty == false ? rawWorkspaceID : nil
         let requestedWorkspaceName = rawWorkspaceName?.isEmpty == false ? rawWorkspaceName : nil
-        guard requestedWorkspaceID != nil || requestedWorkspaceName != nil,
-              let windowInfo = await eligibleStartTargetWindowInfo(deviceID: deviceID)
-        else { return nil }
+        guard requestedWorkspaceID != nil || requestedWorkspaceName != nil else { return nil }
+        let windowInfo: EligibleStartTargetWindowInfo
+        switch await eligibleStartTargetWindowInfoLookup(deviceID: deviceID) {
+        case let .available(info):
+            windowInfo = info
+        case let .unavailable(reason):
+            rememberWorkspaceStartUnavailableReason(frame: frame, deviceID: deviceID, reason: reason.rawValue)
+            return nil
+        }
 
         let normalizedName = requestedWorkspaceName?.lowercased()
         let matches = windowInfo.summaries.filter { summary in
@@ -459,6 +483,12 @@ actor RemoteGatewayRuntime {
             return idMatches && nameMatches
         }
         return (summary: matches.count == 1 ? matches[0] : nil, matchCount: matches.count)
+    }
+
+    private func hasWorkspaceStartSelector(_ payload: [String: JSONValue]) -> Bool {
+        let rawWorkspaceID = payload["workspace_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawWorkspaceName = payload["workspace_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return rawWorkspaceID?.isEmpty == false || rawWorkspaceName?.isEmpty == false
     }
 
     private func startFrame(_ frame: RemoteClientFrame, routedTo summary: EligibleStartTargetWindowSummary) -> RemoteClientFrame {
@@ -780,15 +810,38 @@ actor RemoteGatewayRuntime {
     }
 
     private func eligibleStartTargetWindowInfo(deviceID: String) async -> EligibleStartTargetWindowInfo? {
-        guard let (link, _) = try? await resolveAppLink(deviceID: deviceID) else { return nil }
-        guard let result = try? await link.callTool(
-            name: "bind_context",
-            arguments: ["op": .string("list"), "_rawJSON": .bool(true)],
-            timeout: 10
-        ), result.isError != true,
-        let payload = try? RemoteMCPToolResultCodec.jsonValue(from: result),
-        let windows = payload.objectValue?["windows"]?.arrayValue
-        else { return nil }
+        switch await eligibleStartTargetWindowInfoLookup(deviceID: deviceID) {
+        case let .available(info):
+            info
+        case .unavailable:
+            nil
+        }
+    }
+
+    private func eligibleStartTargetWindowInfoLookup(deviceID: String) async -> EligibleStartTargetWindowInfoLookupResult {
+        let link: AppLinkSession
+        do {
+            (link, _) = try await resolveAppLink(deviceID: deviceID)
+        } catch {
+            return .unavailable(.appLinkUnavailable)
+        }
+
+        let result: MCPToolResult
+        do {
+            result = try await link.callTool(
+                name: "bind_context",
+                arguments: ["op": .string("list"), "_rawJSON": .bool(true)],
+                timeout: 10
+            )
+        } catch {
+            return .unavailable(.appToolError)
+        }
+        guard result.isError != true else { return .unavailable(.appToolError) }
+        guard let payload = try? RemoteMCPToolResultCodec.jsonValue(from: result),
+              let windows = payload.objectValue?["windows"]?.arrayValue
+        else { return .unavailable(.decodeFailure) }
+        guard !windows.isEmpty else { return .unavailable(.emptyWindowList) }
+
         var windowIDs: [Int] = []
         let summaries: [EligibleStartTargetWindowSummary] = windows.compactMap { window in
             guard let object = window.objectValue,
@@ -816,10 +869,10 @@ actor RemoteGatewayRuntime {
                 details: .object(summary)
             )
         }
-        guard !summaries.isEmpty else { return nil }
+        guard !summaries.isEmpty else { return .unavailable(.decodeFailure) }
         let details = JSONValue.array(summaries.map(\.details))
         lastEligibleWindowDetailsByDevice[deviceID] = details
-        return EligibleStartTargetWindowInfo(details: details, windowIDs: windowIDs, summaries: summaries)
+        return .available(EligibleStartTargetWindowInfo(details: details, windowIDs: windowIDs, summaries: summaries))
     }
 
     private func responseFrame(for outcome: CommandLedger.RecordedOutcome, frame: RemoteClientFrame) -> RemoteServerFrame {
@@ -981,14 +1034,39 @@ actor RemoteGatewayRuntime {
         return autoRoutedStartWindowIDByCommandKey.removeValue(forKey: "\(deviceID)|\(requestID)")
     }
 
+    private func commandKey(frame: RemoteClientFrame, deviceID: String) -> String? {
+        guard let requestID = frame.requestID else { return nil }
+        return "\(deviceID)|\(requestID)"
+    }
+
     private func rememberWorkspaceStartMatchCount(frame: RemoteClientFrame, deviceID: String, count: Int) {
-        guard frame.type == "start", let requestID = frame.requestID else { return }
-        workspaceStartMatchCountByCommandKey["\(deviceID)|\(requestID)"] = count
+        guard frame.type == "start", let key = commandKey(frame: frame, deviceID: deviceID) else { return }
+        workspaceStartMatchCountByCommandKey[key] = count
     }
 
     private func takeWorkspaceStartMatchCount(frame: RemoteClientFrame, deviceID: String) -> Int? {
-        guard frame.type == "start", let requestID = frame.requestID else { return nil }
-        return workspaceStartMatchCountByCommandKey.removeValue(forKey: "\(deviceID)|\(requestID)")
+        guard frame.type == "start", let key = commandKey(frame: frame, deviceID: deviceID) else { return nil }
+        return workspaceStartMatchCountByCommandKey.removeValue(forKey: key)
+    }
+
+    private func rememberWorkspaceStartMatchSkipped(frame: RemoteClientFrame, deviceID: String, reason: String) {
+        guard frame.type == "start", let key = commandKey(frame: frame, deviceID: deviceID) else { return }
+        workspaceStartMatchSkippedByCommandKey[key] = reason
+    }
+
+    private func takeWorkspaceStartMatchSkipped(frame: RemoteClientFrame, deviceID: String) -> String? {
+        guard frame.type == "start", let key = commandKey(frame: frame, deviceID: deviceID) else { return nil }
+        return workspaceStartMatchSkippedByCommandKey.removeValue(forKey: key)
+    }
+
+    private func rememberWorkspaceStartUnavailableReason(frame: RemoteClientFrame, deviceID: String, reason: String) {
+        guard frame.type == "start", let key = commandKey(frame: frame, deviceID: deviceID) else { return }
+        workspaceStartMatchUnavailableReasonByCommandKey[key] = reason
+    }
+
+    private func takeWorkspaceStartUnavailableReason(frame: RemoteClientFrame, deviceID: String) -> String? {
+        guard frame.type == "start", let key = commandKey(frame: frame, deviceID: deviceID) else { return nil }
+        return workspaceStartMatchUnavailableReasonByCommandKey.removeValue(forKey: key)
     }
 
     private func audit(
@@ -1002,6 +1080,8 @@ actor RemoteGatewayRuntime {
         let responseObject = responsePayload?.objectValue ?? [:]
         let autoRoutedWindowID = takeAutoRoutedStartWindowID(frame: frame, deviceID: deviceID)
         let workspaceMatchCount = takeWorkspaceStartMatchCount(frame: frame, deviceID: deviceID)
+        let workspaceMatchSkipped = takeWorkspaceStartMatchSkipped(frame: frame, deviceID: deviceID)
+        let workspaceMatchUnavailableReason = takeWorkspaceStartUnavailableReason(frame: frame, deviceID: deviceID)
         let isStartBindingFailure = frame.type == "start"
             && outcome == "failure"
             && (code == "binding_required" || code == "ambiguous_start_target")
@@ -1025,7 +1105,9 @@ actor RemoteGatewayRuntime {
             autoRoutedWindowID: autoRoutedWindowID,
             hasWorkspaceName: isStartBindingFailure ? hasWorkspaceName : nil,
             hasWorkspaceID: isStartBindingFailure ? hasWorkspaceID : nil,
-            workspaceMatchCount: isStartBindingFailure ? workspaceMatchCount : nil
+            workspaceMatchCount: isStartBindingFailure ? workspaceMatchCount : nil,
+            workspaceMatchSkipped: isStartBindingFailure ? workspaceMatchSkipped : nil,
+            workspaceMatchUnavailableReason: isStartBindingFailure ? workspaceMatchUnavailableReason : nil
         ))
     }
 }
