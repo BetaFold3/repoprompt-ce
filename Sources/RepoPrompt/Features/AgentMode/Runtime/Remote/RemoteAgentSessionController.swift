@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import RepoPromptRemoteWire
 
 protocol RemoteAgentSessionConnection: Sendable {
@@ -52,6 +53,8 @@ enum RemoteSessionEvent: Equatable {
 }
 
 actor RemoteAgentSessionController {
+    private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "RemoteControlClient")
+
     nonisolated let events: AsyncStream<RemoteSessionEvent>
 
     private let hostID: String
@@ -62,6 +65,7 @@ actor RemoteAgentSessionController {
     private var lastAppliedSeq: UInt64
     private var nextLogOffset: Int
     private var projector: RemoteTranscriptProjector?
+    private var lastKnownRunState: AgentSessionRunState = .idle
     private var scheduledLogCatchUpTask: Task<Void, Never>?
     private var scheduledLogCatchUpDirty = false
     private var didReportLogCatchUpFailure = false
@@ -75,6 +79,7 @@ actor RemoteAgentSessionController {
         hostID = binding.hostID
         hostDisplayName = binding.hostDisplayName
         remoteSessionID = binding.remoteSessionID.isEmpty ? nil : binding.remoteSessionID
+        lastKnownRunState = binding.remoteSessionID.isEmpty ? .idle : .completed
         lastAppliedSeq = binding.lastAppliedSeq
         nextLogOffset = binding.nextLogOffset
         self.connection = connection
@@ -105,7 +110,7 @@ actor RemoteAgentSessionController {
         sessionName: String?,
         windowID: Int?,
         workspaceID: String?,
-        workspaceName: String? = nil
+        workspaceName: String?
     ) async throws -> String {
         try ensureNotShutdown()
         var payload: [String: JSONValue] = [
@@ -128,19 +133,30 @@ actor RemoteAgentSessionController {
             requestID: makeRequestID(prefix: "start"),
             payload: .object(payload)
         )
+        Self.logger.log("remote start request sent request_id=\(frame.requestID ?? "", privacy: .public) has_window_id=\(windowID != nil) has_workspace_id=\(workspaceID?.isEmpty == false) has_workspace_name=\(payload["workspace_name"] != nil)")
         let response = try await commandWithTransportRetry(frame, operation: "start", mayRetryTransportLoss: true)
         let sessionID = try Self.remoteSessionID(from: response)
-        if sessionID != remoteSessionID {
+        let didResetCursor = sessionID != remoteSessionID
+        if didResetCursor {
             lastAppliedSeq = 0
             nextLogOffset = 0
             scheduledLogCatchUpDirty = false
             didReportLogCatchUpFailure = false
         }
         didYieldSessionExpired = false
+        lastKnownRunState = .running
         remoteSessionID = sessionID
+        Self.logger.notice("remote start response adopted request_id=\(frame.requestID ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) did_reset_cursor=\(didResetCursor)")
         projector = RemoteTranscriptProjector(remoteSessionID: sessionID)
         emitBinding()
-        try await connection.subscribe(sessionIDs: [sessionID])
+        do {
+            try await connection.subscribe(sessionIDs: [sessionID])
+            Self.logger.notice("remote subscribe succeeded session_id=\(sessionID, privacy: .public)")
+        } catch {
+            let errorLogMetadata = Self.errorLogMetadata(error)
+            Self.logger.notice("remote subscribe failed session_id=\(sessionID, privacy: .public) error_type=\(errorLogMetadata.type, privacy: .public) error_code=\(errorLogMetadata.code, privacy: .public) error_description=\(errorLogMetadata.description, privacy: .private)")
+            throw error
+        }
         applySnapshot(response, frameType: "session_update")
         try await catchUpFromHost()
         return sessionID
@@ -156,6 +172,7 @@ actor RemoteAgentSessionController {
             payload: .object(["message": .string(text)])
         )
         let response = try await commandWithTransportRetry(frame, operation: "steer", mayRetryTransportLoss: true)
+        lastKnownRunState = .running
         applySnapshot(response, frameType: "session_update")
         try await catchUpFromHost()
     }
@@ -199,7 +216,14 @@ actor RemoteAgentSessionController {
         if projector == nil {
             projector = RemoteTranscriptProjector(remoteSessionID: sessionID)
         }
-        try await connection.subscribe(sessionIDs: [sessionID])
+        do {
+            try await connection.subscribe(sessionIDs: [sessionID])
+            Self.logger.notice("remote subscribe succeeded session_id=\(sessionID, privacy: .public)")
+        } catch {
+            let errorLogMetadata = Self.errorLogMetadata(error)
+            Self.logger.notice("remote subscribe failed session_id=\(sessionID, privacy: .public) error_type=\(errorLogMetadata.type, privacy: .public) error_code=\(errorLogMetadata.code, privacy: .public) error_description=\(errorLogMetadata.description, privacy: .private)")
+            throw error
+        }
         try await catchUpFromHost()
     }
 
@@ -215,16 +239,26 @@ actor RemoteAgentSessionController {
     }
 
     func handleInboundFrame(_ frame: RemoteServerFrame) async {
-        guard !isShutdown else { return }
-        guard frame.sessionID == nil || frame.sessionID == remoteSessionID else { return }
+        if isShutdown {
+            logInboundFrameDrop(frame, reason: "shutdown")
+            return
+        }
+        if frame.sessionID != nil, frame.sessionID != remoteSessionID {
+            logInboundFrameDrop(frame, reason: "session_mismatch")
+            return
+        }
         if let seq = frame.seq {
-            if seq <= lastAppliedSeq { return }
+            if seq <= lastAppliedSeq {
+                logInboundFrameDrop(frame, reason: "seq_gated")
+                return
+            }
             if seq > lastAppliedSeq + 1 {
                 await catchUpFromHostReportingFailures()
             }
             lastAppliedSeq = max(lastAppliedSeq, seq)
             emitBinding()
         }
+        logInboundFrameHandled(frame)
         switch frame.type {
         case "session_update":
             if let payload = frame.payload {
@@ -238,6 +272,8 @@ actor RemoteAgentSessionController {
             }
         case "session_expired":
             yieldSessionExpiredOnce()
+            let sessionID = remoteSessionID ?? ""
+            Self.logger.notice("remote terminal status session_id=\(sessionID, privacy: .public) status=expired")
             eventsContinuation.yield(.terminal(status: "expired"))
         case "interaction_resolved":
             let object = frame.payload?.objectValue ?? [:]
@@ -250,6 +286,14 @@ actor RemoteAgentSessionController {
         default:
             break
         }
+    }
+
+    private func logInboundFrameDrop(_ frame: RemoteServerFrame, reason: String) {
+        Self.logger.log("remote inbound frame dropped type=\(frame.type, privacy: .public) session_id=\(frame.sessionID ?? "", privacy: .public) seq=\(frame.seq ?? 0) has_seq=\(frame.seq != nil) reason=\(reason, privacy: .public)")
+    }
+
+    private func logInboundFrameHandled(_ frame: RemoteServerFrame) {
+        Self.logger.log("remote inbound frame handled type=\(frame.type, privacy: .public) session_id=\(frame.sessionID ?? "", privacy: .public) seq=\(frame.seq ?? 0) has_seq=\(frame.seq != nil)")
     }
 
     func handleConnectionState(_ state: RemoteHostConnection.State) {
@@ -317,11 +361,15 @@ actor RemoteAgentSessionController {
             try ensureNotShutdown()
             let offset = nextLogOffset
             let page = try await fetchLogPage(offset: offset, limit: 20)
-            guard page.returnedTurnCount > 0 else { return }
+            guard page.returnedTurnCount > 0 else {
+                logLogPageResult(page, branch: "empty", emittedRowCount: 0)
+                return
+            }
 
             guard page.completedTurnCount != nil else {
                 emitLogPage(page)
                 let didAdvance = advanceLogOffset(to: page.consumableOffset, from: offset)
+                logLogPageResult(page, branch: "legacy", emittedRowCount: page.items.count)
                 keepPaging = nextLogOffset < page.totalTurns && didAdvance
                 if !didAdvance {
                     emitNonAdvancingLogPageWarning()
@@ -329,10 +377,11 @@ actor RemoteAgentSessionController {
                 continue
             }
 
-            let consumableOffset = page.consumableOffset
+            let consumableOffset = effectiveConsumableOffset(for: page)
             if consumableOffset >= page.nextLogOffset {
                 emitLogPage(page)
-                let didAdvance = advanceLogOffset(to: page.consumableOffset, from: offset)
+                let didAdvance = advanceLogOffset(to: consumableOffset, from: offset)
+                logLogPageResult(page, branch: "complete", emittedRowCount: page.items.count)
                 keepPaging = nextLogOffset < page.totalTurns && didAdvance
                 if !didAdvance {
                     emitNonAdvancingLogPageWarning()
@@ -340,15 +389,19 @@ actor RemoteAgentSessionController {
             } else if consumableOffset <= offset {
                 emitLogPage(page)
                 emitBinding()
+                logLogPageResult(page, branch: "parked", emittedRowCount: page.items.count)
                 keepPaging = false
             } else {
                 let completedPage = try await fetchLogPage(offset: offset, limit: consumableOffset - offset)
-                guard completedPage.consumableOffset >= completedPage.nextLogOffset else {
+                let completedPageConsumableOffset = effectiveConsumableOffset(for: completedPage)
+                guard completedPageConsumableOffset >= completedPage.nextLogOffset else {
+                    logLogPageResult(page, branch: "mixed-discarded", emittedRowCount: 0)
                     keepPaging = false
                     continue
                 }
                 emitLogPage(completedPage)
-                let didAdvance = advanceLogOffset(to: min(consumableOffset, completedPage.consumableOffset), from: offset)
+                let didAdvance = advanceLogOffset(to: min(consumableOffset, completedPageConsumableOffset), from: offset)
+                logLogPageResult(completedPage, branch: "mixed", emittedRowCount: completedPage.items.count)
                 keepPaging = nextLogOffset < page.totalTurns && didAdvance
                 if !didAdvance {
                     emitNonAdvancingLogPageWarning()
@@ -361,6 +414,7 @@ actor RemoteAgentSessionController {
         guard let sessionID = remoteSessionID else {
             throw RemoteLogPagingError.missingSession
         }
+        Self.logger.log("remote get_log fetch session_id=\(sessionID, privacy: .public) offset=\(offset) limit=\(limit)")
         let logFrame = RemoteClientFrame(
             type: "get_log",
             requestID: makeRequestID(prefix: "log"),
@@ -381,6 +435,22 @@ actor RemoteAgentSessionController {
         if !page.items.isEmpty {
             eventsContinuation.yield(.transcriptRows(page.items))
         }
+    }
+
+    private func effectiveConsumableOffset(for page: RemoteProjectedLogPage) -> Int {
+        let rawOffset = page.consumableOffset
+        guard page.completedTurnCount != nil, lastKnownRunState.isActive else { return rawOffset }
+        let cappedOffset = min(rawOffset, max(0, page.totalTurns - 1))
+        if cappedOffset != rawOffset {
+            let runStateRaw = lastKnownRunState.rawValue
+            Self.logger.notice("remote active-run completed boundary capped session_id=\(page.sessionID, privacy: .public) raw_consumable_offset=\(rawOffset) capped_consumable_offset=\(cappedOffset) total_turns=\(page.totalTurns) run_state=\(runStateRaw, privacy: .public)")
+        }
+        return cappedOffset
+    }
+
+    private func logLogPageResult(_ page: RemoteProjectedLogPage, branch: String, emittedRowCount: Int) {
+        let nextOffset = nextLogOffset
+        Self.logger.log("remote get_log page session_id=\(page.sessionID, privacy: .public) offset=\(page.turnOffset) limit=\(page.turnLimit) returned_turn_count=\(page.returnedTurnCount) total_turns=\(page.totalTurns) completed_turn_count=\(page.completedTurnCount ?? -1) has_completed_turn_count=\(page.completedTurnCount != nil) emitted_row_count=\(emittedRowCount) next_log_offset=\(nextOffset) branch=\(branch, privacy: .public)")
     }
 
     private func advanceLogOffset(to offset: Int, from previousOffset: Int) -> Bool {
@@ -409,6 +479,9 @@ actor RemoteAgentSessionController {
             yieldSessionExpiredOnce()
             return
         }
+        let sessionID = remoteSessionID ?? ""
+        let errorLogMetadata = Self.errorLogMetadata(error)
+        Self.logger.notice("remote transcript catch-up failed session_id=\(sessionID, privacy: .public) error_type=\(errorLogMetadata.type, privacy: .public) error_code=\(errorLogMetadata.code, privacy: .public) error_description=\(errorLogMetadata.description, privacy: .private)")
         if !didReportLogCatchUpFailure {
             eventsContinuation.yield(.systemMessage("Remote transcript catch-up failed: \(error)"))
         }
@@ -416,8 +489,11 @@ actor RemoteAgentSessionController {
     }
 
     private func yieldSessionExpiredOnce() {
+        lastKnownRunState = .failed
         guard !didYieldSessionExpired else { return }
         didYieldSessionExpired = true
+        let sessionID = remoteSessionID ?? ""
+        Self.logger.notice("remote session expired session_id=\(sessionID, privacy: .public)")
         eventsContinuation.yield(.sessionExpired)
     }
 
@@ -452,6 +528,9 @@ actor RemoteAgentSessionController {
                 sessionName: projection.sessionName
             ))
         }
+        let sessionID = remoteSessionID ?? ""
+        lastKnownRunState = projection.runState
+        Self.logger.log("remote snapshot projected frame_type=\(frameType ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) run_state=\(projection.runState.rawValue, privacy: .public)")
         eventsContinuation.yield(.runState(projection.runState, pendingInteraction: projection.pendingInteraction))
         if let resolved = Self.interactionResolution(from: payload) {
             eventsContinuation.yield(.interactionResolved(
@@ -463,6 +542,7 @@ actor RemoteAgentSessionController {
             yieldSessionExpiredOnce()
         }
         if let terminalStatus = projection.terminalStatus {
+            Self.logger.notice("remote terminal status session_id=\(sessionID, privacy: .public) status=\(terminalStatus, privacy: .public)")
             eventsContinuation.yield(.terminal(status: terminalStatus))
         }
     }
@@ -484,6 +564,15 @@ actor RemoteAgentSessionController {
 
     private func missingSessionError() -> RemoteClientError {
         .sessionExpired(.init(code: "missing_session", message: "Remote session is not attached."))
+    }
+
+    private static func errorLogMetadata(_ error: Error) -> (type: String, code: String, description: String) {
+        let code: String = if let remoteError = error as? RemoteClientError {
+            remoteError.commandError?.code ?? ""
+        } else {
+            ""
+        }
+        return (String(describing: Swift.type(of: error)), code, String(describing: error))
     }
 
     private static func remoteSessionID(from payload: JSONValue) throws -> String {

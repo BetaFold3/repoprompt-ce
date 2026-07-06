@@ -35,6 +35,7 @@ actor RemoteGatewayRuntime {
     private let pushSubscriptionStore: WebPushSubscriptionStore?
     private let now: @Sendable () -> Date
     private var lastEligibleWindowDetailsByDevice: [String: JSONValue] = [:]
+    private var autoRoutedStartWindowIDByCommandKey: [String: Int] = [:]
 
     init(
         appLink: AppLinkSession,
@@ -262,7 +263,7 @@ actor RemoteGatewayRuntime {
         }
         do {
             let payload = try await callTranslatedTool(for: frame, deviceID: deviceID)
-            audit(frame: frame, deviceID: deviceID, outcome: "success")
+            audit(frame: frame, deviceID: deviceID, outcome: "success", responsePayload: payload)
             return .commandResult(requestID: frame.requestID, sessionID: frame.sessionID, payload: payload)
         } catch {
             let mapped = mapError(error, frame: frame)
@@ -338,7 +339,7 @@ actor RemoteGatewayRuntime {
             await recordExplicitStartAffinityIfNeeded(frame: frame, payload: payload)
             outcome = .success(payload)
             await ledger.complete(key: key, outcome: outcome)
-            audit(frame: frame, deviceID: deviceID, outcome: "success")
+            audit(frame: frame, deviceID: deviceID, outcome: "success", responsePayload: payload)
             if frame.type == "steer" || frame.type == "respond" {
                 await watchManager.rearm(deviceID: deviceID, sessionID: frame.sessionID)
             }
@@ -383,7 +384,8 @@ actor RemoteGatewayRuntime {
             deviceID: deviceID,
             link: link,
             bindingState: bindingState,
-            allowCorrectiveRetry: true
+            allowCorrectiveRetry: true,
+            allowStartRoutingRetry: true
         )
     }
 
@@ -392,7 +394,8 @@ actor RemoteGatewayRuntime {
         deviceID: String,
         link: AppLinkSession,
         bindingState: RemoteGatewayBindingState,
-        allowCorrectiveRetry: Bool
+        allowCorrectiveRetry: Bool,
+        allowStartRoutingRetry: Bool
     ) async throws -> JSONValue {
         let sessionID = singleSessionIDIfSessionAddressed(frame)
         var resolvedWindowID = await resolvedWindowID(
@@ -415,6 +418,7 @@ actor RemoteGatewayRuntime {
            let matchedWindow = await uniqueWorkspaceStartWindow(payload: payload, deviceID: deviceID)
         {
             effectiveFrame = startFrame(frame, routedTo: matchedWindow)
+            rememberAutoRoutedStart(frame: frame, deviceID: deviceID, windowID: matchedWindow.windowID)
         }
         let payload = try await executeTranslatedTool(
             frame: effectiveFrame,
@@ -423,7 +427,8 @@ actor RemoteGatewayRuntime {
             bindingState: bindingState,
             resolvedWindowID: resolvedWindowID,
             retrySessionID: sessionID,
-            allowCorrectiveRetry: allowCorrectiveRetry
+            allowCorrectiveRetry: allowCorrectiveRetry,
+            allowStartRoutingRetry: allowStartRoutingRetry
         )
         if effectiveFrame != frame {
             await recordExplicitStartAffinityIfNeeded(frame: effectiveFrame, payload: payload)
@@ -474,7 +479,8 @@ actor RemoteGatewayRuntime {
         bindingState: RemoteGatewayBindingState,
         resolvedWindowID: Int?,
         retrySessionID: String?,
-        allowCorrectiveRetry: Bool
+        allowCorrectiveRetry: Bool,
+        allowStartRoutingRetry: Bool
     ) async throws -> JSONValue {
         let translator = RemoteCommandTranslator(bindingState: bindingState)
         let toolCall = try translator.translate(frame, resolvedWindowID: resolvedWindowID)
@@ -490,7 +496,25 @@ actor RemoteGatewayRuntime {
                 await appLinkPool?.refreshBindingState(forDevice: deviceID)
             }
             if Self.isStartRoutingTargetError(runtimeError, frame: frame) {
-                await appLinkPool?.refreshBindingState(forDevice: deviceID)
+                let refreshedBindingState = await appLinkPool?.refreshBindingState(forDevice: deviceID)
+                if allowStartRoutingRetry,
+                   explicitStartWindowID(frame) == nil,
+                   let refreshedBindingState,
+                   refreshedBindingState != .bound
+                {
+                    do {
+                        return try await callTranslatedToolSingle(
+                            for: frame,
+                            deviceID: deviceID,
+                            link: link,
+                            bindingState: refreshedBindingState,
+                            allowCorrectiveRetry: false,
+                            allowStartRoutingRetry: false
+                        )
+                    } catch {
+                        throw RemoteCommandTranslatorError.ambiguousStartTarget
+                    }
+                }
                 throw RemoteCommandTranslatorError.ambiguousStartTarget
             }
             if allowCorrectiveRetry,
@@ -510,7 +534,8 @@ actor RemoteGatewayRuntime {
                     bindingState: bindingState,
                     resolvedWindowID: rediscovered,
                     retrySessionID: nil,
-                    allowCorrectiveRetry: false
+                    allowCorrectiveRetry: false,
+                    allowStartRoutingRetry: false
                 )
             }
             throw runtimeError
@@ -576,7 +601,8 @@ actor RemoteGatewayRuntime {
                 deviceID: deviceID,
                 link: link,
                 bindingState: bindingState,
-                allowCorrectiveRetry: false
+                allowCorrectiveRetry: false,
+                allowStartRoutingRetry: false
             )
         }
 
@@ -590,7 +616,8 @@ actor RemoteGatewayRuntime {
                 bindingState: bindingState,
                 resolvedWindowID: partition.windowID,
                 retrySessionID: nil,
-                allowCorrectiveRetry: false
+                allowCorrectiveRetry: false,
+                allowStartRoutingRetry: false
             )
             snapshots.append(contentsOf: RemoteSessionSnapshot.extractSnapshots(from: payload).map(\.payload))
         }
@@ -938,19 +965,38 @@ actor RemoteGatewayRuntime {
         return nil
     }
 
+    private func rememberAutoRoutedStart(frame: RemoteClientFrame, deviceID: String, windowID: Int) {
+        guard frame.type == "start", let requestID = frame.requestID else { return }
+        autoRoutedStartWindowIDByCommandKey["\(deviceID)|\(requestID)"] = windowID
+    }
+
+    private func takeAutoRoutedStartWindowID(frame: RemoteClientFrame, deviceID: String) -> Int? {
+        guard frame.type == "start", let requestID = frame.requestID else { return nil }
+        return autoRoutedStartWindowIDByCommandKey.removeValue(forKey: "\(deviceID)|\(requestID)")
+    }
+
     private func audit(
         frame: RemoteClientFrame,
         deviceID: String,
         outcome: String,
-        code: String? = nil
+        code: String? = nil,
+        responsePayload: JSONValue? = nil
     ) {
+        let requestPayload = frame.payload?.objectValue ?? [:]
+        let responseObject = responsePayload?.objectValue ?? [:]
+        let autoRoutedWindowID = takeAutoRoutedStartWindowID(frame: frame, deviceID: deviceID)
         auditLog?.recordBestEffort(RemoteAuditRecord(
             deviceID: deviceID,
             requestID: frame.requestID,
             op: frame.type,
             sessionID: frame.sessionID,
             outcome: outcome,
-            code: code
+            code: code,
+            offset: frame.type == "get_log" ? requestPayload["offset"]?.intValue : nil,
+            limit: frame.type == "get_log" ? requestPayload["limit"]?.intValue : nil,
+            returnedTurnCount: frame.type == "get_log" ? responseObject["returned_turn_count"]?.intValue : nil,
+            completedTurnCount: frame.type == "get_log" ? responseObject["completed_turn_count"]?.intValue : nil,
+            autoRoutedWindowID: autoRoutedWindowID
         ))
     }
 }

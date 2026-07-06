@@ -49,7 +49,7 @@ final class RemoteAgentModeCoordinator {
         sessionName: String?,
         windowID: Int?,
         workspaceID: String?,
-        workspaceName: String? = nil
+        workspaceName: String?
     ) async throws {
         let controller = try controller(for: session)
         session.runState = .running

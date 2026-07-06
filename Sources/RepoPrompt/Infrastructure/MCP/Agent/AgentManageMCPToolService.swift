@@ -273,7 +273,10 @@ struct AgentManageMCPToolService {
             agentModeVM: agentModeVM
         )
         let totalTurns = transcriptInfo.transcript.turns.count
-        let completedTurnCount = completedTurnCount(in: transcriptInfo.transcript)
+        var completedTurnCount = completedTurnCount(in: transcriptInfo.transcript)
+        if transcriptInfo.liveRunState?.isActive == true {
+            completedTurnCount = min(completedTurnCount, max(0, totalTurns - 1))
+        }
         let slicedTurns = Array(transcriptInfo.transcript.turns.dropFirst(offset).prefix(limit))
         let slicedTranscript = AgentTranscript(
             version: transcriptInfo.transcript.version,
@@ -881,7 +884,7 @@ struct AgentManageMCPToolService {
         reference: String,
         workspace: WorkspaceModel,
         agentModeVM: AgentModeViewModel
-    ) async throws -> (sessionID: UUID, name: String?, transcript: AgentTranscript) {
+    ) async throws -> (sessionID: UUID, name: String?, transcript: AgentTranscript, liveRunState: AgentSessionRunState?) {
         let normalizedReference = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         let referenceUUID = UUID(uuidString: normalizedReference)
         if let referenceUUID,
@@ -890,12 +893,19 @@ struct AgentManageMCPToolService {
         {
             let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
             let liveName = agentModeVM.sessionIndex[sessionID]?.name
-            return (sessionID, liveName, hydrated.transcript)
+            return (sessionID, liveName, hydrated.transcript, hydrated.runState)
+        }
+        let persistedRunStateRawFromStorage = if let referenceUUID {
+            try? await AgentSessionDataService.shared.rawLastRunStateForAgentSession(id: referenceUUID, for: workspace)
+        } else {
+            String?.none
         }
         guard let persisted = try await AgentSessionDataService.shared.loadAgentSession(reference: reference, for: workspace) else {
             throw MCPError.invalidParams("Session '\(reference)' was not found in the active workspace.")
         }
-        return (persisted.id, persisted.name, persisted.transcript ?? .empty)
+        let persistedRunStateRaw = persistedRunStateRawFromStorage ?? persisted.lastRunState
+        let persistedRunState = persistedRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))
+        return (persisted.id, persisted.name, persisted.transcript ?? .empty, persistedRunState)
     }
 
     private func resolveHandoffSession(

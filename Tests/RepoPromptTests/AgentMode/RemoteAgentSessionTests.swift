@@ -180,7 +180,8 @@ final class RemoteAgentSessionTests: XCTestCase {
             modelSelectionRaw: nil,
             sessionName: nil,
             windowID: nil,
-            workspaceID: nil
+            workspaceID: nil,
+            workspaceName: nil
         )
 
         XCTAssertEqual(sessionID, "remote-session-new")
@@ -317,7 +318,8 @@ final class RemoteAgentSessionTests: XCTestCase {
             modelSelectionRaw: nil,
             sessionName: nil,
             windowID: 2,
-            workspaceID: nil
+            workspaceID: nil,
+            workspaceName: nil
         )
 
         XCTAssertEqual(sessionID, "remote-session-done")
@@ -329,6 +331,106 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(rows.map(\.text), ["Initial reply"])
         let getLogCount = await connection.commandCount(type: "get_log")
         XCTAssertEqual(getLogCount, 1)
+    }
+
+    func testStartCatchUpCapsPoisonedCompletedTurnWhileRunActive() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "start": [Self.snapshotPayload(status: "running", sessionID: "remote-session-race")],
+            "poll": [Self.snapshotPayload(status: "running", sessionID: "remote-session-race")],
+            "get_log": [
+                Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1),
+                Self.logPayload(
+                    offset: 0,
+                    returned: 1,
+                    total: 1,
+                    xml: "<user>Prompt</user>\n<assistant>Reply</assistant>",
+                    completed: 1
+                )
+            ]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: connection
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        let sessionID = try await controller.start(
+            message: "Prompt",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: nil,
+            workspaceID: nil,
+            workspaceName: nil
+        )
+
+        XCTAssertEqual(sessionID, "remote-session-race")
+        let parkedBindingValue = await controller.currentBinding()
+        let parkedBinding = try XCTUnwrap(parkedBindingValue)
+        XCTAssertEqual(parkedBinding.nextLogOffset, 0)
+        let initialRows = await recorder.allTranscriptRows()
+        XCTAssertEqual(initialRows.first?.map(\.text), ["Prompt"])
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_terminal",
+            requestID: nil,
+            sessionID: "remote-session-race",
+            seq: 1,
+            payload: Self.snapshotPayload(status: "completed", sessionID: "remote-session-race")
+        ))
+        await waitForRemoteAgentSessionCondition {
+            await connection.commandCount(type: "get_log") >= 2
+        }
+        await waitForRemoteAgentSessionCondition {
+            await (recorder.allTranscriptRows()).count >= 2
+        }
+
+        let allRows = await recorder.allTranscriptRows()
+        XCTAssertEqual(allRows[1].map(\.text), ["Prompt", "Reply"])
+        let completedBindingValue = await controller.currentBinding()
+        let completedBinding = try XCTUnwrap(completedBindingValue)
+        XCTAssertEqual(completedBinding.nextLogOffset, 1)
+        let getLogOffsets = await connection.getLogOffsets()
+        XCTAssertEqual(getLogOffsets, [0, 0])
+    }
+
+    func testCompletedRemoteLogPageConsumesWhenRunInactive() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "get_log": [
+                Self.logPayload(
+                    offset: 0,
+                    returned: 1,
+                    total: 1,
+                    xml: "<user>Prompt</user>\n<assistant>Old reply</assistant>",
+                    completed: 1
+                )
+            ]
+        ])
+        let controller = RemoteAgentSessionController(binding: makeBinding(lastAppliedSeq: 0, nextLogOffset: 0), connection: connection)
+        defer { Task { await controller.shutdown() } }
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_terminal",
+            requestID: nil,
+            sessionID: "remote-session-abc",
+            seq: 1,
+            payload: Self.snapshotPayload(status: "completed")
+        ))
+        await waitForRemoteAgentSessionCondition {
+            await connection.commandCount(type: "get_log") >= 1
+        }
+
+        let bindingValue = await controller.currentBinding()
+        let binding = try XCTUnwrap(bindingValue)
+        XCTAssertEqual(binding.nextLogOffset, 1)
     }
 
     func testWaitingRemoteTurnIsRefetchedUntilCompletedTurnCountAdvances() async throws {

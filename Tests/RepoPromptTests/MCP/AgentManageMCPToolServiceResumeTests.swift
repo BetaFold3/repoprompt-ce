@@ -146,6 +146,36 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         XCTAssertEqual(staleMiddleResult.objectValue?["completed_turn_count"]?.intValue, 1)
         XCTAssertEqual(staleMiddleResult.objectValue?["returned_turn_count"]?.intValue, 2)
 
+        session.runState = .running
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [.user("Queued prompt", sequenceIndex: 0)],
+            terminalState: .idle,
+            compact: false
+        )
+        let activeSingleStaleCompleteResult = try await service.execute(args: [
+            "op": .string("get_log"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        XCTAssertEqual(activeSingleStaleCompleteResult.objectValue?["completed_turn_count"]?.intValue, 0)
+        XCTAssertEqual(activeSingleStaleCompleteResult.objectValue?["returned_turn_count"]?.intValue, 1)
+
+        session.runState = .running
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                .user("Prompt", sequenceIndex: 0),
+                .assistant("Reply", sequenceIndex: 1),
+                .user("Queued follow-up", sequenceIndex: 2)
+            ],
+            terminalState: .idle,
+            compact: false
+        )
+        let activeStaleCompleteResult = try await service.execute(args: [
+            "op": .string("get_log"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        XCTAssertEqual(activeStaleCompleteResult.objectValue?["completed_turn_count"]?.intValue, 1)
+        XCTAssertEqual(activeStaleCompleteResult.objectValue?["returned_turn_count"]?.intValue, 2)
+
         session.runState = .waitingForUser
         session.transcript = AgentTranscriptIO.buildTranscript(
             from: [
@@ -161,6 +191,65 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         ])
         XCTAssertEqual(waitingResult.objectValue?["completed_turn_count"]?.intValue, 0)
         XCTAssertEqual(waitingResult.objectValue?["returned_turn_count"]?.intValue, 1)
+
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let persistedActiveSessionID = UUID()
+        let persistedActiveTranscript = AgentTranscriptIO.buildTranscript(
+            from: [.user("Persisted queued prompt", sequenceIndex: 0)],
+            terminalState: .idle,
+            compact: false
+        )
+        let persistedActiveSession = AgentSession(
+            id: persistedActiveSessionID,
+            workspaceID: workspace.id,
+            name: "Persisted Active",
+            savedAt: Date(timeIntervalSinceReferenceDate: 10),
+            transcript: persistedActiveTranscript,
+            itemCount: 1,
+            lastRunState: AgentSessionRunState.running.rawValue,
+            autoEditEnabled: true
+        )
+        _ = try await AgentSessionDataService.shared.saveAgentSession(
+            persistedActiveSession,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 1
+        )
+        let persistedActiveResult = try await service.execute(args: [
+            "op": .string("get_log"),
+            "session_id": .string(persistedActiveSessionID.uuidString)
+        ])
+        XCTAssertEqual(persistedActiveResult.objectValue?["completed_turn_count"]?.intValue, 0)
+        XCTAssertEqual(persistedActiveResult.objectValue?["returned_turn_count"]?.intValue, 1)
+
+        let persistedCompletedSessionID = UUID()
+        let persistedCompletedTranscript = AgentTranscriptIO.buildTranscript(
+            from: [.user("Persisted prompt", sequenceIndex: 0), .assistant("Persisted reply", sequenceIndex: 1)],
+            terminalState: .completed,
+            compact: false
+        )
+        let persistedCompletedSession = AgentSession(
+            id: persistedCompletedSessionID,
+            workspaceID: workspace.id,
+            name: "Persisted Completed",
+            savedAt: Date(timeIntervalSinceReferenceDate: 11),
+            transcript: persistedCompletedTranscript,
+            itemCount: 2,
+            lastRunState: AgentSessionRunState.completed.rawValue,
+            autoEditEnabled: true
+        )
+        _ = try await AgentSessionDataService.shared.saveAgentSession(
+            persistedCompletedSession,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 2
+        )
+        let persistedCompletedResult = try await service.execute(args: [
+            "op": .string("get_log"),
+            "session_id": .string(persistedCompletedSessionID.uuidString)
+        ])
+        XCTAssertEqual(persistedCompletedResult.objectValue?["completed_turn_count"]?.intValue, 1)
+        XCTAssertEqual(persistedCompletedResult.objectValue?["returned_turn_count"]?.intValue, 1)
     }
 
     private func makeWindow() async throws -> WindowState {

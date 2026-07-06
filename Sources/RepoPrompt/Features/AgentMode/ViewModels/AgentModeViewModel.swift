@@ -12108,7 +12108,8 @@ final class AgentModeViewModel: ObservableObject {
                     windowID: option.windowID,
                     // Guard only against the host-reported workspace of the chosen
                     // window — never a client-local workspace UUID.
-                    workspaceID: option.workspaceID
+                    workspaceID: option.workspaceID,
+                    workspaceName: nil
                 )
             } catch {
                 if presentRemoteStartWindowPickerIfPossible(

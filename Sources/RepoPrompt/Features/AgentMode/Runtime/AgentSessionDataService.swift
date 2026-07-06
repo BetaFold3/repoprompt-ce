@@ -138,6 +138,10 @@ actor AgentSessionDataService {
 
     // MARK: - Lightweight decode helpers
 
+    private struct AgentSessionLastRunStateHeader: Decodable {
+        let lastRunState: String?
+    }
+
     private struct AgentSessionHeader: Decodable {
         let id: UUID
         let serializationVersion: Int?
@@ -966,6 +970,14 @@ actor AgentSessionDataService {
         guard session.name != validatedName else { return }
         session.name = validatedName
         _ = try await saveAgentSession(session, for: workspace)
+    }
+
+    func rawLastRunStateForAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> String? {
+        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        let fileURL = agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        return try decoder.decode(AgentSessionLastRunStateHeader.self, from: data).lastRunState
     }
 
     /// Load an AgentSession from disk.

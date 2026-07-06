@@ -111,9 +111,34 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         ]))
     }
 
+    private func waitForAuditRecord(
+        in directory: URL,
+        op: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> [String: Any] {
+        for _ in 0 ..< 100 {
+            let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+            for fileURL in files where fileURL.pathExtension == "jsonl" {
+                let text = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+                for rawLine in text.split(separator: "\n") {
+                    guard let data = rawLine.data(using: .utf8),
+                          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          object["op"] as? String == op
+                    else { continue }
+                    return object
+                }
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Timed out waiting for audit record", file: file, line: line)
+        return [:]
+    }
+
     private func makeRuntime(
         connection: RecordingAppLinkConnection,
-        bindingState: RemoteGatewayBindingState
+        bindingState: RemoteGatewayBindingState,
+        auditLog: RemoteAuditLog? = nil
     ) async throws -> RemoteGatewayRuntime {
         let root = try GatewayTestHelpers.temporaryRoot()
         let config = try GatewayTestHelpers.configuration(root: root)
@@ -132,7 +157,7 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             appLink: appLink,
             ledger: CommandLedger(),
             watchManager: watchManager,
-            auditLog: nil,
+            auditLog: auditLog,
             bindingState: bindingState
         )
         await watchManager.setWindowResolver { deviceID, sessionID in
@@ -346,6 +371,74 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.name == "agent_run" })
     }
 
+    func testGetLogAuditIncludesPagingFields() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(sessionID),
+                "turn_offset": .int(7),
+                "turn_limit": .int(3),
+                "returned_turn_count": .int(2),
+                "total_turns": .int(10),
+                "completed_turn_count": .int(8),
+                "transcript_xml": .string("<transcript/>")
+            ])))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound, auditLog: auditLog)
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "get_log",
+                requestID: "log-r1",
+                sessionID: sessionID,
+                payload: .object(["offset": .int(7), "limit": .int(3)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        let record = try await waitForAuditRecord(in: auditDirectory, op: "get_log")
+        XCTAssertEqual(record["offset"] as? Int, 7)
+        XCTAssertEqual(record["limit"] as? Int, 3)
+        XCTAssertEqual(record["returned_turn_count"] as? Int, 2)
+        XCTAssertEqual(record["completed_turn_count"] as? Int, 8)
+    }
+
+    func testAutoRoutedStartAuditIncludesMatchedWindowID() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(sessionID),
+                "status": .string("running")
+            ])))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"), auditLog: auditLog)
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "start-r1",
+                payload: .object(["message": .string("go"), "workspace_name": .string("Workspace B")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        let record = try await waitForAuditRecord(in: auditDirectory, op: "start")
+        XCTAssertEqual(record["auto_routed_window_id"] as? Int, 2)
+    }
+
     func testStartWithExplicitWindowSelectorProceedsOnAmbiguousConnection() async throws {
         let connection = RecordingAppLinkConnection(responses: [
             .result(GatewayTestHelpers.toolResult(json: .object([
@@ -545,12 +638,85 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(steerCalls.count, 1)
     }
 
-    func testStartRoutingAppErrorReturnsAmbiguousStartTargetWithWindowsAndRefreshesBinding() async throws {
+    func testStartRoutingAppErrorWithUniqueWorkspaceNameAutoRoutesAfterBindingRefresh() async throws {
         let deviceID = "remote:1a2b3c4d"
         let connection = RecordingAppLinkConnection(responses: [
             .result(GatewayTestHelpers.toolResult(json: .object([
                 "code": .string("invalid_params"),
-                "error": .string("agent_run.start requires either an explicit tab context, an exact run-scoped tab, or a window-only connection bound to the target window.")
+                "error": .string("agent_run.start requires either an explicit tab context, an exact run-scoped tab, or a window-only connection bound to the target window")
+            ]), isError: true)),
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(sessionID),
+                "status": .string("running")
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
+        ])
+        let root = try GatewayTestHelpers.temporaryRoot()
+        let config = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let probe = BindingProbeRecorder([
+            .bound,
+            .ambiguousStartTarget("multiple windows"),
+            .ambiguousStartTarget("multiple windows")
+        ])
+        let pool = AppLinkPool(
+            configuration: config,
+            connector: BindingRuntimeConnector(connection: connection),
+            bindingProbe: { _ in probe.next() }
+        )
+        _ = try await pool.ensureLink(forDevice: deviceID)
+
+        let defaultAppLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: RecordingAppLinkConnection())
+        )
+        try await defaultAppLink.connect()
+        let runtime = try RemoteGatewayRuntime(
+            appLink: defaultAppLink,
+            ledger: CommandLedger(),
+            watchManager: SessionWatchManager(appLink: defaultAppLink, appLinkPool: pool),
+            auditLog: nil,
+            appLinkPool: pool
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "r1",
+                payload: .object(["message": .string("go"), "workspace_name": .string("Workspace B")])
+            ),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        let steerResponse = await runtime.handle(
+            RemoteClientFrame(type: "steer", requestID: "r2", sessionID: sessionID, payload: .object(["message": .string("next")])),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(steerResponse?.type, "command_result")
+
+        let calls = await connection.calls
+        let startCalls = calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("start") }
+        XCTAssertEqual(startCalls.count, 2)
+        XCTAssertNil(startCalls[0].arguments["_windowID"])
+        XCTAssertEqual(startCalls[1].arguments["_windowID"], .int(2))
+        XCTAssertEqual(startCalls[1].arguments["workspace_id"], .string("55555555-5555-5555-5555-555555555555"))
+        XCTAssertNil(startCalls[1].arguments["workspace_name"])
+        let steerCall = try XCTUnwrap(calls.first { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") })
+        XCTAssertEqual(steerCall.arguments["_windowID"], .int(2))
+        XCTAssertGreaterThanOrEqual(probe.count, 2, "Start routing app errors should refresh stale bound state before retrying")
+    }
+
+    func testStartRoutingAppErrorWithNonMatchingWorkspaceNameReturnsAmbiguousStartTargetWithWindowsAndRefreshesBinding() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "code": .string("invalid_params"),
+                "error": .string("agent_run.start requires either an explicit tab context, an exact run-scoped tab, or a window-only connection bound to the target window")
             ]), isError: true)),
             .result(windowListResponse())
         ])
@@ -582,7 +748,7 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         )
 
         let response = await runtime.handle(
-            RemoteClientFrame(type: "start", requestID: "r1", payload: .object(["message": .string("go")])),
+            RemoteClientFrame(type: "start", requestID: "r1", payload: .object(["message": .string("go"), "workspace_name": .string("Missing")])),
             deviceID: deviceID,
             sinkID: UUID(),
             sink: RecordingFrameSink()

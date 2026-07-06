@@ -8,6 +8,11 @@ struct RemoteAuditRecord: Codable, Equatable {
     let sessionID: String?
     let outcome: String
     let code: String?
+    let offset: Int?
+    let limit: Int?
+    let returnedTurnCount: Int?
+    let completedTurnCount: Int?
+    let autoRoutedWindowID: Int?
 
     init(
         date: Date = Date(),
@@ -16,7 +21,12 @@ struct RemoteAuditRecord: Codable, Equatable {
         op: String,
         sessionID: String?,
         outcome: String,
-        code: String? = nil
+        code: String? = nil,
+        offset: Int? = nil,
+        limit: Int? = nil,
+        returnedTurnCount: Int? = nil,
+        completedTurnCount: Int? = nil,
+        autoRoutedWindowID: Int? = nil
     ) {
         ts = RemoteAuditLog.timestampFormatter.string(from: date)
         self.deviceID = deviceID
@@ -25,6 +35,11 @@ struct RemoteAuditRecord: Codable, Equatable {
         self.sessionID = sessionID
         self.outcome = outcome
         self.code = code
+        self.offset = offset
+        self.limit = limit
+        self.returnedTurnCount = returnedTurnCount
+        self.completedTurnCount = completedTurnCount
+        self.autoRoutedWindowID = autoRoutedWindowID
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -35,6 +50,11 @@ struct RemoteAuditRecord: Codable, Equatable {
         case sessionID = "session_id"
         case outcome
         case code
+        case offset
+        case limit
+        case returnedTurnCount = "returned_turn_count"
+        case completedTurnCount = "completed_turn_count"
+        case autoRoutedWindowID = "auto_routed_window_id"
     }
 }
 
