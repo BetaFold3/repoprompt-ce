@@ -901,6 +901,177 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertFalse(description.contains("bind_context"))
     }
 
+    func testListChildSessionsSendsParentFilterAndParsesDescriptors() async throws {
+        let parentRemoteID = "11111111-1111-1111-1111-111111111111"
+        let childRemoteID = "22222222-2222-2222-2222-222222222222"
+        let siblingRemoteID = "33333333-3333-3333-3333-333333333333"
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "list_sessions": [Self.listSessionsPayload(children: [
+                Self.sessionDescriptorPayload(
+                    sessionID: childRemoteID,
+                    name: "Child Worker",
+                    state: "running",
+                    agentID: AgentProviderKind.codexExec.rawValue,
+                    model: "codex",
+                    parentSessionID: parentRemoteID
+                ),
+                Self.sessionDescriptorPayload(
+                    sessionID: siblingRemoteID,
+                    name: "Sibling Worker",
+                    state: "completed",
+                    agentID: AgentProviderKind.claudeCode.rawValue,
+                    model: "claude",
+                    parentSessionID: "44444444-4444-4444-4444-444444444444"
+                )
+            ])]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: parentRemoteID),
+            connection: connection
+        )
+
+        let children = try await controller.listChildSessions()
+
+        XCTAssertEqual(children.count, 1)
+        let child = try XCTUnwrap(children.first)
+        XCTAssertEqual(child.sessionID, childRemoteID)
+        XCTAssertEqual(child.name, "Child Worker")
+        XCTAssertEqual(child.stateRaw, "running")
+        XCTAssertEqual(child.agentKindRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(child.agentModelRaw, "codex")
+        XCTAssertEqual(child.parentSessionID, parentRemoteID)
+        let frames = await connection.frames(type: "list_sessions")
+        let frame = try XCTUnwrap(frames.first)
+        XCTAssertNil(frame.sessionID)
+        XCTAssertEqual(frame.payload?.objectValue?["parent_session_id"]?.stringValue, parentRemoteID)
+        XCTAssertEqual(frame.payload?.objectValue?["limit"]?.intValue, 500)
+    }
+
+    @MainActor
+    func testCoordinatorMaterializesRemoteChildrenFromListSessionsAndDedupes() async throws {
+        let fixture = try await makeRemoteNamingFixture(
+            tabTitle: "Remote Parent",
+            childDiscoveryDebounceInterval: 0
+        )
+        let parentRemoteID = UUID()
+        let childRemoteID = UUID()
+        let parentSession = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        parentSession.remoteHost = makeBinding(remoteSessionID: parentRemoteID.uuidString)
+        let childListPayload = Self.listSessionsPayload(children: [
+            Self.sessionDescriptorPayload(
+                sessionID: childRemoteID.uuidString,
+                name: "Child Worker",
+                state: "running",
+                agentID: AgentProviderKind.codexExec.rawValue,
+                model: "codex",
+                parentSessionID: parentRemoteID.uuidString
+            )
+        ])
+        let recordingConnection = RecordingRemoteAgentSessionConnection(responses: [
+            "list_sessions": [childListPayload, childListPayload]
+        ])
+        let parentController = try RemoteAgentSessionController(
+            binding: XCTUnwrap(parentSession.remoteHost),
+            connection: recordingConnection
+        )
+        let fanoutConnection = RemoteHostConnection(hostID: parentSession.remoteHost?.hostID ?? "host-abc")
+        try fixture.coordinator.test_attachController(
+            tabID: fixture.tabID,
+            hostID: parentSession.remoteHost?.hostID ?? "host-abc",
+            controller: parentController,
+            connection: fanoutConnection
+        )
+        defer { fixture.coordinator.stop(tabID: fixture.tabID) }
+        var attachedRemoteSessionIDs: [String] = []
+        fixture.coordinator.test_setMaterializedRemoteChildAttachHandler { childSession in
+            if let remoteSessionID = childSession.remoteHost?.remoteSessionID {
+                attachedRemoteSessionIDs.append(remoteSessionID)
+            }
+        }
+
+        fixture.coordinator.test_requestChildSessionDiscovery(tabID: fixture.tabID)
+
+        await waitForRemoteCoordinatorLifecycle {
+            fixture.viewModel.sessions.values.contains { $0.remoteHost?.remoteSessionID == childRemoteID.uuidString }
+        }
+        let listFrames = await recordingConnection.frames(type: "list_sessions")
+        let firstListFrame = try XCTUnwrap(listFrames.first)
+        XCTAssertEqual(firstListFrame.payload?.objectValue?["parent_session_id"]?.stringValue, parentRemoteID.uuidString)
+        XCTAssertEqual(firstListFrame.payload?.objectValue?["limit"]?.intValue, 500)
+        let materializedChildren = fixture.viewModel.sessions.values.filter {
+            $0.remoteHost?.remoteSessionID == childRemoteID.uuidString
+        }
+        XCTAssertEqual(materializedChildren.count, 1)
+        let childSession = try XCTUnwrap(materializedChildren.first)
+        XCTAssertEqual(childSession.activeAgentSessionID, childRemoteID)
+        XCTAssertEqual(childSession.parentSessionID, fixture.sessionID)
+        XCTAssertEqual(childSession.remoteHost?.hostID, parentSession.remoteHost?.hostID)
+        XCTAssertEqual(childSession.remoteHost?.remoteSessionID, childRemoteID.uuidString)
+        XCTAssertEqual(fixture.viewModel.test_ownerValidatedSessionIndex[childRemoteID]?.parentSessionID, fixture.sessionID)
+        XCTAssertEqual(attachedRemoteSessionIDs, [childRemoteID.uuidString])
+
+        fixture.coordinator.test_requestChildSessionDiscovery(tabID: fixture.tabID)
+        await waitForRemoteAgentSessionCondition {
+            await recordingConnection.commandCount(type: "list_sessions") >= 2
+        }
+        XCTAssertEqual(
+            fixture.viewModel.sessions.values.count(where: { $0.remoteHost?.remoteSessionID == childRemoteID.uuidString }),
+            1
+        )
+        XCTAssertEqual(attachedRemoteSessionIDs, [childRemoteID.uuidString])
+    }
+
+    @MainActor
+    func testCoordinatorReportsRemoteChildMaterializationFailureOnce() async throws {
+        let fixture = try await makeRemoteNamingFixture(
+            tabTitle: "Remote Parent",
+            childDiscoveryDebounceInterval: 0
+        )
+        let parentRemoteID = UUID()
+        let invalidChildRemoteID = "not-a-child-uuid"
+        let parentSession = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        parentSession.remoteHost = makeBinding(remoteSessionID: parentRemoteID.uuidString)
+        let childListPayload = Self.listSessionsPayload(children: [
+            Self.sessionDescriptorPayload(
+                sessionID: invalidChildRemoteID,
+                name: "Broken Child",
+                state: "running",
+                agentID: AgentProviderKind.codexExec.rawValue,
+                model: "codex",
+                parentSessionID: parentRemoteID.uuidString
+            )
+        ])
+        let recordingConnection = RecordingRemoteAgentSessionConnection(responses: [
+            "list_sessions": [childListPayload, childListPayload]
+        ])
+        let parentController = try RemoteAgentSessionController(
+            binding: XCTUnwrap(parentSession.remoteHost),
+            connection: recordingConnection
+        )
+        let fanoutConnection = RemoteHostConnection(hostID: parentSession.remoteHost?.hostID ?? "host-abc")
+        fixture.coordinator.test_attachController(
+            tabID: fixture.tabID,
+            hostID: parentSession.remoteHost?.hostID ?? "host-abc",
+            controller: parentController,
+            connection: fanoutConnection
+        )
+        defer { fixture.coordinator.stop(tabID: fixture.tabID) }
+        let expectedMessage = "Remote child session materialization failed for '\(invalidChildRemoteID)'."
+
+        fixture.coordinator.test_requestChildSessionDiscovery(tabID: fixture.tabID)
+        await waitForRemoteCoordinatorLifecycle {
+            self.systemMessages(in: parentSession).contains(expectedMessage)
+        }
+
+        fixture.coordinator.test_requestChildSessionDiscovery(tabID: fixture.tabID)
+        await waitForRemoteAgentSessionCondition {
+            await recordingConnection.commandCount(type: "list_sessions") >= 2
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(systemMessages(in: parentSession).count(where: { $0 == expectedMessage }), 1)
+    }
+
     @MainActor
     func testStoppingLastRemoteTabsReleasesControllersAndFanoutTasks() async throws {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
@@ -973,6 +1144,7 @@ final class RemoteAgentSessionTests: XCTestCase {
     @MainActor
     private func makeRemoteNamingFixture(
         tabTitle: String,
+        childDiscoveryDebounceInterval: TimeInterval = 3,
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws -> RemoteNamingFixture {
@@ -1019,13 +1191,6 @@ final class RemoteAgentSessionTests: XCTestCase {
             promptManager: prompt,
             workspaceManager: workspaceManager
         )
-        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
-        viewModel.test_installSessionIndexSnapshot(
-            [:],
-            owner: owner,
-            latestOwner: owner,
-            activeWorkspace: workspace
-        )
         viewModel.test_setCurrentTabIDOverride(tabID)
         let session = await viewModel.ensureSessionReady(tabID: tabID)
         session.remoteHost = makeBinding()
@@ -1034,8 +1199,8 @@ final class RemoteAgentSessionTests: XCTestCase {
             on: session,
             updateWorkspaceMetadata: true
         )
-        viewModel.upsertSessionIndex(
-            sessionID: sessionID,
+        let entry = AgentSessionIndexEntry(
+            id: sessionID,
             tabID: tabID,
             name: tabTitle,
             lastUserMessageAt: nil,
@@ -1046,12 +1211,28 @@ final class RemoteAgentSessionTests: XCTestCase {
             agentModelRaw: session.selectedModelRaw,
             agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
             autoEditEnabled: session.autoEditEnabled,
+            parentSessionID: nil,
+            hasUnknownConversationContent: false,
             remoteHostID: session.remoteHost?.hostID,
-            remoteHostName: session.remoteHost?.hostDisplayName
+            remoteHostName: session.remoteHost?.hostDisplayName,
+            isMCPOriginated: false,
+            origin: nil,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )
+        let owner = AgentModeViewModel.SessionIndexOwner(
+            workspaceID: workspace.id,
+            activationEpoch: 1
+        )
+        viewModel.test_installSessionIndexSnapshot(
+            [sessionID: entry],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
         )
         XCTAssertEqual(viewModel.resolvedSessionDisplayName(for: tabID), tabTitle, file: file, line: line)
 
-        let coordinator = RemoteAgentModeCoordinator()
+        let coordinator = RemoteAgentModeCoordinator(childDiscoveryDebounceInterval: childDiscoveryDebounceInterval)
         coordinator.attach(viewModel: viewModel)
         return RemoteNamingFixture(
             tabID: tabID,
@@ -1119,6 +1300,30 @@ final class RemoteAgentSessionTests: XCTestCase {
             payload["session_id"] = .string(sessionID)
         }
         return .object(payload)
+    }
+
+    private static func listSessionsPayload(children: [JSONValue]) -> JSONValue {
+        .object(["sessions": .array(children)])
+    }
+
+    private static func sessionDescriptorPayload(
+        sessionID: String,
+        name: String,
+        state: String,
+        agentID: String,
+        model: String,
+        parentSessionID: String
+    ) -> JSONValue {
+        .object([
+            "session_id": .string(sessionID),
+            "name": .string(name),
+            "state": .string(state),
+            "agent": .object([
+                "id": .string(agentID),
+                "model": .string(model)
+            ]),
+            "parent_session_id": .string(parentSessionID)
+        ])
     }
 
     private static func logPayload(offset: Int, returned: Int, total: Int, xml: String, completed: Int? = nil) -> JSONValue {
@@ -1264,6 +1469,10 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func commandCount(type: String) -> Int {
             frames.count { $0.type == type }
+        }
+
+        func frames(type: String) -> [RemoteClientFrame] {
+            frames.filter { $0.type == type }
         }
 
         func getLogOffsets() -> [Int] {

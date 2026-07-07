@@ -91,7 +91,7 @@ struct AgentRunLocationHostOption: Identifiable, Equatable, Hashable {
 
     private static func disambiguatedAbbreviations(for group: [AbbreviationEntry]) -> [String: String] {
         let displayNameCounts = Dictionary(grouping: group, by: \.displayName).mapValues { $0.count }
-        let duplicateDisplayNames = Set(displayNameCounts.filter { $0.value > 1 }.map { $0.key })
+        let duplicateDisplayNames = Set(displayNameCounts.filter { $0.value > 1 }.map(\.key))
         let sortedGroup = group.sorted { lhs, rhs in
             if lhs.displayName == rhs.displayName { return lhs.id < rhs.id }
             return lhs.displayName < rhs.displayName
@@ -129,20 +129,40 @@ struct AgentRunLocationHostOption: Identifiable, Equatable, Hashable {
                 }
             }
 
-            let fallback = Dictionary(
-                uniqueKeysWithValues: uniqueDisplayNameEntries.map { entry in
-                    (
-                        entry.id,
-                        entry.base
-                            + entry.lastTokenExtension(length: maxExtensionLength)
-                            + idSuffix(for: entry.id, count: 2)
-                    )
-                }
+            let fallback = fallbackAbbreviations(
+                for: uniqueDisplayNameEntries,
+                extensionLength: maxExtensionLength,
+                reservedCandidates: reservedCandidates
             )
             candidates.merge(resolved ?? fallback) { current, _ in current }
         }
 
         return candidates
+    }
+
+    private static func fallbackAbbreviations(
+        for entries: [AbbreviationEntry],
+        extensionLength: Int,
+        reservedCandidates: Set<String>
+    ) -> [String: String] {
+        var resolved: [String: String] = [:]
+        var usedCandidates = reservedCandidates
+
+        for entry in entries {
+            var suffixLength = 2
+            var candidate: String
+            repeat {
+                candidate = entry.base
+                    + entry.lastTokenExtension(length: extensionLength)
+                    + idSuffix(for: entry.id, count: suffixLength)
+                suffixLength += 1
+            } while usedCandidates.contains(candidate) && suffixLength <= entry.id.count + 1
+
+            resolved[entry.id] = candidate
+            usedCandidates.insert(candidate)
+        }
+
+        return resolved
     }
 
     private static func idSuffix(for id: String, count: Int) -> String {

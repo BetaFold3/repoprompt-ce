@@ -15,7 +15,7 @@ struct AgentSessionRow: View {
     /// user dismisses the badge explicitly.
     var attentionRunState: AgentSessionRunState?
     var remoteHostName: String?
-    var remoteControlDeviceID: String? = nil
+    var remoteControlDeviceID: String?
     /// Bound-worktree visual identity for this session (Item 10). When non-nil,
     /// a small colored dot/ring is overlaid at the bottom-right of the status
     /// plate without shifting the title — see `worktreeMarker`.

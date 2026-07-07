@@ -14,7 +14,7 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
         let xml = AgentTranscriptIO.buildSpartanLogXML(
             from: transcript,
             maxTranscriptItems: 100,
-            maxToolArgsCharacters: 2_000
+            maxToolArgsCharacters: 2000
         )
 
         let summaryRange = try XCTUnwrap(xml.range(of: "<system>"))
@@ -30,13 +30,14 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
                 "session_id": "child-failed-1",
                 "status": "failed"
             ],
-            toolIsError: true
+            toolIsError: true,
+            spawnSessionName: nil
         )
 
         let xml = AgentTranscriptIO.buildSpartanLogXML(
             from: transcript,
             maxTranscriptItems: 100,
-            maxToolArgsCharacters: 2_000
+            maxToolArgsCharacters: 2000
         )
 
         XCTAssertTrue(xml.contains("<tool_call name=\"agent_run\""))
@@ -52,7 +53,7 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
         let xml = AgentTranscriptIO.buildSpartanLogXML(
             from: transcript,
             maxTranscriptItems: 100,
-            maxToolArgsCharacters: 2_000
+            maxToolArgsCharacters: 2000
         )
 
         let page = RemoteTranscriptProjector(remoteSessionID: "remote-spawn-roundtrip")
@@ -80,7 +81,7 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
         let xml = AgentTranscriptIO.buildForkTranscriptXML(
             from: transcript,
             maxTranscriptItems: 100,
-            maxToolArgsCharacters: 2_000
+            maxToolArgsCharacters: 2000
         )
 
         XCTAssertFalse(xml.contains("<tool_call name=\"agent_run\""))
@@ -91,20 +92,78 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
                 "session_id": "child-handoff-failed-1",
                 "status": "failed"
             ],
-            toolIsError: true
+            toolIsError: true,
+            spawnSessionName: nil
         )
         let failedXML = AgentTranscriptIO.buildForkTranscriptXML(
             from: failedTranscript,
             maxTranscriptItems: 100,
-            maxToolArgsCharacters: 2_000
+            maxToolArgsCharacters: 2000
         )
         XCTAssertFalse(failedXML.contains("<tool_call name=\"agent_run\""))
         XCTAssertFalse(failedXML.contains("Sub-agent child-handoff-failed-1: failed"))
     }
 
+    #if DEBUG
+        func testGroupedHistorySpawnPreviewUsesSpawnSourceRowInsideMixedChildBlock() throws {
+            let readInvocationID = UUID()
+            let spawnInvocationID = UUID()
+            let spawnArgs = try jsonString([
+                "message": "Investigate mixed child block",
+                "session_name": "Mixed Worker"
+            ])
+            let rows: [AgentChatItem] = try [
+                .toolCall(
+                    name: "read_file",
+                    invocationID: readInvocationID,
+                    argsJSON: jsonString(["path": "/tmp/not-the-spawn.swift"]),
+                    sequenceIndex: 0
+                ),
+                .toolCall(
+                    name: "agent_run",
+                    invocationID: spawnInvocationID,
+                    argsJSON: spawnArgs,
+                    sequenceIndex: 1
+                ),
+                .toolResult(
+                    name: "agent_run",
+                    invocationID: spawnInvocationID,
+                    argsJSON: spawnArgs,
+                    resultJSON: jsonString([
+                        "session_id": "child-mixed-1",
+                        "status": "completed"
+                    ]),
+                    sequenceIndex: 2
+                )
+            ]
+            let childBlock = AgentTranscriptRenderBlock(
+                id: "mixed-spawn-child",
+                kind: .activityCluster,
+                turnID: UUID(),
+                retentionTier: .full,
+                rows: rows,
+                isArchived: false,
+                activityIDs: rows.map(\.id)
+            )
+
+            let items = AgentTranscriptIO.debugGroupedHistorySpawnXMLItemsForTesting(from: childBlock)
+
+            let toolCallItems = items.filter { $0.kind == .toolCall }
+            XCTAssertEqual(toolCallItems.count, 1)
+            let preview = try XCTUnwrap(toolCallItems.first)
+            XCTAssertEqual(preview.toolName, "agent_run")
+            XCTAssertTrue(preview.toolArgsJSON?.contains("\"session_name\":\"Mixed Worker\"") == true)
+            XCTAssertFalse(items.contains { $0.kind == .toolCall && $0.toolName == "read_file" })
+            XCTAssertTrue(items.contains { item in
+                item.kind == .system && item.text == "Sub-agent Mixed Worker: completed"
+            })
+        }
+    #endif
+
     private func makeCollapsedSpawnTranscript(
         resultObject: [String: Any],
-        toolIsError: Bool = false
+        toolIsError: Bool = false,
+        spawnSessionName: String? = "Worker Alpha"
     ) throws -> AgentTranscript {
         var sequenceIndex = 0
         var items: [AgentChatItem] = []
@@ -112,10 +171,11 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
         sequenceIndex += 1
 
         let spawnInvocationID = UUID()
-        let spawnArgs = try jsonString([
-            "message": "Investigate S2",
-            "session_name": "Worker Alpha"
-        ])
+        var spawnArgsObject = ["message": "Investigate S2"]
+        if let spawnSessionName {
+            spawnArgsObject["session_name"] = spawnSessionName
+        }
+        let spawnArgs = try jsonString(spawnArgsObject)
         items.append(.toolCall(
             name: "agent_run",
             invocationID: spawnInvocationID,
@@ -123,11 +183,11 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
             sequenceIndex: sequenceIndex
         ))
         sequenceIndex += 1
-        items.append(.toolResult(
+        try items.append(.toolResult(
             name: "agent_run",
             invocationID: spawnInvocationID,
             argsJSON: spawnArgs,
-            resultJSON: try jsonString(resultObject),
+            resultJSON: jsonString(resultObject),
             isError: toolIsError,
             sequenceIndex: sequenceIndex
         ))
@@ -135,17 +195,17 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
 
         for fillerIndex in 0 ..< 9 {
             let invocationID = UUID()
-            items.append(.toolCall(
+            try items.append(.toolCall(
                 name: "read_file",
                 invocationID: invocationID,
-                argsJSON: try jsonString(["path": "/tmp/filler-\(fillerIndex).swift"]),
+                argsJSON: jsonString(["path": "/tmp/filler-\(fillerIndex).swift"]),
                 sequenceIndex: sequenceIndex
             ))
             sequenceIndex += 1
-            items.append(.toolResult(
+            try items.append(.toolResult(
                 name: "read_file",
                 invocationID: invocationID,
-                resultJSON: try jsonString([
+                resultJSON: jsonString([
                     "content": "ok \(fillerIndex)",
                     "status": "completed"
                 ]),

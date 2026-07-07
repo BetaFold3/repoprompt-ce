@@ -186,7 +186,8 @@ struct RemoteCommandTranslator {
             return try translateAgentManage(
                 op: "list_sessions",
                 payload: payload,
-                allowedPayloadKeys: Self.listSessionsPayloadKeys
+                allowedPayloadKeys: Self.listSessionsPayloadKeys,
+                resolvedWindowID: resolvedWindowID
             )
         case "get_log":
             return try translateAgentManage(
@@ -417,7 +418,8 @@ struct RemoteCommandTranslator {
     private static let listSessionsPayloadKeys: Set<String> = [
         "agent",
         "state",
-        "limit"
+        "limit",
+        "parent_session_id"
     ]
 
     private static let getLogPayloadKeys: Set<String> = [
@@ -432,7 +434,8 @@ struct RemoteCommandTranslator {
         "poll",
         "subscribe",
         "unsubscribe",
-        "get_log"
+        "get_log",
+        "list_sessions"
     ]
 
     private static let sessionAddressedAgentRunOps: Set<String> = [
@@ -443,6 +446,7 @@ struct RemoteCommandTranslator {
     ]
 
     private static let sessionAddressedAgentManageOps: Set<String> = [
-        "get_log"
+        "get_log",
+        "list_sessions"
     ]
 }

@@ -44,10 +44,19 @@ final class RemoteCommandTranslatorTests: XCTestCase {
                 [:]
             ),
             (
-                RemoteClientFrame(type: "list_sessions", payload: .object(["limit": .int(5)])),
+                RemoteClientFrame(
+                    type: "list_sessions",
+                    payload: .object([
+                        "limit": .int(5),
+                        "parent_session_id": .string("22222222-2222-2222-2222-222222222222")
+                    ])
+                ),
                 "agent_manage",
                 "list_sessions",
-                ["limit": .int(5)]
+                [
+                    "limit": .int(5),
+                    "parent_session_id": .string("22222222-2222-2222-2222-222222222222")
+                ]
             ),
             (
                 RemoteClientFrame(type: "get_log", sessionID: sid, payload: .object(["offset": .int(2), "limit": .int(3)])),
@@ -91,6 +100,65 @@ final class RemoteCommandTranslatorTests: XCTestCase {
                 error as? RemoteCommandTranslatorError,
                 .unsupportedPayloadKey(operation: "list_agents", key: "roles_only")
             )
+        }
+    }
+
+    func testListSessionsAllowsParentFilterAndRejectsUnknownKeys() throws {
+        let parentID = "22222222-2222-2222-2222-222222222222"
+        let allowed = try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "list_sessions",
+            payload: .object([
+                "parent_session_id": .string(parentID),
+                "limit": .int(10)
+            ])
+        ))
+        XCTAssertEqual(allowed.toolName, "agent_manage")
+        XCTAssertEqual(allowed.arguments["op"], .string("list_sessions"))
+        XCTAssertEqual(allowed.arguments["parent_session_id"], .string(parentID))
+        XCTAssertEqual(allowed.arguments["limit"], .int(10))
+
+        XCTAssertThrowsError(try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "list_sessions",
+            payload: .object([
+                "parent_session_id": .string(parentID),
+                "include_hidden": .bool(true)
+            ])
+        ))) { error in
+            XCTAssertEqual(
+                error as? RemoteCommandTranslatorError,
+                .unsupportedPayloadKey(operation: "list_sessions", key: "include_hidden")
+            )
+        }
+    }
+
+    func testParentSessionIDIsRejectedOutsideListSessions() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let parentID = "22222222-2222-2222-2222-222222222222"
+        let frames = [
+            RemoteClientFrame(
+                type: "start",
+                payload: .object(["message": .string("go"), "parent_session_id": .string(parentID)])
+            ),
+            RemoteClientFrame(
+                type: "steer",
+                sessionID: sid,
+                payload: .object(["message": .string("next"), "parent_session_id": .string(parentID)])
+            ),
+            RemoteClientFrame(
+                type: "get_log",
+                sessionID: sid,
+                payload: .object(["parent_session_id": .string(parentID)])
+            )
+        ]
+
+        for frame in frames {
+            XCTAssertThrowsError(try RemoteCommandTranslator().translate(frame), frame.type) { error in
+                XCTAssertEqual(
+                    error as? RemoteCommandTranslatorError,
+                    .unsupportedPayloadKey(operation: frame.type, key: "parent_session_id"),
+                    frame.type
+                )
+            }
         }
     }
 
@@ -336,6 +404,15 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         )
         XCTAssertEqual(getLog.toolName, "agent_manage")
         XCTAssertEqual(getLog.arguments["_windowID"], .int(9))
+
+        let listSessions = try translator.translate(
+            RemoteClientFrame(type: "list_sessions", payload: .object(["parent_session_id": .string(sid)])),
+            resolvedWindowID: 9
+        )
+        XCTAssertEqual(listSessions.toolName, "agent_manage")
+        XCTAssertEqual(listSessions.arguments["op"], .string("list_sessions"))
+        XCTAssertEqual(listSessions.arguments["parent_session_id"], .string(sid))
+        XCTAssertEqual(listSessions.arguments["_windowID"], .int(9))
 
         XCTAssertThrowsError(try translator.translate(
             RemoteClientFrame(type: "steer", requestID: "r2", sessionID: sid, payload: .object(["message": .string("next")]))

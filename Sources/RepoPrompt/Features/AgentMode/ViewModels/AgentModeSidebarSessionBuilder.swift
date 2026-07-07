@@ -307,6 +307,10 @@ struct AgentModeSidebarSessionBuilder {
         )
     }
 
+    /// Deliberately reads the bound live session (not the metadata-gated one):
+    /// origin is a runtime property stamped at run activation, and the
+    /// persisted index entry fallback below covers tabs whose live origin is
+    /// still the default before persisted state loads.
     private static func remoteControlDeviceID(
         liveSession: TabSession?,
         entry: AgentSessionIndexEntry?

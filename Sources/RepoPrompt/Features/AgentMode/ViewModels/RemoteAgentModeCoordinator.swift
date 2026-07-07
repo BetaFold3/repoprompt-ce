@@ -1,11 +1,21 @@
 import Foundation
+import OSLog
 import RepoPromptRemoteWire
 
 @MainActor
 final class RemoteAgentModeCoordinator {
+    private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "RemoteAgentModeCoordinator")
+
     private struct HostConnectionTasks {
         var inbound: Task<Void, Never>
         var state: Task<Void, Never>
+    }
+
+    private struct RemoteChildDiscoveryContext {
+        var key: String
+        var parentTabID: UUID
+        var parentRemoteSessionID: String
+        var hostBinding: AgentSessionRemoteHostBinding
     }
 
     private weak var viewModel: AgentModeViewModel?
@@ -17,11 +27,25 @@ final class RemoteAgentModeCoordinator {
     private var surfacedChannelReasonsByTabID: [UUID: Set<String>] = [:]
     private var lastAdoptedHostNameByTabID: [UUID: String] = [:]
     private var startSessionNameByTabID: [UUID: String] = [:]
+    private var childDiscoveryInFlightKeys: Set<String> = []
+    private var childDiscoveryImmediatePendingKeys: Set<String> = []
+    private var activeRunStateChildDiscoveryKeys: Set<String> = []
+    private var discoveryKeyByTabID: [UUID: String] = [:]
+    private var reportedChildMaterializationFailuresByDiscoveryKey: [String: Set<String>] = [:]
+    private var childDiscoveryPendingContextsByKey: [String: RemoteChildDiscoveryContext] = [:]
+    private var childDiscoveryTasksByKey: [String: Task<Void, Never>] = [:]
+    private var lastChildDiscoveryStartedAtByKey: [String: Date] = [:]
+    private let childDiscoveryDebounceInterval: TimeInterval
+    #if DEBUG
+        private var materializedRemoteChildAttachHandler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
+    #endif
 
     init(
-        connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared }
+        connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared },
+        childDiscoveryDebounceInterval: TimeInterval = 3
     ) {
         self.connectionManagerProvider = connectionManagerProvider
+        self.childDiscoveryDebounceInterval = childDiscoveryDebounceInterval
     }
 
     func attach(viewModel: AgentModeViewModel) {
@@ -128,10 +152,14 @@ final class RemoteAgentModeCoordinator {
     }
 
     func stop(tabID: UUID) {
+        let storedDiscoveryKey = discoveryKeyByTabID.removeValue(forKey: tabID)
+        let currentDiscoveryKey = viewModel?.sessions[tabID].flatMap { childDiscoveryKey(for: $0) }
+        for key in Set([storedDiscoveryKey, currentDiscoveryKey].compactMap(\.self)) {
+            cancelChildDiscovery(key: key)
+        }
         eventTasksByTabID.removeValue(forKey: tabID)?.cancel()
         surfacedChannelReasonsByTabID.removeValue(forKey: tabID)
         lastAdoptedHostNameByTabID.removeValue(forKey: tabID)
-        startSessionNameByTabID.removeValue(forKey: tabID)
         let controller = controllersByTabID.removeValue(forKey: tabID)
         if let hostID = hostIDByTabID.removeValue(forKey: tabID) {
             stopConnectionFanoutIfUnused(hostID: hostID)
@@ -234,9 +262,16 @@ final class RemoteAgentModeCoordinator {
         guard let session = viewModel?.sessions[tabID] else { return }
         switch event {
         case let .transcriptRows(rows):
+            let containsSpawnTool = Self.containsSpawnToolCall(rows)
             applyTranscriptRows(rows, to: session)
+            if containsSpawnTool {
+                requestChildSessionDiscovery(for: session, reason: "transcript_spawn")
+            }
         case let .runState(runState, pendingInteraction):
             applyRunState(runState, pendingInteraction: pendingInteraction, to: session)
+            if runState.isActive {
+                requestFirstActiveChildSessionDiscovery(for: session, reason: "session_update")
+            }
         case let .interactionResolved(interactionID, resolvedBy):
             clearResolvedInteraction(tabID: tabID, interactionID: interactionID, resolvedBy: resolvedBy)
         case .sessionExpired:
@@ -245,6 +280,7 @@ final class RemoteAgentModeCoordinator {
             appendSystemMessage("Remote session expired on host.", tabID: tabID)
         case let .terminal(status):
             applyTerminal(status: status, to: session)
+            requestChildSessionDiscovery(for: session, reason: "terminal", immediate: true)
         case let .channel(channelState):
             applyChannel(channelState, to: session)
         case let .systemMessage(message):
@@ -355,6 +391,275 @@ final class RemoteAgentModeCoordinator {
             session.runState = .failed
         }
         session.setRunningStatus(nil, source: nil)
+    }
+
+    private func requestFirstActiveChildSessionDiscovery(
+        for session: AgentModeViewModel.TabSession,
+        reason: String
+    ) {
+        guard let context = childDiscoveryContext(for: session),
+              controllersByTabID[session.tabID] != nil,
+              activeRunStateChildDiscoveryKeys.insert(context.key).inserted
+        else { return }
+        requestChildSessionDiscovery(for: session, reason: reason)
+    }
+
+    private func requestChildSessionDiscovery(
+        for session: AgentModeViewModel.TabSession,
+        reason _: String,
+        immediate: Bool = false
+    ) {
+        guard let context = childDiscoveryContext(for: session) else { return }
+        guard let controller = controllersByTabID[session.tabID] else { return }
+        recordDiscoveryKey(context.key, tabID: context.parentTabID)
+        if childDiscoveryInFlightKeys.contains(context.key) {
+            childDiscoveryPendingContextsByKey[context.key] = context
+            if immediate {
+                childDiscoveryImmediatePendingKeys.insert(context.key)
+            }
+            return
+        }
+        if !immediate,
+           let lastStartedAt = lastChildDiscoveryStartedAtByKey[context.key]
+        {
+            let delay = childDiscoveryDebounceInterval - Date().timeIntervalSince(lastStartedAt)
+            if delay > 0 {
+                childDiscoveryPendingContextsByKey[context.key] = context
+                guard childDiscoveryTasksByKey[context.key] == nil else { return }
+                childDiscoveryTasksByKey[context.key] = Task { [weak self, key = context.key] in
+                    let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
+                    if nanoseconds > 0 {
+                        try? await Task.sleep(nanoseconds: nanoseconds)
+                    }
+                    guard !Task.isCancelled else { return }
+                    await self?.startPendingChildDiscovery(key: key)
+                }
+                return
+            }
+        }
+        if immediate {
+            childDiscoveryTasksByKey.removeValue(forKey: context.key)?.cancel()
+            childDiscoveryPendingContextsByKey.removeValue(forKey: context.key)
+            childDiscoveryImmediatePendingKeys.remove(context.key)
+        }
+        startChildDiscovery(context: context, controller: controller)
+    }
+
+    private func startPendingChildDiscovery(key: String) {
+        childDiscoveryTasksByKey.removeValue(forKey: key)
+        childDiscoveryImmediatePendingKeys.remove(key)
+        guard let pending = childDiscoveryPendingContextsByKey.removeValue(forKey: key),
+              let controller = controllersByTabID[pending.parentTabID]
+        else { return }
+        startChildDiscovery(context: pending, controller: controller)
+    }
+
+    private func startChildDiscovery(
+        context: RemoteChildDiscoveryContext,
+        controller: RemoteAgentSessionController
+    ) {
+        lastChildDiscoveryStartedAtByKey[context.key] = Date()
+        childDiscoveryInFlightKeys.insert(context.key)
+        childDiscoveryTasksByKey[context.key]?.cancel()
+        childDiscoveryTasksByKey[context.key] = Task { [weak self, controller, context] in
+            do {
+                let descriptors = try await controller.listChildSessions()
+                await self?.completeChildDiscovery(context: context, descriptors: descriptors)
+            } catch is CancellationError {
+                self?.finishChildDiscovery(context: context)
+            } catch {
+                self?.failChildDiscovery(context: context, error: error)
+            }
+        }
+    }
+
+    private func completeChildDiscovery(
+        context: RemoteChildDiscoveryContext,
+        descriptors: [RemoteAgentSessionDescriptor]
+    ) async {
+        childDiscoveryTasksByKey.removeValue(forKey: context.key)
+        for descriptor in descriptors {
+            await materializeRemoteChildSession(descriptor, context: context)
+        }
+        childDiscoveryInFlightKeys.remove(context.key)
+        restartPendingChildDiscoveryIfNeeded(after: context)
+    }
+
+    private func failChildDiscovery(context: RemoteChildDiscoveryContext, error _: Error) {
+        childDiscoveryTasksByKey.removeValue(forKey: context.key)
+        childDiscoveryInFlightKeys.remove(context.key)
+        restartPendingChildDiscoveryIfNeeded(after: context)
+    }
+
+    private func finishChildDiscovery(context: RemoteChildDiscoveryContext) {
+        childDiscoveryTasksByKey.removeValue(forKey: context.key)
+        childDiscoveryInFlightKeys.remove(context.key)
+        childDiscoveryImmediatePendingKeys.remove(context.key)
+        childDiscoveryPendingContextsByKey.removeValue(forKey: context.key)
+    }
+
+    private func restartPendingChildDiscoveryIfNeeded(after context: RemoteChildDiscoveryContext) {
+        guard let pending = childDiscoveryPendingContextsByKey.removeValue(forKey: context.key),
+              let controller = controllersByTabID[pending.parentTabID]
+        else { return }
+        if childDiscoveryImmediatePendingKeys.remove(context.key) != nil {
+            startChildDiscovery(context: pending, controller: controller)
+            return
+        }
+        let delay = childDiscoveryDebounceInterval - Date().timeIntervalSince(lastChildDiscoveryStartedAtByKey[context.key] ?? .distantPast)
+        if delay > 0 {
+            childDiscoveryPendingContextsByKey[context.key] = pending
+            guard childDiscoveryTasksByKey[context.key] == nil else { return }
+            childDiscoveryTasksByKey[context.key] = Task { [weak self, key = context.key] in
+                let nanoseconds = UInt64(max(0, delay) * 1_000_000_000)
+                if nanoseconds > 0 {
+                    try? await Task.sleep(nanoseconds: nanoseconds)
+                }
+                guard !Task.isCancelled else { return }
+                await self?.startPendingChildDiscovery(key: key)
+            }
+            return
+        }
+        startChildDiscovery(context: pending, controller: controller)
+    }
+
+    private func materializeRemoteChildSession(
+        _ descriptor: RemoteAgentSessionDescriptor,
+        context: RemoteChildDiscoveryContext
+    ) async {
+        let childRemoteSessionID = descriptor.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !childRemoteSessionID.isEmpty,
+              childRemoteSessionID != context.parentRemoteSessionID,
+              descriptor.parentSessionID?.trimmingCharacters(in: .whitespacesAndNewlines) == context.parentRemoteSessionID,
+              !isRemoteSessionMaterialized(hostID: context.hostBinding.hostID, remoteSessionID: childRemoteSessionID)
+        else { return }
+        guard let viewModel,
+              let parentSession = viewModel.sessions[context.parentTabID]
+        else { return }
+        guard let childSession = await viewModel.materializeRemoteChildSession(
+            descriptor,
+            parentSession: parentSession,
+            parentRemoteHost: context.hostBinding
+        ) else {
+            reportChildMaterializationFailureIfNeeded(
+                childRemoteSessionID: childRemoteSessionID,
+                context: context
+            )
+            return
+        }
+        clearReportedChildMaterializationFailure(
+            childRemoteSessionID: childRemoteSessionID,
+            discoveryKey: context.key
+        )
+        if let adoptedName = descriptor.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !adoptedName.isEmpty
+        {
+            lastAdoptedHostNameByTabID[childSession.tabID] = AgentSession.validatedName(adoptedName)
+        }
+        do {
+            try await attachMaterializedRemoteChildSession(childSession)
+        } catch {
+            appendSystemMessage("Remote child session attach failed: \(Self.describe(error))", tabID: context.parentTabID)
+        }
+    }
+
+    private func attachMaterializedRemoteChildSession(_ session: AgentModeViewModel.TabSession) async throws {
+        #if DEBUG
+            if let materializedRemoteChildAttachHandler {
+                try await materializedRemoteChildAttachHandler(session)
+                return
+            }
+        #endif
+        let controller = try controller(for: session)
+        try await controller.attachAndCatchUp()
+    }
+
+    private func childDiscoveryContext(for session: AgentModeViewModel.TabSession) -> RemoteChildDiscoveryContext? {
+        guard let remoteHost = session.remoteHost,
+              session.activeAgentSessionID != nil
+        else { return nil }
+        let parentRemoteSessionID = remoteHost.remoteSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !parentRemoteSessionID.isEmpty else { return nil }
+        return RemoteChildDiscoveryContext(
+            key: childDiscoveryKey(hostID: remoteHost.hostID, remoteSessionID: parentRemoteSessionID),
+            parentTabID: session.tabID,
+            parentRemoteSessionID: parentRemoteSessionID,
+            hostBinding: remoteHost
+        )
+    }
+
+    private func childDiscoveryKey(for session: AgentModeViewModel.TabSession) -> String? {
+        guard let remoteHost = session.remoteHost else { return nil }
+        let parentRemoteSessionID = remoteHost.remoteSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !parentRemoteSessionID.isEmpty else { return nil }
+        return childDiscoveryKey(hostID: remoteHost.hostID, remoteSessionID: parentRemoteSessionID)
+    }
+
+    private func childDiscoveryKey(hostID: String, remoteSessionID: String) -> String {
+        "\(hostID)|\(remoteSessionID)"
+    }
+
+    private func recordDiscoveryKey(_ key: String, tabID: UUID) {
+        if let previousKey = discoveryKeyByTabID[tabID], previousKey != key {
+            cancelChildDiscovery(key: previousKey)
+        }
+        discoveryKeyByTabID[tabID] = key
+    }
+
+    private func cancelChildDiscovery(key: String) {
+        childDiscoveryTasksByKey.removeValue(forKey: key)?.cancel()
+        childDiscoveryInFlightKeys.remove(key)
+        activeRunStateChildDiscoveryKeys.remove(key)
+        childDiscoveryImmediatePendingKeys.remove(key)
+        childDiscoveryPendingContextsByKey.removeValue(forKey: key)
+        lastChildDiscoveryStartedAtByKey.removeValue(forKey: key)
+        reportedChildMaterializationFailuresByDiscoveryKey.removeValue(forKey: key)
+        discoveryKeyByTabID = discoveryKeyByTabID.filter { $0.value != key }
+    }
+
+    private func reportChildMaterializationFailureIfNeeded(
+        childRemoteSessionID: String,
+        context: RemoteChildDiscoveryContext
+    ) {
+        var reported = reportedChildMaterializationFailuresByDiscoveryKey[context.key, default: []]
+        if reported.insert(childRemoteSessionID).inserted {
+            reportedChildMaterializationFailuresByDiscoveryKey[context.key] = reported
+            appendSystemMessage(
+                "Remote child session materialization failed for '\(childRemoteSessionID)'.",
+                tabID: context.parentTabID
+            )
+        } else {
+            Self.logger.debug("remote child materialization failure already reported discovery_key=\(context.key, privacy: .public) child_session_id=\(childRemoteSessionID, privacy: .public)")
+        }
+    }
+
+    private func clearReportedChildMaterializationFailure(
+        childRemoteSessionID: String,
+        discoveryKey: String
+    ) {
+        guard var reported = reportedChildMaterializationFailuresByDiscoveryKey[discoveryKey] else { return }
+        reported.remove(childRemoteSessionID)
+        if reported.isEmpty {
+            reportedChildMaterializationFailuresByDiscoveryKey.removeValue(forKey: discoveryKey)
+        } else {
+            reportedChildMaterializationFailuresByDiscoveryKey[discoveryKey] = reported
+        }
+    }
+
+    private func isRemoteSessionMaterialized(hostID: String, remoteSessionID: String) -> Bool {
+        viewModel?.sessions.values.contains { session in
+            session.remoteHost?.hostID == hostID
+                && session.remoteHost?.remoteSessionID == remoteSessionID
+        } == true
+    }
+
+    private static func containsSpawnToolCall(_ rows: [AgentChatItem]) -> Bool {
+        rows.contains { row in
+            guard row.kind == .toolCall,
+                  let toolName = row.toolName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            else { return false }
+            return toolName == "agent_run" || toolName == "agent_manage"
+        }
     }
 
     private func applyChannel(_ state: RemoteChannelState, to session: AgentModeViewModel.TabSession) {
@@ -579,6 +884,17 @@ final class RemoteAgentModeCoordinator {
                 tabID: tabID,
                 allowHostSessionNameAdoptionFromStartName: allowHostSessionNameAdoptionFromStartName
             )
+        }
+
+        func test_setMaterializedRemoteChildAttachHandler(
+            _ handler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
+        ) {
+            materializedRemoteChildAttachHandler = handler
+        }
+
+        func test_requestChildSessionDiscovery(tabID: UUID) {
+            guard let session = viewModel?.sessions[tabID] else { return }
+            requestChildSessionDiscovery(for: session, reason: "test")
         }
     #endif
 

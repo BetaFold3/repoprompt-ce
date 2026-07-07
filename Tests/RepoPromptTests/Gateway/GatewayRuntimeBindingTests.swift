@@ -280,6 +280,47 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(poll.arguments["_windowID"], .int(2))
     }
 
+    func testParentFilteredListSessionsRoutesToParentWindow() async throws {
+        let childSessionID = "22222222-2222-2222-2222-222222222222"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([sessionID])),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "sessions": .array([
+                    .object([
+                        "session_id": .string(childSessionID),
+                        "name": .string("Child Worker"),
+                        "state": .string("running"),
+                        "parent_session_id": .string(sessionID)
+                    ])
+                ])
+            ])))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "r-child-list",
+                payload: .object(["parent_session_id": .string(sessionID)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        let sessions = try XCTUnwrap(response?.payload?.objectValue?["sessions"]?.arrayValue)
+        XCTAssertEqual(sessions.first?.objectValue?["session_id"]?.stringValue, childSessionID)
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context", "agent_manage", "agent_manage", "agent_manage"])
+        let listSessions = try XCTUnwrap(calls.last)
+        XCTAssertEqual(listSessions.arguments["op"], .string("list_sessions"))
+        XCTAssertEqual(listSessions.arguments["parent_session_id"], .string(sessionID))
+        XCTAssertEqual(listSessions.arguments["_windowID"], .int(2))
+    }
+
     func testStartWithoutSelectorOnAmbiguousConnectionReturnsStructuredErrorWithWindows() async throws {
         let connection = RecordingAppLinkConnection(responses: [
             .result(windowListResponse())

@@ -179,6 +179,34 @@ final class AgentRunLocationHostOptionAbbreviationTests: XCTestCase {
         XCTAssertEqual(abbreviations["bb-host"], "msbb")
     }
 
+    func testAbbreviationFallbackAvoidsReservedDuplicateNameCandidates() {
+        let abbreviations = AgentRunLocationHostOption.abbreviations(
+            for: [
+                (id: "aa-host", displayName: "Mac Studio"),
+                (id: "bb-host", displayName: "Mac Studio"),
+                (id: "aa-2", displayName: "Mac S")
+            ]
+        )
+
+        XCTAssertEqual(abbreviations["aa-host"], "msaa")
+        XCTAssertEqual(abbreviations["bb-host"], "msbb")
+        XCTAssertEqual(abbreviations["aa-2"], "msaa-")
+        XCTAssertEqual(Set(abbreviations.values).count, abbreviations.count)
+    }
+
+    func testAbbreviationFallbackAvoidsOtherFallbackCandidates() {
+        let abbreviations = AgentRunLocationHostOption.abbreviations(
+            for: [
+                (id: "aa-1", displayName: "Mac S"),
+                (id: "aa-2", displayName: "Macro S")
+            ]
+        )
+
+        XCTAssertEqual(abbreviations["aa-1"], "msaa")
+        XCTAssertEqual(abbreviations["aa-2"], "msaa-")
+        XCTAssertEqual(Set(abbreviations.values).count, abbreviations.count)
+    }
+
     func testAbbreviationsArePermutationInvariant() {
         let hosts = [
             (id: "mac-studio", displayName: "Mac Studio"),

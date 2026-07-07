@@ -982,9 +982,20 @@ actor RemoteGatewayRuntime {
     }
 
     private func singleSessionIDIfSessionAddressed(_ frame: RemoteClientFrame) -> String? {
+        if frame.type == "list_sessions" {
+            return parentSessionID(from: frame)
+        }
         guard ["steer", "respond", "cancel", "get_log", "poll"].contains(frame.type) else { return nil }
         guard let ids = try? sessionIDs(from: frame), ids.count == 1 else { return nil }
         return ids[0]
+    }
+
+    private func parentSessionID(from frame: RemoteClientFrame) -> String? {
+        guard frame.type == "list_sessions",
+              let raw = frame.payload?.objectValue?["parent_session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty
+        else { return nil }
+        return raw
     }
 
     private func pollFrame(from frame: RemoteClientFrame, sessionIDs: [String]) -> RemoteClientFrame {

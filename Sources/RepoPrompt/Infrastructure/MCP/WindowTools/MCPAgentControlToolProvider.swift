@@ -198,7 +198,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
 
                 **list_agents**: roles_only?
                 **list_workflows**: no additional fields
-                **list_sessions**: agent?, state?, limit?
+                **list_sessions**: agent?, state?, limit?, parent_session_id?
                 **get_log**: session_id (required), offset?, limit?
                 **extract_handoff / handoff**: session_id (required), up_to_item_id?, include_file_contents?, output_path?, overwrite?, inline?, max_transcript_items?, max_tool_args_characters?
                 **create_session**: model_id?, session_name?
@@ -222,6 +222,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                     "max_transcript_items": .integer(description: "[extract_handoff] Transcript item budget; clamped to 1...1000. Default 200."),
                     "max_tool_args_characters": .integer(description: "[extract_handoff] Tool argument character budget; clamped to 0...20000. Default 2000."),
                     "state": .string(description: "[list_sessions] Session state filter. Use MCP-facing values such as running, waiting_for_input, completed, failed."),
+                    "parent_session_id": .string(description: "[list_sessions] Only return sessions whose parent session UUID matches. Never widens connection-scoped visibility; a mismatch with the connection's scoped parent yields an empty list."),
                     "offset": .integer(description: "[get_log] Turn offset."),
                     "session_ids": .array(description: "[cleanup_sessions] Array of session UUIDs to delete.", items: .string()),
                     "roles_only": .boolean(description: "[list_agents] When true, return only the authoritative role-label mapping (task_labels) and omit the explicit per-agent target catalog. Default false.")

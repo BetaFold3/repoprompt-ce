@@ -26,6 +26,15 @@ struct RemoteChannelState: Equatable {
     var kind: Kind
 }
 
+struct RemoteAgentSessionDescriptor: Equatable {
+    var sessionID: String
+    var name: String?
+    var stateRaw: String?
+    var agentKindRaw: String?
+    var agentModelRaw: String?
+    var parentSessionID: String?
+}
+
 private enum RemoteLogPagingError: Error, CustomStringConvertible {
     case missingSession
     case missingProjector
@@ -227,6 +236,26 @@ actor RemoteAgentSessionController {
         try await catchUpFromHost()
     }
 
+    func listSessions(parentSessionID: String) async throws -> [RemoteAgentSessionDescriptor] {
+        try ensureNotShutdown()
+        let trimmedParentID = parentSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedParentID.isEmpty else { return [] }
+        let frame = RemoteClientFrame(
+            type: "list_sessions",
+            requestID: makeRequestID(prefix: "sessions"),
+            payload: .object([
+                "parent_session_id": .string(trimmedParentID),
+                "limit": .int(500)
+            ])
+        )
+        let response = try await commandWithTransportRetry(
+            frame,
+            operation: "list_sessions",
+            mayRetryTransportLoss: true
+        )
+        return Self.sessionDescriptors(from: response)
+    }
+
     func currentBinding() -> AgentSessionRemoteHostBinding? {
         guard let remoteSessionID else { return nil }
         return AgentSessionRemoteHostBinding(
@@ -236,6 +265,15 @@ actor RemoteAgentSessionController {
             lastAppliedSeq: lastAppliedSeq,
             nextLogOffset: nextLogOffset
         )
+    }
+
+    func listChildSessions() async throws -> [RemoteAgentSessionDescriptor] {
+        try ensureNotShutdown()
+        guard let sessionID = remoteSessionID else { throw missingSessionError() }
+        let normalizedParentSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try await listSessions(parentSessionID: normalizedParentSessionID).filter { descriptor in
+            descriptor.parentSessionID?.trimmingCharacters(in: .whitespacesAndNewlines) == normalizedParentSessionID
+        }
     }
 
     func handleInboundFrame(_ frame: RemoteServerFrame) async {
@@ -590,6 +628,26 @@ actor RemoteAgentSessionController {
             return sessionID
         }
         throw RemoteClientError.protocolViolation("agent_run start response did not include session_id.")
+    }
+
+    private static func sessionDescriptors(from payload: JSONValue) -> [RemoteAgentSessionDescriptor] {
+        let sessions = payload.objectValue?["sessions"]?.arrayValue ?? []
+        return sessions.compactMap { value in
+            guard let object = value.objectValue,
+                  let sessionID = object["session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !sessionID.isEmpty
+            else { return nil }
+            let agentObject = object["agent"]?.objectValue
+            let name = object["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return RemoteAgentSessionDescriptor(
+                sessionID: sessionID,
+                name: name?.isEmpty == false ? name : nil,
+                stateRaw: object["raw_state"]?.stringValue ?? object["state"]?.stringValue,
+                agentKindRaw: agentObject?["id"]?.stringValue ?? object["agent"]?.stringValue,
+                agentModelRaw: agentObject?["model"]?.stringValue,
+                parentSessionID: object["parent_session_id"]?.stringValue
+            )
+        }
     }
 
     private static func interactionResolution(from payload: JSONValue) -> (interactionID: String, resolvedBy: String?)? {

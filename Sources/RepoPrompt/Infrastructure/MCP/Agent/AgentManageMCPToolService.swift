@@ -213,6 +213,16 @@ struct AgentManageMCPToolService {
             throw MCPError.invalidParams("No active workspace available for agent_manage.list_sessions.")
         }
         let agentModeVM = targetWindow.agentModeViewModel
+        let explicitParentSessionID: UUID?
+        if args["parent_session_id"] != nil {
+            let rawParentSessionID = try requireNonEmptyString(args["parent_session_id"], name: "parent_session_id")
+            guard let parsedParentSessionID = UUID(uuidString: rawParentSessionID) else {
+                throw MCPError.invalidParams("parent_session_id must be a valid UUID.")
+            }
+            explicitParentSessionID = parsedParentSessionID
+        } else {
+            explicitParentSessionID = nil
+        }
         let scopedParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
         let agentFilter = normalizedString(args["agent"])?.lowercased()
         let stateFilter = normalizedString(args["state"])
@@ -270,9 +280,20 @@ struct AgentManageMCPToolService {
             )
         }
 
-        // Scope to direct children when called from agent mode
+        // Scope to direct children when called from agent mode. An explicit
+        // parent_session_id narrows discovery, but it must never widen a
+        // connection-scoped child session: mismatched explicit/scoped parents
+        // are treated as an empty intersection.
         let scoped: [[String: Value]] = {
-            guard let parentID = scopedParentSessionID else { return Array(entriesByID.values) }
+            if let explicitParentSessionID,
+               let scopedParentSessionID,
+               explicitParentSessionID != scopedParentSessionID
+            {
+                return []
+            }
+            guard let parentID = explicitParentSessionID ?? scopedParentSessionID else {
+                return Array(entriesByID.values)
+            }
             return entriesByID.values.filter { object in
                 object["parent_session_id"]?.stringValue == parentID.uuidString
             }

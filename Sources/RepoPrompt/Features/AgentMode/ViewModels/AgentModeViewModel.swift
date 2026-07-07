@@ -1127,6 +1127,186 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    func materializeRemoteChildSession(
+        _ descriptor: RemoteAgentSessionDescriptor,
+        parentSession: TabSession,
+        parentRemoteHost: AgentSessionRemoteHostBinding
+    ) async -> TabSession? {
+        let childRemoteSessionID = descriptor.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let childSessionID = UUID(uuidString: childRemoteSessionID),
+              let parentLocalSessionID = parentSession.activeAgentSessionID
+        else { return nil }
+
+        if let existing = sessions.values.first(where: { session in
+            session.remoteHost?.hostID == parentRemoteHost.hostID
+                && session.remoteHost?.remoteSessionID == childRemoteSessionID
+        }) {
+            configureMaterializedRemoteChildSession(
+                existing,
+                sessionID: existing.activeAgentSessionID ?? childSessionID,
+                descriptor: descriptor,
+                childRemoteSessionID: childRemoteSessionID,
+                parentLocalSessionID: parentLocalSessionID,
+                parentTabID: parentSession.tabID,
+                parentRemoteHost: parentRemoteHost,
+                isNewMaterialization: false
+            )
+            return existing
+        }
+
+        if case let .unique(existingTabID) = persistentBindingResolution(for: childSessionID) {
+            let existing = await ensureSessionReady(tabID: existingTabID)
+            if existing.activeAgentSessionID != childSessionID {
+                guard installPersistentSessionBinding(
+                    sessionID: childSessionID,
+                    on: existing,
+                    updateWorkspaceMetadata: true,
+                    invalidateAsyncWork: true
+                )?.sessionID == childSessionID else { return nil }
+            }
+            existing.hasLoadedPersistedState = true
+            configureMaterializedRemoteChildSession(
+                existing,
+                sessionID: childSessionID,
+                descriptor: descriptor,
+                childRemoteSessionID: childRemoteSessionID,
+                parentLocalSessionID: parentLocalSessionID,
+                parentTabID: parentSession.tabID,
+                parentRemoteHost: parentRemoteHost,
+                isNewMaterialization: false
+            )
+            return existing
+        }
+
+        guard let promptManager,
+              let createdTab = await promptManager.createBackgroundComposeTab(
+                  strategy: .blank,
+                  name: Self.remoteChildSessionName(descriptor.name),
+                  capacityPolicy: .mcpBackgroundAgent
+              )
+        else { return nil }
+
+        let childSession = session(for: createdTab.id)
+        guard installPersistentSessionBinding(
+            sessionID: childSessionID,
+            on: childSession,
+            updateWorkspaceMetadata: true,
+            invalidateAsyncWork: true
+        )?.sessionID == childSessionID else { return nil }
+        childSession.hasLoadedPersistedState = true
+        configureMaterializedRemoteChildSession(
+            childSession,
+            sessionID: childSessionID,
+            descriptor: descriptor,
+            childRemoteSessionID: childRemoteSessionID,
+            parentLocalSessionID: parentLocalSessionID,
+            parentTabID: parentSession.tabID,
+            parentRemoteHost: parentRemoteHost,
+            isNewMaterialization: true
+        )
+        return childSession
+    }
+
+    private func configureMaterializedRemoteChildSession(
+        _ session: TabSession,
+        sessionID: UUID,
+        descriptor: RemoteAgentSessionDescriptor,
+        childRemoteSessionID: String,
+        parentLocalSessionID: UUID,
+        parentTabID: UUID,
+        parentRemoteHost: AgentSessionRemoteHostBinding,
+        isNewMaterialization: Bool
+    ) {
+        let childName = Self.remoteChildSessionName(descriptor.name)
+        let currentName = resolvedSessionDisplayName(for: session.tabID)
+        if isNewMaterialization
+            || AgentSessionTitleNaming.isDefaultSessionTitle(currentName)
+            || currentName == "Agent Session"
+        {
+            renameSession(tabID: session.tabID, to: childName)
+        }
+
+        session.remoteHost = AgentSessionRemoteHostBinding(
+            hostID: parentRemoteHost.hostID,
+            hostDisplayName: parentRemoteHost.hostDisplayName,
+            remoteSessionID: childRemoteSessionID
+        )
+        session.parentSessionID = parentLocalSessionID
+        if isNewMaterialization || !session.runState.isTerminalForCommit {
+            session.runState = Self.remoteChildRunState(from: descriptor.stateRaw)
+        }
+        if let agentKindRaw = descriptor.agentKindRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let agentKind = AgentProviderKind(rawValue: agentKindRaw)
+        {
+            session.selectedAgent = agentKind
+        }
+        if let modelRaw = descriptor.agentModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !modelRaw.isEmpty
+        {
+            session.selectedModelRaw = modelRaw
+        }
+        session.hasLoadedPersistedState = true
+        session.isDirty = true
+        session.lastActivityAt = Date()
+
+        upsertSessionIndex(
+            sessionID: sessionID,
+            tabID: session.tabID,
+            name: resolvedSessionDisplayName(for: session.tabID),
+            lastUserMessageAt: session.lastUserMessageAt,
+            savedAt: session.lastActivityAt,
+            lastRunStateRaw: session.runState.rawValue,
+            itemCount: max(session.transcriptCanonicalVisibleRowCount, session.items.count),
+            agentKindRaw: session.selectedAgent.rawValue,
+            agentModelRaw: session.selectedModelRaw,
+            agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
+            autoEditEnabled: session.autoEditEnabled,
+            parentSessionID: parentLocalSessionID,
+            isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin,
+            worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
+            remoteHostID: parentRemoteHost.hostID,
+            remoteHostName: parentRemoteHost.hostDisplayName,
+            activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+        )
+        updateBindingsFromSession(session)
+        requestUIRefresh(tabID: session.tabID, urgent: false)
+        requestUIRefresh(tabID: parentTabID, urgent: false)
+        scheduleSave(for: session.tabID)
+    }
+
+    private static func remoteChildSessionName(_ rawName: String?) -> String {
+        let trimmed = rawName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let candidate = trimmed.isEmpty ? "Agent Session" : trimmed
+        return AgentSession.validatedName(candidate)
+    }
+
+    private static func remoteChildRunState(from rawState: String?) -> AgentSessionRunState {
+        let trimmed = rawState?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let state = AgentSessionRunState(rawValue: trimmed) {
+            return state
+        }
+        let compact = trimmed
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+        switch compact {
+        case "waitingforinput", "waitingforuser", "waitingforquestion", "waitingforapproval":
+            return .waitingForUser
+        case "running":
+            return .running
+        case "completed":
+            return .completed
+        case "cancelled", "canceled":
+            return .cancelled
+        case "failed", "expired":
+            return .failed
+        default:
+            return .idle
+        }
+    }
+
     /// Persist the last-used model for a given agent to UserDefaults.
     private static func persistModelForAgent(agentRaw: String, modelRaw: String) {
         var dict = UserDefaults.standard.dictionary(forKey: lastUsedModelsByAgentKey) as? [String: String] ?? [:]

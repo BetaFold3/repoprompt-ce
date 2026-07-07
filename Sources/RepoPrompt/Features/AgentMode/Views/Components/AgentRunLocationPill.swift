@@ -31,6 +31,11 @@ struct AgentRunLocationPill: View {
     }
 
     private var hoverTooltipText: String {
+        if !props.isEnabled,
+           let disabledReason = props.disabledReason
+        {
+            return disabledReason
+        }
         if case .host = props.selection,
            let fullName = selectedHostFullName
         {
@@ -110,7 +115,7 @@ struct AgentRunLocationPill: View {
     }
 
     private var selectedHostFullName: String? {
-        guard let selectedHostID = selectedHostID else { return nil }
+        guard let selectedHostID else { return nil }
         return props.hostOptions.first(where: { $0.id == selectedHostID })?.displayName
             ?? props.selectedHostDisplayName
     }
