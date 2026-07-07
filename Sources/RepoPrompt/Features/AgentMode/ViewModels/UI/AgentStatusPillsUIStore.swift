@@ -16,6 +16,7 @@ struct AgentRunLocationProps: Equatable {
     let tabID: UUID
     let selection: AgentRunLocation
     let selectedHostDisplayName: String?
+    let selectedHostAbbreviation: String?
     let hostOptions: [AgentRunLocationHostOption]
     let isEnabled: Bool
     let disabledReason: String?

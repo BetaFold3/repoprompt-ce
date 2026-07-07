@@ -29,9 +29,18 @@ extension AgentModeViewModel {
         else {
             return nil
         }
-        let hostOptions = (try? remoteHostRegistry.listHosts())?
-            .filter { !$0.isRevokedByHost }
-            .map { AgentRunLocationHostOption(id: $0.id, displayName: $0.displayName) } ?? []
+        let hosts = (try? remoteHostRegistry.listHosts())?
+            .filter { !$0.isRevokedByHost } ?? []
+        let abbreviations = AgentRunLocationHostOption.abbreviations(
+            for: hosts.map { (id: $0.id, displayName: $0.displayName) }
+        )
+        let hostOptions = hosts.map {
+            AgentRunLocationHostOption(
+                id: $0.id,
+                displayName: $0.displayName,
+                abbreviation: abbreviations[$0.id]
+            )
+        }
         guard !hostOptions.isEmpty else { return nil }
 
         let session = sessions[tabID]
@@ -40,6 +49,21 @@ extension AgentModeViewModel {
             if case let .host(hostID) = selection {
                 return hostOptions.first(where: { $0.id == hostID })?.displayName
                     ?? session?.remoteHost?.hostDisplayName
+            }
+            return nil
+        }()
+        let selectedHostAbbreviation: String? = {
+            if case let .host(hostID) = selection {
+                if let option = hostOptions.first(where: { $0.id == hostID }) {
+                    return option.abbreviation
+                }
+                if let remoteHost = session?.remoteHost,
+                   remoteHost.hostID == hostID
+                {
+                    return AgentRunLocationHostOption.abbreviations(
+                        for: [(id: remoteHost.hostID, displayName: remoteHost.hostDisplayName)]
+                    )[remoteHost.hostID]
+                }
             }
             return nil
         }()
@@ -57,6 +81,7 @@ extension AgentModeViewModel {
             tabID: tabID,
             selection: selection,
             selectedHostDisplayName: selectedHostDisplayName,
+            selectedHostAbbreviation: selectedHostAbbreviation,
             hostOptions: hostOptions,
             isEnabled: disabledReason == nil,
             disabledReason: disabledReason

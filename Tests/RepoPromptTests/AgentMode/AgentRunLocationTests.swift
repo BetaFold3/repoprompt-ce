@@ -60,6 +60,7 @@ final class AgentRunLocationTests: XCTestCase {
         let runProps = try XCTUnwrap(viewModel.runLocationProps(tabID: tabID))
         XCTAssertEqual(runProps.selection, .host(hostID: host.id))
         XCTAssertEqual(runProps.selectedHostDisplayName, "Studio Mac")
+        XCTAssertEqual(runProps.selectedHostAbbreviation, "sm")
 
         let worktreeProps = try XCTUnwrap(viewModel.executionLocationProps(tabID: tabID))
         XCTAssertFalse(worktreeProps.isEnabled)
@@ -134,6 +135,62 @@ final class AgentRunLocationTests: XCTestCase {
     private func id(_ value: Int) -> UUID {
         let suffix = String(format: "%012d", value)
         return UUID(uuidString: "00000000-0000-0000-0000-\(suffix)")!
+    }
+}
+
+final class AgentRunLocationHostOptionAbbreviationTests: XCTestCase {
+    func testAbbreviationsStripApostrophesBeforeTokenizing() {
+        let abbreviations = AgentRunLocationHostOption.abbreviations(
+            for: [(id: "host-a", displayName: "Tuan's Mac Studio")]
+        )
+
+        XCTAssertEqual(abbreviations["host-a"], "tm")
+    }
+
+    func testAbbreviationsUseFirstTwoCharactersForSingleToken() {
+        let abbreviations = AgentRunLocationHostOption.abbreviations(
+            for: [(id: "host-a", displayName: "Studio")]
+        )
+
+        XCTAssertEqual(abbreviations["host-a"], "st")
+    }
+
+    func testAbbreviationsExtendLastTokenForCollisionsDeterministically() {
+        let abbreviations = AgentRunLocationHostOption.abbreviations(
+            for: [
+                (id: "mac-studio", displayName: "Mac Studio"),
+                (id: "mac-server", displayName: "Mac Server")
+            ]
+        )
+
+        XCTAssertEqual(abbreviations["mac-studio"], "mst")
+        XCTAssertEqual(abbreviations["mac-server"], "mse")
+    }
+
+    func testAbbreviationsDisambiguateIdenticalDisplayNamesWithIDPrefix() {
+        let abbreviations = AgentRunLocationHostOption.abbreviations(
+            for: [
+                (id: "aa-host", displayName: "Mac Studio"),
+                (id: "bb-host", displayName: "Mac Studio")
+            ]
+        )
+
+        XCTAssertEqual(abbreviations["aa-host"], "msaa")
+        XCTAssertEqual(abbreviations["bb-host"], "msbb")
+    }
+
+    func testAbbreviationsArePermutationInvariant() {
+        let hosts = [
+            (id: "mac-studio", displayName: "Mac Studio"),
+            (id: "mac-server", displayName: "Mac Server"),
+            (id: "studio", displayName: "Studio"),
+            (id: "aa-host", displayName: "Tuan's Mac Studio")
+        ]
+
+        XCTAssertEqual(
+            AgentRunLocationHostOption.abbreviations(for: hosts),
+            AgentRunLocationHostOption.abbreviations(for: Array(hosts.reversed()))
+        )
     }
 }
 

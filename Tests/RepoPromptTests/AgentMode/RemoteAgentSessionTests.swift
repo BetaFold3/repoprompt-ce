@@ -376,6 +376,9 @@ final class RemoteAgentSessionTests: XCTestCase {
         let parkedBindingValue = await controller.currentBinding()
         let parkedBinding = try XCTUnwrap(parkedBindingValue)
         XCTAssertEqual(parkedBinding.nextLogOffset, 0)
+        await waitForRemoteAgentSessionCondition {
+            await !(recorder.allTranscriptRows()).isEmpty
+        }
         let initialRows = await recorder.allTranscriptRows()
         XCTAssertEqual(initialRows.first?.map(\.text), ["Prompt"])
 
@@ -805,6 +808,61 @@ final class RemoteAgentSessionTests: XCTestCase {
         ))
     }
 
+    func testRemoteStartSessionNameDerivationUsesDefaultTitlesOnly() {
+        let derived = AgentSessionTitleNaming.sessionNameForRemoteStart(
+            currentTitle: "T10",
+            userText: "Fix the flaky auth test by avoiding sleeps in worker startup"
+        )
+        XCTAssertEqual(derived, "Fix the flaky auth test by avoiding")
+        XCTAssertLessThanOrEqual(derived.count, 40)
+
+        XCTAssertEqual(
+            AgentSessionTitleNaming.sessionNameForRemoteStart(
+                currentTitle: "Customer Chosen Title",
+                userText: "Fix the flaky auth test"
+            ),
+            "Customer Chosen Title"
+        )
+        XCTAssertEqual(
+            AgentSessionTitleNaming.sessionNameForRemoteStart(
+                currentTitle: "T11",
+                userText: "   \nSecond line should not be used"
+            ),
+            "T11"
+        )
+    }
+
+    @MainActor
+    func testCoordinatorAdoptsHostSessionNameForDefaultTitleAndUpdatesIndex() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "T10")
+
+        fixture.coordinator.test_applyMetadata(sessionName: "  Host Derived Session  ", tabID: fixture.tabID)
+
+        XCTAssertEqual(fixture.viewModel.resolvedSessionDisplayName(for: fixture.tabID), "Host Derived Session")
+        XCTAssertEqual(fixture.viewModel.test_ownerValidatedSessionIndex[fixture.sessionID]?.name, "Host Derived Session")
+    }
+
+    @MainActor
+    func testCoordinatorDoesNotOverwriteUserTypedSessionName() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "User Typed Session")
+
+        fixture.coordinator.test_applyMetadata(sessionName: "Host Suggested Session", tabID: fixture.tabID)
+
+        XCTAssertEqual(fixture.viewModel.resolvedSessionDisplayName(for: fixture.tabID), "User Typed Session")
+        XCTAssertEqual(fixture.viewModel.test_ownerValidatedSessionIndex[fixture.sessionID]?.name, "User Typed Session")
+    }
+
+    @MainActor
+    func testCoordinatorReadoptsPreviouslyAdoptedHostSessionName() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "T12")
+
+        fixture.coordinator.test_applyMetadata(sessionName: "Host First Name", tabID: fixture.tabID)
+        fixture.coordinator.test_applyMetadata(sessionName: "Host Better Name", tabID: fixture.tabID)
+
+        XCTAssertEqual(fixture.viewModel.resolvedSessionDisplayName(for: fixture.tabID), "Host Better Name")
+        XCTAssertEqual(fixture.viewModel.test_ownerValidatedSessionIndex[fixture.sessionID]?.name, "Host Better Name")
+    }
+
     @MainActor
     func testChannelClosingReasonSurfacesAsBannerAndDedupedSystemRows() {
         let coordinator = RemoteAgentModeCoordinator()
@@ -913,6 +971,99 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
+    private func makeRemoteNamingFixture(
+        tabTitle: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> RemoteNamingFixture {
+        let tabID = UUID()
+        let sessionID = UUID()
+        let workspace = WorkspaceModel(
+            name: "Remote Naming",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [ComposeTabState(id: tabID, name: tabTitle, activeAgentSessionID: sessionID)],
+            activeComposeTabID: tabID
+        )
+        let fileManager = WorkspaceFilesViewModel()
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -1,
+            settingsManager: WindowSettingsManager(windowID: -1)
+        )
+        let workspaceManager = WorkspaceManagerViewModel(
+            fileManager: fileManager,
+            promptViewModel: prompt,
+            performInitialWorkspaceActivation: false
+        )
+        prompt.attachWorkspaceManager(workspaceManager)
+        workspaceManager.workspaces = [workspace]
+        workspaceManager.activeWorkspace = workspace
+        prompt.loadComposeTabsFromWorkspace(workspace)
+
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in RemoteAgentSessionNoopCodexController() }
+        )
+        viewModel.test_setSidebarAutoArchiveDependencies(
+            promptManager: prompt,
+            workspaceManager: workspaceManager
+        )
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+        viewModel.test_installSessionIndexSnapshot(
+            [:],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.remoteHost = makeBinding()
+        _ = viewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+        viewModel.upsertSessionIndex(
+            sessionID: sessionID,
+            tabID: tabID,
+            name: tabTitle,
+            lastUserMessageAt: nil,
+            savedAt: Date(timeIntervalSinceReferenceDate: 10),
+            lastRunStateRaw: session.runState.rawValue,
+            itemCount: 0,
+            agentKindRaw: session.selectedAgent.rawValue,
+            agentModelRaw: session.selectedModelRaw,
+            agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
+            autoEditEnabled: session.autoEditEnabled,
+            remoteHostID: session.remoteHost?.hostID,
+            remoteHostName: session.remoteHost?.hostDisplayName
+        )
+        XCTAssertEqual(viewModel.resolvedSessionDisplayName(for: tabID), tabTitle, file: file, line: line)
+
+        let coordinator = RemoteAgentModeCoordinator()
+        coordinator.attach(viewModel: viewModel)
+        return RemoteNamingFixture(
+            tabID: tabID,
+            sessionID: sessionID,
+            viewModel: viewModel,
+            coordinator: coordinator,
+            prompt: prompt,
+            workspaceManager: workspaceManager
+        )
+    }
+
+    @MainActor
     private func systemMessages(in session: AgentModeViewModel.TabSession) -> [String] {
         session.items.filter { $0.kind == .system }.map(\.text)
     }
@@ -943,6 +1094,15 @@ final class RemoteAgentSessionTests: XCTestCase {
             lastAppliedSeq: lastAppliedSeq,
             nextLogOffset: nextLogOffset
         )
+    }
+
+    private struct RemoteNamingFixture {
+        let tabID: UUID
+        let sessionID: UUID
+        let viewModel: AgentModeViewModel
+        let coordinator: RemoteAgentModeCoordinator
+        let prompt: PromptViewModel
+        let workspaceManager: WorkspaceManagerViewModel
     }
 
     private final class RemoteAgentSessionWeakBox<Value: AnyObject> {
@@ -1153,4 +1313,96 @@ final class RemoteAgentSessionTests: XCTestCase {
             customStoragePath: directory
         )
     }
+}
+
+private final class RemoteAgentSessionNoopCodexController: CodexSessionControlling {
+    private let eventStream: AsyncStream<CodexNativeSessionController.Event>
+    private let eventContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
+
+    init() {
+        var continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+        eventStream = AsyncStream { continuation = $0 }
+        eventContinuation = continuation!
+        eventContinuation.finish()
+    }
+
+    deinit {
+        eventContinuation.finish()
+    }
+
+    var hasActiveThread: Bool {
+        false
+    }
+
+    var events: AsyncStream<CodexNativeSessionController.Event> {
+        eventStream
+    }
+
+    func ensureEventsStreamReady() {}
+
+    func startOrResume(
+        existing _: CodexNativeSessionController.SessionRef?,
+        baseInstructions _: String
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        CodexNativeSessionController.SessionRef(conversationID: "noop", rolloutPath: nil, model: nil, reasoningEffort: nil)
+    }
+
+    func readThreadSnapshot(
+        includeTurns _: Bool,
+        timeout _: TimeInterval?
+    ) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        CodexNativeSessionController.ThreadSnapshot(
+            conversationID: "noop",
+            rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil,
+            runtimeStatus: .idle,
+            currentTurnID: nil,
+            activeTurnIDs: [],
+            latestTurnStatus: nil
+        )
+    }
+
+    func startUserTurn(
+        text _: String,
+        images _: [AgentImageAttachment],
+        model _: String?,
+        reasoningEffort _: String?,
+        serviceTier _: String?
+    ) async throws -> CodexTurnStartReceipt {
+        CodexTurnStartReceipt(provisionalSubmissionID: "noop")
+    }
+
+    func steerUserTurn(
+        text _: String,
+        images _: [AgentImageAttachment],
+        expectedTurnID: String
+    ) async throws -> CodexTurnSteerReceipt {
+        CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
+    }
+
+    func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+    }
+
+    func compactThread() async throws {}
+    func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
+        nil
+    }
+
+    func setThreadGoalObjective(_: String) async throws -> CodexNativeSessionController.ThreadGoal {
+        throw CancellationError()
+    }
+
+    func setThreadGoalStatus(_: CodexNativeSessionController.ThreadGoalStatus) async throws -> CodexNativeSessionController.ThreadGoal {
+        throw CancellationError()
+    }
+
+    func clearThreadGoal() async throws -> Bool {
+        false
+    }
+
+    func cancelCurrentTurn() async {}
+    func shutdown() async {}
+    func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {}
 }

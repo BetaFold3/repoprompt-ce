@@ -274,6 +274,7 @@ struct AgentModeSidebarSessionBuilder {
         let resolvedSessionID = authoritativeSessionID ?? entry?.id
         let resolvedParentSessionID = metadataLiveSession?.parentSessionID ?? entry?.parentSessionID
         let isMCPControlled = mcpControlledTabIDs.contains(tab.id)
+        let remoteControlDeviceID = Self.remoteControlDeviceID(liveSession: boundLiveSession, entry: entry)
         let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
         let mergeAttention = sidebarRowWorktreeMergeAttention(liveSession: metadataLiveSession, entry: entry)
         let searchFields = Self.searchFields(
@@ -299,10 +300,24 @@ struct AgentModeSidebarSessionBuilder {
             depth: 0,
             isMCPControlled: isMCPControlled,
             remoteHostName: metadataLiveSession?.remoteHost?.hostDisplayName ?? entry?.remoteHostName,
+            remoteControlDeviceID: remoteControlDeviceID,
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
             searchFields: searchFields
         )
+    }
+
+    private static func remoteControlDeviceID(
+        liveSession: TabSession?,
+        entry: AgentSessionIndexEntry?
+    ) -> String? {
+        if case let .remote(deviceID) = liveSession?.origin {
+            return deviceID
+        }
+        if case let .remote(deviceID) = entry?.origin {
+            return deviceID
+        }
+        return nil
     }
 
     /// Resolves the active worktree merge attention summary for a session row.
@@ -727,6 +742,7 @@ struct AgentModeSidebarSessionBuilder {
             depth: depth,
             isMCPControlled: session.isMCPControlled,
             remoteHostName: session.remoteHostName,
+            remoteControlDeviceID: session.remoteControlDeviceID,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
             searchFields: session.searchFields

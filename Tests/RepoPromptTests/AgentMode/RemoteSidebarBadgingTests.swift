@@ -55,7 +55,8 @@ final class RemoteSidebarBadgingTests: XCTestCase {
                     parentSessionID,
                     tabID: parentTabID,
                     lastUserMessageAt: date(100),
-                    remoteHostName: "Studio Mac"
+                    remoteHostName: "Studio Mac",
+                    origin: .remote(deviceID: "ab12cd34")
                 ),
                 entry(
                     childSessionID,
@@ -75,19 +76,157 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         XCTAssertEqual(rows.map(\.tabID), [parentTabID])
         let parent = try XCTUnwrap(rows.first)
         XCTAssertEqual(parent.remoteHostName, "Studio Mac")
+        XCTAssertEqual(parent.remoteControlDeviceID, "ab12cd34")
         XCTAssertTrue(parent.hasThreadChildren)
         XCTAssertTrue(parent.isThreadCollapsed)
         XCTAssertEqual(parent.hiddenThreadDescendantCount, 1)
     }
 
+    func testRemoteControlDeviceIDUsesRemoteOriginFromIndexEntry() throws {
+        let tabID = id(21)
+        let sessionID = id(121)
+        let rows = build(
+            tabs: [tab(tabID, sessionID: sessionID)],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    lastUserMessageAt: date(100),
+                    origin: .remote(deviceID: "ab12cd34")
+                )
+            ])
+        )
+
+        XCTAssertEqual(try row(for: tabID, in: rows).remoteControlDeviceID, "ab12cd34")
+    }
+
+    func testRemoteControlDeviceIDIgnoresGatewayMCPOrigin() throws {
+        let tabID = id(22)
+        let sessionID = id(122)
+        let rows = build(
+            tabs: [tab(tabID, sessionID: sessionID)],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    lastUserMessageAt: date(100),
+                    origin: .mcp(clientID: "repoprompt-gateway")
+                )
+            ])
+        )
+
+        XCTAssertNil(try row(for: tabID, in: rows).remoteControlDeviceID)
+    }
+
+    func testRemoteControlDeviceIDPrefersLiveRemoteOriginOverIndexEntry() throws {
+        let tabID = id(23)
+        let sessionID = id(123)
+        let rows = build(
+            tabs: [tab(tabID, sessionID: sessionID)],
+            sessions: [
+                tabID: liveSession(
+                    tabID: tabID,
+                    sessionID: sessionID,
+                    origin: .remote(deviceID: "feedbabe")
+                )
+            ],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    lastUserMessageAt: date(100),
+                    origin: .remote(deviceID: "ab12cd34")
+                )
+            ])
+        )
+
+        XCTAssertEqual(try row(for: tabID, in: rows).remoteControlDeviceID, "feedbabe")
+    }
+
+    func testSidebarSessionEqualityIncludesRemoteControlDeviceID() {
+        let tabID = id(24)
+        let base = AgentModeViewModel.SidebarSession(
+            id: tabID,
+            tabID: tabID,
+            title: "Remote",
+            lastUserMessageAt: nil,
+            activityDate: date(100),
+            isPinned: false,
+            sessionID: id(124),
+            parentSessionID: nil,
+            depth: 0,
+            isMCPControlled: true,
+            remoteControlDeviceID: "ab12cd34"
+        )
+        let changed = AgentModeViewModel.SidebarSession(
+            id: tabID,
+            tabID: tabID,
+            title: "Remote",
+            lastUserMessageAt: nil,
+            activityDate: date(100),
+            isPinned: false,
+            sessionID: id(124),
+            parentSessionID: nil,
+            depth: 0,
+            isMCPControlled: true,
+            remoteControlDeviceID: "feedbabe"
+        )
+
+        XCTAssertNotEqual(base, changed)
+    }
+
+    func testSidebarContentFingerprintIncludesPersistedRemoteOrigin() {
+        let tabID = id(25)
+        let sessionID = id(125)
+        let mcpFingerprint = AgentModeViewModel.AgentSessionSidebarContentFingerprint(
+            currentTabID: nil,
+            sessionListCacheReady: true,
+            tabsWithActiveAgentRun: Set<UUID>(),
+            mcpControlledTabIDs: Set<UUID>(),
+            tabMetadataSignatures: [],
+            sessionSignatures: [],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    lastUserMessageAt: date(100),
+                    origin: .mcp(clientID: "repoprompt-gateway")
+                )
+            ]),
+            sessionListSortDates: [:],
+            sidebarRestoreFrozenOrderByTabID: [:]
+        )
+        let remoteFingerprint = AgentModeViewModel.AgentSessionSidebarContentFingerprint(
+            currentTabID: nil,
+            sessionListCacheReady: true,
+            tabsWithActiveAgentRun: Set<UUID>(),
+            mcpControlledTabIDs: Set<UUID>(),
+            tabMetadataSignatures: [],
+            sessionSignatures: [],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    lastUserMessageAt: date(100),
+                    origin: .remote(deviceID: "ab12cd34")
+                )
+            ]),
+            sessionListSortDates: [:],
+            sidebarRestoreFrozenOrderByTabID: [:]
+        )
+
+        XCTAssertNotEqual(mcpFingerprint, remoteFingerprint)
+    }
+
     private func build(
         tabs: [ComposeTabState],
+        sessions: [UUID: AgentModeViewModel.TabSession] = [:],
         sessionIndex: [UUID: AgentSessionIndexEntry]
     ) -> [AgentModeViewModel.SidebarSession] {
         AgentModeSidebarSessionBuilder(
             allTabs: tabs,
             linkedTabs: tabs,
-            sessions: [:],
+            sessions: sessions,
             authoritativeSessionIDByTabID: Dictionary(
                 uniqueKeysWithValues: tabs.compactMap { tab in
                     tab.activeAgentSessionID.map { (tab.id, $0) }
@@ -107,6 +246,20 @@ final class RemoteSidebarBadgingTests: XCTestCase {
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in RemoteSidebarNoopCodexController() }
         )
+    }
+
+    private func liveSession(
+        tabID: UUID,
+        sessionID: UUID,
+        origin: AgentSessionOrigin
+    ) -> AgentModeViewModel.TabSession {
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        session.hasLoadedPersistedState = true
+        session.origin = origin
+        session.lastUserMessageAt = date(100)
+        session.lastActivityAt = date(100)
+        return session
     }
 
     private func tab(
@@ -130,7 +283,8 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         parentSessionID: UUID? = nil,
         lastUserMessageAt: Date?,
         savedAt: Date? = nil,
-        remoteHostName: String? = nil
+        remoteHostName: String? = nil,
+        origin: AgentSessionOrigin? = nil
     ) -> AgentSessionIndexEntry {
         AgentSessionIndexEntry(
             id: sessionID,
@@ -148,8 +302,8 @@ final class RemoteSidebarBadgingTests: XCTestCase {
             hasUnknownConversationContent: false,
             remoteHostID: remoteHostName == nil ? nil : "host-1",
             remoteHostName: remoteHostName,
-            isMCPOriginated: false,
-            origin: nil,
+            isMCPOriginated: origin?.isMCPOriginated ?? false,
+            origin: origin,
             worktreeBindingSummaries: [],
             activeWorktreeMergeSummaries: []
         )

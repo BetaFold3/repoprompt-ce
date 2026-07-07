@@ -12354,6 +12354,20 @@ final class AgentModeViewModel: ObservableObject {
                 syncComposerUIState(tabID: tabID)
                 syncStatusPillsUIState()
             }
+            var didDeriveRemoteSessionName = false
+            if shouldStartRemote {
+                let currentSessionName = resolvedSessionDisplayName(for: tabID)
+                let preparedSessionName = AgentSessionTitleNaming.sessionNameForRemoteStart(
+                    currentTitle: currentSessionName,
+                    userText: effectiveUserText
+                )
+                if AgentSessionTitleNaming.isDefaultSessionTitle(currentSessionName),
+                   preparedSessionName != AgentSession.validatedName(currentSessionName)
+                {
+                    renameSession(tabID: tabID, to: preparedSessionName)
+                    didDeriveRemoteSessionName = true
+                }
+            }
             let sessionName = resolvedSessionDisplayName(for: tabID)
             let workspaceName = workspaceManager?.activeWorkspace?.name
             Task { [weak self, weak session] in
@@ -12371,7 +12385,8 @@ final class AgentModeViewModel: ObservableObject {
                             sessionName: sessionName,
                             windowID: nil,
                             workspaceID: nil,
-                            workspaceName: workspaceName
+                            workspaceName: workspaceName,
+                            allowHostSessionNameAdoptionFromStartName: didDeriveRemoteSessionName
                         )
                     } else {
                         try await remoteCoordinator.steer(session: session, text: wrappedText)

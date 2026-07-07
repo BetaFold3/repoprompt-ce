@@ -14,8 +14,29 @@ struct AgentRunLocationPill: View {
         case .thisMac:
             "This Mac"
         case let .host(hostID):
-            props.hostOptions.first(where: { $0.id == hostID })?.displayName ?? props.selectedHostDisplayName ?? "Remote host"
+            props.hostOptions.first(where: { $0.id == hostID })?.abbreviation
+                ?? props.selectedHostAbbreviation
+                ?? props.selectedHostDisplayName
+                ?? "Remote host"
         }
+    }
+
+    private var accessibilitySelectionLabel: String {
+        switch props.selection {
+        case .thisMac:
+            "This Mac"
+        case .host:
+            selectedHostFullName ?? selectionLabel
+        }
+    }
+
+    private var hoverTooltipText: String {
+        if case .host = props.selection,
+           let fullName = selectedHostFullName
+        {
+            return "Run on \(fullName)"
+        }
+        return props.disabledReason ?? "Choose where this run starts"
     }
 
     private var iconName: String {
@@ -79,12 +100,18 @@ struct AgentRunLocationPill: View {
         .buttonStyle(.plain)
         .disabled(!props.isEnabled)
         .opacity(props.isEnabled ? 1 : 0.6)
-        .hoverTooltip(props.disabledReason ?? "Choose where this run starts", .top)
-        .accessibilityLabel("Run on \(selectionLabel)")
+        .hoverTooltip(hoverTooltipText, .top)
+        .accessibilityLabel("Run on \(accessibilitySelectionLabel)")
     }
 
     private var selectedHostID: String? {
         if case let .host(hostID) = props.selection { return hostID }
         return nil
+    }
+
+    private var selectedHostFullName: String? {
+        guard let selectedHostID = selectedHostID else { return nil }
+        return props.hostOptions.first(where: { $0.id == selectedHostID })?.displayName
+            ?? props.selectedHostDisplayName
     }
 }

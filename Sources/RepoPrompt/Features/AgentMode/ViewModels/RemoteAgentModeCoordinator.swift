@@ -15,6 +15,8 @@ final class RemoteAgentModeCoordinator {
     private var hostIDByTabID: [UUID: String] = [:]
     private var connectionTasksByHostID: [String: HostConnectionTasks] = [:]
     private var surfacedChannelReasonsByTabID: [UUID: Set<String>] = [:]
+    private var lastAdoptedHostNameByTabID: [UUID: String] = [:]
+    private var startSessionNameByTabID: [UUID: String] = [:]
 
     init(
         connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared }
@@ -49,9 +51,15 @@ final class RemoteAgentModeCoordinator {
         sessionName: String?,
         windowID: Int?,
         workspaceID: String?,
-        workspaceName: String?
+        workspaceName: String?,
+        allowHostSessionNameAdoptionFromStartName: Bool = false
     ) async throws {
         let controller = try controller(for: session)
+        recordStartSessionName(
+            sessionName,
+            tabID: session.tabID,
+            allowHostSessionNameAdoptionFromStartName: allowHostSessionNameAdoptionFromStartName
+        )
         session.runState = .running
         session.setRunningStatus("Starting on \(session.remoteHost?.hostDisplayName ?? "remote host")…", source: .transport)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
@@ -122,6 +130,8 @@ final class RemoteAgentModeCoordinator {
     func stop(tabID: UUID) {
         eventTasksByTabID.removeValue(forKey: tabID)?.cancel()
         surfacedChannelReasonsByTabID.removeValue(forKey: tabID)
+        lastAdoptedHostNameByTabID.removeValue(forKey: tabID)
+        startSessionNameByTabID.removeValue(forKey: tabID)
         let controller = controllersByTabID.removeValue(forKey: tabID)
         if let hostID = hostIDByTabID.removeValue(forKey: tabID) {
             stopConnectionFanoutIfUnused(hostID: hostID)
@@ -248,7 +258,7 @@ final class RemoteAgentModeCoordinator {
             if let modelRaw, !modelRaw.isEmpty {
                 session.selectedModelRaw = modelRaw
             }
-            _ = sessionName
+            adoptHostSessionNameIfAllowed(sessionName, for: session, tabID: tabID)
         case let .binding(binding):
             session.remoteHost = binding
             updateSessionIndex(for: session)
@@ -421,6 +431,44 @@ final class RemoteAgentModeCoordinator {
         appendSystemMessage("Remote channel degraded: \(reason). Reconnecting…", to: session)
     }
 
+    private func recordStartSessionName(
+        _ sessionName: String?,
+        tabID: UUID,
+        allowHostSessionNameAdoptionFromStartName: Bool
+    ) {
+        guard allowHostSessionNameAdoptionFromStartName,
+              let sessionName
+        else { return }
+        let trimmed = sessionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        startSessionNameByTabID[tabID] = AgentSession.validatedName(trimmed)
+    }
+
+    private func adoptHostSessionNameIfAllowed(
+        _ sessionName: String?,
+        for session: AgentModeViewModel.TabSession,
+        tabID: UUID
+    ) {
+        guard session.remoteHost != nil,
+              let viewModel,
+              let sessionName
+        else { return }
+        let trimmed = sessionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let hostName = AgentSession.validatedName(trimmed)
+        guard !hostName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let currentName = viewModel.resolvedSessionDisplayName(for: tabID)
+        guard hostName != currentName else { return }
+
+        let shouldAdopt = AgentSessionTitleNaming.isDefaultSessionTitle(currentName)
+            || lastAdoptedHostNameByTabID[tabID] == currentName
+            || startSessionNameByTabID[tabID] == currentName
+        guard shouldAdopt else { return }
+
+        viewModel.renameSession(tabID: tabID, to: hostName)
+        lastAdoptedHostNameByTabID[tabID] = hostName
+    }
+
     private func appendSystemMessage(_ message: String, tabID: UUID) {
         guard let session = viewModel?.sessions[tabID] else { return }
         appendSystemMessage(message, to: session)
@@ -509,6 +557,27 @@ final class RemoteAgentModeCoordinator {
                 eventTasks: eventTasksByTabID.count,
                 hostFanoutTasks: connectionTasksByHostID.count,
                 tabHostBindings: hostIDByTabID.count
+            )
+        }
+
+        func test_applyMetadata(
+            agentKindRaw: String? = nil,
+            modelRaw: String? = nil,
+            sessionName: String?,
+            tabID: UUID
+        ) {
+            handle(.metadata(agentKindRaw: agentKindRaw, modelRaw: modelRaw, sessionName: sessionName), tabID: tabID)
+        }
+
+        func test_recordStartSessionName(
+            _ sessionName: String?,
+            tabID: UUID,
+            allowHostSessionNameAdoptionFromStartName: Bool = true
+        ) {
+            recordStartSessionName(
+                sessionName,
+                tabID: tabID,
+                allowHostSessionNameAdoptionFromStartName: allowHostSessionNameAdoptionFromStartName
             )
         }
     #endif

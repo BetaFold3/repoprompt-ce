@@ -675,6 +675,7 @@ extension AgentModeViewModel {
         let depth: Int
         let isMCPControlled: Bool
         let remoteHostName: String?
+        let remoteControlDeviceID: String?
         /// Bound-worktree visual identity for this session (Item 10). Nil when
         /// the session has no worktree bindings. Carries the representative
         /// (first) binding when a session is bound to multiple roots.
@@ -707,6 +708,7 @@ extension AgentModeViewModel {
             depth: Int,
             isMCPControlled: Bool,
             remoteHostName: String? = nil,
+            remoteControlDeviceID: String? = nil,
             worktree: AgentWorktreeIndicator? = nil,
             worktreeMergeAttention: AgentWorktreeMergeAttention? = nil,
             threadKey: AgentSidebarThreadKey? = nil,
@@ -728,6 +730,7 @@ extension AgentModeViewModel {
             self.depth = depth
             self.isMCPControlled = isMCPControlled
             self.remoteHostName = remoteHostName
+            self.remoteControlDeviceID = remoteControlDeviceID
             self.worktree = worktree
             self.worktreeMergeAttention = worktreeMergeAttention
             self.threadKey = threadKey
