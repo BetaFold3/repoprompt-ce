@@ -354,6 +354,7 @@ allowed_tracked_docs=(
   "docs/open-source-readiness.md"
   "docs/privacy/telemetry.md"
   "docs/technical_implementation_reports/remote-control-gateway.md"
+  "docs/technical_implementation_reports/2026-07-08-remote-session-ux-gaps-implementation.md"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"

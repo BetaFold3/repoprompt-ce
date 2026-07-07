@@ -160,6 +160,7 @@ final class RemoteAgentModeCoordinator {
         eventTasksByTabID.removeValue(forKey: tabID)?.cancel()
         surfacedChannelReasonsByTabID.removeValue(forKey: tabID)
         lastAdoptedHostNameByTabID.removeValue(forKey: tabID)
+        startSessionNameByTabID.removeValue(forKey: tabID)
         let controller = controllersByTabID.removeValue(forKey: tabID)
         if let hostID = hostIDByTabID.removeValue(forKey: tabID) {
             stopConnectionFanoutIfUnused(hostID: hostID)
@@ -478,7 +479,17 @@ final class RemoteAgentModeCoordinator {
         descriptors: [RemoteAgentSessionDescriptor]
     ) async {
         childDiscoveryTasksByKey.removeValue(forKey: context.key)
+        // Discovery may resume after the parent tab was stopped (for example a run-location
+        // switch): never materialize children or restart discovery for a torn-down parent.
+        guard !Task.isCancelled, controllersByTabID[context.parentTabID] != nil else {
+            finishChildDiscovery(context: context)
+            return
+        }
         for descriptor in descriptors {
+            guard !Task.isCancelled, controllersByTabID[context.parentTabID] != nil else {
+                finishChildDiscovery(context: context)
+                return
+            }
             await materializeRemoteChildSession(descriptor, context: context)
         }
         childDiscoveryInFlightKeys.remove(context.key)
@@ -895,6 +906,10 @@ final class RemoteAgentModeCoordinator {
         func test_requestChildSessionDiscovery(tabID: UUID) {
             guard let session = viewModel?.sessions[tabID] else { return }
             requestChildSessionDiscovery(for: session, reason: "test")
+        }
+
+        func test_startSessionNameRecord(tabID: UUID) -> String? {
+            startSessionNameByTabID[tabID]
         }
     #endif
 

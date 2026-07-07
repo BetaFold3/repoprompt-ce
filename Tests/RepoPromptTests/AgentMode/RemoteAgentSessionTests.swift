@@ -1022,6 +1022,76 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testStopClearsStartSessionNameRecord() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "T10")
+        fixture.coordinator.test_recordStartSessionName("Derived Name", tabID: fixture.tabID)
+        XCTAssertEqual(fixture.coordinator.test_startSessionNameRecord(tabID: fixture.tabID), "Derived Name")
+
+        fixture.coordinator.stop(tabID: fixture.tabID)
+
+        XCTAssertNil(fixture.coordinator.test_startSessionNameRecord(tabID: fixture.tabID))
+    }
+
+    @MainActor
+    func testStoppedParentDoesNotMaterializeChildrenFromLateDiscovery() async throws {
+        let fixture = try await makeRemoteNamingFixture(
+            tabTitle: "Remote Parent",
+            childDiscoveryDebounceInterval: 0
+        )
+        let parentRemoteID = UUID()
+        let childRemoteID = UUID()
+        let parentSession = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        parentSession.remoteHost = makeBinding(remoteSessionID: parentRemoteID.uuidString)
+        let childListPayload = Self.listSessionsPayload(children: [
+            Self.sessionDescriptorPayload(
+                sessionID: childRemoteID.uuidString,
+                name: "Child Worker",
+                state: "running",
+                agentID: AgentProviderKind.codexExec.rawValue,
+                model: "codex",
+                parentSessionID: parentRemoteID.uuidString
+            )
+        ])
+        let recordingConnection = RecordingRemoteAgentSessionConnection(
+            responses: ["list_sessions": [childListPayload]],
+            commandDelayNanosecondsByType: ["list_sessions": 150_000_000]
+        )
+        let parentController = try RemoteAgentSessionController(
+            binding: XCTUnwrap(parentSession.remoteHost),
+            connection: recordingConnection
+        )
+        let fanoutConnection = RemoteHostConnection(hostID: parentSession.remoteHost?.hostID ?? "host-abc")
+        fixture.coordinator.test_attachController(
+            tabID: fixture.tabID,
+            hostID: parentSession.remoteHost?.hostID ?? "host-abc",
+            controller: parentController,
+            connection: fanoutConnection
+        )
+        var attachedRemoteSessionIDs: [String] = []
+        fixture.coordinator.test_setMaterializedRemoteChildAttachHandler { childSession in
+            if let remoteSessionID = childSession.remoteHost?.remoteSessionID {
+                attachedRemoteSessionIDs.append(remoteSessionID)
+            }
+        }
+
+        fixture.coordinator.test_requestChildSessionDiscovery(tabID: fixture.tabID)
+        await waitForRemoteAgentSessionCondition {
+            await recordingConnection.commandCount(type: "list_sessions") >= 1
+        }
+
+        fixture.coordinator.stop(tabID: fixture.tabID)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+
+        XCTAssertFalse(fixture.viewModel.sessions.values.contains {
+            $0.remoteHost?.remoteSessionID == childRemoteID.uuidString
+        })
+        XCTAssertTrue(attachedRemoteSessionIDs.isEmpty)
+        let counts = fixture.coordinator.test_lifecycleCounts()
+        XCTAssertEqual(counts.controllers, 0)
+        XCTAssertEqual(counts.hostFanoutTasks, 0)
+    }
+
+    @MainActor
     func testCoordinatorReportsRemoteChildMaterializationFailureOnce() async throws {
         let fixture = try await makeRemoteNamingFixture(
             tabTitle: "Remote Parent",
@@ -1434,22 +1504,28 @@ final class RemoteAgentSessionTests: XCTestCase {
     private actor RecordingRemoteAgentSessionConnection: RemoteAgentSessionConnection {
         private var responses: [String: [JSONValue]]
         private let getLogDelayNanoseconds: UInt64
+        private let commandDelayNanosecondsByType: [String: UInt64]
         private var frames: [RemoteClientFrame] = []
         private var subscribedSessionIDs: [[String]] = []
         private var ensureConnectedCallCount = 0
 
         init(
             responses: [String: [JSONValue]] = [:],
-            getLogDelayNanoseconds: UInt64 = 0
+            getLogDelayNanoseconds: UInt64 = 0,
+            commandDelayNanosecondsByType: [String: UInt64] = [:]
         ) {
             self.responses = responses
             self.getLogDelayNanoseconds = getLogDelayNanoseconds
+            self.commandDelayNanosecondsByType = commandDelayNanosecondsByType
         }
 
         func command(_ frame: RemoteClientFrame, timeout _: TimeInterval) async throws -> JSONValue {
             frames.append(frame)
             if frame.type == "get_log", getLogDelayNanoseconds > 0 {
                 try? await Task.sleep(nanoseconds: getLogDelayNanoseconds)
+            }
+            if let delay = commandDelayNanosecondsByType[frame.type], delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
             }
             if var queued = responses[frame.type], !queued.isEmpty {
                 let response = queued.removeFirst()
