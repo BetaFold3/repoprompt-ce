@@ -356,6 +356,7 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/remote-control-gateway.md"
   "docs/technical_implementation_reports/2026-07-08-remote-session-ux-gaps-implementation.md"
   "docs/technical_implementation_reports/2026-07-08-remote-recency-grouping-and-device-badge.md"
+  "docs/technical_implementation_reports/2026-07-08-remote-e2e-truncation-spinners-picker-fixes.md"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"

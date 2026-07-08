@@ -290,7 +290,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         let rows = try XCTUnwrap(firstRows)
         XCTAssertEqual(rows.map(\.text), ["Final reply"])
         let getLogCount = await connection.commandCount(type: "get_log")
-        XCTAssertEqual(getLogCount, 1)
+        XCTAssertEqual(getLogCount, 2)
     }
 
     func testCompletedDetachedStartStillFetchesInitialReplyLog() async throws {
@@ -376,9 +376,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         let parkedBindingValue = await controller.currentBinding()
         let parkedBinding = try XCTUnwrap(parkedBindingValue)
         XCTAssertEqual(parkedBinding.nextLogOffset, 0)
-        await waitForRemoteAgentSessionCondition {
-            await !(recorder.allTranscriptRows()).isEmpty
-        }
+        await recorder.waitForTranscriptBatchCount(1)
         let initialRows = await recorder.allTranscriptRows()
         XCTAssertEqual(initialRows.first?.map(\.text), ["Prompt"])
 
@@ -402,7 +400,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         let completedBinding = try XCTUnwrap(completedBindingValue)
         XCTAssertEqual(completedBinding.nextLogOffset, 1)
         let getLogOffsets = await connection.getLogOffsets()
-        XCTAssertEqual(getLogOffsets, [0, 0])
+        XCTAssertEqual(getLogOffsets, [0, 0, 0])
     }
 
     func testCompletedRemoteLogPageConsumesWhenRunInactive() async throws {
@@ -505,7 +503,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         let systemMessages = await recorder.recordedSystemMessages()
         XCTAssertFalse(systemMessages.contains("Remote log page did not advance; stopped catch-up paging."))
         let getLogOffsets = await connection.getLogOffsets()
-        XCTAssertEqual(getLogOffsets, [0, 0])
+        XCTAssertEqual(getLogOffsets, [0, 0, 0])
     }
 
     func testMixedCompletedAndIncompletePageIsSplitBeforeEmittingRows() async throws {
@@ -1206,6 +1204,107 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testTerminalSettlesResultlessToolCallsAlreadyApplied() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Remote Tools")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-tools-before-terminal")
+        session.runState = .running
+        let toolCall = Self.remoteToolCall(name: "read_file")
+
+        fixture.coordinator.test_applyTranscriptRows([toolCall], to: session)
+
+        let runningTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
+        XCTAssertNil(runningTool.toolResultJSON)
+        XCTAssertNil(runningTool.toolIsError)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: runningTool), .running)
+
+        fixture.coordinator.test_handleEvent(.terminal(status: "completed"), tabID: fixture.tabID)
+
+        let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
+        XCTAssertNotNil(settledTool.toolResultJSON)
+        XCTAssertEqual(settledTool.toolIsError, false)
+        XCTAssertNotEqual(ToolCallCardStateResolver.status(for: settledTool), .running)
+        XCTAssertEqual(session.runState, .completed)
+    }
+
+    @MainActor
+    func testPostTerminalTranscriptRowsSettleResultlessToolCalls() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Remote Tools")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-tools-after-terminal")
+        session.runState = .running
+
+        fixture.coordinator.test_handleEvent(.terminal(status: "completed"), tabID: fixture.tabID)
+        XCTAssertEqual(session.runState, .completed)
+
+        let toolCall = Self.remoteToolCall(name: "read_file")
+        fixture.coordinator.test_handleEvent(.transcriptRows([toolCall]), tabID: fixture.tabID)
+
+        let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
+        XCTAssertNotNil(settledTool.toolResultJSON)
+        XCTAssertEqual(settledTool.toolIsError, false)
+        XCTAssertNotEqual(ToolCallCardStateResolver.status(for: settledTool), .running)
+    }
+
+    @MainActor
+    func testTerminalFailedSettlesResultlessToolCallsAlreadyAppliedAsFailure() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Remote Failed Tools")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-tools-failed-before-terminal")
+        session.runState = .running
+        let toolCall = Self.remoteToolCall(name: "read_file")
+
+        fixture.coordinator.test_applyTranscriptRows([toolCall], to: session)
+        fixture.coordinator.test_handleEvent(.terminal(status: "failed"), tabID: fixture.tabID)
+
+        let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertEqual(settledTool.toolIsError, true)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: settledTool), .failure)
+        XCTAssertTrue(settledTool.toolResultJSON?.contains("\"status\":\"failed\"") == true, settledTool.toolResultJSON ?? "nil")
+    }
+
+    @MainActor
+    func testPostTerminalTranscriptRowsSettleCancelledResultlessToolCallsAsFailure() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Remote Cancelled Tools")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-tools-cancelled-after-terminal")
+        session.runState = .running
+
+        fixture.coordinator.test_handleEvent(.terminal(status: "cancelled"), tabID: fixture.tabID)
+        XCTAssertEqual(session.runState, .cancelled)
+
+        let toolCall = Self.remoteToolCall(name: "read_file")
+        fixture.coordinator.test_handleEvent(.transcriptRows([toolCall]), tabID: fixture.tabID)
+
+        let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
+        XCTAssertEqual(settledTool.toolIsError, true)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: settledTool), .failure)
+        XCTAssertTrue(settledTool.toolResultJSON?.contains("\"status\":\"cancelled\"") == true, settledTool.toolResultJSON ?? "nil")
+    }
+
+    @MainActor
+    func testPostTerminalTranscriptRowsPreserveExplicitFailedToolResult() throws {
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-tools-explicit-failed")
+        session.runState = .completed
+        let failedJSON = #"{"status":"failed","summary_only":true,"marker":"preserve"}"#
+        let failedTool = Self.remoteToolCall(
+            name: "read_file",
+            toolResultJSON: failedJSON,
+            toolIsError: true
+        )
+        let coordinator = RemoteAgentModeCoordinator()
+
+        coordinator.test_applyTranscriptRows([failedTool], to: session)
+
+        let tool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
+        XCTAssertEqual(tool.toolResultJSON, failedJSON)
+        XCTAssertEqual(tool.toolIsError, true)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: tool), .failure)
+    }
+
+    @MainActor
     func testStoppedParentDoesNotMaterializeChildrenFromLateDiscovery() async throws {
         let fixture = try await makeRemoteNamingFixture(
             tabTitle: "Remote Parent",
@@ -1582,6 +1681,25 @@ final class RemoteAgentSessionTests: XCTestCase {
         return .object(payload)
     }
 
+    private static func remoteToolCall(
+        name: String,
+        toolResultJSON: String? = nil,
+        toolIsError: Bool? = nil,
+        sequenceIndex: Int = 0
+    ) -> AgentChatItem {
+        AgentChatItem(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: TimeInterval(sequenceIndex)),
+            kind: .toolCall,
+            text: "Using tool: \(name)",
+            toolName: name,
+            toolArgsJSON: #"{"path":"README.md"}"#,
+            toolResultJSON: toolResultJSON,
+            toolIsError: toolIsError,
+            sequenceIndex: sequenceIndex
+        )
+    }
+
     private func waitForRemoteAgentSessionCondition(
         _ predicate: @escaping () async -> Bool,
         file: StaticString = #filePath,
@@ -1597,6 +1715,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
     private actor RemoteSessionEventRecorder {
         private var transcriptRows: [[AgentChatItem]] = []
+        private var transcriptBatchWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
         private var systemMessages: [String] = []
         private var expiredCount = 0
 
@@ -1604,6 +1723,7 @@ final class RemoteAgentSessionTests: XCTestCase {
             switch event {
             case let .transcriptRows(rows):
                 transcriptRows.append(rows)
+                resumeSatisfiedTranscriptBatchWaiters()
             case let .systemMessage(message):
                 systemMessages.append(message)
             case .sessionExpired:
@@ -1619,6 +1739,25 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func allTranscriptRows() -> [[AgentChatItem]] {
             transcriptRows
+        }
+
+        func waitForTranscriptBatchCount(_ count: Int) async {
+            guard transcriptRows.count < count else { return }
+            await withCheckedContinuation { continuation in
+                transcriptBatchWaiters.append((count, continuation))
+            }
+        }
+
+        private func resumeSatisfiedTranscriptBatchWaiters() {
+            var remaining: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+            for waiter in transcriptBatchWaiters {
+                if transcriptRows.count >= waiter.count {
+                    waiter.continuation.resume()
+                } else {
+                    remaining.append(waiter)
+                }
+            }
+            transcriptBatchWaiters = remaining
         }
 
         func upsertedTranscriptRows() -> [AgentChatItem] {

@@ -19,9 +19,11 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
 
         let summaryRange = try XCTUnwrap(xml.range(of: "<system>"))
         let toolCallRange = try XCTUnwrap(xml.range(of: "<tool_call name=\"agent_run\""))
+        let toolResultRange = try XCTUnwrap(xml.range(of: "<tool_result name=\"agent_run\" status=\"success\"/>"))
         let statusRange = try XCTUnwrap(xml.range(of: "<system>Sub-agent Worker Alpha: completed</system>"))
         XCTAssertLessThan(summaryRange.lowerBound, toolCallRange.lowerBound)
-        XCTAssertLessThan(toolCallRange.lowerBound, statusRange.lowerBound)
+        XCTAssertLessThan(toolCallRange.upperBound, toolResultRange.lowerBound)
+        XCTAssertLessThan(toolResultRange.upperBound, statusRange.lowerBound)
     }
 
     func testSpartanLogXMLKeepsFailedAgentRunPreviewAndStatusForCollapsedGroupedHistory() throws {
@@ -41,7 +43,120 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
         )
 
         XCTAssertTrue(xml.contains("<tool_call name=\"agent_run\""))
+        XCTAssertTrue(xml.contains("<tool_result name=\"agent_run\" status=\"failed\"/>"))
         XCTAssertTrue(xml.contains("<system>Sub-agent child-failed-1: failed</system>"))
+    }
+
+    func testSpartanLogXMLEmitsFailedToolResultForFreshFinalTurnRun() throws {
+        let transcript = try makeFreshToolTranscript(
+            toolName: "agent_run",
+            resultObject: [
+                "session_id": "child-failed-fresh-1",
+                "status": "failed",
+                "is_error": true
+            ],
+            toolIsError: true
+        )
+
+        let xml = AgentTranscriptIO.buildSpartanLogXML(
+            from: transcript,
+            maxTranscriptItems: 100,
+            maxToolArgsCharacters: 2000
+        )
+
+        let toolCallRange = try XCTUnwrap(xml.range(of: "<tool_call name=\"agent_run\""))
+        let toolResultRange = try XCTUnwrap(xml.range(of: "<tool_result name=\"agent_run\" status=\"failed\"/>"))
+        XCTAssertLessThan(toolCallRange.upperBound, toolResultRange.lowerBound)
+    }
+
+    func testSpartanLogXMLDropsToolCallAndToolResultAsPairWhenBudgetedOut() throws {
+        let transcript = try makeFreshToolTranscript(
+            toolName: "read_file",
+            resultObject: ["status": "completed"],
+            toolIsError: false
+        )
+
+        let xml = AgentTranscriptIO.buildSpartanLogXML(
+            from: transcript,
+            maxTranscriptItems: 2,
+            maxToolArgsCharacters: 2000
+        )
+
+        XCTAssertTrue(xml.contains("<user>Run a tool</user>"))
+        XCTAssertTrue(xml.contains("<assistant>Done.</assistant>"))
+        XCTAssertFalse(xml.contains("<tool_call name=\"read_file\""))
+        XCTAssertFalse(xml.contains("<tool_result name=\"read_file\""))
+    }
+
+    func testSpartanLogXMLDoesNotEmitToolResultForRunningToolResult() throws {
+        let transcript = try makeFreshToolTranscript(
+            toolName: "read_file",
+            resultObject: ["status": "running"],
+            toolIsError: false
+        )
+
+        let xml = AgentTranscriptIO.buildSpartanLogXML(
+            from: transcript,
+            maxTranscriptItems: 100,
+            maxToolArgsCharacters: 2000
+        )
+
+        XCTAssertTrue(xml.contains("<tool_call name=\"read_file\""))
+        XCTAssertFalse(xml.contains("<tool_result name=\"read_file\""))
+
+        let item = try XCTUnwrap(
+            RemoteTranscriptProjector(remoteSessionID: "remote-running-result")
+                .projectGetLogResponse(.object([
+                    "session_id": .string("remote-running-result"),
+                    "turn_offset": .int(0),
+                    "turn_limit": .int(20),
+                    "returned_turn_count": .int(1),
+                    "total_turns": .int(1),
+                    "transcript_xml": .string(xml)
+                ]))
+                .items
+                .first { $0.kind == .toolCall }
+        )
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .running)
+    }
+
+    func testSpartanLogXMLEscapesHostileToolNameAttributesConsistently() throws {
+        let hostileToolName = "hostile\" > & < tool"
+        let sanitizedToolName = "hostile\"_>_&_<_tool"
+        let escapedToolName = "hostile&quot;_&gt;_&amp;_&lt;_tool"
+        let transcript = try makeFreshToolTranscript(
+            toolName: hostileToolName,
+            resultObject: ["status": "completed"],
+            toolIsError: false
+        )
+
+        let xml = AgentTranscriptIO.buildSpartanLogXML(
+            from: transcript,
+            maxTranscriptItems: 100,
+            maxToolArgsCharacters: 2000
+        )
+
+        XCTAssertTrue(xml.contains("<tool_call name=\"\(escapedToolName)\">"))
+        XCTAssertTrue(xml.contains("<tool_result name=\"\(escapedToolName)\" status=\"success\"/>"))
+        XCTAssertFalse(xml.contains("<tool_call name=\"\(hostileToolName)"))
+        XCTAssertFalse(xml.contains("<tool_result name=\"\(hostileToolName)"))
+
+        let item = try XCTUnwrap(
+            RemoteTranscriptProjector(remoteSessionID: "remote-hostile-tool-name")
+                .projectGetLogResponse(.object([
+                    "session_id": .string("remote-hostile-tool-name"),
+                    "turn_offset": .int(0),
+                    "turn_limit": .int(20),
+                    "returned_turn_count": .int(1),
+                    "total_turns": .int(1),
+                    "transcript_xml": .string(xml)
+                ]))
+                .items
+                .first { $0.kind == .toolCall }
+        )
+        XCTAssertEqual(item.toolName, sanitizedToolName)
+        XCTAssertNotNil(item.toolResultJSON)
+        XCTAssertNotEqual(ToolCallCardStateResolver.status(for: item), .running)
     }
 
     func testSpartanLogXMLAgentRunPreviewRoundTripsThroughRemoteTranscriptProjector() throws {
@@ -159,6 +274,39 @@ final class AgentTranscriptGroupedHistorySpawnExportTests: XCTestCase {
             })
         }
     #endif
+
+    private func makeFreshToolTranscript(
+        toolName: String,
+        resultObject: [String: Any],
+        toolIsError: Bool
+    ) throws -> AgentTranscript {
+        let invocationID = UUID()
+        let argsJSON = try jsonString(["path": "README.md"])
+        let items: [AgentChatItem] = try [
+            .user("Run a tool", sequenceIndex: 0),
+            .toolCall(
+                name: toolName,
+                invocationID: invocationID,
+                argsJSON: argsJSON,
+                sequenceIndex: 1
+            ),
+            .toolResult(
+                name: toolName,
+                invocationID: invocationID,
+                argsJSON: argsJSON,
+                resultJSON: jsonString(resultObject),
+                isError: toolIsError,
+                sequenceIndex: 2
+            ),
+            .assistant("Done.", sequenceIndex: 3)
+        ]
+        return AgentTranscriptIO.buildTranscript(
+            from: items,
+            terminalState: .completed,
+            nextSequenceIndex: 4,
+            compact: false
+        )
+    }
 
     private func makeCollapsedSpawnTranscript(
         resultObject: [String: Any],

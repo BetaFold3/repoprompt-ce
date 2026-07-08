@@ -37,7 +37,7 @@ actor RemoteGatewayRuntime {
     }
 
     private enum WorkspaceMatchSkippedReason: String {
-        case bound
+        case explicitWindowID = "explicit_window_id"
     }
 
     private let appLink: AppLinkSession
@@ -431,12 +431,11 @@ actor RemoteGatewayRuntime {
         }
         var effectiveFrame = frame
         if frame.type == "start",
-           explicitStartWindowID(frame) == nil,
            let payload = frame.payload?.objectValue,
            hasWorkspaceStartSelector(payload)
         {
-            if bindingState == .bound {
-                rememberWorkspaceStartMatchSkipped(frame: frame, deviceID: deviceID, reason: .bound)
+            if explicitStartWindowID(frame) != nil {
+                rememberWorkspaceStartMatchSkipped(frame: frame, deviceID: deviceID, reason: .explicitWindowID)
             } else if let match = await workspaceStartWindowMatch(payload: payload, frame: frame, deviceID: deviceID) {
                 rememberWorkspaceStartMatchCount(frame: frame, deviceID: deviceID, count: match.matchCount)
                 if let matchedWindow = match.summary {
@@ -539,8 +538,7 @@ actor RemoteGatewayRuntime {
                 let refreshedBindingState = await appLinkPool?.refreshBindingState(forDevice: deviceID)
                 if allowStartRoutingRetry,
                    explicitStartWindowID(frame) == nil,
-                   let refreshedBindingState,
-                   refreshedBindingState != .bound
+                   let refreshedBindingState
                 {
                     do {
                         return try await callTranslatedToolSingle(
@@ -670,7 +668,8 @@ actor RemoteGatewayRuntime {
     private func resolveAppLink(deviceID: String) async throws -> (AppLinkSession, RemoteGatewayBindingState) {
         if let appLinkPool, let session = await appLinkPool.session(forDevice: deviceID) {
             let bindingState = await appLinkPool.bindingState(forDevice: deviceID)
-            if case .bound = bindingState {
+            let shouldRefresh = await appLinkPool.bindingStateRequiresRefresh(forDevice: deviceID)
+            if case .bound = bindingState, !shouldRefresh {
                 return (session, bindingState)
             }
             let refreshed = await appLinkPool.refreshBindingState(forDevice: deviceID) ?? bindingState
@@ -1118,12 +1117,13 @@ actor RemoteGatewayRuntime {
             limit: frame.type == "get_log" ? requestPayload["limit"]?.intValue : nil,
             returnedTurnCount: frame.type == "get_log" ? responseObject["returned_turn_count"]?.intValue : nil,
             completedTurnCount: frame.type == "get_log" ? responseObject["completed_turn_count"]?.intValue : nil,
+            transcriptXMLChars: frame.type == "get_log" ? responseObject["transcript_xml"]?.stringValue?.count : nil,
             autoRoutedWindowID: autoRoutedWindowID,
             hasWorkspaceName: isStartBindingFailure ? hasWorkspaceName : nil,
             hasWorkspaceID: isStartBindingFailure ? hasWorkspaceID : nil,
-            workspaceMatchCount: isStartBindingFailure ? workspaceMatchCount : nil,
-            workspaceMatchSkipped: isStartBindingFailure ? workspaceMatchSkipped : nil,
-            workspaceMatchUnavailableReason: isStartBindingFailure ? workspaceMatchUnavailableReason : nil
+            workspaceMatchCount: frame.type == "start" ? workspaceMatchCount : nil,
+            workspaceMatchSkipped: frame.type == "start" ? workspaceMatchSkipped : nil,
+            workspaceMatchUnavailableReason: frame.type == "start" ? workspaceMatchUnavailableReason : nil
         ))
     }
 }

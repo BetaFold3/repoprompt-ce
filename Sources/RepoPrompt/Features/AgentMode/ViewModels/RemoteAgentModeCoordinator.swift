@@ -336,6 +336,7 @@ final class RemoteAgentModeCoordinator {
         let remoteSessionID = session.remoteHost?.remoteSessionID ?? "remote"
         let projector = RemoteTranscriptProjector(remoteSessionID: remoteSessionID)
         let projectedUserTextKeys = Set(rows.filter { $0.kind == .user }.map { Self.normalizedTextKey($0.text) })
+        let wasTerminal = Self.isTerminalRunState(session.runState)
         session.mutateItemsBatch { items in
             let existingItemIDs = Set(items.map(\.id))
             let optimisticUserTimestampByText = Self.optimisticUserTimestampByText(
@@ -362,7 +363,14 @@ final class RemoteAgentModeCoordinator {
                     merged.contains { $0.id == id }
                 }
             }
+            if wasTerminal {
+                _ = Self.settleResultlessToolCalls(in: &merged, terminalRunState: session.runState)
+            }
             items = merged
+        }
+        logTranscriptRowsApplied(rows, remoteSessionID: remoteSessionID, tabID: session.tabID)
+        if wasTerminal {
+            viewModel?.ensureDerivedTranscriptCurrentForExport(tabID: session.tabID)
         }
         session.hasSentFirstMessage = session.items.contains { $0.kind == .user }
         session.lastUserMessageAt = session.items
@@ -435,6 +443,9 @@ final class RemoteAgentModeCoordinator {
             session.runState = .failed
         }
         session.setRunningStatus(nil, source: nil)
+        session.mutateItemsBatch { items in
+            _ = Self.settleResultlessToolCalls(in: &items, terminalStatus: status)
+        }
     }
 
     private func requestFirstActiveChildSessionDiscovery(
@@ -707,6 +718,13 @@ final class RemoteAgentModeCoordinator {
         } == true
     }
 
+    private func logTranscriptRowsApplied(_ rows: [AgentChatItem], remoteSessionID: String, tabID: UUID) {
+        let lastAssistant = rows.last { $0.kind == .assistant }
+        let lastAssistantIDSuffix = lastAssistant.map { String($0.id.uuidString.suffix(12)) } ?? "none"
+        let lastAssistantTextCount = lastAssistant?.text.count ?? -1
+        Self.logger.log("remote transcript apply session_id=\(remoteSessionID, privacy: .public) tab_id=\(tabID.uuidString, privacy: .public) applied_row_count=\(rows.count) last_assistant_id_suffix=\(lastAssistantIDSuffix, privacy: .public) last_assistant_text_count=\(lastAssistantTextCount)")
+    }
+
     private static func optimisticUserTimestampByText(
         in items: [AgentChatItem],
         pendingIDs: Set<UUID>,
@@ -733,6 +751,69 @@ final class RemoteAgentModeCoordinator {
             else { return false }
             return toolName == "agent_run" || toolName == "agent_manage"
         }
+    }
+
+    private static func settleResultlessToolCalls(
+        in items: inout [AgentChatItem],
+        terminalRunState: AgentSessionRunState
+    ) -> Int {
+        settleResultlessToolCalls(in: &items, terminalSettlement: terminalSettlement(for: terminalRunState))
+    }
+
+    private static func settleResultlessToolCalls(
+        in items: inout [AgentChatItem],
+        terminalStatus: String
+    ) -> Int {
+        settleResultlessToolCalls(in: &items, terminalSettlement: terminalSettlement(for: terminalStatus))
+    }
+
+    private static func settleResultlessToolCalls(
+        in items: inout [AgentChatItem],
+        terminalSettlement: (statusWord: String, isError: Bool)
+    ) -> Int {
+        var settledCount = 0
+        for index in items.indices where items[index].kind == .toolCall
+            && items[index].toolResultJSON == nil
+            && items[index].toolIsError == nil
+        {
+            items[index].toolResultJSON = AgentToolResultPersistencePolicy.minimalResultJSON(
+                statusWord: terminalSettlement.statusWord,
+                normalizedToolName: items[index].toolName
+            )
+            items[index].toolIsError = terminalSettlement.isError
+            settledCount += 1
+        }
+        return settledCount
+    }
+
+    private static func terminalSettlement(for runState: AgentSessionRunState) -> (statusWord: String, isError: Bool) {
+        switch runState {
+        case .completed:
+            ("completed", false)
+        case .cancelled:
+            ("cancelled", true)
+        case .failed:
+            ("failed", true)
+        case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval:
+            ("failed", true)
+        }
+    }
+
+    private static func terminalSettlement(for status: String) -> (statusWord: String, isError: Bool) {
+        switch status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "completed":
+            ("completed", false)
+        case "cancelled", "canceled":
+            ("cancelled", true)
+        case "expired", "failed":
+            ("failed", true)
+        default:
+            ("failed", true)
+        }
+    }
+
+    private static func isTerminalRunState(_ runState: AgentSessionRunState) -> Bool {
+        runState == .completed || runState == .cancelled || runState == .failed
     }
 
     private func applyChannel(_ state: RemoteChannelState, to session: AgentModeViewModel.TabSession) {

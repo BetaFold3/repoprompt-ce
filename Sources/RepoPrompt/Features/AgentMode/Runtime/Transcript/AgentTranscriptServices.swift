@@ -3491,10 +3491,11 @@ enum AgentTranscriptIO {
         enum Payload {
             case tagged(tag: String, text: String)
             case rawXML(String)
+            case toolCall(name: String, args: String, resultStatusWord: String?)
         }
 
         let pos: Int
-        let payload: Payload
+        var payload: Payload
         let dropPriority: ForkItemDropPriority
         let turnID: UUID?
     }
@@ -3532,6 +3533,7 @@ enum AgentTranscriptIO {
 
         // Second pass: build fork items with priorities.
         var forkItems: [ForkItem] = []
+        var lastToolCallIndexByExecutionID: [String: Int] = [:]
         flatIndex = 0
         var pos = 0
         for entry in entries {
@@ -3562,12 +3564,34 @@ enum AgentTranscriptIO {
                     guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
                           let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(row.toolName) else { continue }
                     let args = truncateArgs(row.toolArgsJSON, max: maxToolArgsCharacters)
-                    let xml = args.isEmpty
-                        ? "<tool_call name=\"\(toolName)\"/>"
-                        : "<tool_call name=\"\(toolName)\">\(args)</tool_call>"
-                    forkItems.append(ForkItem(pos: pos, payload: .rawXML(xml), dropPriority: .toolCall, turnID: tid))
+                    let resultStatusWord = forkTranscriptToolResultStatusWord(for: row)
+                    forkItems.append(ForkItem(
+                        pos: pos,
+                        payload: .toolCall(name: toolName, args: args, resultStatusWord: resultStatusWord),
+                        dropPriority: .toolCall,
+                        turnID: tid
+                    ))
+                    if let execution = AgentTranscriptToolNormalizer.toolExecution(for: row) {
+                        lastToolCallIndexByExecutionID[execution.stableExecutionID] = forkItems.count - 1
+                    }
                     pos += 1
-                case .toolResult, .thinking:
+                case .toolResult:
+                    guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
+                          let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(row.toolName),
+                          let execution = AgentTranscriptToolNormalizer.toolExecution(for: row),
+                          let toolCallIndex = lastToolCallIndexByExecutionID[execution.stableExecutionID]
+                    else { continue }
+                    guard let resultStatusWord = forkTranscriptToolResultStatusWord(for: row) else { continue }
+                    if case let .toolCall(existingToolName, args, nil) = forkItems[toolCallIndex].payload,
+                       existingToolName == toolName
+                    {
+                        forkItems[toolCallIndex].payload = .toolCall(
+                            name: existingToolName,
+                            args: args,
+                            resultStatusWord: resultStatusWord
+                        )
+                    }
+                case .thinking:
                     break
                 }
             }
@@ -3589,7 +3613,7 @@ enum AgentTranscriptIO {
                     }
                     count += 1
                     lastWasSystem = (tag == "system")
-                case .rawXML:
+                case .rawXML, .toolCall:
                     count += 1
                     lastWasSystem = false
                 }
@@ -3676,6 +3700,12 @@ enum AgentTranscriptIO {
                 appendOutput(.tagged(tag: tag, text: text))
             case let .rawXML(xml):
                 appendOutput(.rawXML(xml))
+            case let .toolCall(name, args, resultStatusWord):
+                appendOutput(.rawXML(forkTranscriptToolCallXML(
+                    name: name,
+                    args: args,
+                    resultStatusWord: resultStatusWord
+                )))
             }
         }
 
@@ -3693,6 +3723,75 @@ enum AgentTranscriptIO {
         }
         lines.append("</transcript>")
         return lines.joined(separator: "\n")
+    }
+
+    private static func forkTranscriptToolCallXML(
+        name: String,
+        args: String,
+        resultStatusWord: String?
+    ) -> String {
+        let escapedName = forkTranscriptXMLAttributeEscaped(name)
+        let callXML = args.isEmpty
+            ? "<tool_call name=\"\(escapedName)\"/>"
+            : "<tool_call name=\"\(escapedName)\">\(args)</tool_call>"
+        guard let resultStatusWord else { return callXML }
+        return callXML + "\n<tool_result name=\"\(escapedName)\" status=\"\(resultStatusWord)\"/>"
+    }
+
+    private static func forkTranscriptXMLAttributeEscaped(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    private static func forkTranscriptToolResultStatusWord(for item: AgentChatItem) -> String? {
+        guard item.toolResultJSON != nil || item.toolIsError != nil else { return nil }
+        if item.kind == .toolResult {
+            return forkTranscriptToolResultStatusWord(
+                from: AgentTranscriptToolNormalizer.status(for: item),
+                toolIsError: item.toolIsError
+            )
+        }
+        if let object = ToolRawJSON.object(from: item.toolResultJSON) {
+            if let rawStatus = ToolRawJSON.string(object, key: "status")
+                ?? ToolRawJSON.string(object, key: "result")
+                ?? ToolRawJSON.string(object, key: "outcome")
+                ?? ToolRawJSON.string(object, key: "state"),
+                let normalized = AgentTranscriptToolStatusSemantics.normalizedStatusWord(rawStatus)
+            {
+                return forkTranscriptToolResultStatusWord(
+                    from: AgentTranscriptToolStatusSemantics.transcriptStatus(fromNormalizedStatusWord: normalized),
+                    toolIsError: item.toolIsError
+                )
+            }
+            if let isError = ToolRawJSON.bool(object, key: "is_error") ?? ToolRawJSON.bool(object, key: "isError") {
+                return isError ? "failed" : "success"
+            }
+            if let exitCode = ToolRawJSON.int(object, key: "exitCode") ?? ToolRawJSON.int(object, key: "exit_code") {
+                return exitCode == 0 ? "success" : "failed"
+            }
+        }
+        return forkTranscriptToolResultStatusWord(from: .unknown, toolIsError: item.toolIsError)
+    }
+
+    private static func forkTranscriptToolResultStatusWord(
+        from status: AgentTranscriptToolStatus,
+        toolIsError: Bool?
+    ) -> String? {
+        switch status {
+        case .success:
+            "success"
+        case .warning:
+            "warning"
+        case .failed, .cancelled:
+            "failed"
+        case .pending, .running:
+            nil
+        case .unknown:
+            toolIsError == true ? "failed" : "success"
+        }
     }
 
     /// Builds a spartan XML transcript for MCP log monitoring.
@@ -4334,6 +4433,10 @@ enum AgentTranscriptIO {
             from: sourceRow,
             execution: toolExecution
         )
+        let statusWord = forkTranscriptToolResultStatusWord(
+            from: toolExecution?.status ?? .success,
+            toolIsError: toolExecution?.toolIsError
+        )
         logHandoffDebug("spawn tool preview emit tool=\(toolName) args=\(argsJSON ?? "nil")")
         return AgentChatItem(
             timestamp: sourceRow.timestamp,
@@ -4341,6 +4444,13 @@ enum AgentTranscriptIO {
             text: "",
             toolName: toolName,
             toolArgsJSON: argsJSON,
+            toolResultJSON: statusWord.map {
+                AgentToolResultPersistencePolicy.minimalResultJSON(
+                    statusWord: $0,
+                    normalizedToolName: toolName
+                )
+            },
+            toolIsError: statusWord.map { $0 == "failed" },
             sequenceIndex: sourceRow.sequenceIndex,
             isStreaming: false
         )
@@ -4503,6 +4613,10 @@ enum AgentTranscriptIO {
             from: sourceRow,
             execution: toolExecution
         )
+        let statusWord = forkTranscriptToolResultStatusWord(
+            from: toolExecution?.status ?? .success,
+            toolIsError: toolExecution?.toolIsError
+        )
         logHandoffDebug("tool preview emit tool=\(toolName) args=\(argsJSON ?? "nil")")
         return AgentChatItem(
             timestamp: sourceRow.timestamp,
@@ -4510,6 +4624,13 @@ enum AgentTranscriptIO {
             text: "",
             toolName: toolName,
             toolArgsJSON: argsJSON,
+            toolResultJSON: statusWord.map {
+                AgentToolResultPersistencePolicy.minimalResultJSON(
+                    statusWord: $0,
+                    normalizedToolName: toolName
+                )
+            },
+            toolIsError: statusWord.map { $0 == "failed" },
             sequenceIndex: sourceRow.sequenceIndex,
             isStreaming: false
         )

@@ -957,6 +957,11 @@ struct AgentManageMCPToolService {
            let sessionID = liveSession.activeAgentSessionID
         {
             let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
+            if !hydrated.runState.isActive {
+                // Safe on every terminal get_log: canReuseDerivedTranscriptForSave makes this
+                // a no-op when already synchronized.
+                await agentModeVM.ensureDerivedTranscriptCurrentForExport(tabID: liveSession.tabID)
+            }
             let liveName = agentModeVM.sessionIndex[sessionID]?.name
             return (sessionID, liveName, hydrated.transcript, hydrated.runState)
         }

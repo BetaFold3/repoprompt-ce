@@ -46,6 +46,7 @@ private final class PoolRecordingConnector: AppLinkConnecting, @unchecked Sendab
 
 private actor PoolRecordingConnection: AppLinkConnection {
     private(set) var disconnected = false
+    private(set) var callTimeouts: [TimeInterval?] = []
     var nextResult: MCPToolResult?
 
     func setNextResult(_ result: MCPToolResult) {
@@ -55,9 +56,25 @@ private actor PoolRecordingConnection: AppLinkConnection {
     func callTool(
         name _: String,
         arguments _: [String: Value],
-        timeout _: TimeInterval?
+        timeout: TimeInterval?
     ) async throws -> MCPToolResult {
-        nextResult ?? GatewayTestHelpers.toolResult(json: .object(["sessions": .array([])]))
+        callTimeouts.append(timeout)
+        return nextResult ?? GatewayTestHelpers.toolResult(json: .object([
+            "windows": .array([
+                .object([
+                    "window_id": .int(1),
+                    "is_current_window": .bool(true),
+                    "workspace": .object([
+                        "id": .string("44444444-4444-4444-4444-444444444444"),
+                        "name": .string("Workspace A")
+                    ])
+                ])
+            ]),
+            "binding": .object([
+                "binding_kind": .string("window"),
+                "window_id": .int(1)
+            ])
+        ]))
     }
 
     func disconnect() async {
@@ -65,19 +82,48 @@ private actor PoolRecordingConnection: AppLinkConnection {
     }
 }
 
+private final class ManualMonotonicClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var time: TimeInterval
+
+    init(_ time: TimeInterval = 0) {
+        self.time = time
+    }
+
+    func now() -> TimeInterval {
+        lock.lock()
+        defer { lock.unlock() }
+        return time
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.lock()
+        time += interval
+        lock.unlock()
+    }
+}
+
 private final class BindingProbeSequence: @unchecked Sendable {
     private let lock = NSLock()
-    private var states: [RemoteGatewayBindingState]
+    private var states: [AppLinkPool.BindingProbeResult]
+    private(set) var callCount = 0
 
-    init(_ states: [RemoteGatewayBindingState]) {
+    init(_ states: [AppLinkPool.BindingProbeResult]) {
         self.states = states
     }
 
-    func next() -> RemoteGatewayBindingState {
+    func next() -> AppLinkPool.BindingProbeResult {
         lock.lock()
         defer { lock.unlock() }
+        callCount += 1
         if states.isEmpty { return .bound }
         return states.removeFirst()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return callCount
     }
 }
 
@@ -137,12 +183,32 @@ final class GatewayAppLinkPoolTests: XCTestCase {
     }
 
     private func makePool(
-        bindingProbe: AppLinkPool.BindingProbe? = nil
+        bindingProbe: AppLinkPool.BindingProbe? = nil,
+        unknownBindingRefreshCooldown: TimeInterval = 0,
+        now: @escaping AppLinkPool.MonotonicNow = { ProcessInfo.processInfo.systemUptime }
     ) -> AppLinkPool {
         AppLinkPool(
             configuration: configuration,
             connector: connector,
-            bindingProbe: bindingProbe ?? { _ in .bound }
+            bindingProbe: bindingProbe ?? { _ in .bound },
+            unknownBindingRefreshCooldown: unknownBindingRefreshCooldown,
+            now: now
+        )
+    }
+
+    private func makeRuntime(pool: AppLinkPool) async throws -> RemoteGatewayRuntime {
+        let defaultConnection = RecordingAppLinkConnection()
+        let appLink = AppLinkSession(
+            config: configuration,
+            connector: StaticAppLinkConnector(connection: defaultConnection)
+        )
+        try await appLink.connect()
+        return try RemoteGatewayRuntime(
+            appLink: appLink,
+            ledger: CommandLedger(),
+            watchManager: SessionWatchManager(appLink: appLink, appLinkPool: pool),
+            auditLog: nil,
+            appLinkPool: pool
         )
     }
 
@@ -223,9 +289,9 @@ final class GatewayAppLinkPoolTests: XCTestCase {
             isError: true
         ))
 
-        let state = await AppLinkPool.defaultBindingProbe(session: session)
-        guard case .bindingRequired = state else {
-            return XCTFail("Expected bindingRequired, got \(state)")
+        let result = await AppLinkPool.defaultBindingProbe(session: session)
+        guard case .bindingRequired = result.state else {
+            return XCTFail("Expected bindingRequired, got \(result)")
         }
     }
 
@@ -312,6 +378,176 @@ final class GatewayAppLinkPoolTests: XCTestCase {
         XCTAssertEqual(refreshed, .bound)
         let finalState = await pool.bindingState(forDevice: "remote:1a2b3c4d")
         XCTAssertEqual(finalState, .bound)
+    }
+
+    func testDefaultBindingProbeDetectsMultiWindowBindContextList() async throws {
+        let session = AppLinkSession(
+            config: configuration,
+            clientName: "remote:1a2b3c4d",
+            connector: connector
+        )
+        try await session.connect()
+        let connection = try XCTUnwrap(connector.connections["remote:1a2b3c4d"])
+        await connection.setNextResult(GatewayTestHelpers.toolResult(json: .object([
+            "windows": .array([
+                .object(["window_id": .int(1)]),
+                .object(["window_id": .int(2)])
+            ]),
+            "binding": .object(["binding_kind": .string("unbound")])
+        ])))
+
+        let result = await AppLinkPool.defaultBindingProbe(session: session)
+        guard case .bindingRequired = result.state else {
+            return XCTFail("Expected bindingRequired, got \(result)")
+        }
+        XCTAssertFalse(result.refreshOnNextResolve)
+    }
+
+    func testDefaultBindingProbeTransportErrorReturnsUnknown() async throws {
+        let connection = RecordingAppLinkConnection(responses: [.timeout(10)])
+        let session = AppLinkSession(
+            config: configuration,
+            clientName: "remote:1a2b3c4d",
+            connector: StaticAppLinkConnector(connection: connection)
+        )
+        try await session.connect()
+
+        let result = await AppLinkPool.defaultBindingProbe(session: session)
+        XCTAssertEqual(result.state, .bound)
+        XCTAssertTrue(result.refreshOnNextResolve)
+    }
+
+    func testUnknownBindingProbeStateRefreshesOnNextResolve() async throws {
+        let probeResults = BindingProbeSequence([.unknown, .bound])
+        let pool = makePool(bindingProbe: { _ in probeResults.next() })
+        let deviceID = "remote:1a2b3c4d"
+        _ = try await pool.ensureLink(forDevice: deviceID)
+        let initialState = await pool.bindingState(forDevice: deviceID)
+        let initialRequiresRefresh = await pool.bindingStateRequiresRefresh(forDevice: deviceID)
+        XCTAssertEqual(initialState, .bound)
+        XCTAssertTrue(initialRequiresRefresh)
+
+        let runtime = try await makeRuntime(pool: pool)
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_sessions"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(probeResults.count, 2)
+        let finalRequiresRefresh = await pool.bindingStateRequiresRefresh(forDevice: deviceID)
+        XCTAssertFalse(finalRequiresRefresh)
+    }
+
+    func testUnknownBindingProbeCooldownSuppressesImmediateResolveRefresh() async throws {
+        let clock = ManualMonotonicClock()
+        let probeResults = BindingProbeSequence([.unknown, .bound])
+        let pool = makePool(
+            bindingProbe: { _ in probeResults.next() },
+            unknownBindingRefreshCooldown: 4,
+            now: { clock.now() }
+        )
+        let deviceID = "remote:1a2b3c4d"
+        _ = try await pool.ensureLink(forDevice: deviceID)
+        XCTAssertEqual(probeResults.count, 1)
+        let immediateRequiresRefresh = await pool.bindingStateRequiresRefresh(forDevice: deviceID)
+        XCTAssertFalse(immediateRequiresRefresh)
+
+        let runtime = try await makeRuntime(pool: pool)
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_sessions"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(probeResults.count, 1)
+    }
+
+    func testUnknownBindingProbeCooldownRefreshesAfterExpiry() async throws {
+        let clock = ManualMonotonicClock()
+        let probeResults = BindingProbeSequence([.unknown, .unknown])
+        let pool = makePool(
+            bindingProbe: { _ in probeResults.next() },
+            unknownBindingRefreshCooldown: 4,
+            now: { clock.now() }
+        )
+        let deviceID = "remote:1a2b3c4d"
+        _ = try await pool.ensureLink(forDevice: deviceID)
+        clock.advance(by: 4.1)
+        let expiredRequiresRefresh = await pool.bindingStateRequiresRefresh(forDevice: deviceID)
+        XCTAssertTrue(expiredRequiresRefresh)
+
+        let runtime = try await makeRuntime(pool: pool)
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_sessions"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(probeResults.count, 2)
+        let resetRequiresRefresh = await pool.bindingStateRequiresRefresh(forDevice: deviceID)
+        XCTAssertFalse(resetRequiresRefresh)
+    }
+
+    func testSuccessfulBindingProbeRefreshClearsUnknownCooldown() async throws {
+        let clock = ManualMonotonicClock()
+        let probeResults = BindingProbeSequence([.unknown, .bound, .unknown])
+        let pool = makePool(
+            bindingProbe: { _ in probeResults.next() },
+            unknownBindingRefreshCooldown: 4,
+            now: { clock.now() }
+        )
+        let deviceID = "remote:1a2b3c4d"
+        _ = try await pool.ensureLink(forDevice: deviceID)
+        clock.advance(by: 4.1)
+
+        let runtime = try await makeRuntime(pool: pool)
+        let firstResponse = await runtime.handle(
+            RemoteClientFrame(type: "list_sessions"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(firstResponse?.type, "command_result")
+        XCTAssertEqual(probeResults.count, 2)
+        let clearedRequiresRefresh = await pool.bindingStateRequiresRefresh(forDevice: deviceID)
+        XCTAssertFalse(clearedRequiresRefresh)
+
+        clock.advance(by: 4.1)
+        let secondResponse = await runtime.handle(
+            RemoteClientFrame(type: "list_sessions"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(secondResponse?.type, "command_result")
+        XCTAssertEqual(probeResults.count, 2)
+    }
+
+    func testDefaultRefreshBindingProbeUsesShorterTimeoutThanInitialConnect() async throws {
+        let pool = AppLinkPool(
+            configuration: configuration,
+            connector: connector,
+            unknownBindingRefreshCooldown: 0
+        )
+        let deviceID = "remote:1a2b3c4d"
+        _ = try await pool.ensureLink(forDevice: deviceID)
+        await pool.setBindingState(.bound, forDevice: deviceID, refreshOnNextResolve: true)
+
+        _ = await pool.refreshBindingState(forDevice: deviceID)
+
+        let connection = try XCTUnwrap(connector.connections[deviceID])
+        let timeouts = await connection.callTimeouts
+        XCTAssertEqual(timeouts, [
+            AppLinkPool.defaultInitialBindingProbeTimeout,
+            AppLinkPool.defaultRefreshBindingProbeTimeout
+        ])
     }
 
     func testTeardownOnRevokeClosesLink() async throws {

@@ -144,6 +144,13 @@ struct RemoteTranscriptProjector: Equatable {
                 text: "Using tool: \(row.toolName ?? "tool")",
                 toolName: row.toolName,
                 toolArgsJSON: row.text.isEmpty ? nil : row.text,
+                toolResultJSON: row.toolResultStatusWord.map {
+                    AgentToolResultPersistencePolicy.minimalResultJSON(
+                        statusWord: $0,
+                        normalizedToolName: row.toolName
+                    )
+                },
+                toolIsError: row.toolResultStatusWord.map { $0 == "failed" },
                 sequenceIndex: sequenceIndex
             )
         case .system:
@@ -159,11 +166,12 @@ struct RemoteTranscriptProjector: Equatable {
         var kind: AgentChatItemKind
         var text: String
         var toolName: String?
+        var toolResultStatusWord: String?
     }
 
     private static func parseTranscriptXML(_ xml: String) -> [XMLRow] {
         guard !xml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
-        let pattern = #"(?s)<(user|assistant|system|error)>(.*?)</\1>|<tool_call\s+name="([^"]+)"\s*/>|<tool_call\s+name="([^"]+)">(.*?)</tool_call>"#
+        let pattern = #"(?s)<(user|assistant|system|error)>(.*?)</\1>|<tool_call\b([^>]*)\s*/>|<tool_call\b([^>]*)>(.*?)</tool_call>|<tool_result\b([^>]*)\s*/>"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
         let range = NSRange(xml.startIndex ..< xml.endIndex, in: xml)
         let matches = regex.matches(in: xml, options: [], range: range)
@@ -180,10 +188,25 @@ struct RemoteTranscriptProjector: Equatable {
                 default: .system
                 }
                 rows.append(XMLRow(kind: kind, text: text, toolName: nil))
-            } else if let toolName = string(in: xml, match: match, at: 3) {
+            } else if let attributes = string(in: xml, match: match, at: 3),
+                      let toolName = attribute("name", in: attributes)
+            {
                 rows.append(XMLRow(kind: .toolCall, text: "", toolName: decodeXMLEntities(toolName)))
-            } else if let toolName = string(in: xml, match: match, at: 4) {
-                rows.append(XMLRow(kind: .toolCall, text: decodeXMLEntities(string(in: xml, match: match, at: 5) ?? ""), toolName: decodeXMLEntities(toolName)))
+            } else if let attributes = string(in: xml, match: match, at: 4),
+                      let toolName = attribute("name", in: attributes)
+            {
+                rows.append(XMLRow(
+                    kind: .toolCall,
+                    text: decodeXMLEntities(string(in: xml, match: match, at: 5) ?? ""),
+                    toolName: decodeXMLEntities(toolName)
+                ))
+            } else if let attributes = string(in: xml, match: match, at: 6),
+                      let toolName = attribute("name", in: attributes),
+                      let statusWord = projectedToolResultStatusWord(attribute("status", in: attributes)),
+                      rows.last?.kind == .toolCall,
+                      rows.last?.toolName == decodeXMLEntities(toolName)
+            {
+                rows[rows.count - 1].toolResultStatusWord = statusWord
             }
         }
         if rows.isEmpty {
@@ -198,6 +221,29 @@ struct RemoteTranscriptProjector: Equatable {
             return [XMLRow(kind: .system, text: fallback, toolName: nil)]
         }
         return rows
+    }
+
+    private static func attribute(_ name: String, in attributes: String) -> String? {
+        let escapedName = NSRegularExpression.escapedPattern(for: name)
+        let pattern = #"(?:^|\s)"# + escapedName + #"\s*=\s*"([^"]*)""#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return nil }
+        let range = NSRange(attributes.startIndex ..< attributes.endIndex, in: attributes)
+        guard let match = regex.firstMatch(in: attributes, options: [], range: range) else { return nil }
+        return string(in: attributes, match: match, at: 1)
+    }
+
+    private static func projectedToolResultStatusWord(_ raw: String?) -> String? {
+        guard let normalized = AgentTranscriptToolStatusSemantics.normalizedStatusWord(raw) else { return nil }
+        switch AgentTranscriptToolStatusSemantics.transcriptStatus(fromNormalizedStatusWord: normalized) {
+        case .success:
+            return "success"
+        case .warning:
+            return "warning"
+        case .failed, .cancelled:
+            return "failed"
+        case .pending, .running, .unknown:
+            return nil
+        }
     }
 
     private static func string(in xml: String, match: NSTextCheckingResult, at index: Int) -> String? {

@@ -88,6 +88,74 @@ final class RemoteTranscriptProjectorTests: XCTestCase {
         XCTAssertEqual(item.text, projected.text)
     }
 
+    func testToolResultFoldsIntoPrecedingToolCallAndSettlesCard() throws {
+        let items = project(xml: """
+        <transcript>
+        <tool_call name="read_file">{"path":"README.md"}</tool_call>
+        <tool_result name="read_file" status="success"/>
+        </transcript>
+        """)
+
+        XCTAssertEqual(items.count, 1)
+        let item = try XCTUnwrap(items.first)
+        XCTAssertEqual(item.kind, .toolCall)
+        XCTAssertEqual(item.toolName, "read_file")
+        XCTAssertNotNil(item.toolResultJSON)
+        XCTAssertEqual(item.toolIsError, false)
+        XCTAssertNotEqual(ToolCallCardStateResolver.status(for: item), .running)
+    }
+
+    func testToolCallWithoutToolResultRemainsRunning() throws {
+        let item = try XCTUnwrap(project(xml: #"<tool_call name="read_file"/>"#).first)
+
+        XCTAssertNil(item.toolResultJSON)
+        XCTAssertNil(item.toolIsError)
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .running)
+    }
+
+    func testToolResultDoesNotConsumeSequenceIndex() {
+        let withResult = project(xml: """
+        <user>Start</user>
+        <tool_call name="read_file"/>
+        <tool_result status="success" name="read_file" extra="ignored"/>
+        <assistant>Done</assistant>
+        """)
+        let withoutResult = project(xml: """
+        <user>Start</user>
+        <tool_call name="read_file"/>
+        <assistant>Done</assistant>
+        """)
+
+        XCTAssertEqual(withResult.map(\.kind), withoutResult.map(\.kind))
+        XCTAssertEqual(withResult.map(\.sequenceIndex), withoutResult.map(\.sequenceIndex))
+        XCTAssertEqual(withResult.map(\.id), withoutResult.map(\.id))
+        XCTAssertNotNil(withResult.first { $0.kind == .toolCall }?.toolResultJSON)
+        XCTAssertNil(withoutResult.first { $0.kind == .toolCall }?.toolResultJSON)
+    }
+
+    func testUnmatchedToolResultIsIgnored() {
+        let items = project(xml: """
+        <tool_call name="read_file"/>
+        <tool_result name="write_file" status="success"/>
+        <assistant>Done</assistant>
+        """)
+
+        XCTAssertEqual(items.count, 2)
+        XCTAssertNil(items.first { $0.kind == .toolCall }?.toolResultJSON)
+    }
+
+    func testUnknownToolResultJSONFallsBackToRunning() {
+        let item = AgentChatItem(
+            kind: .toolCall,
+            text: "Using tool: read_file",
+            toolName: "read_file",
+            toolResultJSON: #"{"status":"unknown"}"#,
+            toolIsError: nil
+        )
+
+        XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .running)
+    }
+
     private func project(xml: String) -> [AgentChatItem] {
         RemoteTranscriptProjector(remoteSessionID: "remote-session-projector-test")
             .projectGetLogResponse(.object([

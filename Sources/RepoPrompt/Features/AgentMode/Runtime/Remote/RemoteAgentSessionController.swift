@@ -80,6 +80,7 @@ actor RemoteAgentSessionController {
     private var scheduledLogCatchUpDirty = false
     private var didReportLogCatchUpFailure = false
     private var didYieldSessionExpired = false
+    private var didTerminalSettleReRead = false
     private var isShutdown = false
 
     init(
@@ -155,6 +156,7 @@ actor RemoteAgentSessionController {
         }
         didYieldSessionExpired = false
         lastKnownRunState = .running
+        didTerminalSettleReRead = false
         remoteSessionID = sessionID
         Self.logger.notice("remote start response adopted request_id=\(frame.requestID ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) did_reset_cursor=\(didResetCursor)")
         projector = RemoteTranscriptProjector(remoteSessionID: sessionID)
@@ -183,6 +185,7 @@ actor RemoteAgentSessionController {
         )
         let response = try await commandWithTransportRetry(frame, operation: "steer", mayRetryTransportLoss: true)
         lastKnownRunState = .running
+        didTerminalSettleReRead = false
         applySnapshot(response, frameType: "session_update")
         try await catchUpFromHost()
     }
@@ -402,6 +405,7 @@ actor RemoteAgentSessionController {
         }
 
         try await pageLogsFromHost()
+        try await performTerminalSettleReReadIfNeeded()
     }
 
     private func pageLogsFromHost() async throws {
@@ -412,6 +416,7 @@ actor RemoteAgentSessionController {
             try ensureNotShutdown()
             let offset = nextLogOffset
             let page = try await fetchLogPage(offset: offset, limit: 20)
+            try ensureNotShutdown()
             guard page.returnedTurnCount > 0 else {
                 logLogPageResult(page, branch: "empty", emittedRowCount: 0)
                 return
@@ -444,6 +449,7 @@ actor RemoteAgentSessionController {
                 keepPaging = false
             } else {
                 let completedPage = try await fetchLogPage(offset: offset, limit: consumableOffset - offset)
+                try ensureNotShutdown()
                 let completedPageConsumableOffset = effectiveConsumableOffset(for: completedPage)
                 guard completedPageConsumableOffset >= completedPage.nextLogOffset else {
                     logLogPageResult(page, branch: "mixed-discarded", emittedRowCount: 0)
@@ -459,6 +465,18 @@ actor RemoteAgentSessionController {
                 }
             }
         }
+    }
+
+    private func performTerminalSettleReReadIfNeeded() async throws {
+        try ensureNotShutdown()
+        guard !lastKnownRunState.isActive, !didTerminalSettleReRead else { return }
+        guard nextLogOffset > 0 else { return }
+        let settleOffset = max(0, nextLogOffset - 1)
+        let page = try await fetchLogPage(offset: settleOffset, limit: 1)
+        try ensureNotShutdown()
+        didTerminalSettleReRead = true
+        emitLogPage(page)
+        logLogPageResult(page, branch: "terminal-settle", emittedRowCount: page.items.count)
     }
 
     private func fetchLogPage(offset: Int, limit: Int) async throws -> RemoteProjectedLogPage {
@@ -557,6 +575,7 @@ actor RemoteAgentSessionController {
                 self.scheduledLogCatchUpDirty = false
                 do {
                     try await self.pageLogsFromHost()
+                    try await self.performTerminalSettleReReadIfNeeded()
                     self.didReportLogCatchUpFailure = false
                 } catch {
                     self.reportLogCatchUpFailure(error)
@@ -581,6 +600,9 @@ actor RemoteAgentSessionController {
         }
         let sessionID = remoteSessionID ?? ""
         lastKnownRunState = projection.runState
+        if projection.runState.isActive {
+            didTerminalSettleReRead = false
+        }
         Self.logger.log("remote snapshot projected frame_type=\(frameType ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) run_state=\(projection.runState.rawValue, privacy: .public)")
         eventsContinuation.yield(.runState(projection.runState, pendingInteraction: projection.pendingInteraction))
         if let resolved = Self.interactionResolution(from: payload) {

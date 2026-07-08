@@ -22,14 +22,14 @@ private final class BindingRuntimeConnector: AppLinkConnecting, @unchecked Senda
 
 private final class BindingProbeRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var states: [RemoteGatewayBindingState]
+    private var states: [AppLinkPool.BindingProbeResult]
     private(set) var callCount = 0
 
-    init(_ states: [RemoteGatewayBindingState]) {
+    init(_ states: [AppLinkPool.BindingProbeResult]) {
         self.states = states
     }
 
-    func next() -> RemoteGatewayBindingState {
+    func next() -> AppLinkPool.BindingProbeResult {
         lock.lock()
         defer { lock.unlock() }
         callCount += 1
@@ -474,6 +474,7 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(record["limit"] as? Int, 3)
         XCTAssertEqual(record["returned_turn_count"] as? Int, 2)
         XCTAssertEqual(record["completed_turn_count"] as? Int, 8)
+        XCTAssertEqual(record["transcript_xml_chars"] as? Int, "<transcript/>".count)
     }
 
     func testStartBindingFailureAuditIncludesWorkspaceSelectorDiagnostics() async throws {
@@ -509,7 +510,7 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(record["workspace_match_count"] as? Int, 2)
     }
 
-    func testStartBindingFailureAuditRecordsWorkspaceMatchSkippedWhenBound() async throws {
+    func testStartBindingFailureAuditRecordsWorkspaceMatchSkippedForExplicitWindowID() async throws {
         let root = try GatewayTestHelpers.temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
@@ -526,7 +527,7 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             RemoteClientFrame(
                 type: "start",
                 requestID: "start-r1",
-                payload: .object(["message": .string("go"), "workspace_name": .string("Workspace B")])
+                payload: .object(["message": .string("go"), "workspace_name": .string("Workspace B"), "window_id": .int(2)])
             ),
             deviceID: "device",
             sinkID: UUID(),
@@ -538,7 +539,7 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(record["code"] as? String, "ambiguous_start_target")
         XCTAssertEqual(record["has_workspace_name"] as? Bool, true)
         XCTAssertNil(record["workspace_match_count"])
-        XCTAssertEqual(record["workspace_match_skipped"] as? String, "bound")
+        XCTAssertEqual(record["workspace_match_skipped"] as? String, "explicit_window_id")
         XCTAssertNil(record["workspace_match_unavailable_reason"])
     }
 
@@ -862,9 +863,67 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(steerCalls.count, 1)
     }
 
+    func testBoundStartWithUniqueWorkspaceNameAutoRoutesAndAuditsMatchCount() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(sessionID),
+                "status": .string("running")
+            ])))
+        ])
+        let root = try GatewayTestHelpers.temporaryRoot()
+        let config = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, maxRetainedFiles: 2)
+        let pool = AppLinkPool(
+            configuration: config,
+            connector: BindingRuntimeConnector(connection: connection),
+            bindingProbe: { _ in .bound }
+        )
+        _ = try await pool.ensureLink(forDevice: deviceID)
+
+        let defaultAppLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: RecordingAppLinkConnection())
+        )
+        try await defaultAppLink.connect()
+        let runtime = try RemoteGatewayRuntime(
+            appLink: defaultAppLink,
+            ledger: CommandLedger(),
+            watchManager: SessionWatchManager(appLink: defaultAppLink, appLinkPool: pool),
+            auditLog: auditLog,
+            appLinkPool: pool
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "r1",
+                payload: .object(["message": .string("go"), "workspace_name": .string("Workspace B")])
+            ),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context", "agent_run"])
+        let startCall = try XCTUnwrap(calls.last)
+        XCTAssertEqual(startCall.arguments["_windowID"], .int(2))
+        XCTAssertEqual(startCall.arguments["workspace_id"], .string("55555555-5555-5555-5555-555555555555"))
+
+        let auditRecord = try await waitForAuditRecord(in: auditDirectory, op: "start")
+        XCTAssertEqual(auditRecord["outcome"] as? String, "success")
+        XCTAssertEqual(auditRecord["workspace_match_count"] as? Int, 1)
+        XCTAssertEqual(auditRecord["auto_routed_window_id"] as? Int, 2)
+    }
+
     func testStartRoutingAppErrorWithUniqueWorkspaceNameAutoRoutesAfterBindingRefresh() async throws {
         let deviceID = "remote:1a2b3c4d"
         let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object(["error": .string("window inventory unavailable")]), isError: true)),
             .result(GatewayTestHelpers.toolResult(json: .object([
                 "code": .string("invalid_params"),
                 "error": .string("agent_run.start requires either an explicit tab context, an exact run-scoped tab, or a window-only connection bound to the target window")
@@ -880,8 +939,8 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         let config = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
         let probe = BindingProbeRecorder([
             .bound,
-            .ambiguousStartTarget("multiple windows"),
-            .ambiguousStartTarget("multiple windows")
+            .bound,
+            .bound
         ])
         let pool = AppLinkPool(
             configuration: config,
@@ -932,16 +991,18 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertNil(startCalls[1].arguments["workspace_name"])
         let steerCall = try XCTUnwrap(calls.first { $0.name == "agent_run" && $0.arguments["op"] == .string("steer") })
         XCTAssertEqual(steerCall.arguments["_windowID"], .int(2))
-        XCTAssertGreaterThanOrEqual(probe.count, 2, "Start routing app errors should refresh stale bound state before retrying")
+        XCTAssertGreaterThanOrEqual(probe.count, 2, "Start routing app errors should retry even when refreshed binding state is bound")
     }
 
     func testStartRoutingAppErrorWithNonMatchingWorkspaceNameReturnsAmbiguousStartTargetWithWindowsAndRefreshesBinding() async throws {
         let deviceID = "remote:1a2b3c4d"
         let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
             .result(GatewayTestHelpers.toolResult(json: .object([
                 "code": .string("invalid_params"),
                 "error": .string("agent_run.start requires either an explicit tab context, an exact run-scoped tab, or a window-only connection bound to the target window")
             ]), isError: true)),
+            .result(windowListResponse()),
             .result(windowListResponse())
         ])
         let root = try GatewayTestHelpers.temporaryRoot()

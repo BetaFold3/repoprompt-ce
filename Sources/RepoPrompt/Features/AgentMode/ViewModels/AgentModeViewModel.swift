@@ -9448,6 +9448,21 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    @discardableResult
+    func ensureDerivedTranscriptCurrentForExport(tabID: UUID) -> Bool {
+        guard let session = sessions[tabID] else { return false }
+        let publishActivePresentation = canBuildOrPublishActiveTranscriptBindings(for: session)
+        let didRefresh = catchUpDerivedTranscriptIfNeeded(
+            for: session,
+            reason: .saveSession,
+            publishActivePresentation: false
+        )
+        if publishActivePresentation {
+            updateBindingsFromSession(session)
+        }
+        return didRefresh
+    }
+
     private func derivedTranscriptProjectionLooksStale(for session: TabSession) -> Bool {
         guard !session.transcript.turns.isEmpty else { return false }
         let expectedCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: session.transcript)
