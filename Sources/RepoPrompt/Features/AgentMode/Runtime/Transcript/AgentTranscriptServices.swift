@@ -3776,6 +3776,8 @@ enum AgentTranscriptIO {
         return forkTranscriptToolResultStatusWord(from: .unknown, toolIsError: item.toolIsError)
     }
 
+    /// Maps transcript tool status to fork XML status for rows that already carry
+    /// a result payload or `toolIsError`; `.unknown` infers completion only in that context.
     private static func forkTranscriptToolResultStatusWord(
         from status: AgentTranscriptToolStatus,
         toolIsError: Bool?
@@ -3793,6 +3795,15 @@ enum AgentTranscriptIO {
             toolIsError == true ? "failed" : "success"
         }
     }
+
+    #if DEBUG
+        static func debugForkTranscriptToolResultStatusWordForTesting(
+            from status: AgentTranscriptToolStatus,
+            toolIsError: Bool?
+        ) -> String? {
+            forkTranscriptToolResultStatusWord(from: status, toolIsError: toolIsError)
+        }
+    #endif
 
     /// Builds a spartan XML transcript for MCP log monitoring.
     ///
@@ -3950,7 +3961,7 @@ enum AgentTranscriptIO {
                 let migratedToolRow = handoffMigratedStandaloneToolItem(for: block)
                 let toolPreviewItem = groupedHistoryToolPreviewItem(
                     for: block,
-                    allowFailedSpawnFamilyPreview: preserveIntermediateAssistantNarration
+                    preserveFailedToolPreviews: preserveIntermediateAssistantNarration
                 )
                 if let toolPreviewItem {
                     logHandoffDebug("standaloneTool synthesized toolCall tool=\(toolPreviewItem.toolName ?? "nil")")
@@ -4433,8 +4444,11 @@ enum AgentTranscriptIO {
             from: sourceRow,
             execution: toolExecution
         )
+        // Near-dead invariant guard: toolExecution(for:) should never be nil for
+        // toolCall/toolResult preview rows. Default to .pending deliberately so a
+        // missing execution can never fabricate success; do not optimize to .success.
         let statusWord = forkTranscriptToolResultStatusWord(
-            from: toolExecution?.status ?? .success,
+            from: toolExecution?.status ?? .pending,
             toolIsError: toolExecution?.toolIsError
         )
         logHandoffDebug("spawn tool preview emit tool=\(toolName) args=\(argsJSON ?? "nil")")
@@ -4588,7 +4602,7 @@ enum AgentTranscriptIO {
 
     private static func groupedHistoryToolPreviewItem(
         for childBlock: AgentTranscriptRenderBlock,
-        allowFailedSpawnFamilyPreview: Bool = false
+        preserveFailedToolPreviews: Bool = false
     ) -> AgentChatItem? {
         let visibleRows = childBlock.rows.filter { !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow($0) }
         let toolCallRow = visibleRows.first(where: { $0.kind == .toolCall })
@@ -4604,7 +4618,7 @@ enum AgentTranscriptIO {
             .last
         if let toolExecution,
            toolExecution.status == .failed || toolExecution.status == .cancelled,
-           !(allowFailedSpawnFamilyPreview && isSpawnFamilyToolName(toolName))
+           !preserveFailedToolPreviews
         {
             logHandoffDebug("tool preview pruned tool=\(toolName) status=\(toolExecution.status.rawValue)")
             return nil
@@ -4613,8 +4627,11 @@ enum AgentTranscriptIO {
             from: sourceRow,
             execution: toolExecution
         )
+        // Near-dead invariant guard: toolExecution(for:) should never be nil for
+        // toolCall/toolResult preview rows. Default to .pending deliberately so a
+        // missing execution can never fabricate success; do not optimize to .success.
         let statusWord = forkTranscriptToolResultStatusWord(
-            from: toolExecution?.status ?? .success,
+            from: toolExecution?.status ?? .pending,
             toolIsError: toolExecution?.toolIsError
         )
         logHandoffDebug("tool preview emit tool=\(toolName) args=\(argsJSON ?? "nil")")

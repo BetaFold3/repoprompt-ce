@@ -51,8 +51,8 @@ private enum RemoteLogPagingError: Error, CustomStringConvertible {
 }
 
 enum RemoteSessionEvent: Equatable {
-    case transcriptRows([AgentChatItem])
-    case runState(AgentSessionRunState, pendingInteraction: RemotePendingInteraction?)
+    case transcriptRows(items: [AgentChatItem], removedIDs: [UUID])
+    case runState(AgentSessionRunState, pendingInteraction: RemotePendingInteraction?, statusText: String?)
     case interactionResolved(interactionID: String, resolvedBy: String?)
     case sessionExpired
     case terminal(status: String)
@@ -81,6 +81,9 @@ actor RemoteAgentSessionController {
     private var didReportLogCatchUpFailure = false
     private var didYieldSessionExpired = false
     private var didTerminalSettleReRead = false
+    private var projectedRowIDsByPageOffset: [Int: Set<UUID>] = [:]
+    private var lastCompletePageOffset: Int?
+    private var lastLegacyAdvanceOffset: Int?
     private var isShutdown = false
 
     init(
@@ -153,6 +156,7 @@ actor RemoteAgentSessionController {
             nextLogOffset = 0
             scheduledLogCatchUpDirty = false
             didReportLogCatchUpFailure = false
+            resetLogReconciliationState()
         }
         didYieldSessionExpired = false
         lastKnownRunState = .running
@@ -423,8 +427,11 @@ actor RemoteAgentSessionController {
             }
 
             guard page.completedTurnCount != nil else {
-                emitLogPage(page)
+                emitLogPage(page, reconciliation: .parked)
                 let didAdvance = advanceLogOffset(to: page.consumableOffset, from: offset)
+                if didAdvance {
+                    lastLegacyAdvanceOffset = offset
+                }
                 logLogPageResult(page, branch: "legacy", emittedRowCount: page.items.count)
                 keepPaging = nextLogOffset < page.totalTurns && didAdvance
                 if !didAdvance {
@@ -435,7 +442,7 @@ actor RemoteAgentSessionController {
 
             let consumableOffset = effectiveConsumableOffset(for: page)
             if consumableOffset >= page.nextLogOffset {
-                emitLogPage(page)
+                emitLogPage(page, reconciliation: .complete)
                 let didAdvance = advanceLogOffset(to: consumableOffset, from: offset)
                 logLogPageResult(page, branch: "complete", emittedRowCount: page.items.count)
                 keepPaging = nextLogOffset < page.totalTurns && didAdvance
@@ -443,7 +450,7 @@ actor RemoteAgentSessionController {
                     emitNonAdvancingLogPageWarning()
                 }
             } else if consumableOffset <= offset {
-                emitLogPage(page)
+                emitLogPage(page, reconciliation: .parked)
                 emitBinding()
                 logLogPageResult(page, branch: "parked", emittedRowCount: page.items.count)
                 keepPaging = false
@@ -456,7 +463,7 @@ actor RemoteAgentSessionController {
                     keepPaging = false
                     continue
                 }
-                emitLogPage(completedPage)
+                emitLogPage(completedPage, reconciliation: .complete)
                 let didAdvance = advanceLogOffset(to: min(consumableOffset, completedPageConsumableOffset), from: offset)
                 logLogPageResult(completedPage, branch: "mixed", emittedRowCount: completedPage.items.count)
                 keepPaging = nextLogOffset < page.totalTurns && didAdvance
@@ -470,12 +477,24 @@ actor RemoteAgentSessionController {
     private func performTerminalSettleReReadIfNeeded() async throws {
         try ensureNotShutdown()
         guard !lastKnownRunState.isActive, !didTerminalSettleReRead else { return }
-        guard nextLogOffset > 0 else { return }
-        let settleOffset = max(0, nextLogOffset - 1)
-        let page = try await fetchLogPage(offset: settleOffset, limit: 1)
+        let settleOffset: Int
+        let settleLimit: Int
+        let reconciliation: LogPageReconciliation
+        if let lastCompletePageOffset {
+            settleOffset = lastCompletePageOffset
+            settleLimit = max(1, nextLogOffset - lastCompletePageOffset)
+            reconciliation = .complete
+        } else if lastLegacyAdvanceOffset != nil, nextLogOffset > 0 {
+            settleOffset = max(0, nextLogOffset - 1)
+            settleLimit = 1
+            reconciliation = .parked
+        } else {
+            return
+        }
+        let page = try await fetchLogPage(offset: settleOffset, limit: settleLimit)
         try ensureNotShutdown()
         didTerminalSettleReRead = true
-        emitLogPage(page)
+        emitLogPage(page, reconciliation: reconciliation)
         logLogPageResult(page, branch: "terminal-settle", emittedRowCount: page.items.count)
     }
 
@@ -500,10 +519,45 @@ actor RemoteAgentSessionController {
         return page
     }
 
-    private func emitLogPage(_ page: RemoteProjectedLogPage) {
-        if !page.items.isEmpty {
-            eventsContinuation.yield(.transcriptRows(page.items))
+    private enum LogPageReconciliation {
+        case parked
+        case complete
+    }
+
+    private func emitLogPage(_ page: RemoteProjectedLogPage, reconciliation: LogPageReconciliation) {
+        let removedIDs = reconcileProjectedRows(for: page, reconciliation: reconciliation)
+        if !page.items.isEmpty || !removedIDs.isEmpty {
+            eventsContinuation.yield(.transcriptRows(items: page.items, removedIDs: removedIDs))
         }
+    }
+
+    private func reconcileProjectedRows(
+        for page: RemoteProjectedLogPage,
+        reconciliation: LogPageReconciliation
+    ) -> [UUID] {
+        let incomingIDs = Set(page.items.map(\.id))
+        switch reconciliation {
+        case .parked:
+            projectedRowIDsByPageOffset[page.turnOffset, default: []].formUnion(incomingIDs)
+            return []
+        case .complete:
+            let rememberedIDs = projectedRowIDsByPageOffset[page.turnOffset, default: []]
+            // Complete pages mirror the host export exactly. Rows suppressed by the host export
+            // (including maxTranscriptItems budget drops) are reconciled away once absent here.
+            // This registry is in-memory per controller; parked rows persisted from a previous app
+            // run cannot be diffed on the first complete page after restart without future persisted
+            // row-origin tagging.
+            let removedIDs = rememberedIDs.subtracting(incomingIDs)
+            projectedRowIDsByPageOffset[page.turnOffset] = incomingIDs
+            lastCompletePageOffset = page.turnOffset
+            return removedIDs.sorted { $0.uuidString < $1.uuidString }
+        }
+    }
+
+    private func resetLogReconciliationState() {
+        projectedRowIDsByPageOffset.removeAll()
+        lastCompletePageOffset = nil
+        lastLegacyAdvanceOffset = nil
     }
 
     private func effectiveConsumableOffset(for page: RemoteProjectedLogPage) -> Int {
@@ -524,8 +578,17 @@ actor RemoteAgentSessionController {
 
     private func advanceLogOffset(to offset: Int, from previousOffset: Int) -> Bool {
         nextLogOffset = max(nextLogOffset, offset)
+        pruneProjectedRowRegistry()
         emitBinding()
         return nextLogOffset > previousOffset
+    }
+
+    private func pruneProjectedRowRegistry() {
+        let minimumRetainedOffset = nextLogOffset - 1
+        guard minimumRetainedOffset > 0 else { return }
+        projectedRowIDsByPageOffset = projectedRowIDsByPageOffset.filter { offset, _ in
+            offset >= minimumRetainedOffset || offset == lastCompletePageOffset
+        }
     }
 
     private func emitNonAdvancingLogPageWarning() {
@@ -604,7 +667,11 @@ actor RemoteAgentSessionController {
             didTerminalSettleReRead = false
         }
         Self.logger.log("remote snapshot projected frame_type=\(frameType ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) run_state=\(projection.runState.rawValue, privacy: .public)")
-        eventsContinuation.yield(.runState(projection.runState, pendingInteraction: projection.pendingInteraction))
+        eventsContinuation.yield(.runState(
+            projection.runState,
+            pendingInteraction: projection.pendingInteraction,
+            statusText: projection.statusText
+        ))
         if let resolved = Self.interactionResolution(from: payload) {
             eventsContinuation.yield(.interactionResolved(
                 interactionID: resolved.interactionID,

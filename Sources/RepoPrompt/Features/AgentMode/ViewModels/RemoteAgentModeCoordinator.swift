@@ -284,14 +284,14 @@ final class RemoteAgentModeCoordinator {
             session.lastActivityAt = Date()
         }
         switch event {
-        case let .transcriptRows(rows):
+        case let .transcriptRows(rows, removedIDs):
             let containsSpawnTool = Self.containsSpawnToolCall(rows)
-            applyTranscriptRows(rows, to: session)
+            applyTranscriptRows(rows, removedIDs: removedIDs, to: session)
             if containsSpawnTool {
                 requestChildSessionDiscovery(for: session, reason: "transcript_spawn")
             }
-        case let .runState(runState, pendingInteraction):
-            applyRunState(runState, pendingInteraction: pendingInteraction, to: session)
+        case let .runState(runState, pendingInteraction, statusText):
+            applyRunState(runState, pendingInteraction: pendingInteraction, statusText: statusText, to: session)
             if runState.isActive {
                 requestFirstActiveChildSessionDiscovery(for: session, reason: "session_update")
             }
@@ -331,13 +331,21 @@ final class RemoteAgentModeCoordinator {
         viewModel?.scheduleSave(for: tabID)
     }
 
-    private func applyTranscriptRows(_ rows: [AgentChatItem], to session: AgentModeViewModel.TabSession) {
-        guard !rows.isEmpty else { return }
+    private func applyTranscriptRows(
+        _ rows: [AgentChatItem],
+        removedIDs: [UUID] = [],
+        to session: AgentModeViewModel.TabSession
+    ) {
+        guard !rows.isEmpty || !removedIDs.isEmpty else { return }
         let remoteSessionID = session.remoteHost?.remoteSessionID ?? "remote"
         let projector = RemoteTranscriptProjector(remoteSessionID: remoteSessionID)
         let projectedUserTextKeys = Set(rows.filter { $0.kind == .user }.map { Self.normalizedTextKey($0.text) })
         let wasTerminal = Self.isTerminalRunState(session.runState)
         session.mutateItemsBatch { items in
+            let removedIDSet = Set(removedIDs)
+            if !removedIDSet.isEmpty {
+                items.removeAll { removedIDSet.contains($0.id) }
+            }
             let existingItemIDs = Set(items.map(\.id))
             let optimisticUserTimestampByText = Self.optimisticUserTimestampByText(
                 in: items,
@@ -368,7 +376,7 @@ final class RemoteAgentModeCoordinator {
             }
             items = merged
         }
-        logTranscriptRowsApplied(rows, remoteSessionID: remoteSessionID, tabID: session.tabID)
+        logTranscriptRowsApplied(rows, removedIDs: removedIDs, remoteSessionID: remoteSessionID, tabID: session.tabID)
         if wasTerminal {
             viewModel?.ensureDerivedTranscriptCurrentForExport(tabID: session.tabID)
         }
@@ -383,6 +391,7 @@ final class RemoteAgentModeCoordinator {
     private func applyRunState(
         _ runState: AgentSessionRunState,
         pendingInteraction: RemotePendingInteraction?,
+        statusText: String?,
         to session: AgentModeViewModel.TabSession
     ) {
         if let pendingInteraction {
@@ -426,7 +435,10 @@ final class RemoteAgentModeCoordinator {
         }
         session.runState = runState
         if runState == .running {
-            session.setRunningStatus("Running on \(session.remoteHost?.hostDisplayName ?? "remote host")…", source: .transport)
+            session.setRunningStatus(
+                statusText ?? "Running on \(session.remoteHost?.hostDisplayName ?? "remote host")…",
+                source: .transport
+            )
         }
     }
 
@@ -718,11 +730,16 @@ final class RemoteAgentModeCoordinator {
         } == true
     }
 
-    private func logTranscriptRowsApplied(_ rows: [AgentChatItem], remoteSessionID: String, tabID: UUID) {
+    private func logTranscriptRowsApplied(
+        _ rows: [AgentChatItem],
+        removedIDs: [UUID],
+        remoteSessionID: String,
+        tabID: UUID
+    ) {
         let lastAssistant = rows.last { $0.kind == .assistant }
         let lastAssistantIDSuffix = lastAssistant.map { String($0.id.uuidString.suffix(12)) } ?? "none"
         let lastAssistantTextCount = lastAssistant?.text.count ?? -1
-        Self.logger.log("remote transcript apply session_id=\(remoteSessionID, privacy: .public) tab_id=\(tabID.uuidString, privacy: .public) applied_row_count=\(rows.count) last_assistant_id_suffix=\(lastAssistantIDSuffix, privacy: .public) last_assistant_text_count=\(lastAssistantTextCount)")
+        Self.logger.log("remote transcript apply session_id=\(remoteSessionID, privacy: .public) tab_id=\(tabID.uuidString, privacy: .public) applied_row_count=\(rows.count) removed_row_count=\(removedIDs.count) last_assistant_id_suffix=\(lastAssistantIDSuffix, privacy: .public) last_assistant_text_count=\(lastAssistantTextCount)")
     }
 
     private static func optimisticUserTimestampByText(
@@ -1041,8 +1058,33 @@ final class RemoteAgentModeCoordinator {
             handle(event, tabID: tabID)
         }
 
-        func test_applyTranscriptRows(_ rows: [AgentChatItem], to session: AgentModeViewModel.TabSession) {
-            applyTranscriptRows(rows, to: session)
+        func test_applyTranscriptRows(
+            _ rows: [AgentChatItem],
+            removedIDs: [UUID] = [],
+            to session: AgentModeViewModel.TabSession
+        ) {
+            applyTranscriptRows(rows, removedIDs: removedIDs, to: session)
+        }
+
+        func test_applyRunState(
+            _ runState: AgentSessionRunState,
+            pendingInteraction: RemotePendingInteraction? = nil,
+            statusText: String? = nil,
+            to session: AgentModeViewModel.TabSession
+        ) {
+            applyRunState(runState, pendingInteraction: pendingInteraction, statusText: statusText, to: session)
+        }
+
+        func test_applyTerminal(status: String, to session: AgentModeViewModel.TabSession) {
+            applyTerminal(status: status, to: session)
+        }
+
+        static func test_terminalSettlement(for status: String) -> (statusWord: String, isError: Bool) {
+            terminalSettlement(for: status)
+        }
+
+        static func test_terminalSettlement(for runState: AgentSessionRunState) -> (statusWord: String, isError: Bool) {
+            terminalSettlement(for: runState)
         }
 
         func test_recordStartSessionName(

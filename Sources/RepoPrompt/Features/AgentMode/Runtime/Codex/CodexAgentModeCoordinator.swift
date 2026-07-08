@@ -4683,8 +4683,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         recordCodexWatchdogProgress(for: session)
         updateCodexStallWatchdogState(for: session)
+        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else {
+            flushPendingAssistantDelta(session)
+            return
+        }
         sealAssistantBoundary(session)
-        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         let argsJSON = Self.encodeArgsToJSON(args)
         let toolItem = AgentChatItem.toolCall(
             name: toolName,
@@ -4712,8 +4715,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         recordCodexWatchdogProgress(for: session)
         updateCodexStallWatchdogState(for: session)
+        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else {
+            flushPendingAssistantDelta(session)
+            return
+        }
         sealAssistantBoundary(session)
-        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         let argsJSON = Self.encodeArgsToJSON(args)
         let canonicalToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
         var correlationPath = "none"
@@ -7280,6 +7286,40 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: AgentModeViewModel.TabSession
         ) async {
             await handleCodexNativeEvent(event, session: session)
+        }
+
+        @_spi(TestSupport)
+        public func test_handleCodexTrackerToolCall(
+            invocationID: UUID?,
+            toolName: String,
+            args: [String: Value]? = nil,
+            session: AgentModeViewModel.TabSession
+        ) {
+            handleCodexToolCall(
+                invocationID: invocationID,
+                toolName: toolName,
+                args: args,
+                session: session
+            )
+        }
+
+        @_spi(TestSupport)
+        public func test_handleCodexTrackerToolResult(
+            invocationID: UUID?,
+            toolName: String,
+            args: [String: Value]? = nil,
+            resultJSON: String,
+            isError: Bool,
+            session: AgentModeViewModel.TabSession
+        ) {
+            handleCodexToolResult(
+                invocationID: invocationID,
+                toolName: toolName,
+                args: args,
+                resultJSON: resultJSON,
+                isError: isError,
+                session: session
+            )
         }
 
         @_spi(TestSupport)

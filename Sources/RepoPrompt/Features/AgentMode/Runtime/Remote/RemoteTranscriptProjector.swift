@@ -24,6 +24,7 @@ struct RemoteProjectedLogPage: Equatable {
 
 struct RemoteProjectedSnapshot: Equatable {
     var statusRaw: String
+    var statusText: String?
     var runState: AgentSessionRunState
     var pendingInteraction: RemotePendingInteraction?
     var terminalStatus: String?
@@ -64,6 +65,7 @@ struct RemoteTranscriptProjector: Equatable {
     func projectSnapshot(_ payload: JSONValue, frameType: String? = nil) -> RemoteProjectedSnapshot {
         let object = payload.objectValue ?? [:]
         let statusRaw = object["status"]?.stringValue ?? "running"
+        let statusText = object["status_text"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let pending = RemotePendingInteraction(snapshotPayload: payload, remoteSessionID: remoteSessionID)
         let isExpired = frameType == "session_expired" || statusRaw == "expired"
         let terminalStatus: String? = switch statusRaw {
@@ -98,6 +100,7 @@ struct RemoteTranscriptProjector: Equatable {
         let sessionObject = object["session"]?.objectValue
         return RemoteProjectedSnapshot(
             statusRaw: statusRaw,
+            statusText: statusText?.isEmpty == false ? statusText : nil,
             runState: runState,
             pendingInteraction: pending,
             terminalStatus: terminalStatus,

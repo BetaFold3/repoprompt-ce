@@ -80,7 +80,7 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
         XCTAssertEqual(getLogCountAfterSettle, 3)
     }
 
-    func testAttachAndCatchUpTerminalSessionReReadsLastConsumedTurnOnce() async throws {
+    func testAttachAndCatchUpTerminalSessionSkipsTerminalSettleReReadWithoutAppliedCompletePage() async throws {
         let connection = ScriptedRemoteAgentSessionConnection(responses: [
             "poll": [Self.snapshotPayload(status: "completed")],
             "get_log": [
@@ -90,18 +90,55 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
                     total: 1,
                     xml: "<transcript/>",
                     completed: 1
-                ),
-                Self.logPayload(
-                    offset: 0,
-                    returned: 1,
-                    total: 1,
-                    xml: "<user>Prompt</user>\n<assistant>Full terminal reply</assistant>",
-                    completed: 1
                 )
             ]
         ])
         let controller = RemoteAgentSessionController(
             binding: Self.makeBinding(nextLogOffset: 1),
+            connection: connection
+        )
+        defer {
+            Task { await controller.shutdown() }
+        }
+
+        try await controller.attachAndCatchUp()
+
+        let currentBinding = await controller.currentBinding()
+        let binding = try XCTUnwrap(currentBinding)
+        XCTAssertEqual(binding.nextLogOffset, 1)
+        let requests = await connection.getLogRequests()
+        XCTAssertEqual(requests.map(\.offset), [1])
+        XCTAssertEqual(requests.map(\.limit), [20])
+    }
+
+    func testLegacyTerminalSettleReReadHealsTruncatedFinalAssistantWithoutRemovals() async throws {
+        let connection = ScriptedRemoteAgentSessionConnection(responses: [
+            "get_log": [
+                Self.logPayload(
+                    offset: 0,
+                    returned: 1,
+                    total: 1,
+                    xml: "<user>Prompt</user>\n<assistant>partial final</assistant>",
+                    completed: nil
+                ),
+                Self.logPayload(
+                    offset: 1,
+                    returned: 0,
+                    total: 1,
+                    xml: "<transcript/>",
+                    completed: nil
+                ),
+                Self.logPayload(
+                    offset: 0,
+                    returned: 1,
+                    total: 1,
+                    xml: "<user>Prompt</user>\n<assistant>full final assistant</assistant>",
+                    completed: nil
+                )
+            ]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: Self.makeBinding(lastAppliedSeq: 0, nextLogOffset: 0),
             connection: connection
         )
         let recorder = RemoteSessionEventRecorder()
@@ -115,17 +152,34 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
             Task { await controller.shutdown() }
         }
 
-        try await controller.attachAndCatchUp()
-        try await waitForTranscriptBatchCount(1, recorder: recorder)
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-abc",
+            seq: 1,
+            payload: Self.snapshotPayload(status: "running")
+        ))
+        await waitForCondition {
+            await connection.commandCount(type: "get_log") >= 1
+        }
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_terminal",
+            sessionID: "remote-session-abc",
+            seq: 2,
+            payload: Self.snapshotPayload(status: "completed")
+        ))
+        await waitForCondition {
+            await connection.commandCount(type: "get_log") >= 2
+        }
+        try await waitForTranscriptBatchCount(2, recorder: recorder)
 
         let upsertedRows = await recorder.upsertedTranscriptRows()
-        XCTAssertEqual(upsertedRows.map(\.text), ["Prompt", "Full terminal reply"])
-        let currentBinding = await controller.currentBinding()
-        let binding = try XCTUnwrap(currentBinding)
-        XCTAssertEqual(binding.nextLogOffset, 1)
+        XCTAssertEqual(upsertedRows.map(\.text), ["Prompt", "full final assistant"])
         let requests = await connection.getLogRequests()
-        XCTAssertEqual(requests.map(\.offset), [1, 0])
-        XCTAssertEqual(requests.map(\.limit), [20, 1])
+        XCTAssertEqual(requests.map(\.offset), [0, 1, 0])
+        XCTAssertEqual(requests.map(\.limit), [20, 20, 1])
+        let removals = await recorder.allRemovedIDs()
+        XCTAssertTrue(removals.allSatisfy(\.isEmpty))
     }
 
     func testTerminalSettleReReadRetriesAfterTransientFetchFailure() async throws {
@@ -133,10 +187,17 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
         let connection = ScriptedRemoteAgentSessionConnection(scriptedResponses: [
             "get_log": [
                 .payload(Self.logPayload(
-                    offset: 1,
-                    returned: 0,
+                    offset: 0,
+                    returned: 1,
                     total: 1,
-                    xml: "<transcript/>",
+                    xml: "<user>Prompt</user>\n<assistant>partial</assistant>",
+                    completed: 0
+                )),
+                .payload(Self.logPayload(
+                    offset: 0,
+                    returned: 1,
+                    total: 1,
+                    xml: "<user>Prompt</user>\n<assistant>partial</assistant>",
                     completed: 1
                 )),
                 .transportFailure("temporary terminal settle failure"),
@@ -157,7 +218,7 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
             ]
         ])
         let controller = RemoteAgentSessionController(
-            binding: Self.makeBinding(lastAppliedSeq: 0, nextLogOffset: 1),
+            binding: Self.makeBinding(lastAppliedSeq: 0, nextLogOffset: 0),
             connection: connection
         )
         let recorder = RemoteSessionEventRecorder()
@@ -172,13 +233,13 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
         }
 
         await controller.handleInboundFrame(RemoteServerFrame(
-            type: "session_terminal",
+            type: "session_update",
             sessionID: "remote-session-abc",
             seq: 1,
-            payload: Self.snapshotPayload(status: "completed")
+            payload: Self.snapshotPayload(status: "running")
         ))
         await waitForCondition {
-            await connection.commandCount(type: "get_log") >= 2
+            await connection.commandCount(type: "get_log") >= 1
         }
 
         await controller.handleInboundFrame(RemoteServerFrame(
@@ -188,15 +249,25 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
             payload: Self.snapshotPayload(status: "completed")
         ))
         await waitForCondition {
-            await connection.commandCount(type: "get_log") >= 4
+            await connection.commandCount(type: "get_log") >= 3
         }
-        try await waitForTranscriptBatchCount(1, recorder: recorder)
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_terminal",
+            sessionID: "remote-session-abc",
+            seq: 3,
+            payload: Self.snapshotPayload(status: "completed")
+        ))
+        await waitForCondition {
+            await connection.commandCount(type: "get_log") >= 5
+        }
+        try await waitForTranscriptBatchCount(3, recorder: recorder)
 
         let upsertedRows = await recorder.upsertedTranscriptRows()
         XCTAssertEqual(upsertedRows.map(\.text), ["Prompt", fullText])
         let requests = await connection.getLogRequests()
-        XCTAssertEqual(requests.map(\.offset), [1, 0, 1, 0])
-        XCTAssertEqual(requests.map(\.limit), [20, 1, 20, 1])
+        XCTAssertEqual(requests.map(\.offset), [0, 0, 0, 1, 0])
+        XCTAssertEqual(requests.map(\.limit), [20, 20, 1, 20, 1])
     }
 
     func testShutdownAfterFetchReturnsBeforeEmitDoesNotEmitRowsOrAdvanceCursor() async throws {
@@ -369,17 +440,23 @@ private enum ScriptedRemoteResponse {
 
 private actor RemoteSessionEventRecorder {
     private var transcriptRows: [[AgentChatItem]] = []
+    private var removedIDs: [[UUID]] = []
     private var transcriptBatchWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
     func record(_ event: RemoteSessionEvent) {
-        if case let .transcriptRows(rows) = event {
+        if case let .transcriptRows(rows, removed) = event {
             transcriptRows.append(rows)
+            removedIDs.append(removed)
             resumeSatisfiedWaiters()
         }
     }
 
     func allTranscriptRows() -> [[AgentChatItem]] {
         transcriptRows
+    }
+
+    func allRemovedIDs() -> [[UUID]] {
+        removedIDs
     }
 
     func waitForTranscriptBatchCount(_ count: Int) async {

@@ -291,6 +291,9 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(rows.map(\.text), ["Final reply"])
         let getLogCount = await connection.commandCount(type: "get_log")
         XCTAssertEqual(getLogCount, 2)
+        let requests = await connection.getLogRequests()
+        XCTAssertEqual(requests.map(\.offset), [0, 0])
+        XCTAssertEqual(requests.map(\.limit), [20, 1])
     }
 
     func testCompletedDetachedStartStillFetchesInitialReplyLog() async throws {
@@ -587,7 +590,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         }
 
         let allRows = await recorder.allTranscriptRows()
-        XCTAssertEqual(allRows.map { $0.map(\.text) }, [
+        XCTAssertEqual(allRows.filter { !$0.isEmpty }.map { $0.map(\.text) }, [
             ["First prompt", "First reply"],
             ["Second prompt"],
             ["Second prompt", "Second reply"]
@@ -1117,7 +1120,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         session.remoteHost = makeBinding(remoteSessionID: "remote-parent-before")
 
         fixture.coordinator.test_handleEvent(
-            .runState(.running, pendingInteraction: nil),
+            .runState(.running, pendingInteraction: nil, statusText: nil),
             tabID: fixture.tabID
         )
 
@@ -1238,7 +1241,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
 
         let toolCall = Self.remoteToolCall(name: "read_file")
-        fixture.coordinator.test_handleEvent(.transcriptRows([toolCall]), tabID: fixture.tabID)
+        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: []), tabID: fixture.tabID)
 
         let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
         XCTAssertNotNil(settledTool.toolResultJSON)
@@ -1275,7 +1278,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(session.runState, .cancelled)
 
         let toolCall = Self.remoteToolCall(name: "read_file")
-        fixture.coordinator.test_handleEvent(.transcriptRows([toolCall]), tabID: fixture.tabID)
+        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: []), tabID: fixture.tabID)
 
         let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
         XCTAssertEqual(settledTool.toolIsError, true)
@@ -1721,7 +1724,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func record(_ event: RemoteSessionEvent) {
             switch event {
-            case let .transcriptRows(rows):
+            case let .transcriptRows(rows, _):
                 transcriptRows.append(rows)
                 resumeSatisfiedTranscriptBatchWaiters()
             case let .systemMessage(message):
