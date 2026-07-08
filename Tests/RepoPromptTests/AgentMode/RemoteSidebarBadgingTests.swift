@@ -294,9 +294,13 @@ final class RemoteSidebarBadgingTests: XCTestCase {
             deviceID: "ab12cd34",
             displayName: "Tuan’s MacBook Pro"
         )
-        XCTAssertEqual(known.label, "Tuan’s MacBook Pro")
+        XCTAssertEqual(known.label, "TMP")
         XCTAssertEqual(known.badgeTooltip, "Remote controlled by Tuan’s MacBook Pro (ab12cd34)")
         XCTAssertEqual(known.statusPlateTooltip, "Remote controlled by Tuan’s MacBook Pro (ab12cd34)")
+
+        XCTAssertEqual(AgentSessionRow.remoteControlDeviceBadgeAbbreviation(for: "Studio"), "STU")
+        XCTAssertEqual(AgentSessionRow.remoteControlDeviceBadgeAbbreviation(for: "Mac mini"), "MM")
+        XCTAssertEqual(AgentSessionRow.remoteControlDeviceBadgeAbbreviation(for: "Tuan's iPad Pro 13"), "TIP")
 
         let unknown = AgentSessionRow.remoteControlDeviceBadgeText(deviceID: "remote:feedbabe", displayName: nil)
         XCTAssertEqual(unknown.label, "feedbabe")

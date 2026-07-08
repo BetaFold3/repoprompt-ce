@@ -402,7 +402,7 @@ struct AgentSessionRow: View {
         {
             let tooltip = "Remote controlled by \(displayName) (\(label))"
             return AgentRemoteControlDeviceBadgeText(
-                label: displayName,
+                label: remoteControlDeviceBadgeAbbreviation(for: displayName),
                 badgeTooltip: tooltip,
                 statusPlateTooltip: tooltip
             )
@@ -412,6 +412,25 @@ struct AgentSessionRow: View {
             badgeTooltip: "Remote-controlled by device \(deviceID)",
             statusPlateTooltip: "Remote controlled (device \(label))"
         )
+    }
+
+    /// Compact badge label for a paired-device display name: initials of the first
+    /// three tokens ("Tuan's MacBook Pro" → "TMP"); single-token names use their
+    /// first three characters ("Studio" → "STU"). Collisions are acceptable — the
+    /// badge is per-row provenance and the tooltip always carries the full name + hex.
+    static func remoteControlDeviceBadgeAbbreviation(for displayName: String) -> String {
+        let stripped = displayName
+            .replacingOccurrences(of: "'", with: "")
+            .replacingOccurrences(of: "\u{2019}", with: "")
+        let tokens = stripped.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        let initials = tokens.prefix(3).compactMap(\.first)
+        if initials.count >= 2 {
+            return String(initials).uppercased()
+        }
+        if let firstToken = tokens.first {
+            return String(firstToken.prefix(3)).uppercased()
+        }
+        return displayName
     }
 
     static func remoteControlDeviceLabel(for deviceID: String) -> String {
