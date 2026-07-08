@@ -6,6 +6,7 @@ protocol RemoteAgentSessionConnection: Sendable {
     func command(_ frame: RemoteClientFrame, timeout: TimeInterval) async throws -> JSONValue
     func ensureConnected() async throws
     func subscribe(sessionIDs: [String]) async throws
+    func unsubscribe(sessionIDs: [String]) async throws
 }
 
 extension RemoteAgentSessionConnection {
@@ -265,6 +266,18 @@ actor RemoteAgentSessionController {
             lastAppliedSeq: lastAppliedSeq,
             nextLogOffset: nextLogOffset
         )
+    }
+
+    func unsubscribe() async {
+        guard let sessionID = remoteSessionID?.trimmingCharacters(in: .whitespacesAndNewlines), !sessionID.isEmpty else {
+            return
+        }
+        let remoteHostID = hostID
+        do {
+            try await connection.unsubscribe(sessionIDs: [sessionID])
+        } catch {
+            Self.logger.debug("remote unsubscribe failed host_id=\(remoteHostID, privacy: .public) session_id=\(sessionID, privacy: .public) error=\(String(describing: error), privacy: .public)")
+        }
     }
 
     func listChildSessions() async throws -> [RemoteAgentSessionDescriptor] {

@@ -403,8 +403,32 @@ extension AgentModeViewModel {
             sessionListSortDates: ownerValidatedSessionListSortDates,
             sessionListCacheReady: ownerValidatedSessionListCacheReady,
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
-            mcpControlledTabIDs: mcpControlledTabIDs
+            mcpControlledTabIDs: mcpControlledTabIDs,
+            registeredRemoteHosts: registeredRemoteHostsForSidebar(currentIndex: currentIndex)
         ).build()
+    }
+
+    private func registeredRemoteHostsForSidebar(
+        currentIndex: [UUID: AgentSessionIndexEntry]
+    ) -> [(id: String, displayName: String)] {
+        let observedRemoteHostIDs = Set(
+            sessions.values.compactMap { $0.remoteHost?.hostID }
+        ).union(currentIndex.values.compactMap(\.remoteHostID))
+        guard !observedRemoteHostIDs.isEmpty else {
+            sidebarRegisteredRemoteHostsCache = nil
+            return []
+        }
+        if let cache = sidebarRegisteredRemoteHostsCache,
+           cache.remoteHostIDs == observedRemoteHostIDs
+        {
+            return cache.hosts
+        }
+
+        let hosts = ((try? remoteHostRegistry.listHosts()) ?? [])
+            .filter { !$0.isRevokedByHost }
+            .map { (id: $0.id, displayName: $0.displayName) }
+        sidebarRegisteredRemoteHostsCache = (remoteHostIDs: observedRemoteHostIDs, hosts: hosts)
+        return hosts
     }
 
     func collapsibleSidebarThreadKeys(
@@ -659,6 +683,7 @@ extension AgentModeViewModel {
             depth: row.depth,
             isMCPControlled: row.isMCPControlled,
             remoteHostName: row.remoteHostName,
+            remoteHostAbbreviation: row.remoteHostAbbreviation,
             remoteControlDeviceID: row.remoteControlDeviceID,
             worktree: row.worktree,
             worktreeMergeAttention: row.worktreeMergeAttention,

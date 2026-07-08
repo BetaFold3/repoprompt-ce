@@ -167,6 +167,214 @@ final class RemoteHostConnectionTests: XCTestCase {
         await connection.disconnect()
     }
 
+    func testSubscribeBindingRequiredFallsBackPerSessionAndPrunesFailures() async throws {
+        let record = try upsertClientRecord()
+        await enqueueTicket()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        try await connection.ensureConnected()
+        let attempts = SubscribeAttemptRecorder()
+        await connection.setSubscribeCommandHandlerForTesting { sessionIDs in
+            await attempts.record(sessionIDs)
+            if sessionIDs.count > 1 || sessionIDs == ["bad-session"] {
+                throw RemoteClientError.fromCommandError(
+                    code: "binding_required",
+                    message: "bind first"
+                )
+            }
+            return .object([:])
+        }
+
+        do {
+            try await connection.subscribe(sessionIDs: ["bad-session", "good-session"])
+            XCTFail("Expected subscribe to surface the failing requested session")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "binding_required")
+        }
+
+        let desired = await connection.desiredSubscriptionsForTesting()
+        let parked = await connection.parkedSubscriptionsForTesting()
+        XCTAssertEqual(desired, ["good-session"])
+        XCTAssertEqual(parked, ["bad-session"])
+        let subscribeAttempts = await attempts.all()
+        XCTAssertEqual(subscribeAttempts, [["bad-session", "good-session"], ["bad-session"], ["good-session"]])
+        guard case .connected = await connection.currentState() else {
+            XCTFail("Expected binding_required fallback to keep the socket connected")
+            return
+        }
+        await connection.disconnect()
+    }
+
+    func testConnectTimeSubscribeBindingRequiredDoesNotDisconnectSocket() async throws {
+        let record = try upsertClientRecord()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        await connection.setDesiredSubscriptionsForTesting(["stale-session"])
+        await connection.setSubscribeCommandHandlerForTesting { _ in
+            throw RemoteClientError.fromCommandError(
+                code: "binding_required",
+                message: "bind first"
+            )
+        }
+        await enqueueTicket()
+
+        try await connection.ensureConnected()
+
+        guard case .connected = await connection.currentState() else {
+            XCTFail("Expected connect-time command-level subscribe failure to leave the socket connected")
+            return
+        }
+        let desired = await connection.desiredSubscriptionsForTesting()
+        let parked = await connection.parkedSubscriptionsForTesting()
+        XCTAssertTrue(desired.isEmpty)
+        XCTAssertEqual(parked, ["stale-session"])
+        await connection.disconnect()
+    }
+
+    func testSubscribeBindingRequiredDuringConnectStillThrowsForRequestedID() async throws {
+        let record = try upsertClientRecord()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        await connection.setSubscribeCommandHandlerForTesting { _ in
+            throw RemoteClientError.fromCommandError(
+                code: "binding_required",
+                message: "bind first"
+            )
+        }
+        await enqueueTicket()
+
+        do {
+            try await connection.subscribe(sessionIDs: ["bad-session"])
+            XCTFail("Expected requested subscribe failure to be surfaced")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "binding_required")
+        }
+
+        let desired = await connection.desiredSubscriptionsForTesting()
+        let parked = await connection.parkedSubscriptionsForTesting()
+        XCTAssertTrue(desired.isEmpty)
+        XCTAssertEqual(parked, ["bad-session"])
+        guard case .connected = await connection.currentState() else {
+            XCTFail("Expected requested command failure to leave the socket connected")
+            return
+        }
+        await connection.disconnect()
+    }
+
+    func testInterleavedSubscribeSurvivesBindingRequiredFallback() async throws {
+        let record = try upsertClientRecord()
+        await enqueueTicket()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        try await connection.ensureConnected()
+        let attempts = SubscribeAttemptRecorder()
+        let gate = OneShotAsyncGate()
+        await connection.setSubscribeCommandHandlerForTesting { sessionIDs in
+            await attempts.record(sessionIDs)
+            if sessionIDs.count > 1 {
+                throw RemoteClientError.fromCommandError(code: "binding_required", message: "bind first")
+            }
+            if sessionIDs == ["bad-session"] {
+                if await gate.claim() {
+                    Task {
+                        try? await connection.subscribe(sessionIDs: ["late-session"])
+                    }
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                throw RemoteClientError.fromCommandError(code: "binding_required", message: "bind first")
+            }
+            return .object([:])
+        }
+
+        do {
+            try await connection.subscribe(sessionIDs: ["bad-session", "good-session"])
+            XCTFail("Expected bad requested session to fail")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "binding_required")
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let desired = await connection.desiredSubscriptionsForTesting()
+        let parked = await connection.parkedSubscriptionsForTesting()
+        XCTAssertEqual(desired, ["good-session", "late-session"])
+        XCTAssertEqual(parked, ["bad-session"])
+        let subscribeAttempts = await attempts.all()
+        XCTAssertTrue(subscribeAttempts.contains(["late-session"]) || subscribeAttempts.contains(["bad-session", "good-session", "late-session"]))
+        await connection.disconnect()
+    }
+
+    func testInterleavedUnsubscribeIsNotResurrectedByBindingRequiredFallback() async throws {
+        let record = try upsertClientRecord()
+        await enqueueTicket()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        try await connection.ensureConnected()
+        let gate = OneShotAsyncGate()
+        await connection.setSubscribeCommandHandlerForTesting { sessionIDs in
+            if sessionIDs.count > 1 {
+                throw RemoteClientError.fromCommandError(code: "binding_required", message: "bind first")
+            }
+            if sessionIDs == ["bad-session"] {
+                if await gate.claim() {
+                    Task {
+                        try? await connection.unsubscribe(sessionIDs: ["good-session"])
+                    }
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                throw RemoteClientError.fromCommandError(code: "binding_required", message: "bind first")
+            }
+            return .object([:])
+        }
+
+        do {
+            try await connection.subscribe(sessionIDs: ["bad-session", "good-session"])
+            XCTFail("Expected bad requested session to fail")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "binding_required")
+        }
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let desired = await connection.desiredSubscriptionsForTesting()
+        let parked = await connection.parkedSubscriptionsForTesting()
+        XCTAssertTrue(desired.isEmpty)
+        XCTAssertEqual(parked, ["bad-session"])
+        await connection.disconnect()
+    }
+
+    func testParkedSubscribeRetriesAndRecoversOnReconnect() async throws {
+        let record = try upsertClientRecord()
+        await enqueueTicket()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        let attempts = SubscribeAttemptRecorder()
+        let acceptance = SubscribeAcceptanceSwitch()
+        await connection.setSubscribeCommandHandlerForTesting { sessionIDs in
+            await attempts.record(sessionIDs)
+            if await acceptance.isAccepting() {
+                return .object([:])
+            }
+            throw RemoteClientError.fromCommandError(code: "binding_required", message: "bind first")
+        }
+
+        do {
+            try await connection.subscribe(sessionIDs: ["recover-session"])
+            XCTFail("Expected first subscribe to park the session")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "binding_required")
+        }
+        var desired = await connection.desiredSubscriptionsForTesting()
+        var parked = await connection.parkedSubscriptionsForTesting()
+        XCTAssertTrue(desired.isEmpty)
+        XCTAssertEqual(parked, ["recover-session"])
+
+        await connection.disconnect()
+        await acceptance.setAccepting(true)
+        await enqueueTicket()
+        try await connection.ensureConnected()
+
+        desired = await connection.desiredSubscriptionsForTesting()
+        parked = await connection.parkedSubscriptionsForTesting()
+        let recoverAttemptCount = await attempts.count(of: ["recover-session"])
+        XCTAssertEqual(desired, ["recover-session"])
+        XCTAssertTrue(parked.isEmpty)
+        XCTAssertGreaterThanOrEqual(recoverAttemptCount, 2)
+        await connection.disconnect()
+    }
+
     func testRevocationDuringHelloMarksRegistryAndStopsRetrying() async throws {
         let record = try upsertClientRecord()
         _ = await authenticator.updateTrust(GatewayAuthTestSupport.trustSnapshot(
@@ -318,6 +526,44 @@ final class RemoteHostConnectionTests: XCTestCase {
         try registry.upsertHost(record)
         try keyStore.save(device.signer, forHostID: record.id)
         return record
+    }
+
+    private actor SubscribeAttemptRecorder {
+        private var attempts: [[String]] = []
+
+        func record(_ sessionIDs: [String]) {
+            attempts.append(sessionIDs)
+        }
+
+        func all() -> [[String]] {
+            attempts
+        }
+
+        func count(of sessionIDs: [String]) -> Int {
+            attempts.count { $0 == sessionIDs }
+        }
+    }
+
+    private actor OneShotAsyncGate {
+        private var didClaim = false
+
+        func claim() -> Bool {
+            guard !didClaim else { return false }
+            didClaim = true
+            return true
+        }
+    }
+
+    private actor SubscribeAcceptanceSwitch {
+        private var accepting = false
+
+        func setAccepting(_ value: Bool) {
+            accepting = value
+        }
+
+        func isAccepting() -> Bool {
+            accepting
+        }
     }
 
     @discardableResult

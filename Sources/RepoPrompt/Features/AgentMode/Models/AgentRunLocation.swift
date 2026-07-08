@@ -55,17 +55,20 @@ struct AgentRunLocationHostOption: Identifiable, Equatable, Hashable {
             let tokens = Self.tokens(in: displayName)
             switch tokens.count {
             case let count where count >= 2:
-                base = (Self.prefix(tokens[0], count: 1) + Self.prefix(tokens[1], count: 1)).lowercased()
+                // Display policy: primary initials are uppercase for visual
+                // labels, while collision extensions and ID suffixes remain
+                // lowercase/readable additions (for example, "MSaa").
+                base = (Self.prefix(tokens[0], count: 1) + Self.prefix(tokens[1], count: 1)).uppercased()
                 lastToken = tokens[count - 1].lowercased()
                 consumedLastTokenCharacters = count == 2 ? 1 : 0
             case 1:
-                base = Self.prefix(tokens[0], count: 2).lowercased()
+                base = Self.prefix(tokens[0], count: 2).uppercased()
                 lastToken = tokens[0].lowercased()
                 consumedLastTokenCharacters = min(2, tokens[0].count)
             default:
-                base = Self.prefix(id, count: 2).lowercased()
-                lastToken = base
-                consumedLastTokenCharacters = base.count
+                base = Self.prefix(id, count: 2).uppercased()
+                lastToken = id.lowercased()
+                consumedLastTokenCharacters = min(2, id.count)
             }
         }
 

@@ -14,6 +14,7 @@ struct AgentModeSidebarSessionBuilder {
     let sessionListCacheReady: Bool
     let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
     let mcpControlledTabIDs: Set<UUID>
+    let registeredRemoteHosts: [(id: String, displayName: String)]
 
     private struct BuildContext {
         let tabByID: [UUID: ComposeTabState]
@@ -22,6 +23,7 @@ struct AgentModeSidebarSessionBuilder {
         let sortDateByTabID: [UUID: Date]
         let explicitSessionIDByTabID: [UUID: UUID]
         let bestEntryByTabID: [UUID: AgentSessionIndexEntry]
+        let remoteHostAbbreviationByHostID: [String: String]
         let useFrozenRestoreOrder: Bool
     }
 
@@ -107,7 +109,31 @@ struct AgentModeSidebarSessionBuilder {
             sortDateByTabID: sortDateByTabID,
             explicitSessionIDByTabID: explicitSessionIDByTabID,
             bestEntryByTabID: bestEntryByTabID,
+            remoteHostAbbreviationByHostID: remoteHostAbbreviationLookup(),
             useFrozenRestoreOrder: shouldFreezeSidebarOrdering(for: linkedTabs)
+        )
+    }
+
+    private func remoteHostAbbreviationLookup() -> [String: String] {
+        var hostsByID = Dictionary(
+            registeredRemoteHosts.map { ($0.id, $0.displayName) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        for session in sessions.values {
+            guard let remoteHost = session.remoteHost,
+                  hostsByID[remoteHost.hostID] == nil
+            else { continue }
+            hostsByID[remoteHost.hostID] = remoteHost.hostDisplayName
+        }
+        for entry in sessionIndex.values {
+            guard let hostID = entry.remoteHostID,
+                  let hostName = entry.remoteHostName,
+                  hostsByID[hostID] == nil
+            else { continue }
+            hostsByID[hostID] = hostName
+        }
+        return AgentRunLocationHostOption.abbreviations(
+            for: hostsByID.map { (id: $0.key, displayName: $0.value) }
         )
     }
 
@@ -275,6 +301,8 @@ struct AgentModeSidebarSessionBuilder {
         let resolvedParentSessionID = metadataLiveSession?.parentSessionID ?? entry?.parentSessionID
         let isMCPControlled = mcpControlledTabIDs.contains(tab.id)
         let remoteControlDeviceID = Self.remoteControlDeviceID(liveSession: boundLiveSession, entry: entry)
+        let remoteHostID = metadataLiveSession?.remoteHost?.hostID ?? entry?.remoteHostID
+        let remoteHostName = metadataLiveSession?.remoteHost?.hostDisplayName ?? entry?.remoteHostName
         let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
         let mergeAttention = sidebarRowWorktreeMergeAttention(liveSession: metadataLiveSession, entry: entry)
         let searchFields = Self.searchFields(
@@ -299,7 +327,8 @@ struct AgentModeSidebarSessionBuilder {
             parentSessionID: resolvedParentSessionID,
             depth: 0,
             isMCPControlled: isMCPControlled,
-            remoteHostName: metadataLiveSession?.remoteHost?.hostDisplayName ?? entry?.remoteHostName,
+            remoteHostName: remoteHostName,
+            remoteHostAbbreviation: remoteHostID.flatMap { context.remoteHostAbbreviationByHostID[$0] },
             remoteControlDeviceID: remoteControlDeviceID,
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
@@ -746,6 +775,7 @@ struct AgentModeSidebarSessionBuilder {
             depth: depth,
             isMCPControlled: session.isMCPControlled,
             remoteHostName: session.remoteHostName,
+            remoteHostAbbreviation: session.remoteHostAbbreviation,
             remoteControlDeviceID: session.remoteControlDeviceID,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,

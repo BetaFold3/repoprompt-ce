@@ -399,6 +399,7 @@ struct AgentModeSessionsListView: View {
                                 isWaiting: agentModeVM.isTabWaiting(session.tabID),
                                 attentionRunState: sidebarUI.snapshot.attentionRunStateByTabID[session.tabID],
                                 remoteHostName: session.remoteHostName,
+                                remoteHostAbbreviation: session.remoteHostAbbreviation,
                                 remoteControlDeviceID: session.remoteControlDeviceID,
                                 worktree: session.worktree,
                                 worktreeMergeAttention: session.worktreeMergeAttention,

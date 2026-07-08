@@ -637,6 +637,10 @@ final class AgentModeViewModel: ObservableObject {
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var remoteCatalogLoadTasksByHostID: [String: Task<Void, Never>] = [:]
+    var sidebarRegisteredRemoteHostsCache: (
+        remoteHostIDs: Set<String>,
+        hosts: [(id: String, displayName: String)]
+    )?
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     let sessionIndexStore = AgentWorkspaceSessionIndexStore()

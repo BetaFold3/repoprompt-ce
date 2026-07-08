@@ -675,6 +675,7 @@ extension AgentModeViewModel {
         let depth: Int
         let isMCPControlled: Bool
         let remoteHostName: String?
+        let remoteHostAbbreviation: String?
         let remoteControlDeviceID: String?
         /// Bound-worktree visual identity for this session (Item 10). Nil when
         /// the session has no worktree bindings. Carries the representative
@@ -708,6 +709,7 @@ extension AgentModeViewModel {
             depth: Int,
             isMCPControlled: Bool,
             remoteHostName: String? = nil,
+            remoteHostAbbreviation: String? = nil,
             remoteControlDeviceID: String? = nil,
             worktree: AgentWorktreeIndicator? = nil,
             worktreeMergeAttention: AgentWorktreeMergeAttention? = nil,
@@ -730,6 +732,7 @@ extension AgentModeViewModel {
             self.depth = depth
             self.isMCPControlled = isMCPControlled
             self.remoteHostName = remoteHostName
+            self.remoteHostAbbreviation = remoteHostAbbreviation
             self.remoteControlDeviceID = remoteControlDeviceID
             self.worktree = worktree
             self.worktreeMergeAttention = worktreeMergeAttention

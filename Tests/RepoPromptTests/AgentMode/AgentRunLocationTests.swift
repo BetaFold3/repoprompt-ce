@@ -60,7 +60,7 @@ final class AgentRunLocationTests: XCTestCase {
         let runProps = try XCTUnwrap(viewModel.runLocationProps(tabID: tabID))
         XCTAssertEqual(runProps.selection, .host(hostID: host.id))
         XCTAssertEqual(runProps.selectedHostDisplayName, "Studio Mac")
-        XCTAssertEqual(runProps.selectedHostAbbreviation, "sm")
+        XCTAssertEqual(runProps.selectedHostAbbreviation, "SM")
 
         let worktreeProps = try XCTUnwrap(viewModel.executionLocationProps(tabID: tabID))
         XCTAssertFalse(worktreeProps.isEnabled)
@@ -144,7 +144,7 @@ final class AgentRunLocationHostOptionAbbreviationTests: XCTestCase {
             for: [(id: "host-a", displayName: "Tuan's Mac Studio")]
         )
 
-        XCTAssertEqual(abbreviations["host-a"], "tm")
+        XCTAssertEqual(abbreviations["host-a"], "TM")
     }
 
     func testAbbreviationsUseFirstTwoCharactersForSingleToken() {
@@ -152,7 +152,7 @@ final class AgentRunLocationHostOptionAbbreviationTests: XCTestCase {
             for: [(id: "host-a", displayName: "Studio")]
         )
 
-        XCTAssertEqual(abbreviations["host-a"], "st")
+        XCTAssertEqual(abbreviations["host-a"], "ST")
     }
 
     func testAbbreviationsExtendLastTokenForCollisionsDeterministically() {
@@ -163,8 +163,8 @@ final class AgentRunLocationHostOptionAbbreviationTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(abbreviations["mac-studio"], "mst")
-        XCTAssertEqual(abbreviations["mac-server"], "mse")
+        XCTAssertEqual(abbreviations["mac-studio"], "MSt")
+        XCTAssertEqual(abbreviations["mac-server"], "MSe")
     }
 
     func testAbbreviationsDisambiguateIdenticalDisplayNamesWithIDPrefix() {
@@ -175,8 +175,8 @@ final class AgentRunLocationHostOptionAbbreviationTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(abbreviations["aa-host"], "msaa")
-        XCTAssertEqual(abbreviations["bb-host"], "msbb")
+        XCTAssertEqual(abbreviations["aa-host"], "MSaa")
+        XCTAssertEqual(abbreviations["bb-host"], "MSbb")
     }
 
     func testAbbreviationFallbackAvoidsReservedDuplicateNameCandidates() {
@@ -188,9 +188,9 @@ final class AgentRunLocationHostOptionAbbreviationTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(abbreviations["aa-host"], "msaa")
-        XCTAssertEqual(abbreviations["bb-host"], "msbb")
-        XCTAssertEqual(abbreviations["aa-2"], "msaa-")
+        XCTAssertEqual(abbreviations["aa-host"], "MSaa")
+        XCTAssertEqual(abbreviations["bb-host"], "MSbb")
+        XCTAssertEqual(abbreviations["aa-2"], "MSaa-")
         XCTAssertEqual(Set(abbreviations.values).count, abbreviations.count)
     }
 
@@ -202,8 +202,8 @@ final class AgentRunLocationHostOptionAbbreviationTests: XCTestCase {
             ]
         )
 
-        XCTAssertEqual(abbreviations["aa-1"], "msaa")
-        XCTAssertEqual(abbreviations["aa-2"], "msaa-")
+        XCTAssertEqual(abbreviations["aa-1"], "MSaa")
+        XCTAssertEqual(abbreviations["aa-2"], "MSaa-")
         XCTAssertEqual(Set(abbreviations.values).count, abbreviations.count)
     }
 

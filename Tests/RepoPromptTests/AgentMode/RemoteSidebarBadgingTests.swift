@@ -12,6 +12,11 @@ final class RemoteSidebarBadgingTests: XCTestCase {
             tab(parentTabID, sessionID: parentSessionID),
             tab(childTabID, sessionID: childSessionID)
         ]
+        let registeredHosts = [
+            (id: "host-1", displayName: "Mac Studio"),
+            (id: "host-2", displayName: "Mac Server")
+        ]
+        let pillAbbreviations = AgentRunLocationHostOption.abbreviations(for: registeredHosts)
         let rows = build(
             tabs: tabs,
             sessionIndex: sessionIndex([
@@ -21,14 +26,17 @@ final class RemoteSidebarBadgingTests: XCTestCase {
                     tabID: childTabID,
                     parentSessionID: parentSessionID,
                     lastUserMessageAt: date(50),
-                    remoteHostName: "Studio Mac"
+                    remoteHostName: "Mac Studio"
                 )
-            ])
+            ]),
+            registeredRemoteHosts: registeredHosts
         )
 
         let child = try row(for: childTabID, in: rows)
         XCTAssertEqual(child.depth, 1)
-        XCTAssertEqual(child.remoteHostName, "Studio Mac")
+        XCTAssertEqual(child.remoteHostName, "Mac Studio")
+        XCTAssertEqual(child.remoteHostAbbreviation, "MSt")
+        XCTAssertEqual(child.remoteHostAbbreviation, pillAbbreviations["host-1"])
     }
 
     func testRemoteHostNameSurvivesThreadCollapseTransform() throws {
@@ -76,6 +84,7 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         XCTAssertEqual(rows.map(\.tabID), [parentTabID])
         let parent = try XCTUnwrap(rows.first)
         XCTAssertEqual(parent.remoteHostName, "Studio Mac")
+        XCTAssertEqual(parent.remoteHostAbbreviation, "SM")
         XCTAssertEqual(parent.remoteControlDeviceID, "ab12cd34")
         XCTAssertTrue(parent.hasThreadChildren)
         XCTAssertTrue(parent.isThreadCollapsed)
@@ -221,7 +230,8 @@ final class RemoteSidebarBadgingTests: XCTestCase {
     private func build(
         tabs: [ComposeTabState],
         sessions: [UUID: AgentModeViewModel.TabSession] = [:],
-        sessionIndex: [UUID: AgentSessionIndexEntry]
+        sessionIndex: [UUID: AgentSessionIndexEntry],
+        registeredRemoteHosts: [(id: String, displayName: String)] = []
     ) -> [AgentModeViewModel.SidebarSession] {
         AgentModeSidebarSessionBuilder(
             allTabs: tabs,
@@ -236,7 +246,8 @@ final class RemoteSidebarBadgingTests: XCTestCase {
             sessionListSortDates: [:],
             sessionListCacheReady: true,
             sidebarRestoreFrozenOrderByTabID: [:],
-            mcpControlledTabIDs: []
+            mcpControlledTabIDs: [],
+            registeredRemoteHosts: registeredRemoteHosts
         ).build()
     }
 

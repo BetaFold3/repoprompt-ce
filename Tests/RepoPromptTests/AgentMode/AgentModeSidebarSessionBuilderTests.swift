@@ -469,7 +469,8 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             sessionListSortDates: [:],
             sessionListCacheReady: true,
             sidebarRestoreFrozenOrderByTabID: [:],
-            mcpControlledTabIDs: []
+            mcpControlledTabIDs: [],
+            registeredRemoteHosts: []
         ).build()
     }
 

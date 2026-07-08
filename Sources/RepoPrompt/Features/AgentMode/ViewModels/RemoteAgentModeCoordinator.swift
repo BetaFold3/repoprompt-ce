@@ -54,6 +54,7 @@ final class RemoteAgentModeCoordinator {
 
     func attachPersistedSessionIfNeeded(_ session: AgentModeViewModel.TabSession) {
         guard session.remoteHost != nil else { return }
+        guard !(session.parentSessionID != nil && session.runState.isTerminalForCommit) else { return }
         do {
             let controller = try controller(for: session)
             Task { [weak self] in
@@ -152,6 +153,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     func stop(tabID: UUID) {
+        let remoteBinding = viewModel?.sessions[tabID]?.remoteHost
         let storedDiscoveryKey = discoveryKeyByTabID.removeValue(forKey: tabID)
         let currentDiscoveryKey = viewModel?.sessions[tabID].flatMap { childDiscoveryKey(for: $0) }
         for key in Set([storedDiscoveryKey, currentDiscoveryKey].compactMap(\.self)) {
@@ -166,7 +168,23 @@ final class RemoteAgentModeCoordinator {
             stopConnectionFanoutIfUnused(hostID: hostID)
         }
         if let controller {
-            Task { await controller.shutdown() }
+            Task {
+                await controller.unsubscribe()
+                await controller.shutdown()
+            }
+        } else if let remoteBinding {
+            do {
+                let connection = try connectionManagerProvider().connection(for: remoteBinding.hostID)
+                Task {
+                    do {
+                        try await connection.unsubscribe(sessionIDs: [remoteBinding.remoteSessionID])
+                    } catch {
+                        Self.logger.debug("remote unsubscribe failed host_id=\(remoteBinding.hostID, privacy: .public) session_id=\(remoteBinding.remoteSessionID, privacy: .public) error=\(String(describing: error), privacy: .public)")
+                    }
+                }
+            } catch {
+                Self.logger.debug("remote unsubscribe skipped host_id=\(remoteBinding.hostID, privacy: .public) session_id=\(remoteBinding.remoteSessionID, privacy: .public) error=\(String(describing: error), privacy: .public)")
+            }
         }
     }
 
@@ -261,6 +279,10 @@ final class RemoteAgentModeCoordinator {
 
     private func handle(_ event: RemoteSessionEvent, tabID: UUID) {
         guard let session = viewModel?.sessions[tabID] else { return }
+        let shouldRefreshActivity = Self.shouldRefreshActivity(for: event)
+        if shouldRefreshActivity {
+            session.lastActivityAt = Date()
+        }
         switch event {
         case let .transcriptRows(rows):
             let containsSpawnTool = Self.containsSpawnToolCall(rows)
@@ -298,6 +320,8 @@ final class RemoteAgentModeCoordinator {
             adoptHostSessionNameIfAllowed(sessionName, for: session, tabID: tabID)
         case let .binding(binding):
             session.remoteHost = binding
+        }
+        if shouldRefreshActivity {
             updateSessionIndex(for: session)
         }
         session.isDirty = true
@@ -313,8 +337,22 @@ final class RemoteAgentModeCoordinator {
         let projector = RemoteTranscriptProjector(remoteSessionID: remoteSessionID)
         let projectedUserTextKeys = Set(rows.filter { $0.kind == .user }.map { Self.normalizedTextKey($0.text) })
         session.mutateItemsBatch { items in
+            let existingItemIDs = Set(items.map(\.id))
+            let optimisticUserTimestampByText = Self.optimisticUserTimestampByText(
+                in: items,
+                pendingIDs: session.pendingRemoteOptimisticUserItemIDs,
+                projectedUserTextKeys: projectedUserTextKeys
+            )
             var merged = projector.upserting(rows, into: items)
             if !projectedUserTextKeys.isEmpty, !session.pendingRemoteOptimisticUserItemIDs.isEmpty {
+                merged = merged.map { item in
+                    guard item.kind == .user,
+                          !existingItemIDs.contains(item.id),
+                          let optimisticTimestamp = optimisticUserTimestampByText[Self.normalizedTextKey(item.text)],
+                          optimisticTimestamp > item.timestamp
+                    else { return item }
+                    return Self.copy(item, timestamp: optimisticTimestamp)
+                }
                 merged.removeAll { item in
                     item.kind == .user
                         && session.pendingRemoteOptimisticUserItemIDs.contains(item.id)
@@ -327,6 +365,7 @@ final class RemoteAgentModeCoordinator {
             items = merged
         }
         session.hasSentFirstMessage = session.items.contains { $0.kind == .user }
+        session.lastUserMessageAt = session.items.filter { $0.kind == .user }.map(\.timestamp).max()
     }
 
     private func applyRunState(
@@ -664,6 +703,47 @@ final class RemoteAgentModeCoordinator {
         } == true
     }
 
+    private static func optimisticUserTimestampByText(
+        in items: [AgentChatItem],
+        pendingIDs: Set<UUID>,
+        projectedUserTextKeys: Set<String>
+    ) -> [String: Date] {
+        guard !pendingIDs.isEmpty, !projectedUserTextKeys.isEmpty else { return [:] }
+        var timestamps: [String: Date] = [:]
+        for item in items where item.kind == .user && pendingIDs.contains(item.id) {
+            let key = normalizedTextKey(item.text)
+            guard projectedUserTextKeys.contains(key) else { continue }
+            if let existing = timestamps[key] {
+                timestamps[key] = max(existing, item.timestamp)
+            } else {
+                timestamps[key] = item.timestamp
+            }
+        }
+        return timestamps
+    }
+
+    private static func copy(_ item: AgentChatItem, timestamp: Date) -> AgentChatItem {
+        AgentChatItem(
+            id: item.id,
+            timestamp: timestamp,
+            kind: item.kind,
+            text: item.text,
+            attachments: item.attachments,
+            taggedFileAttachments: item.taggedFileAttachments,
+            toolName: item.toolName,
+            toolInvocationID: item.toolInvocationID,
+            toolArgsJSON: item.toolArgsJSON,
+            toolResultJSON: item.toolResultJSON,
+            toolIsError: item.toolIsError,
+            reasoning: item.reasoning,
+            sequenceIndex: item.sequenceIndex,
+            isStreaming: item.isStreaming,
+            workflow: item.workflow,
+            codexGoalMode: item.codexGoalMode,
+            isLocalControlPlaneEcho: item.isLocalControlPlaneEcho
+        )
+    }
+
     private static func containsSpawnToolCall(_ rows: [AgentChatItem]) -> Bool {
         rows.contains { row in
             guard row.kind == .toolCall,
@@ -827,6 +907,15 @@ final class RemoteAgentModeCoordinator {
         text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private static func shouldRefreshActivity(for event: RemoteSessionEvent) -> Bool {
+        switch event {
+        case .transcriptRows, .runState, .terminal, .metadata:
+            true
+        case .interactionResolved, .sessionExpired, .channel, .systemMessage, .binding:
+            false
+        }
+    }
+
     private static func displayChannelReason(_ reason: String) -> String {
         let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "channel_closing" : trimmed
@@ -883,6 +972,14 @@ final class RemoteAgentModeCoordinator {
             tabID: UUID
         ) {
             handle(.metadata(agentKindRaw: agentKindRaw, modelRaw: modelRaw, sessionName: sessionName), tabID: tabID)
+        }
+
+        func test_handleEvent(_ event: RemoteSessionEvent, tabID: UUID) {
+            handle(event, tabID: tabID)
+        }
+
+        func test_applyTranscriptRows(_ rows: [AgentChatItem], to session: AgentModeViewModel.TabSession) {
+            applyTranscriptRows(rows, to: session)
         }
 
         func test_recordStartSessionName(

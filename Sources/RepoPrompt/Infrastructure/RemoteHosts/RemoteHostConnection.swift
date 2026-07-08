@@ -91,6 +91,7 @@ actor RemoteHostConnection {
     private var reconnectTask: Task<Void, Never>?
     private var pendingCommands: [String: PendingCommand] = [:]
     private var desiredSubscriptions: Set<String> = []
+    private var parkedSubscriptions: Set<String> = []
     private var connectedHostName: String?
     private var connectedScopes: Set<String> = []
     private var reconnectBackoff: TimeInterval
@@ -98,6 +99,7 @@ actor RemoteHostConnection {
     private var counterWriteTask: Task<Void, Never>?
     #if DEBUG
         private var reconnectScheduleCount = 0
+        private var subscribeCommandHandlerForTesting: (@Sendable ([String]) async throws -> JSONValue)?
     #endif
 
     init(
@@ -196,11 +198,30 @@ actor RemoteHostConnection {
     }
 
     func subscribe(sessionIDs: [String]) async throws {
-        let normalized = Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+        let normalized = Self.normalizedSessionIDs(sessionIDs)
         guard !normalized.isEmpty else { return }
         desiredSubscriptions.formUnion(normalized)
+        parkedSubscriptions.subtract(normalized)
         try await ensureConnected()
-        _ = try await sendSubscribeCommand(sessionIDs: desiredSubscriptions.sorted())
+        desiredSubscriptions.formUnion(normalized)
+        parkedSubscriptions.subtract(normalized)
+        try await reconcileDesiredSubscriptions(throwingFor: normalized)
+        let missing = normalized.subtracting(desiredSubscriptions)
+        if !missing.isEmpty {
+            throw RemoteClientError.fromCommandError(
+                code: "binding_required",
+                message: "The host could not route one or more requested subscriptions."
+            )
+        }
+    }
+
+    func unsubscribe(sessionIDs: [String]) async throws {
+        let normalized = Self.normalizedSessionIDs(sessionIDs)
+        guard !normalized.isEmpty else { return }
+        desiredSubscriptions.subtract(normalized)
+        parkedSubscriptions.subtract(normalized)
+        guard case .connected = state, webSocketTask != nil else { return }
+        _ = try await sendUnsubscribeCommand(sessionIDs: normalized.sorted())
     }
 
     func testConnection(timeout: TimeInterval = RemoteHostConnection.connectTimeout) async throws -> RemoteHostConnectionTestResult {
@@ -268,6 +289,24 @@ actor RemoteHostConnection {
 
         func hasReconnectTaskForTesting() -> Bool {
             reconnectTask != nil
+        }
+
+        func desiredSubscriptionsForTesting() -> [String] {
+            desiredSubscriptions.sorted()
+        }
+
+        func parkedSubscriptionsForTesting() -> [String] {
+            parkedSubscriptions.sorted()
+        }
+
+        func setDesiredSubscriptionsForTesting(_ sessionIDs: [String]) {
+            desiredSubscriptions = Self.normalizedSessionIDs(sessionIDs)
+        }
+
+        func setSubscribeCommandHandlerForTesting(
+            _ handler: (@Sendable ([String]) async throws -> JSONValue)?
+        ) {
+            subscribeCommandHandlerForTesting = handler
         }
     #endif
 
@@ -380,9 +419,12 @@ actor RemoteHostConnection {
             throw RemoteClientError.transport(String(describing: error))
         }
 
-        if !desiredSubscriptions.isEmpty {
+        stageParkedSubscriptionsForReconnect()
+        if hasTrackedSubscriptions {
             do {
-                _ = try await sendSubscribeCommand(sessionIDs: desiredSubscriptions.sorted())
+                try await reconcileDesiredSubscriptions(throwingFor: [])
+            } catch let error as RemoteClientError where error.commandError != nil {
+                throw error
             } catch {
                 await disconnect()
                 throw error
@@ -488,11 +530,75 @@ actor RemoteHostConnection {
 
     // MARK: - Commands
 
+    private var hasTrackedSubscriptions: Bool {
+        !desiredSubscriptions.isEmpty || !parkedSubscriptions.isEmpty
+    }
+
+    private func stageParkedSubscriptionsForReconnect() {
+        guard !parkedSubscriptions.isEmpty else { return }
+        desiredSubscriptions.formUnion(parkedSubscriptions)
+        parkedSubscriptions.removeAll()
+    }
+
+    private func reconcileDesiredSubscriptions(throwingFor requestedSessionIDs: Set<String>) async throws {
+        let desired = desiredSubscriptions.sorted()
+        guard !desired.isEmpty else { return }
+        do {
+            _ = try await sendSubscribeCommand(sessionIDs: desired)
+        } catch {
+            guard Self.isBindingRequired(error) else { throw error }
+            try await subscribeIndividuallyAfterBindingRequired(throwingFor: requestedSessionIDs)
+        }
+    }
+
+    private func subscribeIndividuallyAfterBindingRequired(throwingFor requestedSessionIDs: Set<String>) async throws {
+        let desired = desiredSubscriptions.sorted()
+        var retained: Set<String> = []
+        var requestedFailure: Error?
+        for sessionID in desired {
+            do {
+                _ = try await sendSubscribeCommand(sessionIDs: [sessionID])
+                retained.insert(sessionID)
+            } catch {
+                if !Self.isCommandLevel(error) { throw error }
+                if requestedSessionIDs.contains(sessionID), requestedFailure == nil {
+                    requestedFailure = error
+                }
+            }
+        }
+        let failed = Set(desired).subtracting(retained)
+        let stillDesiredFailures = failed.intersection(desiredSubscriptions)
+        desiredSubscriptions.subtract(stillDesiredFailures)
+        parkedSubscriptions.formUnion(stillDesiredFailures)
+        parkedSubscriptions.subtract(retained)
+        if let requestedFailure {
+            throw requestedFailure
+        }
+    }
+
     private func sendSubscribeCommand(sessionIDs: [String]) async throws -> JSONValue {
-        try await sendConnectedCommand(
+        #if DEBUG
+            if let subscribeCommandHandlerForTesting {
+                return try await subscribeCommandHandlerForTesting(sessionIDs)
+            }
+        #endif
+        return try await sendConnectedCommand(
             RemoteClientFrame(
                 type: "subscribe",
                 requestID: Self.makeRequestID(prefix: "sub"),
+                payload: .object([
+                    "session_ids": .array(sessionIDs.map(JSONValue.string))
+                ])
+            ),
+            timeout: Self.commandTimeout
+        )
+    }
+
+    private func sendUnsubscribeCommand(sessionIDs: [String]) async throws -> JSONValue {
+        try await sendConnectedCommand(
+            RemoteClientFrame(
+                type: "unsubscribe",
+                requestID: Self.makeRequestID(prefix: "unsub"),
                 payload: .object([
                     "session_ids": .array(sessionIDs.map(JSONValue.string))
                 ])
@@ -689,7 +795,7 @@ actor RemoteHostConnection {
         connectedScopes = []
         connectedHostName = nil
         failAllPending(with: RemoteClientError.connectionClosed)
-        guard !desiredSubscriptions.isEmpty else {
+        guard hasTrackedSubscriptions else {
             transition(to: .idle)
             return
         }
@@ -702,7 +808,7 @@ actor RemoteHostConnection {
     }
 
     private func scheduleReconnectIfNeeded(reason: String) {
-        guard reconnectTask == nil, !desiredSubscriptions.isEmpty else { return }
+        guard reconnectTask == nil, hasTrackedSubscriptions else { return }
         let delay = reconnectBackoff
         reconnectBackoff = min(reconnectBackoff * 2, maximumReconnectBackoff)
         #if DEBUG
@@ -721,7 +827,7 @@ actor RemoteHostConnection {
 
     private func retryAfterBackoff() async {
         reconnectTask = nil
-        guard !desiredSubscriptions.isEmpty else {
+        guard hasTrackedSubscriptions else {
             transition(to: .idle)
             return
         }
@@ -884,6 +990,18 @@ actor RemoteHostConnection {
 
     private static func makeRequestID(prefix: String) -> String {
         "\(prefix)-\(UUID().uuidString.lowercased())"
+    }
+
+    private static func normalizedSessionIDs(_ sessionIDs: [String]) -> Set<String> {
+        Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+    }
+
+    private static func isBindingRequired(_ error: Error) -> Bool {
+        (error as? RemoteClientError)?.commandError?.code == "binding_required"
+    }
+
+    private static func isCommandLevel(_ error: Error) -> Bool {
+        (error as? RemoteClientError)?.commandError != nil
     }
 
     private static func sleep(seconds: TimeInterval) async throws {

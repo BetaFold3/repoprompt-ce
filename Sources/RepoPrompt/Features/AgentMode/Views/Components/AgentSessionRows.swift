@@ -15,6 +15,7 @@ struct AgentSessionRow: View {
     /// user dismisses the badge explicitly.
     var attentionRunState: AgentSessionRunState?
     var remoteHostName: String?
+    var remoteHostAbbreviation: String?
     var remoteControlDeviceID: String?
     /// Bound-worktree visual identity for this session (Item 10). When non-nil,
     /// a small colored dot/ring is overlaid at the bottom-right of the status
@@ -190,7 +191,7 @@ struct AgentSessionRow: View {
                     }
 
                     if let remoteHostName {
-                        remoteHostBadge(hostName: remoteHostName)
+                        remoteHostBadge(hostName: remoteHostName, abbreviation: remoteHostAbbreviation)
                     }
 
                     if let remoteControlDeviceID {
@@ -339,11 +340,16 @@ struct AgentSessionRow: View {
     /// an active worktree merge operation in `awaiting_approval`,
     /// `conflicted`, or `awaiting_commit` state. Sized to match the existing
     /// pin glyph so layout does not jitter when attention attaches/detaches.
-    private func remoteHostBadge(hostName: String) -> some View {
-        HStack(spacing: 3) {
+    private func remoteHostBadge(hostName: String, abbreviation: String?) -> some View {
+        let displayLabel: String = if let abbreviation, !abbreviation.isEmpty {
+            abbreviation
+        } else {
+            hostName
+        }
+        return HStack(spacing: 3) {
             Image(systemName: "network")
                 .font(.system(size: pinFontSize - 1, weight: .semibold))
-            Text(hostName)
+            Text(displayLabel)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.tail)

@@ -1033,6 +1033,146 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testStopPrunesRemoteSubscriptionAndSendsUnsubscribe() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Remote Parent")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-stop")
+        let connection = RecordingRemoteAgentSessionConnection()
+        let controller = try RemoteAgentSessionController(
+            binding: XCTUnwrap(session.remoteHost),
+            connection: connection
+        )
+        let fanoutConnection = RemoteHostConnection(hostID: session.remoteHost?.hostID ?? "host-abc")
+        fixture.coordinator.test_attachController(
+            tabID: fixture.tabID,
+            hostID: session.remoteHost?.hostID ?? "host-abc",
+            controller: controller,
+            connection: fanoutConnection
+        )
+
+        fixture.coordinator.stop(tabID: fixture.tabID)
+
+        await waitForRemoteAgentSessionCondition {
+            await connection.unsubscribedSessionIDBatches().contains(["remote-session-stop"])
+        }
+        let unsubscribedBatches = await connection.unsubscribedSessionIDBatches()
+        XCTAssertEqual(unsubscribedBatches, [["remote-session-stop"]])
+    }
+
+    @MainActor
+    func testStopCatchesBindingRequiredUnsubscribeFailure() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Remote Parent")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-old-host")
+        let connection = RecordingRemoteAgentSessionConnection(
+            unsubscribeError: RemoteClientError.fromCommandError(
+                code: "binding_required",
+                message: "old host"
+            )
+        )
+        let controller = try RemoteAgentSessionController(
+            binding: XCTUnwrap(session.remoteHost),
+            connection: connection
+        )
+        let fanoutConnection = RemoteHostConnection(hostID: session.remoteHost?.hostID ?? "host-abc")
+        fixture.coordinator.test_attachController(
+            tabID: fixture.tabID,
+            hostID: session.remoteHost?.hostID ?? "host-abc",
+            controller: controller,
+            connection: fanoutConnection
+        )
+
+        fixture.coordinator.stop(tabID: fixture.tabID)
+
+        await waitForRemoteAgentSessionCondition {
+            await connection.unsubscribedSessionIDBatches().contains(["remote-session-old-host"])
+        }
+        let counts = fixture.coordinator.test_lifecycleCounts()
+        XCTAssertEqual(counts.controllers, 0)
+        XCTAssertEqual(counts.eventTasks, 0)
+        XCTAssertEqual(counts.hostFanoutTasks, 0)
+    }
+
+    @MainActor
+    func testAttachPersistedTerminalChildSessionDoesNotAttachController() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Terminal Child")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        session.remoteHost = makeBinding(remoteSessionID: "remote-child-terminal")
+        session.parentSessionID = UUID()
+        session.runState = .completed
+
+        fixture.coordinator.attachPersistedSessionIfNeeded(session)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        let counts = fixture.coordinator.test_lifecycleCounts()
+        XCTAssertEqual(counts.controllers, 0)
+        XCTAssertEqual(counts.eventTasks, 0)
+        XCTAssertEqual(counts.hostFanoutTasks, 0)
+    }
+
+    @MainActor
+    func testInboundRunStateEventBumpsParentLastActivityAndIndexSavedAt() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Remote Parent")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        let oldActivity = Date(timeIntervalSinceReferenceDate: 10)
+        session.lastActivityAt = oldActivity
+        session.remoteHost = makeBinding(remoteSessionID: "remote-parent-before")
+
+        fixture.coordinator.test_handleEvent(
+            .runState(.running, pendingInteraction: nil),
+            tabID: fixture.tabID
+        )
+
+        XCTAssertGreaterThan(session.lastActivityAt, oldActivity)
+        XCTAssertGreaterThan(
+            try XCTUnwrap(fixture.viewModel.test_ownerValidatedSessionIndex[fixture.sessionID]?.savedAt),
+            oldActivity
+        )
+        XCTAssertEqual(session.remoteHost?.remoteSessionID, "remote-parent-before")
+    }
+
+    @MainActor
+    func testApplyTranscriptRowsPreservesNewerOptimisticUserTimestamp() {
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-optimistic")
+        let optimisticTimestamp = Date(timeIntervalSinceReferenceDate: 10000)
+        let projectedTimestamp = Date(timeIntervalSinceReferenceDate: 20)
+        let existingProjected = AgentChatItem(
+            id: UUID(),
+            timestamp: projectedTimestamp,
+            kind: .user,
+            text: "Hello remote",
+            sequenceIndex: 0
+        )
+        let optimistic = AgentChatItem(
+            timestamp: optimisticTimestamp,
+            kind: .user,
+            text: "Hello remote",
+            sequenceIndex: 1
+        )
+        session.appendItem(existingProjected)
+        session.appendItem(optimistic)
+        session.pendingRemoteOptimisticUserItemIDs.insert(optimistic.id)
+        let newProjected = AgentChatItem(
+            id: UUID(),
+            timestamp: projectedTimestamp,
+            kind: .user,
+            text: "Hello remote",
+            sequenceIndex: 2
+        )
+        let coordinator = RemoteAgentModeCoordinator()
+
+        coordinator.test_applyTranscriptRows([existingProjected, newProjected], to: session)
+
+        let users = session.items.filter { $0.kind == .user }
+        XCTAssertEqual(users.count, 2)
+        XCTAssertEqual(users.first { $0.id == existingProjected.id }?.timestamp, projectedTimestamp)
+        XCTAssertEqual(users.first { $0.id == newProjected.id }?.timestamp, optimisticTimestamp)
+        XCTAssertEqual(session.lastUserMessageAt, optimisticTimestamp)
+        XCTAssertTrue(session.pendingRemoteOptimisticUserItemIDs.isEmpty)
+    }
+
+    @MainActor
     func testStoppedParentDoesNotMaterializeChildrenFromLateDiscovery() async throws {
         let fixture = try await makeRemoteNamingFixture(
             tabTitle: "Remote Parent",
@@ -1487,6 +1627,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func ensureConnected() async throws {}
         func subscribe(sessionIDs _: [String]) async throws {}
+        func unsubscribe(sessionIDs _: [String]) async throws {}
     }
 
     private actor SessionExpiredGetLogRemoteAgentSessionConnection: RemoteAgentSessionConnection {
@@ -1499,24 +1640,29 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func ensureConnected() async throws {}
         func subscribe(sessionIDs _: [String]) async throws {}
+        func unsubscribe(sessionIDs _: [String]) async throws {}
     }
 
     private actor RecordingRemoteAgentSessionConnection: RemoteAgentSessionConnection {
         private var responses: [String: [JSONValue]]
         private let getLogDelayNanoseconds: UInt64
         private let commandDelayNanosecondsByType: [String: UInt64]
+        private let unsubscribeError: Error?
         private var frames: [RemoteClientFrame] = []
         private var subscribedSessionIDs: [[String]] = []
+        private var unsubscribedSessionIDs: [[String]] = []
         private var ensureConnectedCallCount = 0
 
         init(
             responses: [String: [JSONValue]] = [:],
             getLogDelayNanoseconds: UInt64 = 0,
-            commandDelayNanosecondsByType: [String: UInt64] = [:]
+            commandDelayNanosecondsByType: [String: UInt64] = [:],
+            unsubscribeError: Error? = nil
         ) {
             self.responses = responses
             self.getLogDelayNanoseconds = getLogDelayNanoseconds
             self.commandDelayNanosecondsByType = commandDelayNanosecondsByType
+            self.unsubscribeError = unsubscribeError
         }
 
         func command(_ frame: RemoteClientFrame, timeout _: TimeInterval) async throws -> JSONValue {
@@ -1541,6 +1687,17 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func subscribe(sessionIDs: [String]) async throws {
             subscribedSessionIDs.append(sessionIDs)
+        }
+
+        func unsubscribe(sessionIDs: [String]) async throws {
+            unsubscribedSessionIDs.append(sessionIDs)
+            if let unsubscribeError {
+                throw unsubscribeError
+            }
+        }
+
+        func unsubscribedSessionIDBatches() -> [[String]] {
+            unsubscribedSessionIDs
         }
 
         func commandCount(type: String) -> Int {
