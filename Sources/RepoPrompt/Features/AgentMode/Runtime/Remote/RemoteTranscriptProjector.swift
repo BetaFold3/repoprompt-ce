@@ -112,7 +112,13 @@ struct RemoteTranscriptProjector: Equatable {
         guard !newItems.isEmpty else { return existingItems }
         var byID = Dictionary(uniqueKeysWithValues: existingItems.map { ($0.id, $0) })
         for item in newItems {
-            byID[item.id] = item
+            if let existing = byID[item.id] {
+                // Projected rows carry synthetic sequence-index timestamps; max-merge preserves the
+                // optimistic-rescue timestamp across re-projections and self-heals if real wire timestamps ship later.
+                byID[item.id] = item.replacingTimestamp(max(existing.timestamp, item.timestamp))
+            } else {
+                byID[item.id] = item
+            }
         }
         return byID.values.sorted {
             if $0.sequenceIndex != $1.sequenceIndex {

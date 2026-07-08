@@ -351,7 +351,7 @@ final class RemoteAgentModeCoordinator {
                           let optimisticTimestamp = optimisticUserTimestampByText[Self.normalizedTextKey(item.text)],
                           optimisticTimestamp > item.timestamp
                     else { return item }
-                    return Self.copy(item, timestamp: optimisticTimestamp)
+                    return item.replacingTimestamp(optimisticTimestamp)
                 }
                 merged.removeAll { item in
                     item.kind == .user
@@ -365,7 +365,11 @@ final class RemoteAgentModeCoordinator {
             items = merged
         }
         session.hasSentFirstMessage = session.items.contains { $0.kind == .user }
-        session.lastUserMessageAt = session.items.filter { $0.kind == .user }.map(\.timestamp).max()
+        session.lastUserMessageAt = session.items
+            .filter { $0.kind == .user }
+            .map(\.timestamp)
+            .filter { $0 >= AgentSessionRecencySanity.syntheticTimestampFloor }
+            .max() ?? session.lastUserMessageAt
     }
 
     private func applyRunState(
@@ -720,28 +724,6 @@ final class RemoteAgentModeCoordinator {
             }
         }
         return timestamps
-    }
-
-    private static func copy(_ item: AgentChatItem, timestamp: Date) -> AgentChatItem {
-        AgentChatItem(
-            id: item.id,
-            timestamp: timestamp,
-            kind: item.kind,
-            text: item.text,
-            attachments: item.attachments,
-            taggedFileAttachments: item.taggedFileAttachments,
-            toolName: item.toolName,
-            toolInvocationID: item.toolInvocationID,
-            toolArgsJSON: item.toolArgsJSON,
-            toolResultJSON: item.toolResultJSON,
-            toolIsError: item.toolIsError,
-            reasoning: item.reasoning,
-            sequenceIndex: item.sequenceIndex,
-            isStreaming: item.isStreaming,
-            workflow: item.workflow,
-            codexGoalMode: item.codexGoalMode,
-            isLocalControlPlaneEcho: item.isLocalControlPlaneEcho
-        )
     }
 
     private static func containsSpawnToolCall(_ rows: [AgentChatItem]) -> Bool {

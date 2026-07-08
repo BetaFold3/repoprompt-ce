@@ -1135,8 +1135,8 @@ final class RemoteAgentSessionTests: XCTestCase {
     func testApplyTranscriptRowsPreservesNewerOptimisticUserTimestamp() {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.remoteHost = makeBinding(remoteSessionID: "remote-session-optimistic")
-        let optimisticTimestamp = Date(timeIntervalSinceReferenceDate: 10000)
-        let projectedTimestamp = Date(timeIntervalSinceReferenceDate: 20)
+        let optimisticTimestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let projectedTimestamp = Date(timeIntervalSince1970: 2)
         let existingProjected = AgentChatItem(
             id: UUID(),
             timestamp: projectedTimestamp,
@@ -1170,6 +1170,39 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(users.first { $0.id == newProjected.id }?.timestamp, optimisticTimestamp)
         XCTAssertEqual(session.lastUserMessageAt, optimisticTimestamp)
         XCTAssertTrue(session.pendingRemoteOptimisticUserItemIDs.isEmpty)
+
+        coordinator.test_applyTranscriptRows([existingProjected, newProjected], to: session)
+
+        let usersAfterReprojection = session.items.filter { $0.kind == .user }
+        XCTAssertEqual(usersAfterReprojection.count, 2)
+        XCTAssertEqual(usersAfterReprojection.first { $0.id == existingProjected.id }?.timestamp, projectedTimestamp)
+        XCTAssertEqual(usersAfterReprojection.first { $0.id == newProjected.id }?.timestamp, optimisticTimestamp)
+        XCTAssertEqual(session.lastUserMessageAt, optimisticTimestamp)
+        XCTAssertTrue(session.pendingRemoteOptimisticUserItemIDs.isEmpty)
+    }
+
+    @MainActor
+    func testApplyTranscriptRowsKeepsLastUserMessageAtWhenOnlySyntheticUserRows() {
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.remoteHost = makeBinding(remoteSessionID: "remote-session-synthetic-only")
+        let existingLastUserMessageAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let syntheticTimestamp = Date(timeIntervalSince1970: 3)
+        session.lastUserMessageAt = existingLastUserMessageAt
+        let row = AgentChatItem(
+            id: UUID(),
+            timestamp: syntheticTimestamp,
+            kind: .user,
+            text: "Synthetic only",
+            sequenceIndex: 3
+        )
+        let coordinator = RemoteAgentModeCoordinator()
+
+        coordinator.test_applyTranscriptRows([row], to: session)
+
+        XCTAssertEqual(session.items.count, 1)
+        XCTAssertEqual(session.items.first?.timestamp, syntheticTimestamp)
+        XCTAssertEqual(session.lastUserMessageAt, existingLastUserMessageAt)
+        XCTAssertTrue(session.hasSentFirstMessage)
     }
 
     @MainActor

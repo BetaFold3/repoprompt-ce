@@ -193,6 +193,32 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
     }
 
+    /// Returns a copy of this item with a replaced timestamp and all other fields
+    /// preserved. Kept on the model, directly below the memberwise init, so that a
+    /// newly added (defaulted) init parameter is caught here instead of silently
+    /// resetting in external copy helpers.
+    public func replacingTimestamp(_ timestamp: Date) -> AgentChatItem {
+        AgentChatItem(
+            id: id,
+            timestamp: timestamp,
+            kind: kind,
+            text: text,
+            attachments: attachments,
+            taggedFileAttachments: taggedFileAttachments,
+            toolName: toolName,
+            toolInvocationID: toolInvocationID,
+            toolArgsJSON: toolArgsJSON,
+            toolResultJSON: toolResultJSON,
+            toolIsError: toolIsError,
+            reasoning: reasoning,
+            sequenceIndex: sequenceIndex,
+            isStreaming: isStreaming,
+            workflow: workflow,
+            codexGoalMode: codexGoalMode,
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho
+        )
+    }
+
     public var hasDisplayableAssistantBody: Bool {
         guard kind == .assistant || kind == .assistantInline else { return false }
         return AgentDisplayableText.hasDisplayableBody(text)

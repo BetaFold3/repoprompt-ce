@@ -394,6 +394,7 @@ extension AgentModeViewModel {
                 entries: candidateEntries
             ) != nil
         }
+        let pairedDeviceDisplayNameByBareID = pairedDeviceDisplayNameByBareIDForSidebar()
         return AgentModeSidebarSessionBuilder(
             allTabs: tabs,
             linkedTabs: linkedTabs,
@@ -404,9 +405,57 @@ extension AgentModeViewModel {
             sessionListCacheReady: ownerValidatedSessionListCacheReady,
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
             mcpControlledTabIDs: mcpControlledTabIDs,
-            registeredRemoteHosts: registeredRemoteHostsForSidebar(currentIndex: currentIndex)
+            registeredRemoteHosts: registeredRemoteHostsForSidebar(currentIndex: currentIndex),
+            pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareID
         ).build()
     }
+
+    /// Bare-8-hex device ID → pairing-time display name, for the remote-controlled
+    /// session badge; also feeds the sidebar content fingerprint so renames refresh
+    /// the sidebar. Gated on remote-origin sessions being visible at all: the pairing
+    /// store's first Keychain access mints the host key, which read-only sidebar
+    /// rendering must never trigger for users who have not used remote control.
+    /// Results (including failed loads) are memoized for a short TTL so an unhealthy
+    /// store cannot degrade every fingerprint pass into synchronous Keychain IPC.
+    func pairedDeviceDisplayNameByBareIDForSidebar() -> [String: String] {
+        let observedDeviceIDs = Set(
+            sessions.values.compactMap { session -> String? in
+                if case let .remote(deviceID) = session.origin { return deviceID }
+                return nil
+            }
+        ).union(
+            ownerValidatedSessionIndex.values.compactMap { entry -> String? in
+                if case let .remote(deviceID) = entry.origin { return deviceID }
+                return nil
+            }
+        )
+        guard !observedDeviceIDs.isEmpty else {
+            sidebarPairedDeviceNamesCache = nil
+            return [:]
+        }
+        if let cache = sidebarPairedDeviceNamesCache,
+           cache.observedDeviceIDs == observedDeviceIDs,
+           Date().timeIntervalSince(cache.refreshedAt) < Self.sidebarPairedDeviceNamesCacheTTL
+        {
+            return cache.names
+        }
+        let names: [String: String] = if let records = try? RemotePairingIdentityStore.shared
+            .listDevices(includeRevoked: true)
+        {
+            Dictionary(
+                records.compactMap { record in
+                    MCPClientIdentity.remoteDeviceID(from: record.id).map { ($0, record.displayName) }
+                },
+                uniquingKeysWith: { current, _ in current }
+            )
+        } else {
+            [:]
+        }
+        sidebarPairedDeviceNamesCache = (observedDeviceIDs, names, Date())
+        return names
+    }
+
+    private static let sidebarPairedDeviceNamesCacheTTL: TimeInterval = 30
 
     private func registeredRemoteHostsForSidebar(
         currentIndex: [UUID: AgentSessionIndexEntry]
@@ -685,6 +734,7 @@ extension AgentModeViewModel {
             remoteHostName: row.remoteHostName,
             remoteHostAbbreviation: row.remoteHostAbbreviation,
             remoteControlDeviceID: row.remoteControlDeviceID,
+            remoteControlDeviceDisplayName: row.remoteControlDeviceDisplayName,
             worktree: row.worktree,
             worktreeMergeAttention: row.worktreeMergeAttention,
             threadKey: threadKey,

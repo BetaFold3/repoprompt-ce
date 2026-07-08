@@ -641,6 +641,11 @@ final class AgentModeViewModel: ObservableObject {
         remoteHostIDs: Set<String>,
         hosts: [(id: String, displayName: String)]
     )?
+    var sidebarPairedDeviceNamesCache: (
+        observedDeviceIDs: Set<String>,
+        names: [String: String],
+        refreshedAt: Date
+    )?
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     let sessionIndexStore = AgentWorkspaceSessionIndexStore()

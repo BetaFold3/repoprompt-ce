@@ -197,6 +197,7 @@ extension AgentModeViewModel {
         let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
         let sessionSignatures: [AgentSessionSidebarTabSignature]
         let sessionIndex: [UUID: AgentSessionIndexEntry]
+        var pairedDeviceDisplayNameByBareID: [String: String] = [:]
         let sessionListSortDates: [UUID: Date]
         let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
     }
@@ -677,6 +678,7 @@ extension AgentModeViewModel {
         let remoteHostName: String?
         let remoteHostAbbreviation: String?
         let remoteControlDeviceID: String?
+        let remoteControlDeviceDisplayName: String?
         /// Bound-worktree visual identity for this session (Item 10). Nil when
         /// the session has no worktree bindings. Carries the representative
         /// (first) binding when a session is bound to multiple roots.
@@ -711,6 +713,7 @@ extension AgentModeViewModel {
             remoteHostName: String? = nil,
             remoteHostAbbreviation: String? = nil,
             remoteControlDeviceID: String? = nil,
+            remoteControlDeviceDisplayName: String? = nil,
             worktree: AgentWorktreeIndicator? = nil,
             worktreeMergeAttention: AgentWorktreeMergeAttention? = nil,
             threadKey: AgentSidebarThreadKey? = nil,
@@ -734,6 +737,7 @@ extension AgentModeViewModel {
             self.remoteHostName = remoteHostName
             self.remoteHostAbbreviation = remoteHostAbbreviation
             self.remoteControlDeviceID = remoteControlDeviceID
+            self.remoteControlDeviceDisplayName = remoteControlDeviceDisplayName
             self.worktree = worktree
             self.worktreeMergeAttention = worktreeMergeAttention
             self.threadKey = threadKey

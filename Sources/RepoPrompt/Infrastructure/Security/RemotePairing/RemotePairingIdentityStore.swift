@@ -35,6 +35,12 @@ final class RemotePairingIdentityStore: @unchecked Sendable {
     private let expectedOwnerID: UInt32
     private let keychain: RemotePairingKeychainStoring
     private let lock = NSRecursiveLock()
+    /// Sidebar/dashboard render-time callers can otherwise pay Keychain + lstat + JSON decode per row.
+    /// The app is the only in-process writer and all mutations funnel through save(_:);
+    /// the gateway only reads this file out-of-process. Trade-off: writes from another app
+    /// instance stay invisible until an in-process save() — the pre-cache behavior re-read the
+    /// file per call and was eventually consistent; the supported model is a single app instance.
+    private var cachedRegistry: PairedDeviceRegistry?
 
     init(
         url: URL? = nil,
@@ -74,16 +80,23 @@ final class RemotePairingIdentityStore: @unchecked Sendable {
 
     func registry() throws -> PairedDeviceRegistry {
         try withLock {
+            if let cachedRegistry {
+                return cachedRegistry
+            }
+
             let hostFingerprint = try hostPublicKeyInfo().fingerprint
             switch Self.load(from: url, expectedOwnerID: expectedOwnerID) {
             case let .success(registry):
                 guard registry.hostPublicKeyFingerprint == hostFingerprint else {
                     throw RemotePairingIdentityStoreError.invalidRegistry
                 }
+                cachedRegistry = registry
                 return registry
             case let .failure(error):
                 guard error == .missing else { throw error }
-                return PairedDeviceRegistry(hostPublicKeyFingerprint: hostFingerprint, devices: [])
+                let registry = PairedDeviceRegistry(hostPublicKeyFingerprint: hostFingerprint, devices: [])
+                cachedRegistry = registry
+                return registry
             }
         }
     }
@@ -162,7 +175,12 @@ final class RemotePairingIdentityStore: @unchecked Sendable {
                 let data = try encoder.encode(registry)
                 try data.write(to: url, options: [.atomic])
                 try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                // The just-written registry passed validateRegistry above and is now the
+                // on-disk state; installing it avoids a full Keychain + load + decode miss
+                // on the next read (updateLastSeen fires on connection activity).
+                cachedRegistry = registry
             } catch {
+                cachedRegistry = nil
                 throw RemotePairingIdentityStoreError.writeFailed(error.localizedDescription)
             }
         }

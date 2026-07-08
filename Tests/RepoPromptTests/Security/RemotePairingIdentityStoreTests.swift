@@ -58,4 +58,63 @@ final class RemotePairingIdentityStoreTests: XCTestCase {
         XCTAssertTrue(devices[0].isRevoked)
         XCTAssertNil(devices[0].pushSubscription)
     }
+
+    func testUpsertDeviceRefreshesCachedRegistryForDeviceLookup() throws {
+        let directory = try RemotePairingTestSupport.temporaryDirectory(testCase: self)
+        let url = RemotePairingTestSupport.registryURL(in: directory)
+        let (_, keychain) = RemotePairingTestSupport.hostKeychain()
+        let store = RemotePairingIdentityStore(url: url, keychain: keychain)
+
+        let record = RemotePairingTestSupport.deviceRecord(displayName: "Fresh Client")
+        XCTAssertNil(try store.device(id: record.id))
+
+        try store.upsertDevice(record)
+
+        let loaded = try XCTUnwrap(store.device(id: record.id))
+        XCTAssertEqual(loaded.displayName, "Fresh Client")
+        XCTAssertEqual(loaded.id, record.id)
+    }
+
+    func testRevokeDeviceRefreshesCachedRegistryForListDevices() throws {
+        let directory = try RemotePairingTestSupport.temporaryDirectory(testCase: self)
+        let url = RemotePairingTestSupport.registryURL(in: directory)
+        let (_, keychain) = RemotePairingTestSupport.hostKeychain()
+        let store = RemotePairingIdentityStore(url: url, keychain: keychain)
+
+        let push = WebPushSubscriptionRecord(endpoint: "https://push.example/device", p256dh: "p256dh", auth: "auth")
+        let record = RemotePairingTestSupport.deviceRecord(pushSubscription: push)
+        try store.upsertDevice(record)
+        XCTAssertFalse(try XCTUnwrap(store.listDevices(includeRevoked: true).first).isRevoked)
+
+        let revokedAt = Date(timeIntervalSince1970: 1_700_000_200)
+        try store.revokeDevice(id: record.id, revokedAt: revokedAt)
+
+        let devices = try store.listDevices(includeRevoked: true)
+        XCTAssertEqual(devices.count, 1)
+        XCTAssertEqual(devices[0].revokedAt, revokedAt)
+        XCTAssertNil(devices[0].pushSubscription)
+    }
+
+    func testRegistryReadUsesCachedValueWhenBackingFileChangesExternally() throws {
+        let directory = try RemotePairingTestSupport.temporaryDirectory(testCase: self)
+        let url = RemotePairingTestSupport.registryURL(in: directory)
+        let (hostKey, keychain) = RemotePairingTestSupport.hostKeychain()
+        let store = RemotePairingIdentityStore(url: url, keychain: keychain)
+
+        let original = RemotePairingTestSupport.deviceRecord(displayName: "Original Client")
+        let originalRegistry = RemotePairingTestSupport.validRegistry(hostSigner: hostKey, devices: [original])
+        try RemotePairingTestSupport.writeRegistry(originalRegistry, to: url)
+        XCTAssertEqual(try XCTUnwrap(store.device(id: original.id)).displayName, "Original Client")
+
+        let external = RemotePairingTestSupport.deviceRecord(id: original.id, displayName: "External Client")
+        let externalRegistry = RemotePairingTestSupport.validRegistry(hostSigner: hostKey, devices: [external])
+        try RemotePairingTestSupport.writeRegistry(externalRegistry, to: url)
+        XCTAssertEqual(
+            try RemotePairingIdentityStore.load(from: url).get().devices.first?.displayName,
+            "External Client"
+        )
+
+        let cached = try XCTUnwrap(store.device(id: original.id))
+        XCTAssertEqual(cached.displayName, "Original Client")
+    }
 }

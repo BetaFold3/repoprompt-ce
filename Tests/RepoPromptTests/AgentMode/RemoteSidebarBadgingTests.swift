@@ -152,8 +152,160 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         XCTAssertEqual(try row(for: tabID, in: rows).remoteControlDeviceID, "feedbabe")
     }
 
+    func testRemoteControlDeviceDisplayNameUsesBuilderMap() throws {
+        let namedTabID = id(24)
+        let unknownTabID = id(25)
+        let revokedNamedTabID = id(26)
+        let namedSessionID = id(124)
+        let unknownSessionID = id(125)
+        let revokedNamedSessionID = id(126)
+        let rows = build(
+            tabs: [
+                tab(namedTabID, sessionID: namedSessionID),
+                tab(unknownTabID, sessionID: unknownSessionID),
+                tab(revokedNamedTabID, sessionID: revokedNamedSessionID)
+            ],
+            sessionIndex: sessionIndex([
+                entry(
+                    namedSessionID,
+                    tabID: namedTabID,
+                    lastUserMessageAt: date(100),
+                    origin: .remote(deviceID: "ab12cd34")
+                ),
+                entry(
+                    unknownSessionID,
+                    tabID: unknownTabID,
+                    lastUserMessageAt: date(90),
+                    origin: .remote(deviceID: "feedbabe")
+                ),
+                entry(
+                    revokedNamedSessionID,
+                    tabID: revokedNamedTabID,
+                    lastUserMessageAt: date(80),
+                    origin: .remote(deviceID: "deadbeef")
+                )
+            ]),
+            pairedDeviceDisplayNameByBareID: [
+                "ab12cd34": "Tuan’s MacBook Pro",
+                "deadbeef": "Revoked MacBook"
+            ]
+        )
+
+        let named = try row(for: namedTabID, in: rows)
+        XCTAssertEqual(named.remoteControlDeviceID, "ab12cd34")
+        XCTAssertEqual(named.remoteControlDeviceDisplayName, "Tuan’s MacBook Pro")
+        XCTAssertNil(try row(for: unknownTabID, in: rows).remoteControlDeviceDisplayName)
+        XCTAssertEqual(try row(for: revokedNamedTabID, in: rows).remoteControlDeviceDisplayName, "Revoked MacBook")
+    }
+
+    func testRemoteControlDeviceDisplayNameSurvivesBuilderThreadDepthTransform() throws {
+        let parentTabID = id(27)
+        let childTabID = id(28)
+        let parentSessionID = id(127)
+        let childSessionID = id(128)
+        let rows = build(
+            tabs: [
+                tab(parentTabID, sessionID: parentSessionID),
+                tab(childTabID, sessionID: childSessionID)
+            ],
+            sessionIndex: sessionIndex([
+                entry(parentSessionID, tabID: parentTabID, lastUserMessageAt: date(100)),
+                entry(
+                    childSessionID,
+                    tabID: childTabID,
+                    parentSessionID: parentSessionID,
+                    lastUserMessageAt: date(50),
+                    origin: .remote(deviceID: "ab12cd34")
+                )
+            ]),
+            pairedDeviceDisplayNameByBareID: ["ab12cd34": "Threaded Mac"]
+        )
+
+        let child = try row(for: childTabID, in: rows)
+        XCTAssertEqual(child.depth, 1)
+        XCTAssertEqual(child.remoteControlDeviceID, "ab12cd34")
+        XCTAssertEqual(child.remoteControlDeviceDisplayName, "Threaded Mac")
+    }
+
+    func testSidebarRecencyFloorIgnoresEpochLastUserMessageButPreservesTitleIntent() throws {
+        let tabID = id(29)
+        let sessionID = id(129)
+        let savedAt = date(1_750_000_000)
+        // Default-blank tab name ("T29"): if the recency floor leaked into title
+        // intent, hasSentUserMessage would flip false and the empty-session title
+        // ("New Chat") would replace it. Linked entries render the tab name by design.
+        let rows = build(
+            tabs: [
+                ComposeTabState(
+                    id: tabID,
+                    name: "T29",
+                    lastModified: date(1),
+                    isPinned: false,
+                    activeAgentSessionID: sessionID
+                )
+            ],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    name: "New Session",
+                    lastUserMessageAt: date(1_000_005),
+                    savedAt: savedAt,
+                    itemCount: 0,
+                    origin: .remote(deviceID: "ab12cd34")
+                )
+            ])
+        )
+
+        let row = try row(for: tabID, in: rows)
+        XCTAssertNil(row.lastUserMessageAt)
+        XCTAssertEqual(row.activityDate, savedAt)
+        XCTAssertEqual(row.title, "T29")
+        XCTAssertEqual(
+            AgentSidebarDateSectionBuilder.activeGroups(for: rows, now: savedAt).first?.bucket,
+            .today
+        )
+    }
+
+    func testSidebarRecencyFloorPreservesGenuineUserDate() throws {
+        let tabID = id(30)
+        let sessionID = id(130)
+        let genuineUserDate = date(1_704_067_200)
+        let rows = build(
+            tabs: [tab(tabID, sessionID: sessionID)],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    lastUserMessageAt: genuineUserDate,
+                    savedAt: date(1_750_000_000),
+                    origin: .remote(deviceID: "ab12cd34")
+                )
+            ])
+        )
+
+        let row = try row(for: tabID, in: rows)
+        XCTAssertEqual(row.lastUserMessageAt, genuineUserDate)
+        XCTAssertEqual(row.activityDate, genuineUserDate)
+    }
+
+    func testRemoteControlDeviceBadgeTextUsesFriendlyNameAndHexTooltip() {
+        let known = AgentSessionRow.remoteControlDeviceBadgeText(
+            deviceID: "ab12cd34",
+            displayName: "Tuan’s MacBook Pro"
+        )
+        XCTAssertEqual(known.label, "Tuan’s MacBook Pro")
+        XCTAssertEqual(known.badgeTooltip, "Remote controlled by Tuan’s MacBook Pro (ab12cd34)")
+        XCTAssertEqual(known.statusPlateTooltip, "Remote controlled by Tuan’s MacBook Pro (ab12cd34)")
+
+        let unknown = AgentSessionRow.remoteControlDeviceBadgeText(deviceID: "remote:feedbabe", displayName: nil)
+        XCTAssertEqual(unknown.label, "feedbabe")
+        XCTAssertEqual(unknown.badgeTooltip, "Remote-controlled by device remote:feedbabe")
+        XCTAssertEqual(unknown.statusPlateTooltip, "Remote controlled (device feedbabe)")
+    }
+
     func testSidebarSessionEqualityIncludesRemoteControlDeviceID() {
-        let tabID = id(24)
+        let tabID = id(31)
         let base = AgentModeViewModel.SidebarSession(
             id: tabID,
             tabID: tabID,
@@ -161,7 +313,7 @@ final class RemoteSidebarBadgingTests: XCTestCase {
             lastUserMessageAt: nil,
             activityDate: date(100),
             isPinned: false,
-            sessionID: id(124),
+            sessionID: id(131),
             parentSessionID: nil,
             depth: 0,
             isMCPControlled: true,
@@ -174,7 +326,7 @@ final class RemoteSidebarBadgingTests: XCTestCase {
             lastUserMessageAt: nil,
             activityDate: date(100),
             isPinned: false,
-            sessionID: id(124),
+            sessionID: id(131),
             parentSessionID: nil,
             depth: 0,
             isMCPControlled: true,
@@ -184,9 +336,88 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         XCTAssertNotEqual(base, changed)
     }
 
+    func testSidebarSessionEqualityIncludesRemoteControlDeviceDisplayName() {
+        let tabID = id(32)
+        let base = AgentModeViewModel.SidebarSession(
+            id: tabID,
+            tabID: tabID,
+            title: "Remote",
+            lastUserMessageAt: nil,
+            activityDate: date(100),
+            isPinned: false,
+            sessionID: id(132),
+            parentSessionID: nil,
+            depth: 0,
+            isMCPControlled: true,
+            remoteControlDeviceID: "ab12cd34",
+            remoteControlDeviceDisplayName: "Tuan’s MacBook Pro"
+        )
+        let changed = AgentModeViewModel.SidebarSession(
+            id: tabID,
+            tabID: tabID,
+            title: "Remote",
+            lastUserMessageAt: nil,
+            activityDate: date(100),
+            isPinned: false,
+            sessionID: id(132),
+            parentSessionID: nil,
+            depth: 0,
+            isMCPControlled: true,
+            remoteControlDeviceID: "ab12cd34",
+            remoteControlDeviceDisplayName: "Office MacBook"
+        )
+
+        XCTAssertNotEqual(base, changed)
+    }
+
+    func testSidebarContentFingerprintIncludesRemoteDeviceDisplayNameMap() {
+        let tabID = id(33)
+        let sessionID = id(133)
+        let base = AgentModeViewModel.AgentSessionSidebarContentFingerprint(
+            currentTabID: nil,
+            sessionListCacheReady: true,
+            tabsWithActiveAgentRun: Set<UUID>(),
+            mcpControlledTabIDs: Set<UUID>(),
+            tabMetadataSignatures: [],
+            sessionSignatures: [],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    lastUserMessageAt: date(100),
+                    origin: .remote(deviceID: "ab12cd34")
+                )
+            ]),
+            pairedDeviceDisplayNameByBareID: ["ab12cd34": "Tuan’s MacBook Pro"],
+            sessionListSortDates: [:],
+            sidebarRestoreFrozenOrderByTabID: [:]
+        )
+        let changed = AgentModeViewModel.AgentSessionSidebarContentFingerprint(
+            currentTabID: nil,
+            sessionListCacheReady: true,
+            tabsWithActiveAgentRun: Set<UUID>(),
+            mcpControlledTabIDs: Set<UUID>(),
+            tabMetadataSignatures: [],
+            sessionSignatures: [],
+            sessionIndex: sessionIndex([
+                entry(
+                    sessionID,
+                    tabID: tabID,
+                    lastUserMessageAt: date(100),
+                    origin: .remote(deviceID: "ab12cd34")
+                )
+            ]),
+            pairedDeviceDisplayNameByBareID: ["ab12cd34": "Office MacBook"],
+            sessionListSortDates: [:],
+            sidebarRestoreFrozenOrderByTabID: [:]
+        )
+
+        XCTAssertNotEqual(base, changed)
+    }
+
     func testSidebarContentFingerprintIncludesPersistedRemoteOrigin() {
-        let tabID = id(25)
-        let sessionID = id(125)
+        let tabID = id(34)
+        let sessionID = id(134)
         let mcpFingerprint = AgentModeViewModel.AgentSessionSidebarContentFingerprint(
             currentTabID: nil,
             sessionListCacheReady: true,
@@ -231,7 +462,8 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         tabs: [ComposeTabState],
         sessions: [UUID: AgentModeViewModel.TabSession] = [:],
         sessionIndex: [UUID: AgentSessionIndexEntry],
-        registeredRemoteHosts: [(id: String, displayName: String)] = []
+        registeredRemoteHosts: [(id: String, displayName: String)] = [],
+        pairedDeviceDisplayNameByBareID: [String: String] = [:]
     ) -> [AgentModeViewModel.SidebarSession] {
         AgentModeSidebarSessionBuilder(
             allTabs: tabs,
@@ -247,7 +479,8 @@ final class RemoteSidebarBadgingTests: XCTestCase {
             sessionListCacheReady: true,
             sidebarRestoreFrozenOrderByTabID: [:],
             mcpControlledTabIDs: [],
-            registeredRemoteHosts: registeredRemoteHosts
+            registeredRemoteHosts: registeredRemoteHosts,
+            pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareID
         ).build()
     }
 
@@ -292,19 +525,21 @@ final class RemoteSidebarBadgingTests: XCTestCase {
         _ sessionID: UUID,
         tabID: UUID,
         parentSessionID: UUID? = nil,
+        name: String? = nil,
         lastUserMessageAt: Date?,
         savedAt: Date? = nil,
+        itemCount: Int? = nil,
         remoteHostName: String? = nil,
         origin: AgentSessionOrigin? = nil
     ) -> AgentSessionIndexEntry {
         AgentSessionIndexEntry(
             id: sessionID,
             tabID: tabID,
-            name: "Session \(sessionID.uuidString.suffix(4))",
+            name: name ?? "Session \(sessionID.uuidString.suffix(4))",
             lastUserMessageAt: lastUserMessageAt,
             savedAt: savedAt ?? lastUserMessageAt ?? date(1),
             lastRunStateRaw: nil,
-            itemCount: lastUserMessageAt == nil ? 0 : 1,
+            itemCount: itemCount ?? (lastUserMessageAt == nil ? 0 : 1),
             agentKindRaw: nil,
             agentModelRaw: nil,
             agentReasoningEffortRaw: nil,

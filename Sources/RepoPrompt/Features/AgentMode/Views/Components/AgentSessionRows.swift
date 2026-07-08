@@ -1,5 +1,11 @@
 import SwiftUI
 
+struct AgentRemoteControlDeviceBadgeText: Equatable {
+    let label: String
+    let badgeTooltip: String
+    let statusPlateTooltip: String
+}
+
 // MARK: - Agent Session Row
 
 struct AgentSessionRow: View {
@@ -17,6 +23,7 @@ struct AgentSessionRow: View {
     var remoteHostName: String?
     var remoteHostAbbreviation: String?
     var remoteControlDeviceID: String?
+    var remoteControlDeviceDisplayName: String?
     /// Bound-worktree visual identity for this session (Item 10). When non-nil,
     /// a small colored dot/ring is overlaid at the bottom-right of the status
     /// plate without shifting the title — see `worktreeMarker`.
@@ -195,7 +202,10 @@ struct AgentSessionRow: View {
                     }
 
                     if let remoteControlDeviceID {
-                        remoteControlledBadge(deviceID: remoteControlDeviceID)
+                        remoteControlledBadge(
+                            deviceID: remoteControlDeviceID,
+                            displayName: remoteControlDeviceDisplayName
+                        )
                     }
 
                     if isThreadCollapsed, hiddenThreadDescendantCount > 0 {
@@ -363,13 +373,12 @@ struct AgentSessionRow: View {
         .accessibilityLabel("Running on \(hostName)")
     }
 
-    private func remoteControlledBadge(deviceID: String) -> some View {
-        let label = remoteControlDeviceLabel(for: deviceID)
-        let tooltip = "Remote-controlled by device \(deviceID)"
+    private func remoteControlledBadge(deviceID: String, displayName: String?) -> some View {
+        let text = Self.remoteControlDeviceBadgeText(deviceID: deviceID, displayName: displayName)
         return HStack(spacing: 3) {
             Image(systemName: "antenna.radiowaves.left.and.right")
                 .font(.system(size: pinFontSize - 1, weight: .semibold))
-            Text(label)
+            Text(text.label)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -379,11 +388,33 @@ struct AgentSessionRow: View {
         .padding(.vertical, chipVerticalPadding)
         .background(Capsule().fill(Self.mcpAccentColor.opacity(0.12)))
         .overlay(Capsule().strokeBorder(Self.mcpAccentColor.opacity(0.35), lineWidth: 0.75))
-        .hoverTooltip(tooltip)
-        .accessibilityLabel(tooltip)
+        .hoverTooltip(text.badgeTooltip)
+        .accessibilityLabel(text.badgeTooltip)
     }
 
-    private func remoteControlDeviceLabel(for deviceID: String) -> String {
+    static func remoteControlDeviceBadgeText(
+        deviceID: String,
+        displayName: String?
+    ) -> AgentRemoteControlDeviceBadgeText {
+        let label = remoteControlDeviceLabel(for: deviceID)
+        if let displayName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !displayName.isEmpty
+        {
+            let tooltip = "Remote controlled by \(displayName) (\(label))"
+            return AgentRemoteControlDeviceBadgeText(
+                label: displayName,
+                badgeTooltip: tooltip,
+                statusPlateTooltip: tooltip
+            )
+        }
+        return AgentRemoteControlDeviceBadgeText(
+            label: label,
+            badgeTooltip: "Remote-controlled by device \(deviceID)",
+            statusPlateTooltip: "Remote controlled (device \(label))"
+        )
+    }
+
+    static func remoteControlDeviceLabel(for deviceID: String) -> String {
         String(deviceID.split(separator: ":").last.map(String.init) ?? deviceID).suffix(8).description
     }
 
@@ -703,7 +734,10 @@ struct AgentSessionRow: View {
 
         let state = effectiveStatusState
         let controlTooltip = remoteControlDeviceID.map {
-            "Remote controlled (device \(remoteControlDeviceLabel(for: $0)))"
+            Self.remoteControlDeviceBadgeText(
+                deviceID: $0,
+                displayName: remoteControlDeviceDisplayName
+            ).statusPlateTooltip
         } ?? "MCP Controlled"
         let stateTooltip: String? = switch state {
         case .running:

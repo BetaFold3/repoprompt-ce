@@ -15,6 +15,7 @@ struct AgentModeSidebarSessionBuilder {
     let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
     let mcpControlledTabIDs: Set<UUID>
     let registeredRemoteHosts: [(id: String, displayName: String)]
+    var pairedDeviceDisplayNameByBareID: [String: String] = [:]
 
     private struct BuildContext {
         let tabByID: [UUID: ComposeTabState]
@@ -24,6 +25,7 @@ struct AgentModeSidebarSessionBuilder {
         let explicitSessionIDByTabID: [UUID: UUID]
         let bestEntryByTabID: [UUID: AgentSessionIndexEntry]
         let remoteHostAbbreviationByHostID: [String: String]
+        let pairedDeviceDisplayNameByBareID: [String: String]
         let useFrozenRestoreOrder: Bool
     }
 
@@ -110,6 +112,7 @@ struct AgentModeSidebarSessionBuilder {
             explicitSessionIDByTabID: explicitSessionIDByTabID,
             bestEntryByTabID: bestEntryByTabID,
             remoteHostAbbreviationByHostID: remoteHostAbbreviationLookup(),
+            pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareID,
             useFrozenRestoreOrder: shouldFreezeSidebarOrdering(for: linkedTabs)
         )
     }
@@ -291,9 +294,11 @@ struct AgentModeSidebarSessionBuilder {
             entry: entry,
             context: context
         )
+        // Display-only recency sanity: synthetic remote projector timestamps before
+        // AgentSessionRecencySanity's floor must not block the savedAt fallback.
         let lastUserMessageAt = Self.freshestDate(
-            entry?.lastUserMessageAt,
-            context.sortDateByTabID[tab.id]
+            AgentSessionRecencySanity.plausibleRecencyDate(entry?.lastUserMessageAt),
+            AgentSessionRecencySanity.plausibleRecencyDate(context.sortDateByTabID[tab.id])
         )
         let savedAt = sidebarSavedAt(for: tab, liveSession: metadataLiveSession, indexEntry: entry)
         let activityDate = Self.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
@@ -301,6 +306,9 @@ struct AgentModeSidebarSessionBuilder {
         let resolvedParentSessionID = metadataLiveSession?.parentSessionID ?? entry?.parentSessionID
         let isMCPControlled = mcpControlledTabIDs.contains(tab.id)
         let remoteControlDeviceID = Self.remoteControlDeviceID(liveSession: boundLiveSession, entry: entry)
+        let remoteControlDeviceDisplayName = remoteControlDeviceID.flatMap {
+            context.pairedDeviceDisplayNameByBareID[$0]
+        }
         let remoteHostID = metadataLiveSession?.remoteHost?.hostID ?? entry?.remoteHostID
         let remoteHostName = metadataLiveSession?.remoteHost?.hostDisplayName ?? entry?.remoteHostName
         let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
@@ -330,6 +338,7 @@ struct AgentModeSidebarSessionBuilder {
             remoteHostName: remoteHostName,
             remoteHostAbbreviation: remoteHostID.flatMap { context.remoteHostAbbreviationByHostID[$0] },
             remoteControlDeviceID: remoteControlDeviceID,
+            remoteControlDeviceDisplayName: remoteControlDeviceDisplayName,
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
             searchFields: searchFields
@@ -777,6 +786,7 @@ struct AgentModeSidebarSessionBuilder {
             remoteHostName: session.remoteHostName,
             remoteHostAbbreviation: session.remoteHostAbbreviation,
             remoteControlDeviceID: session.remoteControlDeviceID,
+            remoteControlDeviceDisplayName: session.remoteControlDeviceDisplayName,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
             searchFields: session.searchFields

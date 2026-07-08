@@ -401,6 +401,7 @@ struct AgentModeSessionsListView: View {
                                 remoteHostName: session.remoteHostName,
                                 remoteHostAbbreviation: session.remoteHostAbbreviation,
                                 remoteControlDeviceID: session.remoteControlDeviceID,
+                                remoteControlDeviceDisplayName: session.remoteControlDeviceDisplayName,
                                 worktree: session.worktree,
                                 worktreeMergeAttention: session.worktreeMergeAttention,
                                 threadDepth: session.depth,
