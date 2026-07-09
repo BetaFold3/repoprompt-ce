@@ -2623,7 +2623,8 @@ struct AgentRunMCPToolService {
         let hasStructuredObjects: Bool
     }
 
-    private func parseResponsePayload(args: [String: Value]) throws -> AgentModeViewModel.MCPInteractionResponsePayload {
+    /// Internal for wire-contract round-trip tests.
+    func parseResponsePayload(args: [String: Value]) throws -> AgentModeViewModel.MCPInteractionResponsePayload {
         let parsedAnswers: ParsedAnswers = if let rawAnswers = args["answers"] {
             try parseAnswers(rawAnswers)
         } else {

@@ -1112,4 +1112,94 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             [.string(sessionID)]
         )
     }
+
+    func testRespondFailureRearmsSessionWatch() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input"))),
+            .failure("respond failed"),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input")))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+
+        _ = await runtime.handle(
+            RemoteClientFrame(type: "subscribe", requestID: "r1", sessionID: sessionID),
+            deviceID: "device",
+            sinkID: sinkID,
+            sink: sink
+        )
+        _ = await waitForSessionUpdateCount(1, sink: sink)
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "respond",
+                requestID: "r2",
+                sessionID: sessionID,
+                payload: .object([
+                    "interaction_id": .string("22222222-2222-2222-2222-222222222222"),
+                    "response": .string("accept")
+                ])
+            ),
+            deviceID: "device",
+            sinkID: sinkID,
+            sink: sink
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        let frames = await waitForSessionUpdateCount(2, sink: sink)
+        XCTAssertGreaterThanOrEqual(frames.count, 2)
+        let firstSeq = try XCTUnwrap(frames[0].seq)
+        let secondSeq = try XCTUnwrap(frames[1].seq)
+        XCTAssertGreaterThan(secondSeq, firstSeq)
+
+        try await Task.sleep(for: .milliseconds(150))
+        let finalSessionUpdateCount = await sink.frames.count { $0.type == "session_update" }
+        XCTAssertEqual(finalSessionUpdateCount, 2)
+    }
+
+    func testRespondFailureRearmIgnoresUnwatchedSession() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .failure("respond failed")
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+        let sink = RecordingFrameSink()
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "respond",
+                requestID: "r1",
+                sessionID: sessionID,
+                payload: .object([
+                    "interaction_id": .string("22222222-2222-2222-2222-222222222222"),
+                    "response": .string("accept")
+                ])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: sink
+        )
+        try await Task.sleep(for: .milliseconds(150))
+
+        XCTAssertEqual(response?.type, "command_error")
+        let calls = await connection.calls
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.arguments["op"], .string("respond"))
+    }
+
+    private func waitForSessionUpdateCount(
+        _ minimumCount: Int,
+        sink: RecordingFrameSink,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async -> [RemoteServerFrame] {
+        for _ in 0 ..< 100 {
+            let frames = await sink.frames.filter { $0.type == "session_update" }
+            if frames.count >= minimumCount { return frames }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        let frames = await sink.frames.filter { $0.type == "session_update" }
+        XCTAssertGreaterThanOrEqual(frames.count, minimumCount, file: file, line: line)
+        return frames
+    }
 }

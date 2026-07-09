@@ -367,6 +367,9 @@ actor RemoteGatewayRuntime {
             outcome = ledgerOutcome(for: error, frame: frame)
             await ledger.complete(key: key, outcome: outcome)
             audit(frame: frame, deviceID: deviceID, outcome: "failure", code: outcome.auditCode)
+            if frame.type == "steer" || frame.type == "respond" {
+                await watchManager.rearm(deviceID: deviceID, sessionID: frame.sessionID)
+            }
             // M6.6: binding errors on start carry the eligible windows so remote
             // clients can render an explicit start-target picker.
             if case let .failure(code, message) = outcome,

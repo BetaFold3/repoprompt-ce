@@ -5,6 +5,7 @@ import RepoPromptRemoteWire
 @MainActor
 final class RemoteAgentModeCoordinator {
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "RemoteAgentModeCoordinator")
+    private static let sendingResponseStatusPrefix = "Sending response to "
 
     private struct HostConnectionTasks {
         var inbound: Task<Void, Never>
@@ -16,6 +17,15 @@ final class RemoteAgentModeCoordinator {
         var parentTabID: UUID
         var parentRemoteSessionID: String
         var hostBinding: AgentSessionRemoteHostBinding
+    }
+
+    struct RestorableInteractionState {
+        let interactionID: String
+        let priorRunState: AgentSessionRunState
+        let pendingApproval: AgentApprovalRequest?
+        let pendingAskUser: AgentAskUserPendingState?
+        let pendingUserInputRequest: AgentRequestUserInputRequest?
+        let pendingMCPElicitationRequest: AgentMCPElicitationRequest?
     }
 
     private weak var viewModel: AgentModeViewModel?
@@ -124,9 +134,9 @@ final class RemoteAgentModeCoordinator {
         interactionID: String,
         decision: AgentApprovalDecision
     ) {
-        optimisticallyClearPendingInteraction(session, interactionID: interactionID)
+        let restorable = optimisticallyClearPendingInteraction(session, interactionID: interactionID)
         let payload = RemoteInteractionResponsePayload.approval(decision: decision)
-        submitResponse(session: session, interactionID: interactionID, payload: payload)
+        submitResponse(session: session, interactionID: interactionID, payload: payload, restorable: restorable)
     }
 
     func submitAskUserResponse(
@@ -134,8 +144,8 @@ final class RemoteAgentModeCoordinator {
         interactionID: String,
         response: AgentAskUserResponse
     ) {
-        optimisticallyClearPendingInteraction(session, interactionID: interactionID)
-        submitResponse(session: session, interactionID: interactionID, payload: .askUser(response))
+        let restorable = optimisticallyClearPendingInteraction(session, interactionID: interactionID)
+        submitResponse(session: session, interactionID: interactionID, payload: .askUser(response), restorable: restorable)
     }
 
     func submitUserInputResponse(
@@ -144,8 +154,8 @@ final class RemoteAgentModeCoordinator {
         response: AgentRequestUserInputResponse
     ) {
         let interactionID = request.remoteInteractionID ?? request.id.uuidString
-        optimisticallyClearPendingInteraction(session, interactionID: interactionID)
-        submitResponse(session: session, interactionID: interactionID, payload: .userInput(response))
+        let restorable = optimisticallyClearPendingInteraction(session, interactionID: interactionID)
+        submitResponse(session: session, interactionID: interactionID, payload: .userInput(response), restorable: restorable)
     }
 
     func submitMCPElicitationResponse(
@@ -154,8 +164,8 @@ final class RemoteAgentModeCoordinator {
         response: AgentMCPElicitationResponse
     ) {
         let interactionID = request.remoteInteractionID ?? request.id.uuidString
-        optimisticallyClearPendingInteraction(session, interactionID: interactionID)
-        submitResponse(session: session, interactionID: interactionID, payload: .mcpElicitation(response))
+        let restorable = optimisticallyClearPendingInteraction(session, interactionID: interactionID)
+        submitResponse(session: session, interactionID: interactionID, payload: .mcpElicitation(response), restorable: restorable)
     }
 
     func stop(tabID: UUID) {
@@ -198,7 +208,8 @@ final class RemoteAgentModeCoordinator {
     private func submitResponse(
         session: AgentModeViewModel.TabSession,
         interactionID: String,
-        payload: RemoteInteractionResponsePayload
+        payload: RemoteInteractionResponsePayload,
+        restorable: RestorableInteractionState
     ) {
         do {
             let controller = try controller(for: session)
@@ -209,10 +220,12 @@ final class RemoteAgentModeCoordinator {
                     self?.clearResolvedInteraction(tabID: session.tabID, interactionID: interactionID, resolvedBy: nil)
                 } catch {
                     self?.appendSystemMessage("Remote response failed: \(Self.describe(error))", tabID: session.tabID)
+                    await self?.recoverFromRespondFailure(tabID: session.tabID, restorable: restorable, controller: controller)
                 }
             }
         } catch {
             appendSystemMessage("Remote response failed: \(Self.describe(error))", tabID: session.tabID)
+            Task { await recoverFromRespondFailure(tabID: session.tabID, restorable: restorable, controller: nil) }
         }
     }
 
@@ -915,17 +928,71 @@ final class RemoteAgentModeCoordinator {
     private func optimisticallyClearPendingInteraction(
         _ session: AgentModeViewModel.TabSession,
         interactionID: String
-    ) {
+    ) -> RestorableInteractionState {
+        let restorable = RestorableInteractionState(
+            interactionID: interactionID,
+            priorRunState: session.runState,
+            pendingApproval: session.pendingApproval,
+            pendingAskUser: session.pendingAskUser,
+            pendingUserInputRequest: session.pendingUserInputRequest,
+            pendingMCPElicitationRequest: session.pendingMCPElicitationRequest
+        )
         clearPendingInteractions(session, matching: interactionID)
         session.runState = .running
-        session.setRunningStatus("Sending response to \(session.remoteHost?.hostDisplayName ?? "remote host")…", source: .transport)
+        session.setRunningStatus(Self.sendingResponseStatusPrefix + (session.remoteHost?.hostDisplayName ?? "remote host") + "…", source: .transport)
         viewModel?.reconcileInteractiveRunState(session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        return restorable
     }
 
-    private func clearResolvedInteraction(tabID: UUID, interactionID: String, resolvedBy _: String?) {
+    func recoverFromRespondFailure(
+        tabID: UUID,
+        restorable: RestorableInteractionState,
+        controller: RemoteAgentSessionController?
+    ) async {
+        guard let session = viewModel?.sessions[tabID] else { return }
+        session.setRunningStatus(nil, source: nil)
+        hostProvidedRunningStatusTabIDs.remove(tabID)
+
+        if let controller {
+            do {
+                try await controller.attachAndCatchUp()
+                return
+            } catch {
+                // Fall through to local restore.
+            }
+        }
+
+        // Offline restore can briefly re-surface a concurrently resolved card; the next
+        // sync or interaction_resolved frame clears it through the normal remote paths.
+        guard let refetchedSession = viewModel?.sessions[tabID], refetchedSession.runState == .running else { return }
+        if refetchedSession.pendingApproval == nil, let pendingApproval = restorable.pendingApproval {
+            refetchedSession.pendingApproval = pendingApproval
+        }
+        if refetchedSession.pendingAskUser == nil, let pendingAskUser = restorable.pendingAskUser {
+            refetchedSession.pendingAskUser = pendingAskUser
+        }
+        if refetchedSession.pendingUserInputRequest == nil, let pendingUserInputRequest = restorable.pendingUserInputRequest {
+            refetchedSession.pendingUserInputRequest = pendingUserInputRequest
+        }
+        if refetchedSession.pendingMCPElicitationRequest == nil, let pendingMCPElicitationRequest = restorable.pendingMCPElicitationRequest {
+            refetchedSession.pendingMCPElicitationRequest = pendingMCPElicitationRequest
+        }
+        refetchedSession.runState = restorable.priorRunState
+        viewModel?.reconcileInteractiveRunState(refetchedSession)
+        viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
+    }
+
+    /// Internal for respond-recovery tests.
+    func clearResolvedInteraction(tabID: UUID, interactionID: String, resolvedBy _: String?) {
         guard let session = viewModel?.sessions[tabID] else { return }
         clearPendingInteractions(session, matching: interactionID)
+        if session.runningStatusSource == .transport,
+           session.runningStatusText?.hasPrefix(Self.sendingResponseStatusPrefix) == true
+        {
+            session.setRunningStatus(nil, source: nil)
+            hostProvidedRunningStatusTabIDs.remove(tabID)
+        }
         viewModel?.reconcileInteractiveRunState(session)
         viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
     }

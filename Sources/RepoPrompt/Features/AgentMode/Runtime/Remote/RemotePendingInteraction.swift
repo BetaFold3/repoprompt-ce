@@ -30,7 +30,7 @@ struct RemoteInteractionResponsePayload: Equatable {
         var object: [String: JSONValue] = ["interaction_id": .string(interactionID)]
         if let response { object["response"] = .string(response) }
         if skip { object["skip"] = .bool(true) }
-        if let answers { object["answers"] = answers }
+        if let answers, !skip { object["answers"] = answers }
         if let content { object["content"] = content }
         if let meta { object["meta"] = meta }
         if let amendment { object["amendment"] = .string(amendment) }
@@ -53,6 +53,9 @@ struct RemoteInteractionResponsePayload: Equatable {
     }
 
     static func askUser(_ response: AgentAskUserResponse) -> RemoteInteractionResponsePayload {
+        guard !response.skipped else {
+            return RemoteInteractionResponsePayload(skip: true)
+        }
         let answers = response.answersByQuestionID.reduce(into: [String: JSONValue]()) { partial, entry in
             partial[entry.key] = .object([
                 "answers": .array(entry.value.answers.map(JSONValue.string)),
