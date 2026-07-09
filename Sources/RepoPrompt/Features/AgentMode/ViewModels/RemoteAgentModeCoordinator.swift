@@ -28,6 +28,12 @@ final class RemoteAgentModeCoordinator {
         let pendingMCPElicitationRequest: AgentMCPElicitationRequest?
     }
 
+    struct StashedAskUserState {
+        let interactionID: String
+        let draftsByQuestionID: [String: AgentAskUserDraft]
+        let currentQuestionIndex: Int
+    }
+
     private weak var viewModel: AgentModeViewModel?
     private let connectionManagerProvider: @MainActor () -> RemoteHostConnectionManager
     private let catalogProvider: @MainActor (String) -> RemoteHostAgentCatalog?
@@ -45,6 +51,7 @@ final class RemoteAgentModeCoordinator {
     private var activeRunStateChildDiscoveryKeys: Set<String> = []
     private var discoveryKeyByTabID: [UUID: String] = [:]
     private var reportedChildMaterializationFailuresByDiscoveryKey: [String: Set<String>] = [:]
+    private var stashedAskUserStateByTabID: [UUID: StashedAskUserState] = [:]
     private var childDiscoveryPendingContextsByKey: [String: RemoteChildDiscoveryContext] = [:]
     private var childDiscoveryTasksByKey: [String: Task<Void, Never>] = [:]
     private var lastChildDiscoveryStartedAtByKey: [String: Date] = [:]
@@ -176,6 +183,7 @@ final class RemoteAgentModeCoordinator {
             cancelChildDiscovery(key: key)
         }
         eventTasksByTabID.removeValue(forKey: tabID)?.cancel()
+        clearAskUserStash(tabID: tabID)
         surfacedChannelReasonsByTabID.removeValue(forKey: tabID)
         hostProvidedRunningStatusTabIDs.remove(tabID)
         lastAdoptedHostNameByTabID.removeValue(forKey: tabID)
@@ -319,6 +327,7 @@ final class RemoteAgentModeCoordinator {
             clearResolvedInteraction(tabID: tabID, interactionID: interactionID, resolvedBy: resolvedBy)
         case .sessionExpired:
             hostProvidedRunningStatusTabIDs.remove(tabID)
+            clearAskUserStash(tabID: tabID)
             session.runState = .failed
             clearPendingInteractions(session)
             appendSystemMessage("Remote session expired on host.", tabID: tabID)
@@ -412,7 +421,8 @@ final class RemoteAgentModeCoordinator {
             .max() ?? session.lastUserMessageAt
     }
 
-    private func applyRunState(
+    /// Internal for draft-stash tests.
+    func applyRunState(
         _ runState: AgentSessionRunState,
         pendingInteraction: RemotePendingInteraction?,
         statusText: String?,
@@ -422,6 +432,7 @@ final class RemoteAgentModeCoordinator {
             clearPendingInteractions(session, preserving: pendingInteraction.interactionID)
             switch pendingInteraction {
             case let .approval(interactionID, request):
+                clearAskUserStash(tabID: session.tabID)
                 if !Self.interactionMatches(
                     session.pendingApproval?.id,
                     remoteInteractionID: approvalRemoteInteractionID(session.pendingApproval),
@@ -435,9 +446,13 @@ final class RemoteAgentModeCoordinator {
                     remoteInteractionID: session.pendingAskUser?.interaction.remoteInteractionID,
                     interactionID: interactionID
                 ) {
-                    session.pendingAskUser = pending
+                    clearAskUserStashIfDifferent(tabID: session.tabID, interactionID: interactionID)
+                    session.pendingAskUser = mergedPendingAskUser(tabID: session.tabID, interactionID: interactionID, pending: pending)
+                } else {
+                    clearAskUserStash(tabID: session.tabID, interactionID: interactionID)
                 }
             case let .userInput(interactionID, request):
+                clearAskUserStash(tabID: session.tabID)
                 if !Self.interactionMatches(
                     session.pendingUserInputRequest?.id,
                     remoteInteractionID: session.pendingUserInputRequest?.remoteInteractionID,
@@ -446,6 +461,7 @@ final class RemoteAgentModeCoordinator {
                     session.pendingUserInputRequest = request
                 }
             case let .mcpElicitation(interactionID, request):
+                clearAskUserStash(tabID: session.tabID)
                 if !Self.interactionMatches(
                     session.pendingMCPElicitationRequest?.id,
                     remoteInteractionID: session.pendingMCPElicitationRequest?.remoteInteractionID,
@@ -455,6 +471,7 @@ final class RemoteAgentModeCoordinator {
                 }
             }
         } else {
+            clearAskUserStash(tabID: session.tabID)
             clearPendingInteractions(session)
         }
         session.runState = runState
@@ -472,6 +489,7 @@ final class RemoteAgentModeCoordinator {
     }
 
     private func applyTerminal(status: String, to session: AgentModeViewModel.TabSession) {
+        clearAskUserStash(tabID: session.tabID)
         clearPendingInteractions(session)
         switch status {
         case "completed":
@@ -880,6 +898,7 @@ final class RemoteAgentModeCoordinator {
         case .revoked:
             surfacedChannelReasonsByTabID.removeValue(forKey: session.tabID)
             hostProvidedRunningStatusTabIDs.remove(session.tabID)
+            clearAskUserStash(tabID: session.tabID)
             session.runState = .failed
             clearPendingInteractions(session)
             appendSystemMessage("Remote host revoked this device. Forget and pair again to restore access.", to: session)
@@ -945,12 +964,63 @@ final class RemoteAgentModeCoordinator {
         return restorable
     }
 
+    private func stashAskUserStateIfNeeded(tabID: UUID, restorable: RestorableInteractionState) {
+        guard let pendingAskUser = restorable.pendingAskUser else { return }
+        // The host owns the authoritative ask_user timeout. If a re-sync re-applies
+        // the question, preserving drafts is more important than restarting the
+        // client-side countdown from the original timestamps.
+        stashedAskUserStateByTabID[tabID] = StashedAskUserState(
+            interactionID: restorable.interactionID,
+            draftsByQuestionID: pendingAskUser.draftsByQuestionID,
+            currentQuestionIndex: pendingAskUser.currentQuestionIndex
+        )
+    }
+
+    private func mergedPendingAskUser(
+        tabID: UUID,
+        interactionID: String,
+        pending: AgentAskUserPendingState
+    ) -> AgentAskUserPendingState {
+        guard let stash = stashedAskUserStateByTabID[tabID],
+              stash.interactionID == interactionID,
+              pending.draftsByQuestionID.values.allSatisfy({ !$0.hasContent })
+        else { return pending }
+
+        var merged = pending
+        let questionIDs = Set(pending.interaction.questions.map(\.id))
+        for (questionID, draft) in stash.draftsByQuestionID where questionIDs.contains(questionID) {
+            merged.draftsByQuestionID[questionID] = draft
+        }
+        if pending.interaction.questions.isEmpty {
+            merged.currentQuestionIndex = 0
+        } else {
+            merged.currentQuestionIndex = min(max(stash.currentQuestionIndex, 0), pending.interaction.questions.count - 1)
+        }
+        clearAskUserStash(tabID: tabID, interactionID: interactionID)
+        return merged
+    }
+
+    private func clearAskUserStashIfDifferent(tabID: UUID, interactionID: String) {
+        guard let stash = stashedAskUserStateByTabID[tabID], stash.interactionID != interactionID else { return }
+        stashedAskUserStateByTabID.removeValue(forKey: tabID)
+    }
+
+    private func clearAskUserStash(tabID: UUID, interactionID: String? = nil) {
+        guard let interactionID else {
+            stashedAskUserStateByTabID.removeValue(forKey: tabID)
+            return
+        }
+        guard stashedAskUserStateByTabID[tabID]?.interactionID == interactionID else { return }
+        stashedAskUserStateByTabID.removeValue(forKey: tabID)
+    }
+
     func recoverFromRespondFailure(
         tabID: UUID,
         restorable: RestorableInteractionState,
         controller: RemoteAgentSessionController?
     ) async {
         guard let session = viewModel?.sessions[tabID] else { return }
+        stashAskUserStateIfNeeded(tabID: tabID, restorable: restorable)
         session.setRunningStatus(nil, source: nil)
         hostProvidedRunningStatusTabIDs.remove(tabID)
 
@@ -970,6 +1040,7 @@ final class RemoteAgentModeCoordinator {
             refetchedSession.pendingApproval = pendingApproval
         }
         if refetchedSession.pendingAskUser == nil, let pendingAskUser = restorable.pendingAskUser {
+            clearAskUserStash(tabID: tabID, interactionID: restorable.interactionID)
             refetchedSession.pendingAskUser = pendingAskUser
         }
         if refetchedSession.pendingUserInputRequest == nil, let pendingUserInputRequest = restorable.pendingUserInputRequest {
@@ -986,6 +1057,7 @@ final class RemoteAgentModeCoordinator {
     /// Internal for respond-recovery tests.
     func clearResolvedInteraction(tabID: UUID, interactionID: String, resolvedBy _: String?) {
         guard let session = viewModel?.sessions[tabID] else { return }
+        clearAskUserStash(tabID: tabID, interactionID: interactionID)
         clearPendingInteractions(session, matching: interactionID)
         if session.runningStatusSource == .transport,
            session.runningStatusText?.hasPrefix(Self.sendingResponseStatusPrefix) == true
@@ -1166,6 +1238,26 @@ final class RemoteAgentModeCoordinator {
             hostIDByTabID[tabID] = hostID
             startEventTask(for: tabID, controller: controller)
             startConnectionFanoutIfNeeded(hostID: hostID, connection: connection)
+        }
+
+        /// Internal for respond-wiring tests.
+        func test_installController(
+            _ controller: RemoteAgentSessionController,
+            for session: AgentModeViewModel.TabSession,
+            hostID: String
+        ) {
+            if session.remoteHost == nil {
+                session.remoteHost = AgentSessionRemoteHostBinding(
+                    hostID: hostID,
+                    hostDisplayName: "Remote Host",
+                    remoteSessionID: "",
+                    lastAppliedSeq: 0,
+                    nextLogOffset: 0
+                )
+            }
+            controllersByTabID[session.tabID] = controller
+            hostIDByTabID[session.tabID] = hostID
+            startEventTask(for: session.tabID, controller: controller)
         }
 
         func test_lifecycleCounts() -> (controllers: Int, eventTasks: Int, hostFanoutTasks: Int, tabHostBindings: Int) {

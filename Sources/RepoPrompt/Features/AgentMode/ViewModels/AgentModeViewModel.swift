@@ -15569,11 +15569,14 @@ final class AgentModeViewModel: ObservableObject {
                   let continuation = session.askUserContinuation
             else { return }
 
+            session.pendingInteractionResolutionAttribution = "timeout"
+            defer { session.pendingInteractionResolutionAttribution = nil }
             invalidatePendingAskUserTimeout(for: session)
             session.pendingAskUser = nil
             session.askUserContinuation = nil
             reconcileInteractiveRunState(session)
             updateBindingsFromSession(session)
+            recordMCPInteractionResolution(for: session, interactionID: interactionID)
 
             let elapsedSeconds = max(0, Int(Date().timeIntervalSince(pending.interaction.askedAt)))
             let response = pending.interaction.buildTimedOutResponse(

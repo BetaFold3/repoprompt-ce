@@ -24,8 +24,11 @@ actor SessionWatchManager {
         var sinks: [UUID: any RemoteFrameSink] = [:]
         var watchedSessionIDs: Set<String> = []
         var activeWaitSessionIDs: Set<String> = []
+        var parkedActionableSessionIDs: Set<String> = []
         var waitTask: Task<Void, Never>?
         var waitTaskID: UUID?
+        var revalidationTask: Task<Void, Never>?
+        var revalidationTaskID: UUID?
         /// Whether the device has a registered Web Push subscription; refreshed on
         /// subscribe, sink removal, and explicit push (un)subscription changes.
         var pushEligible = false
@@ -37,6 +40,7 @@ actor SessionWatchManager {
     private let logger: Logger
     private let waitTimeoutSeconds: TimeInterval
     private let pollRefreshSeconds: TimeInterval
+    private let revalidationIntervalSeconds: TimeInterval
     private var windowResolver: WindowResolver?
     private var devices: [String: DeviceState] = [:]
     private var seqByDeviceSession: [String: UInt64] = [:]
@@ -56,7 +60,8 @@ actor SessionWatchManager {
         windowResolver: WindowResolver? = nil,
         logger: Logger = Logger(label: "com.repoprompt.gateway.watch"),
         waitTimeoutSeconds: TimeInterval = 30,
-        pollRefreshSeconds: TimeInterval = 5
+        pollRefreshSeconds: TimeInterval = 5,
+        revalidationIntervalSeconds: TimeInterval = 30
     ) {
         self.appLink = appLink
         self.appLinkPool = appLinkPool
@@ -65,6 +70,7 @@ actor SessionWatchManager {
         self.logger = logger
         self.waitTimeoutSeconds = waitTimeoutSeconds
         self.pollRefreshSeconds = pollRefreshSeconds
+        self.revalidationIntervalSeconds = revalidationIntervalSeconds
     }
 
     func setWindowResolver(_ resolver: WindowResolver?) {
@@ -99,6 +105,7 @@ actor SessionWatchManager {
         appLinkStateTask = nil
         for deviceID in Array(devices.keys) {
             cancelWaitTask(deviceID: deviceID)
+            cancelRevalidationTask(deviceID: deviceID)
         }
         devices.removeAll()
     }
@@ -114,6 +121,7 @@ actor SessionWatchManager {
         state.sinks.removeValue(forKey: sinkID)
         if state.sinks.isEmpty, state.watchedSessionIDs.isEmpty {
             state.waitTask?.cancel()
+            state.revalidationTask?.cancel()
             devices.removeValue(forKey: deviceID)
             return
         }
@@ -123,6 +131,7 @@ actor SessionWatchManager {
         // deciding whether the wait loop keeps running without sinks.
         await refreshPushEligibility(deviceID: deviceID)
         ensureWaitLoop(deviceID: deviceID)
+        ensureRevalidationLoop(deviceID: deviceID)
     }
 
     func subscribe(
@@ -137,6 +146,7 @@ actor SessionWatchManager {
             await validateAndAddSession(deviceID: deviceID, sessionID: sessionID)
         }
         ensureWaitLoop(deviceID: deviceID)
+        ensureRevalidationLoop(deviceID: deviceID)
     }
 
     func unsubscribe(deviceID: String, sessionIDs: [String]) {
@@ -144,14 +154,17 @@ actor SessionWatchManager {
         for sessionID in sessionIDs {
             state.watchedSessionIDs.remove(sessionID)
             state.activeWaitSessionIDs.remove(sessionID)
+            state.parkedActionableSessionIDs.remove(sessionID)
         }
         devices[deviceID] = state
         ensureWaitLoop(deviceID: deviceID)
+        ensureRevalidationLoop(deviceID: deviceID)
     }
 
     func teardownDevice(deviceID: String, reason: String, message: String) async {
         guard let state = devices.removeValue(forKey: deviceID) else { return }
         state.waitTask?.cancel()
+        state.revalidationTask?.cancel()
         for sessionID in state.watchedSessionIDs {
             let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
             seqByDeviceSession.removeValue(forKey: key)
@@ -175,12 +188,14 @@ actor SessionWatchManager {
         guard let sessionID, var state = devices[deviceID], state.watchedSessionIDs.contains(sessionID) else {
             return
         }
+        state.parkedActionableSessionIDs.remove(sessionID)
         state.activeWaitSessionIDs.insert(sessionID)
         devices[deviceID] = state
         // The session left its wake-worthy state via respond/steer; the next
         // wake-worthy transition should push again for a disconnected device.
         lastPushKindByDeviceSession.removeValue(forKey: deviceSessionKey(deviceID: deviceID, sessionID: sessionID))
         ensureWaitLoop(deviceID: deviceID)
+        ensureRevalidationLoop(deviceID: deviceID)
     }
 
     /// Called when a device's push subscription is added or removed so wait-loop
@@ -188,6 +203,7 @@ actor SessionWatchManager {
     func pushEligibilityChanged(deviceID: String) async {
         await refreshPushEligibility(deviceID: deviceID)
         ensureWaitLoop(deviceID: deviceID)
+        ensureRevalidationLoop(deviceID: deviceID)
     }
 
     private func refreshPushEligibility(deviceID: String) async {
@@ -204,6 +220,7 @@ actor SessionWatchManager {
             await validateAndAddSession(deviceID: deviceID, sessionID: sessionID)
         }
         ensureWaitLoop(deviceID: deviceID)
+        ensureRevalidationLoop(deviceID: deviceID)
     }
 
     func nextSeq(deviceID: String, sessionID: String) -> UInt64 {
@@ -229,12 +246,17 @@ actor SessionWatchManager {
                 await emitExpired(deviceID: deviceID, sessionID: sessionID)
                 return
             }
-            var state = devices[deviceID] ?? DeviceState()
+            guard var state = devices[deviceID] else { return }
             state.watchedSessionIDs.insert(snapshot.sessionID)
-            if snapshot.isActionable || snapshot.isTerminal {
+            if snapshot.isActionable, !snapshot.isTerminal {
                 state.activeWaitSessionIDs.remove(snapshot.sessionID)
+                state.parkedActionableSessionIDs.insert(snapshot.sessionID)
+            } else if snapshot.isTerminal {
+                state.activeWaitSessionIDs.remove(snapshot.sessionID)
+                state.parkedActionableSessionIDs.remove(snapshot.sessionID)
             } else {
                 state.activeWaitSessionIDs.insert(snapshot.sessionID)
+                unparkOnExitFromActionable(state: &state, deviceID: deviceID, sessionID: snapshot.sessionID)
             }
             devices[deviceID] = state
             await emitSnapshot(deviceID: deviceID, snapshot: snapshot)
@@ -251,8 +273,14 @@ actor SessionWatchManager {
     private func markSessionPendingObservation(deviceID: String, sessionID: String) {
         var state = devices[deviceID] ?? DeviceState()
         state.watchedSessionIDs.insert(sessionID)
+        state.parkedActionableSessionIDs.remove(sessionID)
         state.activeWaitSessionIDs.insert(sessionID)
         devices[deviceID] = state
+    }
+
+    private func unparkOnExitFromActionable(state: inout DeviceState, deviceID: String, sessionID: String) {
+        guard state.parkedActionableSessionIDs.remove(sessionID) != nil else { return }
+        lastPushKindByDeviceSession.removeValue(forKey: deviceSessionKey(deviceID: deviceID, sessionID: sessionID))
     }
 
     private func pauseObservationAfterToolError(deviceID: String, sessionID: String, error: Error) async {
@@ -295,6 +323,67 @@ actor SessionWatchManager {
         devices[deviceID]?.waitTask?.cancel()
         devices[deviceID]?.waitTask = nil
         devices[deviceID]?.waitTaskID = nil
+    }
+
+    private func ensureRevalidationLoop(deviceID: String) {
+        guard var state = devices[deviceID] else { return }
+        if state.revalidationTask?.isCancelled == true {
+            state.revalidationTask = nil
+            state.revalidationTaskID = nil
+        }
+        let shouldRun = !state.parkedActionableSessionIDs.isEmpty && (!state.sinks.isEmpty || state.pushEligible)
+        if !shouldRun {
+            state.revalidationTask?.cancel()
+            state.revalidationTask = nil
+            state.revalidationTaskID = nil
+            devices[deviceID] = state
+            return
+        }
+        guard state.revalidationTask == nil else {
+            devices[deviceID] = state
+            return
+        }
+        let taskID = UUID()
+        state.revalidationTaskID = taskID
+        state.revalidationTask = Task { [weak self] in
+            await self?.runRevalidationLoop(deviceID: deviceID, taskID: taskID)
+        }
+        devices[deviceID] = state
+    }
+
+    private func cancelRevalidationTask(deviceID: String) {
+        devices[deviceID]?.revalidationTask?.cancel()
+        devices[deviceID]?.revalidationTask = nil
+        devices[deviceID]?.revalidationTaskID = nil
+    }
+
+    private func runRevalidationLoop(deviceID: String, taskID: UUID) async {
+        defer {
+            clearRevalidationTask(deviceID: deviceID, taskID: taskID)
+        }
+        let intervalMilliseconds = Int64((max(0.01, revalidationIntervalSeconds) * 1000).rounded(.up))
+        while !Task.isCancelled {
+            guard let state = devices[deviceID],
+                  !state.parkedActionableSessionIDs.isEmpty,
+                  !state.sinks.isEmpty || state.pushEligible
+            else { return }
+            try? await Task.sleep(for: .milliseconds(intervalMilliseconds))
+            guard !Task.isCancelled,
+                  let current = devices[deviceID],
+                  current.revalidationTaskID == taskID
+            else { return }
+            for sessionID in current.parkedActionableSessionIDs.sorted() {
+                await validateAndAddSession(deviceID: deviceID, sessionID: sessionID)
+            }
+            ensureWaitLoop(deviceID: deviceID)
+        }
+    }
+
+    private func clearRevalidationTask(deviceID: String, taskID: UUID) {
+        guard var state = devices[deviceID], state.revalidationTaskID == taskID else { return }
+        state.revalidationTask = nil
+        state.revalidationTaskID = nil
+        devices[deviceID] = state
     }
 
     private func runWaitLoop(deviceID: String, taskID: UUID) async {
@@ -376,17 +465,25 @@ actor SessionWatchManager {
         if snapshot.isExpired {
             state.watchedSessionIDs.remove(snapshot.sessionID)
             state.activeWaitSessionIDs.remove(snapshot.sessionID)
+            state.parkedActionableSessionIDs.remove(snapshot.sessionID)
             devices[deviceID] = state
             await emitExpired(deviceID: deviceID, sessionID: snapshot.sessionID)
             return
         }
-        if snapshot.isActionable || snapshot.isTerminal {
+        if snapshot.isActionable, !snapshot.isTerminal {
             state.activeWaitSessionIDs.remove(snapshot.sessionID)
+            state.parkedActionableSessionIDs.insert(snapshot.sessionID)
+        } else if snapshot.isTerminal {
+            state.activeWaitSessionIDs.remove(snapshot.sessionID)
+            state.parkedActionableSessionIDs.remove(snapshot.sessionID)
         } else if state.watchedSessionIDs.contains(snapshot.sessionID) {
+            unparkOnExitFromActionable(state: &state, deviceID: deviceID, sessionID: snapshot.sessionID)
             state.activeWaitSessionIDs.insert(snapshot.sessionID)
         }
         devices[deviceID] = state
         await emitSnapshot(deviceID: deviceID, snapshot: snapshot)
+        ensureWaitLoop(deviceID: deviceID)
+        ensureRevalidationLoop(deviceID: deviceID)
     }
 
     private func handleAppLinkState(_ state: AppLinkState) async {
@@ -718,6 +815,14 @@ actor SessionWatchManager {
     }
 
     private func emitExpired(deviceID: String, sessionID: String) async {
+        if var state = devices[deviceID] {
+            state.watchedSessionIDs.remove(sessionID)
+            state.activeWaitSessionIDs.remove(sessionID)
+            state.parkedActionableSessionIDs.remove(sessionID)
+            devices[deviceID] = state
+            ensureWaitLoop(deviceID: deviceID)
+            ensureRevalidationLoop(deviceID: deviceID)
+        }
         let frame = RemoteServerFrame(
             type: "session_expired",
             sessionID: sessionID,
