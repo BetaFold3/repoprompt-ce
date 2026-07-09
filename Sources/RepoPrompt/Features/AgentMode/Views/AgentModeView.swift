@@ -2728,6 +2728,7 @@ struct AgentModeChatDetailView: View {
         let showCancel = showRunScopedToolCancel(for: item, in: block)
         let cancelAction = showCancel ? cancelActiveToolsAction : nil
         let ownerTabID = transcriptSnapshot.presentation.tabID ?? transcriptSnapshot.currentTabID ?? currentTabID
+        let isRemoteSession = ownerTabID.flatMap { agentModeVM.sessions[$0]?.remoteHost } != nil
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
         return AgentMessageBubble(
             item: item,
@@ -2747,7 +2748,8 @@ struct AgentModeChatDetailView: View {
                     tabID: ownerTabID
                 ),
                 showRunScopedToolCancel: showCancel,
-                cancelActiveToolsAction: cancelAction
+                cancelActiveToolsAction: cancelAction,
+                isRemoteSession: isRemoteSession
             ),
             promptManager: promptManager,
             handoffConfig: runInteractionSnapshot.canForkCurrentSession ? handoffConfig(for: item.id) : nil,

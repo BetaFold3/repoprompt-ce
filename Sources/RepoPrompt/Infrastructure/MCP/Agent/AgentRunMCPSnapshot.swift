@@ -338,6 +338,7 @@ struct AgentRunMCPSnapshot: Equatable {
     let updatedAt: Date
     let parentSessionID: UUID?
     let failureReason: FailureReason?
+    let followUpPending: Bool
     let worktreeBindings: [WorktreeBinding]
     let activeWorktreeMerges: [AgentSessionWorktreeMergeSummary]
     /// Most recent interaction resolution, serialized into `_meta.interaction_resolved`
@@ -361,6 +362,7 @@ struct AgentRunMCPSnapshot: Equatable {
         updatedAt: Date,
         parentSessionID: UUID?,
         failureReason: FailureReason?,
+        followUpPending: Bool = false,
         worktreeBindings: [WorktreeBinding],
         activeWorktreeMerges: [AgentSessionWorktreeMergeSummary],
         lastInteractionResolution: InteractionResolution? = nil
@@ -381,6 +383,7 @@ struct AgentRunMCPSnapshot: Equatable {
         self.updatedAt = updatedAt
         self.parentSessionID = parentSessionID
         self.failureReason = failureReason
+        self.followUpPending = followUpPending
         self.worktreeBindings = worktreeBindings
         self.activeWorktreeMerges = activeWorktreeMerges
         self.lastInteractionResolution = lastInteractionResolution
@@ -413,6 +416,9 @@ struct AgentRunMCPSnapshot: Equatable {
         if let interaction {
             obj["interaction"] = .object(interaction.asObject())
             obj["interaction_id"] = .string(interaction.id.uuidString)
+        }
+        if followUpPending {
+            obj["followup_pending"] = .bool(true)
         }
 
         if let failureReason {

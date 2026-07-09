@@ -1010,7 +1010,7 @@ struct AgentRunMCPToolService {
             await Task.yield()
             return await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM).toValue()
         }
-        if let parsed = cancelResult.objectValue.flatMap(snapshot(from:)) {
+        if let parsed = cancelResult.objectValue.flatMap(Self.snapshot(from:)) {
             return decoratedRunValue(snapshot: parsed)
         }
         return cancelResult
@@ -1558,7 +1558,7 @@ struct AgentRunMCPToolService {
     ) async -> Value {
         let resolvedSnapshot: AgentRunMCPSnapshot
         let wakeReason = rawValue.objectValue.flatMap(wakeReason(from:))
-        if let parsedSnapshot = rawValue.objectValue.flatMap(snapshot(from:)) {
+        if let parsedSnapshot = rawValue.objectValue.flatMap(Self.snapshot(from:)) {
             resolvedSnapshot = parsedSnapshot
         } else {
             resolvedSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
@@ -2289,7 +2289,7 @@ struct AgentRunMCPToolService {
         return AgentRunSessionStore.WakeReason(rawValue: raw)
     }
 
-    private func snapshot(from object: [String: Value]) -> AgentRunMCPSnapshot? {
+    static func snapshot(from object: [String: Value]) -> AgentRunMCPSnapshot? {
         guard let sessionIDRaw = object["session_id"]?.stringValue,
               let sessionID = UUID(uuidString: sessionIDRaw),
               let statusRaw = object["status"]?.stringValue,
@@ -2300,13 +2300,13 @@ struct AgentRunMCPToolService {
         let session = object["session"]?.objectValue
         let agent = object["agent"]?.objectValue
         let runID = object["run_id"]?.stringValue.flatMap(UUID.init(uuidString:))
-        let interaction = object["interaction"]?.objectValue.flatMap(interaction(from:))
+        let interaction = object["interaction"]?.objectValue.flatMap(Self.interaction(from:))
         let updatedAt = object["updated_at"]?.stringValue.flatMap(Self.timestampFormatter.date(from:)) ?? Date()
         let tabID = (session?["context_id"] ?? session?["tab_id"])?.stringValue.flatMap(UUID.init(uuidString:))
         let parentSessionID = session?["parent_session_id"]?.stringValue.flatMap(UUID.init(uuidString:))
         let failureReason = object["failure_reason"]?.stringValue.flatMap(AgentRunMCPSnapshot.FailureReason.init(rawValue:))
-        let worktreeBindings = worktreeBindings(from: object)
-        let activeWorktreeMerges = activeWorktreeMerges(from: object)
+        let worktreeBindings = Self.worktreeBindings(from: object)
+        let activeWorktreeMerges = Self.activeWorktreeMerges(from: object)
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
             runID: runID,
@@ -2324,12 +2324,13 @@ struct AgentRunMCPToolService {
             updatedAt: updatedAt,
             parentSessionID: parentSessionID,
             failureReason: failureReason,
+            followUpPending: object["followup_pending"]?.boolValue ?? false,
             worktreeBindings: worktreeBindings,
             activeWorktreeMerges: activeWorktreeMerges
         )
     }
 
-    private func activeWorktreeMerges(from object: [String: Value]) -> [AgentSessionWorktreeMergeSummary] {
+    private static func activeWorktreeMerges(from object: [String: Value]) -> [AgentSessionWorktreeMergeSummary] {
         guard let values = object["active_worktree_merges"]?.arrayValue else { return [] }
         return values.compactMap { value in
             guard let object = value.objectValue,
@@ -2366,7 +2367,7 @@ struct AgentRunMCPToolService {
         }
     }
 
-    private func worktreeBindings(from object: [String: Value]) -> [AgentRunMCPSnapshot.WorktreeBinding] {
+    private static func worktreeBindings(from object: [String: Value]) -> [AgentRunMCPSnapshot.WorktreeBinding] {
         if let values = object["worktree_bindings"]?.arrayValue {
             return values.compactMap { value in
                 guard let object = value.objectValue else { return nil }
@@ -2374,14 +2375,14 @@ struct AgentRunMCPToolService {
             }
         }
         if let object = object["worktree"]?.objectValue,
-           let binding = worktreeBinding(from: object)
+           let binding = Self.worktreeBinding(from: object)
         {
             return [binding]
         }
         return []
     }
 
-    private func worktreeBinding(from object: [String: Value]) -> AgentRunMCPSnapshot.WorktreeBinding? {
+    private static func worktreeBinding(from object: [String: Value]) -> AgentRunMCPSnapshot.WorktreeBinding? {
         guard let id = object["id"]?.stringValue,
               let repositoryID = object["repository_id"]?.stringValue,
               let repoKey = object["repo_key"]?.stringValue,
@@ -2389,7 +2390,7 @@ struct AgentRunMCPToolService {
               let worktreeID = object["worktree_id"]?.stringValue,
               let worktreeRootPath = object["worktree_root_path"]?.stringValue,
               let boundAtRaw = object["bound_at"]?.stringValue,
-              let boundAt = Self.timestampFormatter.date(from: boundAtRaw),
+              let boundAt = timestampFormatter.date(from: boundAtRaw),
               let source = object["source"]?.stringValue
         else {
             return nil
@@ -2413,7 +2414,7 @@ struct AgentRunMCPToolService {
         )
     }
 
-    private func interaction(from object: [String: Value]) -> AgentRunMCPSnapshot.Interaction? {
+    private static func interaction(from object: [String: Value]) -> AgentRunMCPSnapshot.Interaction? {
         guard let idRaw = object["id"]?.stringValue,
               let id = UUID(uuidString: idRaw),
               let kindRaw = object["kind"]?.stringValue,
@@ -2483,6 +2484,16 @@ struct AgentRunMCPToolService {
         snapshots.filter { !isInterestingSnapshot($0) }.map(\.sessionID)
     }
 
+    static func preferredSnapshotWhenStoredTerminal(
+        stored: AgentRunMCPSnapshot,
+        live: AgentRunMCPSnapshot?
+    ) -> AgentRunMCPSnapshot {
+        if let live, !live.status.isTerminal {
+            return live
+        }
+        return stored
+    }
+
     private func currentSnapshot(
         sessionID: UUID,
         registration suppliedRegistration: AgentRunSessionStore.Registration? = nil,
@@ -2495,7 +2506,11 @@ struct AgentRunMCPToolService {
             nil
         }
         if let storedSnapshot, storedSnapshot.status.isTerminal {
-            return storedSnapshot
+            // Incident 2026-07-09: remote-client-premature-terminal-and-model-label-2026-07-09.md.
+            // Stored turn-terminal snapshots must not outrank the live follow-up/superseding running mask.
+            // This also intentionally lets mcpSnapshot's stale-mask hygiene run on poll paths that used to short-circuit.
+            let liveSnapshot = registration.flatMap { agentModeVM.mcpSnapshot(registration: $0) }
+            return Self.preferredSnapshotWhenStoredTerminal(stored: storedSnapshot, live: liveSnapshot)
         }
         if let providedSnapshot = await currentSnapshotProvider?(sessionID, agentModeVM) {
             return providedSnapshot

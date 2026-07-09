@@ -359,6 +359,13 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         }
         try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
 
+        // Direct store publication bypasses AgentRunTerminalCommitBarrier; keep this fixture aligned
+        // with the production invariant from
+        // docs/investigations/remote-client-premature-terminal-and-model-label-2026-07-09.md:
+        // final terminal publication sets the live session terminal with no follow-up mask first.
+        // Live non-terminal/masked snapshots intentionally win in AgentRunSnapshotPrecedenceTests.
+        fixture.session.runState = .completed
+        fixture.session.mcpFollowUpRunPending = false
         let terminal = makeSnapshot(
             sessionID: fixture.sessionID,
             status: .completed,
@@ -777,6 +784,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         await AgentRunSessionStore.signalSnapshot(runningSnapshot, cursor: cursor)
         return RunningSessionFixture(
             sessionID: sessionID,
+            session: session,
             registration: context.registration,
             epoch: epoch,
             cursor: cursor,
@@ -859,6 +867,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
 
 private struct RunningSessionFixture {
     let sessionID: UUID
+    let session: AgentModeViewModel.TabSession
     let registration: AgentRunSessionStore.Registration
     let epoch: AgentRunTurnEpoch
     let cursor: AgentRunSessionStore.WaitCursor

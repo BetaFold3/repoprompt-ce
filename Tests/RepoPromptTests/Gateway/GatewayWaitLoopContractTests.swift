@@ -330,7 +330,8 @@ final class GatewayWaitLoopContractTests: XCTestCase {
             appLink: defaultAppLink,
             appLinkPool: pool,
             waitTimeoutSeconds: 0.2,
-            pollRefreshSeconds: 0.2
+            pollRefreshSeconds: 0.2,
+            terminalQuarantineSeconds: 0
         )
         let sink = RecordingFrameSink()
 
@@ -423,7 +424,8 @@ final class GatewayWaitLoopContractTests: XCTestCase {
         let manager = SessionWatchManager(
             appLink: appLink,
             waitTimeoutSeconds: 0.2,
-            pollRefreshSeconds: 0.2
+            pollRefreshSeconds: 0.2,
+            terminalQuarantineSeconds: 0
         )
         await manager.start()
         let sink = RecordingFrameSink()
@@ -462,7 +464,8 @@ final class GatewayWaitLoopContractTests: XCTestCase {
             pushNotifier: pushNotifier,
             windowResolver: windowResolver,
             waitTimeoutSeconds: waitTimeoutSeconds,
-            pollRefreshSeconds: pollRefreshSeconds
+            pollRefreshSeconds: pollRefreshSeconds,
+            terminalQuarantineSeconds: 0
         )
         return (manager, appLink)
     }

@@ -87,7 +87,13 @@ final class PushTriggerTests: XCTestCase {
         let connection = RecordingAppLinkConnection(responses: [
             .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: session, status: "running")))
         ])
-        let (manager, notifier) = try await makeManager(connection: connection, eligible: true)
+        // This original wake contract predates completed-terminal quarantine; keep
+        // it pinned to immediate terminal emission/push by disabling quarantine.
+        let (manager, notifier) = try await makeManager(
+            connection: connection,
+            eligible: true,
+            terminalQuarantineSeconds: 0
+        )
         let sink = RecordingFrameSink()
         let sinkID = UUID()
 
@@ -99,6 +105,31 @@ final class PushTriggerTests: XCTestCase {
         XCTAssertEqual(wakes.count, 1)
         XCTAssertEqual(wakes.first?.kind, .sessionTerminal)
         XCTAssertNil(wakes.first?.interactionID, "Terminal wakes carry no interaction ID")
+    }
+
+    func testDisconnectedDeviceCompletedTerminalQuarantineStillPushesOnceAfterConfirmation() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: session, status: "running")))
+        ])
+        let (manager, notifier) = try await makeManager(
+            connection: connection,
+            eligible: true,
+            terminalQuarantineSeconds: 0.1
+        )
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+
+        await manager.subscribe(deviceID: device, sinkID: sinkID, sink: sink, sessionIDs: [session])
+        await manager.removeSink(deviceID: device, sinkID: sinkID)
+        await connection.enqueue(.result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: session, status: "completed"))))
+        await connection.enqueue(.result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: session, status: "completed"))))
+        let wakes = await waitForWakes(notifier, minimum: 1)
+
+        XCTAssertEqual(wakes.count, 1)
+        XCTAssertEqual(wakes.first?.kind, .sessionTerminal)
+        try await Task.sleep(for: .milliseconds(150))
+        let finalWakes = await notifier.wakes
+        XCTAssertEqual(finalWakes.count, 1, "Quarantine confirmation must not duplicate terminal pushes: \(finalWakes)")
     }
 
     func testNonWakeWorthyTransitionDoesNotPush() async throws {
@@ -173,7 +204,8 @@ final class PushTriggerTests: XCTestCase {
 
     private func makeManager(
         connection: RecordingAppLinkConnection,
-        eligible: Bool
+        eligible: Bool,
+        terminalQuarantineSeconds: TimeInterval = 5
     ) async throws -> (SessionWatchManager, RecordingPushNotifier) {
         let root = try GatewayTestHelpers.temporaryRoot()
         let config = try GatewayTestHelpers.configuration(root: root)
@@ -196,7 +228,8 @@ final class PushTriggerTests: XCTestCase {
             appLinkPool: appLinkPool,
             pushNotifier: notifier,
             waitTimeoutSeconds: 0.2,
-            pollRefreshSeconds: 0.2
+            pollRefreshSeconds: 0.2,
+            terminalQuarantineSeconds: terminalQuarantineSeconds
         )
         return (manager, notifier)
     }

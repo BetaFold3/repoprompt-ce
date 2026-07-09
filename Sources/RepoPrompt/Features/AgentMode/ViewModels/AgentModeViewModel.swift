@@ -5299,6 +5299,7 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             session.runID
         }
+        let followUpPending = session.mcpFollowUpRunPending || session.pendingSupersedingTurnCompletions > 0
         return AgentRunMCPSnapshot(
             sessionID: resolvedSessionID,
             runID: providerRunID,
@@ -5316,6 +5317,7 @@ final class AgentModeViewModel: ObservableObject {
             updatedAt: Date(),
             parentSessionID: session.parentSessionID,
             failureReason: failureReason,
+            followUpPending: followUpPending,
             worktreeBindings: session.worktreeBindings.map { AgentRunMCPSnapshot.WorktreeBinding(binding: $0) },
             activeWorktreeMerges: session.worktreeMergeOperations.activeWorktreeMergeSummaries,
             lastInteractionResolution: session.lastInteractionResolution

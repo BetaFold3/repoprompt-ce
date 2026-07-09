@@ -72,10 +72,10 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(calls.count(where: { $0.arguments["op"] == .string("poll") }), 2)
     }
 
-    func testParkedTerminalSessionIsNotRevalidated() async throws {
-        let connection = RecordingAppLinkConnection(responses: [
-            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "completed")))
-        ])
+    func testParkedTerminalSessionIsRevalidatedWithoutDuplicateTerminalFrames() async throws {
+        let connection = RecordingAppLinkConnection(responses: Array(repeating: .result(
+            GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "completed"))
+        ), count: 10))
         let (manager, _) = try await makeManager(connection: connection)
         let sink = RecordingFrameSink()
 
@@ -85,7 +85,12 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
         let calls = await connection.calls
         await manager.shutdown()
 
-        XCTAssertEqual(calls.count(where: { $0.arguments["op"] == .string("poll") }), 1)
+        // Regression for remote-client-premature-terminal-and-model-label-2026-07-09:
+        // terminal sessions remain watched for recovery revalidation, but repeated
+        // terminal re-polls must be edge-suppressed.
+        XCTAssertGreaterThanOrEqual(calls.count(where: { $0.arguments["op"] == .string("poll") }), 2)
+        let frames = await sink.frames
+        XCTAssertEqual(frames.count(where: { $0.type == "session_terminal" }), 1)
         XCTAssertFalse(calls.contains { $0.arguments["op"] == .string("wait") })
     }
 
@@ -178,7 +183,8 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
             pushNotifier: pushNotifier,
             waitTimeoutSeconds: 0.2,
             pollRefreshSeconds: 0.2,
-            revalidationIntervalSeconds: 0.05
+            revalidationIntervalSeconds: 0.05,
+            terminalQuarantineSeconds: 0
         )
         return (manager, appLink)
     }

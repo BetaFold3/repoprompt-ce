@@ -44,6 +44,7 @@ final class RemoteAgentModeCoordinator {
     private var surfacedChannelReasonsByTabID: [UUID: Set<String>] = [:]
     /// Tabs whose current running label came from host status_text (not a client placeholder).
     private var hostProvidedRunningStatusTabIDs: Set<UUID> = []
+    private var tabsWithSyntheticSettlements: Set<UUID> = []
     private var lastAdoptedHostNameByTabID: [UUID: String] = [:]
     private var startSessionNameByTabID: [UUID: String] = [:]
     private var childDiscoveryInFlightKeys: Set<String> = []
@@ -58,6 +59,8 @@ final class RemoteAgentModeCoordinator {
     private let childDiscoveryDebounceInterval: TimeInterval
     #if DEBUG
         private var materializedRemoteChildAttachHandler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
+        private var childDiscoveryRequestObserver: ((UUID, Bool) -> Void)?
+        private var syntheticSettlementRevertScanObserver: ((UUID) -> Void)?
     #endif
 
     init(
@@ -186,6 +189,7 @@ final class RemoteAgentModeCoordinator {
         clearAskUserStash(tabID: tabID)
         surfacedChannelReasonsByTabID.removeValue(forKey: tabID)
         hostProvidedRunningStatusTabIDs.remove(tabID)
+        tabsWithSyntheticSettlements.remove(tabID)
         lastAdoptedHostNameByTabID.removeValue(forKey: tabID)
         startSessionNameByTabID.removeValue(forKey: tabID)
         let controller = controllersByTabID.removeValue(forKey: tabID)
@@ -332,8 +336,9 @@ final class RemoteAgentModeCoordinator {
             clearPendingInteractions(session)
             appendSystemMessage("Remote session expired on host.", tabID: tabID)
         case let .terminal(status):
+            let wasAlreadyTerminal = Self.isTerminalRunState(session.runState)
             applyTerminal(status: status, to: session)
-            requestChildSessionDiscovery(for: session, reason: "terminal", immediate: true)
+            requestChildSessionDiscovery(for: session, reason: "terminal", immediate: !wasAlreadyTerminal)
         case let .channel(channelState):
             applyChannel(channelState, to: session)
         case let .systemMessage(message):
@@ -374,6 +379,7 @@ final class RemoteAgentModeCoordinator {
         let projector = RemoteTranscriptProjector(remoteSessionID: remoteSessionID)
         let projectedUserTextKeys = Set(rows.filter { $0.kind == .user }.map { Self.normalizedTextKey($0.text) })
         let wasTerminal = Self.isTerminalRunState(session.runState)
+        var settledCount = 0
         session.mutateItemsBatch { items in
             let removedIDSet = Set(removedIDs)
             if !removedIDSet.isEmpty {
@@ -405,9 +411,12 @@ final class RemoteAgentModeCoordinator {
                 }
             }
             if wasTerminal {
-                _ = Self.settleResultlessToolCalls(in: &merged, terminalRunState: session.runState)
+                settledCount = Self.settleResultlessToolCalls(in: &merged, terminalRunState: session.runState)
             }
             items = merged
+        }
+        if settledCount > 0 {
+            tabsWithSyntheticSettlements.insert(session.tabID)
         }
         logTranscriptRowsApplied(rows, removedIDs: removedIDs, remoteSessionID: remoteSessionID, tabID: session.tabID)
         if wasTerminal {
@@ -428,6 +437,7 @@ final class RemoteAgentModeCoordinator {
         statusText: String?,
         to session: AgentModeViewModel.TabSession
     ) {
+        let wasTerminal = Self.isTerminalRunState(session.runState)
         if let pendingInteraction {
             clearPendingInteractions(session, preserving: pendingInteraction.interactionID)
             switch pendingInteraction {
@@ -474,7 +484,23 @@ final class RemoteAgentModeCoordinator {
             clearAskUserStash(tabID: session.tabID)
             clearPendingInteractions(session)
         }
+        let shouldRevertSyntheticSettlements = runState.isActive
+            && (wasTerminal || tabsWithSyntheticSettlements.contains(session.tabID))
         session.runState = runState
+        if shouldRevertSyntheticSettlements {
+            #if DEBUG
+                syntheticSettlementRevertScanObserver?(session.tabID)
+            #endif
+            session.mutateItemsBatch { items in
+                for index in items.indices where items[index].kind == .toolCall
+                    && AgentToolResultPersistencePolicy.isSyntheticSettlementJSON(items[index].toolResultJSON)
+                {
+                    items[index].toolResultJSON = nil
+                    items[index].toolIsError = nil
+                }
+            }
+            tabsWithSyntheticSettlements.remove(session.tabID)
+        }
         if runState == .running {
             if let statusText {
                 session.setRunningStatus(statusText, source: .transport)
@@ -503,8 +529,12 @@ final class RemoteAgentModeCoordinator {
         }
         session.setRunningStatus(nil, source: nil)
         hostProvidedRunningStatusTabIDs.remove(session.tabID)
+        var settledCount = 0
         session.mutateItemsBatch { items in
-            _ = Self.settleResultlessToolCalls(in: &items, terminalStatus: status)
+            settledCount = Self.settleResultlessToolCalls(in: &items, terminalStatus: status)
+        }
+        if settledCount > 0 {
+            tabsWithSyntheticSettlements.insert(session.tabID)
         }
     }
 
@@ -524,6 +554,9 @@ final class RemoteAgentModeCoordinator {
         reason _: String,
         immediate: Bool = false
     ) {
+        #if DEBUG
+            childDiscoveryRequestObserver?(session.tabID, immediate)
+        #endif
         guard let context = childDiscoveryContext(for: session) else { return }
         guard let controller = controllersByTabID[session.tabID] else { return }
         recordDiscoveryKey(context.key, tabID: context.parentTabID)
@@ -841,7 +874,7 @@ final class RemoteAgentModeCoordinator {
             && items[index].toolResultJSON == nil
             && items[index].toolIsError == nil
         {
-            items[index].toolResultJSON = AgentToolResultPersistencePolicy.minimalResultJSON(
+            items[index].toolResultJSON = AgentToolResultPersistencePolicy.syntheticSettlementResultJSON(
                 statusWord: terminalSettlement.statusWord,
                 normalizedToolName: items[index].toolName
             )
@@ -1336,6 +1369,14 @@ final class RemoteAgentModeCoordinator {
             _ handler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
         ) {
             materializedRemoteChildAttachHandler = handler
+        }
+
+        func test_setChildDiscoveryRequestObserver(_ observer: ((UUID, Bool) -> Void)?) {
+            childDiscoveryRequestObserver = observer
+        }
+
+        func test_setSyntheticSettlementRevertScanObserver(_ observer: ((UUID) -> Void)?) {
+            syntheticSettlementRevertScanObserver = observer
         }
 
         func test_requestChildSessionDiscovery(tabID: UUID) {

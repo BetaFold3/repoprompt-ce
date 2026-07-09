@@ -25,6 +25,7 @@ actor SessionWatchManager {
         var watchedSessionIDs: Set<String> = []
         var activeWaitSessionIDs: Set<String> = []
         var parkedActionableSessionIDs: Set<String> = []
+        var parkedTerminalSessionIDs: Set<String> = []
         var waitTask: Task<Void, Never>?
         var waitTaskID: UUID?
         var revalidationTask: Task<Void, Never>?
@@ -34,6 +35,21 @@ actor SessionWatchManager {
         var pushEligible = false
     }
 
+    private struct QuarantinedTerminal {
+        let snapshot: RemoteSessionSnapshot
+        let task: Task<Void, Never>
+    }
+
+    private enum EmissionTrigger: String {
+        case subscribe
+        case pollCatchUp
+        case waitLoop
+        case revalidation
+        case quarantine
+    }
+
+    private typealias CatchUpSink = (sinkID: UUID, sink: any RemoteFrameSink)
+
     private let appLink: AppLinkSession
     private let appLinkPool: AppLinkPool?
     private let pushNotifier: (any RemotePushNotifying)?
@@ -41,6 +57,7 @@ actor SessionWatchManager {
     private let waitTimeoutSeconds: TimeInterval
     private let pollRefreshSeconds: TimeInterval
     private let revalidationIntervalSeconds: TimeInterval
+    private let terminalQuarantineSeconds: TimeInterval
     private var windowResolver: WindowResolver?
     private var devices: [String: DeviceState] = [:]
     private var seqByDeviceSession: [String: UInt64] = [:]
@@ -51,6 +68,8 @@ actor SessionWatchManager {
     /// the most recent resolution on every wait/poll response, so forward each
     /// distinct resolution as an `interaction_resolved` frame exactly once.
     private var lastResolutionKeyByDeviceSession: [String: String] = [:]
+    private var lastEmittedIsTerminalByDeviceSession: [String: Bool] = [:]
+    private var pendingTerminalQuarantineByDeviceSession: [String: QuarantinedTerminal] = [:]
     private var appLinkStateTask: Task<Void, Never>?
 
     init(
@@ -61,7 +80,8 @@ actor SessionWatchManager {
         logger: Logger = Logger(label: "com.repoprompt.gateway.watch"),
         waitTimeoutSeconds: TimeInterval = 30,
         pollRefreshSeconds: TimeInterval = 5,
-        revalidationIntervalSeconds: TimeInterval = 30
+        revalidationIntervalSeconds: TimeInterval = 30,
+        terminalQuarantineSeconds: TimeInterval = 5
     ) {
         self.appLink = appLink
         self.appLinkPool = appLinkPool
@@ -71,6 +91,7 @@ actor SessionWatchManager {
         self.waitTimeoutSeconds = waitTimeoutSeconds
         self.pollRefreshSeconds = pollRefreshSeconds
         self.revalidationIntervalSeconds = revalidationIntervalSeconds
+        self.terminalQuarantineSeconds = terminalQuarantineSeconds
     }
 
     func setWindowResolver(_ resolver: WindowResolver?) {
@@ -107,6 +128,11 @@ actor SessionWatchManager {
             cancelWaitTask(deviceID: deviceID)
             cancelRevalidationTask(deviceID: deviceID)
         }
+        for quarantine in pendingTerminalQuarantineByDeviceSession.values {
+            quarantine.task.cancel()
+        }
+        pendingTerminalQuarantineByDeviceSession.removeAll()
+        lastEmittedIsTerminalByDeviceSession.removeAll()
         devices.removeAll()
     }
 
@@ -142,8 +168,14 @@ actor SessionWatchManager {
     ) async {
         registerSink(deviceID: deviceID, sinkID: sinkID, sink: sink)
         await refreshPushEligibility(deviceID: deviceID)
+        let catchUpSink: CatchUpSink = (sinkID: sinkID, sink: sink)
         for sessionID in requestedSessionIDs {
-            await validateAndAddSession(deviceID: deviceID, sessionID: sessionID)
+            await validateAndAddSession(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                trigger: .subscribe,
+                catchUpSink: catchUpSink
+            )
         }
         ensureWaitLoop(deviceID: deviceID)
         ensureRevalidationLoop(deviceID: deviceID)
@@ -155,6 +187,8 @@ actor SessionWatchManager {
             state.watchedSessionIDs.remove(sessionID)
             state.activeWaitSessionIDs.remove(sessionID)
             state.parkedActionableSessionIDs.remove(sessionID)
+            state.parkedTerminalSessionIDs.remove(sessionID)
+            clearTerminalObservationState(deviceID: deviceID, sessionID: sessionID)
         }
         devices[deviceID] = state
         ensureWaitLoop(deviceID: deviceID)
@@ -170,6 +204,10 @@ actor SessionWatchManager {
             seqByDeviceSession.removeValue(forKey: key)
             lastPushKindByDeviceSession.removeValue(forKey: key)
             lastResolutionKeyByDeviceSession.removeValue(forKey: key)
+            lastEmittedIsTerminalByDeviceSession.removeValue(forKey: key)
+            if let quarantine = pendingTerminalQuarantineByDeviceSession.removeValue(forKey: key) {
+                quarantine.task.cancel()
+            }
         }
         let frame = RemoteServerFrame(
             type: "channel_closing",
@@ -185,10 +223,12 @@ actor SessionWatchManager {
     }
 
     func rearm(deviceID: String, sessionID: String?) {
+        logger.debug("watch rearm device=\(deviceID) session=\(sessionID ?? "-")")
         guard let sessionID, var state = devices[deviceID], state.watchedSessionIDs.contains(sessionID) else {
             return
         }
         state.parkedActionableSessionIDs.remove(sessionID)
+        state.parkedTerminalSessionIDs.remove(sessionID)
         state.activeWaitSessionIDs.insert(sessionID)
         devices[deviceID] = state
         // The session left its wake-worthy state via respond/steer; the next
@@ -217,7 +257,7 @@ actor SessionWatchManager {
     func pollCatchUp(deviceID: String) async {
         guard let state = devices[deviceID] else { return }
         for sessionID in state.watchedSessionIDs.sorted() {
-            await validateAndAddSession(deviceID: deviceID, sessionID: sessionID)
+            await validateAndAddSession(deviceID: deviceID, sessionID: sessionID, trigger: .pollCatchUp)
         }
         ensureWaitLoop(deviceID: deviceID)
         ensureRevalidationLoop(deviceID: deviceID)
@@ -230,7 +270,15 @@ actor SessionWatchManager {
         return next
     }
 
-    private func validateAndAddSession(deviceID: String, sessionID: String) async {
+    private func validateAndAddSession(
+        deviceID: String,
+        sessionID: String,
+        trigger: EmissionTrigger,
+        catchUpSink: CatchUpSink? = nil
+    ) async {
+        guard var initialState = devices[deviceID] else { return }
+        initialState.watchedSessionIDs.insert(sessionID)
+        devices[deviceID] = initialState
         do {
             let snapshots = try await poll(deviceID: deviceID, sessionIDs: [sessionID])
             guard let snapshot = snapshots.first else {
@@ -243,23 +291,13 @@ actor SessionWatchManager {
                 return
             }
             guard !snapshot.isExpired else {
-                await emitExpired(deviceID: deviceID, sessionID: sessionID)
+                await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: trigger, catchUpSink: catchUpSink)
                 return
             }
             guard var state = devices[deviceID] else { return }
             state.watchedSessionIDs.insert(snapshot.sessionID)
-            if snapshot.isActionable, !snapshot.isTerminal {
-                state.activeWaitSessionIDs.remove(snapshot.sessionID)
-                state.parkedActionableSessionIDs.insert(snapshot.sessionID)
-            } else if snapshot.isTerminal {
-                state.activeWaitSessionIDs.remove(snapshot.sessionID)
-                state.parkedActionableSessionIDs.remove(snapshot.sessionID)
-            } else {
-                state.activeWaitSessionIDs.insert(snapshot.sessionID)
-                unparkOnExitFromActionable(state: &state, deviceID: deviceID, sessionID: snapshot.sessionID)
-            }
             devices[deviceID] = state
-            await emitSnapshot(deviceID: deviceID, snapshot: snapshot)
+            await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: trigger, catchUpSink: catchUpSink)
         } catch let error as SessionWatchError {
             logger.debug("Pausing remote subscription \(sessionID): \(error.description)")
             markSessionPendingObservation(deviceID: deviceID, sessionID: sessionID)
@@ -271,9 +309,10 @@ actor SessionWatchManager {
     }
 
     private func markSessionPendingObservation(deviceID: String, sessionID: String) {
-        var state = devices[deviceID] ?? DeviceState()
-        state.watchedSessionIDs.insert(sessionID)
+        logger.debug("watch mark_pending_observation device=\(deviceID) session=\(sessionID)")
+        guard var state = devices[deviceID], state.watchedSessionIDs.contains(sessionID) else { return }
         state.parkedActionableSessionIDs.remove(sessionID)
+        state.parkedTerminalSessionIDs.remove(sessionID)
         state.activeWaitSessionIDs.insert(sessionID)
         devices[deviceID] = state
     }
@@ -331,7 +370,8 @@ actor SessionWatchManager {
             state.revalidationTask = nil
             state.revalidationTaskID = nil
         }
-        let shouldRun = !state.parkedActionableSessionIDs.isEmpty && (!state.sinks.isEmpty || state.pushEligible)
+        let shouldRun = !(state.parkedActionableSessionIDs.isEmpty && state.parkedTerminalSessionIDs.isEmpty)
+            && (!state.sinks.isEmpty || state.pushEligible)
         if !shouldRun {
             state.revalidationTask?.cancel()
             state.revalidationTask = nil
@@ -364,7 +404,7 @@ actor SessionWatchManager {
         let intervalMilliseconds = Int64((max(0.01, revalidationIntervalSeconds) * 1000).rounded(.up))
         while !Task.isCancelled {
             guard let state = devices[deviceID],
-                  !state.parkedActionableSessionIDs.isEmpty,
+                  !(state.parkedActionableSessionIDs.isEmpty && state.parkedTerminalSessionIDs.isEmpty),
                   !state.sinks.isEmpty || state.pushEligible
             else { return }
             try? await Task.sleep(for: .milliseconds(intervalMilliseconds))
@@ -372,8 +412,9 @@ actor SessionWatchManager {
                   let current = devices[deviceID],
                   current.revalidationTaskID == taskID
             else { return }
-            for sessionID in current.parkedActionableSessionIDs.sorted() {
-                await validateAndAddSession(deviceID: deviceID, sessionID: sessionID)
+            let sessionIDs = current.parkedActionableSessionIDs.union(current.parkedTerminalSessionIDs).sorted()
+            for sessionID in sessionIDs {
+                await validateAndAddSession(deviceID: deviceID, sessionID: sessionID, trigger: .revalidation)
             }
             ensureWaitLoop(deviceID: deviceID)
         }
@@ -461,27 +502,7 @@ actor SessionWatchManager {
     }
 
     private func handleWaitSnapshot(deviceID: String, snapshot: RemoteSessionSnapshot) async {
-        guard var state = devices[deviceID] else { return }
-        if snapshot.isExpired {
-            state.watchedSessionIDs.remove(snapshot.sessionID)
-            state.activeWaitSessionIDs.remove(snapshot.sessionID)
-            state.parkedActionableSessionIDs.remove(snapshot.sessionID)
-            devices[deviceID] = state
-            await emitExpired(deviceID: deviceID, sessionID: snapshot.sessionID)
-            return
-        }
-        if snapshot.isActionable, !snapshot.isTerminal {
-            state.activeWaitSessionIDs.remove(snapshot.sessionID)
-            state.parkedActionableSessionIDs.insert(snapshot.sessionID)
-        } else if snapshot.isTerminal {
-            state.activeWaitSessionIDs.remove(snapshot.sessionID)
-            state.parkedActionableSessionIDs.remove(snapshot.sessionID)
-        } else if state.watchedSessionIDs.contains(snapshot.sessionID) {
-            unparkOnExitFromActionable(state: &state, deviceID: deviceID, sessionID: snapshot.sessionID)
-            state.activeWaitSessionIDs.insert(snapshot.sessionID)
-        }
-        devices[deviceID] = state
-        await emitSnapshot(deviceID: deviceID, snapshot: snapshot)
+        await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: .waitLoop)
         ensureWaitLoop(deviceID: deviceID)
         ensureRevalidationLoop(deviceID: deviceID)
     }
@@ -726,21 +747,197 @@ actor SessionWatchManager {
             ?? "agent_run returned an error result"
     }
 
-    private func emitSnapshot(deviceID: String, snapshot: RemoteSessionSnapshot) async {
+    private func emitSnapshot(
+        deviceID: String,
+        snapshot: RemoteSessionSnapshot,
+        trigger: EmissionTrigger,
+        catchUpSink: CatchUpSink? = nil
+    ) async {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: snapshot.sessionID)
         if snapshot.isExpired {
+            logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "session_expired", seq: nil)
             await emitExpired(deviceID: deviceID, sessionID: snapshot.sessionID)
             return
         }
+
+        if !snapshot.isTerminal {
+            if pendingTerminalQuarantineByDeviceSession[key] != nil {
+                cancelPendingTerminalQuarantine(deviceID: deviceID, sessionID: snapshot.sessionID)
+                logEmission(
+                    deviceID: deviceID,
+                    sessionID: snapshot.sessionID,
+                    trigger: trigger,
+                    status: snapshot.status,
+                    type: "held",
+                    seq: nil,
+                    suffix: " reason=quarantine_superseded"
+                )
+            }
+            guard recordNonTerminalObservation(deviceID: deviceID, snapshot: snapshot) else {
+                logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "suppressed", seq: nil, suffix: " reason=unwatched")
+                return
+            }
+            await emitInteractionResolvedIfNeeded(deviceID: deviceID, snapshot: snapshot)
+            let seq = nextSeq(deviceID: deviceID, sessionID: snapshot.sessionID)
+            let frame = RemoteServerFrame(
+                type: "session_update",
+                sessionID: snapshot.sessionID,
+                seq: seq,
+                payload: snapshot.payload
+            )
+            await broadcast(frame, deviceID: deviceID)
+            lastEmittedIsTerminalByDeviceSession[key] = false
+            logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "session_update", seq: seq)
+            await maybePushWake(deviceID: deviceID, snapshot: snapshot)
+            return
+        }
+
+        guard recordTerminalObservation(deviceID: deviceID, sessionID: snapshot.sessionID) else {
+            logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "suppressed", seq: nil, suffix: " reason=unwatched")
+            return
+        }
+
+        if pendingTerminalQuarantineByDeviceSession[key] != nil {
+            logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "held", seq: nil, suffix: " reason=quarantine_pending")
+            return
+        }
+
+        let quarantineEnabled = terminalQuarantineSeconds > 0
+        if snapshot.status == "completed",
+           quarantineEnabled,
+           trigger != .quarantine,
+           lastEmittedIsTerminalByDeviceSession[key] != true
+        {
+            if holdCompletedTerminalForQuarantine(deviceID: deviceID, snapshot: snapshot, trigger: trigger) {
+                return
+            }
+        }
+
+        if lastEmittedIsTerminalByDeviceSession[key] == true {
+            if let catchUpSink {
+                let seq = nextSeq(deviceID: deviceID, sessionID: snapshot.sessionID)
+                let frame = RemoteServerFrame(
+                    type: "session_terminal",
+                    sessionID: snapshot.sessionID,
+                    seq: seq,
+                    payload: snapshot.payload
+                )
+                await catchUpSink.sink.send(frame)
+                logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "targeted_catchup", seq: seq)
+            } else {
+                logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "suppressed", seq: nil, suffix: " suppressed=true")
+            }
+            return
+        }
+
         await emitInteractionResolvedIfNeeded(deviceID: deviceID, snapshot: snapshot)
-        let type = snapshot.isTerminal ? "session_terminal" : "session_update"
+        let seq = nextSeq(deviceID: deviceID, sessionID: snapshot.sessionID)
         let frame = RemoteServerFrame(
-            type: type,
+            type: "session_terminal",
             sessionID: snapshot.sessionID,
-            seq: nextSeq(deviceID: deviceID, sessionID: snapshot.sessionID),
+            seq: seq,
             payload: snapshot.payload
         )
         await broadcast(frame, deviceID: deviceID)
+        lastEmittedIsTerminalByDeviceSession[key] = true
+        logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "session_terminal", seq: seq)
         await maybePushWake(deviceID: deviceID, snapshot: snapshot)
+    }
+
+    private func recordNonTerminalObservation(deviceID: String, snapshot: RemoteSessionSnapshot) -> Bool {
+        guard var state = devices[deviceID], state.watchedSessionIDs.contains(snapshot.sessionID) else { return false }
+        state.parkedTerminalSessionIDs.remove(snapshot.sessionID)
+        if snapshot.isActionable {
+            state.activeWaitSessionIDs.remove(snapshot.sessionID)
+            state.parkedActionableSessionIDs.insert(snapshot.sessionID)
+        } else {
+            state.activeWaitSessionIDs.insert(snapshot.sessionID)
+            unparkOnExitFromActionable(state: &state, deviceID: deviceID, sessionID: snapshot.sessionID)
+        }
+        devices[deviceID] = state
+        return true
+    }
+
+    private func recordTerminalObservation(deviceID: String, sessionID: String) -> Bool {
+        guard var state = devices[deviceID] else { return true }
+        guard state.watchedSessionIDs.contains(sessionID) else { return false }
+        state.activeWaitSessionIDs.remove(sessionID)
+        state.parkedActionableSessionIDs.remove(sessionID)
+        state.parkedTerminalSessionIDs.insert(sessionID)
+        devices[deviceID] = state
+        return true
+    }
+
+    private func holdCompletedTerminalForQuarantine(deviceID: String, snapshot: RemoteSessionSnapshot, trigger: EmissionTrigger) -> Bool {
+        guard var state = devices[deviceID] else {
+            logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "held", seq: nil, suffix: " reason=device_missing_fallthrough")
+            return false
+        }
+        state.activeWaitSessionIDs.remove(snapshot.sessionID)
+        state.parkedActionableSessionIDs.remove(snapshot.sessionID)
+        state.parkedTerminalSessionIDs.remove(snapshot.sessionID)
+        devices[deviceID] = state
+
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: snapshot.sessionID)
+        let milliseconds = Int64((terminalQuarantineSeconds * 1000).rounded(.up))
+        let task = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(milliseconds))
+            guard !Task.isCancelled else { return }
+            await self?.resolveTerminalQuarantine(deviceID: deviceID, sessionID: snapshot.sessionID)
+        }
+        pendingTerminalQuarantineByDeviceSession[key] = QuarantinedTerminal(snapshot: snapshot, task: task)
+        logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "held", seq: nil)
+        return true
+    }
+
+    private func resolveTerminalQuarantine(deviceID: String, sessionID: String) async {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        guard let quarantine = pendingTerminalQuarantineByDeviceSession.removeValue(forKey: key) else { return }
+        guard devices[deviceID]?.watchedSessionIDs.contains(sessionID) == true else {
+            logEmission(deviceID: deviceID, sessionID: sessionID, trigger: .quarantine, status: quarantine.snapshot.status, type: "suppressed", seq: nil, suffix: " reason=unwatched")
+            return
+        }
+        defer {
+            ensureWaitLoop(deviceID: deviceID)
+            ensureRevalidationLoop(deviceID: deviceID)
+        }
+        do {
+            let snapshots = try await poll(deviceID: deviceID, sessionIDs: [sessionID])
+            guard let snapshot = snapshots.first else {
+                logEmission(deviceID: deviceID, sessionID: sessionID, trigger: .quarantine, status: quarantine.snapshot.status, type: "held", seq: nil, suffix: " reason=confirm_poll_missing")
+                await emitSnapshot(deviceID: deviceID, snapshot: quarantine.snapshot, trigger: .quarantine)
+                return
+            }
+            await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: .quarantine)
+        } catch {
+            logEmission(deviceID: deviceID, sessionID: sessionID, trigger: .quarantine, status: quarantine.snapshot.status, type: "held", seq: nil, suffix: " reason=confirm_poll_failed")
+            await emitSnapshot(deviceID: deviceID, snapshot: quarantine.snapshot, trigger: .quarantine)
+        }
+    }
+
+    private func cancelPendingTerminalQuarantine(deviceID: String, sessionID: String) {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        if let quarantine = pendingTerminalQuarantineByDeviceSession.removeValue(forKey: key) {
+            quarantine.task.cancel()
+        }
+    }
+
+    private func clearTerminalObservationState(deviceID: String, sessionID: String) {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        lastEmittedIsTerminalByDeviceSession.removeValue(forKey: key)
+        cancelPendingTerminalQuarantine(deviceID: deviceID, sessionID: sessionID)
+    }
+
+    private func logEmission(
+        deviceID: String,
+        sessionID: String,
+        trigger: EmissionTrigger,
+        status: String,
+        type: String,
+        seq: UInt64?,
+        suffix: String = ""
+    ) {
+        logger.debug("watch emit device=\(deviceID) session=\(sessionID) trigger=\(trigger.rawValue) status=\(status) type=\(type) seq=\(seq.map(String.init) ?? "-")\(suffix)")
     }
 
     /// Wake-only push semantics (M5): push fires only when the device is
@@ -819,10 +1016,14 @@ actor SessionWatchManager {
             state.watchedSessionIDs.remove(sessionID)
             state.activeWaitSessionIDs.remove(sessionID)
             state.parkedActionableSessionIDs.remove(sessionID)
+            state.parkedTerminalSessionIDs.remove(sessionID)
+            clearTerminalObservationState(deviceID: deviceID, sessionID: sessionID)
             devices[deviceID] = state
             ensureWaitLoop(deviceID: deviceID)
             ensureRevalidationLoop(deviceID: deviceID)
         }
+        lastPushKindByDeviceSession.removeValue(forKey: deviceSessionKey(deviceID: deviceID, sessionID: sessionID))
+        lastResolutionKeyByDeviceSession.removeValue(forKey: deviceSessionKey(deviceID: deviceID, sessionID: sessionID))
         let frame = RemoteServerFrame(
             type: "session_expired",
             sessionID: sessionID,
@@ -852,6 +1053,26 @@ actor SessionWatchManager {
             await sink.send(frame)
         }
     }
+
+    #if DEBUG
+        func debugTerminalState(deviceID: String, sessionID: String) -> (
+            watched: Bool,
+            activeWait: Bool,
+            parkedTerminal: Bool,
+            pendingQuarantine: Bool,
+            lastEmittedIsTerminal: Bool?
+        ) {
+            let state = devices[deviceID]
+            let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+            return (
+                watched: state?.watchedSessionIDs.contains(sessionID) ?? false,
+                activeWait: state?.activeWaitSessionIDs.contains(sessionID) ?? false,
+                parkedTerminal: state?.parkedTerminalSessionIDs.contains(sessionID) ?? false,
+                pendingQuarantine: pendingTerminalQuarantineByDeviceSession[key] != nil,
+                lastEmittedIsTerminal: lastEmittedIsTerminalByDeviceSession[key]
+            )
+        }
+    #endif
 }
 
 struct RemoteSessionSnapshot: Equatable {
