@@ -98,6 +98,7 @@ struct AgentRunWaitScopeCompletion: Equatable {
         case snapshotReady = "snapshot_ready"
         case timedOut = "timed_out"
         case startupPending = "startup_pending"
+        case statusUpdate = "status_update"
         case expired
         case superseded
         case cancelled
@@ -115,6 +116,7 @@ private enum MultiWaitDisposition {
     case actionable(AgentRunMCPSnapshot)
     case steeringInterrupted(AgentRunMCPSnapshot)
     case superseded(AgentRunMCPSnapshot)
+    case statusUpdate(AgentRunMCPSnapshot)
     case terminalPublicationRejected(String)
     case timedOut
     case expired
@@ -199,6 +201,39 @@ struct AgentRunMCPToolService {
 
     static let defaultWaitTimeoutSeconds = MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
     static let defaultStartTaskLabelKind: AgentModelCatalog.TaskLabelKind = .pair
+    nonisolated static let statusUpdateSliceSeconds: TimeInterval = 2
+    #if DEBUG
+        /// Process-global DEBUG seam for fast status-update tests; reset in tearDown.
+        /// Safe under serial XCTest execution only — would race if wait suites ever
+        /// run parallel in-process.
+        nonisolated(unsafe) static var statusUpdateSliceSecondsOverride: TimeInterval?
+    #endif
+
+    nonisolated static func normalizedStatusTextKey(_ text: String?) -> String? {
+        let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    nonisolated static func shouldReturnStatusUpdate(
+        baselineKey: String?,
+        latest: AgentRunMCPSnapshot?
+    ) -> Bool {
+        guard let latest, latest.status == .running,
+              let latestKey = normalizedStatusTextKey(latest.statusText)
+        else {
+            return false
+        }
+        return latestKey != baselineKey
+    }
+
+    private nonisolated static var resolvedStatusUpdateSliceSeconds: TimeInterval {
+        #if DEBUG
+            if let override = statusUpdateSliceSecondsOverride {
+                return max(0.001, override)
+            }
+        #endif
+        return statusUpdateSliceSeconds
+    }
 
     static func resolvedStartTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
         try resolvedLifecycleWaitTimeoutSeconds(value)
@@ -829,6 +864,7 @@ struct AgentRunMCPToolService {
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let timeoutSeconds = try forcePoll ? 0 : Self.resolvedWaitTimeoutSeconds(args["timeout"])
+        let includeStatusUpdates = forcePoll ? false : (parseBool(args["include_status_updates"]) ?? false)
         let metadata = await captureRequestMetadata()
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         if initialSnapshot.isActionableForMCPWait || timeoutSeconds <= 0 {
@@ -841,7 +877,8 @@ struct AgentRunMCPToolService {
             timeoutSeconds: timeoutSeconds,
             stage: "waiting",
             message: "Waiting for the agent run to finish or request input...",
-            liveSnapshot: initialSnapshot
+            liveSnapshot: initialSnapshot,
+            includeStatusUpdates: includeStatusUpdates
         )
     }
 
@@ -860,6 +897,7 @@ struct AgentRunMCPToolService {
         }
 
         let timeoutSeconds = try Self.resolvedWaitTimeoutSeconds(args["timeout"])
+        let includeStatusUpdates = parseBool(args["include_status_updates"]) ?? false
         let metadata = await captureRequestMetadata()
         let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
 
@@ -894,7 +932,8 @@ struct AgentRunMCPToolService {
                     sessionIDs: sessionIDs,
                     agentModeVM: agentModeVM,
                     timeoutSeconds: timeoutSeconds,
-                    initialSnapshots: initialSnapshots
+                    initialSnapshots: initialSnapshots,
+                    includeStatusUpdates: includeStatusUpdates
                 )
             }
             let completion = waitScopeCompletion(from: value, fallbackSessionIDs: sessionIDs)
@@ -1239,13 +1278,21 @@ struct AgentRunMCPToolService {
         message: String,
         workflow: AgentWorkflowDefinition? = nil,
         initialDelivery: AgentModeViewModel.MCPInstructionDispatch? = nil,
-        liveSnapshot _: AgentRunMCPSnapshot? = nil
+        liveSnapshot _: AgentRunMCPSnapshot? = nil,
+        includeStatusUpdates: Bool = false
     ) async throws -> Value {
         guard let initialCursor = agentModeVM.mcpWaitCursor(sessionID: sessionID) else {
             throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
         }
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
+        // Accepted staleness window (plan §2/Q3): a status change landing between a
+        // prior wait's return and this baseline capture is absorbed into the baseline
+        // and only surfaces at the next change or the timeout sample. Deliberate —
+        // sampling, not streaming.
+        let baselineKey = await includeStatusUpdates
+            ? Self.normalizedStatusTextKey((AgentRunSessionStore.snapshot(for: initialCursor))?.statusText)
+            : nil
         let waitScopeToken = await beginAgentRunWait(metadata, [sessionID], timeoutSeconds)
         let completionBox = WaitScopeCompletionBox()
         let snapshot: Value
@@ -1274,9 +1321,12 @@ struct AgentRunMCPToolService {
                         ))
                         return value
                     }
+                    let sliceTimeout = includeStatusUpdates
+                        ? min(remaining, Self.resolvedStatusUpdateSliceSeconds)
+                        : remaining
                     let disposition = await AgentRunSessionStore.waitUntilInteresting(
                         cursor: cursor,
-                        timeoutSeconds: remaining
+                        timeoutSeconds: sliceTimeout
                     )
                     switch disposition {
                     case let .snapshotReady(triggeringSnapshot):
@@ -1335,6 +1385,21 @@ struct AgentRunMCPToolService {
                     case let .terminalPublicationRejected(_, reason):
                         throw MCPError.internalError("The agent run terminal state could not be published: \(reason)")
                     case .timedOut:
+                        let remainingAfterSlice = Self.timeInterval(from: clock.now.duration(to: deadline))
+                        if includeStatusUpdates, remainingAfterSlice > 0 {
+                            let latest = await AgentRunSessionStore.snapshot(for: cursor)
+                            if Self.shouldReturnStatusUpdate(baselineKey: baselineKey, latest: latest) {
+                                completionBox.set(AgentRunWaitScopeCompletion(
+                                    reason: .statusUpdate,
+                                    result: "status_update",
+                                    winnerSessionID: sessionID,
+                                    pendingSessionIDs: [],
+                                    errorDescription: nil
+                                ))
+                                return await statusUpdateWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
+                            }
+                            continue
+                        }
                         let value = await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
                         let result = Self.waitResult(from: value) ?? "timed_out"
                         completionBox.set(AgentRunWaitScopeCompletion(
@@ -1411,6 +1476,16 @@ struct AgentRunMCPToolService {
         object["_meta"] = .object([
             "wait_result": .string(snapshot.isStartupPendingForMCPWait ? "startup_pending" : "timed_out")
         ])
+        return .object(object)
+    }
+
+    private func statusUpdateWaitValue(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel
+    ) async -> Value {
+        let snapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        var object = snapshot.asObject()
+        object["_meta"] = .object(["wait_result": .string("status_update")])
         return .object(object)
     }
 
@@ -1591,7 +1666,8 @@ struct AgentRunMCPToolService {
         sessionIDs: [UUID],
         agentModeVM: AgentModeViewModel,
         timeoutSeconds: TimeInterval,
-        initialSnapshots: [AgentRunMCPSnapshot]
+        initialSnapshots: [AgentRunMCPSnapshot],
+        includeStatusUpdates: Bool = false
     ) async throws -> Value {
         let cursors = await MainActor.run {
             sessionIDs.compactMap { agentModeVM.mcpWaitCursor(sessionID: $0) }
@@ -1607,7 +1683,8 @@ struct AgentRunMCPToolService {
         let result = await Self.waitUntilFirstActionable(
             cursors: cursors,
             fallbackSessionID: sessionIDs[0],
-            timeoutSeconds: timeoutSeconds
+            timeoutSeconds: timeoutSeconds,
+            includeStatusUpdates: includeStatusUpdates
         )
         let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
         switch result.disposition {
@@ -1632,6 +1709,15 @@ struct AgentRunMCPToolService {
                 sessionIDs: sessionIDs,
                 snapshots: snapshots,
                 pendingSessionIDs: pendingSessionIDs(from: snapshots)
+            )
+        case let .statusUpdate(snapshot):
+            let representative = snapshots.first { $0.sessionID == snapshot.sessionID } ?? snapshot
+            return decoratedMultiWaitValue(
+                snapshot: representative,
+                sessionIDs: sessionIDs,
+                result: "status_update",
+                snapshots: snapshots,
+                pendingSessionIDs: pendingSessionIDs(from: snapshots).filter { $0 != snapshot.sessionID }
             )
         case let .terminalPublicationRejected(reason):
             throw MCPError.internalError("An agent run terminal state could not be published: \(reason)")
@@ -1667,10 +1753,15 @@ struct AgentRunMCPToolService {
     private nonisolated static func waitUntilFirstActionable(
         cursors: [AgentRunSessionStore.WaitCursor],
         fallbackSessionID: UUID,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        includeStatusUpdates: Bool = false
     ) async -> WaitAnyResult {
         let operations: [@Sendable () async -> WaitAnyResult] = cursors.map { cursor in
-            { await Self.waitUntilActionable(cursor: cursor, timeoutSeconds: timeoutSeconds) }
+            { await Self.waitUntilActionable(
+                cursor: cursor,
+                timeoutSeconds: timeoutSeconds,
+                includeStatusUpdates: includeStatusUpdates
+            ) }
         }
         return await resolveFirstWaitAny(
             operations: operations,
@@ -1714,11 +1805,18 @@ struct AgentRunMCPToolService {
 
     private nonisolated static func waitUntilActionable(
         cursor initialCursor: AgentRunSessionStore.WaitCursor,
-        timeoutSeconds: TimeInterval
+        timeoutSeconds: TimeInterval,
+        includeStatusUpdates: Bool = false
     ) async -> WaitAnyResult {
         let sessionID = initialCursor.registration.sessionID
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
+        // Same accepted staleness window as the single-session wait: baseline is
+        // captured once per call; changes racing the capture surface on the next
+        // change or timeout sample.
+        let baselineKey = await includeStatusUpdates
+            ? normalizedStatusTextKey((AgentRunSessionStore.snapshot(for: initialCursor))?.statusText)
+            : nil
         var cursor = initialCursor
         while true {
             if Task.isCancelled {
@@ -1728,9 +1826,12 @@ struct AgentRunMCPToolService {
             guard remaining > 0 else {
                 return WaitAnyResult(sessionID: sessionID, disposition: .timedOut)
             }
+            let sliceTimeout = includeStatusUpdates
+                ? min(remaining, resolvedStatusUpdateSliceSeconds)
+                : remaining
             let disposition = await AgentRunSessionStore.waitUntilInteresting(
                 cursor: cursor,
-                timeoutSeconds: remaining
+                timeoutSeconds: sliceTimeout
             )
             switch disposition {
             case let .snapshotReady(snapshot):
@@ -1755,6 +1856,14 @@ struct AgentRunMCPToolService {
             case let .terminalPublicationRejected(_, reason):
                 return WaitAnyResult(sessionID: sessionID, disposition: .terminalPublicationRejected(reason))
             case .timedOut:
+                let remainingAfterSlice = timeInterval(from: clock.now.duration(to: deadline))
+                if includeStatusUpdates, remainingAfterSlice > 0 {
+                    let latest = await AgentRunSessionStore.snapshot(for: cursor)
+                    if shouldReturnStatusUpdate(baselineKey: baselineKey, latest: latest), let latest {
+                        return WaitAnyResult(sessionID: sessionID, disposition: .statusUpdate(latest))
+                    }
+                    continue
+                }
                 return WaitAnyResult(sessionID: sessionID, disposition: .timedOut)
             case .expired:
                 return WaitAnyResult(sessionID: sessionID, disposition: .expired)
@@ -1795,10 +1904,12 @@ struct AgentRunMCPToolService {
             3
         case .expired:
             4
-        case .timedOut:
+        case .statusUpdate:
             5
-        case .cancelled:
+        case .timedOut:
             6
+        case .cancelled:
+            7
         }
     }
 
@@ -1886,6 +1997,8 @@ struct AgentRunMCPToolService {
                 )
             case let .superseded(snapshot):
                 return ("superseded", "superseded_turn", result.sessionID, snapshot.status.rawValue)
+            case let .statusUpdate(snapshot):
+                return ("status_update", nil, result.sessionID, snapshot.status.rawValue)
             case .terminalPublicationRejected:
                 return ("publication_rejected", nil, result.sessionID, nil)
             case .timedOut:
@@ -1919,6 +2032,7 @@ struct AgentRunMCPToolService {
             case .actionable: "actionable"
             case .superseded: "superseded"
             case .expired: "expired"
+            case .statusUpdate: "status_update"
             case .timedOut: "timed_out"
             case .cancelled: "cancelled"
             }
@@ -1943,6 +2057,8 @@ struct AgentRunMCPToolService {
                     disposition = .superseded(snapshot)
                 case "expired":
                     disposition = .expired
+                case "status_update":
+                    disposition = .statusUpdate(snapshot)
                 case "timed_out":
                     disposition = .timedOut
                 case "cancelled":
@@ -1964,6 +2080,7 @@ struct AgentRunMCPToolService {
             case .actionable: "actionable"
             case .superseded: "superseded"
             case .expired: "expired"
+            case .statusUpdate: "status_update"
             case .timedOut: "timed_out"
             case .cancelled: "cancelled"
             }
@@ -1986,6 +2103,7 @@ struct AgentRunMCPToolService {
         case "timed_out": .timedOut
         case "startup_pending": .startupPending
         case "expired": .expired
+        case "status_update": .statusUpdate
         case "superseded": .superseded
         case "cancelled", "interrupted_by_steering": .cancelled
         case "error": .error

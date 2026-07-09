@@ -31,6 +31,7 @@ struct RemoteProjectedSnapshot: Equatable {
     var isExpired: Bool
     var agentKindRaw: String?
     var agentModelRaw: String?
+    var agentReasoningEffortRaw: String?
     var sessionName: String?
 }
 
@@ -97,6 +98,8 @@ struct RemoteTranscriptProjector: Equatable {
             }
         }()
         let agentObject = object["agent"]?.objectValue
+        let agentReasoningEffortRaw = agentObject?["reasoning_effort"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionObject = object["session"]?.objectValue
         return RemoteProjectedSnapshot(
             statusRaw: statusRaw,
@@ -107,6 +110,7 @@ struct RemoteTranscriptProjector: Equatable {
             isExpired: isExpired,
             agentKindRaw: agentObject?["id"]?.stringValue,
             agentModelRaw: agentObject?["model"]?.stringValue,
+            agentReasoningEffortRaw: agentReasoningEffortRaw?.isEmpty == false ? agentReasoningEffortRaw : nil,
             sessionName: sessionObject?["name"]?.stringValue
         )
     }

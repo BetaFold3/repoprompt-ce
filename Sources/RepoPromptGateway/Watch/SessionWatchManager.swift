@@ -311,7 +311,8 @@ actor SessionWatchManager {
                 let waitResult = try await waitAndHandlePartitions(
                     deviceID: deviceID,
                     sessionIDs: sessionIDs,
-                    taskID: taskID
+                    taskID: taskID,
+                    includeStatusUpdates: !state.sinks.isEmpty
                 )
                 if waitResult == .paused {
                     return
@@ -444,7 +445,8 @@ actor SessionWatchManager {
     private func waitAndHandlePartitions(
         deviceID: String,
         sessionIDs: [String],
-        taskID: UUID
+        taskID: UUID,
+        includeStatusUpdates: Bool
     ) async throws -> WaitPartitionResult {
         let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
         var sawSnapshot = false
@@ -457,7 +459,8 @@ actor SessionWatchManager {
                         let payload = try await self.callAgentRunWaitPartition(
                             deviceID: deviceID,
                             sessionIDs: partition.sessionIDs,
-                            windowID: partition.windowID
+                            windowID: partition.windowID,
+                            includeStatusUpdates: includeStatusUpdates
                         )
                         return .success(sessionIDs: partition.sessionIDs, payload: payload)
                     } catch let error as SessionWatchError {
@@ -529,13 +532,18 @@ actor SessionWatchManager {
         return payload
     }
 
-    private func callAgentRunWait(deviceID: String, sessionIDs: [String]) async throws -> JSONValue {
+    private func callAgentRunWait(
+        deviceID: String,
+        sessionIDs: [String],
+        includeStatusUpdates: Bool = false
+    ) async throws -> JSONValue {
         let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
         if partitions.count == 1 {
             return try await callAgentRunWaitPartition(
                 deviceID: deviceID,
                 sessionIDs: partitions[0].sessionIDs,
-                windowID: partitions[0].windowID
+                windowID: partitions[0].windowID,
+                includeStatusUpdates: includeStatusUpdates
             )
         }
         var snapshots: [JSONValue] = []
@@ -545,7 +553,8 @@ actor SessionWatchManager {
                     try await self.callAgentRunWaitPartition(
                         deviceID: deviceID,
                         sessionIDs: partition.sessionIDs,
-                        windowID: partition.windowID
+                        windowID: partition.windowID,
+                        includeStatusUpdates: includeStatusUpdates
                     )
                 }
             }
@@ -556,9 +565,17 @@ actor SessionWatchManager {
         return .object(["snapshots": .array(snapshots)])
     }
 
-    private func callAgentRunWaitPartition(deviceID: String, sessionIDs: [String], windowID: Int?) async throws -> JSONValue {
+    private func callAgentRunWaitPartition(
+        deviceID: String,
+        sessionIDs: [String],
+        windowID: Int?,
+        includeStatusUpdates: Bool
+    ) async throws -> JSONValue {
         var args = agentRunSessionArgs(op: "wait", sessionIDs: sessionIDs, windowID: windowID)
         args["timeout"] = .double(waitTimeoutSeconds)
+        if includeStatusUpdates {
+            args["include_status_updates"] = .bool(true)
+        }
         let result = try await appLink(forDevice: deviceID)
             .callTool(name: "agent_run", arguments: args, timeout: waitTimeoutSeconds + 5)
         let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)

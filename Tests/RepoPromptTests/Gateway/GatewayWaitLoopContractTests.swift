@@ -7,6 +7,68 @@ import RepoPromptShared
 import XCTest
 
 final class GatewayWaitLoopContractTests: XCTestCase {
+    private actor RecordingPushEligibilityNotifier: RemotePushNotifying {
+        private let eligibleDevices: Set<String>
+
+        init(eligibleDevices: Set<String>) {
+            self.eligibleDevices = eligibleDevices
+        }
+
+        func isPushEligible(deviceID: String) -> Bool {
+            eligibleDevices.contains(deviceID)
+        }
+
+        func sendWake(deviceID _: String, payload _: WebPushWakePayload) {}
+    }
+
+    func testWaitPartitionArgsIncludeStatusUpdatesWhenSinksLive() async throws {
+        let s1 = "11111111-1111-1111-1111-111111111111"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: s1, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: s1, status: "running")))
+        ])
+        let (manager, _) = try await makeManager(connection: connection)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [s1])
+        let calls = await waitForCalls(connection, minimum: 2)
+        await manager.shutdown()
+
+        let waitCall = try XCTUnwrap(calls.first { $0.name == "agent_run" && $0.arguments["op"] == .string("wait") })
+        XCTAssertEqual(waitCall.arguments["include_status_updates"], .bool(true))
+    }
+
+    func testWaitPartitionOmitsStatusUpdatesForSinklessPushEligibleDevice() async throws {
+        let s1 = "11111111-1111-1111-1111-111111111111"
+        let deviceID = "device"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: s1, status: "running")))
+        ])
+        let notifier = RecordingPushEligibilityNotifier(eligibleDevices: [deviceID])
+        let (manager, _) = try await makeManager(
+            connection: connection,
+            pushNotifier: notifier,
+            waitTimeoutSeconds: 0.05,
+            pollRefreshSeconds: 0.05
+        )
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+
+        await manager.subscribe(deviceID: deviceID, sinkID: sinkID, sink: sink, sessionIDs: [s1])
+        await manager.removeSink(deviceID: deviceID, sinkID: sinkID)
+        let calls = await waitForCalls(connection, minimum: 3)
+        await manager.shutdown()
+
+        let waitCalls = calls.filter { $0.name == "agent_run" && $0.arguments["op"] == .string("wait") }
+        // The LAST wait call must be sinkless-shaped; a contains-based check would
+        // pass even if the flag flip-flopped per iteration.
+        let lastWaitCall = try XCTUnwrap(waitCalls.last)
+        XCTAssertNil(
+            lastWaitCall.arguments["include_status_updates"],
+            "A disconnected push-eligible wait loop must omit include_status_updates: \(waitCalls)"
+        )
+    }
+
     func testMultiplexWaitUsesSessionIDsArray() async throws {
         let s1 = "11111111-1111-1111-1111-111111111111"
         let s2 = "22222222-2222-2222-2222-222222222222"
@@ -383,6 +445,7 @@ final class GatewayWaitLoopContractTests: XCTestCase {
     private func makeManager(
         connection: RecordingAppLinkConnection,
         windowResolver: SessionWatchManager.WindowResolver? = nil,
+        pushNotifier: (any RemotePushNotifying)? = nil,
         waitTimeoutSeconds: TimeInterval = 0.2,
         pollRefreshSeconds: TimeInterval = 0.2
     ) async throws -> (SessionWatchManager, AppLinkSession) {
@@ -396,6 +459,7 @@ final class GatewayWaitLoopContractTests: XCTestCase {
         try await appLink.connect()
         let manager = SessionWatchManager(
             appLink: appLink,
+            pushNotifier: pushNotifier,
             windowResolver: windowResolver,
             waitTimeoutSeconds: waitTimeoutSeconds,
             pollRefreshSeconds: pollRefreshSeconds

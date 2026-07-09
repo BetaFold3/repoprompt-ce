@@ -948,6 +948,48 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(frame.payload?.objectValue?["limit"]?.intValue, 500)
     }
 
+    func testMetadataEventCarriesReasoningEffortFromSnapshot() async throws {
+        let connection = RecordingRemoteAgentSessionConnection()
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(lastAppliedSeq: 0),
+            connection: connection
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-abc",
+            seq: 1,
+            payload: Self.snapshotPayload(
+                agentID: "codexExec",
+                agentModel: "gpt-5.4-mini",
+                agentReasoningEffort: "high"
+            )
+        ))
+
+        await waitForRemoteAgentSessionCondition {
+            await !recorder.metadataEvents().isEmpty
+        }
+        let maybeEvent = await recorder.metadataEvents().first
+        let event = try XCTUnwrap(maybeEvent)
+        guard case let .metadata(agentKindRaw, modelRaw, reasoningEffortRaw, sessionName) = event else {
+            return XCTFail("Expected metadata event")
+        }
+        XCTAssertEqual(agentKindRaw, "codexExec")
+        XCTAssertEqual(modelRaw, "gpt-5.4-mini")
+        XCTAssertEqual(reasoningEffortRaw, "high")
+        XCTAssertNil(sessionName)
+    }
+
     @MainActor
     func testCoordinatorMaterializesRemoteChildrenFromListSessionsAndDedupes() async throws {
         let fixture = try await makeRemoteNamingFixture(
@@ -1639,11 +1681,22 @@ final class RemoteAgentSessionTests: XCTestCase {
         }
     }
 
-    private static func snapshotPayload(status: String = "running", sessionID: String? = nil) -> JSONValue {
+    private static func snapshotPayload(
+        status: String = "running",
+        sessionID: String? = nil,
+        agentID: String? = nil,
+        agentModel: String? = nil,
+        agentReasoningEffort: String? = nil
+    ) -> JSONValue {
         var payload: [String: JSONValue] = ["status": .string(status)]
         if let sessionID {
             payload["session_id"] = .string(sessionID)
         }
+        var agent: [String: JSONValue] = [:]
+        if let agentID { agent["id"] = .string(agentID) }
+        if let agentModel { agent["model"] = .string(agentModel) }
+        if let agentReasoningEffort { agent["reasoning_effort"] = .string(agentReasoningEffort) }
+        if !agent.isEmpty { payload["agent"] = .object(agent) }
         return .object(payload)
     }
 
@@ -1720,6 +1773,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         private var transcriptRows: [[AgentChatItem]] = []
         private var transcriptBatchWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
         private var systemMessages: [String] = []
+        private var metadata: [RemoteSessionEvent] = []
         private var expiredCount = 0
 
         func record(_ event: RemoteSessionEvent) {
@@ -1729,6 +1783,8 @@ final class RemoteAgentSessionTests: XCTestCase {
                 resumeSatisfiedTranscriptBatchWaiters()
             case let .systemMessage(message):
                 systemMessages.append(message)
+            case .metadata:
+                metadata.append(event)
             case .sessionExpired:
                 expiredCount += 1
             default:
@@ -1779,6 +1835,10 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func recordedSystemMessages() -> [String] {
             systemMessages
+        }
+
+        func metadataEvents() -> [RemoteSessionEvent] {
+            metadata
         }
 
         func sessionExpiredCount() -> Int {

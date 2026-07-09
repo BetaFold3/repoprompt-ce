@@ -58,7 +58,7 @@ enum RemoteSessionEvent: Equatable {
     case terminal(status: String)
     case channel(RemoteChannelState)
     case systemMessage(String)
-    case metadata(agentKindRaw: String?, modelRaw: String?, sessionName: String?)
+    case metadata(agentKindRaw: String?, modelRaw: String?, reasoningEffortRaw: String?, sessionName: String?)
     case binding(AgentSessionRemoteHostBinding)
 }
 
@@ -658,6 +658,7 @@ actor RemoteAgentSessionController {
             eventsContinuation.yield(.metadata(
                 agentKindRaw: projection.agentKindRaw,
                 modelRaw: projection.agentModelRaw,
+                reasoningEffortRaw: projection.agentReasoningEffortRaw,
                 sessionName: projection.sessionName
             ))
         }
@@ -666,7 +667,7 @@ actor RemoteAgentSessionController {
         if projection.runState.isActive {
             didTerminalSettleReRead = false
         }
-        Self.logger.log("remote snapshot projected frame_type=\(frameType ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) run_state=\(projection.runState.rawValue, privacy: .public)")
+        Self.logger.log("remote snapshot projected frame_type=\(frameType ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) run_state=\(projection.runState.rawValue, privacy: .public) has_status_text=\(projection.statusText != nil)")
         eventsContinuation.yield(.runState(
             projection.runState,
             pendingInteraction: projection.pendingInteraction,

@@ -282,7 +282,7 @@ final class RemoteAgentClientFixesTests: XCTestCase {
         XCTAssertEqual(session.runningStatusText, "Thinking…")
 
         coordinator.test_applyRunState(.running, statusText: nil, to: session)
-        XCTAssertEqual(session.runningStatusText, "Running on Studio Mac…")
+        XCTAssertEqual(session.runningStatusText, "Thinking…")
 
         session.setRunningStatus("Existing waiting label", source: .transport)
         coordinator.test_applyRunState(.waitingForQuestion, statusText: "Queued to start", to: session)
@@ -314,6 +314,160 @@ final class RemoteAgentClientFixesTests: XCTestCase {
             payload: Self.snapshotPayload(status: "running", statusText: "Thinking…")
         ))
         await waitForCondition { await recorder.runStateEvents().contains(.runState(.running, pendingInteraction: nil, statusText: "Thinking…")) }
+    }
+
+    @MainActor
+    func testMetadataEchoRemapsPlainModelToCompoundSelection() async {
+        let catalog = clientStructuredCatalog()
+        let fixture = await makeMetadataFixture(catalog: catalog)
+        fixture.session.selectedModelRaw = "codexExec:gpt-5.4-mini-low"
+
+        fixture.coordinator.test_applyMetadata(
+            agentKindRaw: "codexExec",
+            modelRaw: "gpt-5.4-mini",
+            reasoningEffortRaw: "high",
+            sessionName: nil,
+            tabID: fixture.tabID
+        )
+
+        XCTAssertEqual(fixture.session.selectedModelRaw, "codexExec:gpt-5.4-mini-high")
+        XCTAssertFalse(catalog.effortOptions(forModelID: fixture.session.selectedModelRaw).isEmpty)
+    }
+
+    @MainActor
+    func testMetadataEchoDoesNotClobberCompoundWhenCatalogUnavailable() async {
+        let fixture = await makeMetadataFixture(catalog: nil)
+        fixture.session.selectedModelRaw = "codexExec:gpt-5.4-mini-high"
+        fixture.session.selectedReasoningEffortRaw = "high"
+
+        fixture.coordinator.test_applyMetadata(
+            agentKindRaw: "codexExec",
+            modelRaw: "gpt-5.4-mini",
+            reasoningEffortRaw: "low",
+            sessionName: nil,
+            tabID: fixture.tabID
+        )
+
+        XCTAssertEqual(fixture.session.selectedModelRaw, "codexExec:gpt-5.4-mini-high")
+        XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, "high")
+    }
+
+    @MainActor
+    func testMetadataEchoAdoptsCompoundForHostDefaultStart() async {
+        let fixture = await makeMetadataFixture(catalog: clientStructuredCatalog())
+        fixture.session.selectedModelRaw = RemoteHostAgentCatalog.hostDefaultModelID
+        fixture.session.selectedReasoningEffortRaw = nil
+
+        fixture.coordinator.test_applyMetadata(
+            agentKindRaw: "codexExec",
+            modelRaw: "gpt-5.4-mini",
+            reasoningEffortRaw: "medium",
+            sessionName: nil,
+            tabID: fixture.tabID
+        )
+
+        XCTAssertEqual(fixture.session.selectedModelRaw, "codexExec:gpt-5.4-mini-medium")
+        XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, "medium")
+    }
+
+    @MainActor
+    func testMetadataEchoLegacyCatalogAdoptsPlainModelWhenSelectionNotCompound() async {
+        let fixture = await makeMetadataFixture(catalog: clientLegacyCatalog())
+        fixture.session.selectedModelRaw = "local-legacy-model"
+        fixture.session.selectedReasoningEffortRaw = nil
+
+        fixture.coordinator.test_applyMetadata(
+            agentKindRaw: "codexExec",
+            modelRaw: "gpt-5.5",
+            reasoningEffortRaw: "high",
+            sessionName: nil,
+            tabID: fixture.tabID
+        )
+
+        XCTAssertEqual(fixture.session.selectedModelRaw, "gpt-5.5")
+        XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, "high")
+    }
+
+    @MainActor
+    func testMetadataEchoSyncsReasoningEffortFromMatchedOption() async {
+        let fixture = await makeMetadataFixture(catalog: clientStructuredCatalog())
+        fixture.session.selectedModelRaw = "codexExec:gpt-5.4-mini-high"
+        fixture.session.selectedReasoningEffortRaw = "stale"
+
+        fixture.coordinator.test_applyMetadata(
+            agentKindRaw: "codexExec",
+            modelRaw: "gpt-5.4-mini",
+            reasoningEffortRaw: "high",
+            sessionName: nil,
+            tabID: fixture.tabID
+        )
+
+        XCTAssertEqual(fixture.session.selectedModelRaw, "codexExec:gpt-5.4-mini-high")
+        XCTAssertEqual(fixture.session.selectedReasoningEffortRaw, "high")
+    }
+
+    @MainActor
+    func testModelIDForStartRemainsResolvableAfterMetadataEcho() async {
+        let fixture = await makeMetadataFixture(catalog: clientStructuredCatalog())
+        fixture.session.selectedModelRaw = RemoteHostAgentCatalog.hostDefaultModelID
+
+        fixture.coordinator.test_applyMetadata(
+            agentKindRaw: "codexExec",
+            modelRaw: "gpt-5.4-mini",
+            reasoningEffortRaw: "low",
+            sessionName: nil,
+            tabID: fixture.tabID
+        )
+
+        XCTAssertEqual(
+            RemoteHostAgentCatalog.modelIDForStart(fixture.session.selectedModelRaw),
+            "codexExec:gpt-5.4-mini-low"
+        )
+    }
+
+    @MainActor
+    func testRunningNilStatusTextDoesNotDowngradeHostProvidedLabel() {
+        let coordinator = RemoteAgentModeCoordinator()
+        let session = makeSession(remoteSessionID: "remote-running-label")
+
+        coordinator.test_applyRunState(.running, statusText: "Thinking…", to: session)
+        coordinator.test_applyRunState(.running, statusText: nil, to: session)
+
+        XCTAssertEqual(session.runningStatusText, "Thinking…")
+    }
+
+    @MainActor
+    func testRunningNilStatusTextBeforeAnyHostLabelSetsFallback() {
+        let coordinator = RemoteAgentModeCoordinator()
+        let session = makeSession(remoteSessionID: "remote-running-fallback")
+
+        coordinator.test_applyRunState(.running, statusText: nil, to: session)
+
+        XCTAssertEqual(session.runningStatusText, "Running on Studio Mac…")
+    }
+
+    @MainActor
+    func testTerminalClearsHostLabelFlagSoNextRunFallsBackAgain() {
+        let coordinator = RemoteAgentModeCoordinator()
+        let session = makeSession(remoteSessionID: "remote-terminal-clears-label")
+
+        coordinator.test_applyRunState(.running, statusText: "Thinking…", to: session)
+        coordinator.test_applyTerminal(status: "completed", to: session)
+        coordinator.test_applyRunState(.running, statusText: nil, to: session)
+
+        XCTAssertEqual(session.runningStatusText, "Running on Studio Mac…")
+    }
+
+    @MainActor
+    func testConnectedChannelLabelPersistsThroughNilStatusRunningFrame() {
+        let coordinator = RemoteAgentModeCoordinator()
+        let session = makeSession(remoteSessionID: "remote-connected-label")
+
+        coordinator.test_applyRunState(.running, statusText: "Thinking…", to: session)
+        coordinator.test_applyChannel(.init(kind: .connected), to: session)
+        coordinator.test_applyRunState(.running, statusText: nil, to: session)
+
+        XCTAssertEqual(session.runningStatusText, "Connected to Studio Mac")
     }
 
     func testCompletePageReconcilesBudgetDroppedRows() async throws {
@@ -348,6 +502,84 @@ final class RemoteAgentClientFixesTests: XCTestCase {
         return session
     }
 
+    @MainActor
+    private func makeMetadataFixture(catalog: RemoteHostAgentCatalog?) async -> RemoteMetadataFixture {
+        let tabID = UUID()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() }
+        )
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.remoteHost = Self.makeBinding(hostID: "metadata-host", remoteSessionID: "metadata-remote")
+        let coordinator = RemoteAgentModeCoordinator(catalogProvider: { _ in catalog })
+        coordinator.attach(viewModel: viewModel)
+        return RemoteMetadataFixture(
+            tabID: tabID,
+            viewModel: viewModel,
+            session: session,
+            coordinator: coordinator
+        )
+    }
+
+    private func clientStructuredCatalog() -> RemoteHostAgentCatalog {
+        RemoteHostAgentCatalog(agents: [
+            RemoteHostAgent(
+                name: "Codex CLI",
+                defaultModelID: "codexExec:gpt-5.4-mini-medium",
+                models: [
+                    RemoteHostModel(
+                        modelID: "codexExec:gpt-5.4-mini-low",
+                        name: "Codex CLI GPT-5.4 Mini Low",
+                        agentID: "codexExec",
+                        baseModelID: "gpt-5.4-mini",
+                        effort: "low",
+                        modelDisplayName: "GPT-5.4 Mini",
+                        effortDisplayName: "Low"
+                    ),
+                    RemoteHostModel(
+                        modelID: "codexExec:gpt-5.4-mini-medium",
+                        name: "Codex CLI GPT-5.4 Mini Medium",
+                        agentID: "codexExec",
+                        baseModelID: "gpt-5.4-mini",
+                        effort: "medium",
+                        modelDisplayName: "GPT-5.4 Mini",
+                        effortDisplayName: "Medium",
+                        isDefault: true
+                    ),
+                    RemoteHostModel(
+                        modelID: "codexExec:gpt-5.4-mini-high",
+                        name: "Codex CLI GPT-5.4 Mini High",
+                        agentID: "codexExec",
+                        baseModelID: "gpt-5.4-mini",
+                        effort: "high",
+                        modelDisplayName: "GPT-5.4 Mini",
+                        effortDisplayName: "High"
+                    )
+                ],
+                capabilities: ["agent_conversation_send"]
+            )
+        ])
+    }
+
+    private func clientLegacyCatalog() -> RemoteHostAgentCatalog {
+        RemoteHostAgentCatalog(agents: [
+            RemoteHostAgent(
+                name: "Codex CLI",
+                defaultModelID: "codexExec:gpt-5.5-high",
+                models: [
+                    RemoteHostModel(
+                        modelID: "codexExec:gpt-5.5-high",
+                        name: "Codex CLI GPT-5.5 High",
+                        reasoningEffort: "high"
+                    )
+                ],
+                capabilities: ["agent_conversation_send"]
+            )
+        ])
+    }
+
     private func project(xml: String, sessionID: String, offset: Int = 0) -> [AgentChatItem] {
         RemoteTranscriptProjector(remoteSessionID: sessionID)
             .projectGetLogResponse(Self.logPayload(offset: offset, returned: 1, total: 1, xml: xml, completed: 1))
@@ -367,6 +599,13 @@ final class RemoteAgentClientFixesTests: XCTestCase {
             lastAppliedSeq: lastAppliedSeq,
             nextLogOffset: nextLogOffset
         )
+    }
+
+    private struct RemoteMetadataFixture {
+        let tabID: UUID
+        let viewModel: AgentModeViewModel
+        let session: AgentModeViewModel.TabSession
+        let coordinator: RemoteAgentModeCoordinator
     }
 
     fileprivate static func snapshotPayload(status: String = "running", sessionID: String? = nil, statusText: String? = nil) -> JSONValue {
@@ -502,4 +741,96 @@ private actor ScriptedConnection: RemoteAgentSessionConnection {
             .object([:])
         }
     }
+}
+
+private final class ClientFixesNoopCodexController: CodexSessionControlling {
+    private let eventStream: AsyncStream<CodexNativeSessionController.Event>
+    private let eventContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
+
+    init() {
+        var continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+        eventStream = AsyncStream { continuation = $0 }
+        eventContinuation = continuation!
+        eventContinuation.finish()
+    }
+
+    deinit {
+        eventContinuation.finish()
+    }
+
+    var hasActiveThread: Bool {
+        false
+    }
+
+    var events: AsyncStream<CodexNativeSessionController.Event> {
+        eventStream
+    }
+
+    func ensureEventsStreamReady() {}
+
+    func startOrResume(
+        existing _: CodexNativeSessionController.SessionRef?,
+        baseInstructions _: String
+    ) async throws -> CodexNativeSessionController.SessionRef {
+        CodexNativeSessionController.SessionRef(conversationID: "noop", rolloutPath: nil, model: nil, reasoningEffort: nil)
+    }
+
+    func readThreadSnapshot(
+        includeTurns _: Bool,
+        timeout _: TimeInterval?
+    ) async throws -> CodexNativeSessionController.ThreadSnapshot {
+        CodexNativeSessionController.ThreadSnapshot(
+            conversationID: "noop",
+            rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil,
+            runtimeStatus: .idle,
+            currentTurnID: nil,
+            activeTurnIDs: [],
+            latestTurnStatus: nil
+        )
+    }
+
+    func startUserTurn(
+        text _: String,
+        images _: [AgentImageAttachment],
+        model _: String?,
+        reasoningEffort _: String?,
+        serviceTier _: String?
+    ) async throws -> CodexTurnStartReceipt {
+        CodexTurnStartReceipt(provisionalSubmissionID: "noop")
+    }
+
+    func steerUserTurn(
+        text _: String,
+        images _: [AgentImageAttachment],
+        expectedTurnID: String
+    ) async throws -> CodexTurnSteerReceipt {
+        CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
+    }
+
+    func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+    }
+
+    func compactThread() async throws {}
+    func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
+        nil
+    }
+
+    func setThreadGoalObjective(_: String) async throws -> CodexNativeSessionController.ThreadGoal {
+        throw CancellationError()
+    }
+
+    func setThreadGoalStatus(_: CodexNativeSessionController.ThreadGoalStatus) async throws -> CodexNativeSessionController.ThreadGoal {
+        throw CancellationError()
+    }
+
+    func clearThreadGoal() async throws -> Bool {
+        false
+    }
+
+    func cancelCurrentTurn() async {}
+    func shutdown() async {}
+    func respondToServerRequest(id _: CodexAppServerRequestID, result _: [String: Any]) async {}
 }

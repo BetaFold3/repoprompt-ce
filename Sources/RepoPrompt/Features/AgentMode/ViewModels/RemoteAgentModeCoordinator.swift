@@ -20,11 +20,14 @@ final class RemoteAgentModeCoordinator {
 
     private weak var viewModel: AgentModeViewModel?
     private let connectionManagerProvider: @MainActor () -> RemoteHostConnectionManager
+    private let catalogProvider: @MainActor (String) -> RemoteHostAgentCatalog?
     private var controllersByTabID: [UUID: RemoteAgentSessionController] = [:]
     private var eventTasksByTabID: [UUID: Task<Void, Never>] = [:]
     private var hostIDByTabID: [UUID: String] = [:]
     private var connectionTasksByHostID: [String: HostConnectionTasks] = [:]
     private var surfacedChannelReasonsByTabID: [UUID: Set<String>] = [:]
+    /// Tabs whose current running label came from host status_text (not a client placeholder).
+    private var hostProvidedRunningStatusTabIDs: Set<UUID> = []
     private var lastAdoptedHostNameByTabID: [UUID: String] = [:]
     private var startSessionNameByTabID: [UUID: String] = [:]
     private var childDiscoveryInFlightKeys: Set<String> = []
@@ -42,9 +45,11 @@ final class RemoteAgentModeCoordinator {
 
     init(
         connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared },
+        catalogProvider: @escaping @MainActor (String) -> RemoteHostAgentCatalog? = { RemoteHostCatalog.shared.cachedNonDegradedCatalog(for: $0) },
         childDiscoveryDebounceInterval: TimeInterval = 3
     ) {
         self.connectionManagerProvider = connectionManagerProvider
+        self.catalogProvider = catalogProvider
         self.childDiscoveryDebounceInterval = childDiscoveryDebounceInterval
     }
 
@@ -85,6 +90,7 @@ final class RemoteAgentModeCoordinator {
             tabID: session.tabID,
             allowHostSessionNameAdoptionFromStartName: allowHostSessionNameAdoptionFromStartName
         )
+        hostProvidedRunningStatusTabIDs.remove(session.tabID)
         session.runState = .running
         session.setRunningStatus("Starting on \(session.remoteHost?.hostDisplayName ?? "remote host")…", source: .transport)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
@@ -161,6 +167,7 @@ final class RemoteAgentModeCoordinator {
         }
         eventTasksByTabID.removeValue(forKey: tabID)?.cancel()
         surfacedChannelReasonsByTabID.removeValue(forKey: tabID)
+        hostProvidedRunningStatusTabIDs.remove(tabID)
         lastAdoptedHostNameByTabID.removeValue(forKey: tabID)
         startSessionNameByTabID.removeValue(forKey: tabID)
         let controller = controllersByTabID.removeValue(forKey: tabID)
@@ -298,6 +305,7 @@ final class RemoteAgentModeCoordinator {
         case let .interactionResolved(interactionID, resolvedBy):
             clearResolvedInteraction(tabID: tabID, interactionID: interactionID, resolvedBy: resolvedBy)
         case .sessionExpired:
+            hostProvidedRunningStatusTabIDs.remove(tabID)
             session.runState = .failed
             clearPendingInteractions(session)
             appendSystemMessage("Remote session expired on host.", tabID: tabID)
@@ -308,15 +316,18 @@ final class RemoteAgentModeCoordinator {
             applyChannel(channelState, to: session)
         case let .systemMessage(message):
             appendSystemMessage(message, tabID: tabID)
-        case let .metadata(agentKindRaw, modelRaw, sessionName):
+        case let .metadata(agentKindRaw, modelRaw, reasoningEffortRaw, sessionName):
             if let agentKindRaw,
                let kind = AgentProviderKind(rawValue: agentKindRaw)
             {
                 session.selectedAgent = kind
             }
-            if let modelRaw, !modelRaw.isEmpty {
-                session.selectedModelRaw = modelRaw
-            }
+            applyHostModelMetadata(
+                agentKindRaw: agentKindRaw,
+                modelRaw: modelRaw,
+                reasoningEffortRaw: reasoningEffortRaw,
+                to: session
+            )
             adoptHostSessionNameIfAllowed(sessionName, for: session, tabID: tabID)
         case let .binding(binding):
             session.remoteHost = binding
@@ -435,10 +446,15 @@ final class RemoteAgentModeCoordinator {
         }
         session.runState = runState
         if runState == .running {
-            session.setRunningStatus(
-                statusText ?? "Running on \(session.remoteHost?.hostDisplayName ?? "remote host")…",
-                source: .transport
-            )
+            if let statusText {
+                session.setRunningStatus(statusText, source: .transport)
+                hostProvidedRunningStatusTabIDs.insert(session.tabID)
+            } else if !hostProvidedRunningStatusTabIDs.contains(session.tabID) {
+                session.setRunningStatus(
+                    "Running on \(session.remoteHost?.hostDisplayName ?? "remote host")…",
+                    source: .transport
+                )
+            }
         }
     }
 
@@ -455,6 +471,7 @@ final class RemoteAgentModeCoordinator {
             session.runState = .failed
         }
         session.setRunningStatus(nil, source: nil)
+        hostProvidedRunningStatusTabIDs.remove(session.tabID)
         session.mutateItemsBatch { items in
             _ = Self.settleResultlessToolCalls(in: &items, terminalStatus: status)
         }
@@ -838,6 +855,9 @@ final class RemoteAgentModeCoordinator {
         case .connected:
             surfacedChannelReasonsByTabID[session.tabID] = []
             if session.runState.isActive {
+                // This intentionally surfaces the channel recovery over any host status_text label.
+                // While hostProvidedRunningStatusTabIDs remains set, later nil-status running frames
+                // keep this label until the host sends the next non-empty status_text.
                 session.setRunningStatus("Connected to \(session.remoteHost?.hostDisplayName ?? "remote host")", source: .transport)
             }
         case let .degraded(reason):
@@ -846,10 +866,50 @@ final class RemoteAgentModeCoordinator {
             surfaceChannelReasonIfNeeded(displayReason, to: session)
         case .revoked:
             surfacedChannelReasonsByTabID.removeValue(forKey: session.tabID)
+            hostProvidedRunningStatusTabIDs.remove(session.tabID)
             session.runState = .failed
             clearPendingInteractions(session)
             appendSystemMessage("Remote host revoked this device. Forget and pair again to restore access.", to: session)
         }
+    }
+
+    private func applyHostModelMetadata(
+        agentKindRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        to session: AgentModeViewModel.TabSession
+    ) {
+        guard let model = Self.normalizedMetadataString(modelRaw) else { return }
+        let hostID = session.remoteHost?.hostID
+        let catalog = hostID.flatMap { catalogProvider($0) }
+        if catalog == nil, let hostID {
+            // Best-effort self-heal for the cold-cache case. While a *degraded* entry
+            // sits in the cache (20s TTL), this call is a no-op (its guard checks
+            // cachedCatalog == nil), so mapping stays unavailable until TTL expiry or
+            // refreshRemoteHostCatalogAfterConnect; the no-clobber path below keeps the
+            // selection safe for that window.
+            viewModel?.loadRemoteHostCatalogIfNeeded(hostID: hostID)
+        }
+        let mapped = catalog?.resolveCompoundSelection(
+            agentIDRaw: agentKindRaw,
+            baseModelRaw: model,
+            effortRaw: reasoningEffortRaw
+        )
+        if let mapped {
+            session.selectedModelRaw = mapped.modelID
+            session.selectedReasoningEffortRaw = mapped.effort
+            return
+        }
+
+        if RemoteHostAgentCatalog.agentKind(forModelID: session.selectedModelRaw) != nil {
+            // Residual risk by design: if a structured host echoes a model outside its catalog,
+            // keep the client's compound-shaped selection rather than clobbering the picker.
+            Self.logger.debug("metadata echo unmappable; kept compound selection")
+            return
+        }
+
+        session.selectedModelRaw = model
+        session.selectedReasoningEffortRaw = reasoningEffortRaw
     }
 
     private func optimisticallyClearPendingInteraction(
@@ -1001,6 +1061,11 @@ final class RemoteAgentModeCoordinator {
         return trimmed.isEmpty ? "channel_closing" : trimmed
     }
 
+    private static func normalizedMetadataString(_ raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     private static func interactionMatches(
         _ id: UUID?,
         remoteInteractionID: String?,
@@ -1048,10 +1113,19 @@ final class RemoteAgentModeCoordinator {
         func test_applyMetadata(
             agentKindRaw: String? = nil,
             modelRaw: String? = nil,
+            reasoningEffortRaw: String? = nil,
             sessionName: String?,
             tabID: UUID
         ) {
-            handle(.metadata(agentKindRaw: agentKindRaw, modelRaw: modelRaw, sessionName: sessionName), tabID: tabID)
+            handle(
+                .metadata(
+                    agentKindRaw: agentKindRaw,
+                    modelRaw: modelRaw,
+                    reasoningEffortRaw: reasoningEffortRaw,
+                    sessionName: sessionName
+                ),
+                tabID: tabID
+            )
         }
 
         func test_handleEvent(_ event: RemoteSessionEvent, tabID: UUID) {

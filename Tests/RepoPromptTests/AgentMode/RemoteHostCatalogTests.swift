@@ -122,6 +122,81 @@ final class RemoteHostCatalogTests: XCTestCase {
         XCTAssertEqual(catalog.modelID(forEffort: "high", selectedModelID: fable.preferredModelID), "claudeCode:claude-fable-5:high")
     }
 
+    func testResolveCompoundSelectionMatchesBaseModelAndEffort() throws {
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(structuredCatalogJSON.utf8))
+
+        let resolved = catalog.resolveCompoundSelection(
+            agentIDRaw: "claudeCode",
+            baseModelRaw: "claude-fable-5",
+            effortRaw: "high"
+        )
+
+        XCTAssertEqual(resolved, RemoteHostCompoundResolution(
+            modelID: "claudeCode:claude-fable-5:high",
+            effort: "high"
+        ))
+    }
+
+    func testResolveCompoundSelectionIsCaseInsensitiveOnAgentAndBaseModel() throws {
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(structuredCatalogJSON.utf8))
+
+        let resolved = catalog.resolveCompoundSelection(
+            agentIDRaw: "CLAUDECODE",
+            baseModelRaw: "CLAUDE-FABLE-5",
+            effortRaw: "MEDIUM"
+        )
+
+        XCTAssertEqual(resolved, RemoteHostCompoundResolution(
+            modelID: "claudeCode:claude-fable-5:medium",
+            effort: "medium"
+        ))
+    }
+
+    func testResolveCompoundSelectionNilEffortAdoptsSoleOption() throws {
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(singleOptionStructuredCatalogJSON.utf8))
+
+        let resolved = catalog.resolveCompoundSelection(
+            agentIDRaw: "codexExec",
+            baseModelRaw: "gpt-5.1-codex-mini",
+            effortRaw: nil
+        )
+
+        XCTAssertEqual(resolved, RemoteHostCompoundResolution(
+            modelID: "codexExec:gpt-5.1-codex-mini",
+            effort: nil
+        ))
+    }
+
+    func testResolveCompoundSelectionNilEffortWithMultipleOptionsReturnsNil() throws {
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(structuredCatalogJSON.utf8))
+
+        XCTAssertNil(catalog.resolveCompoundSelection(
+            agentIDRaw: "claudeCode",
+            baseModelRaw: "claude-fable-5",
+            effortRaw: nil
+        ))
+    }
+
+    func testResolveCompoundSelectionReturnsNilForUnstructuredCatalog() throws {
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(unstructuredCatalogJSON.utf8))
+
+        XCTAssertNil(catalog.resolveCompoundSelection(
+            agentIDRaw: "codexExec",
+            baseModelRaw: "gpt-5.5",
+            effortRaw: "low"
+        ))
+    }
+
+    func testResolveCompoundSelectionReturnsNilForUnknownBaseModel() throws {
+        let catalog = try JSONDecoder().decode(RemoteHostAgentCatalog.self, from: Data(structuredCatalogJSON.utf8))
+
+        XCTAssertNil(catalog.resolveCompoundSelection(
+            agentIDRaw: "claudeCode",
+            baseModelRaw: "unknown-model",
+            effortRaw: "high"
+        ))
+    }
+
     func testUnenrichedCatalogKeepsLegacyFlatFallbackWithoutEffortPicker() throws {
         let json = """
         {
@@ -167,6 +242,29 @@ final class RemoteHostCatalogTests: XCTestCase {
         XCTAssertEqual(second, first)
         XCTAssertEqual(catalog.cachedCatalog(for: "host-a"), first)
         XCTAssertEqual(loader.loadCount, 1)
+    }
+
+    @MainActor
+    func testCachedNonDegradedCatalogReturnsNilForCachedDegradedEntry() async {
+        let clock = RemoteHostCatalogTestClock(Date(timeIntervalSince1970: 1_800_000_000))
+        let healthy = healthyCatalog(modelID: "codexExec:healthy-after-degraded-window")
+        let loader = RemoteHostCatalogTestLoader(responses: [.degraded, healthy])
+        let catalog = RemoteHostCatalog(now: { clock.now }, catalogLoader: loader.load)
+
+        let degraded = await catalog.catalog(for: "host-nd")
+
+        XCTAssertTrue(degraded.isDegraded)
+        XCTAssertEqual(catalog.cachedCatalog(for: "host-nd"), degraded)
+        XCTAssertNil(
+            catalog.cachedNonDegradedCatalog(for: "host-nd"),
+            "Degraded cache entries must not be surfaced as usable catalogs (degraded ≠ legacy-unstructured)."
+        )
+
+        clock.now = clock.now.addingTimeInterval(21)
+        let reloaded = await catalog.catalog(for: "host-nd")
+
+        XCTAssertEqual(reloaded, healthy)
+        XCTAssertEqual(catalog.cachedNonDegradedCatalog(for: "host-nd"), healthy)
     }
 
     @MainActor
@@ -288,6 +386,46 @@ final class RemoteHostCatalogTests: XCTestCase {
           ],
           "task_labels": [
             {"label": "pair", "model_id": "claudeCode:claude-fable-5:high", "name": "Claude Code Fable 5 High"}
+          ]
+        }
+        """
+    }
+
+    private var singleOptionStructuredCatalogJSON: String {
+        """
+        {
+          "agents": [
+            {
+              "name": "Codex CLI",
+              "available": true,
+              "default_model_id": "codexExec:gpt-5.1-codex-mini",
+              "models": [
+                {
+                  "model_id": "codexExec:gpt-5.1-codex-mini",
+                  "name": "GPT-5.1 Codex Mini",
+                  "agent_id": "codexExec",
+                  "base_model_id": "gpt-5.1-codex-mini",
+                  "model_display_name": "GPT-5.1 Codex Mini"
+                }
+              ],
+              "capabilities": ["agent_conversation_send"]
+            }
+          ]
+        }
+        """
+    }
+
+    private var unstructuredCatalogJSON: String {
+        """
+        {
+          "agents": [
+            {
+              "name": "Codex CLI",
+              "available": true,
+              "models": [
+                {"model_id": "codexExec:gpt-5.5-low", "name": "Codex CLI GPT-5.5 Low", "reasoning_effort": "low"}
+              ]
+            }
           ]
         }
         """

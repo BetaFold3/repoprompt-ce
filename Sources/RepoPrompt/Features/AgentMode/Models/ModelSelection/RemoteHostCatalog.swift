@@ -159,6 +159,41 @@ struct RemoteHostAgentCatalog: Codable, Equatable {
         return group.effortOptions
     }
 
+    /// Resolves host snapshot metadata back to an exact structured picker option.
+    /// Returns nil for degraded/unstructured catalogs, unknown agent/base tuples,
+    /// ambiguous missing efforts, or stale host echoes outside the structured catalog.
+    func resolveCompoundSelection(
+        agentIDRaw: String?,
+        baseModelRaw: String?,
+        effortRaw: String?
+    ) -> RemoteHostCompoundResolution? {
+        guard supportsStructuredModelGroups,
+              let baseModel = normalizedString(baseModelRaw)
+        else { return nil }
+
+        let agentID = normalizedString(agentIDRaw)
+        let matchingGroups = structuredAgentGroups
+            .flatMap(\.models)
+            .filter { group in
+                group.baseModelID.caseInsensitiveCompare(baseModel) == .orderedSame
+                    && (agentID == nil || Self.caseInsensitiveEquals(group.agentID, agentID))
+            }
+        guard let group = matchingGroups.first else { return nil }
+
+        let effort = normalizedString(effortRaw)
+        let option: RemoteHostEffortOption?
+        if let effort {
+            option = group.options.first { $0.effort?.caseInsensitiveCompare(effort) == .orderedSame }
+        } else if group.options.count == 1 {
+            option = group.options.first
+        } else {
+            let nilEffortOptions = group.options.filter { $0.effort == nil }
+            option = nilEffortOptions.count == 1 ? nilEffortOptions.first : nil
+        }
+        guard let option else { return nil }
+        return RemoteHostCompoundResolution(modelID: option.modelID, effort: option.effort)
+    }
+
     func selectedEffortOption(forModelID rawModelID: String?) -> RemoteHostEffortOption? {
         guard let rawModelID,
               let group = selectedBaseModelGroup(forModelID: rawModelID)
@@ -228,6 +263,21 @@ struct RemoteHostAgentCatalog: Codable, Equatable {
         let agentKey = agentID ?? agentName
         return "\(agentKey.lowercased())/\(baseModelID.lowercased())"
     }
+
+    private static func caseInsensitiveEquals(_ lhs: String?, _ rhs: String?) -> Bool {
+        guard let lhs, let rhs else { return false }
+        return lhs.caseInsensitiveCompare(rhs) == .orderedSame
+    }
+
+    private func normalizedString(_ raw: String?) -> String? {
+        let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+struct RemoteHostCompoundResolution: Equatable {
+    var modelID: String
+    var effort: String?
 }
 
 struct RemoteHostAgent: Codable, Equatable, Identifiable {
@@ -517,6 +567,13 @@ final class RemoteHostCatalog {
 
     func cachedCatalog(for hostID: String) -> RemoteHostAgentCatalog? {
         cachedEntry(for: hostID, at: now())?.catalog
+    }
+
+    func cachedNonDegradedCatalog(for hostID: String) -> RemoteHostAgentCatalog? {
+        guard let catalog = cachedEntry(for: hostID, at: now())?.catalog,
+              !catalog.isDegraded
+        else { return nil }
+        return catalog
     }
 
     func invalidate(hostID: String) {

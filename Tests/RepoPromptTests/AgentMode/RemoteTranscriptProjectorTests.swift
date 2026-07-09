@@ -156,6 +156,34 @@ final class RemoteTranscriptProjectorTests: XCTestCase {
         XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .running)
     }
 
+    func testProjectSnapshotParsesAgentReasoningEffort() {
+        let projector = RemoteTranscriptProjector(remoteSessionID: "remote-session-projector-effort")
+
+        XCTAssertEqual(projector.projectSnapshot(.object([
+            "status": .string("running"),
+            "agent": .object([
+                "id": .string("codexExec"),
+                "model": .string("gpt-5.4-mini"),
+                "reasoning_effort": .string("  high  ")
+            ])
+        ])).agentReasoningEffortRaw, "high")
+        XCTAssertNil(projector.projectSnapshot(.object([
+            "status": .string("running"),
+            "agent": .object([
+                "id": .string("codexExec"),
+                "model": .string("gpt-5.4-mini")
+            ])
+        ])).agentReasoningEffortRaw)
+        XCTAssertNil(projector.projectSnapshot(.object([
+            "status": .string("running"),
+            "agent": .object([
+                "id": .string("codexExec"),
+                "model": .string("gpt-5.4-mini"),
+                "reasoning_effort": .string("  \n\t ")
+            ])
+        ])).agentReasoningEffortRaw)
+    }
+
     private func project(xml: String) -> [AgentChatItem] {
         RemoteTranscriptProjector(remoteSessionID: "remote-session-projector-test")
             .projectGetLogResponse(.object([
