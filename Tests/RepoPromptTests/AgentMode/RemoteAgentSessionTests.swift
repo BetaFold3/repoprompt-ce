@@ -86,10 +86,12 @@ final class RemoteAgentSessionTests: XCTestCase {
         let meta = try XCTUnwrap(metadata.first)
         XCTAssertEqual(meta.remoteHostID, binding.hostID)
         XCTAssertEqual(meta.remoteHostName, binding.hostDisplayName)
+        XCTAssertEqual(meta.remoteSessionID, binding.remoteSessionID)
 
         let sidebarEntry = try XCTUnwrap(sidebar.entriesBySessionID[sessionID])
         XCTAssertEqual(sidebarEntry.remoteHostID, binding.hostID)
         XCTAssertEqual(sidebarEntry.remoteHostName, binding.hostDisplayName)
+        XCTAssertEqual(sidebarEntry.remoteSessionID, binding.remoteSessionID)
         XCTAssertEqual(sidebar.preferredSessionIDByTabID[tabID], sessionID)
     }
 
@@ -131,6 +133,104 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertFalse(record.matchesIndexedSessionMetadata(changedRecord))
     }
 
+    func testMetadataIndexRemoteSessionIDRoundTripsAcrossAllProjections() throws {
+        let session = try AgentSession(
+            id: XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000307")),
+            name: "Indexed Remote Session",
+            savedAt: Date(timeIntervalSinceReferenceDate: 60),
+            itemCount: 3,
+            remoteHost: makeBinding(remoteSessionID: "remote-session-indexed"),
+            autoEditEnabled: true
+        )
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-00000000-0000-0000-0000-000000000307.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: 321,
+            observedFileModificationDate: Date(timeIntervalSinceReferenceDate: 61)
+        )
+        let encoded = try JSONEncoder().encode(AgentSessionMetadataIndex(entries: [record]))
+        let decoded = try JSONDecoder().decode(AgentSessionMetadataIndex.self, from: encoded)
+        let decodedRecord = try XCTUnwrap(decoded.entries.first)
+
+        XCTAssertEqual(decodedRecord.remoteSessionID, "remote-session-indexed")
+        XCTAssertEqual(decodedRecord.sidebarEntry(tabID: UUID())?.remoteSessionID, "remote-session-indexed")
+        XCTAssertEqual(decodedRecord.agentSessionMeta().remoteSessionID, "remote-session-indexed")
+
+        var changedSession = session
+        changedSession.remoteHost?.remoteSessionID = "remote-session-recreated"
+        let changedRecord = AgentSessionMetadataRecord.record(
+            from: changedSession,
+            fileURL: fileURL,
+            observedFileSize: 321,
+            observedFileModificationDate: Date(timeIntervalSinceReferenceDate: 61)
+        )
+        XCTAssertFalse(record.matchesIndexedSessionMetadata(changedRecord))
+
+        var unstartedSession = session
+        unstartedSession.remoteHost?.remoteSessionID = "   "
+        let unstartedRecord = AgentSessionMetadataRecord.record(
+            from: unstartedSession,
+            fileURL: fileURL,
+            observedFileSize: 321,
+            observedFileModificationDate: Date(timeIntervalSinceReferenceDate: 61)
+        )
+        XCTAssertNil(unstartedRecord.remoteSessionID)
+    }
+
+    @MainActor
+    func testCoordinatorLocalSessionExistsChecksLiveAndPersistedRemoteSessionIDs() {
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in RemoteAgentSessionNoopCodexController() }
+        )
+        let workspace = WorkspaceModel(name: "Dedupe Workspace", repoPaths: ["/tmp/repo"])
+        let owner = AgentModeViewModel.SessionIndexOwner(workspaceID: workspace.id, activationEpoch: 1)
+        let indexedSessionID = UUID()
+        let indexedTabID = UUID()
+        let indexedEntry = AgentSessionIndexEntry(
+            id: indexedSessionID,
+            tabID: indexedTabID,
+            name: "Persisted Remote",
+            lastUserMessageAt: nil,
+            savedAt: Date(timeIntervalSinceReferenceDate: 70),
+            lastRunStateRaw: AgentSessionRunState.completed.rawValue,
+            itemCount: 1,
+            agentKindRaw: AgentProviderKind.codexExec.rawValue,
+            agentModelRaw: "codex",
+            agentReasoningEffortRaw: nil,
+            autoEditEnabled: true,
+            parentSessionID: nil,
+            hasUnknownConversationContent: false,
+            remoteHostID: "host-index",
+            remoteHostName: "Index Host",
+            remoteSessionID: "remote-index",
+            isMCPOriginated: false,
+            origin: .user,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )
+        viewModel.test_installSessionIndexSnapshot(
+            [indexedSessionID: indexedEntry],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+
+        let liveSession = AgentModeViewModel.TabSession(tabID: UUID())
+        liveSession.remoteHost = makeBinding(hostID: "host-live", remoteSessionID: "remote-live")
+        viewModel.test_installLiveSession(liveSession)
+
+        let coordinator = RemoteAgentModeCoordinator()
+        coordinator.attach(viewModel: viewModel)
+
+        XCTAssertTrue(coordinator.localSessionExists(hostID: "host-index", remoteSessionID: "remote-index"))
+        XCTAssertTrue(coordinator.localSessionExists(hostID: "host-live", remoteSessionID: "remote-live"))
+        XCTAssertFalse(coordinator.localSessionExists(hostID: "host-index", remoteSessionID: "remote-live"))
+        XCTAssertFalse(coordinator.localSessionExists(hostID: "host-live", remoteSessionID: "   "))
+    }
+
     func testLegacyMetadataIndexRecordsDecodeWithoutRemoteHostFields() throws {
         let payload = """
         {
@@ -158,8 +258,10 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         XCTAssertNil(record.remoteHostID)
         XCTAssertNil(record.remoteHostName)
+        XCTAssertNil(record.remoteSessionID)
         XCTAssertNil(record.agentSessionMeta().remoteHostID)
         XCTAssertNil(record.agentSessionMeta().remoteHostName)
+        XCTAssertNil(record.agentSessionMeta().remoteSessionID)
     }
 
     func testStartWithNewRemoteSessionResetsCountersAndAcceptsSeqOne() async throws {

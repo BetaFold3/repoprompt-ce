@@ -12,6 +12,7 @@ struct ManageWorkspacesView: View {
 
     @State private var workspaceBeingRenamed: WorkspaceModel?
     @State private var renameField: String = ""
+    @State private var renameRemoteHostID: String?
     @State private var showGlobalStorage: Bool = false
     @State private var searchText: String = ""
     @State private var showDuplicateCleanupConfirmation = false
@@ -474,6 +475,7 @@ struct ManageWorkspacesView: View {
                             onRename: {
                                 workspaceBeingRenamed = ws
                                 renameField = ws.name
+                                renameRemoteHostID = ws.defaultRemoteHostID
                             },
                             onToggleHidden: {
                                 toggleHiddenState(for: ws)
@@ -520,6 +522,10 @@ struct ManageWorkspacesView: View {
                     height: fontPreset.scaledMetric(28)
                 ))
             }
+
+            WorkspaceRunLocationPicker(
+                selectedHostID: $workspaceManager.creationDraft.defaultRemoteHostID
+            )
 
             if !workspaceManager.creationDraft.selectedRepoPaths.isEmpty {
                 Text("Folders: \(workspaceManager.creationDraft.selectedRepoPaths.joined(separator: ", "))")
@@ -585,6 +591,8 @@ struct ManageWorkspacesView: View {
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .frame(minWidth: fontPreset.scaledMetric(200))
 
+            WorkspaceRunLocationPicker(selectedHostID: $renameRemoteHostID)
+
             HStack {
                 Spacer()
                 Button("Cancel") {
@@ -594,8 +602,13 @@ struct ManageWorkspacesView: View {
                     let finalName = renameField.trimmingCharacters(in: .whitespaces)
                     guard !finalName.isEmpty else { return }
                     workspaceManager.renameWorkspace(workspace, newName: finalName)
+                    workspaceManager.setWorkspaceDefaultRemoteHost(
+                        workspace,
+                        hostID: renameRemoteHostID
+                    )
                     workspaceBeingRenamed = nil
                 }
+                .disabled(renameField.trimmingCharacters(in: .whitespaces).isEmpty)
             }
         }
         .padding()

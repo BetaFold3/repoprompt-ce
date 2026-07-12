@@ -310,6 +310,10 @@ struct RemoteCommandTranslator {
             throw RemoteCommandTranslatorError.missingSessionID(frame?.type ?? op)
         }
         for (key, value) in payload {
+            if op == "list_sessions", key == "workspace_name" {
+                // Gateway-only routing hint; the host validates workspace_id instead.
+                continue
+            }
             arguments[key] = value.mcpValue
         }
         if let resolvedWindowID, Self.sessionAddressedAgentManageOps.contains(op) || op == "list_agents" {
@@ -419,7 +423,9 @@ struct RemoteCommandTranslator {
         "agent",
         "state",
         "limit",
-        "parent_session_id"
+        "parent_session_id",
+        "workspace_id",
+        "workspace_name"
     ]
 
     private static let getLogPayloadKeys: Set<String> = [

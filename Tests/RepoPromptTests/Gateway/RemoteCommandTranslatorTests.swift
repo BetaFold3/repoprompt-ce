@@ -131,6 +131,33 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         }
     }
 
+    func testListSessionsWorkspaceSelectorsRouteWithResolvedWindowAndStripName() throws {
+        let workspaceID = "33333333-3333-3333-3333-333333333333"
+        let frame = RemoteClientFrame(
+            type: "list_sessions",
+            payload: .object([
+                "workspace_id": .string(workspaceID),
+                "workspace_name": .string("Workspace A")
+            ])
+        )
+
+        for bindingState in [
+            RemoteGatewayBindingState.bound,
+            RemoteGatewayBindingState.bindingRequired("bind first")
+        ] {
+            let call = try RemoteCommandTranslator(bindingState: bindingState).translate(
+                frame,
+                resolvedWindowID: 7
+            )
+
+            XCTAssertEqual(call.toolName, "agent_manage")
+            XCTAssertEqual(call.arguments["op"], .string("list_sessions"))
+            XCTAssertEqual(call.arguments["workspace_id"], .string(workspaceID))
+            XCTAssertNil(call.arguments["workspace_name"])
+            XCTAssertEqual(call.arguments["_windowID"], .int(7))
+        }
+    }
+
     func testParentSessionIDIsRejectedOutsideListSessions() throws {
         let sid = "11111111-1111-1111-1111-111111111111"
         let parentID = "22222222-2222-2222-2222-222222222222"

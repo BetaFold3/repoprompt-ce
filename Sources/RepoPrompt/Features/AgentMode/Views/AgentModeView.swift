@@ -2730,6 +2730,18 @@ struct AgentModeChatDetailView: View {
         let ownerTabID = transcriptSnapshot.presentation.tabID ?? transcriptSnapshot.currentTabID ?? currentTabID
         let isRemoteSession = ownerTabID.flatMap { agentModeVM.sessions[$0]?.remoteHost } != nil
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
+        let runLocallyInsteadAction: (() -> Void)? = if let ownerTabID,
+                                                        agentModeVM.shouldOfferRunLocallyInstead(
+                                                            tabID: ownerTabID,
+                                                            itemID: item.id
+                                                        )
+        {
+            { [weak agentModeVM] in
+                agentModeVM?.runLocallyInsteadAfterRemoteFailure(tabID: ownerTabID)
+            }
+        } else {
+            nil
+        }
         return AgentMessageBubble(
             item: item,
             isMostRecentEditBubble: item.id == renderContext.mostRecentEditID,
@@ -2758,7 +2770,8 @@ struct AgentModeChatDetailView: View {
                 .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
             showRunScopedToolCancel: showCancel,
             cancelActiveToolsAction: cancelAction,
-            codexManagedLoginAction: codexManagedLoginAction
+            codexManagedLoginAction: codexManagedLoginAction,
+            runLocallyInsteadAction: runLocallyInsteadAction
         )
         .id(item.id)
         .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)

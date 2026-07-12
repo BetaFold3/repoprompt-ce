@@ -600,6 +600,7 @@ final class AgentModeViewModel: ObservableObject {
     let remoteCoordinator: RemoteAgentModeCoordinator
     let remoteHostRegistry: RemoteHostRegistry
     let remoteHostCatalog: RemoteHostCatalog
+    var remoteRunLocallyFallbackItemIDByTabID: [UUID: UUID] = [:]
     let providerBindingService: AgentModeProviderBindingService
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
     private let shouldManageCodexTooling: Bool
@@ -1217,6 +1218,85 @@ final class AgentModeViewModel: ObservableObject {
         return childSession
     }
 
+    @discardableResult
+    func materializeRemoteWorkspaceSession(
+        descriptor: RemoteAgentSessionDescriptor,
+        hostRecord: PairedHostRecord
+    ) async -> TabSession? {
+        let remoteSessionID = descriptor.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let localSessionID = UUID(uuidString: remoteSessionID),
+              !remoteCoordinator.localSessionExists(hostID: hostRecord.id, remoteSessionID: remoteSessionID),
+              let promptManager,
+              let createdTab = await promptManager.createBackgroundComposeTab(
+                  strategy: .blank,
+                  name: Self.remoteChildSessionName(descriptor.name)
+              )
+        else { return nil }
+
+        let session = session(for: createdTab.id)
+        guard installPersistentSessionBinding(
+            sessionID: localSessionID,
+            on: session,
+            updateWorkspaceMetadata: true,
+            invalidateAsyncWork: true
+        )?.sessionID == localSessionID else {
+            await promptManager.closeComposeTab(createdTab.id)
+            return nil
+        }
+
+        let sessionName = Self.remoteChildSessionName(descriptor.name)
+        renameSession(tabID: session.tabID, to: sessionName)
+        session.remoteHost = AgentSessionRemoteHostBinding(
+            hostID: hostRecord.id,
+            hostDisplayName: hostRecord.displayName,
+            remoteSessionID: remoteSessionID
+        )
+        session.parentSessionID = nil
+        session.runState = Self.remoteChildRunState(from: descriptor.stateRaw)
+        if let agentKindRaw = descriptor.agentKindRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let agentKind = AgentProviderKind(rawValue: agentKindRaw)
+        {
+            session.selectedAgent = agentKind
+        }
+        if let modelRaw = descriptor.agentModelRaw?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !modelRaw.isEmpty
+        {
+            session.selectedModelRaw = modelRaw
+        }
+        // Deliberately preserve the new tab's local `.user` origin. Host provenance
+        // is display-only metadata from the catalog, not local session ownership.
+        session.hasLoadedPersistedState = true
+        session.isDirty = true
+        session.lastActivityAt = descriptor.lastModified ?? Date()
+
+        upsertSessionIndex(
+            sessionID: localSessionID,
+            tabID: session.tabID,
+            name: sessionName,
+            lastUserMessageAt: nil,
+            savedAt: session.lastActivityAt,
+            lastRunStateRaw: session.runState.rawValue,
+            itemCount: descriptor.itemCount ?? 0,
+            agentKindRaw: session.selectedAgent.rawValue,
+            agentModelRaw: session.selectedModelRaw,
+            agentReasoningEffortRaw: session.selectedReasoningEffortRaw,
+            autoEditEnabled: session.autoEditEnabled,
+            parentSessionID: nil,
+            isMCPOriginated: false,
+            origin: session.origin,
+            worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
+            remoteHostID: hostRecord.id,
+            remoteHostName: hostRecord.displayName,
+            remoteSessionID: remoteSessionID,
+            activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
+        )
+        updateBindingsFromSession(session)
+        requestUIRefresh(tabID: session.tabID, urgent: false)
+        scheduleSave(for: session.tabID)
+        await promptManager.switchComposeTab(session.tabID)
+        return session
+    }
+
     private func configureMaterializedRemoteChildSession(
         _ session: TabSession,
         sessionID: UUID,
@@ -1277,6 +1357,7 @@ final class AgentModeViewModel: ObservableObject {
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
             remoteHostID: parentRemoteHost.hostID,
             remoteHostName: parentRemoteHost.hostDisplayName,
+            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
         )
         updateBindingsFromSession(session)
@@ -1920,7 +2001,8 @@ final class AgentModeViewModel: ObservableObject {
             testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
             testUsesProductionAgentDefaultsAndModelPolling: Bool = false,
             remoteHostRegistry: RemoteHostRegistry = .shared,
-            remoteHostCatalog: RemoteHostCatalog = .shared
+            remoteHostCatalog: RemoteHostCatalog = .shared,
+            testRemoteCoordinator: RemoteAgentModeCoordinator? = nil
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -2017,7 +2099,7 @@ final class AgentModeViewModel: ObservableObject {
                     testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
                 }
             )
-            remoteCoordinator = RemoteAgentModeCoordinator()
+            remoteCoordinator = testRemoteCoordinator ?? RemoteAgentModeCoordinator()
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
             workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
                 codexCoordinator: codexCoordinator,
@@ -3042,6 +3124,7 @@ final class AgentModeViewModel: ObservableObject {
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
         pendingAssistantPresentationByTabID.removeAll()
+        remoteRunLocallyFallbackItemIDByTabID.removeAll()
         workspaceSwitchProvider.cancelAllBackgroundCleanup()
         cancelSessionIndexRefresh(releaseFrozenOrder: true)
         let tabIDs = Array(sessions.keys)
@@ -6337,6 +6420,7 @@ final class AgentModeViewModel: ObservableObject {
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 remoteHostID: existingEntry.remoteHostID ?? session.remoteHost?.hostID,
                 remoteHostName: existingEntry.remoteHostName ?? session.remoteHost?.hostDisplayName,
+                remoteSessionID: existingEntry.remoteSessionID ?? session.remoteHost?.normalizedRemoteSessionID,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
                 origin: AgentSessionOrigin.merged(existingEntry.origin, session.origin),
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
@@ -6360,7 +6444,10 @@ final class AgentModeViewModel: ObservableObject {
             autoEditEnabled: session.autoEditEnabled,
             parentSessionID: parentSessionID,
             isMCPOriginated: session.isMCPOriginated,
-            origin: session.origin
+            origin: session.origin,
+            remoteHostID: session.remoteHost?.hostID,
+            remoteHostName: session.remoteHost?.hostDisplayName,
+            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID
         )
     }
 
@@ -10146,6 +10233,7 @@ final class AgentModeViewModel: ObservableObject {
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
         remoteHostID: String? = nil,
         remoteHostName: String? = nil,
+        remoteSessionID: String? = nil,
         activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = []
     ) {
         applyLocalSessionIndexUpsert(AgentSessionIndexEntry(
@@ -10164,6 +10252,7 @@ final class AgentModeViewModel: ObservableObject {
             hasUnknownConversationContent: hasUnknownConversationContent,
             remoteHostID: remoteHostID,
             remoteHostName: remoteHostName,
+            remoteSessionID: remoteSessionID,
             isMCPOriginated: isMCPOriginated,
             origin: origin,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -10990,6 +11079,9 @@ final class AgentModeViewModel: ObservableObject {
         // going away so we don't leave dangling entries referring to dead IDs.
         cleanupSidebarRunAttention(tabIDs: tabIDs)
         for tabID in tabIDs {
+            remoteRunLocallyFallbackItemIDByTabID.removeValue(forKey: tabID)
+        }
+        for tabID in tabIDs {
             let boundID = boundSessionID(for: tabID)
             if let session = sessions[tabID] {
                 removePendingUIRefresh(for: tabID)
@@ -11459,6 +11551,7 @@ final class AgentModeViewModel: ObservableObject {
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
                 remoteHostID: agentSession.remoteHost?.hostID,
                 remoteHostName: agentSession.remoteHost?.hostDisplayName,
+                remoteSessionID: agentSession.remoteHost?.normalizedRemoteSessionID,
                 activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries
             )
             #if DEBUG
@@ -11769,9 +11862,14 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
             sourceSnapshot.applySessionSettings(to: destinationSession)
-            if !pendingState.isEmpty {
-                installPendingUserTurnState(pendingState, on: destinationSession)
-            }
+            // V1-3: install unconditionally so the destination's remote-host state
+            // always matches what the source's run-location pill showed at send
+            // time. An empty pending state (remoteHost == nil) reconciles away
+            // the unconditional `createAndActivateSessionTab()` workspace-default
+            // auto-bind after an explicit "This Mac" selection on the source;
+            // otherwise the post-prepare `pendingUserTurnState == pendingState`
+            // guard below can never be satisfied and the first send blocks.
+            installPendingUserTurnState(pendingState, on: destinationSession)
             if let blocked = preflightInitialUserTurn(text: text, session: destinationSession) {
                 clearPendingUserTurnState(on: destinationSession)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
@@ -11817,6 +11915,21 @@ final class AgentModeViewModel: ObservableObject {
                 return result
             }
             clearPendingUserTurnState(on: sourceSession)
+            // V1-3: the clear wiped the still-sessionless source tab's remote-run
+            // intent while leaving its pinned host-default model raw behind.
+            // Re-apply the binding the pill actually showed at send time so the
+            // source stays coherent (bound + pinned) for the next first-send;
+            // an explicit "This Mac" source (pendingState.remoteHost == nil)
+            // stays unbound. The re-apply only fails when the host was revoked
+            // or removed mid-flight (the user turn landed on the destination,
+            // so hasSubmittedTurn cannot trip here) — in that case drop the
+            // leftover pinned sentinel so the unbound source stays coherent.
+            if let boundHostID = pendingState.remoteHost?.hostID,
+               !applyHostRunLocation(hostID: boundHostID, to: sourceSession),
+               sourceSession.selectedModelRaw == RemoteHostAgentCatalog.hostDefaultModelID
+            {
+                sourceSession.selectedModelRaw = defaultModelRaw(for: sourceSession.selectedAgent)
+            }
             clearComposerDraftIfUnchanged(for: claim)
             return result
         }
@@ -12283,7 +12396,7 @@ final class AgentModeViewModel: ObservableObject {
         return true
     }
 
-    private func failRemoteSend(
+    func failRemoteSend(
         session: TabSession,
         tabID: UUID,
         optimisticUserItemID: UUID,
@@ -12292,9 +12405,40 @@ final class AgentModeViewModel: ObservableObject {
     ) {
         session.pendingRemoteOptimisticUserItemIDs.remove(optimisticUserItemID)
         session.runState = .failed
-        session.appendItem(.error("\(prefix): \(RemoteAgentModeCoordinator.describe(error))"))
+        session.setRunningStatus(nil, source: nil)
+        let description = RemoteAgentModeCoordinator.describe(
+            error,
+            workspaceName: workspaceManager?.activeWorkspace?.name,
+            hostName: session.remoteHost?.hostDisplayName
+        )
+        let text = "\(prefix): \(description)"
+        let commandCode = (error as? RemoteClientError)?.commandError?.code ?? ""
+        let usesSystemPresentation = Self.remoteFailureOffersLocalFallback(error)
+            || ["workspace_not_open", "workspace_mismatch"]
+            .contains(commandCode)
+        let item = usesSystemPresentation
+            ? AgentChatItem.system(text, sequenceIndex: session.nextSequenceIndex)
+            : AgentChatItem.error(text, sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(item)
+        if Self.remoteFailureOffersLocalFallback(error) {
+            remoteRunLocallyFallbackItemIDByTabID[tabID] = item.id
+        } else {
+            remoteRunLocallyFallbackItemIDByTabID.removeValue(forKey: tabID)
+        }
         requestUIRefresh(tabID: tabID, urgent: true)
         scheduleSave(for: tabID)
+    }
+
+    private static func remoteFailureOffersLocalFallback(_ error: Error) -> Bool {
+        guard let remoteError = error as? RemoteClientError else { return false }
+        switch remoteError {
+        case .hostNotFound, .hostRevoked, .missingDeviceKey, .timeout, .transport, .connectionClosed:
+            return true
+        case .security, .invalidTicket, .protocolViolation, .rateLimited, .revoked,
+             .bindingRequired, .ambiguousStartTarget, .inDoubt, .insufficientScope,
+             .sessionExpired, .interactionAlreadyResolved, .authentication, .command:
+            return false
+        }
     }
 
     func selectRemoteStartWindow(_ option: RemoteStartWindowOption) {
@@ -12541,6 +12685,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         if session.remoteHost != nil {
+            remoteRunLocallyFallbackItemIDByTabID.removeValue(forKey: tabID)
             session.pendingRemoteOptimisticUserItemIDs.insert(userItem.id)
             let shouldStartRemote = Self.shouldStartRemoteTurn(
                 runState: session.runState,
@@ -16527,6 +16672,10 @@ final class AgentModeViewModel: ObservableObject {
         guard let tabID = currentTabID else { return nil }
         let session = session(for: tabID)
         markSessionAsFreshlyCreated(session)
+        if applyWorkspaceDefaultRunLocationIfNeeded(to: session) {
+            session.isDirty = true
+            scheduleSave(for: tabID)
+        }
         invalidateSidebarRestoreOrdering()
         updateBindingsFromSession(session)
         return tabID

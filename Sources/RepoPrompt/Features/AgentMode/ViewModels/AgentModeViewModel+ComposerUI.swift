@@ -64,7 +64,24 @@ extension AgentModeViewModel {
 
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
         guard let tabID else { return nil }
-        let resolvedSession = session ?? self.session(for: tabID)
+        let existingSession = session ?? sessions[tabID]
+        let resolvedSession = existingSession ?? self.session(for: tabID)
+        // V1-3: the default tab of a fresh workspace never passes through
+        // `createAndActivateSessionTab()` — its session materializes lazily
+        // right here on the first composer sync. Apply the workspace-default
+        // run location exactly once at that creation so the run-location pill
+        // and the first-send snapshot carry the host binding + pinned model.
+        // One-shot: an existing session is never re-bound, so an explicit
+        // "This Mac" selection sticks. Hydrated sessions (persistent binding
+        // installed at creation → activeAgentSessionID != nil) and MCP flows
+        // (ensureSessionReady / mcpResolveOrCreateSessionTarget never call
+        // this composer seam) keep their no-auto-bind behavior.
+        if existingSession == nil,
+           resolvedSession.activeAgentSessionID == nil,
+           isEligibleForInitialStartLocation(tabID: tabID, session: resolvedSession)
+        {
+            applyWorkspaceDefaultRunLocationIfNeeded(to: resolvedSession)
+        }
         let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
         if workspaceSwitchInFlight, (expectedInitialStartLocation ?? .local) == .local {
             return nil

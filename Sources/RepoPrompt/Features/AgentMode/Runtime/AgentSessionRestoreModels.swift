@@ -16,6 +16,7 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var hasUnknownConversationContent: Bool
     var remoteHostID: String?
     var remoteHostName: String?
+    var remoteSessionID: String?
     var isMCPOriginated: Bool
     /// Session provenance (plan §6.4); `nil` for entries built from legacy
     /// records that only carried `isMCPOriginated`.

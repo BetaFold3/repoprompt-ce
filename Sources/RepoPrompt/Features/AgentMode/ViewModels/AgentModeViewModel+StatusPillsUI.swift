@@ -93,6 +93,30 @@ extension AgentModeViewModel {
         return .host(hostID: remoteHost.hostID)
     }
 
+    func shouldOfferRunLocallyInstead(tabID: UUID?, itemID: UUID) -> Bool {
+        guard let tabID else { return false }
+        return remoteRunLocallyFallbackItemIDByTabID[tabID] == itemID
+            && canRunLocallyAfterRemoteFailure(tabID: tabID)
+    }
+
+    func runLocallyInsteadAfterRemoteFailure(tabID: UUID) {
+        guard canRunLocallyAfterRemoteFailure(tabID: tabID) else { return }
+        selectRunLocation(.thisMac, for: tabID)
+    }
+
+    private func canRunLocallyAfterRemoteFailure(tabID: UUID) -> Bool {
+        guard remoteRunLocallyFallbackItemIDByTabID[tabID] != nil,
+              let session = sessions[tabID],
+              let remoteHost = session.remoteHost
+        else { return false }
+        // Offer the local fallback only for failed INITIAL starts (no host
+        // session ever adopted). After a failed steer the adopted host session
+        // may still be executing; falling back locally would stop/unbind while
+        // the host run continues (dual execution) and the retained
+        // remoteSessionID would hide the orphaned host session from pickup.
+        return remoteHost.normalizedRemoteSessionID == nil && session.runState == .failed
+    }
+
     func isEligibleForInitialRunLocation(tabID: UUID, session: TabSession?) -> Bool {
         isEligibleForInitialStartLocation(tabID: tabID, session: session)
     }
@@ -234,10 +258,51 @@ extension AgentModeViewModel {
         syncStatusPillsUIState()
     }
 
+    private func hasSubmittedTurn(_ session: TabSession) -> Bool {
+        session.hasSentFirstMessage
+            || session.items.contains { $0.kind == .user }
+            || session.transcript.turns.contains { $0.request != nil }
+    }
+
+    @discardableResult
+    func applyHostRunLocation(hostID: String, to session: TabSession) -> Bool {
+        guard session.remoteHost == nil,
+              !hasSubmittedTurn(session),
+              let host = try? remoteHostRegistry.host(id: hostID),
+              !host.isRevokedByHost
+        else { return false }
+
+        session.remoteHost = AgentSessionRemoteHostBinding(
+            hostID: host.id,
+            hostDisplayName: host.displayName,
+            remoteSessionID: ""
+        )
+        session.pendingInitialStartLocation = .local
+        session.selectedModelRaw = RemoteHostAgentCatalog.hostDefaultModelID
+        if session.tabID == currentTabID {
+            setSelectedModelRawDuringStateRestore(RemoteHostAgentCatalog.hostDefaultModelID)
+        }
+        loadRemoteHostCatalogIfNeeded(hostID: host.id)
+        return true
+    }
+
+    @discardableResult
+    func applyWorkspaceDefaultRunLocationIfNeeded(
+        to session: TabSession,
+        workspace: WorkspaceModel? = nil
+    ) -> Bool {
+        guard let hostID = (workspace ?? workspaceManager?.activeWorkspace)?.defaultRemoteHostID else {
+            return false
+        }
+        return applyHostRunLocation(hostID: hostID, to: session)
+    }
+
     func selectRunLocation(_ selection: AgentRunLocation, for tabID: UUID) {
+        let isRemoteFailureLocalFallback = selection == .thisMac
+            && canRunLocallyAfterRemoteFailure(tabID: tabID)
         guard tabID == currentTabID,
               let props = runLocationProps(tabID: tabID),
-              props.isEnabled,
+              props.isEnabled || isRemoteFailureLocalFallback,
               props.selection != selection
         else { return }
         let session = session(for: tabID)
@@ -247,6 +312,7 @@ extension AgentModeViewModel {
                 remoteCoordinator.stop(tabID: tabID)
             }
             session.remoteHost = nil
+            remoteRunLocallyFallbackItemIDByTabID.removeValue(forKey: tabID)
             if session.selectedModelRaw == RemoteHostAgentCatalog.hostDefaultModelID {
                 let fallback = defaultModelRaw(for: session.selectedAgent)
                 session.selectedModelRaw = fallback
@@ -255,18 +321,15 @@ extension AgentModeViewModel {
                 }
             }
         case let .host(hostID):
-            guard let host = try? remoteHostRegistry.host(id: hostID) else { return }
-            session.remoteHost = AgentSessionRemoteHostBinding(
-                hostID: host.id,
-                hostDisplayName: host.displayName,
-                remoteSessionID: ""
-            )
-            session.pendingInitialStartLocation = .local
-            session.selectedModelRaw = RemoteHostAgentCatalog.hostDefaultModelID
-            if tabID == currentTabID {
-                setSelectedModelRawDuringStateRestore(RemoteHostAgentCatalog.hostDefaultModelID)
+            guard !hasSubmittedTurn(session) else { return }
+            if session.remoteHost != nil {
+                guard let host = try? remoteHostRegistry.host(id: hostID),
+                      !host.isRevokedByHost
+                else { return }
+                remoteCoordinator.stop(tabID: tabID)
+                session.remoteHost = nil
             }
-            loadRemoteHostCatalogIfNeeded(hostID: host.id)
+            guard applyHostRunLocation(hostID: hostID, to: session) else { return }
         }
         session.isDirty = true
         scheduleSave(for: tabID)

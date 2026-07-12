@@ -206,11 +206,42 @@ struct AgentManageMCPToolService {
         return fallback?.rawValue
     }
 
+    /// Host-generated `workspace_mismatch` failure message for workspace-scoped
+    /// `list_sessions`. The gateway has no structured error channel from app
+    /// tools, so `RemoteGatewayRuntimeError.code` normalizes this by sniffing
+    /// the `workspace_mismatch` marker in the message — keep the
+    /// `workspace_mismatch: ` prefix stable. Locked end-to-end by
+    /// `GatewayRuntimeBindingTests.testWorkspaceScopedListSessionsNormalizesRealHostWorkspaceMismatchMessage`.
+    /// (`AgentRunMCPToolService`'s start-path variant carries the same prefix
+    /// with an extra remediation sentence and is not derived from this helper.)
+    nonisolated static func workspaceMismatchMessage(
+        activeWorkspaceName: String,
+        activeWorkspaceID: UUID,
+        requestedWorkspaceID: UUID
+    ) -> String {
+        "workspace_mismatch: the target window's active workspace is '\(activeWorkspaceName)' (\(activeWorkspaceID.uuidString)), not \(requestedWorkspaceID.uuidString)."
+    }
+
     private func executeListSessions(args: [String: Value]) async throws -> Value {
         let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.list_sessions.")
+        }
+        if let workspaceIDValue = args["workspace_id"] {
+            let requestedWorkspaceID = try requireNonEmptyString(workspaceIDValue, name: "workspace_id")
+            guard let requestedUUID = UUID(uuidString: requestedWorkspaceID) else {
+                throw MCPError.invalidParams("workspace_id must be a workspace UUID.")
+            }
+            guard workspace.id == requestedUUID else {
+                throw MCPError.invalidParams(
+                    Self.workspaceMismatchMessage(
+                        activeWorkspaceName: workspace.name,
+                        activeWorkspaceID: workspace.id,
+                        requestedWorkspaceID: requestedUUID
+                    )
+                )
+            }
         }
         let agentModeVM = targetWindow.agentModeViewModel
         let explicitParentSessionID: UUID?
@@ -318,7 +349,11 @@ struct AgentManageMCPToolService {
         }
 
         return .object([
-            "sessions": .array(Array(filtered.prefix(limit)).map(Value.object))
+            "sessions": .array(Array(filtered.prefix(limit)).map(Value.object)),
+            "workspace": .object([
+                "id": .string(workspace.id.uuidString),
+                "name": .string(workspace.name)
+            ])
         ])
     }
 

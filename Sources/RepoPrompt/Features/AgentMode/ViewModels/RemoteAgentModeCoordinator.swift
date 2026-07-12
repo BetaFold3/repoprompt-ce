@@ -19,6 +19,11 @@ final class RemoteAgentModeCoordinator {
         var hostBinding: AgentSessionRemoteHostBinding
     }
 
+    private struct WorkspacePickupKey: Hashable {
+        var hostID: String
+        var remoteSessionID: String
+    }
+
     struct RestorableInteractionState {
         let interactionID: String
         let priorRunState: AgentSessionRunState
@@ -37,6 +42,7 @@ final class RemoteAgentModeCoordinator {
     private weak var viewModel: AgentModeViewModel?
     private let connectionManagerProvider: @MainActor () -> RemoteHostConnectionManager
     private let catalogProvider: @MainActor (String) -> RemoteHostAgentCatalog?
+    private let workspaceSessionCatalogStore: any RemoteWorkspaceSessionCatalogStoring
     private var controllersByTabID: [UUID: RemoteAgentSessionController] = [:]
     private var eventTasksByTabID: [UUID: Task<Void, Never>] = [:]
     private var hostIDByTabID: [UUID: String] = [:]
@@ -52,6 +58,7 @@ final class RemoteAgentModeCoordinator {
     private var activeRunStateChildDiscoveryKeys: Set<String> = []
     private var discoveryKeyByTabID: [UUID: String] = [:]
     private var reportedChildMaterializationFailuresByDiscoveryKey: [String: Set<String>] = [:]
+    private var workspacePickupInFlightKeys: Set<WorkspacePickupKey> = []
     private var stashedAskUserStateByTabID: [UUID: StashedAskUserState] = [:]
     private var childDiscoveryPendingContextsByKey: [String: RemoteChildDiscoveryContext] = [:]
     private var childDiscoveryTasksByKey: [String: Task<Void, Never>] = [:]
@@ -59,6 +66,7 @@ final class RemoteAgentModeCoordinator {
     private let childDiscoveryDebounceInterval: TimeInterval
     #if DEBUG
         private var materializedRemoteChildAttachHandler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
+        private var materializedRemoteWorkspaceAttachHandler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
         private var childDiscoveryRequestObserver: ((UUID, Bool) -> Void)?
         private var syntheticSettlementRevertScanObserver: ((UUID) -> Void)?
     #endif
@@ -66,10 +74,12 @@ final class RemoteAgentModeCoordinator {
     init(
         connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared },
         catalogProvider: @escaping @MainActor (String) -> RemoteHostAgentCatalog? = { RemoteHostCatalog.shared.cachedNonDegradedCatalog(for: $0) },
+        workspaceSessionCatalogStore: (any RemoteWorkspaceSessionCatalogStoring)? = nil,
         childDiscoveryDebounceInterval: TimeInterval = 3
     ) {
         self.connectionManagerProvider = connectionManagerProvider
         self.catalogProvider = catalogProvider
+        self.workspaceSessionCatalogStore = workspaceSessionCatalogStore ?? RemoteWorkspaceSessionCatalogStore.shared
         self.childDiscoveryDebounceInterval = childDiscoveryDebounceInterval
     }
 
@@ -126,6 +136,9 @@ final class RemoteAgentModeCoordinator {
             binding.remoteSessionID = remoteSessionID
             session.remoteHost = binding
             updateSessionIndex(for: session)
+            Task { @MainActor [weak self] in
+                await self?.refreshWorkspaceSessionCatalogAfterSuccessfulStart(hostID: binding.hostID)
+            }
         }
     }
 
@@ -299,6 +312,7 @@ final class RemoteAgentModeCoordinator {
 
     private func deliver(_ state: RemoteHostConnection.State, hostID: String) async {
         if case .connected = state {
+            workspaceSessionCatalogStore.invalidate(hostID: hostID)
             viewModel?.refreshRemoteHostCatalogAfterConnect(hostID: hostID)
         }
         let controllers = controllersByTabID.compactMap { tabID, controller in
@@ -804,10 +818,112 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
+    func cachedWorkspaceSessionCatalogState(
+        hostID: String,
+        clientWorkspaceID: UUID
+    ) -> RemoteWorkspaceSessionCatalogStore.State? {
+        workspaceSessionCatalogStore.cachedState(hostID: hostID, clientWorkspaceID: clientWorkspaceID)
+    }
+
+    func fetchWorkspaceSessionCatalog(
+        hostID: String,
+        clientWorkspaceID: UUID,
+        workspaceName: String,
+        forceRefresh: Bool
+    ) async -> RemoteWorkspaceSessionCatalogStore.State {
+        await workspaceSessionCatalogStore.fetch(
+            hostID: hostID,
+            clientWorkspaceID: clientWorkspaceID,
+            workspaceName: workspaceName,
+            forceRefresh: forceRefresh
+        )
+    }
+
+    func invalidateWorkspaceSessionCatalog(hostID: String, clientWorkspaceID: UUID) {
+        workspaceSessionCatalogStore.invalidate(hostID: hostID, clientWorkspaceID: clientWorkspaceID)
+    }
+
+    /// Materializes a client projection of a host-authoritative workspace session.
+    /// The host remains the execution authority; v1 intentionally adds no locking.
+    @discardableResult
+    func pickUpWorkspaceSession(
+        descriptor: RemoteAgentSessionDescriptor,
+        hostRecord: PairedHostRecord
+    ) async -> AgentModeViewModel.TabSession? {
+        let remoteSessionID = descriptor.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !remoteSessionID.isEmpty else { return nil }
+        let key = WorkspacePickupKey(hostID: hostRecord.id, remoteSessionID: remoteSessionID)
+        guard !workspacePickupInFlightKeys.contains(key),
+              !localSessionExists(hostID: hostRecord.id, remoteSessionID: remoteSessionID)
+        else { return nil }
+
+        workspacePickupInFlightKeys.insert(key)
+        defer { workspacePickupInFlightKeys.remove(key) }
+        guard let viewModel,
+              let session = await viewModel.materializeRemoteWorkspaceSession(
+                  descriptor: descriptor,
+                  hostRecord: hostRecord
+              )
+        else { return nil }
+
+        if let adoptedName = descriptor.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !adoptedName.isEmpty
+        {
+            lastAdoptedHostNameByTabID[session.tabID] = AgentSession.validatedName(adoptedName)
+        }
+        do {
+            try await attachMaterializedRemoteWorkspaceSession(session)
+        } catch {
+            let description = Self.describe(
+                error,
+                workspaceName: viewModel.remoteWorkspaceCatalogContext(hostID: hostRecord.id)?.workspaceName,
+                hostName: hostRecord.displayName
+            )
+            appendSystemMessage(
+                "Remote workspace session attach failed: \(description)",
+                tabID: session.tabID
+            )
+        }
+        return session
+    }
+
+    private func attachMaterializedRemoteWorkspaceSession(_ session: AgentModeViewModel.TabSession) async throws {
+        #if DEBUG
+            if let materializedRemoteWorkspaceAttachHandler {
+                try await materializedRemoteWorkspaceAttachHandler(session)
+                return
+            }
+        #endif
+        let controller = try controller(for: session)
+        try await controller.attachAndCatchUp()
+    }
+
+    private func refreshWorkspaceSessionCatalogAfterSuccessfulStart(hostID: String) async {
+        guard let context = viewModel?.remoteWorkspaceCatalogContext(hostID: hostID) else { return }
+        _ = await fetchWorkspaceSessionCatalog(
+            hostID: hostID,
+            clientWorkspaceID: context.clientWorkspaceID,
+            workspaceName: context.workspaceName,
+            forceRefresh: true
+        )
+        viewModel?.publishRemoteWorkspaceSidebarChange()
+    }
+
+    func localSessionExists(hostID: String, remoteSessionID: String) -> Bool {
+        let normalizedRemoteSessionID = remoteSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedRemoteSessionID.isEmpty else { return false }
+        if isRemoteSessionMaterialized(hostID: hostID, remoteSessionID: normalizedRemoteSessionID) {
+            return true
+        }
+        return viewModel?.ownerValidatedSessionIndex.values.contains { entry in
+            entry.remoteHostID == hostID && entry.remoteSessionID == normalizedRemoteSessionID
+        } == true
+    }
+
     private func isRemoteSessionMaterialized(hostID: String, remoteSessionID: String) -> Bool {
         viewModel?.sessions.values.contains { session in
             session.remoteHost?.hostID == hostID
-                && session.remoteHost?.remoteSessionID == remoteSessionID
+                && session.remoteHost?.normalizedRemoteSessionID == remoteSessionID
         } == true
     }
 
@@ -1211,6 +1327,7 @@ final class RemoteAgentModeCoordinator {
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
             remoteHostID: remoteHost.hostID,
             remoteHostName: remoteHost.hostDisplayName,
+            remoteSessionID: remoteHost.normalizedRemoteSessionID,
             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
         )
     }
@@ -1257,6 +1374,10 @@ final class RemoteAgentModeCoordinator {
     }
 
     #if DEBUG
+        func test_deliverConnectionState(_ state: RemoteHostConnection.State, hostID: String) async {
+            await deliver(state, hostID: hostID)
+        }
+
         func test_applyChannel(_ state: RemoteChannelState, to session: AgentModeViewModel.TabSession) {
             applyChannel(state, to: session)
         }
@@ -1371,6 +1492,16 @@ final class RemoteAgentModeCoordinator {
             materializedRemoteChildAttachHandler = handler
         }
 
+        func test_setMaterializedRemoteWorkspaceAttachHandler(
+            _ handler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
+        ) {
+            materializedRemoteWorkspaceAttachHandler = handler
+        }
+
+        func test_workspacePickupInFlightCount() -> Int {
+            workspacePickupInFlightKeys.count
+        }
+
         func test_setChildDiscoveryRequestObserver(_ observer: ((UUID, Bool) -> Void)?) {
             childDiscoveryRequestObserver = observer
         }
@@ -1389,13 +1520,47 @@ final class RemoteAgentModeCoordinator {
         }
     #endif
 
-    static func describe(_ error: Error) -> String {
-        if (error as? RemoteClientError)?.commandError?.code == "binding_required" {
-            return "The host couldn't route this message to its window. Try again — if it keeps failing, the session's window may have been closed on the host."
+    static func describe(
+        _ error: Error,
+        workspaceName: String? = nil,
+        hostName: String? = nil
+    ) -> String {
+        if let commandError = (error as? RemoteClientError)?.commandError {
+            if commandError.code == "binding_required" {
+                return "The host couldn't route this message to its window. Try again — if it keeps failing, the session's window may have been closed on the host."
+            }
+            if ["workspace_not_open", "workspace_mismatch"].contains(commandError.code) {
+                let details = commandError.details?.objectValue
+                let resolvedWorkspaceName = normalizedFriendlyName(workspaceName)
+                    ?? normalizedFriendlyName(details?["workspace_name"]?.stringValue)
+                    ?? (
+                        commandError.code == "workspace_not_open"
+                            ? quotedWorkspaceName(in: commandError.message)
+                            : nil
+                    )
+                let resolvedHostName = normalizedFriendlyName(hostName)
+                    ?? normalizedFriendlyName(details?["host_name"]?.stringValue)
+                let hostPhrase = resolvedHostName ?? "the host"
+                if let resolvedWorkspaceName {
+                    return "Workspace '\(resolvedWorkspaceName)' is not open on \(hostPhrase). Open it there and try again."
+                }
+                return "The requested workspace is not open on \(hostPhrase). Open it there and try again."
+            }
         }
         if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {
             return localized
         }
         return String(describing: error)
+    }
+
+    private static func normalizedFriendlyName(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func quotedWorkspaceName(in message: String) -> String? {
+        let parts = message.split(separator: "'", omittingEmptySubsequences: false)
+        guard parts.count >= 3 else { return nil }
+        return normalizedFriendlyName(String(parts[1]))
     }
 }

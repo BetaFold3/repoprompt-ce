@@ -354,6 +354,7 @@ enum AgentSessionRestoreSupport {
             hasUnknownConversationContent: hasUnknownConversationContent,
             remoteHostID: session.remoteHost?.hostID,
             remoteHostName: session.remoteHost?.hostDisplayName,
+            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
             isMCPOriginated: session.isMCPOriginated,
             origin: session.origin,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,

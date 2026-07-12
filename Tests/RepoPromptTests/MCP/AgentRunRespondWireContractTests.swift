@@ -1,5 +1,5 @@
 import MCP
-@testable import RepoPrompt
+@testable import RepoPromptApp
 @testable import RepoPromptGateway
 import RepoPromptRemoteWire
 import XCTest

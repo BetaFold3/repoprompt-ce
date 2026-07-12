@@ -248,6 +248,7 @@ struct AgentModeSidebarSessionBuilder {
             hasUnknownConversationContent: entry.hasUnknownConversationContent,
             remoteHostID: entry.remoteHostID,
             remoteHostName: entry.remoteHostName,
+            remoteSessionID: entry.remoteSessionID,
             isMCPOriginated: entry.isMCPOriginated,
             origin: entry.origin,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,

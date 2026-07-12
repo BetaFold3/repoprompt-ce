@@ -133,6 +133,11 @@ struct AgentSessionRemoteHostBinding: Codable, Equatable {
     var lastAppliedSeq: UInt64
     var nextLogOffset: Int
 
+    var normalizedRemoteSessionID: String? {
+        let trimmed = remoteSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     init(
         hostID: String,
         hostDisplayName: String,

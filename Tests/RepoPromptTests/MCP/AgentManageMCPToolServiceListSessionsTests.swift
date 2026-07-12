@@ -28,6 +28,54 @@ final class AgentManageMCPToolServiceListSessionsTests: XCTestCase {
         XCTAssertEqual(child["parent_session_id"]?.stringValue, parentID.uuidString)
     }
 
+    func testListSessionsMatchingWorkspaceIDReturnsWorkspaceEcho() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        let service = makeService(window: window)
+
+        let value = try await service.execute(args: [
+            "op": .string("list_sessions"),
+            "workspace_id": .string(workspace.id.uuidString)
+        ])
+
+        let echoedWorkspace = try XCTUnwrap(value.objectValue?["workspace"]?.objectValue)
+        XCTAssertEqual(echoedWorkspace["id"]?.stringValue, workspace.id.uuidString)
+        XCTAssertEqual(echoedWorkspace["name"]?.stringValue, workspace.name)
+    }
+
+    func testListSessionsWorkspaceIDMismatchThrowsWorkspaceMismatch() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let service = makeService(window: window)
+
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("list_sessions"),
+                "workspace_id": .string(UUID().uuidString)
+            ])
+            XCTFail("Expected workspace mismatch")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("workspace_mismatch: "))
+        }
+    }
+
+    func testListSessionsInvalidWorkspaceIDThrowsInvalidParams() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let service = makeService(window: window)
+
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("list_sessions"),
+                "workspace_id": .string("not-a-uuid")
+            ])
+            XCTFail("Expected invalid workspace UUID")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("workspace_id must be a workspace UUID."))
+        }
+    }
+
     func testListSessionsExplicitParentDoesNotWidenConnectionScopedParent() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -63,6 +111,9 @@ final class AgentManageMCPToolServiceListSessionsTests: XCTestCase {
         XCTAssertEqual(sessions.count, 1)
         XCTAssertEqual(sessions.first?.objectValue?["session_id"]?.stringValue, matchingChildID.uuidString)
         XCTAssertEqual(sessions.first?.objectValue?["parent_session_id"]?.stringValue, scopedParentID.uuidString)
+        let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        XCTAssertEqual(value.objectValue?["workspace"]?.objectValue?["id"]?.stringValue, workspace.id.uuidString)
+        XCTAssertEqual(value.objectValue?["workspace"]?.objectValue?["name"]?.stringValue, workspace.name)
     }
 
     private func installSession(

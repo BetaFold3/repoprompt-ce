@@ -4480,12 +4480,12 @@ enum AgentTranscriptIO {
                 && isSpawnFamilyToolName(row.toolName)
                 && AgentTranscriptToolNormalizer.stableExecutionID(for: row) == executionID
         }),
-              let resultObject = AgentTranscriptToolNormalizer.jsonObject(from: resultRow.toolResultJSON)
-                  ?? AgentTranscriptToolNormalizer.jsonObject(from: resultRow.text),
-              let statusText = spawnChildStatusText(
-                  from: resultObject,
-                  fallbackStatus: AgentTranscriptToolNormalizer.status(for: resultRow)
-              )
+            let resultObject = AgentTranscriptToolNormalizer.jsonObject(from: resultRow.toolResultJSON)
+            ?? AgentTranscriptToolNormalizer.jsonObject(from: resultRow.text),
+            let statusText = spawnChildStatusText(
+                from: resultObject,
+                fallbackStatus: AgentTranscriptToolNormalizer.status(for: resultRow)
+            )
         else { return nil }
         let argsObject = AgentTranscriptToolNormalizer.jsonObject(from: resultRow.toolArgsJSON)
             ?? visibleRows.first(where: { row in

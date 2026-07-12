@@ -60,6 +60,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var parentSessionID: UUID?
     var remoteHostID: String?
     var remoteHostName: String?
+    var remoteSessionID: String?
     var isMCPOriginated: Bool
     /// Session provenance (plan §6.4); `nil` for legacy records that predate
     /// origin tracking. Use `effectiveOrigin` for a normalized value.
@@ -138,6 +139,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         parentSessionID: UUID?,
         remoteHostID: String? = nil,
         remoteHostName: String? = nil,
+        remoteSessionID: String? = nil,
         isMCPOriginated: Bool,
         origin: AgentSessionOrigin? = nil,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
@@ -171,6 +173,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.parentSessionID = parentSessionID
         self.remoteHostID = remoteHostID
         self.remoteHostName = remoteHostName
+        self.remoteSessionID = remoteSessionID
         self.isMCPOriginated = isMCPOriginated
         self.origin = origin
         self.worktreeBindingSummaries = worktreeBindingSummaries
@@ -206,6 +209,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case parentSessionID
         case remoteHostID
         case remoteHostName
+        case remoteSessionID
         case isMCPOriginated
         case origin
         case worktreeBindingSummaries
@@ -242,6 +246,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         remoteHostID = try container.decodeIfPresent(String.self, forKey: .remoteHostID)
         remoteHostName = try container.decodeIfPresent(String.self, forKey: .remoteHostName)
+        remoteSessionID = try container.decodeIfPresent(String.self, forKey: .remoteSessionID)
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
         origin = try container.decodeIfPresent(AgentSessionOrigin.self, forKey: .origin)
         worktreeBindingSummaries = try container.decodeIfPresent([AgentSessionWorktreeBindingSummary].self, forKey: .worktreeBindingSummaries) ?? []
@@ -276,6 +281,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             hasUnknownConversationContent: hasUnknownConversationContent,
             remoteHostID: remoteHostID,
             remoteHostName: remoteHostName,
+            remoteSessionID: remoteSessionID,
             isMCPOriginated: effectiveOrigin.isMCPOriginated,
             origin: effectiveOrigin,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -296,6 +302,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             parentSessionID: parentSessionID,
             remoteHostID: remoteHostID,
             remoteHostName: remoteHostName,
+            remoteSessionID: remoteSessionID,
             isMCPOriginated: effectiveOrigin.isMCPOriginated,
             origin: effectiveOrigin,
             worktreeBindingSummaries: worktreeBindingSummaries,
@@ -322,6 +329,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && parentSessionID == other.parentSessionID
             && remoteHostID == other.remoteHostID
             && remoteHostName == other.remoteHostName
+            && remoteSessionID == other.remoteSessionID
             && effectiveOrigin.isMCPOriginated == other.effectiveOrigin.isMCPOriginated
             && effectiveOrigin == other.effectiveOrigin
             && worktreeBindingSummaries == other.worktreeBindingSummaries
@@ -369,6 +377,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             parentSessionID: session.parentSessionID,
             remoteHostID: session.remoteHost?.hostID,
             remoteHostName: session.remoteHost?.hostDisplayName,
+            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
             isMCPOriginated: session.isMCPOriginated,
             origin: session.origin,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,

@@ -1,5 +1,6 @@
 import Foundation
 import Logging
+@testable import RepoPromptApp
 @testable import RepoPromptGateway
 import RepoPromptRemoteWire
 import XCTest
@@ -93,6 +94,56 @@ final class GatewayRuntimeBindingTests: XCTestCase {
                 ])
             ]),
             "binding": .object(["state": .string("unbound")])
+        ]))
+    }
+
+    private func sharedWorkspaceWindowListResponse() -> MCPToolResult {
+        GatewayTestHelpers.toolResult(json: .object([
+            "windows": .array([
+                .object([
+                    "window_id": .int(1),
+                    "workspace": .object([
+                        "id": .string("66666666-6666-6666-6666-666666666666"),
+                        "name": .string("Shared Workspace")
+                    ])
+                ]),
+                .object([
+                    "window_id": .int(2),
+                    "workspace": .object([
+                        "id": .string("66666666-6666-6666-6666-666666666666"),
+                        "name": .string("Shared Workspace")
+                    ])
+                ]),
+                .object([
+                    "window_id": .int(3),
+                    "workspace": .object([
+                        "id": .string("77777777-7777-7777-7777-777777777777"),
+                        "name": .string("Other Workspace")
+                    ])
+                ])
+            ]),
+            "binding": .object(["state": .string("unbound")])
+        ]))
+    }
+
+    private func workspaceSessionListResponse(
+        _ sessions: [(id: String, name: String, lastModified: String)],
+        workspaceID: String,
+        workspaceName: String
+    ) -> MCPToolResult {
+        GatewayTestHelpers.toolResult(json: .object([
+            "sessions": .array(sessions.map { session in
+                .object([
+                    "session_id": .string(session.id),
+                    "name": .string(session.name),
+                    "last_modified": .string(session.lastModified),
+                    "state": .string("running")
+                ])
+            }),
+            "workspace": .object([
+                "id": .string(workspaceID),
+                "name": .string(workspaceName)
+            ])
         ]))
     }
 
@@ -319,6 +370,343 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(listSessions.arguments["op"], .string("list_sessions"))
         XCTAssertEqual(listSessions.arguments["parent_session_id"], .string(sessionID))
         XCTAssertEqual(listSessions.arguments["_windowID"], .int(2))
+    }
+
+    func testWorkspaceScopedListSessionsRoutesSingleMatchAndStripsWorkspaceName() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(workspaceSessionListResponse(
+                [(sessionID, "Workspace B Session", "2026-07-12T01:00:00.000Z")],
+                workspaceID: "55555555-5555-5555-5555-555555555555",
+                workspaceName: "Workspace B"
+            ))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "workspace-list-single",
+                payload: .object(["workspace_name": .string(" workspace b ")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(response?.payload?.objectValue?["window_count"], .int(1))
+        XCTAssertEqual(
+            response?.payload?.objectValue?["workspace"]?.objectValue?["id"]?.stringValue,
+            "55555555-5555-5555-5555-555555555555"
+        )
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context", "agent_manage"])
+        let listCall = try XCTUnwrap(calls.last)
+        XCTAssertEqual(listCall.arguments["_windowID"], .int(2))
+        XCTAssertEqual(listCall.arguments["workspace_id"], .string("55555555-5555-5555-5555-555555555555"))
+        XCTAssertNil(listCall.arguments["workspace_name"])
+    }
+
+    func testWorkspaceScopedListSessionsFansOutDeduplicatesNewestAndRecordsAffinity() async throws {
+        let duplicateID = sessionID
+        let firstOnlyID = "22222222-2222-2222-2222-222222222222"
+        let secondOnlyID = "33333333-3333-3333-3333-333333333333"
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(sharedWorkspaceWindowListResponse()),
+            .result(workspaceSessionListResponse(
+                [
+                    (duplicateID, "Older Duplicate", "2026-07-12T01:00:00.000Z"),
+                    (firstOnlyID, "First Only", "2026-07-12T02:00:00.000Z")
+                ],
+                workspaceID: "66666666-6666-6666-6666-666666666666",
+                workspaceName: "Shared Workspace"
+            )),
+            .result(workspaceSessionListResponse(
+                [
+                    (duplicateID, "Newer Duplicate", "2026-07-12T04:00:00.000Z"),
+                    (secondOnlyID, "Second Only", "2026-07-12T03:00:00.000Z")
+                ],
+                workspaceID: "66666666-6666-6666-6666-666666666666",
+                workspaceName: "Shared Workspace"
+            )),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(duplicateID),
+                "status": .string("running")
+            ])))
+        ])
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .ambiguousStartTarget("multiple windows"),
+            auditLog: auditLog
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "workspace-list-union",
+                payload: .object(["workspace_name": .string("shared workspace")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(response?.payload?.objectValue?["window_count"], .int(2))
+        let sessions = try XCTUnwrap(response?.payload?.objectValue?["sessions"]?.arrayValue)
+        XCTAssertEqual(sessions.count, 3)
+        XCTAssertEqual(sessions.map { $0.objectValue?["session_id"]?.stringValue }, [duplicateID, secondOnlyID, firstOnlyID])
+        XCTAssertEqual(sessions.first?.objectValue?["name"]?.stringValue, "Newer Duplicate")
+
+        let steerResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "steer",
+                requestID: "workspace-list-affinity",
+                sessionID: duplicateID,
+                payload: .object(["message": .string("continue")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(steerResponse?.type, "command_result")
+
+        let calls = await connection.calls
+        let listCalls = calls.filter { $0.name == "agent_manage" }
+        XCTAssertEqual(listCalls.count, 2)
+        XCTAssertEqual(listCalls.map { $0.arguments["_windowID"] }, [.int(1), .int(2)])
+        XCTAssertTrue(listCalls.allSatisfy { $0.arguments["workspace_name"] == nil })
+        XCTAssertTrue(listCalls.allSatisfy {
+            $0.arguments["workspace_id"] == .string("66666666-6666-6666-6666-666666666666")
+        })
+        let steerCall = try XCTUnwrap(calls.last { $0.name == "agent_run" })
+        XCTAssertEqual(steerCall.arguments["_windowID"], .int(2))
+        let auditRecord = try await waitForAuditRecord(in: auditDirectory, op: "list_sessions")
+        XCTAssertEqual(auditRecord["workspace_match_count"] as? Int, 2)
+    }
+
+    func testWorkspaceScopedListSessionsAppliesLimitAfterUnion() async throws {
+        let duplicateID = sessionID
+        let firstOnlyID = "22222222-2222-2222-2222-222222222222"
+        let secondOnlyID = "33333333-3333-3333-3333-333333333333"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(sharedWorkspaceWindowListResponse()),
+            .result(workspaceSessionListResponse(
+                [
+                    (duplicateID, "Older Duplicate", "2026-07-12T01:00:00.000Z"),
+                    (firstOnlyID, "First Only", "2026-07-12T02:00:00.000Z")
+                ],
+                workspaceID: "66666666-6666-6666-6666-666666666666",
+                workspaceName: "Shared Workspace"
+            )),
+            .result(workspaceSessionListResponse(
+                [
+                    (duplicateID, "Newer Duplicate", "2026-07-12T04:00:00.000Z"),
+                    (secondOnlyID, "Second Only", "2026-07-12T03:00:00.000Z")
+                ],
+                workspaceID: "66666666-6666-6666-6666-666666666666",
+                workspaceName: "Shared Workspace"
+            ))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "workspace-list-limit",
+                payload: .object([
+                    "workspace_name": .string("Shared Workspace"),
+                    "limit": .int(2)
+                ])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        let sessions = try XCTUnwrap(response?.payload?.objectValue?["sessions"]?.arrayValue)
+        XCTAssertEqual(sessions.map { $0.objectValue?["session_id"]?.stringValue }, [duplicateID, secondOnlyID])
+        XCTAssertEqual(response?.payload?.objectValue?["window_count"], .int(2))
+    }
+
+    func testWorkspaceScopedListSessionsRejectsUnsupportedPayloadBeforeLookup() async throws {
+        let connection = RecordingAppLinkConnection()
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "workspace-list-invalid",
+                payload: .object([
+                    "workspace_name": .string("Missing"),
+                    "include_hidden": .bool(true)
+                ])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "unsupported_payload_key")
+        let calls = await connection.calls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    func testWorkspaceScopedListSessionsWithoutMatchesReturnsWorkspaceNotOpenWithWindows() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse())
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "workspace-list-missing",
+                payload: .object(["workspace_name": .string("Missing")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "workspace_not_open")
+        let windows = try XCTUnwrap(response?.payload?.objectValue?["details"]?.objectValue?["windows"]?.arrayValue)
+        XCTAssertEqual(windows.count, 2)
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context"])
+    }
+
+    func testWorkspaceScopedListSessionsNormalizesWorkspaceMismatchWithWindows() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "code": .string("invalid_params"),
+                "error": .string("workspace_mismatch: the target window's active workspace changed")
+            ]), isError: true))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "workspace-list-mismatch",
+                payload: .object(["workspace_name": .string("Workspace B")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "workspace_mismatch")
+        let windows = try XCTUnwrap(response?.payload?.objectValue?["details"]?.objectValue?["windows"]?.arrayValue)
+        XCTAssertEqual(windows.count, 2)
+    }
+
+    /// Post-v1 review test gap: the gateway's `workspace_mismatch` mapping is
+    /// message sniffing (`RemoteGatewayRuntimeError.code`), and the older test
+    /// above fakes the host message. This locks the REAL message the host
+    /// generates for workspace-scoped `list_sessions` — derived from the shared
+    /// `AgentManageMCPToolService.workspaceMismatchMessage` literal, so a host
+    /// copy edit that breaks the sniffed prefix fails here. Residual gap:
+    /// `AgentRunMCPToolService`'s start-path variant is an independent literal
+    /// with the same prefix and is not covered by this test.
+    func testWorkspaceScopedListSessionsNormalizesRealHostWorkspaceMismatchMessage() async throws {
+        let hostMessage = try AgentManageMCPToolService.workspaceMismatchMessage(
+            activeWorkspaceName: "Workspace A",
+            activeWorkspaceID: XCTUnwrap(UUID(uuidString: "44444444-4444-4444-4444-444444444444")),
+            requestedWorkspaceID: XCTUnwrap(UUID(uuidString: "55555555-5555-5555-5555-555555555555"))
+        )
+        XCTAssertTrue(hostMessage.hasPrefix("workspace_mismatch: "))
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "code": .string("invalid_params"),
+                "error": .string(hostMessage)
+            ]), isError: true))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "workspace-list-real-mismatch",
+                payload: .object(["workspace_name": .string("Workspace B")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "workspace_mismatch")
+        XCTAssertEqual(response?.payload?.objectValue?["message"]?.stringValue, hostMessage)
+        let windows = try XCTUnwrap(response?.payload?.objectValue?["details"]?.objectValue?["windows"]?.arrayValue)
+        XCTAssertEqual(windows.count, 2)
+    }
+
+    func testWorkspaceScopedListSessionsLookupFailureDoesNotFabricateWorkspaceNotOpen() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "error": .string("window inventory unavailable")
+            ]), isError: true))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .ambiguousStartTarget("multiple windows"))
+
+        let response = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "workspace-list-lookup-failure",
+                payload: .object(["workspace_name": .string("Workspace B")])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_error")
+        XCTAssertEqual(response?.payload?.objectValue?["code"]?.stringValue, "app_tool_error")
+        XCTAssertNotEqual(response?.payload?.objectValue?["code"]?.stringValue, "workspace_not_open")
+    }
+
+    func testUnscopedListSessionsReturnsHostPayloadWithoutGatewayReshaping() async throws {
+        let expectedPayload = JSONValue.object([
+            "sessions": .array([
+                .object([
+                    "session_id": .string(sessionID),
+                    "name": .string("Unscoped Session")
+                ])
+            ]),
+            "workspace": .object([
+                "id": .string("44444444-4444-4444-4444-444444444444"),
+                "name": .string("Workspace A")
+            ])
+        ])
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: expectedPayload))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_sessions", requestID: "unscoped-list"),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(response?.payload, expectedPayload)
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["agent_manage"])
+        XCTAssertNil(calls[0].arguments["workspace_id"])
+        XCTAssertNil(calls[0].arguments["workspace_name"])
     }
 
     func testStartWithoutSelectorOnAmbiguousConnectionReturnsStructuredErrorWithWindows() async throws {

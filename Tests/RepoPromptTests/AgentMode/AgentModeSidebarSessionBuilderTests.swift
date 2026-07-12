@@ -121,6 +121,7 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
     }
 
     func testLiveContinuationWinsOverStalePersistedDates() throws {
+        let recentBase: TimeInterval = 1_800_000_000
         let parentTabID = id(20)
         let continuedChildTabID = id(21)
         let otherChildTabID = id(22)
@@ -133,26 +134,26 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             tab(otherChildTabID, sessionID: otherChildSessionID)
         ]
         let index = sessionIndex([
-            entry(parentSessionID, tabID: parentTabID, lastUserMessageAt: date(10)),
+            entry(parentSessionID, tabID: parentTabID, lastUserMessageAt: date(recentBase + 10)),
             entry(
                 continuedChildSessionID,
                 tabID: continuedChildTabID,
                 parentSessionID: parentSessionID,
-                lastUserMessageAt: date(100),
-                savedAt: date(1000)
+                lastUserMessageAt: date(recentBase + 100),
+                savedAt: date(recentBase + 1000)
             ),
             entry(
                 otherChildSessionID,
                 tabID: otherChildTabID,
                 parentSessionID: parentSessionID,
-                lastUserMessageAt: date(200)
+                lastUserMessageAt: date(recentBase + 200)
             )
         ])
         let continuedSession = liveSession(
             tabID: continuedChildTabID,
             sessionID: continuedChildSessionID,
             parentSessionID: parentSessionID,
-            lastUserMessageAt: date(300)
+            lastUserMessageAt: date(recentBase + 300)
         )
 
         let rows = build(
@@ -163,8 +164,8 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
 
         XCTAssertEqual(rows.map(\.tabID), [parentTabID, continuedChildTabID, otherChildTabID])
         let continuedRow = try XCTUnwrap(rows.first(where: { $0.tabID == continuedChildTabID }))
-        XCTAssertEqual(continuedRow.lastUserMessageAt, date(300))
-        XCTAssertEqual(continuedRow.activityDate, date(300))
+        XCTAssertEqual(continuedRow.lastUserMessageAt, date(recentBase + 300))
+        XCTAssertEqual(continuedRow.activityDate, date(recentBase + 300))
     }
 
     func testUnhydratedPersistedRowUsesIndexSavedAtInsteadOfTabLastModified() throws {

@@ -25,6 +25,7 @@ struct AgentSessionMeta {
     let parentSessionID: UUID?
     let remoteHostID: String?
     let remoteHostName: String?
+    let remoteSessionID: String?
     let isMCPOriginated: Bool
     /// Session provenance (plan §6.4); `nil` only when built from legacy data
     /// that predates origin tracking.
@@ -1169,6 +1170,7 @@ actor AgentSessionDataService {
                         parentSessionID: session.parentSessionID,
                         remoteHostID: session.remoteHost?.hostID,
                         remoteHostName: session.remoteHost?.hostDisplayName,
+                        remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
                         isMCPOriginated: session.isMCPOriginated,
                         origin: session.origin,
                         worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
@@ -1226,6 +1228,7 @@ actor AgentSessionDataService {
                             parentSessionID: session.parentSessionID,
                             remoteHostID: session.remoteHost?.hostID,
                             remoteHostName: session.remoteHost?.hostDisplayName,
+                            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
                             isMCPOriginated: session.isMCPOriginated,
                             origin: session.origin,
                             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,

@@ -34,6 +34,10 @@ struct RemoteAgentSessionDescriptor: Equatable {
     var agentKindRaw: String?
     var agentModelRaw: String?
     var parentSessionID: String?
+    var lastModified: Date?
+    var itemCount: Int?
+    var originSummary: String?
+    var isLive: Bool?
 }
 
 private enum RemoteLogPagingError: Error, CustomStringConvertible {
@@ -733,24 +737,43 @@ actor RemoteAgentSessionController {
         throw RemoteClientError.protocolViolation("agent_run start response did not include session_id.")
     }
 
-    private static func sessionDescriptors(from payload: JSONValue) -> [RemoteAgentSessionDescriptor] {
+    static func sessionDescriptors(from payload: JSONValue) -> [RemoteAgentSessionDescriptor] {
         let sessions = payload.objectValue?["sessions"]?.arrayValue ?? []
         return sessions.compactMap { value in
             guard let object = value.objectValue,
-                  let sessionID = object["session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !sessionID.isEmpty
+                  let sessionID = normalizedDescriptorString(object["session_id"]?.stringValue)
             else { return nil }
             let agentObject = object["agent"]?.objectValue
-            let name = object["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             return RemoteAgentSessionDescriptor(
                 sessionID: sessionID,
-                name: name?.isEmpty == false ? name : nil,
+                name: normalizedDescriptorString(object["name"]?.stringValue),
                 stateRaw: object["raw_state"]?.stringValue ?? object["state"]?.stringValue,
                 agentKindRaw: agentObject?["id"]?.stringValue ?? object["agent"]?.stringValue,
                 agentModelRaw: agentObject?["model"]?.stringValue,
-                parentSessionID: object["parent_session_id"]?.stringValue
+                parentSessionID: normalizedDescriptorString(object["parent_session_id"]?.stringValue),
+                lastModified: descriptorDate(from: object["last_modified"]?.stringValue),
+                itemCount: object["item_count"]?.intValue,
+                originSummary: normalizedDescriptorString(object["origin"]?.stringValue),
+                isLive: object["is_live"]?.boolValue
             )
         }
+    }
+
+    private static func normalizedDescriptorString(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func descriptorDate(from value: String?) -> Date? {
+        guard let value = normalizedDescriptorString(value) else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) {
+            return date
+        }
+        let basic = ISO8601DateFormatter()
+        basic.formatOptions = [.withInternetDateTime]
+        return basic.date(from: value)
     }
 
     private static func interactionResolution(from payload: JSONValue) -> (interactionID: String, resolvedBy: String?)? {
