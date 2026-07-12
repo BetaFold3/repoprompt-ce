@@ -481,7 +481,9 @@ final class RemoteAgentSessionTests: XCTestCase {
         let parkedBindingValue = await controller.currentBinding()
         let parkedBinding = try XCTUnwrap(parkedBindingValue)
         XCTAssertEqual(parkedBinding.nextLogOffset, 0)
-        await recorder.waitForTranscriptBatchCount(1)
+        await waitForRemoteAgentSessionCondition {
+            await recorder.hasTranscriptBatchCount(1)
+        }
         let initialRows = await recorder.allTranscriptRows()
         XCTAssertEqual(initialRows.first?.map(\.text), ["Prompt"])
 
@@ -1120,7 +1122,7 @@ final class RemoteAgentSessionTests: XCTestCase {
             connection: recordingConnection
         )
         let fanoutConnection = RemoteHostConnection(hostID: parentSession.remoteHost?.hostID ?? "host-abc")
-        try fixture.coordinator.test_attachController(
+        fixture.coordinator.test_attachController(
             tabID: fixture.tabID,
             hostID: parentSession.remoteHost?.hostID ?? "host-abc",
             controller: parentController,
@@ -1873,7 +1875,6 @@ final class RemoteAgentSessionTests: XCTestCase {
 
     private actor RemoteSessionEventRecorder {
         private var transcriptRows: [[AgentChatItem]] = []
-        private var transcriptBatchWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
         private var systemMessages: [String] = []
         private var metadata: [RemoteSessionEvent] = []
         private var expiredCount = 0
@@ -1882,7 +1883,6 @@ final class RemoteAgentSessionTests: XCTestCase {
             switch event {
             case let .transcriptRows(rows, _):
                 transcriptRows.append(rows)
-                resumeSatisfiedTranscriptBatchWaiters()
             case let .systemMessage(message):
                 systemMessages.append(message)
             case .metadata:
@@ -1902,23 +1902,8 @@ final class RemoteAgentSessionTests: XCTestCase {
             transcriptRows
         }
 
-        func waitForTranscriptBatchCount(_ count: Int) async {
-            guard transcriptRows.count < count else { return }
-            await withCheckedContinuation { continuation in
-                transcriptBatchWaiters.append((count, continuation))
-            }
-        }
-
-        private func resumeSatisfiedTranscriptBatchWaiters() {
-            var remaining: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
-            for waiter in transcriptBatchWaiters {
-                if transcriptRows.count >= waiter.count {
-                    waiter.continuation.resume()
-                } else {
-                    remaining.append(waiter)
-                }
-            }
-            transcriptBatchWaiters = remaining
+        func hasTranscriptBatchCount(_ count: Int) -> Bool {
+            transcriptRows.count >= count
         }
 
         func upsertedTranscriptRows() -> [AgentChatItem] {

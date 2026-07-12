@@ -151,6 +151,10 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
             "Target 'RepoPromptApp' must retain the existing Sources/RepoPrompt implementation"
         )
 
+    repo_prompt_remote_wire = targets["RepoPromptRemoteWire"]
+    if repo_prompt_remote_wire.get("dependencies", []):
+        raise GeneratorError("Target 'RepoPromptRemoteWire' must have no dependencies")
+
     expected_test_dependencies = {
         "RepoPromptApp",
         "RepoPromptMCP",
@@ -942,6 +946,7 @@ def validate_xcodebuild_list(destination: Path) -> None:
         GATEWAY_SCHEME,
         TEST_SCHEME,
         "RepoPrompt",
+        "repoprompt-mcp",
         "repoprompt-gateway",
     }
     missing = sorted(required - schemes)

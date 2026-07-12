@@ -49,6 +49,7 @@ Sources/
   RepoPromptShared/
     MCP/                         # shared app/client MCP control and bootstrap wire definitions
   RepoPromptRemoteWire/          # dependency-free remote-control wire DTOs, canonical JSON, tickets, and signing helpers
+  RepoPromptGateway/             # gateway executable: app links, auth, audit, relay, push, watch, wire adapters, and PWA resources
   RepoPromptMCPClientKit/        # reusable bootstrap MCP client plumbing for CLI/gateway clients
   RepoPromptMCP/                 # MCP CLI implementation
   RepoPromptC/                   # C support target
@@ -94,6 +95,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app/client protocol definitions shared by multiple executables go under `Sources/RepoPromptShared`, except for the documented remote-control wire exception below.
 - MCP filesystem/product/build-flavor identity, bootstrap handshake wire DTOs, and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
 - New reusable bootstrap MCP client plumbing shared by the CLI and gateway clients goes under `Sources/RepoPromptMCPClientKit`.
+- New gateway-only app-link, auth, audit, relay, push, server, watch, resource, and wire-adapter code goes under `Sources/RepoPromptGateway`; dependency-free remote-control protocol DTOs and signing helpers remain in `Sources/RepoPromptRemoteWire`.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
 - New CLI-only implementation code goes under `Sources/RepoPromptMCP`.
 - New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
@@ -158,8 +160,9 @@ make guardrails
 
 The guardrail script verifies:
 
-- the shipped `RepoPrompt` executable source root contains only its entry file, declares exactly one `@main`, and the `RepoPromptApp` implementation declares none;
-- `Package.swift` keeps the `RepoPrompt` executable as a thin dependency on the internal `RepoPromptApp` target at `Sources/RepoPrompt`;
+- the shipped `RepoPrompt` executable source root contains only its entry file, declares exactly one `@main`, and the current `RepoPromptApp` implementation target declares none;
+- `Package.swift` keeps the current implementation target named `RepoPromptApp` at `Sources/RepoPrompt`, with the `RepoPrompt` executable as its thin sole-dependent entry target;
+- the RemoteWire import guardrail keeps `RepoPromptRemoteWire` dependency-free and permits only `Foundation` and `CryptoKit` imports, never app, gateway, MCP, NIO, logging, or shared implementation modules;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;

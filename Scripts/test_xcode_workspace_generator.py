@@ -109,6 +109,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
 
         self.assertEqual(targets["RepoPromptApp"]["type"], "regular")
         self.assertEqual(targets["RepoPromptApp"]["path"], "Sources/RepoPrompt")
+        self.assertEqual(targets["RepoPromptRemoteWire"].get("dependencies", []), [])
         self.assertEqual(
             set(generator._by_name_dependencies(targets["RepoPromptTests"])),
             {
@@ -200,6 +201,18 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
             generator.TEST_SCHEME,
             "RepoPrompt",
         ]
+        missing_mcp = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "workspace": {"schemes": [*convenience_schemes, "repoprompt-gateway"]}
+            }),
+            stderr="",
+        )
+        with patch.object(generator.subprocess, "run", return_value=missing_mcp):
+            with self.assertRaisesRegex(generator.GeneratorError, "repoprompt-mcp"):
+                generator.validate_xcodebuild_list(Path("/tmp/generated-xcode"))
+
         missing_gateway = subprocess.CompletedProcess(
             args=[],
             returncode=0,
@@ -214,7 +227,9 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
             args=[],
             returncode=0,
             stdout=json.dumps({
-                "workspace": {"schemes": [*convenience_schemes, "repoprompt-gateway"]}
+                "workspace": {
+                    "schemes": [*convenience_schemes, "repoprompt-mcp", "repoprompt-gateway"]
+                }
             }),
             stderr="",
         )
@@ -336,6 +351,16 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptRemoteWire'"):
             generator.validate_manifest(missing_remote_wire_target, generator.REPO_ROOT)
+
+        dependent_remote_wire_target = deepcopy(self.manifest)
+        target_map = {
+            target["name"]: target for target in dependent_remote_wire_target["targets"]
+        }
+        target_map["RepoPromptRemoteWire"]["dependencies"] = [
+            {"byName": ["RepoPromptShared", None]}
+        ]
+        with self.assertRaisesRegex(generator.GeneratorError, "must have no dependencies"):
+            generator.validate_manifest(dependent_remote_wire_target, generator.REPO_ROOT)
 
         missing_gateway_target = deepcopy(self.manifest)
         missing_gateway_target["targets"] = [
