@@ -1,3 +1,4 @@
+import Combine
 @testable import RepoPromptApp
 import XCTest
 
@@ -208,6 +209,80 @@ final class AgentRunLocationTests: XCTestCase {
 
     // MARK: - V1-3 fresh-workspace first-tab auto-bind (post-v1 review P1-1)
 
+    func testExplicitNewSessionCreationPublishesWorkspaceDefaultRunLocationSnapshot() async throws {
+        let fixture = try await makeWorkspaceFixture()
+        var didBridgeActiveComposeTabChange = false
+        let activeComposeTabBridge = NotificationCenter.default.publisher(for: .activeComposeTabChanged)
+            .sink { notification in
+                guard notification.userInfo?["windowID"] as? Int == fixture.windowID else { return }
+                didBridgeActiveComposeTabChange = true
+                fixture.viewModel.setAgentModeActive(true)
+            }
+        fixture.viewModel.setAgentModeActive(true)
+        defer {
+            activeComposeTabBridge.cancel()
+            fixture.viewModel.setAgentModeActive(false)
+        }
+
+        let createdTabID = await fixture.viewModel.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(createdTabID)
+        let session = try XCTUnwrap(fixture.viewModel.sessions[tabID])
+
+        XCTAssertTrue(didBridgeActiveComposeTabChange)
+        XCTAssertEqual(fixture.viewModel.currentTabID, tabID)
+        XCTAssertEqual(session.remoteHost?.hostID, fixture.host.id)
+        XCTAssertEqual(
+            fixture.viewModel.ui.statusPills.snapshot.runLocation?.selection,
+            .host(hostID: fixture.host.id)
+        )
+        XCTAssertEqual(
+            fixture.viewModel.ui.statusPills.snapshot,
+            fixture.viewModel.makeStatusPillsSnapshot()
+        )
+    }
+
+    func testUpdateBindingsRefreshesStatusSnapshotForRemoteHostOnlyTransitions() async throws {
+        let fixture = try await makeWorkspaceFixture()
+        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        XCTAssertEqual(fixture.viewModel.currentTabID, fixture.initialTabID)
+        XCTAssertNil(session.remoteHost)
+
+        fixture.viewModel.syncStatusPillsUIState()
+        let localRevision = fixture.viewModel.ui.statusPills.revision
+
+        session.remoteHost = AgentSessionRemoteHostBinding(
+            hostID: fixture.host.id,
+            hostDisplayName: fixture.host.displayName,
+            remoteSessionID: ""
+        )
+        fixture.viewModel.updateBindingsFromSession(session)
+
+        XCTAssertGreaterThan(fixture.viewModel.ui.statusPills.revision, localRevision)
+        XCTAssertEqual(
+            fixture.viewModel.ui.statusPills.snapshot.runLocation?.selection,
+            .host(hostID: fixture.host.id)
+        )
+        XCTAssertEqual(
+            fixture.viewModel.ui.statusPills.snapshot,
+            fixture.viewModel.makeStatusPillsSnapshot()
+        )
+
+        let hostRevision = fixture.viewModel.ui.statusPills.revision
+        session.remoteHost = nil
+        fixture.viewModel.updateBindingsFromSession(session)
+
+        XCTAssertGreaterThan(fixture.viewModel.ui.statusPills.revision, hostRevision)
+        XCTAssertNil(session.remoteHost)
+        XCTAssertEqual(
+            fixture.viewModel.ui.statusPills.snapshot.runLocation?.selection,
+            .thisMac
+        )
+        XCTAssertEqual(
+            fixture.viewModel.ui.statusPills.snapshot,
+            fixture.viewModel.makeStatusPillsSnapshot()
+        )
+    }
+
     func testFreshWorkspaceDefaultTabAutoBindsLazyComposerSessionExactlyOnce() async throws {
         let fixture = try await makeWorkspaceFixture()
         XCTAssertNil(fixture.viewModel.sessions[fixture.initialTabID])
@@ -338,6 +413,7 @@ final class AgentRunLocationTests: XCTestCase {
         let workspace: WorkspaceModel
         let host: PairedHostRecord
         let initialTabID: UUID
+        let windowID: Int
         let lifecycleRecorder: LifecycleRecorder
     }
 
@@ -368,11 +444,12 @@ final class AgentRunLocationTests: XCTestCase {
             loadStoredDataOnInit: false
         )
         apiSettings.isCodexConnected = true
+        let windowID = 1
         let prompt = PromptViewModel(
             fileManager: fileManager,
             apiSettingsViewModel: apiSettings,
-            windowID: -1,
-            settingsManager: WindowSettingsManager(windowID: -1)
+            windowID: windowID,
+            settingsManager: WindowSettingsManager(windowID: windowID)
         )
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: fileManager,
@@ -390,7 +467,7 @@ final class AgentRunLocationTests: XCTestCase {
         let catalog = RemoteHostCatalog(connectionManagerProvider: { catalogConnectionManager })
         let lifecycleRecorder = LifecycleRecorder()
         let viewModel = AgentModeViewModel(
-            testWindowID: 1,
+            testWindowID: windowID,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
             codexControllerFactory: { _, _, _, _, _, _ in
                 LifecycleNoopCodexController(recorder: lifecycleRecorder)
@@ -411,6 +488,7 @@ final class AgentRunLocationTests: XCTestCase {
             workspace: workspace,
             host: host,
             initialTabID: initialTabID,
+            windowID: windowID,
             lifecycleRecorder: lifecycleRecorder
         )
     }

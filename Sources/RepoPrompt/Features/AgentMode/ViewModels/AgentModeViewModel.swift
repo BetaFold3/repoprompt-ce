@@ -8830,6 +8830,12 @@ final class AgentModeViewModel: ObservableObject {
         {
             invalidation.insert(.runtimeMetrics)
         }
+        if !invalidation.contains(.statusPills) {
+            let nextStatusPillsSnapshot = makeStatusPillsSnapshot()
+            if ui.statusPills.snapshot != nextStatusPillsSnapshot {
+                invalidation.insert(.statusPills)
+            }
+        }
         if !invalidation.contains(.composer), ui.composer.props != makeComposerProps(tabID: session.tabID) {
             invalidation.insert(.composer)
         }

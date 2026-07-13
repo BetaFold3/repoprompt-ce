@@ -60,6 +60,20 @@ struct AgentRunLocationPill: View {
         }
     }
 
+    private var outlineColor: Color {
+        switch props.selection {
+        case .thisMac: Color.secondary.opacity(0.15)
+        case .host: Color.accentColor.opacity(0.35)
+        }
+    }
+
+    private var outlineLineWidth: CGFloat {
+        switch props.selection {
+        case .thisMac: 0.5
+        case .host: 0.8
+        }
+    }
+
     var body: some View {
         Menu {
             Button {
@@ -98,7 +112,7 @@ struct AgentRunLocationPill: View {
             .clipShape(RoundedRectangle(cornerRadius: AgentPillMetrics.cornerRadius(), style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: AgentPillMetrics.cornerRadius(), style: .continuous)
-                    .stroke(accentColor.opacity(0.35), lineWidth: 0.8)
+                    .stroke(outlineColor, lineWidth: outlineLineWidth)
             )
         }
         .menuStyle(.borderlessButton)
