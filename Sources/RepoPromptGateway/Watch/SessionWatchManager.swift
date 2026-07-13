@@ -20,9 +20,20 @@ private enum SessionWatchError: Error, Equatable, CustomStringConvertible {
 actor SessionWatchManager {
     typealias WindowResolver = @Sendable (_ deviceID: String, _ sessionID: String) async -> Int?
 
+    struct SubscriptionValidation {
+        let deviceID: String
+        let sinkID: UUID
+        let sessionTokens: [String: UUID]
+
+        var sessionIDs: [String] {
+            sessionTokens.keys.sorted()
+        }
+    }
+
     private struct DeviceState {
         var sinks: [UUID: any RemoteFrameSink] = [:]
         var watchedSessionIDs: Set<String> = []
+        var subscriptionTokenBySessionID: [String: UUID] = [:]
         var activeWaitSessionIDs: Set<String> = []
         var parkedActionableSessionIDs: Set<String> = []
         var parkedTerminalSessionIDs: Set<String> = []
@@ -63,6 +74,7 @@ actor SessionWatchManager {
     private let appLinkPool: AppLinkPool?
     private let pushNotifier: (any RemotePushNotifying)?
     private let logger: Logger
+    private let sequenceEpoch: String
     private let waitTimeoutSeconds: TimeInterval
     private let pollRefreshSeconds: TimeInterval
     private let revalidationIntervalSeconds: TimeInterval
@@ -88,6 +100,7 @@ actor SessionWatchManager {
         pushNotifier: (any RemotePushNotifying)? = nil,
         windowResolver: WindowResolver? = nil,
         logger: Logger = Logger(label: "com.repoprompt.gateway.watch"),
+        sequenceEpoch: String = UUID().uuidString.lowercased(),
         waitTimeoutSeconds: TimeInterval = 30,
         pollRefreshSeconds: TimeInterval = 5,
         revalidationIntervalSeconds: TimeInterval = 30,
@@ -98,6 +111,7 @@ actor SessionWatchManager {
         self.pushNotifier = pushNotifier
         self.windowResolver = windowResolver
         self.logger = logger
+        self.sequenceEpoch = sequenceEpoch
         self.waitTimeoutSeconds = waitTimeoutSeconds
         self.pollRefreshSeconds = pollRefreshSeconds
         self.revalidationIntervalSeconds = revalidationIntervalSeconds
@@ -171,31 +185,73 @@ actor SessionWatchManager {
         ensureRevalidationLoop(deviceID: deviceID)
     }
 
+    /// Registers observation intent without polling or emitting. Production callers
+    /// send the correlated subscribe result before starting the returned validation.
+    func registerSubscription(
+        deviceID: String,
+        sinkID: UUID,
+        sink: any RemoteFrameSink,
+        sessionIDs requestedSessionIDs: [String]
+    ) -> SubscriptionValidation {
+        var state = devices[deviceID] ?? DeviceState()
+        state.sinks[sinkID] = sink
+        var sessionTokens: [String: UUID] = [:]
+        for sessionID in requestedSessionIDs {
+            let token = state.subscriptionTokenBySessionID[sessionID] ?? UUID()
+            state.watchedSessionIDs.insert(sessionID)
+            state.subscriptionTokenBySessionID[sessionID] = token
+            sessionTokens[sessionID] = token
+        }
+        devices[deviceID] = state
+        return SubscriptionValidation(deviceID: deviceID, sinkID: sinkID, sessionTokens: sessionTokens)
+    }
+
+    /// Performs the host validation/catch-up work for a registered subscription.
+    /// The session token is rechecked after suspension so unsubscribe/expiry wins.
+    /// Sink loss only disables targeted catch-up; device observation still starts.
+    func validateSubscription(_ validation: SubscriptionValidation) async {
+        await refreshPushEligibility(deviceID: validation.deviceID)
+        for sessionID in validation.sessionIDs {
+            guard let token = validation.sessionTokens[sessionID],
+                  isCurrentSubscription(
+                      deviceID: validation.deviceID,
+                      sessionID: sessionID,
+                      token: token
+                  )
+            else { continue }
+            await validateAndAddSession(
+                deviceID: validation.deviceID,
+                sessionID: sessionID,
+                trigger: .subscribe,
+                catchUpSinkID: validation.sinkID,
+                subscriptionToken: token
+            )
+        }
+        ensureWaitLoop(deviceID: validation.deviceID)
+        ensureRevalidationLoop(deviceID: validation.deviceID)
+    }
+
+    /// Test/internal convenience retaining the original register-and-validate behavior.
     func subscribe(
         deviceID: String,
         sinkID: UUID,
         sink: any RemoteFrameSink,
         sessionIDs requestedSessionIDs: [String]
     ) async {
-        registerSink(deviceID: deviceID, sinkID: sinkID, sink: sink)
-        await refreshPushEligibility(deviceID: deviceID)
-        let catchUpSink: CatchUpSink = (sinkID: sinkID, sink: sink)
-        for sessionID in requestedSessionIDs {
-            await validateAndAddSession(
-                deviceID: deviceID,
-                sessionID: sessionID,
-                trigger: .subscribe,
-                catchUpSink: catchUpSink
-            )
-        }
-        ensureWaitLoop(deviceID: deviceID)
-        ensureRevalidationLoop(deviceID: deviceID)
+        let validation = registerSubscription(
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink,
+            sessionIDs: requestedSessionIDs
+        )
+        await validateSubscription(validation)
     }
 
     func unsubscribe(deviceID: String, sessionIDs: [String]) {
         guard var state = devices[deviceID] else { return }
         for sessionID in sessionIDs {
             state.watchedSessionIDs.remove(sessionID)
+            state.subscriptionTokenBySessionID.removeValue(forKey: sessionID)
             state.activeWaitSessionIDs.remove(sessionID)
             state.parkedActionableSessionIDs.remove(sessionID)
             state.parkedTerminalSessionIDs.remove(sessionID)
@@ -212,7 +268,6 @@ actor SessionWatchManager {
         state.revalidationTask?.cancel()
         for sessionID in state.watchedSessionIDs {
             let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
-            seqByDeviceSession.removeValue(forKey: key)
             lastPushKindByDeviceSession.removeValue(forKey: key)
             lastResolutionKeyByDeviceSession.removeValue(forKey: key)
             lastEmittedIsTerminalByDeviceSession.removeValue(forKey: key)
@@ -286,13 +341,21 @@ actor SessionWatchManager {
         deviceID: String,
         sessionID: String,
         trigger: EmissionTrigger,
-        catchUpSink: CatchUpSink? = nil
+        catchUpSinkID: UUID? = nil,
+        subscriptionToken: UUID? = nil
     ) async {
-        guard var initialState = devices[deviceID] else { return }
-        initialState.watchedSessionIDs.insert(sessionID)
-        devices[deviceID] = initialState
+        guard isCurrentSubscription(
+            deviceID: deviceID,
+            sessionID: sessionID,
+            token: subscriptionToken
+        ) else { return }
         do {
             let snapshots = try await poll(deviceID: deviceID, sessionIDs: [sessionID])
+            guard isCurrentSubscription(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: subscriptionToken
+            ) else { return }
             guard let snapshot = snapshots.first else {
                 // No parseable snapshot is NOT authoritative expiry: the app may be
                 // mid-workspace-switch or returned a partial/odd-shaped response.
@@ -302,22 +365,75 @@ actor SessionWatchManager {
                 scheduleWaitLoopRetry(deviceID: deviceID)
                 return
             }
+            let catchUpSink = catchUpSinkID.flatMap { sinkID in
+                subscriptionToken.flatMap { token in
+                    currentCatchUpSink(
+                        deviceID: deviceID,
+                        sinkID: sinkID,
+                        sessionID: sessionID,
+                        token: token
+                    )
+                }
+            }
             guard !snapshot.isExpired else {
                 await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: trigger, catchUpSink: catchUpSink)
                 return
             }
-            guard var state = devices[deviceID] else { return }
+            guard var state = devices[deviceID],
+                  state.watchedSessionIDs.contains(sessionID)
+            else { return }
             state.watchedSessionIDs.insert(snapshot.sessionID)
             devices[deviceID] = state
+            guard isCurrentSubscription(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: subscriptionToken
+            ) else { return }
             await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: trigger, catchUpSink: catchUpSink)
         } catch let error as SessionWatchError {
+            guard isCurrentSubscription(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: subscriptionToken
+            ) else { return }
             logger.debug("Pausing remote subscription \(sessionID): \(error.description)")
             markSessionPendingObservation(deviceID: deviceID, sessionID: sessionID)
             scheduleWaitLoopRetry(deviceID: deviceID)
         } catch {
+            guard isCurrentSubscription(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: subscriptionToken
+            ) else { return }
             logger.debug("Pausing remote subscription \(sessionID) after app-link/tool error: \(String(describing: error))")
             await pauseObservationAfterToolError(deviceID: deviceID, sessionID: sessionID, error: error)
         }
+    }
+
+    private func currentCatchUpSink(
+        deviceID: String,
+        sinkID: UUID,
+        sessionID: String,
+        token: UUID
+    ) -> CatchUpSink? {
+        guard let state = devices[deviceID],
+              state.watchedSessionIDs.contains(sessionID),
+              state.subscriptionTokenBySessionID[sessionID] == token,
+              let sink = state.sinks[sinkID]
+        else { return nil }
+        return (sinkID: sinkID, sink: sink)
+    }
+
+    private func isCurrentSubscription(
+        deviceID: String,
+        sessionID: String,
+        token: UUID?
+    ) -> Bool {
+        guard let state = devices[deviceID],
+              state.watchedSessionIDs.contains(sessionID)
+        else { return false }
+        guard let token else { return true }
+        return state.subscriptionTokenBySessionID[sessionID] == token
     }
 
     private func markSessionPendingObservation(deviceID: String, sessionID: String) {
@@ -795,6 +911,7 @@ actor SessionWatchManager {
                 type: "session_update",
                 sessionID: snapshot.sessionID,
                 seq: seq,
+                seqEpoch: sequenceEpoch,
                 payload: snapshot.payload
             )
             await broadcast(frame, deviceID: deviceID)
@@ -836,6 +953,7 @@ actor SessionWatchManager {
                     type: "session_terminal",
                     sessionID: snapshot.sessionID,
                     seq: seq,
+                    seqEpoch: sequenceEpoch,
                     payload: snapshot.payload
                 )
                 await broadcast(frame, deviceID: deviceID)
@@ -859,6 +977,7 @@ actor SessionWatchManager {
                     type: "session_terminal",
                     sessionID: snapshot.sessionID,
                     seq: seq,
+                    seqEpoch: sequenceEpoch,
                     payload: snapshot.payload
                 )
                 await catchUpSink.sink.send(frame)
@@ -875,6 +994,7 @@ actor SessionWatchManager {
             type: "session_terminal",
             sessionID: snapshot.sessionID,
             seq: seq,
+            seqEpoch: sequenceEpoch,
             payload: snapshot.payload
         )
         await broadcast(frame, deviceID: deviceID)
@@ -1096,6 +1216,7 @@ actor SessionWatchManager {
             type: "interaction_resolved",
             sessionID: snapshot.sessionID,
             seq: nextSeq(deviceID: deviceID, sessionID: snapshot.sessionID),
+            seqEpoch: sequenceEpoch,
             payload: .object(payload)
         )
         await broadcast(frame, deviceID: deviceID)
@@ -1104,6 +1225,7 @@ actor SessionWatchManager {
     private func emitExpired(deviceID: String, sessionID: String) async {
         if var state = devices[deviceID] {
             state.watchedSessionIDs.remove(sessionID)
+            state.subscriptionTokenBySessionID.removeValue(forKey: sessionID)
             state.activeWaitSessionIDs.remove(sessionID)
             state.parkedActionableSessionIDs.remove(sessionID)
             state.parkedTerminalSessionIDs.remove(sessionID)
@@ -1118,6 +1240,7 @@ actor SessionWatchManager {
             type: "session_expired",
             sessionID: sessionID,
             seq: nextSeq(deviceID: deviceID, sessionID: sessionID),
+            seqEpoch: sequenceEpoch,
             payload: .object([
                 "session_id": .string(sessionID),
                 "status": .string("expired")

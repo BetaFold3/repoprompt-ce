@@ -92,6 +92,7 @@ public struct RemoteServerFrame: Codable, Equatable, Sendable {
     public let requestID: String?
     public let sessionID: String?
     public let seq: UInt64?
+    public let seqEpoch: String?
     public let payload: JSONValue?
 
     public init(
@@ -100,6 +101,7 @@ public struct RemoteServerFrame: Codable, Equatable, Sendable {
         requestID: String? = nil,
         sessionID: String? = nil,
         seq: UInt64? = nil,
+        seqEpoch: String? = nil,
         payload: JSONValue? = nil
     ) {
         self.v = v
@@ -107,6 +109,7 @@ public struct RemoteServerFrame: Codable, Equatable, Sendable {
         self.requestID = requestID
         self.sessionID = sessionID
         self.seq = seq
+        self.seqEpoch = seqEpoch
         self.payload = payload
     }
 
@@ -150,6 +153,7 @@ public struct RemoteServerFrame: Codable, Equatable, Sendable {
         case requestID = "request_id"
         case sessionID = "session_id"
         case seq
+        case seqEpoch = "seq_epoch"
         case payload
     }
 }

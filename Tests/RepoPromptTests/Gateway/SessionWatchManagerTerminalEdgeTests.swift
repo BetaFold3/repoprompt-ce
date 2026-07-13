@@ -6,6 +6,14 @@ import RepoPromptRemoteWire
 import XCTest
 
 final class SessionWatchManagerTerminalEdgeTests: XCTestCase {
+    private actor AlwaysEligiblePushNotifier: RemotePushNotifying {
+        func isPushEligible(deviceID _: String) -> Bool {
+            true
+        }
+
+        func sendWake(deviceID _: String, payload _: WebPushWakePayload) {}
+    }
+
     private let deviceID = "device"
     private let sessionID = "11111111-1111-1111-1111-111111111111"
 
@@ -26,6 +34,7 @@ final class SessionWatchManagerTerminalEdgeTests: XCTestCase {
         let frames = await sink.frames
         XCTAssertEqual(frames.count(where: { $0.type == "session_terminal" }), 1)
         XCTAssertEqual(frames.count(where: { $0.type == "session_update" }), 0)
+        XCTAssertTrue(frames.filter { $0.seq != nil }.allSatisfy { $0.seqEpoch != nil })
     }
 
     func testTerminalEdgeRearmsAfterRunningUpdate() async throws {
@@ -218,6 +227,112 @@ final class SessionWatchManagerTerminalEdgeTests: XCTestCase {
         XCTAssertEqual(state.lastEmittedTerminalTranscriptItemCount, 2)
     }
 
+    func testConcurrentSameSessionRegistrationsKeepBothSinksEligible() async throws {
+        let connection = ScriptedAppLinkConnection(poll: [
+            .result(snapshot(status: "running"))
+        ])
+        let (manager, _) = try await makeManager(connection: connection, terminalQuarantineSeconds: 0)
+        let firstSink = RecordingFrameSink()
+        let secondSink = RecordingFrameSink()
+        let firstValidation = await manager.registerSubscription(
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: firstSink,
+            sessionIDs: [sessionID]
+        )
+        _ = await manager.registerSubscription(
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: secondSink,
+            sessionIDs: [sessionID]
+        )
+
+        await manager.validateSubscription(firstValidation)
+
+        let firstFrames = await firstSink.frames
+        let secondFrames = await secondSink.frames
+        await manager.shutdown()
+        XCTAssertTrue(firstFrames.contains { $0.type == "session_update" })
+        XCTAssertTrue(secondFrames.contains { $0.type == "session_update" })
+    }
+
+    func testSinkRemovalDuringDeferredValidationStillStartsDeviceObservation() async throws {
+        let gate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection(responses: [
+            .gated(
+                GatewayTestHelpers.toolResult(
+                    json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")
+                ),
+                gate
+            )
+        ])
+        let notifier = AlwaysEligiblePushNotifier()
+        let (manager, _) = try await makeManager(
+            connection: connection,
+            pushNotifier: notifier,
+            terminalQuarantineSeconds: 0
+        )
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+        let validation = await manager.registerSubscription(
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink,
+            sessionIDs: [sessionID]
+        )
+        let validationTask = Task {
+            await manager.validateSubscription(validation)
+        }
+
+        await gate.waitUntilEntered()
+        await manager.removeSink(deviceID: deviceID, sinkID: sinkID)
+        await gate.release()
+        await validationTask.value
+
+        let state = await manager.debugTerminalState(deviceID: deviceID, sessionID: sessionID)
+        let frames = await sink.frames
+        await manager.shutdown()
+        XCTAssertTrue(state.watched)
+        XCTAssertTrue(state.activeWait)
+        XCTAssertTrue(frames.isEmpty)
+    }
+
+    func testUnsubscribeBeforeDeferredSubscribeValidationDoesNotEmitOrResurrect() async throws {
+        let gate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection(responses: [
+            .gated(
+                GatewayTestHelpers.toolResult(
+                    json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")
+                ),
+                gate
+            )
+        ])
+        let (manager, _) = try await makeManager(connection: connection, terminalQuarantineSeconds: 0)
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+        let validation = await manager.registerSubscription(
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink,
+            sessionIDs: [sessionID]
+        )
+        let validationTask = Task {
+            await manager.validateSubscription(validation)
+        }
+
+        await gate.waitUntilEntered()
+        await manager.unsubscribe(deviceID: deviceID, sessionIDs: [sessionID])
+        await gate.release()
+        await validationTask.value
+
+        let state = await manager.debugTerminalState(deviceID: deviceID, sessionID: sessionID)
+        let frames = await sink.frames
+        await manager.shutdown()
+
+        XCTAssertFalse(state.watched)
+        XCTAssertTrue(frames.isEmpty)
+    }
+
     func testUnsubscribeDuringInFlightWaitDoesNotResurrectSession() async throws {
         let secondSessionID = "22222222-2222-2222-2222-222222222222"
         let gate = RecordingAppLinkResponseGate()
@@ -274,6 +389,7 @@ final class SessionWatchManagerTerminalEdgeTests: XCTestCase {
 
     private func makeManager(
         connection: RecordingAppLinkConnection,
+        pushNotifier: (any RemotePushNotifying)? = nil,
         terminalQuarantineSeconds: TimeInterval
     ) async throws -> (SessionWatchManager, AppLinkSession) {
         let root = try GatewayTestHelpers.temporaryRoot()
@@ -286,6 +402,7 @@ final class SessionWatchManagerTerminalEdgeTests: XCTestCase {
         try await appLink.connect()
         let manager = SessionWatchManager(
             appLink: appLink,
+            pushNotifier: pushNotifier,
             waitTimeoutSeconds: 0.2,
             pollRefreshSeconds: 5,
             revalidationIntervalSeconds: 10,

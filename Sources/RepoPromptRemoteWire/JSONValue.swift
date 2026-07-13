@@ -41,6 +41,7 @@ public enum JSONValue: Codable, Hashable, Sendable {
         if let requestID = frame.requestID { object["request_id"] = .string(requestID) }
         if let sessionID = frame.sessionID { object["session_id"] = .string(sessionID) }
         if let seq = frame.seq { object["seq"] = .int(Int(seq)) }
+        if let seqEpoch = frame.seqEpoch { object["seq_epoch"] = .string(seqEpoch) }
         if let payload = frame.payload { object["payload"] = payload }
         self = .object(object)
     }

@@ -21,6 +21,23 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(decoded.serializationVersion, 6)
     }
 
+    func testRemoteHostBindingSequenceEpochRoundTripsAndLegacyDecodesNil() throws {
+        let binding = makeBinding(seqEpoch: "epoch-1")
+        let roundTripped = try JSONDecoder().decode(
+            AgentSessionRemoteHostBinding.self,
+            from: JSONEncoder().encode(binding)
+        )
+        let legacy = try JSONDecoder().decode(
+            AgentSessionRemoteHostBinding.self,
+            from: Data(
+                #"{"hostID":"host","hostDisplayName":"Host","remoteSessionID":"session","lastAppliedSeq":9,"nextLogOffset":3}"#.utf8
+            )
+        )
+
+        XCTAssertEqual(roundTripped.seqEpoch, "epoch-1")
+        XCTAssertNil(legacy.seqEpoch)
+    }
+
     func testAgentSessionRoundTripsRemoteHostBindingWithoutVersionBump() throws {
         let binding = makeBinding()
         let session = try AgentSession(
@@ -304,6 +321,211 @@ final class RemoteAgentSessionTests: XCTestCase {
         let binding = try XCTUnwrap(currentBinding)
         XCTAssertEqual(binding.lastAppliedSeq, 1)
         XCTAssertEqual(binding.nextLogOffset, 0)
+    }
+
+    func testStartRetainsAdoptedBindingAfterTransientSubscribeFailureAndRecovers() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(
+            responses: [
+                "start": [Self.snapshotPayload(sessionID: "remote-session-recovered")],
+                "poll": [Self.snapshotPayload()],
+                "get_log": [Self.logPayload(offset: 0, returned: 0, total: 0, xml: "<transcript/>")]
+            ],
+            subscribeErrors: [.timeout(operation: "subscribe", seconds: 30)]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: connection
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        let sessionID = try await controller.start(
+            message: "hello",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: nil,
+            workspaceID: nil,
+            workspaceName: nil
+        )
+
+        XCTAssertEqual(sessionID, "remote-session-recovered")
+        let adoptedBinding = await controller.currentBinding()
+        XCTAssertEqual(adoptedBinding?.remoteSessionID, "remote-session-recovered")
+        await waitForRemoteAgentSessionCondition {
+            let subscribeCount = await connection.subscribeCallCount()
+            let pollCount = await connection.commandCount(type: "poll")
+            return subscribeCount >= 2 && pollCount >= 1
+        }
+        let startCount = await connection.commandCount(type: "start")
+        let messages = await recorder.recordedSystemMessages()
+        XCTAssertEqual(startCount, 1)
+        XCTAssertTrue(messages.contains { $0.contains("without resending") })
+        XCTAssertTrue(messages.contains("Remote observation restored."))
+    }
+
+    func testDefinitiveSubscribeFailureStillThrowsAfterPersistingAdoptedBinding() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(
+            responses: [
+                "start": [Self.snapshotPayload(sessionID: "remote-session-bound")]
+            ],
+            subscribeErrors: [
+                .bindingRequired(.init(code: "binding_required", message: "bind first"))
+            ]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+
+        do {
+            _ = try await controller.start(
+                message: "hello",
+                modelSelectionRaw: nil,
+                sessionName: nil,
+                windowID: nil,
+                workspaceID: nil,
+                workspaceName: nil
+            )
+            XCTFail("Expected binding_required to remain a definitive observation failure")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "binding_required")
+        }
+
+        let adoptedBinding = await controller.currentBinding()
+        let startCount = await connection.commandCount(type: "start")
+        XCTAssertEqual(adoptedBinding?.remoteSessionID, "remote-session-bound")
+        XCTAssertEqual(startCount, 1)
+    }
+
+    func testUnsubscribeDuringGatedRecoveryCompensatesStaleSubscription() async throws {
+        let subscribeGate = RemoteSubscribeGate()
+        let connection = RecordingRemoteAgentSessionConnection(
+            responses: [
+                "start": [Self.snapshotPayload(sessionID: "remote-session-recovery-cancel")]
+            ],
+            subscribeErrors: [.timeout(operation: "subscribe", seconds: 30)],
+            subscribeGate: subscribeGate
+        )
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+
+        _ = try await controller.start(
+            message: "hello",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: nil,
+            workspaceID: nil,
+            workspaceName: nil
+        )
+        await subscribeGate.waitUntilEntered()
+
+        await controller.unsubscribe()
+        await subscribeGate.release()
+        await waitForRemoteAgentSessionCondition {
+            await connection.unsubscribeCallCount() >= 2
+        }
+
+        let pollCount = await connection.commandCount(type: "poll")
+        let unsubscribed = await connection.unsubscribedSessionIDBatches()
+        XCTAssertEqual(pollCount, 0)
+        XCTAssertEqual(unsubscribed.last, ["remote-session-recovery-cancel"])
+    }
+
+    func testEpochChangeResetsEventCursorKeepsLogOffsetAndRejectsRetiredEpoch() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "poll": [Self.snapshotPayload()],
+            "get_log": [
+                Self.logPayload(offset: 7, returned: 0, total: 7, xml: "<transcript/>")
+            ]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(lastAppliedSeq: 42, seqEpoch: "epoch-old", nextLogOffset: 7),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-abc",
+            seq: 1,
+            seqEpoch: "epoch-new",
+            payload: Self.snapshotPayload()
+        ))
+
+        var currentBinding = await controller.currentBinding()
+        var binding = try XCTUnwrap(currentBinding)
+        let firstLogOffset = await connection.getLogOffsets().first
+        XCTAssertEqual(binding.seqEpoch, "epoch-new")
+        XCTAssertEqual(binding.lastAppliedSeq, 1)
+        XCTAssertEqual(binding.nextLogOffset, 7)
+        XCTAssertEqual(firstLogOffset, 7)
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-abc",
+            seq: 43,
+            seqEpoch: "epoch-old",
+            payload: Self.snapshotPayload()
+        ))
+
+        currentBinding = await controller.currentBinding()
+        binding = try XCTUnwrap(currentBinding)
+        XCTAssertEqual(binding.seqEpoch, "epoch-new")
+        XCTAssertEqual(binding.lastAppliedSeq, 1)
+    }
+
+    func testPersistedEpochTransitionsToLegacyDomainAndRejectsDelayedRetiredEpoch() async throws {
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "poll": [Self.snapshotPayload()],
+            "get_log": [
+                Self.logPayload(offset: 7, returned: 0, total: 7, xml: "<transcript/>")
+            ]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(lastAppliedSeq: 42, seqEpoch: "epoch-known", nextLogOffset: 7),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-abc",
+            seq: 1,
+            payload: Self.snapshotPayload()
+        ))
+
+        var currentBinding = await controller.currentBinding()
+        var binding = try XCTUnwrap(currentBinding)
+        XCTAssertNil(binding.seqEpoch)
+        XCTAssertEqual(binding.lastAppliedSeq, 1)
+        XCTAssertEqual(binding.nextLogOffset, 7)
+        let pollCount = await connection.commandCount(type: "poll")
+        XCTAssertGreaterThanOrEqual(pollCount, 1)
+
+        await controller.handleInboundFrame(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-abc",
+            seq: 43,
+            seqEpoch: "epoch-known",
+            payload: Self.snapshotPayload()
+        ))
+
+        currentBinding = await controller.currentBinding()
+        binding = try XCTUnwrap(currentBinding)
+        XCTAssertNil(binding.seqEpoch)
+        XCTAssertEqual(binding.lastAppliedSeq, 1)
     }
 
     func testContiguousSessionUpdateTriggersLogFetch() async throws {
@@ -1811,6 +2033,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         hostID: String = "host-abc",
         remoteSessionID: String = "remote-session-abc",
         lastAppliedSeq: UInt64 = 42,
+        seqEpoch: String? = nil,
         nextLogOffset: Int = 7
     ) -> AgentSessionRemoteHostBinding {
         AgentSessionRemoteHostBinding(
@@ -1818,6 +2041,7 @@ final class RemoteAgentSessionTests: XCTestCase {
             hostDisplayName: "Studio Mac",
             remoteSessionID: remoteSessionID,
             lastAppliedSeq: lastAppliedSeq,
+            seqEpoch: seqEpoch,
             nextLogOffset: nextLogOffset
         )
     }
@@ -1927,6 +2151,32 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertTrue(finalResult, "Timed out waiting for remote agent session condition", file: file, line: line)
     }
 
+    private actor RemoteSubscribeGate {
+        private var entered = false
+        private var released = false
+        private var enterWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func waitUntilEntered() async {
+            if entered { return }
+            await withCheckedContinuation { enterWaiters.append($0) }
+        }
+
+        func enterAndWaitForRelease() async {
+            entered = true
+            enterWaiters.forEach { $0.resume() }
+            enterWaiters.removeAll()
+            guard !released else { return }
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+
+        func release() {
+            released = true
+            releaseWaiters.forEach { $0.resume() }
+            releaseWaiters.removeAll()
+        }
+    }
+
     private actor RemoteSessionEventRecorder {
         private var transcriptRows: [[AgentChatItem]] = []
         private var systemMessages: [String] = []
@@ -2023,6 +2273,8 @@ final class RemoteAgentSessionTests: XCTestCase {
         private var responses: [String: [JSONValue]]
         private let getLogDelayNanoseconds: UInt64
         private let commandDelayNanosecondsByType: [String: UInt64]
+        private var subscribeErrors: [RemoteClientError]
+        private let subscribeGate: RemoteSubscribeGate?
         private let unsubscribeError: Error?
         private var frames: [RemoteClientFrame] = []
         private var subscribedSessionIDs: [[String]] = []
@@ -2033,11 +2285,15 @@ final class RemoteAgentSessionTests: XCTestCase {
             responses: [String: [JSONValue]] = [:],
             getLogDelayNanoseconds: UInt64 = 0,
             commandDelayNanosecondsByType: [String: UInt64] = [:],
+            subscribeErrors: [RemoteClientError] = [],
+            subscribeGate: RemoteSubscribeGate? = nil,
             unsubscribeError: Error? = nil
         ) {
             self.responses = responses
             self.getLogDelayNanoseconds = getLogDelayNanoseconds
             self.commandDelayNanosecondsByType = commandDelayNanosecondsByType
+            self.subscribeErrors = subscribeErrors
+            self.subscribeGate = subscribeGate
             self.unsubscribeError = unsubscribeError
         }
 
@@ -2063,6 +2319,14 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func subscribe(sessionIDs: [String]) async throws {
             subscribedSessionIDs.append(sessionIDs)
+            if !subscribeErrors.isEmpty {
+                throw subscribeErrors.removeFirst()
+            }
+            await subscribeGate?.enterAndWaitForRelease()
+        }
+
+        func subscribeCallCount() -> Int {
+            subscribedSessionIDs.count
         }
 
         func unsubscribe(sessionIDs: [String]) async throws {
@@ -2074,6 +2338,10 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func unsubscribedSessionIDBatches() -> [[String]] {
             unsubscribedSessionIDs
+        }
+
+        func unsubscribeCallCount() -> Int {
+            unsubscribedSessionIDs.count
         }
 
         func commandCount(type: String) -> Int {

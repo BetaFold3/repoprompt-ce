@@ -243,6 +243,121 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         return runtime
     }
 
+    func testSubscribeAcknowledgesBeforeDeferredValidationCanEmit() async throws {
+        let gate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection(responses: [
+            .gated(
+                GatewayTestHelpers.toolResult(
+                    json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")
+                ),
+                gate
+            )
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+        let request = RemoteClientFrame(
+            type: "subscribe",
+            requestID: "subscribe-order",
+            sessionID: sessionID
+        )
+
+        let handledResponse = await runtime.handle(
+            request,
+            deviceID: "device",
+            sinkID: sinkID,
+            sink: sink
+        )
+        let response = try XCTUnwrap(handledResponse)
+
+        let callsBeforeAcknowledgment = await connection.calls
+        XCTAssertTrue(callsBeforeAcknowledgment.isEmpty)
+        await sink.send(response)
+        await runtime.didQueueResponse(
+            for: request,
+            response: response,
+            deviceID: "device",
+            sinkID: sinkID
+        )
+        await gate.waitUntilEntered()
+
+        let framesWhileValidationBlocked = await sink.frames
+        XCTAssertEqual(framesWhileValidationBlocked.map(\.type), ["command_result"])
+
+        await gate.release()
+        for _ in 0 ..< 50 {
+            let currentFrames = await sink.frames
+            if currentFrames.contains(where: { $0.type == "session_update" }) {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        let frames = await sink.frames
+        XCTAssertEqual(frames.first?.type, "command_result")
+        XCTAssertTrue(frames.contains { $0.type == "session_update" })
+    }
+
+    func testConcurrentMissingRequestIDSubscriptionsKeepPerSinkValidation() async throws {
+        let otherSessionID = "22222222-2222-2222-2222-222222222222"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")
+            )),
+            .result(GatewayTestHelpers.toolResult(
+                json: GatewayTestHelpers.snapshot(sessionID: otherSessionID, status: "running")
+            ))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+        let firstSink = RecordingFrameSink()
+        let secondSink = RecordingFrameSink()
+        let firstSinkID = UUID()
+        let secondSinkID = UUID()
+        let firstRequest = RemoteClientFrame(type: "subscribe", sessionID: sessionID)
+        let secondRequest = RemoteClientFrame(type: "subscribe", sessionID: otherSessionID)
+
+        let firstHandled = await runtime.handle(
+            firstRequest,
+            deviceID: "device",
+            sinkID: firstSinkID,
+            sink: firstSink
+        )
+        let secondHandled = await runtime.handle(
+            secondRequest,
+            deviceID: "device",
+            sinkID: secondSinkID,
+            sink: secondSink
+        )
+        let firstResponse = try XCTUnwrap(firstHandled)
+        let secondResponse = try XCTUnwrap(secondHandled)
+        await firstSink.send(firstResponse)
+        await secondSink.send(secondResponse)
+        await runtime.didQueueResponse(
+            for: firstRequest,
+            response: firstResponse,
+            deviceID: "device",
+            sinkID: firstSinkID
+        )
+        await runtime.didQueueResponse(
+            for: secondRequest,
+            response: secondResponse,
+            deviceID: "device",
+            sinkID: secondSinkID
+        )
+
+        var calls = await connection.calls
+        for _ in 0 ..< 50 where calls.count < 2 {
+            try? await Task.sleep(for: .milliseconds(20))
+            calls = await connection.calls
+        }
+        let polledSessionIDs = Set(calls.compactMap { call -> String? in
+            guard call.name == "agent_run",
+                  call.arguments["op"] == .string("poll")
+            else { return nil }
+            return call.arguments["session_id"]?.stringValue
+        })
+        XCTAssertEqual(polledSessionIDs, Set([sessionID, otherSessionID]))
+    }
+
     func testSubscribeOnUnboundConnectionReturnsBindingRequiredWithWindows() async throws {
         let connection = RecordingAppLinkConnection(responses: [
             .result(windowListResponse())
@@ -318,15 +433,31 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
         let sink = RecordingFrameSink()
 
+        let request = RemoteClientFrame(type: "subscribe", requestID: "r1", sessionID: sessionID)
+        let sinkID = UUID()
         let response = await runtime.handle(
-            RemoteClientFrame(type: "subscribe", requestID: "r1", sessionID: sessionID),
+            request,
             deviceID: "device",
-            sinkID: UUID(),
+            sinkID: sinkID,
             sink: sink
         )
 
-        XCTAssertEqual(response?.type, "command_result")
-        let calls = await connection.calls
+        let responseFrame = try XCTUnwrap(response)
+        XCTAssertEqual(responseFrame.type, "command_result")
+        await sink.send(responseFrame)
+        await runtime.didQueueResponse(
+            for: request,
+            response: responseFrame,
+            deviceID: "device",
+            sinkID: sinkID
+        )
+        var calls = await connection.calls
+        for _ in 0 ..< 50 where !calls.contains(where: {
+            $0.name == "agent_run" && $0.arguments["op"] == .string("poll")
+        }) {
+            try? await Task.sleep(for: .milliseconds(20))
+            calls = await connection.calls
+        }
         let poll = try XCTUnwrap(calls.last { $0.name == "agent_run" && $0.arguments["op"] == .string("poll") })
         XCTAssertEqual(poll.arguments["_windowID"], .int(2))
     }
@@ -1511,11 +1642,20 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         let sink = RecordingFrameSink()
         let sinkID = UUID()
 
-        _ = await runtime.handle(
-            RemoteClientFrame(type: "subscribe", requestID: "r1", sessionID: sessionID),
+        let subscribeRequest = RemoteClientFrame(type: "subscribe", requestID: "r1", sessionID: sessionID)
+        let handledSubscribeResponse = await runtime.handle(
+            subscribeRequest,
             deviceID: "device",
             sinkID: sinkID,
             sink: sink
+        )
+        let subscribeResponse = try XCTUnwrap(handledSubscribeResponse)
+        await sink.send(subscribeResponse)
+        await runtime.didQueueResponse(
+            for: subscribeRequest,
+            response: subscribeResponse,
+            deviceID: "device",
+            sinkID: sinkID
         )
         _ = await waitForSessionUpdateCount(1, sink: sink)
 

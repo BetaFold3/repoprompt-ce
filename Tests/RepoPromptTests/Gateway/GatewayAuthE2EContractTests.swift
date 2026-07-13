@@ -209,6 +209,74 @@ final class GatewayAuthE2EContractTests: XCTestCase {
         try await assertAuditContains(code: "insufficient_scope", deviceID: device.deviceID)
     }
 
+    func testSubscribeAcknowledgmentReleasesAuthenticatedFIFOBeforeDeferredCatchUp() async throws {
+        let ticket = try GatewayAuthTestSupport.mintTicket(
+            hostSigner: hostSigner,
+            deviceID: device.deviceID,
+            scopes: [GatewayRemoteScope.sessionsObserve]
+        )
+        let socket = openSocket()
+        defer { socket.cancel(with: .normalClosure, reason: nil) }
+        let helloAck = try await performTicketHello(socket, ticket: ticket, deviceKey: device.signer)
+        XCTAssertEqual(helloAck.type, "hello_ack")
+
+        let appConnection = try XCTUnwrap(connector.connection(for: device.deviceID))
+        let validationGate = RecordingAppLinkResponseGate()
+        await appConnection.enqueue(.gated(
+            GatewayTestHelpers.toolResult(
+                json: GatewayTestHelpers.snapshot(sessionID: "session-a", status: "running")
+            ),
+            validationGate
+        ))
+        await appConnection.enqueue(.result(GatewayTestHelpers.toolResult(json: .object([
+            "session_id": .string("session-a"),
+            "offset": .int(0),
+            "limit": .int(20),
+            "returned_turn_count": .int(0),
+            "total_turns": .int(0),
+            "transcript": .string("<transcript/>")
+        ]))))
+
+        let subscribe = try GatewayAuthTestSupport.signedFrameData(
+            object: GatewayAuthTestSupport.frameObject(
+                type: "subscribe",
+                requestID: "req-subscribe",
+                sessionID: "session-a"
+            ),
+            ticketID: ticket.ticketID,
+            deviceID: device.deviceID,
+            counter: 2,
+            deviceKey: device.signer
+        )
+        try await send(subscribe, over: socket)
+        let subscribeResult = try await receiveFrame(socket)
+        XCTAssertEqual(subscribeResult.type, "command_result")
+        XCTAssertEqual(subscribeResult.requestID, "req-subscribe")
+        await validationGate.waitUntilEntered()
+
+        let getLog = try GatewayAuthTestSupport.signedFrameData(
+            object: GatewayAuthTestSupport.frameObject(
+                type: "get_log",
+                requestID: "req-get-log",
+                sessionID: "session-a",
+                payload: .object(["offset": .int(0), "limit": .int(20)])
+            ),
+            ticketID: ticket.ticketID,
+            deviceID: device.deviceID,
+            counter: 3,
+            deviceKey: device.signer
+        )
+        try await send(getLog, over: socket)
+        let getLogResult = try await receiveFrame(socket)
+        XCTAssertEqual(getLogResult.type, "command_result")
+        XCTAssertEqual(getLogResult.requestID, "req-get-log")
+
+        await validationGate.release()
+        let update = try await receiveFrame(socket)
+        XCTAssertEqual(update.type, "session_update")
+        XCTAssertEqual(update.sessionID, "session-a")
+    }
+
     func testOneTimeTicketCannotBeReusedForASecondConnection() async throws {
         let ticket = try GatewayAuthTestSupport.mintTicket(
             hostSigner: hostSigner,
@@ -343,9 +411,16 @@ private final class E2EPoolConnector: AppLinkConnecting, @unchecked Sendable {
     private let lock = NSLock()
     private let capacityRejectedClientName: String
     private(set) var connectedClientNames: [String] = []
+    private var connectionsByClientName: [String: RecordingAppLinkConnection] = [:]
 
     init(capacityRejectedClientName: String) {
         self.capacityRejectedClientName = capacityRejectedClientName
+    }
+
+    func connection(for clientName: String) -> RecordingAppLinkConnection? {
+        lock.lock()
+        defer { lock.unlock() }
+        return connectionsByClientName[clientName]
     }
 
     func connect(
@@ -356,9 +431,11 @@ private final class E2EPoolConnector: AppLinkConnecting, @unchecked Sendable {
         if clientName == capacityRejectedClientName {
             throw AppLinkError.handshakeRejected(errorCode: "capacity_exceeded", reason: "Server at capacity")
         }
+        let connection = RecordingAppLinkConnection()
         lock.lock()
         connectedClientNames.append(clientName)
+        connectionsByClientName[clientName] = connection
         lock.unlock()
-        return RecordingAppLinkConnection()
+        return connection
     }
 }

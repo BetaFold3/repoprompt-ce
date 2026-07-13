@@ -4,12 +4,20 @@ import MCP
 import RepoPromptRemoteWire
 
 protocol RemoteFrameSink: Sendable {
+    /// Returns after the frame has been accepted into the sink's ordered outbound queue.
     func send(_ frame: RemoteServerFrame) async
     func close() async
 }
 
 actor RemoteGatewayRuntime {
     static let phase0DeviceID = "phase0:static-token"
+
+    private struct SubscriptionValidationKey: Hashable {
+        let deviceID: String
+        let sinkID: UUID
+        let requestID: String?
+        let sessionIDs: [String]
+    }
 
     private struct EligibleStartTargetWindowSummary {
         let windowID: Int
@@ -62,6 +70,9 @@ actor RemoteGatewayRuntime {
     private var workspaceMatchCountByCommandKey: [String: Int] = [:]
     private var workspaceStartMatchSkippedByCommandKey: [String: String] = [:]
     private var workspaceMatchUnavailableReasonByCommandKey: [String: String] = [:]
+    private var pendingSubscriptionValidations: [
+        SubscriptionValidationKey: [SessionWatchManager.SubscriptionValidation]
+    ] = [:]
 
     init(
         appLink: AppLinkSession,
@@ -101,6 +112,41 @@ actor RemoteGatewayRuntime {
             reason: reason,
             message: "This remote device is no longer trusted by the RepoPrompt app."
         )
+    }
+
+    /// Starts work that must be ordered after a correlated response is queued.
+    /// Validation runs in a child task so authenticated frame admission is released.
+    func didQueueResponse(
+        for request: RemoteClientFrame,
+        response: RemoteServerFrame,
+        deviceID: String,
+        sinkID: UUID
+    ) {
+        guard request.type == "subscribe" else { return }
+        let sessionIDs = (try? sessionIDs(from: request)) ?? []
+        let key = subscriptionValidationKey(
+            deviceID: deviceID,
+            sinkID: sinkID,
+            requestID: request.requestID,
+            sessionIDs: sessionIDs
+        )
+        guard response.type == "command_result",
+              var validations = pendingSubscriptionValidations[key],
+              !validations.isEmpty
+        else {
+            pendingSubscriptionValidations.removeValue(forKey: key)
+            return
+        }
+        let validation = validations.removeFirst()
+        if validations.isEmpty {
+            pendingSubscriptionValidations.removeValue(forKey: key)
+        } else {
+            pendingSubscriptionValidations[key] = validations
+        }
+        let watchManager = watchManager
+        Task {
+            await watchManager.validateSubscription(validation)
+        }
     }
 
     func handle(
@@ -153,7 +199,19 @@ actor RemoteGatewayRuntime {
         }
         do {
             let ids = try sessionIDs(from: frame)
-            await watchManager.subscribe(deviceID: deviceID, sinkID: sinkID, sink: sink, sessionIDs: ids)
+            let validation = await watchManager.registerSubscription(
+                deviceID: deviceID,
+                sinkID: sinkID,
+                sink: sink,
+                sessionIDs: ids
+            )
+            let validationKey = subscriptionValidationKey(
+                deviceID: deviceID,
+                sinkID: sinkID,
+                requestID: frame.requestID,
+                sessionIDs: ids
+            )
+            pendingSubscriptionValidations[validationKey, default: []].append(validation)
             audit(frame: frame, deviceID: deviceID, outcome: "success")
             return .commandResult(
                 requestID: frame.requestID,
@@ -179,6 +237,20 @@ actor RemoteGatewayRuntime {
                 message: String(describing: error)
             )
         }
+    }
+
+    private func subscriptionValidationKey(
+        deviceID: String,
+        sinkID: UUID,
+        requestID: String?,
+        sessionIDs: [String]
+    ) -> SubscriptionValidationKey {
+        SubscriptionValidationKey(
+            deviceID: deviceID,
+            sinkID: sinkID,
+            requestID: requestID,
+            sessionIDs: sessionIDs.sorted()
+        )
     }
 
     private func handleUnsubscribe(_ frame: RemoteClientFrame, deviceID: String) async -> RemoteServerFrame {

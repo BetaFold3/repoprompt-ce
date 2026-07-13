@@ -131,6 +131,7 @@ struct AgentSessionRemoteHostBinding: Codable, Equatable {
     var hostDisplayName: String
     var remoteSessionID: String
     var lastAppliedSeq: UInt64
+    var seqEpoch: String?
     var nextLogOffset: Int
 
     var normalizedRemoteSessionID: String? {
@@ -143,12 +144,14 @@ struct AgentSessionRemoteHostBinding: Codable, Equatable {
         hostDisplayName: String,
         remoteSessionID: String,
         lastAppliedSeq: UInt64 = 0,
+        seqEpoch: String? = nil,
         nextLogOffset: Int = 0
     ) {
         self.hostID = hostID
         self.hostDisplayName = hostDisplayName
         self.remoteSessionID = remoteSessionID
         self.lastAppliedSeq = lastAppliedSeq
+        self.seqEpoch = seqEpoch
         self.nextLogOffset = nextLogOffset
     }
 }

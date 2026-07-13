@@ -77,11 +77,18 @@ actor RemoteAgentSessionController {
     private let eventsContinuation: AsyncStream<RemoteSessionEvent>.Continuation
     private var remoteSessionID: String?
     private var lastAppliedSeq: UInt64
+    private var seqEpoch: String?
+    private var retiredSeqEpochs: Set<String> = []
     private var nextLogOffset: Int
     private var projector: RemoteTranscriptProjector?
     private var lastKnownRunState: AgentSessionRunState = .idle
     private var scheduledLogCatchUpTask: Task<Void, Never>?
     private var scheduledLogCatchUpDirty = false
+    private var observationRecoveryTask: Task<Void, Never>?
+    private var observationRecoveryGeneration: UUID?
+    private var observationLifecycleGeneration = UUID()
+    private var observationEnabled = true
+    private var didReportObservationFailure = false
     private var didReportLogCatchUpFailure = false
     private var didYieldSessionExpired = false
     private var didTerminalSettleReRead = false
@@ -99,6 +106,7 @@ actor RemoteAgentSessionController {
         remoteSessionID = binding.remoteSessionID.isEmpty ? nil : binding.remoteSessionID
         lastKnownRunState = binding.remoteSessionID.isEmpty ? .idle : .completed
         lastAppliedSeq = binding.lastAppliedSeq
+        seqEpoch = Self.normalizedSequenceEpoch(binding.seqEpoch)
         nextLogOffset = binding.nextLogOffset
         self.connection = connection
         if !binding.remoteSessionID.isEmpty {
@@ -118,7 +126,12 @@ actor RemoteAgentSessionController {
     func shutdown() {
         guard !isShutdown else { return }
         isShutdown = true
+        observationEnabled = false
+        observationLifecycleGeneration = UUID()
         scheduledLogCatchUpTask?.cancel()
+        observationRecoveryTask?.cancel()
+        observationRecoveryTask = nil
+        observationRecoveryGeneration = nil
         eventsContinuation.finish()
     }
 
@@ -131,6 +144,12 @@ actor RemoteAgentSessionController {
         workspaceName: String?
     ) async throws -> String {
         try ensureNotShutdown()
+        observationRecoveryTask?.cancel()
+        observationRecoveryTask = nil
+        observationRecoveryGeneration = nil
+        observationEnabled = true
+        observationLifecycleGeneration = UUID()
+        let observationGeneration = observationLifecycleGeneration
         var payload: [String: JSONValue] = [
             "message": .string(message),
             "detach": .bool(true)
@@ -157,6 +176,8 @@ actor RemoteAgentSessionController {
         let didResetCursor = sessionID != remoteSessionID
         if didResetCursor {
             lastAppliedSeq = 0
+            seqEpoch = nil
+            retiredSeqEpochs.removeAll()
             nextLogOffset = 0
             scheduledLogCatchUpDirty = false
             didReportLogCatchUpFailure = false
@@ -169,16 +190,20 @@ actor RemoteAgentSessionController {
         Self.logger.notice("remote start response adopted request_id=\(frame.requestID ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) did_reset_cursor=\(didResetCursor)")
         projector = RemoteTranscriptProjector(remoteSessionID: sessionID)
         emitBinding()
-        do {
-            try await connection.subscribe(sessionIDs: [sessionID])
-            Self.logger.notice("remote subscribe succeeded session_id=\(sessionID, privacy: .public)")
-        } catch {
-            let errorLogMetadata = Self.errorLogMetadata(error)
-            Self.logger.notice("remote subscribe failed session_id=\(sessionID, privacy: .public) error_type=\(errorLogMetadata.type, privacy: .public) error_code=\(errorLogMetadata.code, privacy: .public) error_description=\(errorLogMetadata.description, privacy: .private)")
-            throw error
-        }
         applySnapshot(response, frameType: "session_update")
-        try await catchUpFromHost()
+        do {
+            guard try await observeAndCatchUp(
+                sessionID: sessionID,
+                generation: observationGeneration
+            ) else { return sessionID }
+        } catch {
+            guard isObservationCurrent(generation: observationGeneration, sessionID: sessionID) else {
+                return sessionID
+            }
+            guard Self.isTransientObservationFailure(error) else { throw error }
+            reportObservationDegraded(error, sessionID: sessionID)
+            scheduleObservationRecovery(for: sessionID, lifecycleGeneration: observationGeneration)
+        }
         return sessionID
     }
 
@@ -237,15 +262,21 @@ actor RemoteAgentSessionController {
         if projector == nil {
             projector = RemoteTranscriptProjector(remoteSessionID: sessionID)
         }
+        let observationGeneration = observationLifecycleGeneration
+        guard observationEnabled else { return }
         do {
-            try await connection.subscribe(sessionIDs: [sessionID])
-            Self.logger.notice("remote subscribe succeeded session_id=\(sessionID, privacy: .public)")
+            guard try await observeAndCatchUp(
+                sessionID: sessionID,
+                generation: observationGeneration
+            ) else { return }
         } catch {
-            let errorLogMetadata = Self.errorLogMetadata(error)
-            Self.logger.notice("remote subscribe failed session_id=\(sessionID, privacy: .public) error_type=\(errorLogMetadata.type, privacy: .public) error_code=\(errorLogMetadata.code, privacy: .public) error_description=\(errorLogMetadata.description, privacy: .private)")
-            throw error
+            guard isObservationCurrent(generation: observationGeneration, sessionID: sessionID) else {
+                return
+            }
+            guard Self.isTransientObservationFailure(error) else { throw error }
+            reportObservationDegraded(error, sessionID: sessionID)
+            scheduleObservationRecovery(for: sessionID, lifecycleGeneration: observationGeneration)
         }
-        try await catchUpFromHost()
     }
 
     func listSessions(parentSessionID: String) async throws -> [RemoteAgentSessionDescriptor] {
@@ -275,11 +306,17 @@ actor RemoteAgentSessionController {
             hostDisplayName: hostDisplayName,
             remoteSessionID: remoteSessionID,
             lastAppliedSeq: lastAppliedSeq,
+            seqEpoch: seqEpoch,
             nextLogOffset: nextLogOffset
         )
     }
 
     func unsubscribe() async {
+        observationEnabled = false
+        observationLifecycleGeneration = UUID()
+        observationRecoveryTask?.cancel()
+        observationRecoveryTask = nil
+        observationRecoveryGeneration = nil
         guard let sessionID = remoteSessionID?.trimmingCharacters(in: .whitespacesAndNewlines), !sessionID.isEmpty else {
             return
         }
@@ -310,6 +347,41 @@ actor RemoteAgentSessionController {
             return
         }
         if let seq = frame.seq {
+            let incomingEpoch = Self.normalizedSequenceEpoch(frame.seqEpoch)
+            var shouldForceEpochCatchUp = false
+            if let currentEpoch = seqEpoch {
+                if let incomingEpoch {
+                    if incomingEpoch != currentEpoch {
+                        if retiredSeqEpochs.contains(incomingEpoch) {
+                            logInboundFrameDrop(frame, reason: "retired_seq_epoch")
+                            return
+                        }
+                        retiredSeqEpochs.insert(currentEpoch)
+                        seqEpoch = incomingEpoch
+                        lastAppliedSeq = 0
+                        shouldForceEpochCatchUp = true
+                        emitBinding()
+                    }
+                } else {
+                    retiredSeqEpochs.insert(currentEpoch)
+                    seqEpoch = nil
+                    lastAppliedSeq = 0
+                    shouldForceEpochCatchUp = true
+                    emitBinding()
+                }
+            } else if let incomingEpoch {
+                if retiredSeqEpochs.contains(incomingEpoch) {
+                    logInboundFrameDrop(frame, reason: "retired_seq_epoch")
+                    return
+                }
+                shouldForceEpochCatchUp = lastAppliedSeq > 0
+                seqEpoch = incomingEpoch
+                lastAppliedSeq = 0
+                emitBinding()
+            }
+            if shouldForceEpochCatchUp {
+                await catchUpFromHostReportingFailures()
+            }
             if seq <= lastAppliedSeq {
                 logInboundFrameDrop(frame, reason: "seq_gated")
                 return
@@ -369,6 +441,141 @@ actor RemoteAgentSessionController {
             eventsContinuation.yield(.channel(.init(kind: .revoked)))
         case .idle, .mintingTicket, .connecting:
             break
+        }
+    }
+
+    private func observeAndCatchUp(sessionID: String, generation: UUID) async throws -> Bool {
+        guard isObservationCurrent(generation: generation, sessionID: sessionID) else { return false }
+        do {
+            try await connection.subscribe(sessionIDs: [sessionID])
+        } catch {
+            guard isObservationCurrent(generation: generation, sessionID: sessionID) else {
+                return false
+            }
+            throw error
+        }
+        guard isObservationCurrent(generation: generation, sessionID: sessionID) else {
+            await compensateStaleObservationSubscription(sessionID: sessionID)
+            return false
+        }
+        Self.logger.notice("remote subscribe succeeded session_id=\(sessionID, privacy: .public)")
+        do {
+            try await catchUpFromHost()
+        } catch {
+            guard isObservationCurrent(generation: generation, sessionID: sessionID) else {
+                await compensateStaleObservationSubscription(sessionID: sessionID)
+                return false
+            }
+            throw error
+        }
+        guard isObservationCurrent(generation: generation, sessionID: sessionID) else {
+            await compensateStaleObservationSubscription(sessionID: sessionID)
+            return false
+        }
+        if didReportObservationFailure {
+            eventsContinuation.yield(.systemMessage("Remote observation restored."))
+        }
+        didReportObservationFailure = false
+        return true
+    }
+
+    private func isObservationCurrent(generation: UUID, sessionID: String) -> Bool {
+        observationEnabled
+            && observationLifecycleGeneration == generation
+            && remoteSessionID == sessionID
+            && !isShutdown
+    }
+
+    private func compensateStaleObservationSubscription(sessionID: String) async {
+        do {
+            try await connection.unsubscribe(sessionIDs: [sessionID])
+        } catch {
+            Self.logger.debug("remote stale observation compensation failed session_id=\(sessionID, privacy: .public) error=\(String(describing: error), privacy: .public)")
+        }
+    }
+
+    private func scheduleObservationRecovery(for sessionID: String, lifecycleGeneration: UUID) {
+        guard isObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID),
+              observationRecoveryTask == nil
+        else { return }
+        let generation = UUID()
+        observationRecoveryGeneration = generation
+        observationRecoveryTask = Task { [weak self] in
+            await self?.runObservationRecovery(
+                for: sessionID,
+                generation: generation,
+                lifecycleGeneration: lifecycleGeneration
+            )
+        }
+    }
+
+    private func runObservationRecovery(
+        for sessionID: String,
+        generation: UUID,
+        lifecycleGeneration: UUID
+    ) async {
+        defer {
+            if observationRecoveryGeneration == generation {
+                observationRecoveryTask = nil
+                observationRecoveryGeneration = nil
+            }
+        }
+        for attempt in 1 ... 3 {
+            guard !Task.isCancelled,
+                  isObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+            else { return }
+            if attempt > 1 {
+                let delayMilliseconds = 250 * (1 << (attempt - 2))
+                do {
+                    try await Task.sleep(for: .milliseconds(delayMilliseconds))
+                } catch {
+                    return
+                }
+            }
+            do {
+                guard try await observeAndCatchUp(
+                    sessionID: sessionID,
+                    generation: lifecycleGeneration
+                ) else { return }
+                return
+            } catch {
+                guard isObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID) else {
+                    return
+                }
+                guard Self.isTransientObservationFailure(error) else {
+                    reportObservationRecoveryStopped(error, sessionID: sessionID)
+                    return
+                }
+                if attempt == 3 {
+                    reportObservationRecoveryStopped(error, sessionID: sessionID)
+                }
+            }
+        }
+    }
+
+    private func reportObservationDegraded(_ error: Error, sessionID: String) {
+        let errorLogMetadata = Self.errorLogMetadata(error)
+        Self.logger.notice("remote observation degraded session_id=\(sessionID, privacy: .public) error_type=\(errorLogMetadata.type, privacy: .public) error_code=\(errorLogMetadata.code, privacy: .public) error_description=\(errorLogMetadata.description, privacy: .private)")
+        guard !didReportObservationFailure else { return }
+        didReportObservationFailure = true
+        eventsContinuation.yield(.systemMessage(
+            "Remote session was accepted, but observation is degraded. Retrying without resending your message."
+        ))
+    }
+
+    private func reportObservationRecoveryStopped(_ error: Error, sessionID: String) {
+        let errorLogMetadata = Self.errorLogMetadata(error)
+        Self.logger.notice("remote observation recovery stopped session_id=\(sessionID, privacy: .public) error_type=\(errorLogMetadata.type, privacy: .public) error_code=\(errorLogMetadata.code, privacy: .public) error_description=\(errorLogMetadata.description, privacy: .private)")
+        eventsContinuation.yield(.systemMessage("Remote observation recovery failed: \(error)"))
+    }
+
+    private static func isTransientObservationFailure(_ error: Error) -> Bool {
+        guard let remoteError = error as? RemoteClientError else { return false }
+        return switch remoteError {
+        case .timeout, .transport, .connectionClosed, .rateLimited:
+            true
+        default:
+            false
         }
     }
 
@@ -718,6 +925,13 @@ actor RemoteAgentSessionController {
             ""
         }
         return (String(describing: Swift.type(of: error)), code, String(describing: error))
+    }
+
+    private static func normalizedSequenceEpoch(_ epoch: String?) -> String? {
+        guard let epoch = epoch?.trimmingCharacters(in: .whitespacesAndNewlines), !epoch.isEmpty else {
+            return nil
+        }
+        return epoch
     }
 
     private static func remoteSessionID(from payload: JSONValue) throws -> String {

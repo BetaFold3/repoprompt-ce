@@ -92,6 +92,9 @@ actor RemoteHostConnection {
     private var pendingCommands: [String: PendingCommand] = [:]
     private var desiredSubscriptions: Set<String> = []
     private var parkedSubscriptions: Set<String> = []
+    private var acknowledgedSubscriptions: Set<String> = []
+    private var subscriptionReconciliationInFlight = false
+    private var subscriptionReconciliationWaiters: [CheckedContinuation<Void, Never>] = []
     private var connectedHostName: String?
     private var connectedScopes: Set<String> = []
     private var reconnectBackoff: TimeInterval
@@ -203,10 +206,8 @@ actor RemoteHostConnection {
         desiredSubscriptions.formUnion(normalized)
         parkedSubscriptions.subtract(normalized)
         try await ensureConnected()
-        desiredSubscriptions.formUnion(normalized)
-        parkedSubscriptions.subtract(normalized)
         try await reconcileDesiredSubscriptions(throwingFor: normalized)
-        let missing = normalized.subtracting(desiredSubscriptions)
+        let missing = normalized.subtracting(acknowledgedSubscriptions)
         if !missing.isEmpty {
             throw RemoteClientError.fromCommandError(
                 code: "binding_required",
@@ -222,6 +223,7 @@ actor RemoteHostConnection {
         parkedSubscriptions.subtract(normalized)
         guard case .connected = state, webSocketTask != nil else { return }
         _ = try await sendUnsubscribeCommand(sessionIDs: normalized.sorted())
+        acknowledgedSubscriptions.subtract(normalized)
     }
 
     func testConnection(timeout: TimeInterval = RemoteHostConnection.connectTimeout) async throws -> RemoteHostConnectionTestResult {
@@ -266,6 +268,7 @@ actor RemoteHostConnection {
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.connectionClosed)
         transition(to: .idle)
     }
@@ -299,8 +302,13 @@ actor RemoteHostConnection {
             parkedSubscriptions.sorted()
         }
 
+        func acknowledgedSubscriptionsForTesting() -> [String] {
+            acknowledgedSubscriptions.sorted()
+        }
+
         func setDesiredSubscriptionsForTesting(_ sessionIDs: [String]) {
             desiredSubscriptions = Self.normalizedSessionIDs(sessionIDs)
+            acknowledgedSubscriptions.removeAll()
         }
 
         func setSubscribeCommandHandlerForTesting(
@@ -382,6 +390,7 @@ actor RemoteHostConnection {
             lastCounter: counterFloor(for: record)
         )
         let webSocketURL = try Self.webSocketURL(for: record.gatewayURL)
+        acknowledgedSubscriptions.removeAll()
         let task = webSocketSession.webSocketTask(with: webSocketURL)
         transition(to: .connecting)
         task.resume()
@@ -541,23 +550,37 @@ actor RemoteHostConnection {
     }
 
     private func reconcileDesiredSubscriptions(throwingFor requestedSessionIDs: Set<String>) async throws {
-        let desired = desiredSubscriptions.sorted()
-        guard !desired.isEmpty else { return }
+        await acquireSubscriptionReconciliationPermit()
+        defer { releaseSubscriptionReconciliationPermit() }
+
+        let pending = desiredSubscriptions.subtracting(acknowledgedSubscriptions)
+        guard !pending.isEmpty else { return }
         do {
-            _ = try await sendSubscribeCommand(sessionIDs: desired)
+            _ = try await sendSubscribeCommand(sessionIDs: pending.sorted())
+            let stillDesired = pending.intersection(desiredSubscriptions)
+            acknowledgedSubscriptions.formUnion(stillDesired)
+            parkedSubscriptions.subtract(stillDesired)
         } catch {
             guard Self.isBindingRequired(error) else { throw error }
-            try await subscribeIndividuallyAfterBindingRequired(throwingFor: requestedSessionIDs)
+            try await subscribeIndividuallyAfterBindingRequired(
+                sessionIDs: pending,
+                throwingFor: requestedSessionIDs
+            )
         }
     }
 
-    private func subscribeIndividuallyAfterBindingRequired(throwingFor requestedSessionIDs: Set<String>) async throws {
-        let desired = desiredSubscriptions.sorted()
+    private func subscribeIndividuallyAfterBindingRequired(
+        sessionIDs: Set<String>,
+        throwingFor requestedSessionIDs: Set<String>
+    ) async throws {
         var retained: Set<String> = []
         var requestedFailure: Error?
-        for sessionID in desired {
+        for sessionID in sessionIDs.sorted() {
+            guard desiredSubscriptions.contains(sessionID) else { continue }
             do {
                 _ = try await sendSubscribeCommand(sessionIDs: [sessionID])
+                guard desiredSubscriptions.contains(sessionID) else { continue }
+                acknowledgedSubscriptions.insert(sessionID)
                 retained.insert(sessionID)
             } catch {
                 if !Self.isCommandLevel(error) { throw error }
@@ -566,13 +589,32 @@ actor RemoteHostConnection {
                 }
             }
         }
-        let failed = Set(desired).subtracting(retained)
+        let failed = sessionIDs.subtracting(retained)
         let stillDesiredFailures = failed.intersection(desiredSubscriptions)
         desiredSubscriptions.subtract(stillDesiredFailures)
+        acknowledgedSubscriptions.subtract(stillDesiredFailures)
         parkedSubscriptions.formUnion(stillDesiredFailures)
         parkedSubscriptions.subtract(retained)
         if let requestedFailure {
             throw requestedFailure
+        }
+    }
+
+    private func acquireSubscriptionReconciliationPermit() async {
+        if !subscriptionReconciliationInFlight {
+            subscriptionReconciliationInFlight = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            subscriptionReconciliationWaiters.append(continuation)
+        }
+    }
+
+    private func releaseSubscriptionReconciliationPermit() {
+        if subscriptionReconciliationWaiters.isEmpty {
+            subscriptionReconciliationInFlight = false
+        } else {
+            subscriptionReconciliationWaiters.removeFirst().resume()
         }
     }
 
@@ -757,6 +799,7 @@ actor RemoteHostConnection {
                 signer = nil
                 connectedScopes = []
                 connectedHostName = nil
+                acknowledgedSubscriptions.removeAll()
                 readTask?.cancel()
                 readTask = nil
                 scheduleReconnectIfNeeded(reason: code)
@@ -794,6 +837,7 @@ actor RemoteHostConnection {
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.connectionClosed)
         guard hasTrackedSubscriptions else {
             transition(to: .idle)
@@ -854,6 +898,7 @@ actor RemoteHostConnection {
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.hostRevoked(hostID))
         transition(to: .revoked)
     }

@@ -167,6 +167,36 @@ final class RemoteHostConnectionTests: XCTestCase {
         await connection.disconnect()
     }
 
+    func testSequentialSubscribeSendsOnlyDeltaAndReconnectReplaysFullDesiredSet() async throws {
+        let record = try upsertClientRecord()
+        await enqueueTicket()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        try await connection.ensureConnected()
+        let attempts = SubscribeAttemptRecorder()
+        await connection.setSubscribeCommandHandlerForTesting { sessionIDs in
+            await attempts.record(sessionIDs)
+            return .object([:])
+        }
+
+        try await connection.subscribe(sessionIDs: ["session-a"])
+        try await connection.subscribe(sessionIDs: ["session-b"])
+        try await connection.subscribe(sessionIDs: ["session-a"])
+
+        var subscribeAttempts = await attempts.all()
+        let acknowledged = await connection.acknowledgedSubscriptionsForTesting()
+        XCTAssertEqual(subscribeAttempts, [["session-a"], ["session-b"]])
+        XCTAssertEqual(acknowledged, ["session-a", "session-b"])
+
+        await connection.disconnect()
+        await enqueueTicket()
+        try await connection.ensureConnected()
+
+        subscribeAttempts = await attempts.all()
+        XCTAssertEqual(subscribeAttempts.last, ["session-a", "session-b"])
+        XCTAssertEqual(subscribeAttempts.count, 3)
+        await connection.disconnect()
+    }
+
     func testSubscribeBindingRequiredFallsBackPerSessionAndPrunesFailures() async throws {
         let record = try upsertClientRecord()
         await enqueueTicket()

@@ -644,6 +644,12 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
                 Task {
                     if let response = await runtime.handle(frame, deviceID: deviceID, sinkID: sinkID, sink: sink) {
                         await sink.send(response)
+                        await runtime.didQueueResponse(
+                            for: frame,
+                            response: response,
+                            deviceID: deviceID,
+                            sinkID: sinkID
+                        )
                     }
                 }
             }
@@ -889,6 +895,12 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
 
             if let response = await runtime.handle(frame, deviceID: deviceID, sinkID: sinkID, sink: sink) {
                 await sink.send(response)
+                await runtime.didQueueResponse(
+                    for: frame,
+                    response: response,
+                    deviceID: deviceID,
+                    sinkID: sinkID
+                )
             }
         }
     }

@@ -56,6 +56,25 @@ final class RemoteWireProtocolTests: XCTestCase {
         XCTAssertEqual(frame.payload?.objectValue?["ok"]?.boolValue, true)
     }
 
+    func testServerSequenceEpochRoundTripsAndLegacyFrameDecodesNil() throws {
+        let frame = RemoteServerFrame(
+            type: "session_update",
+            sessionID: "session-1",
+            seq: 7,
+            seqEpoch: "epoch-1",
+            payload: .object(["status": .string("running")])
+        )
+
+        let encoded = try RemoteWireProtocol.encodeServerFrame(frame)
+        let decoded = try RemoteWireProtocol.decodeServerFrame(from: encoded)
+        let legacy = try RemoteWireProtocol.decodeServerFrame(
+            from: Data(#"{"v":1,"type":"session_update","session_id":"session-1","seq":1}"#.utf8)
+        )
+
+        XCTAssertEqual(decoded.seqEpoch, "epoch-1")
+        XCTAssertNil(legacy.seqEpoch)
+    }
+
     func testCanonicalJSONEncodingSortsObjectKeys() throws {
         let value: JSONValue = .object(["b": .int(2), "a": .int(1)])
         let canonical = try RemoteWireProtocol.canonicalJSONString(for: value)
