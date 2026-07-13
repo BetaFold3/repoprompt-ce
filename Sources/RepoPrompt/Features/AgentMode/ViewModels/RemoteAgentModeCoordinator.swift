@@ -403,6 +403,7 @@ final class RemoteAgentModeCoordinator {
             let optimisticUserTimestampByText = Self.optimisticUserTimestampByText(
                 in: items,
                 pendingIDs: session.pendingRemoteOptimisticUserItemIDs,
+                providerTextByItemID: session.pendingRemoteOptimisticProviderTextByItemID,
                 projectedUserTextKeys: projectedUserTextKeys
             )
             var merged = projector.upserting(rows, into: items)
@@ -418,11 +419,22 @@ final class RemoteAgentModeCoordinator {
                 merged.removeAll { item in
                     item.kind == .user
                         && session.pendingRemoteOptimisticUserItemIDs.contains(item.id)
-                        && projectedUserTextKeys.contains(Self.normalizedTextKey(item.text))
+                        && projectedUserTextKeys.contains(Self.optimisticUserMatchKey(
+                            for: item,
+                            providerTextByItemID: session.pendingRemoteOptimisticProviderTextByItemID
+                        ))
                 }
                 session.pendingRemoteOptimisticUserItemIDs = session.pendingRemoteOptimisticUserItemIDs.filter { id in
                     merged.contains { $0.id == id }
                 }
+                let pendingIDs = session.pendingRemoteOptimisticUserItemIDs
+                session.pendingRemoteOptimisticProviderTextByItemID = session.pendingRemoteOptimisticProviderTextByItemID.filter {
+                    pendingIDs.contains($0.key)
+                }
+                session.remoteResendPayloadsByItemID = session.remoteResendPayloadsByItemID.filter {
+                    pendingIDs.contains($0.key)
+                }
+                session.remoteResendInFlightItemIDs.formIntersection(pendingIDs)
             }
             if wasTerminal {
                 settledCount = Self.settleResultlessToolCalls(in: &merged, terminalRunState: session.runState)
@@ -942,12 +954,13 @@ final class RemoteAgentModeCoordinator {
     private static func optimisticUserTimestampByText(
         in items: [AgentChatItem],
         pendingIDs: Set<UUID>,
+        providerTextByItemID: [UUID: String],
         projectedUserTextKeys: Set<String>
     ) -> [String: Date] {
         guard !pendingIDs.isEmpty, !projectedUserTextKeys.isEmpty else { return [:] }
         var timestamps: [String: Date] = [:]
         for item in items where item.kind == .user && pendingIDs.contains(item.id) {
-            let key = normalizedTextKey(item.text)
+            let key = optimisticUserMatchKey(for: item, providerTextByItemID: providerTextByItemID)
             guard projectedUserTextKeys.contains(key) else { continue }
             if let existing = timestamps[key] {
                 timestamps[key] = max(existing, item.timestamp)
@@ -956,6 +969,13 @@ final class RemoteAgentModeCoordinator {
             }
         }
         return timestamps
+    }
+
+    private static func optimisticUserMatchKey(
+        for item: AgentChatItem,
+        providerTextByItemID: [UUID: String]
+    ) -> String {
+        normalizedTextKey(providerTextByItemID[item.id] ?? item.text)
     }
 
     private static func containsSpawnToolCall(_ rows: [AgentChatItem]) -> Bool {
@@ -1033,7 +1053,11 @@ final class RemoteAgentModeCoordinator {
     private func applyChannel(_ state: RemoteChannelState, to session: AgentModeViewModel.TabSession) {
         switch state.kind {
         case .connected:
+            let hadSurfacedDegradation = !(surfacedChannelReasonsByTabID[session.tabID] ?? []).isEmpty
             surfacedChannelReasonsByTabID[session.tabID] = []
+            if hadSurfacedDegradation {
+                appendSystemMessage("Remote channel restored.", to: session)
+            }
             if session.runState.isActive {
                 // This intentionally surfaces the channel recovery over any host status_text label.
                 // While hostProvidedRunningStatusTabIDs remains set, later nil-status running frames

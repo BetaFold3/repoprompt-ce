@@ -187,6 +187,37 @@ final class SessionWatchManagerTerminalEdgeTests: XCTestCase {
         XCTAssertEqual(frames.count(where: { $0.type == "session_terminal" }), 2)
     }
 
+    func testTerminalFingerprintClearsAcrossUnsubscribeAndResubscribe() async throws {
+        let connection = ScriptedAppLinkConnection(poll: [
+            .result(snapshot(status: "completed", transcriptItemCount: 1)),
+            .result(snapshot(status: "completed", transcriptItemCount: 2))
+        ])
+        let (manager, _) = try await makeManager(connection: connection, terminalQuarantineSeconds: 0)
+        let sinkID = UUID()
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: deviceID, sinkID: sinkID, sink: sink, sessionIDs: [sessionID])
+        var state = await manager.debugTerminalState(deviceID: deviceID, sessionID: sessionID)
+        XCTAssertEqual(state.lastEmittedTerminalTranscriptItemCount, 1)
+        XCTAssertNotNil(state.lastEmittedTerminalUpdatedAt)
+
+        await manager.unsubscribe(deviceID: deviceID, sessionIDs: [sessionID])
+        state = await manager.debugTerminalState(deviceID: deviceID, sessionID: sessionID)
+        XCTAssertNil(state.lastEmittedIsTerminal)
+        XCTAssertNil(state.lastEmittedTerminalTranscriptItemCount)
+        XCTAssertNil(state.lastEmittedTerminalUpdatedAt)
+
+        await manager.subscribe(deviceID: deviceID, sinkID: sinkID, sink: sink, sessionIDs: [sessionID])
+        let frames = await sink.frames
+        state = await manager.debugTerminalState(deviceID: deviceID, sessionID: sessionID)
+        await manager.shutdown()
+
+        let terminalFrames = frames.filter { $0.type == "session_terminal" && $0.sessionID == sessionID }
+        XCTAssertEqual(terminalFrames.count, 2)
+        XCTAssertEqual(terminalFrames.map { $0.payload?.objectValue?["transcript_item_count"]?.intValue }, [1, 2])
+        XCTAssertEqual(state.lastEmittedTerminalTranscriptItemCount, 2)
+    }
+
     func testUnsubscribeDuringInFlightWaitDoesNotResurrectSession() async throws {
         let secondSessionID = "22222222-2222-2222-2222-222222222222"
         let gate = RecordingAppLinkResponseGate()
@@ -286,8 +317,17 @@ final class SessionWatchManagerTerminalEdgeTests: XCTestCase {
         return (manager, appLink)
     }
 
-    private func snapshot(status: String) -> JSONValue {
-        GatewayTestHelpers.snapshot(sessionID: sessionID, status: status)
+    private func snapshot(
+        status: String,
+        transcriptItemCount: Int = 0,
+        updatedAt: String = "2026-07-02T00:00:00.000Z"
+    ) -> JSONValue {
+        .object([
+            "session_id": .string(sessionID),
+            "status": .string(status),
+            "transcript_item_count": .int(transcriptItemCount),
+            "updated_at": .string(updatedAt)
+        ])
     }
 
     private func waitForFrames(

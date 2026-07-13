@@ -2742,6 +2742,18 @@ struct AgentModeChatDetailView: View {
         } else {
             nil
         }
+        let resendUndeliveredAction: (() -> Void)? = if let ownerTabID,
+                                                        agentModeVM.undeliveredPresentation(
+                                                            for: item,
+                                                            tabID: ownerTabID
+                                                        ).resendActionLabel != nil
+        {
+            { [weak agentModeVM] in
+                agentModeVM?.resendUndeliveredRemoteUserTurn(tabID: ownerTabID, itemID: item.id)
+            }
+        } else {
+            nil
+        }
         return AgentMessageBubble(
             item: item,
             isMostRecentEditBubble: item.id == renderContext.mostRecentEditID,
@@ -2771,7 +2783,8 @@ struct AgentModeChatDetailView: View {
             showRunScopedToolCancel: showCancel,
             cancelActiveToolsAction: cancelAction,
             codexManagedLoginAction: codexManagedLoginAction,
-            runLocallyInsteadAction: runLocallyInsteadAction
+            runLocallyInsteadAction: runLocallyInsteadAction,
+            resendUndeliveredAction: resendUndeliveredAction
         )
         .id(item.id)
         .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)

@@ -155,6 +155,9 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// True for local control-plane echoes that should display in chat but are not provider-backed user turns.
     public var isLocalControlPlaneEcho: Bool
 
+    /// True when an optimistic remote user turn failed before delivery was acknowledged.
+    public var isUndeliveredRemoteSend: Bool
+
     public init(
         id: UUID = UUID(),
         timestamp: Date = Date(),
@@ -172,7 +175,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         isStreaming: Bool = false,
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
-        isLocalControlPlaneEcho: Bool = false
+        isLocalControlPlaneEcho: Bool = false,
+        isUndeliveredRemoteSend: Bool = false
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -191,6 +195,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
+        self.isUndeliveredRemoteSend = isUndeliveredRemoteSend
     }
 
     /// Returns a copy of this item with a replaced timestamp and all other fields
@@ -215,7 +220,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             isStreaming: isStreaming,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend
         )
     }
 
@@ -230,6 +236,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         case id, timestamp, kind, text, attachments, taggedFileAttachments
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
         case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, isLocalControlPlaneEcho
+        case isUndeliveredRemoteSend
     }
 
     public init(from decoder: Decoder) throws {
@@ -251,6 +258,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
+        isUndeliveredRemoteSend = try c.decodeIfPresent(Bool.self, forKey: .isUndeliveredRemoteSend) ?? false
     }
 
     // MARK: - Factory Methods
@@ -307,7 +315,8 @@ extension AgentChatItem {
             isStreaming: isStreaming,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend
         )
     }
 }
@@ -333,6 +342,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool
+    public var isUndeliveredRemoteSend: Bool
 
     public init(from item: AgentChatItem, sanitizeToolResults: Bool = true) {
         id = item.id
@@ -348,6 +358,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
+        isUndeliveredRemoteSend = item.isUndeliveredRemoteSend
         toolResultStatus = nil
 
         if sanitizeToolResults, item.kind == .toolResult {
@@ -420,7 +431,8 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             isStreaming: false,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho,
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend
         )
     }
 
@@ -467,6 +479,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case workflow
         case codexGoalMode
         case isLocalControlPlaneEcho
+        case isUndeliveredRemoteSend
     }
 
     public init(from decoder: Decoder) throws {
@@ -488,6 +501,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         workflow = try container.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try container.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
         isLocalControlPlaneEcho = try container.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
+        isUndeliveredRemoteSend = try container.decodeIfPresent(Bool.self, forKey: .isUndeliveredRemoteSend) ?? false
     }
 }
 

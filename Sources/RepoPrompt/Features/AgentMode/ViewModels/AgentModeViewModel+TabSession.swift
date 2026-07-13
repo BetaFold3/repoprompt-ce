@@ -2,6 +2,37 @@ import Combine
 import Foundation
 
 extension AgentModeViewModel {
+    /// A resend selector carries either a picked target (`windowID`, with an optional `workspaceID` guard
+    /// and `workspaceName` nil) or a name-only selector (`workspaceName`, with IDs nil), never both.
+    /// The gateway ANDs ID and name matching, so a mixed selector can match zero windows.
+    struct RemoteResendPayload {
+        let providerText: String
+        let wasStart: Bool
+        let modelSelectionRaw: String?
+        let sessionName: String?
+        let workspaceName: String?
+        let windowID: Int?
+        let workspaceID: String?
+
+        init(
+            providerText: String,
+            wasStart: Bool,
+            modelSelectionRaw: String?,
+            sessionName: String?,
+            workspaceName: String?,
+            windowID: Int? = nil,
+            workspaceID: String? = nil
+        ) {
+            self.providerText = providerText
+            self.wasStart = wasStart
+            self.modelSelectionRaw = modelSelectionRaw
+            self.sessionName = sessionName
+            self.workspaceName = workspaceName
+            self.windowID = windowID
+            self.workspaceID = workspaceID
+        }
+    }
+
     // MARK: - Tab Session
 
     /// Per-tab session state for agent mode
@@ -165,6 +196,15 @@ extension AgentModeViewModel {
         var remoteHost: AgentSessionRemoteHostBinding?
         /// Optimistic local user rows awaiting replacement by host-projected transcript rows.
         var pendingRemoteOptimisticUserItemIDs: Set<UUID> = []
+        /// Exact provider-facing text used to match pending optimistic rows against host catch-up.
+        /// Keys are transient and must remain a subset of `pendingRemoteOptimisticUserItemIDs`.
+        var pendingRemoteOptimisticProviderTextByItemID: [UUID: String] = [:]
+        /// Provider payloads for explicit item-level resend; normalized name-only or window-ID selectors round-trip through persistence.
+        var remoteResendPayloadsByItemID: [UUID: RemoteResendPayload] = [:]
+        var remoteResendInFlightItemIDs: Set<UUID> = []
+        /// Optimistic item whose locally successful remote start produced the adopted session.
+        /// Persisted from local success only; inbound binding/catch-up events must never infer this attribution.
+        var locallyAttributedStartItemID: UUID?
 
         /// Persisted logical-root to worktree bindings for this Agent session.
         var worktreeBindings: [AgentSessionWorktreeBinding] = []

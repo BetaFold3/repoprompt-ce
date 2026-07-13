@@ -90,6 +90,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool?
+    public var isUndeliveredRemoteSend: Bool?
     public var isStreaming: Bool
     public var toolExecution: AgentTranscriptToolExecution?
     public var reasoning: String?
@@ -108,6 +109,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
         isLocalControlPlaneEcho: Bool? = nil,
+        isUndeliveredRemoteSend: Bool? = nil,
         isStreaming: Bool = false,
         toolExecution: AgentTranscriptToolExecution? = nil,
         reasoning: String? = nil,
@@ -125,6 +127,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
+        self.isUndeliveredRemoteSend = isUndeliveredRemoteSend
         self.isStreaming = isStreaming
         self.toolExecution = toolExecution
         self.reasoning = reasoning
@@ -144,6 +147,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho ? true : nil
+        isUndeliveredRemoteSend = item.isUndeliveredRemoteSend ? true : nil
         isStreaming = item.isStreaming
         self.toolExecution = toolExecution
         reasoning = item.reasoning
@@ -169,7 +173,8 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             isStreaming: overrideStreaming ?? isStreaming,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false
         )
     }
 
@@ -234,6 +239,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
     public var isLocalControlPlaneEcho: Bool?
+    public var isUndeliveredRemoteSend: Bool?
 
     public init(from item: AgentChatItem) {
         id = item.id
@@ -245,6 +251,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho ? true : nil
+        isUndeliveredRemoteSend = item.isUndeliveredRemoteSend ? true : nil
     }
 
     public func toItem() -> AgentChatItem {
@@ -258,7 +265,8 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
             sequenceIndex: sequenceIndex,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
-            isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
+            isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false
         )
     }
 }

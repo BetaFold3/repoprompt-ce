@@ -272,6 +272,7 @@ extension AgentModeViewModel {
               !host.isRevokedByHost
         else { return false }
 
+        session.locallyAttributedStartItemID = nil
         session.remoteHost = AgentSessionRemoteHostBinding(
             hostID: host.id,
             hostDisplayName: host.displayName,
@@ -308,9 +309,27 @@ extension AgentModeViewModel {
         let session = session(for: tabID)
         switch selection {
         case .thisMac:
+            clearRemoteStartWindowPickerIfOwned(by: tabID)
             if session.remoteHost != nil {
                 remoteCoordinator.stop(tabID: tabID)
             }
+            let undeliveredUserItemIDs = Set(session.items.lazy.filter {
+                $0.kind == .user && $0.isUndeliveredRemoteSend
+            }.map(\.id))
+            if !undeliveredUserItemIDs.isEmpty {
+                session.mutateItemsBatch { items in
+                    for index in items.indices where undeliveredUserItemIDs.contains(items[index].id) {
+                        items[index].isUndeliveredRemoteSend = false
+                    }
+                }
+                for itemID in undeliveredUserItemIDs {
+                    session.remoteResendPayloadsByItemID.removeValue(forKey: itemID)
+                    session.remoteResendInFlightItemIDs.remove(itemID)
+                    session.pendingRemoteOptimisticUserItemIDs.remove(itemID)
+                    session.pendingRemoteOptimisticProviderTextByItemID.removeValue(forKey: itemID)
+                }
+            }
+            session.locallyAttributedStartItemID = nil
             session.remoteHost = nil
             remoteRunLocallyFallbackItemIDByTabID.removeValue(forKey: tabID)
             if session.selectedModelRaw == RemoteHostAgentCatalog.hostDefaultModelID {
@@ -327,6 +346,7 @@ extension AgentModeViewModel {
                       !host.isRevokedByHost
                 else { return }
                 remoteCoordinator.stop(tabID: tabID)
+                session.locallyAttributedStartItemID = nil
                 session.remoteHost = nil
             }
             guard applyHostRunLocation(hostID: hostID, to: session) else { return }

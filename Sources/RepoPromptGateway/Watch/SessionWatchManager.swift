@@ -40,6 +40,15 @@ actor SessionWatchManager {
         let task: Task<Void, Never>
     }
 
+    private struct TerminalFingerprint: Equatable {
+        var transcriptItemCount: Int?
+        var updatedAt: String?
+
+        var isEmpty: Bool {
+            transcriptItemCount == nil && updatedAt == nil
+        }
+    }
+
     private enum EmissionTrigger: String {
         case subscribe
         case pollCatchUp
@@ -69,6 +78,7 @@ actor SessionWatchManager {
     /// distinct resolution as an `interaction_resolved` frame exactly once.
     private var lastResolutionKeyByDeviceSession: [String: String] = [:]
     private var lastEmittedIsTerminalByDeviceSession: [String: Bool] = [:]
+    private var lastEmittedTerminalFingerprintByDeviceSession: [String: TerminalFingerprint] = [:]
     private var pendingTerminalQuarantineByDeviceSession: [String: QuarantinedTerminal] = [:]
     private var appLinkStateTask: Task<Void, Never>?
 
@@ -133,6 +143,7 @@ actor SessionWatchManager {
         }
         pendingTerminalQuarantineByDeviceSession.removeAll()
         lastEmittedIsTerminalByDeviceSession.removeAll()
+        lastEmittedTerminalFingerprintByDeviceSession.removeAll()
         devices.removeAll()
     }
 
@@ -205,6 +216,7 @@ actor SessionWatchManager {
             lastPushKindByDeviceSession.removeValue(forKey: key)
             lastResolutionKeyByDeviceSession.removeValue(forKey: key)
             lastEmittedIsTerminalByDeviceSession.removeValue(forKey: key)
+            lastEmittedTerminalFingerprintByDeviceSession.removeValue(forKey: key)
             if let quarantine = pendingTerminalQuarantineByDeviceSession.removeValue(forKey: key) {
                 quarantine.task.cancel()
             }
@@ -787,6 +799,8 @@ actor SessionWatchManager {
             )
             await broadcast(frame, deviceID: deviceID)
             lastEmittedIsTerminalByDeviceSession[key] = false
+            // A stale terminal fingerprint across an active interlude is harmless:
+            // the next terminal takes the fresh-emission path and overwrites it.
             logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "session_update", seq: seq)
             await maybePushWake(deviceID: deviceID, snapshot: snapshot)
             return
@@ -814,6 +828,31 @@ actor SessionWatchManager {
         }
 
         if lastEmittedIsTerminalByDeviceSession[key] == true {
+            let fingerprint = terminalFingerprint(from: snapshot)
+            if evaluateTerminalReemitAdoptingBaseline(forKey: key, newFingerprint: fingerprint) {
+                await emitInteractionResolvedIfNeeded(deviceID: deviceID, snapshot: snapshot)
+                let seq = nextSeq(deviceID: deviceID, sessionID: snapshot.sessionID)
+                let frame = RemoteServerFrame(
+                    type: "session_terminal",
+                    sessionID: snapshot.sessionID,
+                    seq: seq,
+                    payload: snapshot.payload
+                )
+                await broadcast(frame, deviceID: deviceID)
+                logEmission(
+                    deviceID: deviceID,
+                    sessionID: snapshot.sessionID,
+                    trigger: trigger,
+                    status: snapshot.status,
+                    type: "session_terminal",
+                    seq: seq,
+                    suffix: " reason=fingerprint_changed"
+                )
+                // Changed terminal content is a fresh wake-worthy transition; clear push dedupe.
+                lastPushKindByDeviceSession.removeValue(forKey: key)
+                await maybePushWake(deviceID: deviceID, snapshot: snapshot)
+                return
+            }
             if let catchUpSink {
                 let seq = nextSeq(deviceID: deviceID, sessionID: snapshot.sessionID)
                 let frame = RemoteServerFrame(
@@ -840,8 +879,58 @@ actor SessionWatchManager {
         )
         await broadcast(frame, deviceID: deviceID)
         lastEmittedIsTerminalByDeviceSession[key] = true
+        lastEmittedTerminalFingerprintByDeviceSession[key] = terminalFingerprint(from: snapshot)
         logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "session_terminal", seq: seq)
         await maybePushWake(deviceID: deviceID, snapshot: snapshot)
+    }
+
+    private func terminalFingerprint(from snapshot: RemoteSessionSnapshot) -> TerminalFingerprint {
+        let object = snapshot.payload.objectValue
+        let countValue = object?["transcript_item_count"]
+        let transcriptItemCount: Int? = if let intValue = countValue?.intValue {
+            intValue
+        } else if case let .double(doubleValue)? = countValue,
+                  doubleValue.isFinite,
+                  let truncatedValue = Int(exactly: doubleValue.rounded(.towardZero))
+        {
+            truncatedValue
+        } else {
+            nil
+        }
+        return TerminalFingerprint(
+            transcriptItemCount: transcriptItemCount,
+            updatedAt: object?["updated_at"]?.stringValue
+        )
+    }
+
+    /// Evaluates whether a terminal snapshot should re-emit, adopting the
+    /// first non-empty fingerprint as a silent baseline and merging newly available
+    /// components into stored state without forgetting absent components.
+    private func evaluateTerminalReemitAdoptingBaseline(
+        forKey key: String,
+        newFingerprint: TerminalFingerprint
+    ) -> Bool {
+        guard !newFingerprint.isEmpty else { return false }
+        guard let storedFingerprint = lastEmittedTerminalFingerprintByDeviceSession[key],
+              !storedFingerprint.isEmpty
+        else {
+            lastEmittedTerminalFingerprintByDeviceSession[key] = newFingerprint
+            return false
+        }
+        let transcriptItemCountChanged = storedFingerprint.transcriptItemCount
+            .flatMap { storedCount in
+                newFingerprint.transcriptItemCount.map { $0 != storedCount }
+            } ?? false
+        let updatedAtChanged = storedFingerprint.updatedAt
+            .flatMap { storedUpdatedAt in
+                newFingerprint.updatedAt.map { $0 != storedUpdatedAt }
+            } ?? false
+        let mergedFingerprint = TerminalFingerprint(
+            transcriptItemCount: newFingerprint.transcriptItemCount ?? storedFingerprint.transcriptItemCount,
+            updatedAt: newFingerprint.updatedAt ?? storedFingerprint.updatedAt
+        )
+        lastEmittedTerminalFingerprintByDeviceSession[key] = mergedFingerprint
+        return transcriptItemCountChanged || updatedAtChanged
     }
 
     private func recordNonTerminalObservation(deviceID: String, snapshot: RemoteSessionSnapshot) -> Bool {
@@ -925,6 +1014,7 @@ actor SessionWatchManager {
     private func clearTerminalObservationState(deviceID: String, sessionID: String) {
         let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
         lastEmittedIsTerminalByDeviceSession.removeValue(forKey: key)
+        lastEmittedTerminalFingerprintByDeviceSession.removeValue(forKey: key)
         cancelPendingTerminalQuarantine(deviceID: deviceID, sessionID: sessionID)
     }
 
@@ -1060,7 +1150,9 @@ actor SessionWatchManager {
             activeWait: Bool,
             parkedTerminal: Bool,
             pendingQuarantine: Bool,
-            lastEmittedIsTerminal: Bool?
+            lastEmittedIsTerminal: Bool?,
+            lastEmittedTerminalTranscriptItemCount: Int?,
+            lastEmittedTerminalUpdatedAt: String?
         ) {
             let state = devices[deviceID]
             let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
@@ -1069,7 +1161,9 @@ actor SessionWatchManager {
                 activeWait: state?.activeWaitSessionIDs.contains(sessionID) ?? false,
                 parkedTerminal: state?.parkedTerminalSessionIDs.contains(sessionID) ?? false,
                 pendingQuarantine: pendingTerminalQuarantineByDeviceSession[key] != nil,
-                lastEmittedIsTerminal: lastEmittedIsTerminalByDeviceSession[key]
+                lastEmittedIsTerminal: lastEmittedIsTerminalByDeviceSession[key],
+                lastEmittedTerminalTranscriptItemCount: lastEmittedTerminalFingerprintByDeviceSession[key]?.transcriptItemCount,
+                lastEmittedTerminalUpdatedAt: lastEmittedTerminalFingerprintByDeviceSession[key]?.updatedAt
             )
         }
     #endif

@@ -991,6 +991,60 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testIdleChannelDegradeThenConnectedAppendsOneRestoredRow() {
+        let coordinator = RemoteAgentModeCoordinator()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.remoteHost = makeBinding()
+        session.runState = .completed
+
+        coordinator.test_applyChannel(.init(kind: .degraded(reason: "reconnect_failed")), to: session)
+        coordinator.test_applyChannel(.init(kind: .connected), to: session)
+
+        XCTAssertEqual(
+            systemMessages(in: session),
+            [
+                "Remote channel degraded: reconnect_failed. Reconnecting…",
+                "Remote channel restored."
+            ]
+        )
+    }
+
+    @MainActor
+    func testConnectedWithoutSurfacedDegradationAppendsNoRestoredRow() {
+        let coordinator = RemoteAgentModeCoordinator()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.remoteHost = makeBinding()
+
+        coordinator.test_applyChannel(.init(kind: .connected), to: session)
+        coordinator.test_applyChannel(.init(kind: .connected), to: session)
+
+        XCTAssertTrue(systemMessages(in: session).isEmpty)
+    }
+
+    @MainActor
+    func testRepeatedDegradeRecoverCyclesAppendTwoPairedSequencesWithoutSpam() {
+        let coordinator = RemoteAgentModeCoordinator()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.remoteHost = makeBinding()
+
+        for _ in 0 ..< 2 {
+            coordinator.test_applyChannel(.init(kind: .degraded(reason: "reconnect_failed")), to: session)
+            coordinator.test_applyChannel(.init(kind: .connected), to: session)
+            coordinator.test_applyChannel(.init(kind: .connected), to: session)
+        }
+
+        XCTAssertEqual(
+            systemMessages(in: session),
+            [
+                "Remote channel degraded: reconnect_failed. Reconnecting…",
+                "Remote channel restored.",
+                "Remote channel degraded: reconnect_failed. Reconnecting…",
+                "Remote channel restored."
+            ]
+        )
+    }
+
+    @MainActor
     func testBindingRequiredErrorUsesFriendlyRemoteCopy() {
         let error = RemoteClientError.fromCommandError(
             code: "binding_required",

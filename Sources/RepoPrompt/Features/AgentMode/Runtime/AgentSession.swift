@@ -155,6 +155,57 @@ struct AgentSessionRemoteHostBinding: Codable, Equatable {
 
 // MARK: - Agent Session
 
+// swiftformat:disable:next redundantSendable
+struct PersistedRemoteResendPayload: Codable, Sendable, Equatable {
+    let providerText: String
+    let wasStart: Bool
+    let modelSelectionRaw: String?
+    let sessionName: String?
+    let workspaceName: String?
+    let windowID: Int?
+    let workspaceID: String?
+
+    init(
+        providerText: String,
+        wasStart: Bool,
+        modelSelectionRaw: String?,
+        sessionName: String?,
+        workspaceName: String?,
+        windowID: Int? = nil,
+        workspaceID: String? = nil
+    ) {
+        self.providerText = providerText
+        self.wasStart = wasStart
+        self.modelSelectionRaw = modelSelectionRaw
+        self.sessionName = sessionName
+        // A window ID is the routing authority. For mixed legacy input, prefer
+        // that explicit target and discard the name rather than ANDing conflicting selectors.
+        let normalizedWorkspaceID = workspaceID.flatMap { $0.isEmpty ? nil : $0 }
+        if let windowID {
+            self.workspaceName = nil
+            self.windowID = windowID
+            self.workspaceID = normalizedWorkspaceID
+        } else {
+            self.workspaceName = workspaceName
+            self.windowID = nil
+            self.workspaceID = nil
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            providerText: container.decode(String.self, forKey: .providerText),
+            wasStart: container.decode(Bool.self, forKey: .wasStart),
+            modelSelectionRaw: container.decodeIfPresent(String.self, forKey: .modelSelectionRaw),
+            sessionName: container.decodeIfPresent(String.self, forKey: .sessionName),
+            workspaceName: container.decodeIfPresent(String.self, forKey: .workspaceName),
+            windowID: container.decodeIfPresent(Int.self, forKey: .windowID),
+            workspaceID: container.decodeIfPresent(String.self, forKey: .workspaceID)
+        )
+    }
+}
+
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
     static let currentSerializationVersion = 6
@@ -202,6 +253,12 @@ struct AgentSession: Codable, Identifiable {
 
     /// Remote host/session binding for client-projected gateway sessions.
     var remoteHost: AgentSessionRemoteHostBinding?
+
+    /// Safe resend recovery data for undelivered remote user turns.
+    var remoteResendPayloadsByItemID: [String: PersistedRemoteResendPayload]
+
+    /// Optimistic item whose locally successful remote start produced the adopted session.
+    var locallyAttributedStartItemID: UUID?
 
     var autoEditEnabled: Bool
 
@@ -268,6 +325,8 @@ struct AgentSession: Codable, Identifiable {
         lastRunState: String? = nil,
         providerSessionID: String? = nil,
         remoteHost: AgentSessionRemoteHostBinding? = nil,
+        remoteResendPayloadsByItemID: [String: PersistedRemoteResendPayload] = [:],
+        locallyAttributedStartItemID: UUID? = nil,
         autoEditEnabled: Bool = true,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
@@ -306,6 +365,8 @@ struct AgentSession: Codable, Identifiable {
         self.lastRunState = lastRunState
         self.providerSessionID = providerSessionID
         self.remoteHost = remoteHost
+        self.remoteResendPayloadsByItemID = remoteResendPayloadsByItemID
+        self.locallyAttributedStartItemID = locallyAttributedStartItemID
         self.autoEditEnabled = autoEditEnabled
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
@@ -347,6 +408,8 @@ struct AgentSession: Codable, Identifiable {
         case lastRunState
         case providerSessionID
         case remoteHost
+        case remoteResendPayloadsByItemID
+        case locallyAttributedStartItemID
         case autoEditEnabled
         case providerTokenUsageByTurn
         case codexConversationID
@@ -390,6 +453,11 @@ struct AgentSession: Codable, Identifiable {
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
         remoteHost = try container.decodeIfPresent(AgentSessionRemoteHostBinding.self, forKey: .remoteHost)
+        remoteResendPayloadsByItemID = try container.decodeIfPresent(
+            [String: PersistedRemoteResendPayload].self,
+            forKey: .remoteResendPayloadsByItemID
+        ) ?? [:]
+        locallyAttributedStartItemID = try container.decodeIfPresent(UUID.self, forKey: .locallyAttributedStartItemID)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)

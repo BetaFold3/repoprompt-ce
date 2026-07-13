@@ -37,9 +37,9 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
 
     func testParkedActionableSessionRevalidationEmitsExitFromActionableAndRearms() async throws {
         let connection = RecordingAppLinkConnection(responses: [
-            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input"))),
-            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running"))),
-            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
+            .result(GatewayTestHelpers.toolResult(json: snapshot(status: "waiting_for_input"))),
+            .result(GatewayTestHelpers.toolResult(json: snapshot(status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: snapshot(status: "running")))
         ])
         let (manager, _) = try await makeManager(connection: connection)
         let sink = RecordingFrameSink()
@@ -57,7 +57,7 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
 
     func testParkedActionableStillActionableStaysParkedNoRearmLoop() async throws {
         let connection = RecordingAppLinkConnection(responses: Array(repeating: .result(
-            GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input"))
+            GatewayTestHelpers.toolResult(json: snapshot(status: "waiting_for_input"))
         ), count: 50))
         let (manager, _) = try await makeManager(connection: connection)
         let sink = RecordingFrameSink()
@@ -74,7 +74,7 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
 
     func testParkedTerminalSessionIsRevalidatedWithoutDuplicateTerminalFrames() async throws {
         let connection = RecordingAppLinkConnection(responses: Array(repeating: .result(
-            GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "completed"))
+            GatewayTestHelpers.toolResult(json: snapshot(status: "completed"))
         ), count: 10))
         let (manager, _) = try await makeManager(connection: connection)
         let sink = RecordingFrameSink()
@@ -94,10 +94,286 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.arguments["op"] == .string("wait") })
     }
 
+    func testParkedTerminalChangedTranscriptItemCountEmitsFreshTerminalSequence() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 1
+            ))),
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 2
+            )))
+        ])
+        let (manager, _) = try await makeManager(connection: connection)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        let frames = await waitForFrames(sink, containing: "session_terminal", minimum: 2)
+        await manager.shutdown()
+
+        let terminalFrames = frames.filter { $0.type == "session_terminal" && $0.sessionID == sessionID }
+        XCTAssertEqual(terminalFrames.count, 2)
+        XCTAssertEqual(terminalFrames.map { $0.payload?.objectValue?["transcript_item_count"]?.intValue }, [1, 2])
+        let firstSeq = try XCTUnwrap(terminalFrames[0].seq)
+        let secondSeq = try XCTUnwrap(terminalFrames[1].seq)
+        XCTAssertGreaterThan(secondSeq, firstSeq)
+    }
+
+    func testFingerprintChangedTerminalReemitPushesWakeForDisconnectedPushOnlyDevice() async throws {
+        let deviceID = "device"
+        let sinkID = UUID()
+        let notifier = RecordingPushNotifier(eligibleDevices: [deviceID])
+        let firstTerminalGate = RecordingAppLinkResponseGate()
+        let changedTerminalGate = RecordingAppLinkResponseGate()
+        let unchangedTerminalGate = RecordingAppLinkResponseGate()
+        let afterUnchangedGate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: snapshot(status: "running"))),
+            .gated(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 1
+            )), firstTerminalGate),
+            .gated(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 2
+            )), changedTerminalGate),
+            .gated(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 2
+            )), unchangedTerminalGate),
+            .gated(GatewayTestHelpers.toolResult(json: snapshot(status: "running")), afterUnchangedGate)
+        ])
+        let (manager, _) = try await makeManager(connection: connection, pushNotifier: notifier)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: deviceID, sinkID: sinkID, sink: sink, sessionIDs: [sessionID])
+        await manager.removeSink(deviceID: deviceID, sinkID: sinkID)
+        await firstTerminalGate.waitUntilEntered()
+        await firstTerminalGate.release()
+        var wakes = await waitForWakes(notifier, minimum: 1)
+
+        await changedTerminalGate.waitUntilEntered()
+        await changedTerminalGate.release()
+        wakes = await waitForWakes(notifier, minimum: 2)
+
+        await unchangedTerminalGate.waitUntilEntered()
+        await unchangedTerminalGate.release()
+        await afterUnchangedGate.waitUntilEntered()
+        let wakesAfterUnchangedFingerprint = await notifier.wakes
+        await afterUnchangedGate.release()
+        await manager.shutdown()
+
+        XCTAssertEqual(wakes.map(\.deviceID), [deviceID, deviceID])
+        XCTAssertEqual(wakes.map(\.kind), [.sessionTerminal, .sessionTerminal])
+        XCTAssertEqual(wakes.map(\.sessionID), [sessionID, sessionID])
+        XCTAssertEqual(wakesAfterUnchangedFingerprint.count, 2)
+    }
+
+    func testFingerprintChangedTerminalReemitDoesNotPushWakeWithLiveSink() async throws {
+        let deviceID = "device"
+        let notifier = RecordingPushNotifier(eligibleDevices: [deviceID])
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 1
+            ))),
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 2
+            )))
+        ])
+        let (manager, _) = try await makeManager(connection: connection, pushNotifier: notifier)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: deviceID, sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForFrames(sink, containing: "session_terminal", minimum: 2)
+        let wakes = await notifier.wakes
+        await manager.shutdown()
+
+        XCTAssertTrue(wakes.isEmpty)
+    }
+
+    func testParkedTerminalUnchangedFingerprintRemainsSuppressed() async throws {
+        let terminalSnapshot = snapshot(status: "completed", transcriptItemCount: 1)
+        let connection = RecordingAppLinkConnection(responses: Array(repeating: .result(
+            GatewayTestHelpers.toolResult(json: terminalSnapshot)
+        ), count: 5))
+        let (manager, _) = try await makeManager(connection: connection)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForCalls(connection, minimum: 3)
+        try await Task.sleep(for: .milliseconds(80))
+        let frames = await sink.frames
+        await manager.shutdown()
+
+        let terminalFrames = frames.filter { $0.type == "session_terminal" && $0.sessionID == sessionID }
+        XCTAssertEqual(terminalFrames.count, 1)
+        XCTAssertEqual(terminalFrames.compactMap(\.seq), [1])
+    }
+
+    func testParkedTerminalChangedUpdatedAtEmitsFreshTerminalSequence() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 1,
+                updatedAt: "2026-07-02T00:00:00.000Z"
+            ))),
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 1,
+                updatedAt: "2026-07-02T00:00:01.000Z"
+            )))
+        ])
+        let (manager, _) = try await makeManager(connection: connection)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        let frames = await waitForFrames(sink, containing: "session_terminal", minimum: 2)
+        await manager.shutdown()
+
+        let terminalFrames = frames.filter { $0.type == "session_terminal" && $0.sessionID == sessionID }
+        XCTAssertEqual(terminalFrames.count, 2)
+        XCTAssertEqual(terminalFrames.map { $0.payload?.objectValue?["updated_at"]?.stringValue }, [
+            "2026-07-02T00:00:00.000Z",
+            "2026-07-02T00:00:01.000Z"
+        ])
+        let firstSeq = try XCTUnwrap(terminalFrames[0].seq)
+        let secondSeq = try XCTUnwrap(terminalFrames[1].seq)
+        XCTAssertGreaterThan(secondSeq, firstSeq)
+    }
+
+    func testParkedTerminalMissingFingerprintFieldsRemainDeterministicallySuppressed() async throws {
+        let baselineGate = RecordingAppLinkResponseGate()
+        let changedGate = RecordingAppLinkResponseGate()
+        let legacySnapshot = snapshot(
+            status: "completed",
+            transcriptItemCount: nil,
+            updatedAt: nil
+        )
+        let baselineSnapshot = snapshot(
+            status: "completed",
+            transcriptItemCount: 1,
+            updatedAt: "2026-07-02T00:00:00.000Z"
+        )
+        let changedSnapshot = snapshot(
+            status: "completed",
+            transcriptItemCount: 2,
+            updatedAt: "2026-07-02T00:00:00.000Z"
+        )
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: legacySnapshot)),
+            .result(GatewayTestHelpers.toolResult(json: legacySnapshot)),
+            .gated(GatewayTestHelpers.toolResult(json: baselineSnapshot), baselineGate),
+            .gated(GatewayTestHelpers.toolResult(json: changedSnapshot), changedGate)
+        ])
+        let (manager, _) = try await makeManager(connection: connection)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        await baselineGate.waitUntilEntered()
+        var terminalFrames = await sink.frames.filter {
+            $0.type == "session_terminal" && $0.sessionID == sessionID
+        }
+        XCTAssertEqual(terminalFrames.count, 1)
+        XCTAssertNil(terminalFrames[0].payload?.objectValue?["transcript_item_count"])
+        XCTAssertNil(terminalFrames[0].payload?.objectValue?["updated_at"])
+
+        await baselineGate.release()
+        await changedGate.waitUntilEntered()
+        terminalFrames = await sink.frames.filter {
+            $0.type == "session_terminal" && $0.sessionID == sessionID
+        }
+        let baselineState = await manager.debugTerminalState(deviceID: "device", sessionID: sessionID)
+        XCTAssertEqual(terminalFrames.count, 1)
+        XCTAssertEqual(baselineState.lastEmittedTerminalTranscriptItemCount, 1)
+
+        await changedGate.release()
+        let frames = await waitForFrames(sink, containing: "session_terminal", minimum: 2)
+        await manager.shutdown()
+
+        terminalFrames = frames.filter { $0.type == "session_terminal" && $0.sessionID == sessionID }
+        XCTAssertEqual(terminalFrames.count, 2)
+        XCTAssertEqual(terminalFrames.map { $0.payload?.objectValue?["transcript_item_count"]?.intValue }, [nil, 2])
+        XCTAssertEqual(terminalFrames.compactMap(\.seq), [1, 2])
+
+        let partialFillGate = RecordingAppLinkResponseGate()
+        let countChangeGate = RecordingAppLinkResponseGate()
+        let updatedAtChangeGate = RecordingAppLinkResponseGate()
+        let partialConnection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: nil,
+                updatedAt: "2026-07-02T00:00:00.000Z"
+            ))),
+            .gated(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 5,
+                updatedAt: "2026-07-02T00:00:00.000Z"
+            )), partialFillGate),
+            .gated(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 6,
+                updatedAt: nil
+            )), countChangeGate),
+            .gated(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: nil,
+                updatedAt: "2026-07-02T00:00:01.000Z"
+            )), updatedAtChangeGate)
+        ])
+        let (partialManager, _) = try await makeManager(connection: partialConnection)
+        let partialSink = RecordingFrameSink()
+
+        await partialManager.subscribe(
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: partialSink,
+            sessionIDs: [sessionID]
+        )
+        await partialFillGate.waitUntilEntered()
+        await partialFillGate.release()
+        await countChangeGate.waitUntilEntered()
+
+        var partialTerminalFrames = await partialSink.frames.filter {
+            $0.type == "session_terminal" && $0.sessionID == sessionID
+        }
+        var mergedState = await partialManager.debugTerminalState(deviceID: "device", sessionID: sessionID)
+        XCTAssertEqual(partialTerminalFrames.count, 1)
+        XCTAssertEqual(mergedState.lastEmittedTerminalTranscriptItemCount, 5)
+        XCTAssertEqual(mergedState.lastEmittedTerminalUpdatedAt, "2026-07-02T00:00:00.000Z")
+
+        await countChangeGate.release()
+        await updatedAtChangeGate.waitUntilEntered()
+
+        partialTerminalFrames = await partialSink.frames.filter {
+            $0.type == "session_terminal" && $0.sessionID == sessionID
+        }
+        mergedState = await partialManager.debugTerminalState(deviceID: "device", sessionID: sessionID)
+        XCTAssertEqual(partialTerminalFrames.count, 2)
+        XCTAssertEqual(partialTerminalFrames.last?.payload?.objectValue?["transcript_item_count"]?.intValue, 6)
+        XCTAssertNil(partialTerminalFrames.last?.payload?.objectValue?["updated_at"])
+        XCTAssertEqual(mergedState.lastEmittedTerminalTranscriptItemCount, 6)
+        XCTAssertEqual(mergedState.lastEmittedTerminalUpdatedAt, "2026-07-02T00:00:00.000Z")
+
+        await updatedAtChangeGate.release()
+        let partialFrames = await waitForFrames(partialSink, containing: "session_terminal", minimum: 3)
+        await partialManager.shutdown()
+
+        partialTerminalFrames = partialFrames.filter {
+            $0.type == "session_terminal" && $0.sessionID == sessionID
+        }
+        XCTAssertEqual(partialTerminalFrames.count, 3)
+        XCTAssertEqual(partialTerminalFrames.last?.payload?.objectValue?["updated_at"]?.stringValue, "2026-07-02T00:00:01.000Z")
+        XCTAssertNil(partialTerminalFrames.last?.payload?.objectValue?["transcript_item_count"])
+        XCTAssertEqual(partialTerminalFrames.compactMap(\.seq), [1, 2, 3])
+    }
+
     func testRevalidationStopsAfterRespondSuccessRearm() async throws {
         let connection = RecordingAppLinkConnection(responses: [
-            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input"))),
-            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
+            .result(GatewayTestHelpers.toolResult(json: snapshot(status: "waiting_for_input"))),
+            .result(GatewayTestHelpers.toolResult(json: snapshot(status: "running")))
         ])
         let (manager, _) = try await makeManager(connection: connection)
         let sink = RecordingFrameSink()
@@ -138,7 +414,7 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
     func testRevalidationIdleWithoutSinksOrPush() async throws {
         let sinkID = UUID()
         let connection = RecordingAppLinkConnection(responses: [
-            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input")))
+            .result(GatewayTestHelpers.toolResult(json: snapshot(status: "waiting_for_input")))
         ])
         let (manager, _) = try await makeManager(connection: connection)
         let sink = RecordingFrameSink()
@@ -154,12 +430,22 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
         XCTAssertFalse(calls.contains { $0.arguments["op"] == .string("wait") })
     }
 
-    private func snapshot(status: String, interactionID: String? = nil) -> JSONValue {
+    private func snapshot(
+        status: String,
+        transcriptItemCount: Int? = 0,
+        updatedAt: String? = "2026-07-02T00:00:00.000Z",
+        interactionID: String? = nil
+    ) -> JSONValue {
         var payload: [String: JSONValue] = [
             "session_id": .string(sessionID),
-            "status": .string(status),
-            "updated_at": .string("2026-07-02T00:00:00.000Z")
+            "status": .string(status)
         ]
+        if let transcriptItemCount {
+            payload["transcript_item_count"] = .int(transcriptItemCount)
+        }
+        if let updatedAt {
+            payload["updated_at"] = .string(updatedAt)
+        }
         if let interactionID {
             payload["interaction_id"] = .string(interactionID)
         }
@@ -218,11 +504,12 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
     private func waitForFrames(
         _ sink: RecordingFrameSink,
         containing type: String,
+        minimum: Int = 1,
         timeoutMilliseconds: Int = 1000
     ) async -> [RemoteServerFrame] {
         for _ in 0 ..< (timeoutMilliseconds / 20) {
             let frames = await sink.frames
-            if frames.contains(where: { $0.type == type }) { return frames }
+            if frames.count(where: { $0.type == type }) >= minimum { return frames }
             try? await Task.sleep(for: .milliseconds(20))
         }
         return await sink.frames

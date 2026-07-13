@@ -183,6 +183,7 @@ struct AgentMessageBubble: View {
     let cancelActiveToolsAction: (() -> Void)?
     let codexManagedLoginAction: CodexManagedLoginAction?
     let runLocallyInsteadAction: (() -> Void)?
+    let resendUndeliveredAction: (() -> Void)?
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
@@ -209,7 +210,8 @@ struct AgentMessageBubble: View {
         showRunScopedToolCancel: Bool = false,
         cancelActiveToolsAction: (() -> Void)? = nil,
         codexManagedLoginAction: CodexManagedLoginAction? = nil,
-        runLocallyInsteadAction: (() -> Void)? = nil
+        runLocallyInsteadAction: (() -> Void)? = nil,
+        resendUndeliveredAction: (() -> Void)? = nil
     ) {
         self.item = item
         self.isMostRecentEditBubble = isMostRecentEditBubble
@@ -226,6 +228,7 @@ struct AgentMessageBubble: View {
         self.cancelActiveToolsAction = cancelActiveToolsAction
         self.codexManagedLoginAction = codexManagedLoginAction
         self.runLocallyInsteadAction = runLocallyInsteadAction
+        self.resendUndeliveredAction = resendUndeliveredAction
     }
 
     private var runtimeFooter: AgentMessageRuntimeFooter? {
@@ -334,6 +337,17 @@ struct AgentMessageBubble: View {
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
+                    if item.isUndeliveredRemoteSend {
+                        HStack(spacing: 6) {
+                            Text("Undelivered")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                                .foregroundStyle(.red)
+                            if let resendUndeliveredAction {
+                                Button("Resend", action: resendUndeliveredAction)
+                                    .buttonStyle(.plain)
+                            }
+                        }
+                    }
                     if item.codexGoalMode != nil || item.workflow != nil {
                         HStack(spacing: 6) {
                             if let codexGoalMode = item.codexGoalMode {
@@ -352,6 +366,7 @@ struct AgentMessageBubble: View {
                 .padding(12)
                 .background(BubbleColors.lightBlue)
                 .cornerRadius(20)
+                .opacity(item.isUndeliveredRemoteSend ? 0.65 : 1)
 
                 MessageFooterStrip(text: item.text, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
             }

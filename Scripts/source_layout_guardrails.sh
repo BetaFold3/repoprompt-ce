@@ -362,6 +362,7 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-07-09-remote-skip-all-payload-and-respond-recovery-fixes.md"
   "docs/technical_implementation_reports/2026-07-09-remote-interview-draft-preservation-timeout-parity-watch-revalidation.md"
   "docs/technical_implementation_reports/2026-07-09-remote-premature-terminal-latch-and-cb-model-label-fixes.md"
+  "docs/technical_implementation_reports/2026-07-13-live-smoke-deferred-followups-f1-f3.md"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"

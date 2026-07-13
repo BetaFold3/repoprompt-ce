@@ -81,6 +81,493 @@ final class RemoteAgentClientFixesTests: XCTestCase {
     }
 
     @MainActor
+    func testResentOptimisticUserDedupesAgainstHostLogCatchUp() {
+        let coordinator = RemoteAgentModeCoordinator()
+        let session = makeSession(remoteSessionID: "remote-resent-dedupe")
+        var optimistic = AgentChatItem(kind: .user, text: "Plain resent text", sequenceIndex: 999)
+        optimistic.isUndeliveredRemoteSend = true
+        session.appendItem(optimistic)
+        session.pendingRemoteOptimisticUserItemIDs.insert(optimistic.id)
+        session.remoteResendPayloadsByItemID[optimistic.id] = .init(
+            providerText: "Plain resent text",
+            wasStart: false,
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            workspaceName: nil
+        )
+        session.remoteResendInFlightItemIDs.insert(optimistic.id)
+        let projected = project(
+            xml: "<user>Plain resent text</user>",
+            sessionID: "remote-resent-dedupe"
+        )
+
+        coordinator.test_applyTranscriptRows(projected, to: session)
+
+        XCTAssertEqual(session.items.count(where: {
+            $0.kind == .user && $0.text == "Plain resent text"
+        }), 1)
+        XCTAssertFalse(session.items.contains { $0.id == optimistic.id })
+        XCTAssertNil(session.remoteResendPayloadsByItemID[optimistic.id])
+        XCTAssertFalse(session.remoteResendInFlightItemIDs.contains(optimistic.id))
+    }
+
+    func testStructuredTranscriptRoundTripPreservesUndeliveredRemoteSendAndDefaultsAbsentFlagFalse() throws {
+        var flagged = AgentChatItem.user("Retry after restart", sequenceIndex: 7)
+        flagged.isUndeliveredRemoteSend = true
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+
+        let decodedAnchor = try decoder.decode(
+            AgentTranscriptRequestAnchor.self,
+            from: encoder.encode(AgentTranscriptRequestAnchor(from: flagged))
+        )
+        XCTAssertTrue(decodedAnchor.toItem().isUndeliveredRemoteSend)
+
+        let decodedActivity = try decoder.decode(
+            AgentTranscriptActivity.self,
+            from: encoder.encode(AgentTranscriptActivity(from: flagged))
+        )
+        XCTAssertTrue(decodedActivity.toItem().isUndeliveredRemoteSend)
+
+        let unflaggedAnchorData = try encoder.encode(AgentTranscriptRequestAnchor(from: .user("Delivered")))
+        let unflaggedAnchorObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: unflaggedAnchorData) as? [String: Any]
+        )
+        XCTAssertNil(unflaggedAnchorObject["isUndeliveredRemoteSend"])
+        XCTAssertFalse(
+            try decoder.decode(AgentTranscriptRequestAnchor.self, from: unflaggedAnchorData)
+                .toItem().isUndeliveredRemoteSend
+        )
+
+        let unflaggedActivityData = try encoder.encode(AgentTranscriptActivity(from: .user("Delivered activity")))
+        let unflaggedActivityObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: unflaggedActivityData) as? [String: Any]
+        )
+        XCTAssertNil(unflaggedActivityObject["isUndeliveredRemoteSend"])
+        XCTAssertFalse(
+            try decoder.decode(AgentTranscriptActivity.self, from: unflaggedActivityData)
+                .toItem().isUndeliveredRemoteSend
+        )
+
+        var productionShaped = AgentSession(name: "Structured resend").withItems([flagged])
+        productionShaped.items = []
+        let restored = try XCTUnwrap(productionShaped.toLiveItems().first)
+        XCTAssertEqual(restored.id, flagged.id)
+        XCTAssertTrue(restored.isUndeliveredRemoteSend)
+    }
+
+    @MainActor
+    func testRestoredUndeliveredRemoteUserRehydratesPendingIDAndDedupesCatchUp() async throws {
+        let service = AgentSessionDataService.shared
+        let workspace = makeTemporaryWorkspace()
+        defer { try? FileManager.default.removeItem(at: try XCTUnwrap(workspace.customStoragePath)) }
+        let tabID = UUID()
+        let sessionID = UUID()
+        var original = AgentChatItem.user("Restored pending turn", sequenceIndex: 999)
+        original.isUndeliveredRemoteSend = true
+        var flaggedSystem = AgentChatItem.system("Not an optimistic user", sequenceIndex: 1000)
+        flaggedSystem.isUndeliveredRemoteSend = true
+        let persistedSession = AgentSession(
+            id: sessionID,
+            workspaceID: workspace.id,
+            composeTabID: tabID,
+            name: "Restored remote dedupe",
+            items: [
+                AgentChatItemPersist(from: original),
+                AgentChatItemPersist(from: flaggedSystem)
+            ],
+            itemCount: 2,
+            lastRunState: AgentSessionRunState.failed.rawValue,
+            remoteHost: Self.makeBinding(remoteSessionID: "remote-restored-dedupe")
+        )
+        _ = try await service.saveAgentSession(
+            persistedSession,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 2
+        )
+        let hydrationRequest = AgentSessionHydrationRequest(
+            workspace: workspace,
+            tabID: tabID,
+            sessionID: sessionID,
+            resolvedDisplayName: "Restored remote dedupe",
+            hasPendingQuestionUI: false,
+            transcriptViewportState: .liveBottom,
+            isCompressedHistoryRevealed: false,
+            initialPerformanceSnapshot: .empty
+        )
+        let preparedPayload = try await service.preparePersistedHydration(hydrationRequest)
+        let prepared = try XCTUnwrap(preparedPayload)
+        let payload = AgentSessionHydrationPayload(
+            sessionID: prepared.sessionID,
+            persistedSession: persistedSession,
+            canonicalLiveItems: persistedSession.items.map { $0.toItem() },
+            transcript: prepared.transcript,
+            builtPresentation: prepared.builtPresentation,
+            normalizedRunState: prepared.normalizedRunState,
+            normalizedSelection: prepared.normalizedSelection,
+            lastUserMessageAt: prepared.lastUserMessageAt,
+            restoredIndexEntry: prepared.restoredIndexEntry,
+            needsReloadMigrationSave: prepared.needsReloadMigrationSave
+        )
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        viewModel.test_installLiveSession(session)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+
+        let didApplyHydration = await viewModel.test_applyPersistedHydration(payload, to: session)
+        XCTAssertTrue(didApplyHydration)
+
+        let restored = try XCTUnwrap(session.items.first {
+            $0.kind == .user && $0.text == "Restored pending turn"
+        })
+        let restoredSystem = try XCTUnwrap(session.items.first {
+            $0.kind == .system && $0.text == "Not an optimistic user"
+        })
+        XCTAssertTrue(session.pendingRemoteOptimisticUserItemIDs.contains(restored.id))
+        XCTAssertFalse(session.pendingRemoteOptimisticUserItemIDs.contains(restoredSystem.id))
+        let coordinator = RemoteAgentModeCoordinator()
+        let projected = project(
+            xml: "<user>Restored pending turn</user>",
+            sessionID: "remote-restored-dedupe"
+        )
+        coordinator.test_applyTranscriptRows(projected, to: session)
+
+        XCTAssertEqual(session.items.count(where: {
+            $0.kind == .user && $0.text == "Restored pending turn"
+        }), 1)
+        XCTAssertFalse(session.items.contains { $0.id == restored.id })
+    }
+
+    @MainActor
+    func testPersistedWindowOnlyTargetRoundTripsThroughProductionHydrationAndDispatchesOnce() async throws {
+        let service = AgentSessionDataService.shared
+        let workspace = makeTemporaryWorkspace()
+        defer { try? FileManager.default.removeItem(at: try XCTUnwrap(workspace.customStoragePath)) }
+        let tabID = UUID()
+        let sessionID = UUID()
+        let providerText = "Byte-identical provider text\nwith spacing  "
+        var original = AgentChatItem.user("Displayed resend text", sequenceIndex: 999)
+        original.isUndeliveredRemoteSend = true
+        var persistedSession = AgentSession(
+            id: sessionID,
+            workspaceID: workspace.id,
+            composeTabID: tabID,
+            name: "Persisted resend recovery",
+            lastRunState: AgentSessionRunState.failed.rawValue,
+            remoteHost: Self.makeBinding(remoteSessionID: ""),
+            remoteResendPayloadsByItemID: [
+                original.id.uuidString: PersistedRemoteResendPayload(
+                    providerText: providerText,
+                    wasStart: true,
+                    modelSelectionRaw: "codexExec:gpt-5.4",
+                    sessionName: "Recovered start",
+                    workspaceName: "Stale Project Name",
+                    windowID: 42,
+                    workspaceID: nil
+                )
+            ]
+        ).withItems([original])
+        persistedSession.items = []
+        let persistedURL = try await service.saveAgentSession(
+            persistedSession,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 1
+        )
+        let persistedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: persistedURL)) as? [String: Any]
+        )
+        XCTAssertEqual((persistedObject["items"] as? [Any])?.count, 0)
+
+        let loadedSessionResult = try await service.loadAgentSession(id: sessionID, for: workspace)
+        let loadedSession = try XCTUnwrap(loadedSessionResult)
+        let loadedItem = try XCTUnwrap(loadedSession.items.first { $0.id == original.id })
+        XCTAssertTrue(loadedItem.isUndeliveredRemoteSend)
+        XCTAssertNotNil(loadedSession.transcript)
+        let loadedPayload = try XCTUnwrap(loadedSession.remoteResendPayloadsByItemID[original.id.uuidString])
+        XCTAssertNil(loadedPayload.workspaceName)
+        XCTAssertEqual(loadedPayload.windowID, 42)
+        XCTAssertNil(loadedPayload.workspaceID)
+
+        let hydrationRequest = AgentSessionHydrationRequest(
+            workspace: workspace,
+            tabID: tabID,
+            sessionID: sessionID,
+            resolvedDisplayName: loadedSession.name,
+            hasPendingQuestionUI: false,
+            transcriptViewportState: .liveBottom,
+            isCompressedHistoryRevealed: false,
+            initialPerformanceSnapshot: .empty
+        )
+        let preparedResult = try await service.preparePersistedHydration(hydrationRequest)
+        let prepared = try XCTUnwrap(preparedResult)
+        let preparedItem = try XCTUnwrap(prepared.canonicalLiveItems.first { $0.id == original.id })
+        XCTAssertTrue(preparedItem.isUndeliveredRemoteSend)
+        XCTAssertNotNil(prepared.persistedSession.remoteResendPayloadsByItemID[original.id.uuidString])
+
+        let coordinator = RemoteAgentModeCoordinator()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() },
+            testRemoteCoordinator: coordinator
+        )
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        viewModel.test_installLiveSession(session)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+
+        let didApplyHydration = await viewModel.test_applyPersistedHydration(prepared, to: session)
+        XCTAssertTrue(didApplyHydration)
+        let restored = try XCTUnwrap(session.items.first { $0.id == original.id })
+        XCTAssertEqual(
+            viewModel.undeliveredPresentation(for: restored, tabID: tabID),
+            .init(isUndelivered: true, resendActionLabel: "Resend")
+        )
+        XCTAssertTrue(session.remoteResendInFlightItemIDs.isEmpty)
+        let restoredPayload = try XCTUnwrap(session.remoteResendPayloadsByItemID[original.id])
+        XCTAssertEqual(restoredPayload.providerText, providerText)
+        XCTAssertEqual(session.pendingRemoteOptimisticProviderTextByItemID[original.id], providerText)
+        XCTAssertNil(restoredPayload.workspaceName)
+        XCTAssertEqual(restoredPayload.windowID, 42)
+        XCTAssertNil(restoredPayload.workspaceID)
+
+        let connection = ScriptedConnection()
+        let remoteHost = try XCTUnwrap(session.remoteHost)
+        let controller = RemoteAgentSessionController(
+            binding: remoteHost,
+            connection: connection
+        )
+        let hostID = try XCTUnwrap(session.remoteHost?.hostID)
+        coordinator.test_installController(
+            controller,
+            for: session,
+            hostID: hostID
+        )
+        viewModel.resendUndeliveredRemoteUserTurn(tabID: tabID, itemID: original.id)
+        viewModel.resendUndeliveredRemoteUserTurn(tabID: tabID, itemID: original.id)
+        for _ in 0 ..< 200 {
+            if await connection.commandFrames(type: "start").count == 1 { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        let startFrames = await connection.commandFrames(type: "start")
+        XCTAssertEqual(startFrames.count, 1)
+        let startFrame = try XCTUnwrap(startFrames.first)
+        XCTAssertEqual(startFrame.payload?.objectValue?["message"]?.stringValue, providerText)
+        XCTAssertEqual(startFrame.payload?.objectValue?["window_id"]?.intValue, 42)
+        XCTAssertNil(startFrame.payload?.objectValue?["workspace_id"])
+        XCTAssertNil(startFrame.payload?.objectValue?["workspace_name"])
+        for _ in 0 ..< 200 {
+            if session.remoteResendPayloadsByItemID[original.id] == nil { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertNil(session.remoteResendPayloadsByItemID[original.id])
+        XCTAssertEqual(session.pendingRemoteOptimisticProviderTextByItemID[original.id], providerText)
+
+        let projected = project(
+            xml: "<user>\(providerText)</user>",
+            sessionID: session.remoteHost?.normalizedRemoteSessionID ?? "remote-started-by-resend"
+        )
+        coordinator.test_applyTranscriptRows(projected, to: session)
+
+        let projectedUser = try XCTUnwrap(session.items.first { $0.kind == .user })
+        XCTAssertEqual(session.items.count(where: { $0.kind == .user }), 1)
+        XCTAssertFalse(session.items.contains { $0.id == original.id })
+        XCTAssertEqual(projectedUser.text, providerText)
+        XCTAssertEqual(projectedUser.timestamp, original.timestamp)
+        XCTAssertTrue(session.pendingRemoteOptimisticUserItemIDs.isEmpty)
+        XCTAssertTrue(session.pendingRemoteOptimisticProviderTextByItemID.isEmpty)
+    }
+
+    @MainActor
+    func testHydratedStartAttributionMismatchResendsAsSteer() async throws {
+        let service = AgentSessionDataService.shared
+        let workspace = makeTemporaryWorkspace()
+        defer { try? FileManager.default.removeItem(at: try XCTUnwrap(workspace.customStoragePath)) }
+        let tabID = UUID()
+        let sessionID = UUID()
+        let attributedItemID = UUID()
+        var original = AgentChatItem.user("Hydrated mismatch", sequenceIndex: 999)
+        original.isUndeliveredRemoteSend = true
+        let persistedSession = AgentSession(
+            id: sessionID,
+            workspaceID: workspace.id,
+            composeTabID: tabID,
+            name: "Persisted attribution",
+            items: [AgentChatItemPersist(from: original)],
+            itemCount: 1,
+            lastRunState: AgentSessionRunState.failed.rawValue,
+            remoteHost: Self.makeBinding(remoteSessionID: "remote-attributed"),
+            remoteResendPayloadsByItemID: [
+                original.id.uuidString: PersistedRemoteResendPayload(
+                    providerText: "Hydrated mismatch",
+                    wasStart: true,
+                    modelSelectionRaw: nil,
+                    sessionName: nil,
+                    workspaceName: "Project Alpha"
+                )
+            ],
+            locallyAttributedStartItemID: attributedItemID
+        )
+        _ = try await service.saveAgentSession(
+            persistedSession,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 1
+        )
+        let loadedSessionResult = try await service.loadAgentSession(id: sessionID, for: workspace)
+        let loadedSession = try XCTUnwrap(loadedSessionResult)
+        let hydrationRequest = AgentSessionHydrationRequest(
+            workspace: workspace,
+            tabID: tabID,
+            sessionID: sessionID,
+            resolvedDisplayName: loadedSession.name,
+            hasPendingQuestionUI: false,
+            transcriptViewportState: .liveBottom,
+            isCompressedHistoryRevealed: false,
+            initialPerformanceSnapshot: .empty
+        )
+        let preparedResult = try await service.preparePersistedHydration(hydrationRequest)
+        let prepared = try XCTUnwrap(preparedResult)
+        let payload = AgentSessionHydrationPayload(
+            sessionID: prepared.sessionID,
+            persistedSession: loadedSession,
+            canonicalLiveItems: [original],
+            transcript: prepared.transcript,
+            builtPresentation: prepared.builtPresentation,
+            normalizedRunState: prepared.normalizedRunState,
+            normalizedSelection: prepared.normalizedSelection,
+            lastUserMessageAt: prepared.lastUserMessageAt,
+            restoredIndexEntry: prepared.restoredIndexEntry,
+            needsReloadMigrationSave: prepared.needsReloadMigrationSave
+        )
+        let coordinator = RemoteAgentModeCoordinator()
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() },
+            testRemoteCoordinator: coordinator
+        )
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        viewModel.test_installLiveSession(session)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        let didApplyHydration = await viewModel.test_applyPersistedHydration(payload, to: session)
+        XCTAssertTrue(didApplyHydration)
+        XCTAssertEqual(session.locallyAttributedStartItemID, attributedItemID)
+
+        let connection = ScriptedConnection()
+        let remoteHost = try XCTUnwrap(session.remoteHost)
+        let controller = RemoteAgentSessionController(binding: remoteHost, connection: connection)
+        coordinator.test_installController(controller, for: session, hostID: remoteHost.hostID)
+
+        viewModel.resendUndeliveredRemoteUserTurn(tabID: tabID, itemID: original.id)
+        for _ in 0 ..< 200 {
+            if await connection.commandFrames(type: "steer").count == 1 { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+
+        let steerFrames = await connection.commandFrames(type: "steer")
+        XCTAssertEqual(steerFrames.count, 1)
+        XCTAssertEqual(steerFrames.first?.sessionID, "remote-attributed")
+        XCTAssertEqual(steerFrames.first?.payload?.objectValue?["message"]?.stringValue, "Hydrated mismatch")
+        let startFrames = await connection.commandFrames(type: "start")
+        XCTAssertTrue(startFrames.isEmpty)
+        XCTAssertFalse(session.items.contains {
+            $0.kind == .system && $0.text == "Remote send was already delivered."
+        })
+    }
+
+    @MainActor
+    func testV43LegacySessionDecodeDefaultsResendPayloadsToEmptyAndBadgeOnly() async throws {
+        let workspace = makeTemporaryWorkspace()
+        defer { try? FileManager.default.removeItem(at: try XCTUnwrap(workspace.customStoragePath)) }
+        let tabID = UUID()
+        let sessionID = UUID()
+        var original = AgentChatItem.user("Legacy undelivered", sequenceIndex: 999)
+        original.isUndeliveredRemoteSend = true
+        let source = AgentSession(
+            id: sessionID,
+            workspaceID: workspace.id,
+            composeTabID: tabID,
+            name: "Legacy resend recovery",
+            items: [AgentChatItemPersist(from: original)],
+            itemCount: 1,
+            lastRunState: AgentSessionRunState.failed.rawValue,
+            remoteHost: Self.makeBinding(remoteSessionID: "remote-legacy")
+        )
+        let encoded = try JSONEncoder().encode(source)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        object.removeValue(forKey: "remoteResendPayloadsByItemID")
+        object.removeValue(forKey: "locallyAttributedStartItemID")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(AgentSession.self, from: legacyData)
+        XCTAssertTrue(decoded.remoteResendPayloadsByItemID.isEmpty)
+        XCTAssertNil(decoded.locallyAttributedStartItemID)
+
+        let partialSelectorData = Data(
+            #"{"providerText":"Retry","wasStart":true,"workspaceName":"Project Alpha","windowID":7}"#.utf8
+        )
+        let partialSelector = try JSONDecoder().decode(PersistedRemoteResendPayload.self, from: partialSelectorData)
+        XCTAssertNil(partialSelector.workspaceName)
+        XCTAssertEqual(partialSelector.windowID, 7)
+        XCTAssertNil(partialSelector.workspaceID)
+
+        let service = AgentSessionDataService.shared
+        _ = try await service.saveAgentSession(
+            decoded,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 1
+        )
+        let hydrationRequest = AgentSessionHydrationRequest(
+            workspace: workspace,
+            tabID: tabID,
+            sessionID: sessionID,
+            resolvedDisplayName: decoded.name,
+            hasPendingQuestionUI: false,
+            transcriptViewportState: .liveBottom,
+            isCompressedHistoryRevealed: false,
+            initialPerformanceSnapshot: .empty
+        )
+        let preparedResult = try await service.preparePersistedHydration(hydrationRequest)
+        let prepared = try XCTUnwrap(preparedResult)
+        let payload = AgentSessionHydrationPayload(
+            sessionID: prepared.sessionID,
+            persistedSession: decoded,
+            canonicalLiveItems: decoded.items.map { $0.toItem() },
+            transcript: prepared.transcript,
+            builtPresentation: prepared.builtPresentation,
+            normalizedRunState: prepared.normalizedRunState,
+            normalizedSelection: prepared.normalizedSelection,
+            lastUserMessageAt: prepared.lastUserMessageAt,
+            restoredIndexEntry: prepared.restoredIndexEntry,
+            needsReloadMigrationSave: prepared.needsReloadMigrationSave
+        )
+        let viewModel = AgentModeViewModel(
+            testWindowID: 1,
+            testWorkspacePath: FileManager.default.currentDirectoryPath,
+            codexControllerFactory: { _, _, _, _, _, _ in ClientFixesNoopCodexController() }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        viewModel.test_installLiveSession(session)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+
+        let didApplyHydration = await viewModel.test_applyPersistedHydration(payload, to: session)
+        XCTAssertTrue(didApplyHydration)
+        let restored = try XCTUnwrap(session.items.first { $0.id == original.id })
+        XCTAssertEqual(
+            viewModel.undeliveredPresentation(for: restored, tabID: tabID),
+            .init(isUndelivered: true, resendActionLabel: nil)
+        )
+        XCTAssertTrue(session.remoteResendPayloadsByItemID.isEmpty)
+    }
+
+    @MainActor
     func testT11CompleteFailedToolUpdatesInPlaceWithoutDuplicate() throws {
         let coordinator = RemoteAgentModeCoordinator()
         let session = makeSession(remoteSessionID: "remote-t11")
@@ -495,6 +982,17 @@ final class RemoteAgentClientFixesTests: XCTestCase {
         XCTAssertEqual(batches[1].removedIDs, try [XCTUnwrap(batches[0].items.first?.id)])
     }
 
+    private func makeTemporaryWorkspace() -> WorkspaceModel {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RemoteAgentClientFixesTests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        return WorkspaceModel(
+            name: "Remote Client Fixes Persistence",
+            repoPaths: ["/tmp/repo"],
+            customStoragePath: directory
+        )
+    }
+
     @MainActor
     private func makeSession(remoteSessionID: String) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
@@ -715,6 +1213,10 @@ private actor ScriptedConnection: RemoteAgentSessionConnection {
     func ensureConnected() async throws {}
     func subscribe(sessionIDs _: [String]) async throws {}
     func unsubscribe(sessionIDs _: [String]) async throws {}
+
+    func commandFrames(type: String) -> [RemoteClientFrame] {
+        frames.filter { $0.type == type }
+    }
 
     func getLogRequests() -> [(offset: Int, limit: Int)] {
         frames.compactMap { frame in
