@@ -104,8 +104,9 @@ LoggingSystem.bootstrap { label in
     StreamLogHandler.standardError(label: label)
 }
 
-var logger = Logger(label: "com.repoprompt.gateway")
-logger.logLevel = .info
+var configuredLogger = Logger(label: "com.repoprompt.gateway")
+configuredLogger.logLevel = .info
+let logger = configuredLogger
 
 do {
     let configuration = try GatewayConfiguration.parse()
@@ -192,6 +193,62 @@ do {
         vapidPublicKeyBase64URL: VAPIDKeyStore.publicKeyBase64URL(for: vapidPrivateKey),
         logger: logger
     )
+
+    let revokedTransitionState = GatewayRevokedDeviceTransitionState()
+    let trustRefreshCoordinator = GatewayTrustRefreshCoordinator(
+        fetchSnapshot: {
+            try await GatewayTrustSynchronizer.fetchSnapshot(appLink: appLink)
+        },
+        applySnapshot: { snapshot in
+            let revokedDeviceIDs = await authenticator.updateTrust(snapshot)
+            let tornDown = await appLinkPool.applyTrustSnapshot(snapshot)
+            let teardownDeviceIDs = await revokedTransitionState.devicesRequiringTeardown(
+                revoked: Set(revokedDeviceIDs),
+                tornDown: Set(tornDown),
+                snapshot: snapshot
+            )
+            for deviceID in teardownDeviceIDs {
+                let code = snapshot.devices[deviceID]?.isRevoked == true ? "device_revoked" : "device_unpaired"
+                await runtime.teardownRevokedDevice(deviceID: deviceID, reason: code)
+                httpServer.closeConnections(forDevice: deviceID)
+                auditLog.recordBestEffort(RemoteAuditRecord(
+                    deviceID: deviceID,
+                    requestID: nil,
+                    op: "trust_sync",
+                    sessionID: nil,
+                    outcome: tornDown.contains(deviceID) ? "revoked_teardown" : "revoked_connection_teardown",
+                    code: code
+                ))
+            }
+            // Push subscriptions are removed on revocation/unpairing (M5).
+            for deviceID in pushSubscriptionStore.deviceIDs {
+                let device = snapshot.devices[deviceID]
+                if device == nil || device?.isRevoked == true {
+                    if (try? pushSubscriptionStore.removeSubscription(forDevice: deviceID)) == true {
+                        await watchManager.pushEligibilityChanged(deviceID: deviceID)
+                        auditLog.recordBestEffort(RemoteAuditRecord(
+                            deviceID: deviceID,
+                            requestID: nil,
+                            op: "trust_sync",
+                            sessionID: nil,
+                            outcome: "push_subscription_removed",
+                            code: "device_revoked"
+                        ))
+                    }
+                }
+            }
+        }
+    )
+    await pairingRelay.setPostCompletePairingAction {
+        do {
+            try await trustRefreshCoordinator.refresh()
+        } catch is CancellationError {
+            // Gateway shutdown owns cancellation; pairing HTTP work will be
+            // closed by server teardown.
+        } catch {
+            logger.warning("Post-pairing gateway trust refresh failed: \(String(describing: error))")
+        }
+    }
     try await httpServer.start()
     try RemoteGatewayProcessLeaseFile.write(
         RemoteGatewayProcessLease(
@@ -209,49 +266,13 @@ do {
     // Trust sync: the gateway holds only the host public key and paired-device
     // public keys/tickets; revocations tear down per-device app links.
     let trustSyncTask = Task {
-        var revokedTransitionTracker = GatewayRevokedDeviceTransitionTracker()
         while !Task.isCancelled {
             do {
-                let snapshot = try await GatewayTrustSynchronizer.fetchSnapshot(appLink: appLink)
-                let revokedDeviceIDs = await authenticator.updateTrust(snapshot)
-                let tornDown = await appLinkPool.applyTrustSnapshot(snapshot)
-                let teardownDeviceIDs = revokedTransitionTracker.devicesRequiringTeardown(
-                    revoked: Set(revokedDeviceIDs),
-                    tornDown: Set(tornDown),
-                    snapshot: snapshot
-                )
-                for deviceID in teardownDeviceIDs {
-                    let code = snapshot.devices[deviceID]?.isRevoked == true ? "device_revoked" : "device_unpaired"
-                    await runtime.teardownRevokedDevice(deviceID: deviceID, reason: code)
-                    httpServer.closeConnections(forDevice: deviceID)
-                    auditLog.recordBestEffort(RemoteAuditRecord(
-                        deviceID: deviceID,
-                        requestID: nil,
-                        op: "trust_sync",
-                        sessionID: nil,
-                        outcome: tornDown.contains(deviceID) ? "revoked_teardown" : "revoked_connection_teardown",
-                        code: code
-                    ))
-                }
-                // Push subscriptions are removed on revocation/unpairing (M5).
-                for deviceID in pushSubscriptionStore.deviceIDs {
-                    let device = snapshot.devices[deviceID]
-                    if device == nil || device?.isRevoked == true {
-                        if (try? pushSubscriptionStore.removeSubscription(forDevice: deviceID)) == true {
-                            await watchManager.pushEligibilityChanged(deviceID: deviceID)
-                            auditLog.recordBestEffort(RemoteAuditRecord(
-                                deviceID: deviceID,
-                                requestID: nil,
-                                op: "trust_sync",
-                                sessionID: nil,
-                                outcome: "push_subscription_removed",
-                                code: "device_revoked"
-                            ))
-                        }
-                    }
-                }
+                try await trustRefreshCoordinator.refresh()
             } catch {
-                logger.debug("Gateway trust sync failed: \(String(describing: error))")
+                if !Task.isCancelled {
+                    logger.warning("Gateway trust sync failed: \(String(describing: error))")
+                }
             }
             try? await Task.sleep(for: .seconds(15))
         }
@@ -260,6 +281,7 @@ do {
     let terminationReason = await waitForTermination(parentPID: configuration.parentPID, appLink: appLink)
     logger.notice("Stopping RepoPrompt gateway (\(terminationReason.description))")
     trustSyncTask.cancel()
+    await trustRefreshCoordinator.stop()
     await httpServer.shutdown()
     await watchManager.shutdown()
     await appLinkPool.shutdownAll()

@@ -203,7 +203,9 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
                 try await executeCompletePairing(args: args, dependencies: dependencies)
             }
         case .mintTicket:
-            return try executeMintTicket(args: args, dependencies: dependencies)
+            return try await executeExpectedFailureBoundary {
+                try executeMintTicket(args: args, dependencies: dependencies)
+            }
         case .revokeDevice:
             return try executeRevokeDevice(args: args, dependencies: dependencies)
         case .listDevices:
@@ -390,10 +392,18 @@ final class MCPRemotePairingToolProvider: MCPWindowToolProviding {
     ) throws -> Value {
         let deviceID = try requiredTrimmedString(args["device_id"], name: "device_id")
         guard let device = try dependencies.identityStore.device(id: deviceID) else {
-            throw MCPError.invalidRequest("No paired device exists for \(deviceID).")
+            throw RemotePairingExpectedFailure(
+                code: "unknown_device",
+                message: "No paired device exists for \(deviceID).",
+                status: 404
+            )
         }
         guard !device.isRevoked else {
-            throw MCPError.invalidRequest("Device \(deviceID) is revoked.")
+            throw RemotePairingExpectedFailure(
+                code: "device_revoked",
+                message: "Device \(deviceID) is revoked.",
+                status: 403
+            )
         }
         let requestedScopes = try parseScopes(args["scopes"], required: false) ?? device.scopes
         let grantedScopes = requestedScopes.intersection(device.scopes)

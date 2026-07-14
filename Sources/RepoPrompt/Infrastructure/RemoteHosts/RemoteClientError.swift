@@ -37,7 +37,7 @@ enum RemoteClientError: Error, Equatable, LocalizedError {
     static func fromCommandError(code: String, message: String, details: JSONValue? = nil) -> RemoteClientError {
         let error = RemoteCommandError(code: code, message: message, details: details)
         switch code {
-        case "device_revoked", "unknown_device":
+        case "device_revoked":
             return .revoked(error)
         case "binding_required":
             return .bindingRequired(error)
@@ -59,6 +59,7 @@ enum RemoteClientError: Error, Equatable, LocalizedError {
              "ticket_signature_invalid",
              "ticket_already_used",
              "trust_unavailable",
+             "unknown_device",
              "counter_replayed",
              "signature_required",
              "unsupported_signature_algorithm",

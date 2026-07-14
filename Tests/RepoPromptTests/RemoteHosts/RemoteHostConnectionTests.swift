@@ -6,6 +6,46 @@ import RepoPromptRemoteWire
 import XCTest
 
 final class RemoteHostConnectionTests: XCTestCase {
+    func testUnknownDeviceIsRetryableAuthenticationFailure() {
+        let error = RemoteClientError.fromCommandError(
+            code: "unknown_device",
+            message: "The gateway trust snapshot has not observed this device yet."
+        )
+
+        guard case let .authentication(commandError) = error else {
+            return XCTFail("Expected unknown_device to remain a nonsticky authentication failure, got \(error)")
+        }
+        XCTAssertEqual(commandError.code, "unknown_device")
+    }
+
+    func testTicketHTTPErrorRequiresStructuredDeviceRevokedCode() throws {
+        let unstructured = try XCTUnwrap(
+            #"{"error":"Device remote:11223344 is revoked."}"#.data(using: .utf8)
+        )
+        let unstructuredError = RemoteHostConnection.classifyTicketHTTPError(statusCode: 403, data: unstructured)
+        guard case .transport = unstructuredError else {
+            return XCTFail("Expected revocation-like free text to remain nonsticky, got \(unstructuredError)")
+        }
+
+        let unknownDevice = try XCTUnwrap(
+            #"{"code":"unknown_device","error":"No paired device exists."}"#.data(using: .utf8)
+        )
+        let unknownDeviceError = RemoteHostConnection.classifyTicketHTTPError(statusCode: 404, data: unknownDevice)
+        guard case let .authentication(commandError) = unknownDeviceError else {
+            return XCTFail("Expected structured unknown_device to remain retryable, got \(unknownDeviceError)")
+        }
+        XCTAssertEqual(commandError.code, "unknown_device")
+
+        let revoked = try XCTUnwrap(
+            #"{"code":"device_revoked","error":"The host revoked this device."}"#.data(using: .utf8)
+        )
+        let revokedError = RemoteHostConnection.classifyTicketHTTPError(statusCode: 403, data: revoked)
+        guard case let .revoked(commandError) = revokedError else {
+            return XCTFail("Expected explicit device_revoked to be definitive, got \(revokedError)")
+        }
+        XCTAssertEqual(commandError.code, "device_revoked")
+    }
+
     private var root: URL!
     private var configuration: GatewayConfiguration!
     private var hostSigner: P256.Signing.PrivateKey!
@@ -427,6 +467,45 @@ final class RemoteHostConnectionTests: XCTestCase {
         XCTAssertNotNil(try registry.host(id: record.id)?.revokedByHostAt)
         let revokedState = await connection.currentState()
         XCTAssertEqual(revokedState, .revoked)
+    }
+
+    func testUnknownDeviceDuringHelloDoesNotPersistRevocationAndCanRetry() async throws {
+        let record = try upsertClientRecord()
+        _ = await authenticator.updateTrust(GatewayAuthTestSupport.trustSnapshot(
+            hostSigner: hostSigner,
+            devices: []
+        ))
+        await enqueueTicket()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+
+        do {
+            try await connection.ensureConnected()
+            XCTFail("Expected the stale trust snapshot to reject an unknown device")
+        } catch let error as RemoteClientError {
+            guard case let .authentication(commandError) = error else {
+                XCTFail("Expected a retryable authentication error, got \(error)")
+                return
+            }
+            XCTAssertEqual(commandError.code, "unknown_device")
+        }
+
+        XCTAssertNil(try registry.host(id: record.id)?.revokedByHostAt)
+        let stateAfterDenial = await connection.currentState()
+        XCTAssertNotEqual(stateAfterDenial, .revoked)
+
+        _ = await authenticator.updateTrust(GatewayAuthTestSupport.trustSnapshot(
+            hostSigner: hostSigner,
+            devices: [(device, false)]
+        ))
+        await enqueueTicket()
+        try await connection.ensureConnected()
+
+        guard case .connected = await connection.currentState() else {
+            XCTFail("Expected retry to connect after gateway trust caught up")
+            return
+        }
+        XCTAssertNil(try registry.host(id: record.id)?.revokedByHostAt)
+        await connection.disconnect()
     }
 
     func testUnknownServerFramesAreIgnored() async throws {

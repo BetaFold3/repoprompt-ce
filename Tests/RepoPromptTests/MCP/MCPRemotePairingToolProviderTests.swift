@@ -192,6 +192,42 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
         XCTAssertNil(revoked.pushSubscription)
     }
 
+    func testMintTicketReturnsStructuredMissingAndRevokedDeviceFailures() async throws {
+        let directory = try RemotePairingTestSupport.temporaryDirectory(testCase: self)
+        let store = makeStore(url: RemotePairingTestSupport.registryURL(in: directory))
+        let manager = RemoteDeviceApprovalManager(bringWindowToFront: { _ in })
+        let deps = makeDependencies(identityStore: store, approvalManager: manager)
+        let context = MCPWindowToolContext(toolName: MCPWindowToolName.remotePairing, windowID: 1)
+
+        let missing = try await MCPRemotePairingToolProvider.execute(
+            args: [
+                "op": .string(RemotePairingOperation.mintTicket.rawValue),
+                "device_id": .string("remote:missing")
+            ],
+            context: context,
+            dependencies: deps
+        )
+        XCTAssertEqual(missing.objectValue?["ok"]?.boolValue, false)
+        XCTAssertEqual(missing.objectValue?["code"]?.stringValue, "unknown_device")
+        XCTAssertEqual(missing.objectValue?["status"]?.intValue, 404)
+
+        let record = RemotePairingTestSupport.deviceRecord(id: "remote:revoked")
+        try store.upsertDevice(record)
+        _ = try store.revokeDevice(id: record.id, revokedAt: Date())
+
+        let revoked = try await MCPRemotePairingToolProvider.execute(
+            args: [
+                "op": .string(RemotePairingOperation.mintTicket.rawValue),
+                "device_id": .string(record.id)
+            ],
+            context: context,
+            dependencies: deps
+        )
+        XCTAssertEqual(revoked.objectValue?["ok"]?.boolValue, false)
+        XCTAssertEqual(revoked.objectValue?["code"]?.stringValue, "device_revoked")
+        XCTAssertEqual(revoked.objectValue?["status"]?.intValue, 403)
+    }
+
     private func makeStore(url: URL) -> RemotePairingIdentityStore {
         let (_, keychain) = RemotePairingTestSupport.hostKeychain()
         return RemotePairingIdentityStore(url: url, keychain: keychain)

@@ -53,7 +53,9 @@ actor GatewayPairingRelay {
         "pairing_denied",
         "pairing_challenge_expired",
         "pairing_challenge_replayed",
-        "pairing_challenge_not_found"
+        "pairing_challenge_not_found",
+        "unknown_device",
+        "device_revoked"
     ]
 
     static func status(forExpectedFailure code: String) -> Int {
@@ -72,6 +74,7 @@ actor GatewayPairingRelay {
     private let logger: Logger
     private let now: @Sendable () -> Date
     private let discoveryPeerObserver: (@Sendable (String) -> Void)?
+    private var postCompletePairingAction: (@Sendable () async -> Void)?
     private var recentRequestTimesByPath: [String: [Date]] = [:]
     private var recentDiscoveryRequestsByPeer: [String: [Date]] = [:]
     private var recentDiscoveryRequests: [Date] = []
@@ -89,6 +92,13 @@ actor GatewayPairingRelay {
         self.logger = logger
         self.now = now
         self.discoveryPeerObserver = discoveryPeerObserver
+    }
+
+    /// Installed during gateway startup before the HTTP server accepts work.
+    /// Successful pairing waits for this action, making refreshed gateway trust
+    /// visible before the controller can mint a ticket and open its WebSocket.
+    func setPostCompletePairingAction(_ action: @escaping @Sendable () async -> Void) {
+        postCompletePairingAction = action
     }
 
     func isAppLinkReady() async -> Bool {
@@ -277,6 +287,9 @@ actor GatewayPairingRelay {
                 let status = payload.objectValue?["status"]?.intValue ?? Self.status(forExpectedFailure: code)
                 audit(op: auditOp, outcome: "denied", code: code)
                 return RelayResponse(status: status, body: payload)
+            }
+            if op == "complete_pairing", payload.objectValue?["ok"]?.boolValue != false {
+                await postCompletePairingAction?()
             }
             audit(op: auditOp, outcome: "success", code: nil)
             return RelayResponse(status: 200, body: payload)

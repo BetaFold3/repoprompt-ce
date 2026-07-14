@@ -5,6 +5,102 @@ import RepoPromptRemoteWire
 import XCTest
 
 final class GatewayPairingRelayTests: XCTestCase {
+    func testSuccessfulCompletePairingWaitsForPostPairingTrustRefresh() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let connection = RecordingAppLinkConnection()
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let relay = GatewayPairingRelay(appLink: appLink)
+        let refreshGate = RecordingAppLinkResponseGate()
+        await relay.setPostCompletePairingAction {
+            await refreshGate.enterAndWaitForRelease()
+        }
+
+        let completionProbe = GatewayTrustRefreshInvocationProbe()
+        let responseTask = Task {
+            let response = await relay.handle(path: GatewayPairingRelay.completePairingPath, body: Data())
+            await completionProbe.recordInvocation()
+            return response
+        }
+        await refreshGate.waitUntilEntered()
+        try await Task.sleep(for: .milliseconds(50))
+        let completedWhileRefreshBlocked = await completionProbe.invocationCount
+        XCTAssertEqual(completedWhileRefreshBlocked, 0, "Response must wait for the trust refresh")
+
+        await refreshGate.release()
+        let response = await responseTask.value
+        XCTAssertEqual(response.status, 200)
+        let calls = await connection.calls
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.arguments["op"], .string("complete_pairing"))
+    }
+
+    func testFailedCompletePairingDoesNotRefreshTrust() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let payload: JSONValue = .object([
+            "ok": .bool(false),
+            "code": .string("pairing_denied"),
+            "error": .string("Denied")
+        ])
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: payload))
+        ])
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let refreshProbe = GatewayTrustRefreshInvocationProbe()
+        let relay = GatewayPairingRelay(appLink: appLink)
+        await relay.setPostCompletePairingAction {
+            await refreshProbe.recordInvocation()
+        }
+
+        let response = await relay.handle(path: GatewayPairingRelay.completePairingPath, body: Data())
+
+        XCTAssertEqual(response.status, 403)
+        let invocationCount = await refreshProbe.invocationCount
+        XCTAssertEqual(invocationCount, 0)
+    }
+
+    func testMintTicketPreservesStructuredDeviceTrustFailures() async throws {
+        for (code, status) in [("unknown_device", 404), ("device_revoked", 403)] {
+            let root = try GatewayTestHelpers.temporaryRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let config = try GatewayTestHelpers.configuration(root: root)
+            let payload: JSONValue = .object([
+                "ok": .bool(false),
+                "code": .string(code),
+                "error": .string("Structured device trust failure."),
+                "status": .int(status)
+            ])
+            let connection = RecordingAppLinkConnection(responses: [
+                .result(GatewayTestHelpers.toolResult(json: payload))
+            ])
+            let appLink = AppLinkSession(
+                config: config,
+                connector: StaticAppLinkConnector(connection: connection),
+                sleep: { _ in }
+            )
+            try await appLink.connect()
+            let relay = GatewayPairingRelay(appLink: appLink)
+
+            let response = await relay.handle(path: GatewayPairingRelay.mintTicketPath, body: Data())
+
+            XCTAssertEqual(response.status, status)
+            XCTAssertEqual(response.body, payload)
+        }
+    }
+
     func testBeginPairingRateLimitRejectsBurstBeforeCallingAppAgain() async throws {
         let root = try GatewayTestHelpers.temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -200,5 +296,13 @@ final class GatewayPairingRelayTests: XCTestCase {
         // markdown block, the relay's codec falls back to {"text": ...}, and the
         // PWA never sees pairing_id (complete_pairing then fails with -32602).
         XCTAssertEqual(calls.first?.arguments["_rawJSON"]?.boolValue, true)
+    }
+}
+
+private actor GatewayTrustRefreshInvocationProbe {
+    private(set) var invocationCount = 0
+
+    func recordInvocation() {
+        invocationCount += 1
     }
 }

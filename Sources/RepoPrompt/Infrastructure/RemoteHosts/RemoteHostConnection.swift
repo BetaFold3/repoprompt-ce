@@ -337,7 +337,7 @@ actor RemoteHostConnection {
                         retriedCounter = true
                         persistCounter(UInt64(max(0, currentEpochMilliseconds(date: now()))) + 1)
                         continue
-                    case "device_revoked", "unknown_device":
+                    case "device_revoked":
                         markRevoked()
                         throw RemoteClientError.revoked(commandError)
                     default:
@@ -505,24 +505,21 @@ actor RemoteHostConnection {
     }
 
     private func ticketHTTPError(_ response: RemoteHostConnectionHTTPResponse) -> RemoteClientError {
-        let object = try? JSONDecoder().decode(JSONValue.self, from: response.data).objectValue
+        Self.classifyTicketHTTPError(statusCode: response.statusCode, data: response.data)
+    }
+
+    static func classifyTicketHTTPError(statusCode: Int, data: Data) -> RemoteClientError {
+        let object = try? JSONDecoder().decode(JSONValue.self, from: data).objectValue
         let code = object?["code"]?.stringValue
         let message = object?["error"]?.stringValue
             ?? object?["message"]?.stringValue
             ?? object?["text"]?.stringValue
-            ?? "Ticket endpoint returned HTTP \(response.statusCode)."
-        if response.statusCode == 429 || code == "rate_limited" {
+            ?? "Ticket endpoint returned HTTP \(statusCode)."
+        if statusCode == 429 || code == "rate_limited" {
             return .rateLimited(message: message)
         }
-        if message.localizedCaseInsensitiveContains("revoked") {
-            let error = RemoteCommandError(code: "device_revoked", message: message, details: nil)
-            markRevoked()
-            return .revoked(error)
-        }
-        if message.localizedCaseInsensitiveContains("no paired device") {
-            let error = RemoteCommandError(code: "unknown_device", message: message, details: nil)
-            markRevoked()
-            return .revoked(error)
+        if let code {
+            return RemoteClientError.fromCommandError(code: code, message: message)
         }
         return .transport(message)
     }
@@ -813,9 +810,13 @@ actor RemoteHostConnection {
     private func handleUncorrelatedCommandError(_ error: RemoteClientError) {
         guard let commandError = error.commandError else { return }
         switch commandError.code {
-        case "device_revoked", "unknown_device":
+        case "device_revoked":
             markRevoked()
             failAllPending(with: error)
+        case "unknown_device":
+            transition(to: .degraded(code: commandError.code, retryAt: now().addingTimeInterval(reconnectBackoff)))
+            failAllPending(with: error)
+            scheduleReconnectIfNeeded(reason: commandError.code)
         case "counter_replayed":
             persistCounter(UInt64(max(0, currentEpochMilliseconds(date: now()))) + 1)
             transition(to: .degraded(code: commandError.code, retryAt: now().addingTimeInterval(reconnectBackoff)))
