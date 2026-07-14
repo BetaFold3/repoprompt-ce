@@ -1,5 +1,11 @@
 import SwiftUI
 
+struct AgentRemoteControlDeviceBadgeText: Equatable {
+    let label: String
+    let badgeTooltip: String
+    let statusPlateTooltip: String
+}
+
 // MARK: - Agent Session Row
 
 struct AgentSessionRow: View {
@@ -14,6 +20,10 @@ struct AgentSessionRow: View {
     /// that survives re-renders until the session is selected/resumed or the
     /// user dismisses the badge explicitly.
     var attentionRunState: AgentSessionRunState?
+    var remoteHostName: String?
+    var remoteHostAbbreviation: String?
+    var remoteControlDeviceID: String?
+    var remoteControlDeviceDisplayName: String?
     /// Bound-worktree visual identity for this session (Item 10). When non-nil,
     /// a small colored dot/ring is overlaid at the bottom-right of the status
     /// plate without shifting the title — see `worktreeMarker`.
@@ -187,6 +197,17 @@ struct AgentSessionRow: View {
                         mergeAttentionBadge(for: attention)
                     }
 
+                    if let remoteHostName {
+                        remoteHostBadge(hostName: remoteHostName, abbreviation: remoteHostAbbreviation)
+                    }
+
+                    if let remoteControlDeviceID {
+                        remoteControlledBadge(
+                            deviceID: remoteControlDeviceID,
+                            displayName: remoteControlDeviceDisplayName
+                        )
+                    }
+
                     if isThreadCollapsed, hiddenThreadDescendantCount > 0 {
                         hiddenCountChip
                     }
@@ -329,6 +350,93 @@ struct AgentSessionRow: View {
     /// an active worktree merge operation in `awaiting_approval`,
     /// `conflicted`, or `awaiting_commit` state. Sized to match the existing
     /// pin glyph so layout does not jitter when attention attaches/detaches.
+    private func remoteHostBadge(hostName: String, abbreviation: String?) -> some View {
+        let displayLabel: String = if let abbreviation, !abbreviation.isEmpty {
+            abbreviation
+        } else {
+            hostName
+        }
+        return HStack(spacing: 3) {
+            Image(systemName: "network")
+                .font(.system(size: pinFontSize - 1, weight: .semibold))
+            Text(displayLabel)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(Color.accentColor)
+        .padding(.horizontal, chipHorizontalPadding)
+        .padding(.vertical, chipVerticalPadding)
+        .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+        .overlay(Capsule().strokeBorder(Color.accentColor.opacity(0.35), lineWidth: 0.75))
+        .hoverTooltip("Running on \(hostName)")
+        .accessibilityLabel("Running on \(hostName)")
+    }
+
+    private func remoteControlledBadge(deviceID: String, displayName: String?) -> some View {
+        let text = Self.remoteControlDeviceBadgeText(deviceID: deviceID, displayName: displayName)
+        return HStack(spacing: 3) {
+            Image(systemName: "antenna.radiowaves.left.and.right")
+                .font(.system(size: pinFontSize - 1, weight: .semibold))
+            Text(text.label)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(Self.mcpAccentColor)
+        .padding(.horizontal, chipHorizontalPadding)
+        .padding(.vertical, chipVerticalPadding)
+        .background(Capsule().fill(Self.mcpAccentColor.opacity(0.12)))
+        .overlay(Capsule().strokeBorder(Self.mcpAccentColor.opacity(0.35), lineWidth: 0.75))
+        .hoverTooltip(text.badgeTooltip)
+        .accessibilityLabel(text.badgeTooltip)
+    }
+
+    static func remoteControlDeviceBadgeText(
+        deviceID: String,
+        displayName: String?
+    ) -> AgentRemoteControlDeviceBadgeText {
+        let label = remoteControlDeviceLabel(for: deviceID)
+        if let displayName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !displayName.isEmpty
+        {
+            let tooltip = "Remote controlled by \(displayName) (\(label))"
+            return AgentRemoteControlDeviceBadgeText(
+                label: remoteControlDeviceBadgeAbbreviation(for: displayName),
+                badgeTooltip: tooltip,
+                statusPlateTooltip: tooltip
+            )
+        }
+        return AgentRemoteControlDeviceBadgeText(
+            label: label,
+            badgeTooltip: "Remote-controlled by device \(deviceID)",
+            statusPlateTooltip: "Remote controlled (device \(label))"
+        )
+    }
+
+    /// Compact badge label for a paired-device display name: initials of the first
+    /// three tokens ("Tuan's MacBook Pro" → "TMP"); single-token names use their
+    /// first three characters ("Studio" → "STU"). Collisions are acceptable — the
+    /// badge is per-row provenance and the tooltip always carries the full name + hex.
+    static func remoteControlDeviceBadgeAbbreviation(for displayName: String) -> String {
+        let stripped = displayName
+            .replacingOccurrences(of: "'", with: "")
+            .replacingOccurrences(of: "\u{2019}", with: "")
+        let tokens = stripped.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        let initials = tokens.prefix(3).compactMap(\.first)
+        if initials.count >= 2 {
+            return String(initials).uppercased()
+        }
+        if let firstToken = tokens.first {
+            return String(firstToken.prefix(3)).uppercased()
+        }
+        return displayName
+    }
+
+    static func remoteControlDeviceLabel(for deviceID: String) -> String {
+        String(deviceID.split(separator: ":").last.map(String.init) ?? deviceID).suffix(8).description
+    }
+
     private func mergeAttentionBadge(for attention: AgentWorktreeMergeAttention) -> some View {
         let tint: Color = switch attention.kind {
         case .conflicted: .orange
@@ -624,10 +732,17 @@ struct AgentSessionRow: View {
     /// (`statusPlateTooltip`) with the bound-worktree identity line so a
     /// single hover surfaces both. Either portion may be absent.
     private var plateTooltip: String? {
-        let status = statusPlateTooltip
-        guard let worktreeTooltip = worktree?.tooltipText else { return status }
-        guard let status else { return worktreeTooltip }
-        return status + "\n" + worktreeTooltip
+        var parts: [String] = []
+        if let status = statusPlateTooltip {
+            parts.append(status)
+        }
+        if let remoteHostName {
+            parts.append("Running on \(remoteHostName)")
+        }
+        if let worktreeTooltip = worktree?.tooltipText {
+            parts.append(worktreeTooltip)
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "\n")
     }
 
     /// Run-state / MCP portion of the plate tooltip, before worktree identity
@@ -637,6 +752,12 @@ struct AgentSessionRow: View {
         if showsDisclosureChevron { return nil }
 
         let state = effectiveStatusState
+        let controlTooltip = remoteControlDeviceID.map {
+            Self.remoteControlDeviceBadgeText(
+                deviceID: $0,
+                displayName: remoteControlDeviceDisplayName
+            ).statusPlateTooltip
+        } ?? "MCP Controlled"
         let stateTooltip: String? = switch state {
         case .running:
             "Running"
@@ -656,9 +777,9 @@ struct AgentSessionRow: View {
 
         switch (stateTooltip, isMCPControlledRoot) {
         case (let tip?, true):
-            return tip + " — MCP Controlled"
+            return tip + " — " + controlTooltip
         case (nil, true):
-            return "MCP Controlled"
+            return controlTooltip
         case (let tip, false):
             return tip
         }

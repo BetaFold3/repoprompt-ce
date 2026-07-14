@@ -5,6 +5,7 @@ import SwiftUI
 struct ContentRootShellView: View {
     @ObservedObject var viewModel: ContentViewModel
     @ObservedObject var workspaceApprovalManager: WorkspaceApprovalManager
+    @ObservedObject var remoteDeviceApprovalManager: RemoteDeviceApprovalManager
     @Binding var showWorkspaceSwitchOverlay: Bool
     @StateObject private var agentNavigationHUD = AgentNavigationHUDViewModel()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -58,6 +59,18 @@ struct ContentRootShellView: View {
                 )
                 .transition(.opacity.combined(with: .scale(scale: 0.95)))
                 .zIndex(1001)
+            }
+
+            // Remote Device Pairing Approval Overlay
+            if let request = remoteDeviceApprovalManager.pendingRequest,
+               remoteDeviceApprovalManager.isApprovalOverlayVisible
+            {
+                RemoteDeviceApprovalOverlayView(
+                    approvalManager: remoteDeviceApprovalManager,
+                    request: request
+                )
+                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                .zIndex(1002)
             }
         }
         .animation(hudAnimation, value: agentNavigationHUD.isPresented)

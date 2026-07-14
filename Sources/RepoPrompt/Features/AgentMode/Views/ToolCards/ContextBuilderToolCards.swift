@@ -33,6 +33,9 @@ struct ContextBuilderCallCard: View {
     }
 
     private var phase: ContextBuilderCardPhase {
+        if context.isRemoteSession {
+            return Self.remoteCallCardPhase(for: item)
+        }
         if isActiveCallCard, isRunningForTab {
             return .running
         }
@@ -43,11 +46,17 @@ struct ContextBuilderCallCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
+        contextBuilderCardDetailLine(
+            contextBuilderAgentVM: contextBuilderAgentVM,
+            isRemoteSession: context.isRemoteSession
+        )
     }
 
     private var summary: String {
-        contextBuilderCardSubtitle(
+        if context.isRemoteSession {
+            return contextBuilderRemoteCardSubtitle(phase: phase)
+        }
+        return contextBuilderCardSubtitle(
             contextBuilderAgentVM: contextBuilderAgentVM,
             fallbackStatus: nil,
             phase: phase
@@ -68,7 +77,8 @@ struct ContextBuilderCallCard: View {
     }
 
     private var showsHeaderCancelButton: Bool {
-        phase == .running
+        !context.isRemoteSession
+            && phase == .running
             && context.showRunScopedToolCancel
             && canCancelRunningContextBuilder
     }
@@ -97,14 +107,20 @@ struct ContextBuilderCallCard: View {
         ) {
             switch phase {
             case .running:
-                ContextBuilderRunDetailsView(
-                    contextBuilderAgentVM: contextBuilderAgentVM,
-                    tabID: context.tabID,
-                    maxLogEntries: 6,
-                    showQuestionCard: true,
-                    showCancelRunButton: true,
-                    onCancelRun: cancelRun
-                )
+                if context.isRemoteSession {
+                    Text("Running on remote host…")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                } else {
+                    ContextBuilderRunDetailsView(
+                        contextBuilderAgentVM: contextBuilderAgentVM,
+                        tabID: context.tabID,
+                        maxLogEntries: 6,
+                        showQuestionCard: true,
+                        showCancelRunButton: true,
+                        onCancelRun: cancelRun
+                    )
+                }
             case .generatingPlan:
                 ContextBuilderPlanProgressView(
                     contextBuilderAgentVM: contextBuilderAgentVM,
@@ -138,6 +154,10 @@ struct ContextBuilderCallCard: View {
                 }
             }
         }
+    }
+
+    static func remoteCallCardPhase(for item: AgentChatItem) -> ContextBuilderCardPhase {
+        item.toolResultJSON == nil && item.toolIsError == nil ? .running : .completed
     }
 }
 
@@ -178,6 +198,9 @@ struct ContextBuilderResultCard: View {
     }
 
     private var phase: ContextBuilderCardPhase {
+        if context.isRemoteSession {
+            return .completed
+        }
         if isActiveResultCard, isRunningForTab {
             return .running
         }
@@ -188,10 +211,16 @@ struct ContextBuilderResultCard: View {
     }
 
     private var detailLine: String? {
-        contextBuilderCardDetailLine(contextBuilderAgentVM: contextBuilderAgentVM)
+        contextBuilderCardDetailLine(
+            contextBuilderAgentVM: contextBuilderAgentVM,
+            isRemoteSession: context.isRemoteSession
+        )
     }
 
     private var summary: String {
+        if context.isRemoteSession {
+            return contextBuilderFinalStatusLabel(dto?.status)
+        }
         if isActiveResultCard {
             return contextBuilderCardSubtitle(
                 contextBuilderAgentVM: contextBuilderAgentVM,
@@ -230,7 +259,8 @@ struct ContextBuilderResultCard: View {
     }
 
     private var showsHeaderCancelButton: Bool {
-        phase == .running
+        !context.isRemoteSession
+            && phase == .running
             && context.showRunScopedToolCancel
             && canCancelRunningContextBuilder
     }
@@ -540,7 +570,7 @@ private struct ContextBuilderCompletedSummaryView: View {
     }
 }
 
-private enum ContextBuilderCardPhase {
+enum ContextBuilderCardPhase: Equatable {
     case running
     case generatingPlan
     case completed
@@ -595,16 +625,38 @@ private func cancelContextBuilderRun(
 }
 
 @MainActor
-private func contextBuilderCardDetailLine(contextBuilderAgentVM: ContextBuilderAgentViewModel) -> String? {
-    var detail = "Context Builder: \(contextBuilderAgentVM.runModelDisplayName)"
-    if let followUpType = nonEmptyContextBuilderValue(contextBuilderAgentVM.mcpResponseType) {
-        if let followUpModel = nonEmptyContextBuilderValue(contextBuilderAgentVM.mcpPlanModel) {
+func contextBuilderCardDetailLine(
+    contextBuilderAgentVM: ContextBuilderAgentViewModel,
+    isRemoteSession: Bool = false
+) -> String? {
+    contextBuilderCardDetailLine(
+        isRemoteSession: isRemoteSession,
+        runModelDisplayName: contextBuilderAgentVM.runModelDisplayName,
+        mcpResponseType: contextBuilderAgentVM.mcpResponseType,
+        mcpPlanModel: contextBuilderAgentVM.mcpPlanModel
+    )
+}
+
+func contextBuilderCardDetailLine(
+    isRemoteSession: Bool,
+    runModelDisplayName: String,
+    mcpResponseType: String?,
+    mcpPlanModel: String?
+) -> String? {
+    guard !isRemoteSession else { return nil }
+    var detail = "Context Builder: \(runModelDisplayName)"
+    if let followUpType = nonEmptyContextBuilderValue(mcpResponseType) {
+        if let followUpModel = nonEmptyContextBuilderValue(mcpPlanModel) {
             detail += " → \(followUpType): \(followUpModel)"
         } else {
             detail += " → \(followUpType)"
         }
     }
     return detail
+}
+
+private func contextBuilderRemoteCardSubtitle(phase: ContextBuilderCardPhase) -> String {
+    phase == .running ? "running" : "completed"
 }
 
 @MainActor

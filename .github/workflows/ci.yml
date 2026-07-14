@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Restore SwiftPM build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .build
@@ -58,6 +58,9 @@ jobs:
 
       - name: Build MCP product
         run: swift build --product repoprompt-mcp
+
+      - name: Build gateway product
+        run: swift build --product repoprompt-gateway
 
       - name: Run app tests
         shell: bash
@@ -91,7 +94,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Restore SwiftPM build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .build
@@ -113,7 +116,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Restore SwiftPM build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             .build

@@ -371,6 +371,8 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
     var currentPromptText: String?
     /// The last search query typed in the file-search panel (persisted per workspace)
     var lastSearchQuery: String?
+    /// Paired remote host used by default for newly created agent sessions.
+    var defaultRemoteHostID: String?
     var selectedMetaPromptIDs: [UUID]
 
     // Copy and Chat Preset Fields
@@ -412,6 +414,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         customPath: String? = nil,
         currentPromptText: String? = nil,
         lastSearchQuery: String? = nil,
+        defaultRemoteHostID: String? = nil,
         selectedMetaPromptIDs: [UUID] = [],
         isSystemWorkspace: Bool = false,
         customStoragePath: URL? = nil,
@@ -436,6 +439,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         self.currentPromptText = currentPromptText
         self.selectedMetaPromptIDs = selectedMetaPromptIDs
         self.lastSearchQuery = lastSearchQuery
+        self.defaultRemoteHostID = defaultRemoteHostID
         self.isSystemWorkspace = isSystemWorkspace
         self.customStoragePath = customStoragePath
         self.ephemeralFlag = ephemeralFlag
@@ -470,6 +474,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         customPath = (try? c.decode(String.self, forKey: .customPath))
         currentPromptText = (try? c.decode(String.self, forKey: .currentPromptText))
         lastSearchQuery = (try? c.decode(String.self, forKey: .lastSearchQuery))
+        defaultRemoteHostID = (try? c.decode(String.self, forKey: .defaultRemoteHostID))
         selectedMetaPromptIDs = (try? c.decode([UUID].self, forKey: .selectedMetaPromptIDs)) ?? []
         copyPresetId = (try? c.decode(UUID.self, forKey: .copyPresetId))
         copyCustomizations = (try? c.decode(CopyCustomizations.self, forKey: .copyCustomizations))
@@ -502,6 +507,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         try c.encodeIfPresent(customPath, forKey: .customPath)
         try c.encodeIfPresent(currentPromptText, forKey: .currentPromptText)
         try c.encodeIfPresent(lastSearchQuery, forKey: .lastSearchQuery)
+        try c.encodeIfPresent(defaultRemoteHostID, forKey: .defaultRemoteHostID)
         try c.encode(selectedMetaPromptIDs, forKey: .selectedMetaPromptIDs)
         try c.encodeIfPresent(ephemeralFlag, forKey: .ephemeralFlag)
         try c.encodeIfPresent(copyPresetId, forKey: .copyPresetId)
@@ -524,6 +530,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
             lhs.customPath == rhs.customPath &&
             lhs.currentPromptText == rhs.currentPromptText &&
             lhs.lastSearchQuery == rhs.lastSearchQuery &&
+            lhs.defaultRemoteHostID == rhs.defaultRemoteHostID &&
             lhs.selectedMetaPromptIDs == rhs.selectedMetaPromptIDs &&
             lhs.isHiddenInMenus == rhs.isHiddenInMenus &&
             lhs.isSystemWorkspace == rhs.isSystemWorkspace &&
@@ -552,6 +559,7 @@ struct WorkspaceModel: Codable, Identifiable, Equatable {
         case customPath
         case currentPromptText
         case lastSearchQuery
+        case defaultRemoteHostID
         case selectedMetaPromptIDs
         case ephemeralFlag
         case copyPresetId

@@ -8,4 +8,5 @@ final class AgentModeUIFacades {
     let sessionSidebar = AgentSessionSidebarUIStore()
     let transcript = AgentTranscriptUIStore()
     let runInteraction = AgentRunInteractionUIStore()
+    let remoteStartPicker = AgentRemoteStartPickerUIStore()
 }

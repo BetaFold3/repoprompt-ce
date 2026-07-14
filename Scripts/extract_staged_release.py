@@ -52,6 +52,8 @@ def allowed_symlink(member: PurePosixPath, target: str, app_name: str) -> bool:
     cli_links = {
         app / "Contents" / "Resources" / "repoprompt-mcp": "../MacOS/repoprompt-mcp",
         app / "Contents" / "Resources" / "bin" / "repoprompt-mcp": "../../MacOS/repoprompt-mcp",
+        app / "Contents" / "Resources" / "repoprompt-gateway": "../MacOS/repoprompt-gateway",
+        app / "Contents" / "Resources" / "bin" / "repoprompt-gateway": "../../MacOS/repoprompt-gateway",
     }
     sparkle = app / "Contents" / "Frameworks" / "Sparkle.framework"
     if member in cli_links:

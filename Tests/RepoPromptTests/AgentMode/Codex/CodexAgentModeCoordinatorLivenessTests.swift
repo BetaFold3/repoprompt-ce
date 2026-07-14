@@ -235,6 +235,264 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(revision.providerDrainGeneration, session.providerTerminalDrainGeneration)
     }
 
+    func testTurnCompletionWaitsForLateAssistantCompletionBeforeTerminalCommit() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-final"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "partial final su", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertNotNil(session.activeRunOwnership)
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(.init(scope: scope, text: "partial final summary is complete")),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["partial final summary is complete"])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(revision.terminalState, .completed)
+        XCTAssertEqual(revision.sourceItemsRevision, session.sourceItemsRevision)
+    }
+
+    func testAssistantCompletionBeforeTurnCompletionUsesFastTerminalPath() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-final"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "partial final su", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantCompleted(.init(scope: scope, text: "partial final summary is complete")),
+            session: session
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["partial final summary is complete"])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testTurnCompletionSettleTimeoutCommitsPartialAssistantWithoutHanging() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-final"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "partial final su", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+
+        await viewModel.test_codexCoordinator.test_forcePendingCodexTerminalSettleTimeout(session: session)
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["partial final su"])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+    }
+
+    func testTurnStartedDuringAssistantSettleCommitsPendingTerminalBeforeNewTurn() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-final"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "partial final su", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        XCTAssertNil(session.lastTerminalCommitRevision)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "next-turn"),
+            session: session
+        )
+
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(revision.terminalState, .completed)
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["partial final su"])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+    }
+
+    func testDifferentTurnCompletionDuringAssistantSettleCommitsPendingTerminal() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-final"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "partial final su", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        let runID = try XCTUnwrap(session.runID)
+        let runAttemptID = try XCTUnwrap(session.activeRunAttemptID)
+        session.codexAuthoritativeActiveTurn = .init(
+            threadID: "fake",
+            turnID: "next-turn",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: runAttemptID
+        )
+        session.codexRoutingObservedTurnID = "next-turn"
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "next-turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(revision.terminalState, .completed)
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["partial final su"])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+    }
+
+    func testSettleScopeRejectsMatchingItemFromDifferentThread() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-final"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "partial final su", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        let previousSequence = session.activeRunLiveness?.lastAcceptedSequence ?? 0
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .livenessActivity(.init(
+                kind: .mcpToolProgress,
+                method: "item/mcpToolCall/progress",
+                threadID: "different-thread",
+                turnID: scope.turnID,
+                itemID: scope.itemID,
+                activeFlags: ["waiting_for_user_input"],
+                message: "stale progress"
+            )),
+            session: session
+        )
+
+        XCTAssertEqual(session.activeRunLiveness?.lastAcceptedSequence ?? 0, previousSequence)
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+    }
+
+    func testInterruptedTurnCompletionBypassesAssistantSettle() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-final"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "partial final su", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .interrupted),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertFalse(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["partial final su"])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(revision.terminalState, .cancelled)
+    }
+
     func testCanonicalAssistantCompletionReconcilesNoDeltaExactPrefixUTF8DuplicateAndEmpty() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)

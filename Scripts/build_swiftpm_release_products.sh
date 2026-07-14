@@ -101,6 +101,11 @@ for arch in arm64 x86_64; do
         --arch "$arch" \
         --scratch-path "$scratch" \
         --product repoprompt-mcp
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build \
+        "${SWIFT_BUILD_ARGS[@]}" \
+        --arch "$arch" \
+        --scratch-path "$scratch" \
+        --product repoprompt-gateway
     printf '+ %q ' "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --arch "$arch" --scratch-path "$scratch" --show-bin-path
     printf '\n'
     bin_dir="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --arch "$arch" --scratch-path "$scratch" --show-bin-path)"
@@ -111,6 +116,7 @@ for arch in arm64 x86_64; do
     fi
     require_exact_arch "$bin_dir/RepoPrompt" "$arch"
     require_exact_arch "$bin_dir/repoprompt-mcp" "$arch"
+    require_exact_arch "$bin_dir/repoprompt-gateway" "$arch"
 done
 
 run "$RESOURCE_COMPARATOR" "$ARM64_BIN_DIR" "$X86_64_BIN_DIR"
@@ -129,9 +135,14 @@ run "$LIPO" -create \
     "$ARM64_BIN_DIR/repoprompt-mcp" \
     "$X86_64_BIN_DIR/repoprompt-mcp" \
     -output "$staged_output/repoprompt-mcp"
-run chmod +x "$staged_output/RepoPrompt" "$staged_output/repoprompt-mcp"
+run "$LIPO" -create \
+    "$ARM64_BIN_DIR/repoprompt-gateway" \
+    "$X86_64_BIN_DIR/repoprompt-gateway" \
+    -output "$staged_output/repoprompt-gateway"
+run chmod +x "$staged_output/RepoPrompt" "$staged_output/repoprompt-mcp" "$staged_output/repoprompt-gateway"
 require_exact_arch "$staged_output/RepoPrompt" "arm64,x86_64"
 require_exact_arch "$staged_output/repoprompt-mcp" "arm64,x86_64"
+require_exact_arch "$staged_output/repoprompt-gateway" "arm64,x86_64"
 
 for resource in "$ARM64_BIN_DIR"/*.bundle "$ARM64_BIN_DIR/Sparkle.framework"; do
     [[ -e "$resource" ]] || continue

@@ -83,6 +83,7 @@ enum MCPToolExecutionContractCatalog {
         for toolName in [
             MCPWindowToolName.applyEdits,
             MCPWindowToolName.askUser,
+            MCPWindowToolName.remotePairing,
             MCPWindowToolName.waitForNextInstruction
         ] {
             result[toolName] = .interactiveCancellable

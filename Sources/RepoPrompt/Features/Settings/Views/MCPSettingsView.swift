@@ -85,6 +85,10 @@ struct MCPSettingsView: View {
 
                 serverControlSection
                 Divider()
+                remoteGatewaySection
+                Divider()
+                remoteHostsSection
+                Divider()
                 modelPresetsSection
                 Divider()
                 contextBuilderSection
@@ -229,6 +233,18 @@ struct MCPSettingsView: View {
                 .buttonStyle(CustomButtonStyle())
                 .hoverTooltip("Completely shuts down the listener for every window and client")
             }
+        }
+    }
+
+    private var remoteGatewaySection: some View {
+        RemoteControlSettingsView { message, isError in
+            showFeedback(message, isError: isError)
+        }
+    }
+
+    private var remoteHostsSection: some View {
+        RemoteHostsSettingsView { message, isError in
+            showFeedback(message, isError: isError)
         }
     }
 

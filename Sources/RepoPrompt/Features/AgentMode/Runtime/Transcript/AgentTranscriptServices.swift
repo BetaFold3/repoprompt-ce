@@ -3491,10 +3491,11 @@ enum AgentTranscriptIO {
         enum Payload {
             case tagged(tag: String, text: String)
             case rawXML(String)
+            case toolCall(name: String, args: String, resultStatusWord: String?)
         }
 
         let pos: Int
-        let payload: Payload
+        var payload: Payload
         let dropPriority: ForkItemDropPriority
         let turnID: UUID?
     }
@@ -3532,6 +3533,7 @@ enum AgentTranscriptIO {
 
         // Second pass: build fork items with priorities.
         var forkItems: [ForkItem] = []
+        var lastToolCallIndexByExecutionID: [String: Int] = [:]
         flatIndex = 0
         var pos = 0
         for entry in entries {
@@ -3562,12 +3564,34 @@ enum AgentTranscriptIO {
                     guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
                           let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(row.toolName) else { continue }
                     let args = truncateArgs(row.toolArgsJSON, max: maxToolArgsCharacters)
-                    let xml = args.isEmpty
-                        ? "<tool_call name=\"\(toolName)\"/>"
-                        : "<tool_call name=\"\(toolName)\">\(args)</tool_call>"
-                    forkItems.append(ForkItem(pos: pos, payload: .rawXML(xml), dropPriority: .toolCall, turnID: tid))
+                    let resultStatusWord = forkTranscriptToolResultStatusWord(for: row)
+                    forkItems.append(ForkItem(
+                        pos: pos,
+                        payload: .toolCall(name: toolName, args: args, resultStatusWord: resultStatusWord),
+                        dropPriority: .toolCall,
+                        turnID: tid
+                    ))
+                    if let execution = AgentTranscriptToolNormalizer.toolExecution(for: row) {
+                        lastToolCallIndexByExecutionID[execution.stableExecutionID] = forkItems.count - 1
+                    }
                     pos += 1
-                case .toolResult, .thinking:
+                case .toolResult:
+                    guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
+                          let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(row.toolName),
+                          let execution = AgentTranscriptToolNormalizer.toolExecution(for: row),
+                          let toolCallIndex = lastToolCallIndexByExecutionID[execution.stableExecutionID]
+                    else { continue }
+                    guard let resultStatusWord = forkTranscriptToolResultStatusWord(for: row) else { continue }
+                    if case let .toolCall(existingToolName, args, nil) = forkItems[toolCallIndex].payload,
+                       existingToolName == toolName
+                    {
+                        forkItems[toolCallIndex].payload = .toolCall(
+                            name: existingToolName,
+                            args: args,
+                            resultStatusWord: resultStatusWord
+                        )
+                    }
+                case .thinking:
                     break
                 }
             }
@@ -3589,7 +3613,7 @@ enum AgentTranscriptIO {
                     }
                     count += 1
                     lastWasSystem = (tag == "system")
-                case .rawXML:
+                case .rawXML, .toolCall:
                     count += 1
                     lastWasSystem = false
                 }
@@ -3676,6 +3700,12 @@ enum AgentTranscriptIO {
                 appendOutput(.tagged(tag: tag, text: text))
             case let .rawXML(xml):
                 appendOutput(.rawXML(xml))
+            case let .toolCall(name, args, resultStatusWord):
+                appendOutput(.rawXML(forkTranscriptToolCallXML(
+                    name: name,
+                    args: args,
+                    resultStatusWord: resultStatusWord
+                )))
             }
         }
 
@@ -3694,6 +3724,86 @@ enum AgentTranscriptIO {
         lines.append("</transcript>")
         return lines.joined(separator: "\n")
     }
+
+    private static func forkTranscriptToolCallXML(
+        name: String,
+        args: String,
+        resultStatusWord: String?
+    ) -> String {
+        let escapedName = forkTranscriptXMLAttributeEscaped(name)
+        let callXML = args.isEmpty
+            ? "<tool_call name=\"\(escapedName)\"/>"
+            : "<tool_call name=\"\(escapedName)\">\(args)</tool_call>"
+        guard let resultStatusWord else { return callXML }
+        return callXML + "\n<tool_result name=\"\(escapedName)\" status=\"\(resultStatusWord)\"/>"
+    }
+
+    private static func forkTranscriptXMLAttributeEscaped(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    private static func forkTranscriptToolResultStatusWord(for item: AgentChatItem) -> String? {
+        guard item.toolResultJSON != nil || item.toolIsError != nil else { return nil }
+        if item.kind == .toolResult {
+            return forkTranscriptToolResultStatusWord(
+                from: AgentTranscriptToolNormalizer.status(for: item),
+                toolIsError: item.toolIsError
+            )
+        }
+        if let object = ToolRawJSON.object(from: item.toolResultJSON) {
+            if let rawStatus = ToolRawJSON.string(object, key: "status")
+                ?? ToolRawJSON.string(object, key: "result")
+                ?? ToolRawJSON.string(object, key: "outcome")
+                ?? ToolRawJSON.string(object, key: "state"),
+                let normalized = AgentTranscriptToolStatusSemantics.normalizedStatusWord(rawStatus)
+            {
+                return forkTranscriptToolResultStatusWord(
+                    from: AgentTranscriptToolStatusSemantics.transcriptStatus(fromNormalizedStatusWord: normalized),
+                    toolIsError: item.toolIsError
+                )
+            }
+            if let isError = ToolRawJSON.bool(object, key: "is_error") ?? ToolRawJSON.bool(object, key: "isError") {
+                return isError ? "failed" : "success"
+            }
+            if let exitCode = ToolRawJSON.int(object, key: "exitCode") ?? ToolRawJSON.int(object, key: "exit_code") {
+                return exitCode == 0 ? "success" : "failed"
+            }
+        }
+        return forkTranscriptToolResultStatusWord(from: .unknown, toolIsError: item.toolIsError)
+    }
+
+    /// Maps transcript tool status to fork XML status for rows that already carry
+    /// a result payload or `toolIsError`; `.unknown` infers completion only in that context.
+    private static func forkTranscriptToolResultStatusWord(
+        from status: AgentTranscriptToolStatus,
+        toolIsError: Bool?
+    ) -> String? {
+        switch status {
+        case .success:
+            "success"
+        case .warning:
+            "warning"
+        case .failed, .cancelled:
+            "failed"
+        case .pending, .running:
+            nil
+        case .unknown:
+            toolIsError == true ? "failed" : "success"
+        }
+    }
+
+    #if DEBUG
+        static func debugForkTranscriptToolResultStatusWordForTesting(
+            from status: AgentTranscriptToolStatus,
+            toolIsError: Bool?
+        ) -> String? {
+            forkTranscriptToolResultStatusWord(from: status, toolIsError: toolIsError)
+        }
+    #endif
 
     /// Builds a spartan XML transcript for MCP log monitoring.
     ///
@@ -3828,6 +3938,9 @@ enum AgentTranscriptIO {
                         turnID: block.turnID,
                         isToolBoundary: true
                     ))
+                    if preserveIntermediateAssistantNarration {
+                        entries.append(contentsOf: groupedHistorySpawnToolExportEntries(for: block))
+                    }
                 }
 
                 if let upToRowID,
@@ -3846,7 +3959,10 @@ enum AgentTranscriptIO {
             // same sanitized tool-result shape we persist rather than the full live payload.
             if block.kind == .standaloneTool {
                 let migratedToolRow = handoffMigratedStandaloneToolItem(for: block)
-                let toolPreviewItem = groupedHistoryToolPreviewItem(for: block)
+                let toolPreviewItem = groupedHistoryToolPreviewItem(
+                    for: block,
+                    preserveFailedToolPreviews: preserveIntermediateAssistantNarration
+                )
                 if let toolPreviewItem {
                     logHandoffDebug("standaloneTool synthesized toolCall tool=\(toolPreviewItem.toolName ?? "nil")")
                 }
@@ -4209,6 +4325,271 @@ enum AgentTranscriptIO {
         return entries
     }
 
+    private static func groupedHistorySpawnToolExportEntries(
+        for block: AgentTranscriptRenderBlock
+    ) -> [HandoffExportEntry] {
+        let childBlocks = block.groupedHistory?.sections
+            .flatMap(\.childBlocks) ?? []
+        return groupedHistorySpawnToolExportEntries(
+            for: childBlocks,
+            turnID: block.turnID
+        )
+    }
+
+    private static func groupedHistorySpawnToolExportEntries(
+        for childBlocks: [AgentTranscriptRenderBlock],
+        turnID: UUID
+    ) -> [HandoffExportEntry] {
+        var entries: [HandoffExportEntry] = []
+        var emittedExecutionIDs = Set<String>()
+        for childBlock in childBlocks {
+            for sourceRow in groupedHistorySpawnToolPreviewSourceRows(in: childBlock) {
+                let executionID = AgentTranscriptToolNormalizer.stableExecutionID(for: sourceRow)
+                guard let toolPreviewItem = groupedHistorySpawnToolPreviewItem(
+                    for: childBlock,
+                    sourceRow: sourceRow,
+                    executionID: executionID
+                ) else { continue }
+                guard emittedExecutionIDs.insert(executionID).inserted else { continue }
+                entries.append(HandoffExportEntry(
+                    migratedItem: nil,
+                    sourceRowID: nil,
+                    xmlItems: [toolPreviewItem],
+                    turnID: turnID,
+                    isToolBoundary: true
+                ))
+                if let statusItem = groupedHistorySpawnStatusItem(
+                    for: childBlock,
+                    executionID: executionID
+                ) {
+                    entries.append(HandoffExportEntry(
+                        migratedItem: nil,
+                        sourceRowID: nil,
+                        xmlItems: [statusItem],
+                        turnID: turnID,
+                        isToolBoundary: false
+                    ))
+                }
+            }
+        }
+        return entries
+    }
+
+    #if DEBUG
+        static func debugGroupedHistorySpawnXMLItemsForTesting(
+            from childBlock: AgentTranscriptRenderBlock,
+            turnID: UUID = UUID()
+        ) -> [AgentChatItem] {
+            groupedHistorySpawnToolExportEntries(
+                for: [childBlock],
+                turnID: turnID
+            ).flatMap(\.xmlItems)
+        }
+    #endif
+
+    private static func groupedHistorySpawnToolPreviewSourceRows(
+        in childBlock: AgentTranscriptRenderBlock
+    ) -> [AgentChatItem] {
+        let visibleRows = childBlock.rows.filter { !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow($0) }
+        var sourceRowsByExecutionID: [String: AgentChatItem] = [:]
+        var orderedExecutionIDs: [String] = []
+        for row in visibleRows
+            where (row.kind == .toolCall || row.kind == .toolResult)
+            && isSpawnFamilyToolName(row.toolName)
+        {
+            let executionID = AgentTranscriptToolNormalizer.stableExecutionID(for: row)
+            if sourceRowsByExecutionID[executionID] == nil {
+                orderedExecutionIDs.append(executionID)
+                sourceRowsByExecutionID[executionID] = row
+            } else if row.kind == .toolCall {
+                sourceRowsByExecutionID[executionID] = row
+            }
+        }
+        return orderedExecutionIDs.compactMap { sourceRowsByExecutionID[$0] }
+    }
+
+    private static func isSpawnFamilyToolName(_ toolName: String?) -> Bool {
+        guard let normalized = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(toolName) else {
+            return false
+        }
+        return normalized == "agent_run" || normalized == "agent_manage"
+    }
+
+    private static func groupedHistoryToolExecution(
+        in childBlock: AgentTranscriptRenderBlock,
+        matching executionID: String
+    ) -> AgentTranscriptToolExecution? {
+        childBlock.rows
+            .compactMap { AgentTranscriptToolNormalizer.toolExecution(for: $0) }
+            .last(where: { $0.stableExecutionID == executionID })
+    }
+
+    private static func groupedHistorySpawnToolPreviewItem(
+        for childBlock: AgentTranscriptRenderBlock,
+        sourceRow: AgentChatItem,
+        executionID: String
+    ) -> AgentChatItem? {
+        guard sourceRow.kind == .toolCall || sourceRow.kind == .toolResult,
+              let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(sourceRow.toolName),
+              isSpawnFamilyToolName(toolName)
+        else {
+            logHandoffDebug("spawn tool preview skipped: source row is not spawn-family")
+            return nil
+        }
+        let toolExecution = groupedHistoryToolExecution(
+            in: childBlock,
+            matching: executionID
+        ) ?? AgentTranscriptToolNormalizer.toolExecution(for: sourceRow)
+        let argsJSON = localizedGroupedHistoryPreviewArgsJSON(
+            from: sourceRow,
+            execution: toolExecution
+        )
+        // Near-dead invariant guard: toolExecution(for:) should never be nil for
+        // toolCall/toolResult preview rows. Default to .pending deliberately so a
+        // missing execution can never fabricate success; do not optimize to .success.
+        let statusWord = forkTranscriptToolResultStatusWord(
+            from: toolExecution?.status ?? .pending,
+            toolIsError: toolExecution?.toolIsError
+        )
+        logHandoffDebug("spawn tool preview emit tool=\(toolName) args=\(argsJSON ?? "nil")")
+        return AgentChatItem(
+            timestamp: sourceRow.timestamp,
+            kind: .toolCall,
+            text: "",
+            toolName: toolName,
+            toolArgsJSON: argsJSON,
+            toolResultJSON: statusWord.map {
+                AgentToolResultPersistencePolicy.minimalResultJSON(
+                    statusWord: $0,
+                    normalizedToolName: toolName
+                )
+            },
+            toolIsError: statusWord.map { $0 == "failed" },
+            sequenceIndex: sourceRow.sequenceIndex,
+            isStreaming: false
+        )
+    }
+
+    private static func groupedHistorySpawnStatusItem(
+        for childBlock: AgentTranscriptRenderBlock,
+        executionID: String
+    ) -> AgentChatItem? {
+        let visibleRows = childBlock.rows.filter { !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow($0) }
+        guard let resultRow = visibleRows.last(where: { row in
+            row.kind == .toolResult
+                && isSpawnFamilyToolName(row.toolName)
+                && AgentTranscriptToolNormalizer.stableExecutionID(for: row) == executionID
+        }),
+            let resultObject = AgentTranscriptToolNormalizer.jsonObject(from: resultRow.toolResultJSON)
+            ?? AgentTranscriptToolNormalizer.jsonObject(from: resultRow.text),
+            let statusText = spawnChildStatusText(
+                from: resultObject,
+                fallbackStatus: AgentTranscriptToolNormalizer.status(for: resultRow)
+            )
+        else { return nil }
+        let argsObject = AgentTranscriptToolNormalizer.jsonObject(from: resultRow.toolArgsJSON)
+            ?? visibleRows.first(where: { row in
+                row.kind == .toolCall
+                    && isSpawnFamilyToolName(row.toolName)
+                    && AgentTranscriptToolNormalizer.stableExecutionID(for: row) == executionID
+            }).flatMap { AgentTranscriptToolNormalizer.jsonObject(from: $0.toolArgsJSON) }
+        guard let childLabel = spawnChildDisplayLabel(
+            from: resultObject,
+            argsObject: argsObject
+        ) else { return nil }
+        return AgentChatItem(
+            timestamp: resultRow.timestamp,
+            kind: .system,
+            text: "Sub-agent \(childLabel): \(statusText)",
+            sequenceIndex: resultRow.sequenceIndex,
+            isStreaming: false
+        )
+    }
+
+    private static func spawnChildDisplayLabel(
+        from resultObject: [String: Any],
+        argsObject: [String: Any]?
+    ) -> String? {
+        let sessionObject = resultObject["session"] as? [String: Any]
+        let argsSessionObject = argsObject?["session"] as? [String: Any]
+        return compactSpawnStatusComponent(
+            stringValue(resultObject, keys: ["session_name", "sessionName", "name", "display_name", "displayName"])
+                ?? stringValue(sessionObject, keys: ["session_name", "sessionName", "name", "display_name", "displayName"])
+                ?? stringValue(argsObject, keys: ["session_name", "sessionName", "name", "display_name", "displayName"])
+                ?? stringValue(argsSessionObject, keys: ["session_name", "sessionName", "name", "display_name", "displayName"])
+                ?? stringValue(resultObject, keys: ["session_id", "sessionID", "id"])
+                ?? stringValue(sessionObject, keys: ["session_id", "sessionID", "id"])
+                ?? stringValue(argsObject, keys: ["session_id", "sessionID", "id"])
+                ?? stringValue(argsSessionObject, keys: ["session_id", "sessionID", "id"])
+        )
+    }
+
+    private static func spawnChildStatusText(
+        from resultObject: [String: Any],
+        fallbackStatus: AgentTranscriptToolStatus
+    ) -> String? {
+        if let rawStatus = stringValue(resultObject, keys: ["status", "state", "result", "outcome"]),
+           let statusText = spawnChildStatusText(fromRawStatus: rawStatus)
+        {
+            return statusText
+        }
+        switch fallbackStatus {
+        case .pending:
+            return "pending"
+        case .running:
+            return "running"
+        case .success:
+            return "completed"
+        case .warning:
+            return "warning"
+        case .failed:
+            return "failed"
+        case .cancelled:
+            return "cancelled"
+        case .unknown:
+            return nil
+        }
+    }
+
+    private static func spawnChildStatusText(fromRawStatus rawStatus: String) -> String? {
+        let compact = compactSpawnStatusComponent(rawStatus)?.lowercased()
+        guard let compact, !compact.isEmpty else { return nil }
+        let normalized = AgentTranscriptToolStatusSemantics.normalizedStatusWord(compact) ?? compact
+        switch normalized {
+        case "success":
+            return "completed"
+        case "pending", "running", "warning", "failed", "cancelled":
+            return normalized
+        default:
+            return normalized
+        }
+    }
+
+    private static func compactSpawnStatusComponent(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let compact = raw
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !compact.isEmpty else { return nil }
+        return AgentTranscriptSummaryTextFormatter.wordBoundaryTruncate(compact, maxLength: 80)
+    }
+
+    private static func stringValue(_ object: [String: Any]?, keys: [String]) -> String? {
+        guard let object else { return nil }
+        for key in keys {
+            if let value = object[key] as? String,
+               !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                return value
+            }
+            if let number = object[key] as? NSNumber {
+                return number.stringValue
+            }
+        }
+        return nil
+    }
+
     private static func handoffMigratedStandaloneToolItem(
         for block: AgentTranscriptRenderBlock
     ) -> AgentChatItem? {
@@ -4220,7 +4601,8 @@ enum AgentTranscriptIO {
     }
 
     private static func groupedHistoryToolPreviewItem(
-        for childBlock: AgentTranscriptRenderBlock
+        for childBlock: AgentTranscriptRenderBlock,
+        preserveFailedToolPreviews: Bool = false
     ) -> AgentChatItem? {
         let visibleRows = childBlock.rows.filter { !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow($0) }
         let toolCallRow = visibleRows.first(where: { $0.kind == .toolCall })
@@ -4235,7 +4617,8 @@ enum AgentTranscriptIO {
             .compactMap { AgentTranscriptToolNormalizer.toolExecution(for: $0) }
             .last
         if let toolExecution,
-           toolExecution.status == .failed || toolExecution.status == .cancelled
+           toolExecution.status == .failed || toolExecution.status == .cancelled,
+           !preserveFailedToolPreviews
         {
             logHandoffDebug("tool preview pruned tool=\(toolName) status=\(toolExecution.status.rawValue)")
             return nil
@@ -4244,6 +4627,13 @@ enum AgentTranscriptIO {
             from: sourceRow,
             execution: toolExecution
         )
+        // Near-dead invariant guard: toolExecution(for:) should never be nil for
+        // toolCall/toolResult preview rows. Default to .pending deliberately so a
+        // missing execution can never fabricate success; do not optimize to .success.
+        let statusWord = forkTranscriptToolResultStatusWord(
+            from: toolExecution?.status ?? .pending,
+            toolIsError: toolExecution?.toolIsError
+        )
         logHandoffDebug("tool preview emit tool=\(toolName) args=\(argsJSON ?? "nil")")
         return AgentChatItem(
             timestamp: sourceRow.timestamp,
@@ -4251,6 +4641,13 @@ enum AgentTranscriptIO {
             text: "",
             toolName: toolName,
             toolArgsJSON: argsJSON,
+            toolResultJSON: statusWord.map {
+                AgentToolResultPersistencePolicy.minimalResultJSON(
+                    statusWord: $0,
+                    normalizedToolName: toolName
+                )
+            },
+            toolIsError: statusWord.map { $0 == "failed" },
             sequenceIndex: sourceRow.sequenceIndex,
             isStreaming: false
         )

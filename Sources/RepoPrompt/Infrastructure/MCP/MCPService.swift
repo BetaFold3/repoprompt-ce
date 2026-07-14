@@ -178,6 +178,14 @@ actor MCPService: Sendable {
         state.isRunning = false
         updates.continuation.yield(state)
 
+        // M6.3: announce the imminent teardown to bootstrap clients (including the
+        // remote gateway app leg) so remote channels receive `channel_closing`
+        // before the transport drops.
+        await ServerNetworkManager.shared.broadcastChannelClosing(
+            reason: .serverShutdown,
+            message: "The RepoPrompt MCP server is shutting down."
+        )
+
         await controller.fullShutdown()
 
         // Preserve participation registered while the controller shutdown was suspended.
@@ -265,6 +273,30 @@ actor MCPService: Sendable {
 
         /// Session key (capabilityToken) for disambiguating multiple client instances
         let sessionKey: String?
+
+        /// Paired-device display name resolved from the remote pairing registry when
+        /// `clientName` is a `remote:<device8>` gateway-carried device link.
+        let remoteDeviceDisplayName: String?
+
+        /// Human-facing client name: `remote:*` device links render the paired device's
+        /// display name (with the device ID for disambiguation) where available.
+        var displayClientName: String {
+            guard let remoteDeviceDisplayName, !remoteDeviceDisplayName.isEmpty,
+                  remoteDeviceDisplayName != clientName
+            else {
+                return clientName
+            }
+            return "\(remoteDeviceDisplayName) (\(clientName))"
+        }
+
+        /// Resolves the paired-device display name for `remote:<device8>` client names.
+        static func remoteDeviceDisplayName(
+            forClientName clientName: String,
+            lookup: (String) -> String?
+        ) -> String? {
+            guard clientName.hasPrefix("remote:") else { return nil }
+            return lookup(clientName)
+        }
     }
 
     /// Tool call history entry for dashboard display
@@ -289,6 +321,15 @@ actor MCPService: Sendable {
     func dashboardSnapshot() async -> DashboardSnapshot {
         let raw = await controller.dashboardSnapshot(currentDiagnostics: state.diagnostics)
 
+        // Resolve paired-device display names once per snapshot for remote:* links.
+        let remoteClientNames = Set(raw.connections.connections.map(\.clientName).filter { $0.hasPrefix("remote:") })
+        var remoteDisplayNames: [String: String] = [:]
+        for clientName in remoteClientNames {
+            if let displayName = (try? RemotePairingIdentityStore.shared.device(id: clientName))?.displayName {
+                remoteDisplayNames[clientName] = displayName
+            }
+        }
+
         let connections = raw.connections.connections.map {
             DashboardConnection(
                 id: $0.id,
@@ -303,7 +344,11 @@ actor MCPService: Sendable {
                 hasInFlightCalls: $0.hasInFlightCalls,
                 activeToolScope: $0.activeToolScope,
                 activeToolScopes: $0.activeToolScopes,
-                sessionKey: $0.sessionKey
+                sessionKey: $0.sessionKey,
+                remoteDeviceDisplayName: DashboardConnection.remoteDeviceDisplayName(
+                    forClientName: $0.clientName,
+                    lookup: { remoteDisplayNames[$0] }
+                )
             )
         }
 

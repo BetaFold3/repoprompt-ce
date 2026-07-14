@@ -24,6 +24,12 @@ public enum RepoPromptControlMethod {
     /// Sent by app to CLI during long-running operations to indicate progress.
     /// CLI can display on stderr to prevent agent timeouts.
     public static let progress = "repoprompt/control/progress"
+
+    /// Sent by app to connected clients (including the remote gateway app leg)
+    /// BEFORE the MCP server tears down connections, so downstream channels
+    /// (for example remote WebSocket clients) can surface a graceful
+    /// `channel_closing` instead of observing an abrupt disconnect.
+    public static let channelClosing = "repoprompt/control/channel_closing"
 }
 
 // MARK: - Termination Reasons
@@ -133,6 +139,25 @@ public struct RepoPromptProgressParams: Codable, Sendable, Hashable {
     }
 }
 
+/// Parameters for the channel closing control notification.
+public struct RepoPromptChannelClosingParams: Codable, Sendable, Hashable {
+    /// Why the channel is closing.
+    public let reason: TerminationReason
+
+    /// Optional human-readable message for logging/UI.
+    public let message: String?
+
+    /// When the close was announced (ISO8601 string for cross-decoder compatibility).
+    public let announcedAt: String
+
+    public init(reason: TerminationReason, message: String? = nil, announcedAt: Date = Date()) {
+        self.reason = reason
+        self.message = message
+        let formatter = ISO8601DateFormatter()
+        self.announcedAt = formatter.string(from: announcedAt)
+    }
+}
+
 // MARK: - JSON-RPC Notification Structure
 
 /// A JSON-RPC 2.0 notification (no id field, so no response expected).
@@ -176,6 +201,16 @@ public extension RepoPromptControlNotification where T == RepoPromptRunCompleted
         RepoPromptControlNotification(
             method: RepoPromptControlMethod.runCompleted,
             params: RepoPromptRunCompletedParams(runType: runType, success: success, summary: summary)
+        )
+    }
+}
+
+public extension RepoPromptControlNotification where T == RepoPromptChannelClosingParams {
+    /// Creates a channel closing notification with the given reason.
+    static func channelClosing(reason: TerminationReason, message: String? = nil) -> Self {
+        RepoPromptControlNotification(
+            method: RepoPromptControlMethod.channelClosing,
+            params: RepoPromptChannelClosingParams(reason: reason, message: message)
         )
     }
 }
@@ -323,6 +358,17 @@ public enum RepoPromptControlDetection {
         decoder.dateDecodingStrategy = .iso8601
         guard let notification = try? decoder.decode(
             RepoPromptControlNotification<RepoPromptRunCompletedParams>.self,
+            from: jsonLine
+        ) else { return nil }
+        return notification.params
+    }
+
+    /// Parses channel closing params from a JSON line.
+    public static func parseChannelClosingParams(from jsonLine: Data) -> RepoPromptChannelClosingParams? {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let notification = try? decoder.decode(
+            RepoPromptControlNotification<RepoPromptChannelClosingParams>.self,
             from: jsonLine
         ) else { return nil }
         return notification.params

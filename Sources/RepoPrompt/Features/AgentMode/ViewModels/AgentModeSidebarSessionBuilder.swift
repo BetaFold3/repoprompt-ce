@@ -14,6 +14,8 @@ struct AgentModeSidebarSessionBuilder {
     let sessionListCacheReady: Bool
     let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
     let mcpControlledTabIDs: Set<UUID>
+    let registeredRemoteHosts: [(id: String, displayName: String)]
+    var pairedDeviceDisplayNameByBareID: [String: String] = [:]
 
     private struct BuildContext {
         let tabByID: [UUID: ComposeTabState]
@@ -22,6 +24,8 @@ struct AgentModeSidebarSessionBuilder {
         let sortDateByTabID: [UUID: Date]
         let explicitSessionIDByTabID: [UUID: UUID]
         let bestEntryByTabID: [UUID: AgentSessionIndexEntry]
+        let remoteHostAbbreviationByHostID: [String: String]
+        let pairedDeviceDisplayNameByBareID: [String: String]
         let useFrozenRestoreOrder: Bool
     }
 
@@ -107,7 +111,32 @@ struct AgentModeSidebarSessionBuilder {
             sortDateByTabID: sortDateByTabID,
             explicitSessionIDByTabID: explicitSessionIDByTabID,
             bestEntryByTabID: bestEntryByTabID,
+            remoteHostAbbreviationByHostID: remoteHostAbbreviationLookup(),
+            pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareID,
             useFrozenRestoreOrder: shouldFreezeSidebarOrdering(for: linkedTabs)
+        )
+    }
+
+    private func remoteHostAbbreviationLookup() -> [String: String] {
+        var hostsByID = Dictionary(
+            registeredRemoteHosts.map { ($0.id, $0.displayName) },
+            uniquingKeysWith: { current, _ in current }
+        )
+        for session in sessions.values {
+            guard let remoteHost = session.remoteHost,
+                  hostsByID[remoteHost.hostID] == nil
+            else { continue }
+            hostsByID[remoteHost.hostID] = remoteHost.hostDisplayName
+        }
+        for entry in sessionIndex.values {
+            guard let hostID = entry.remoteHostID,
+                  let hostName = entry.remoteHostName,
+                  hostsByID[hostID] == nil
+            else { continue }
+            hostsByID[hostID] = hostName
+        }
+        return AgentRunLocationHostOption.abbreviations(
+            for: hostsByID.map { (id: $0.key, displayName: $0.value) }
         )
     }
 
@@ -217,7 +246,11 @@ struct AgentModeSidebarSessionBuilder {
             autoEditEnabled: entry.autoEditEnabled,
             parentSessionID: entry.parentSessionID,
             hasUnknownConversationContent: entry.hasUnknownConversationContent,
+            remoteHostID: entry.remoteHostID,
+            remoteHostName: entry.remoteHostName,
+            remoteSessionID: entry.remoteSessionID,
             isMCPOriginated: entry.isMCPOriginated,
+            origin: entry.origin,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,
             activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries
         )
@@ -262,15 +295,23 @@ struct AgentModeSidebarSessionBuilder {
             entry: entry,
             context: context
         )
+        // Display-only recency sanity: synthetic remote projector timestamps before
+        // AgentSessionRecencySanity's floor must not block the savedAt fallback.
         let lastUserMessageAt = Self.freshestDate(
-            entry?.lastUserMessageAt,
-            context.sortDateByTabID[tab.id]
+            AgentSessionRecencySanity.plausibleRecencyDate(entry?.lastUserMessageAt),
+            AgentSessionRecencySanity.plausibleRecencyDate(context.sortDateByTabID[tab.id])
         )
         let savedAt = sidebarSavedAt(for: tab, liveSession: metadataLiveSession, indexEntry: entry)
         let activityDate = Self.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
         let resolvedSessionID = authoritativeSessionID ?? entry?.id
         let resolvedParentSessionID = metadataLiveSession?.parentSessionID ?? entry?.parentSessionID
         let isMCPControlled = mcpControlledTabIDs.contains(tab.id)
+        let remoteControlDeviceID = Self.remoteControlDeviceID(liveSession: boundLiveSession, entry: entry)
+        let remoteControlDeviceDisplayName = remoteControlDeviceID.flatMap {
+            context.pairedDeviceDisplayNameByBareID[$0]
+        }
+        let remoteHostID = metadataLiveSession?.remoteHost?.hostID ?? entry?.remoteHostID
+        let remoteHostName = metadataLiveSession?.remoteHost?.hostDisplayName ?? entry?.remoteHostName
         let worktree = sidebarRowWorktree(liveSession: metadataLiveSession, entry: entry)
         let mergeAttention = sidebarRowWorktreeMergeAttention(liveSession: metadataLiveSession, entry: entry)
         let searchFields = Self.searchFields(
@@ -295,10 +336,31 @@ struct AgentModeSidebarSessionBuilder {
             parentSessionID: resolvedParentSessionID,
             depth: 0,
             isMCPControlled: isMCPControlled,
+            remoteHostName: remoteHostName,
+            remoteHostAbbreviation: remoteHostID.flatMap { context.remoteHostAbbreviationByHostID[$0] },
+            remoteControlDeviceID: remoteControlDeviceID,
+            remoteControlDeviceDisplayName: remoteControlDeviceDisplayName,
             worktree: worktree,
             worktreeMergeAttention: mergeAttention,
             searchFields: searchFields
         )
+    }
+
+    /// Deliberately reads the bound live session (not the metadata-gated one):
+    /// origin is a runtime property stamped at run activation, and the
+    /// persisted index entry fallback below covers tabs whose live origin is
+    /// still the default before persisted state loads.
+    private static func remoteControlDeviceID(
+        liveSession: TabSession?,
+        entry: AgentSessionIndexEntry?
+    ) -> String? {
+        if case let .remote(deviceID) = liveSession?.origin {
+            return deviceID
+        }
+        if case let .remote(deviceID) = entry?.origin {
+            return deviceID
+        }
+        return nil
     }
 
     /// Resolves the active worktree merge attention summary for a session row.
@@ -722,6 +784,10 @@ struct AgentModeSidebarSessionBuilder {
             parentSessionID: session.parentSessionID,
             depth: depth,
             isMCPControlled: session.isMCPControlled,
+            remoteHostName: session.remoteHostName,
+            remoteHostAbbreviation: session.remoteHostAbbreviation,
+            remoteControlDeviceID: session.remoteControlDeviceID,
+            remoteControlDeviceDisplayName: session.remoteControlDeviceDisplayName,
             worktree: session.worktree,
             worktreeMergeAttention: session.worktreeMergeAttention,
             searchFields: session.searchFields

@@ -1093,6 +1093,27 @@ enum AgentToolResultPersistencePolicy {
         return "\(displayName) • \(status.rawValue)"
     }
 
+    /// Synthetic remote terminal settlement markers are intentionally embedded in the JSON
+    /// payload instead of tracked only in memory so an immediate running update can identify
+    /// and reverse only client-stamped settlements. Accepted limitation: AgentChatItemPersist
+    /// sanitizes .toolCall persistence by dropping toolResultJSON, so this marker does not
+    /// survive a sanitized app-restart round trip.
+    private static let syntheticSettlementMarkerKey = "synthetic_settlement"
+
+    static func syntheticSettlementResultJSON(
+        statusWord: String,
+        normalizedToolName: String? = nil
+    ) -> String {
+        let minimalJSON = minimalResultJSON(statusWord: statusWord, normalizedToolName: normalizedToolName)
+        var object = jsonObject(from: minimalJSON) ?? [:]
+        object[syntheticSettlementMarkerKey] = true
+        return jsonString(from: object) ?? minimalJSON
+    }
+
+    static func isSyntheticSettlementJSON(_ json: String?) -> Bool {
+        boolValue(jsonObject(from: json), keys: [syntheticSettlementMarkerKey]) == true
+    }
+
     static func minimalResultJSON(
         statusWord: String,
         normalizedToolName: String? = nil,

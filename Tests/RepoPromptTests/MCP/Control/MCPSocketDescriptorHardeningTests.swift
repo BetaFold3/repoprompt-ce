@@ -75,6 +75,61 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         #endif
     }
 
+    func testDistinctGatewayBootstrapSessionTokensRemainIndependentlyLive() async throws {
+        #if DEBUG
+            try await Self.withIsolatedManagerSocket(prefix: "distinct-gateway-tokens") { manager, socketURL in
+                await manager.setConnectionApprovalHandler { _, _ in true }
+                await manager.debugSetGatewayLaunchCredentialForTesting("launch-secret")
+                await manager.start()
+                let listenerReady = await Self.waitForCurrentBootstrapListener(manager, at: socketURL)
+                XCTAssertTrue(listenerReady)
+
+                let firstToken = "gateway-bootstrap:repoprompt-gateway"
+                let secondToken = "gateway-bootstrap:remote:aaaa1111"
+                let firstFD = try Self.connectRawUnixClient(to: socketURL)
+                defer { Self.closeIfOpen(firstFD) }
+                let secondFD = try Self.connectRawUnixClient(to: socketURL)
+                defer { Self.closeIfOpen(secondFD) }
+
+                try Self.writeBootstrapRequest(
+                    to: firstFD,
+                    sessionToken: firstToken,
+                    clientName: "repoprompt-gateway",
+                    gatewayCredential: "launch-secret"
+                )
+                let firstResponse = try Self.readBootstrapResponse(from: firstFD)
+                XCTAssertEqual(firstResponse.type, "accepted")
+                let firstConnectionID = try await Self.waitForSessionBinding(manager, token: firstToken)
+
+                try Self.writeBootstrapRequest(
+                    to: secondFD,
+                    sessionToken: secondToken,
+                    clientName: "remote:aaaa1111",
+                    gatewayCredential: "launch-secret"
+                )
+                let secondResponse = try Self.readBootstrapResponse(from: secondFD)
+                XCTAssertEqual(secondResponse.type, "accepted")
+                let secondConnectionID = try await Self.waitForSessionBinding(manager, token: secondToken)
+
+                let firstBoundConnectionID = await manager.debugConnectionIDForSessionTokenForTesting(firstToken)
+                let secondBoundConnectionID = await manager.debugConnectionIDForSessionTokenForTesting(secondToken)
+                let firstConnectionIsLive = await manager.debugContainsConnection(firstConnectionID)
+                let secondConnectionIsLive = await manager.debugContainsConnection(secondConnectionID)
+                XCTAssertNotEqual(firstConnectionID, secondConnectionID)
+                XCTAssertEqual(firstBoundConnectionID, firstConnectionID)
+                XCTAssertEqual(secondBoundConnectionID, secondConnectionID)
+                XCTAssertTrue(firstConnectionIsLive)
+                XCTAssertTrue(secondConnectionIsLive)
+
+                await manager.debugRemoveConnection(firstConnectionID)
+                await manager.debugRemoveConnection(secondConnectionID)
+                await manager.debugSetGatewayLaunchCredentialForTesting(nil)
+            }
+        #else
+            throw XCTSkip("Bootstrap admission credential seam is DEBUG-only")
+        #endif
+    }
+
     func testSuccessiveSameSessionBootstrapAdmissionsDoNotDoubleDiscountReplacement() async throws {
         #if DEBUG
             try await Self.withIsolatedManagerSocket(prefix: "same-token-reservation") { manager, socketURL in
@@ -810,7 +865,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
                 relativeTo: root
             )
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 
@@ -831,7 +886,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             let root = try RepoRoot.url()
             let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 
@@ -868,18 +923,18 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
     func testAppAndCLIReadersPreserveOneShotTerminalCancellationOwnership() throws {
         do {
-            let caseLabel = "testAppAndCLIReadersShareFairOneShotTerminalCancellationLifecycle"
+            let caseLabel = "testAppAndClientKitReadersShareFairOneShotTerminalCancellationLifecycle"
             let root = try RepoRoot.url()
             let appReader = try Self.sourceText(
                 "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift",
                 relativeTo: root
             )
-            let cliReader = try Self.sourceText(
-                "Sources/RepoPromptMCP/Shared/NewlineDelimitedSocketReader.swift",
+            let clientKitReader = try Self.sourceText(
+                "Sources/RepoPromptMCPClientKit/Shared/NewlineDelimitedSocketReader.swift",
                 relativeTo: root
             )
 
-            XCTAssertEqual(appReader, cliReader, caseLabel)
+            XCTAssertEqual(appReader, clientKitReader, caseLabel)
             Self.assertSourceContains(
                 [
                     "public enum NewlineDelimitedSocketReaderTerminal: @unchecked Sendable",
@@ -901,10 +956,10 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         }
 
         do {
-            let caseLabel = "testNonImportableCLITransportClaimsEarlyAndDelayedReaderCancellationExactlyOnce"
+            let caseLabel = "testClientKitTransportClaimsEarlyAndDelayedReaderCancellationExactlyOnce"
             let root = try RepoRoot.url()
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 
@@ -1051,6 +1106,21 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         XCTAssertEqual(response.type, "accepted")
     }
 
+    private static func waitForSessionBinding(
+        _ manager: ServerNetworkManager,
+        token: String
+    ) async throws -> UUID {
+        var connectionID: UUID?
+        let bound = await waitUntil {
+            connectionID = await manager.debugConnectionIDForSessionTokenForTesting(token)
+            return connectionID != nil
+        }
+        guard bound, let connectionID else {
+            throw TestError.bootstrapResponseTimedOut
+        }
+        return connectionID
+    }
+
     private static func readBootstrapResponse(from fd: Int32, timeout: TimeInterval = 2) throws -> MCPBootstrapResponse {
         let deadline = Date().addingTimeInterval(timeout)
         var payload = Data()
@@ -1079,12 +1149,14 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
     private static func writeBootstrapRequest(
         to fd: Int32,
         sessionToken: String = "fd-hardening-\(UUID().uuidString)",
-        clientName: String = "fd-hardening-test"
+        clientName: String = "fd-hardening-test",
+        gatewayCredential: String? = nil
     ) throws {
         var payload = try JSONEncoder().encode(MCPBootstrapRequest(
             sessionToken: sessionToken,
             clientPid: Int(getpid()),
-            clientName: clientName
+            clientName: clientName,
+            gatewayCredential: gatewayCredential
         ))
         payload.append(UInt8(ascii: "\n"))
         try writeAll(payload, to: fd)

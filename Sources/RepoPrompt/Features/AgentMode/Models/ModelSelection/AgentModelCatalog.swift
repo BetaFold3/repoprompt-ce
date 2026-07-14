@@ -2075,6 +2075,10 @@ enum AgentModelCatalog {
         }
 
         for group in menu.groups {
+            let preferredEffort = ClaudeAgentToolPreferences.effortLevel(
+                forModelRaw: group.baseModelRaw,
+                agentKind: agent
+            )
             let targets = group.options.map { option -> DiscoveryStartTarget in
                 let selectionID = AgentModelSelectionID(agentRaw: agent.rawValue, modelRaw: option.rawValue)
                 let specifier = ClaudeModelSpecifier(raw: option.rawValue)
@@ -2091,7 +2095,7 @@ enum AgentModelCatalog {
                     description: option.description,
                     reasoningEffort: nil,
                     available: true,
-                    isDefault: option.rawValue.caseInsensitiveCompare(defaultModelRaw) == .orderedSame,
+                    isDefault: specifier.effortLevel == preferredEffort,
                     contextWindowTokens: contextWindow
                 )
             }

@@ -352,7 +352,11 @@ enum AgentSessionRestoreSupport {
             autoEditEnabled: session.autoEditEnabled,
             parentSessionID: session.parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
+            remoteHostID: session.remoteHost?.hostID,
+            remoteHostName: session.remoteHost?.hostDisplayName,
+            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
             isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
         )

@@ -17,9 +17,10 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         let legacyAgentRoute = try XCTUnwrap(URL(string: "repoprompt://agent/session?workspace_id=\(route.workspaceID.uuidString)&tab_id=\(route.tabID.uuidString)&session_id=\(sessionID.uuidString)&window_id=7"))
         XCTAssertEqual(AppDeepLinkRoute.parse(url: legacyAgentRoute), .route(.agentSession(route)))
 
-        let missingWorkspace = try XCTUnwrap(URL(string: "repoprompt-ce://agent/session?tab_id=\(route.tabID.uuidString)"))
-        let malformedSession = try XCTUnwrap(URL(string: "repoprompt-ce://agent/session?workspace_id=\(route.workspaceID.uuidString)&tab_id=\(route.tabID.uuidString)&session_id=not-a-uuid"))
-        let unsupportedAgentPath = try XCTUnwrap(URL(string: "repoprompt-ce://agent/other?workspace_id=\(route.workspaceID.uuidString)&tab_id=\(route.tabID.uuidString)"))
+        let scheme = AppDeepLinkURLScheme.canonical
+        let missingWorkspace = try XCTUnwrap(URL(string: "\(scheme)://agent/session?tab_id=\(route.tabID.uuidString)"))
+        let malformedSession = try XCTUnwrap(URL(string: "\(scheme)://agent/session?workspace_id=\(route.workspaceID.uuidString)&tab_id=\(route.tabID.uuidString)&session_id=not-a-uuid"))
+        let unsupportedAgentPath = try XCTUnwrap(URL(string: "\(scheme)://agent/other?workspace_id=\(route.workspaceID.uuidString)&tab_id=\(route.tabID.uuidString)"))
 
         XCTAssertEqual(AppDeepLinkRoute.parse(url: missingWorkspace), .invalidScopedRoute)
         XCTAssertEqual(AppDeepLinkRoute.parse(url: malformedSession), .invalidScopedRoute)
@@ -27,16 +28,17 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
     }
 
     func testCanonicalAndLegacySchemesRouteOpeners() throws {
-        XCTAssertTrue(AppDeepLinkURLScheme.isSupported("repoprompt-ce"))
-        XCTAssertTrue(AppDeepLinkURLScheme.isSupported("REPOPROMPT-CE"))
+        let canonical = AppDeepLinkURLScheme.canonical
+        XCTAssertTrue(AppDeepLinkURLScheme.isSupported(canonical))
+        XCTAssertTrue(AppDeepLinkURLScheme.isSupported(canonical.uppercased()))
         XCTAssertTrue(AppDeepLinkURLScheme.isSupported("repoprompt"))
         XCTAssertTrue(AppDeepLinkURLScheme.isSupported("REPOPROMPT"))
         XCTAssertFalse(AppDeepLinkURLScheme.isSupported("https"))
         XCTAssertFalse(AppDeepLinkURLScheme.isSupported(nil))
 
-        let ceOpen = try XCTUnwrap(URL(string: "repoprompt-ce://open//Users/example/Project?workspace=Review&files=Sources/App.swift,README.md&prompt=Review%20this&focus=true&ephemeral=true"))
+        let ceOpen = try XCTUnwrap(URL(string: "\(canonical)://open//Users/example/Project?workspace=Review&files=Sources/App.swift,README.md&prompt=Review%20this&focus=true&ephemeral=true"))
         let legacyOpen = try XCTUnwrap(URL(string: "repoprompt://open//Users/example/Project?persist=false"))
-        let cePrompt = try XCTUnwrap(URL(string: "repoprompt-ce://prompt?title=Review&content=Review%20the%20selection&focus=true"))
+        let cePrompt = try XCTUnwrap(URL(string: "\(canonical)://prompt?title=Review&content=Review%20the%20selection&focus=true"))
         let legacyPrompt = try XCTUnwrap(URL(string: "repoprompt://prompt?title=Review&content=Review%20the%20selection&focus=true"))
         let unsupportedScheme = try XCTUnwrap(URL(string: "https://open//Users/example/Project"))
 

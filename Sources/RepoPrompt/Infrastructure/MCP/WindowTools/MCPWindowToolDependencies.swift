@@ -99,6 +99,7 @@ struct MCPWindowToolDependencies {
         _ activityReporter: ContextBuilderMCPActivityReporter?
     ) async throws -> ChatSendReply
     typealias CaptureRequestMetadata = @MainActor @Sendable () async -> MCPServerViewModel.RequestMetadata
+    typealias IsGatewayPrincipalConnection = @Sendable (_ connectionID: UUID) async -> Bool
     typealias ResolveImplicitContextBuilderGitTarget = @MainActor @Sendable (
         _ metadata: MCPServerViewModel.RequestMetadata
     ) async throws -> ContextBuilderReviewTargetResolution?
@@ -325,6 +326,7 @@ struct MCPWindowToolDependencies {
     let selectionCoordinator: WorkspaceSelectionCoordinator?
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     let captureRequestMetadata: CaptureRequestMetadata
+    let isGatewayPrincipalConnection: IsGatewayPrincipalConnection
     let resolveImplicitContextBuilderGitTarget: ResolveImplicitContextBuilderGitTarget
     let validateContextBuilderGitArtifactSelection: ValidateContextBuilderGitArtifactSelection
     let resolveTabContextSnapshot: ResolveTabContextSnapshot

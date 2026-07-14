@@ -134,9 +134,23 @@ struct AgentModeSessionsSidebarView: View {
                     },
                     isAgentRunActive: {
                         agentModeVM.isAgentRunActive(tabID: currentTabID)
+                    },
+                    disabledReason: {
+                        agentModeVM.localSessionMutationDisabledReason(tabID: currentTabID)
                     }
                 )
             )
+        }
+        .task(id: agentModeVM.remoteWorkspaceSidebarRefreshKey()) {
+            guard agentModeVM.remoteWorkspaceSidebarRefreshKey() != nil else { return }
+            while !Task.isCancelled {
+                await agentModeVM.refreshRemoteWorkspaceSidebar()
+                do {
+                    try await Task.sleep(nanoseconds: 20_000_000_000)
+                } catch {
+                    return
+                }
+            }
         }
     }
 
@@ -377,6 +391,7 @@ struct AgentModeSessionsListView: View {
         let snapshot = sidebarListSnapshot
         let activeSections = AgentSidebarDateSectionBuilder.activeSections(for: snapshot.pagedSessions)
         let firstActiveSectionID = activeSections.first?.id
+        let remoteWorkspaceSection = agentModeVM.remoteWorkspaceSidebarSection()
         ScrollView {
             VStack(spacing: listRowSpacing) {
                 ForEach(activeSections) { section in
@@ -395,6 +410,10 @@ struct AgentModeSessionsListView: View {
                                 runState: agentModeVM.runState(for: session.tabID),
                                 isWaiting: agentModeVM.isTabWaiting(session.tabID),
                                 attentionRunState: sidebarUI.snapshot.attentionRunStateByTabID[session.tabID],
+                                remoteHostName: session.remoteHostName,
+                                remoteHostAbbreviation: session.remoteHostAbbreviation,
+                                remoteControlDeviceID: session.remoteControlDeviceID,
+                                remoteControlDeviceDisplayName: session.remoteControlDeviceDisplayName,
                                 worktree: session.worktree,
                                 worktreeMergeAttention: session.worktreeMergeAttention,
                                 threadDepth: session.depth,
@@ -450,6 +469,13 @@ struct AgentModeSessionsListView: View {
                     .padding(.horizontal, showMoreHorizontalPadding)
                     .padding(.vertical, showMoreVerticalPadding)
                     .foregroundColor(.accentColor)
+                }
+
+                if let remoteWorkspaceSection {
+                    RemoteWorkspaceSessionsSidebarSection(
+                        section: remoteWorkspaceSection,
+                        agentModeVM: agentModeVM
+                    )
                 }
 
                 if !snapshot.archivedSessionTabsForHeader.isEmpty {
@@ -539,6 +565,157 @@ struct AgentModeSessionsListView: View {
             AgentModePerfDiagnostics.increment("ui.body.agentSessionsList")
         }
     #endif
+}
+
+private struct RemoteWorkspaceSessionsSidebarSection: View {
+    let section: AgentModeViewModel.RemoteWorkspaceSidebarSection
+    let agentModeVM: AgentModeViewModel
+    @ObservedObject private var fontScale = FontScaleManager.shared
+
+    private var fontPreset: FontScalePreset {
+        fontScale.preset
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: fontPreset.scaledClamped(5, max: 7)) {
+            Divider()
+                .padding(.vertical, fontPreset.scaledClamped(6, max: 9))
+
+            HStack(spacing: 6) {
+                Image(systemName: "desktopcomputer")
+                    .foregroundStyle(.secondary)
+                Text("On \(section.hostRecord.displayName)")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                Button {
+                    Task { await agentModeVM.refreshRemoteWorkspaceSidebar(forceRefresh: true) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .hoverTooltip("Refresh sessions on \(section.hostRecord.displayName)")
+                .accessibilityLabel("Refresh sessions on \(section.hostRecord.displayName)")
+            }
+            .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
+
+            switch section.content {
+            case .loading:
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading workspace sessions…")
+                        .foregroundStyle(.secondary)
+                }
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
+            case let .sessions(descriptors):
+                if descriptors.isEmpty {
+                    Text("No other sessions in this workspace.")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
+                } else {
+                    ForEach(descriptors, id: \.sessionID) { descriptor in
+                        RemoteWorkspaceSessionSidebarRow(descriptor: descriptor) {
+                            Task {
+                                await agentModeVM.pickUpRemoteWorkspaceSession(
+                                    descriptor,
+                                    hostRecord: section.hostRecord
+                                )
+                            }
+                        }
+                    }
+                }
+            case let .workspaceNotOpen(message), let .error(message):
+                remoteFailure(message: message, showsRetry: true)
+            case let .unsupported(message):
+                remoteFailure(message: message, showsRetry: false)
+            }
+        }
+    }
+
+    private func remoteFailure(message: String, showsRetry: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(message)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if showsRetry {
+                Button("Retry") {
+                    Task { await agentModeVM.retryRemoteWorkspaceSidebar() }
+                }
+                .buttonStyle(.plain)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                .foregroundStyle(.tint)
+            }
+        }
+        .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
+    }
+}
+
+private struct RemoteWorkspaceSessionSidebarRow: View {
+    let descriptor: RemoteAgentSessionDescriptor
+    let onSelect: () -> Void
+    @ObservedObject private var fontScale = FontScaleManager.shared
+
+    private var fontPreset: FontScalePreset {
+        fontScale.preset
+    }
+
+    private var title: String {
+        let trimmed = descriptor.name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "Agent Session" : trimmed
+    }
+
+    private var detailText: String {
+        var parts: [String] = []
+        if let state = descriptor.stateRaw?.trimmingCharacters(in: .whitespacesAndNewlines), !state.isEmpty {
+            parts.append(state.replacingOccurrences(of: "_", with: " "))
+        }
+        let agentModel = [descriptor.agentKindRaw, descriptor.agentModelRaw]
+            .compactMap { value -> String? in
+                let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            .joined(separator: " · ")
+        if !agentModel.isEmpty { parts.append(agentModel) }
+        return parts.joined(separator: " · ")
+    }
+
+    var body: some View {
+        Button(action: onSelect) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(descriptor.isLive == true ? Color.green : Color.secondary.opacity(0.45))
+                    .frame(width: 7, height: 7)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    HStack(spacing: 4) {
+                        if !detailText.isEmpty {
+                            Text(detailText)
+                        }
+                        if let lastModified = descriptor.lastModified {
+                            if !detailText.isEmpty { Text("·") }
+                            Text(lastModified, style: .relative)
+                        }
+                    }
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                }
+                Spacer(minLength: 4)
+            }
+            .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
+            .padding(.vertical, fontPreset.scaledClamped(5, max: 7))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Pick up \(title)")
+    }
 }
 
 /// Date-bucket section header used by the Agent Mode sidebar (`Today` /

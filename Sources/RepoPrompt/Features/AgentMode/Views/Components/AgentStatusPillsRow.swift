@@ -19,6 +19,15 @@ struct AgentStatusPillsRow: View {
         #endif
         HStack(spacing: 12) {
             HStack(spacing: 6) {
+                if let runLocation = snapshot.runLocation {
+                    AgentRunLocationPill(
+                        props: runLocation,
+                        selectLocation: { selection in
+                            agentModeVM.selectRunLocation(selection, for: runLocation.tabID)
+                        }
+                    )
+                }
+
                 if let executionLocation = snapshot.executionLocation {
                     AgentExecutionLocationPill(
                         props: executionLocation,

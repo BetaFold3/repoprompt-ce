@@ -1921,6 +1921,79 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
 
 
 class SmokeOperationTests(unittest.TestCase):
+
+    def test_workspace_restore_in_progress_is_retryable_transient(self) -> None:
+        for phase in ("hydrating roots", "restoring state", "finalizing"):
+            output = (
+                'Error: [-32600] Invalid Request: Workspace switch to "test-workspace" is blocked by a active '
+                f'switch to "test-workspace" (reason: restore, phase: {phase}, total age: 0.5s, phase age: 0.0s)\n'
+            )
+
+            self.assertTrue(conductor.is_workspace_restore_in_progress(output, "test-workspace"), phase)
+            self.assertFalse(conductor.is_workspace_restore_in_progress(output, "other-workspace"), phase)
+
+    def test_workspace_restore_in_progress_requires_restore_reason(self) -> None:
+        output = (
+            'Error: [-32600] Invalid Request: Workspace switch to "test-workspace" is blocked by a active '
+            'switch to "test-workspace" (reason: user, phase: switching, total age: 0.5s, phase age: 0.0s)\n'
+        )
+
+        self.assertFalse(conductor.is_workspace_restore_in_progress(output, "test-workspace"))
+
+    def test_smoke_retries_workspace_switch_duringRestoreHydration(self) -> None:
+        calls: list[tuple[str, list[str]]] = []
+        switch_attempts = 0
+
+        def record_command(name: str, argv: list[str], *_args: object, **_kwargs: object) -> tuple[int, str, str]:
+            nonlocal switch_attempts
+            calls.append((name, argv))
+            if name == "workspace switch":
+                switch_attempts += 1
+                if switch_attempts == 1:
+                    return (
+                        1,
+                        "",
+                        'Error: [-32600] Invalid Request: Workspace switch to "test-workspace" is blocked by a active '
+                        'switch to "test-workspace" (reason: restore, phase: hydrating roots, total age: 0.5s, phase age: 0.0s)\n',
+                    )
+            return 0, "", ""
+
+        with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "run_operation_command", side_effect=record_command
+        ), mock.patch.object(conductor.time, "sleep", return_value=None):
+            code = conductor.operation_smoke(Path.cwd(), {"windowId": "7", "workspace": "test-workspace"})
+
+        self.assertEqual(code, 0)
+        self.assertEqual(switch_attempts, 2)
+        self.assertEqual([name for name, _argv in calls[:3]], ["windows", "workspace switch", "workspace switch"])
+
+    def test_smoke_retries_workspace_switch_duringRestoringStatePhase_onStdout(self) -> None:
+        calls: list[tuple[str, list[str]]] = []
+        switch_attempts = 0
+
+        def record_command(name: str, argv: list[str], *_args: object, **_kwargs: object) -> tuple[int, str, str]:
+            nonlocal switch_attempts
+            calls.append((name, argv))
+            if name == "workspace switch":
+                switch_attempts += 1
+                if switch_attempts == 1:
+                    return (
+                        1,
+                        'Error: [-32600] Invalid Request: Workspace switch to "test-workspace" is blocked by a active '
+                        'switch to "test-workspace" (reason: restore, phase: restoring state, total age: 0.4s, phase age: 0.4s)\n',
+                        "",
+                    )
+            return 0, "", ""
+
+        with mock.patch.object(conductor, "require_debug_cli", return_value="/tmp/rpce-cli-debug"), mock.patch.object(
+            conductor, "run_operation_command", side_effect=record_command
+        ), mock.patch.object(conductor.time, "sleep", return_value=None):
+            code = conductor.operation_smoke(Path.cwd(), {"windowId": "7", "workspace": "test-workspace"})
+
+        self.assertEqual(code, 0)
+        self.assertEqual(switch_attempts, 2)
+        self.assertEqual([name for name, _argv in calls[:3]], ["windows", "workspace switch", "workspace switch"])
+
     def test_manage_worktree_list_stage_runs_after_tree_roots_before_agent_manage(self) -> None:
         calls: list[tuple[str, list[str]]] = []
 

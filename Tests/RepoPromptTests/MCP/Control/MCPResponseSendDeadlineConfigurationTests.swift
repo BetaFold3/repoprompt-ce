@@ -52,7 +52,7 @@ final class MCPResponseSendDeadlineConfigurationTests: XCTestCase {
 
         let cliTransport = try source(
             root: root,
-            path: "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift"
+            path: "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift"
         )
         XCTAssertTrue(cliTransport.contains(
             "writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds"

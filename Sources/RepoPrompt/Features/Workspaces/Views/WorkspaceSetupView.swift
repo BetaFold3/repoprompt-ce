@@ -28,6 +28,11 @@ struct WorkspaceSetupView: View {
                 .textFieldStyle(RoundedBorderTextFieldStyle())
                 .padding(.horizontal)
 
+            WorkspaceRunLocationPicker(
+                selectedHostID: $workspaceManager.creationDraft.defaultRemoteHostID
+            )
+            .padding(.horizontal)
+
             // Show the selected repo paths from the manager’s creationDraft
             List {
                 ForEach(workspaceManager.creationDraft.selectedRepoPaths, id: \.self) { path in

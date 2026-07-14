@@ -28,6 +28,9 @@ required_dirs=(
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
   "Sources/RepoPromptShared/MCP"
+  "Sources/RepoPromptMCPClientKit"
+  "Sources/RepoPromptGateway"
+  "Sources/RepoPromptRemoteWire"
   "Tests/RepoPromptTests"
 )
 for dir in "${required_dirs[@]}"; do
@@ -62,6 +65,7 @@ shared_mcp_required_files=(
   "Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
   "Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift"
   "Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift"
+  "Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift"
 )
 for file in "${shared_mcp_required_files[@]}"; do
   if [[ ! -f "$file" ]]; then
@@ -75,6 +79,11 @@ done
 if [[ -e "src/scanner.c" ]]; then
   fail "retired root src/scanner.c manifest-probe sentinel exists; use the tracked TreeSitterScannerSupport target instead"
 fi
+
+print_matches \
+  "RepoPromptRemoteWire imports forbidden app/gateway/MCP/NIO/logging modules" \
+  grep -R -n -E '^[[:space:]]*import[[:space:]]+(MCP|NIO[A-Za-z0-9_]*|Logging|RepoPrompt|RepoPromptGateway|RepoPromptMCP|RepoPromptMCPClientKit|RepoPromptShared)\b' \
+    Sources/RepoPromptRemoteWire --include='*.swift'
 
 tree_sitter_scanner_support_files=(
   "Sources/TreeSitterScannerSupport/include/tree_sitter/alloc.h"
@@ -260,6 +269,12 @@ if [[ "$mcp_event_declarations" != "Sources/RepoPromptShared/MCP/MCPExternalClie
   printf '%s\n' "$mcp_event_declarations" >&2
 fi
 
+mcp_bootstrap_declarations="$(grep -R -l -E '^(public )?(enum MCPBootstrapProtocol|enum MCPBootstrapTiming|struct MCPBootstrapRequest|struct MCPBootstrapResponse|enum MCPBootstrapErrorCode)' Sources --include='*.swift' | sort || true)"
+if [[ "$mcp_bootstrap_declarations" != "Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift" ]]; then
+  fail "MCP bootstrap handshake DTOs must be declared only under RepoPromptShared"
+  printf '%s\n' "$mcp_bootstrap_declarations" >&2
+fi
+
 # 4. Parser fixtures and sample parser inputs must not live in app source.
 print_matches \
   "parser fixture/test directory found under app syntax parsing source" \
@@ -335,14 +350,34 @@ allowed_tracked_docs=(
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
+  "docs/designs/remote-relay-contract.md"
   "docs/open-source-readiness.md"
   "docs/privacy/telemetry.md"
+  "docs/technical_implementation_reports/remote-control-gateway.md"
+  "docs/technical_implementation_reports/2026-07-08-remote-session-ux-gaps-implementation.md"
+  "docs/technical_implementation_reports/2026-07-08-remote-recency-grouping-and-device-badge.md"
+  "docs/technical_implementation_reports/2026-07-08-remote-e2e-truncation-spinners-picker-fixes.md"
+  "docs/technical_implementation_reports/2026-07-08-remote-e2e-followup-spinner-inversion-status-label-fixes.md"
+  "docs/technical_implementation_reports/2026-07-09-remote-effort-picker-clobber-status-label-streaming-fixes.md"
+  "docs/technical_implementation_reports/2026-07-09-remote-skip-all-payload-and-respond-recovery-fixes.md"
+  "docs/technical_implementation_reports/2026-07-09-remote-interview-draft-preservation-timeout-parity-watch-revalidation.md"
+  "docs/technical_implementation_reports/2026-07-09-remote-premature-terminal-latch-and-cb-model-label-fixes.md"
+  "docs/technical_implementation_reports/2026-07-13-live-smoke-deferred-followups-f1-f3.md"
+  "docs/technical_implementation_reports/2026-07-13-remote-transcript-delivery-recovery.md"
+  "docs/technical_implementation_reports/2026-07-13-workspace-run-target-snapshot-invalidation.md"
+  "docs/technical_implementation_reports/2026-07-15-remote-pairing-trust-refresh-and-revocation.md"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"
+  "docs/spec/native-direct-tailnet-pairing.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
+  "docs/investigations/remote-agent-transcript-delivery-regression-2026-07-13.md"
+  "docs/investigations/remote-control-ticket-endpoint-404-2026-07-14.md"
+  "docs/investigations/remote-pairing-device-revoked-after-pairing-2026-07-15.md"
+  "docs/investigations/remote-pairing-onboarding-ux-2026-07-14.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
+  "docs/investigations/workspace-scoped-run-target-label-2026-07-13.md"
   "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )
 while IFS= read -r path; do

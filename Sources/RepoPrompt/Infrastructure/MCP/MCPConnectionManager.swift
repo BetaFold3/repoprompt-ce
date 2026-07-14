@@ -73,6 +73,15 @@ public enum MCPRunPurpose: String, Sendable, Codable {
     case unknown // No policy or unspecified
 }
 
+/// App-verified trust principal for a bootstrap MCP connection.
+///
+/// Gateway-only authorization must key off `.gateway`, never off the client-asserted
+/// `MCPBootstrapRequest.clientName` / MCP initialize `clientInfo.name` strings.
+enum MCPConnectionPrincipal: String, Codable, Equatable {
+    case standard
+    case gateway
+}
+
 /// Dispatcher-validated provenance for a one-shot hidden `_windowID` tool argument.
 /// This value is request-scoped only and must never be synthesized from sticky,
 /// persisted, or automatically selected window affinity.
@@ -280,6 +289,7 @@ struct IdentityContextSnapshot {
     let capabilityToken: String?
     let source: Source
     let hasHandshake: Bool
+    let principal: MCPConnectionPrincipal
     let lastUpdated: Date
 }
 
@@ -526,6 +536,7 @@ actor ServerNetworkManager {
     /// scope `op=list` to a single window instead of returning all windows.
     nonisolated static func isAppWideTool(_ toolName: String) -> Bool {
         toolName == AppSettingsMCPService.toolName
+            || toolName == MCPWindowToolName.remotePairing
     }
 
     nonisolated static func shouldAutoInjectPublicWindowID(for toolName: String) -> Bool {
@@ -1567,11 +1578,15 @@ actor ServerNetworkManager {
         var capabilityToken: String?
         var source: Source
         var hasHandshake: Bool
+        var principal: MCPConnectionPrincipal
         var lastUpdated: Date
     }
 
     /// Identity context per connection
     private var identityContextByConnection: [UUID: ConnectionIdentityContext] = [:]
+
+    /// Launch-scoped credential expected from the app-spawned gateway bootstrap client.
+    private var gatewayLaunchCredential: String?
 
     /// Identity failure escalation tracking
     private var identityFailureWindowStart: Date?
@@ -1586,6 +1601,47 @@ actor ServerNetworkManager {
     /// Sets the identity escalation callback
     func setOnIdentityEscalation(_ handler: @escaping IdentityEscalationHandler) {
         identityEscalationHandler = handler
+    }
+
+    func setGatewayLaunchCredential(_ credential: String?) {
+        let trimmed = credential?.trimmingCharacters(in: .whitespacesAndNewlines)
+        gatewayLaunchCredential = trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    func isGatewayPrincipalConnection(_ connectionID: UUID) -> Bool {
+        identityContextByConnection[connectionID]?.principal == .gateway
+    }
+
+    private enum GatewayPrincipalDecision: Equatable {
+        case standard
+        case gateway
+        case invalid
+
+        var principal: MCPConnectionPrincipal {
+            switch self {
+            case .gateway: .gateway
+            case .standard, .invalid: .standard
+            }
+        }
+    }
+
+    private func gatewayPrincipalDecision(forCredential credential: String?) -> GatewayPrincipalDecision {
+        let trimmed = credential?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let trimmed, !trimmed.isEmpty else { return .standard }
+        guard let expected = gatewayLaunchCredential, !expected.isEmpty else { return .invalid }
+        return Self.constantTimeEquals(trimmed, expected) ? .gateway : .invalid
+    }
+
+    private nonisolated static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
+        let lhsBytes = Array(lhs.utf8)
+        let rhsBytes = Array(rhs.utf8)
+        var difference = lhsBytes.count ^ rhsBytes.count
+        for index in 0 ..< max(lhsBytes.count, rhsBytes.count) {
+            let left = index < lhsBytes.count ? lhsBytes[index] : 0
+            let right = index < rhsBytes.count ? rhsBytes[index] : 0
+            difference |= Int(left ^ right)
+        }
+        return difference == 0
     }
 
     /// Sets a hook for dashboard updates (tool ownership, connection changes, etc.)
@@ -2060,6 +2116,8 @@ actor ServerNetworkManager {
     static var currentToolDispatchAuthorization: ToolDispatchAuthorization?
     @TaskLocal
     static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
+    @TaskLocal
+    static var currentEffectiveWindowID: Int?
 
     nonisolated static func explicitWindowRoutingHint(
         connectionID: UUID,
@@ -2598,12 +2656,19 @@ actor ServerNetworkManager {
             let effective = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
             return (windows, effective)
         }
+        let isGatewayPrincipal = isGatewayPrincipalConnection(connectionID)
 
-        // Single MCP-enabled window → unambiguous binding
+        // Single MCP-enabled window → unambiguous routing. Gateway-principal connections
+        // may use the single window for this request/list operation, but must not seed a
+        // default binding that would later make multi-window probes report false `.bound`.
         if mcpEnabledWindows.count == 1, let window = mcpEnabledWindows.first {
             let windowID = window.windowID
-            setConnectionWindowMapping(connectionID, windowID: windowID)
-            connectionLog("\(reason): auto-bound connection \(connectionID) to single MCP-enabled window \(windowID)")
+            if isGatewayPrincipal {
+                connectionLog("\(reason): routed gateway connection \(connectionID) to single MCP-enabled window \(windowID) (default binding unchanged)")
+            } else {
+                setConnectionWindowMapping(connectionID, windowID: windowID)
+                connectionLog("\(reason): auto-bound connection \(connectionID) to single MCP-enabled window \(windowID)")
+            }
             return windowID
         }
 
@@ -2619,12 +2684,17 @@ actor ServerNetworkManager {
                 connectionLog("\(reason): missing connection-time window count for \(connectionID); treating as multi-window")
             }
         }
-        if connectedDuringSingleWindow || !multiWindowEffective {
+        let shouldUseSingleWindowFallback = !multiWindowEffective || (connectedDuringSingleWindow && !isGatewayPrincipal)
+        if shouldUseSingleWindowFallback {
             if let firstWindow = await WindowStatesManager.shared.firstMCPEnabledWindow() {
                 let windowID = firstWindow.windowID
-                setConnectionWindowMapping(connectionID, windowID: windowID)
                 let bindReason = connectedDuringSingleWindow ? "single-window-at-connect" : "single-window-mode"
-                connectionLog("\(reason): auto-bound connection \(connectionID) to window \(windowID) (\(bindReason))")
+                if isGatewayPrincipal {
+                    connectionLog("\(reason): routed gateway connection \(connectionID) to window \(windowID) (\(bindReason), default binding unchanged)")
+                } else {
+                    setConnectionWindowMapping(connectionID, windowID: windowID)
+                    connectionLog("\(reason): auto-bound connection \(connectionID) to window \(windowID) (\(bindReason))")
+                }
                 return windowID
             }
         }
@@ -2648,6 +2718,9 @@ actor ServerNetworkManager {
     }
 
     func currentConnectionWindowID() -> Int? {
+        if let effectiveWindowID = Self.currentEffectiveWindowID {
+            return effectiveWindowID
+        }
         guard let connectionID = Self.currentConnectionID else { return nil }
         return connectionWindowMap[connectionID]
     }
@@ -4146,7 +4219,7 @@ actor ServerNetworkManager {
             #if DEBUG
                 print("[MCPStartup] calling BootstrapSocketServer.start socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
-            try await server.start { [weak self, weak server] clientFD, sessionToken, clientPid, clientName async -> BootstrapSocketServer.Admission in
+            try await server.start { [weak self, weak server] clientFD, sessionToken, clientPid, clientName, gatewayCredential async -> BootstrapSocketServer.Admission in
                 guard let self, let server else {
                     return .reject(.rejected(reason: "Server unavailable", errorCode: "server_unavailable"))
                 }
@@ -4156,7 +4229,8 @@ actor ServerNetworkManager {
                     clientFD: clientFD,
                     sessionToken: sessionToken,
                     clientPid: clientPid,
-                    clientName: clientName
+                    clientName: clientName,
+                    gatewayCredential: gatewayCredential
                 )
             }
             guard isCurrentBootstrapListener(server, lifecycleGeneration: expectedLifecycleGeneration) else {
@@ -4203,11 +4277,22 @@ actor ServerNetworkManager {
         clientFD: Int32,
         sessionToken: String,
         clientPid: Int,
-        clientName: String?
+        clientName: String?,
+        gatewayCredential: String?
     ) async -> BootstrapSocketServer.Admission {
         let connectionID = UUID()
         connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
         mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") pid=\(clientPid)")
+
+        let principalDecision = gatewayPrincipalDecision(forCredential: gatewayCredential)
+        switch principalDecision {
+        case .invalid:
+            log.warning("Rejecting bootstrap connection \(connectionID) - invalid gateway credential")
+            return .reject(.rejected(reason: "Invalid gateway credential", errorCode: MCPBootstrapErrorCode.approvalDenied.rawValue))
+        case .standard, .gateway:
+            break
+        }
+        let principal = principalDecision.principal
 
         guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
@@ -4311,7 +4396,8 @@ actor ServerNetworkManager {
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
             clientPid: clientPid,
-            clientName: clientName
+            clientName: clientName,
+            principal: principal
         )
     }
 
@@ -4382,7 +4468,8 @@ actor ServerNetworkManager {
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
         clientPid: Int,
-        clientName: String?
+        clientName: String?,
+        principal: MCPConnectionPrincipal
     ) -> BootstrapSocketServer.Admission {
         guard reserveBootstrapSlot(
             connectionID: connectionID,
@@ -4415,7 +4502,8 @@ actor ServerNetworkManager {
                     lifecycleGeneration: admissionLifecycleGeneration,
                     sessionToken: sessionToken,
                     clientPid: clientPid,
-                    clientName: clientName
+                    clientName: clientName,
+                    principal: principal
                 )
             },
             onAcceptAborted: { [self] in
@@ -4433,7 +4521,8 @@ actor ServerNetworkManager {
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
         clientPid: Int,
-        clientName: String?
+        clientName: String?,
+        principal: MCPConnectionPrincipal
     ) async {
         guard let reservation = bootstrapReservations[connectionID],
               reservation.lifecycleGeneration == admissionLifecycleGeneration,
@@ -4482,6 +4571,7 @@ actor ServerNetworkManager {
                 sessionToken: sessionToken,
                 clientPid: clientPid,
                 clientName: clientName,
+                principal: principal,
                 clientFD: committedFD
             )
         } catch {
@@ -4570,6 +4660,7 @@ actor ServerNetworkManager {
             sessionToken: sessionToken,
             clientPid: clientPid,
             clientName: clientName,
+            principal: principal,
             manager: preparedConnection
         ) else {
             if let committedPredecessorRemoval {
@@ -4725,7 +4816,8 @@ actor ServerNetworkManager {
                 lifecycleGeneration: lifecycleGeneration,
                 sessionToken: sessionToken,
                 clientPid: clientPid,
-                clientName: clientName
+                clientName: clientName,
+                principal: .standard
             )
             guard admission.publishTransferredFD?(clientFD) == true else {
                 await rollbackBootstrapReservation(
@@ -4756,6 +4848,7 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
+        principal _: MCPConnectionPrincipal,
         clientFD: Int32
     ) throws -> BootstrapSocketConnectionManager {
         let purpose = purposeForNewBootstrapConnection(
@@ -4788,6 +4881,7 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientPid: Int,
         clientName: String?,
+        principal: MCPConnectionPrincipal,
         manager: BootstrapSocketConnectionManager
     ) -> Bool {
         guard isRunningState, self.lifecycleGeneration == lifecycleGeneration else {
@@ -4800,6 +4894,7 @@ actor ServerNetworkManager {
             capabilityToken: sessionToken,
             source: .handshake,
             hasHandshake: false,
+            principal: principal,
             lastUpdated: Date()
         )
         identityContextByConnection[connectionID] = identityContext
@@ -5158,6 +5253,19 @@ actor ServerNetworkManager {
 
         Task { [weak self] in
             await self?.startBootstrapSocketServer(lifecycleGeneration: replacementLifecycleGeneration)
+        }
+    }
+
+    /// Broadcasts a `channel_closing` control notification (plan §6.3) to all
+    /// bootstrap-socket clients (including the remote gateway app leg) ahead of a
+    /// full server shutdown, so downstream remote channels can surface a graceful
+    /// close before the transport drops.
+    func broadcastChannelClosing(reason: TerminationReason, message: String? = nil) async {
+        let bootstrapConnections = connections.values.compactMap { $0 as? BootstrapSocketConnectionManager }
+        guard !bootstrapConnections.isEmpty else { return }
+        connectionLog("Broadcasting channel_closing (\(reason.rawValue)) to \(bootstrapConnections.count) bootstrap connection(s)")
+        for connection in bootstrapConnections {
+            await connection.sendChannelClosing(reason: reason, message: message)
         }
     }
 
@@ -7406,6 +7514,7 @@ actor ServerNetworkManager {
                         "client_name": identity?.clientName ?? NSNull(),
                         "source": identity?.source.rawValue ?? "unknown",
                         "has_handshake": identity?.hasHandshake ?? false,
+                        "principal": identity?.principal.rawValue ?? MCPConnectionPrincipal.standard.rawValue,
                         "session_key_present": identity?.capabilityToken != nil,
                         "session_fingerprint": debugSessionFingerprint(forToken: identity?.capabilityToken) ?? NSNull()
                     ] as [String: Any]
@@ -8541,6 +8650,34 @@ actor ServerNetworkManager {
                 connectionIDBySessionToken[sessionToken]
             }
 
+            func debugSetGatewayLaunchCredentialForTesting(_ credential: String?) {
+                setGatewayLaunchCredential(credential)
+            }
+
+            func debugGatewayPrincipalDecisionForTesting(gatewayCredential: String?) -> MCPConnectionPrincipal? {
+                let decision = gatewayPrincipalDecision(forCredential: gatewayCredential)
+                return decision == .invalid ? nil : decision.principal
+            }
+
+            func debugInstallIdentityContextForTesting(
+                connectionID: UUID,
+                clientName: String?,
+                principal: MCPConnectionPrincipal
+            ) {
+                identityContextByConnection[connectionID] = ConnectionIdentityContext(
+                    clientName: clientName,
+                    capabilityToken: "debug-\(connectionID.uuidString)",
+                    source: .handshake,
+                    hasHandshake: true,
+                    principal: principal,
+                    lastUpdated: Date()
+                )
+            }
+
+            func debugConnectionPrincipalForTesting(_ connectionID: UUID) -> MCPConnectionPrincipal? {
+                identityContextByConnection[connectionID]?.principal
+            }
+
             func debugSetAfterDirectAdmissionPendingPublishedForTesting(
                 _ handler: (@Sendable (UUID) async -> Void)?
             ) {
@@ -8803,6 +8940,17 @@ actor ServerNetworkManager {
                         gitReadLimit: gitReadLimiterLimit(for: connectionID),
                         fileSearchLimit: fileSearchLimiterLimit(for: connectionID)
                     )
+                }
+            }
+
+            func debugSetConnectionWindowCountAtConnectionTimeForTesting(
+                connectionID: UUID,
+                count: Int?
+            ) {
+                if let count {
+                    windowCountAtConnectionTime[connectionID] = count
+                } else {
+                    windowCountAtConnectionTime.removeValue(forKey: connectionID)
                 }
             }
 
@@ -9210,6 +9358,10 @@ actor ServerNetworkManager {
         }
 
         guard let clientName = clientIdentifier(forConnection: connectionID) else { return false }
+        guard !isGatewayPrincipalConnection(connectionID) else {
+            mcpPolicyLog("skipping persisted policy hydration for gateway-principal connection=\(connectionID) reason=\(reason) client=\(clientName)")
+            return false
+        }
         let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
         if let liveAffinity = preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
             guard shouldAllowPersistedAgentModeRestore(clientName: clientName, purpose: liveAffinity.purpose) else {
@@ -9269,6 +9421,11 @@ actor ServerNetworkManager {
         } else {
             mcpRoutingLog("No pending policy for client=\(clientName) connectionID=\(connectionID)")
             mcpPolicyLog("no pending policy client=\(clientName) connection=\(connectionID)")
+        }
+
+        guard !isGatewayPrincipalConnection(connectionID) else {
+            mcpRoutingLog("Skipping routing fallback for gateway-principal connection=\(connectionID) client=\(clientName)")
+            return
         }
 
         let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
@@ -10829,6 +10986,7 @@ actor ServerNetworkManager {
                                     let existingMapping = bypassWindowRouting ? nil : await self.connectionWindowMap[connectionID]
                                     chosenID = bypassWindowRouting ? nil : capturedPreResolvedWindowID
                                     let preassigned = await self.preassignedConnections.contains(connectionID)
+                                    let isGatewayPrincipal = bypassWindowRouting ? false : await self.isGatewayPrincipalConnection(connectionID)
                                     if let cid = existingMapping {
                                         mcpRoutingLog("Tool=\(toolName) conn=\(connectionID) has existingWindow=\(cid) preassigned=\(preassigned)")
                                     }
@@ -10853,8 +11011,12 @@ actor ServerNetworkManager {
 
                                         chosenID = requestedWindowID
                                         if existingMapping == nil {
-                                            await self.setConnectionWindowMapping(connectionID, windowID: requestedWindowID)
-                                            connectionLog("Tool call: bound unassigned connection \(connectionID) to window \(requestedWindowID) via _windowID")
+                                            if isGatewayPrincipal {
+                                                connectionLog("Tool call: routed gateway connection \(connectionID) to window \(requestedWindowID) via one-shot _windowID (default binding unchanged)")
+                                            } else {
+                                                await self.setConnectionWindowMapping(connectionID, windowID: requestedWindowID)
+                                                connectionLog("Tool call: bound unassigned connection \(connectionID) to window \(requestedWindowID) via _windowID")
+                                            }
                                         } else if let prev = existingMapping, prev != requestedWindowID {
                                             connectionLog("Tool call: applying per-call _windowID override \(prev) → \(requestedWindowID) for connection \(connectionID) (default binding unchanged)")
                                         } else {
@@ -10872,6 +11034,7 @@ actor ServerNetworkManager {
 
                                     // PRIORITY 2: Use clientName to find existing window assignment (for same client, new connection)
                                     if !bypassWindowRouting,
+                                       !isGatewayPrincipal,
                                        chosenID == nil,
                                        let clientName = await self.clientIdentifier(forConnection: connectionID),
                                        let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName)
@@ -10883,6 +11046,7 @@ actor ServerNetworkManager {
 
                                     // PRIORITY 2b: Same-process live run affinity, then persisted window affinity.
                                     if !bypassWindowRouting,
+                                       !isGatewayPrincipal,
                                        chosenID == nil,
                                        let clientName = await self.clientIdentifier(forConnection: connectionID)
                                     {
@@ -10908,7 +11072,10 @@ actor ServerNetworkManager {
 
                                     // PRIORITY 3: Auto-route to active window when:
                                     // - Currently in single-window mode, OR
-                                    // - Connection was established during single-window mode (stays bound even when more windows open)
+                                    // - Non-gateway connection was established during single-window mode (stays bound even when more windows open)
+                                    // Gateway-principal connections may use the current single-window route per call, but
+                                    // must not seed a default mapping or keep using single-window-at-connect after a
+                                    // second window appears; otherwise AppLink binding probes report false `.bound`.
                                     let connectedDuringSingleWindow: Bool
                                     if let recordedWindowCount = await self.windowCountAtConnectionTime[connectionID] {
                                         connectedDuringSingleWindow = recordedWindowCount == 1
@@ -10920,7 +11087,7 @@ actor ServerNetworkManager {
                                     }
                                     let shouldAutoRouteToActiveWindow = !bypassWindowRouting
                                         && chosenID == nil
-                                        && (!multiWindowModeEffective || connectedDuringSingleWindow)
+                                        && (!multiWindowModeEffective || (connectedDuringSingleWindow && !isGatewayPrincipal))
                                     if shouldAutoRouteToActiveWindow {
                                         // Find the window with active MCP tools
                                         let activeWindowID = await WindowStatesManager.shared.firstMCPEnabledWindow()?.windowID
@@ -10930,8 +11097,12 @@ actor ServerNetworkManager {
                                                 : "no policy"
                                             mcpRoutingLog("Auto-routing conn=\(connectionID) to active window=\(activeID) (\(reason))")
                                             chosenID = activeID
-                                            // Store the mapping for this connection
-                                            await self.setConnectionWindowMapping(connectionID, windowID: activeID)
+                                            if isGatewayPrincipal {
+                                                connectionLog("Tool call: routed gateway connection \(connectionID) to window \(activeID) via PRIORITY 3 \(reason) (default binding unchanged)")
+                                            } else {
+                                                // Store the mapping for ordinary clients.
+                                                await self.setConnectionWindowMapping(connectionID, windowID: activeID)
+                                            }
                                         }
                                     }
 
@@ -11660,6 +11831,14 @@ actor ServerNetworkManager {
                                             explicitWindowID: capturedWindowID,
                                             authorization: dispatchAuthorization
                                         )
+                                        #if DEBUG
+                                            if let explicitWindowRoutingHint {
+                                                assert(
+                                                    explicitWindowRoutingHint.windowID == ownershipWindowID,
+                                                    "Explicit _windowID routing hint must match the dispatch ownership window."
+                                                )
+                                            }
+                                        #endif
                                         do {
                                             return try await self.withWindowToolOwnership(
                                                 windowID: ownershipWindowID,
@@ -11671,11 +11850,16 @@ actor ServerNetworkManager {
                                             ) {
                                                 try await Self.$currentToolDispatchAuthorization.withValue(dispatchAuthorization) {
                                                     let value = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
-                                                        try await EditFlowPerf.measure(
-                                                            EditFlowPerf.Stage.MCPToolCall.dispatch,
-                                                            EditFlowPerf.Dimensions(toolName: toolName)
-                                                        ) {
-                                                            try await dispatchResolvedProvider(resolvedOperation)
+                                                        // A non-nil hint is built only from dispatch authorization captured for
+                                                        // ownershipWindowID, so hint.windowID == ownershipWindowID by construction.
+                                                        // Keep the effective-window override nil for non-explicit calls.
+                                                        try await Self.$currentEffectiveWindowID.withValue(explicitWindowRoutingHint?.windowID) {
+                                                            try await EditFlowPerf.measure(
+                                                                EditFlowPerf.Stage.MCPToolCall.dispatch,
+                                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                                            ) {
+                                                                try await dispatchResolvedProvider(resolvedOperation)
+                                                            }
                                                         }
                                                     }
                                                     releaseResourceAdmissionLeases(outcome: "provider_success")
@@ -12114,6 +12298,7 @@ actor ServerNetworkManager {
                 capabilityToken: ctx.capabilityToken,
                 source: source,
                 hasHandshake: ctx.hasHandshake,
+                principal: ctx.principal,
                 lastUpdated: ctx.lastUpdated
             )
         }.sorted { $0.lastUpdated < $1.lastUpdated }
@@ -12135,6 +12320,7 @@ actor ServerNetworkManager {
             capabilityToken: ctx.capabilityToken,
             source: source,
             hasHandshake: ctx.hasHandshake,
+            principal: ctx.principal,
             lastUpdated: ctx.lastUpdated
         )
     }

@@ -1989,7 +1989,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let newWorkspace = createWorkspace(
             name: workspaceName,
-            repoPaths: creationDraft.selectedRepoPaths
+            repoPaths: creationDraft.selectedRepoPaths,
+            defaultRemoteHostID: creationDraft.defaultRemoteHostID
         )
         creationDraft = WorkspaceCreationDraft()
         return newWorkspace
@@ -1998,13 +1999,23 @@ class WorkspaceManagerViewModel: ObservableObject {
     struct WorkspaceCreationDraft {
         var name: String = ""
         var selectedRepoPaths: [String] = []
+        var defaultRemoteHostID: String?
     }
 
     // MARK: - CREATE
 
     @discardableResult
-    func createWorkspace(name: String, repoPaths: [String], ephemeral: Bool = false) -> WorkspaceModel {
-        var newWorkspace = WorkspaceModel(name: name, repoPaths: repoPaths)
+    func createWorkspace(
+        name: String,
+        repoPaths: [String],
+        ephemeral: Bool = false,
+        defaultRemoteHostID: String? = nil
+    ) -> WorkspaceModel {
+        var newWorkspace = WorkspaceModel(
+            name: name,
+            repoPaths: repoPaths,
+            defaultRemoteHostID: defaultRemoteHostID
+        )
 
         // Mark as ephemeral if needed
         newWorkspace.isEphemeral = ephemeral
@@ -5842,6 +5853,34 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             } catch {
                 print("Error saving renamed workspace: \(error)")
+            }
+        }
+    }
+
+    func setWorkspaceDefaultRemoteHost(_ workspace: WorkspaceModel, hostID: String?) {
+        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }),
+              workspaces[index].defaultRemoteHostID != hostID
+        else { return }
+        workspaces[index].defaultRemoteHostID = hostID
+        workspaces[index].dateModified = Date()
+        let workspaceToSave = workspaces[index]
+
+        Task {
+            do {
+                let finalURL = try await saveWorkspaceToFileAsync(
+                    workspaceToSave,
+                    source: .setWorkspaceDefaultRemoteHost
+                )
+                await WorkspaceDiskWriter.shared.flush(url: finalURL)
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: .workspaceListDidChange,
+                        object: nil,
+                        userInfo: ["managerID": instanceID]
+                    )
+                }
+            } catch {
+                print("Error saving workspace run location: \(error)")
             }
         }
     }

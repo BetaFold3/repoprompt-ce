@@ -340,6 +340,7 @@ extension AgentModeViewModel {
             tabMetadataSignatures: tabMetadataSignatures,
             sessionSignatures: signatures,
             sessionIndex: ownerValidatedSessionIndex,
+            pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareIDForSidebar(),
             sessionListSortDates: ownerValidatedSessionListSortDates,
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID
         )

@@ -1,8 +1,16 @@
 import Foundation
+import RepoPromptRemoteWire
 
 enum AppDeepLinkURLScheme {
-    static let canonical = "repoprompt-ce"
+    static var canonical: String {
+        RemoteControlBuildIdentity.current.urlScheme
+    }
+
     static let legacy = "repoprompt"
+
+    static func canonical(for channel: RemoteControlBuildChannel) -> String {
+        channel.urlScheme
+    }
 
     static func isSupported(_ scheme: String?) -> Bool {
         switch scheme?.lowercased() {

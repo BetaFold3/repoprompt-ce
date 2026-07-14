@@ -265,6 +265,7 @@ struct AgentAskUserResponse: Hashable {
 
 struct AgentAskUserInteraction: Identifiable, Hashable {
     let id: UUID
+    let remoteInteractionID: String?
     let title: String?
     let context: String?
     let timeoutSeconds: TimeInterval
@@ -273,6 +274,7 @@ struct AgentAskUserInteraction: Identifiable, Hashable {
 
     init(
         id: UUID = UUID(),
+        remoteInteractionID: String? = nil,
         title: String? = nil,
         context: String? = nil,
         timeoutSeconds: TimeInterval = 300,
@@ -280,6 +282,7 @@ struct AgentAskUserInteraction: Identifiable, Hashable {
         questions: [AgentAskUserQuestion]
     ) {
         self.id = id
+        self.remoteInteractionID = remoteInteractionID
         self.title = title
         self.context = context
         self.timeoutSeconds = timeoutSeconds
@@ -618,6 +621,7 @@ struct AgentRequestUserInputResponse: Hashable {
 
 struct AgentRequestUserInputRequest: Identifiable, Hashable {
     let id: UUID
+    let remoteInteractionID: String?
     let requestID: CodexAppServerRequestID
     let method: String
     let threadID: String
@@ -628,6 +632,7 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
 
     init(
         id: UUID? = nil,
+        remoteInteractionID: String? = nil,
         requestID: CodexAppServerRequestID,
         method: String,
         threadID: String,
@@ -643,6 +648,7 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
             turnID: turnID,
             itemID: itemID
         )
+        self.remoteInteractionID = remoteInteractionID
         self.requestID = requestID
         self.method = method
         self.threadID = threadID
@@ -690,6 +696,7 @@ struct AgentRequestUserInputRequest: Identifiable, Hashable {
 
 struct AgentMCPElicitationRequest: Identifiable, Hashable {
     let id: UUID
+    let remoteInteractionID: String?
     let requestID: CodexAppServerRequestID
     let method: String
     let threadID: String
@@ -707,6 +714,7 @@ struct AgentMCPElicitationRequest: Identifiable, Hashable {
 
     init(
         id: UUID? = nil,
+        remoteInteractionID: String? = nil,
         requestID: CodexAppServerRequestID,
         method: String,
         threadID: String,
@@ -729,6 +737,7 @@ struct AgentMCPElicitationRequest: Identifiable, Hashable {
             turnID: turnID,
             itemID: itemID
         )
+        self.remoteInteractionID = remoteInteractionID
         self.requestID = requestID
         self.method = method
         self.threadID = threadID
@@ -843,6 +852,7 @@ enum AgentApprovalRequestID: Hashable {
     case codex(CodexAppServerRequestID)
     case claudeControl(String)
     case acp(String)
+    case remoteGateway(interactionID: String)
 
     var displayValue: String {
         switch self {
@@ -852,6 +862,8 @@ enum AgentApprovalRequestID: Hashable {
             id
         case let .acp(id):
             id
+        case let .remoteGateway(interactionID):
+            "remote:\(interactionID)"
         }
     }
 }

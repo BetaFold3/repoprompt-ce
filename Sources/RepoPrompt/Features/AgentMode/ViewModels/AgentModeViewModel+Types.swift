@@ -197,6 +197,7 @@ extension AgentModeViewModel {
         let tabMetadataSignatures: [AgentSessionSidebarTabMetadataSignature]
         let sessionSignatures: [AgentSessionSidebarTabSignature]
         let sessionIndex: [UUID: AgentSessionIndexEntry]
+        var pairedDeviceDisplayNameByBareID: [String: String] = [:]
         let sessionListSortDates: [UUID: Date]
         let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
     }
@@ -674,6 +675,10 @@ extension AgentModeViewModel {
         let parentSessionID: UUID?
         let depth: Int
         let isMCPControlled: Bool
+        let remoteHostName: String?
+        let remoteHostAbbreviation: String?
+        let remoteControlDeviceID: String?
+        let remoteControlDeviceDisplayName: String?
         /// Bound-worktree visual identity for this session (Item 10). Nil when
         /// the session has no worktree bindings. Carries the representative
         /// (first) binding when a session is bound to multiple roots.
@@ -705,6 +710,10 @@ extension AgentModeViewModel {
             parentSessionID: UUID?,
             depth: Int,
             isMCPControlled: Bool,
+            remoteHostName: String? = nil,
+            remoteHostAbbreviation: String? = nil,
+            remoteControlDeviceID: String? = nil,
+            remoteControlDeviceDisplayName: String? = nil,
             worktree: AgentWorktreeIndicator? = nil,
             worktreeMergeAttention: AgentWorktreeMergeAttention? = nil,
             threadKey: AgentSidebarThreadKey? = nil,
@@ -725,6 +734,10 @@ extension AgentModeViewModel {
             self.parentSessionID = parentSessionID
             self.depth = depth
             self.isMCPControlled = isMCPControlled
+            self.remoteHostName = remoteHostName
+            self.remoteHostAbbreviation = remoteHostAbbreviation
+            self.remoteControlDeviceID = remoteControlDeviceID
+            self.remoteControlDeviceDisplayName = remoteControlDeviceDisplayName
             self.worktree = worktree
             self.worktreeMergeAttention = worktreeMergeAttention
             self.threadKey = threadKey
@@ -751,7 +764,7 @@ extension AgentModeViewModel {
         let analyticsSnapshot: AgentTranscriptAnalyticsSnapshot
         let sanitizedActivityCount: Int
         let performanceSnapshot: AgentTranscriptPerformanceSnapshot
-        let rawToolResultPayloadRenderRevision: Int
+        let rawToolResultPayloadRenderRevisionByItemID: [UUID: Int]
     }
 
     enum DerivedTranscriptRefreshReason: String {
@@ -838,12 +851,14 @@ extension AgentModeViewModel {
         let imageAttachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
         let initialStartLocation: InitialStartLocation
+        let remoteHost: AgentSessionRemoteHostBinding?
 
         var isEmpty: Bool {
             workflow == nil
                 && imageAttachments.isEmpty
                 && taggedFileAttachments.isEmpty
                 && initialStartLocation == .local
+                && remoteHost == nil
         }
     }
 

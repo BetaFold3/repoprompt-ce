@@ -11,7 +11,7 @@ struct AgentManageMCPToolService {
     let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
-    let restrictDiscoveryToRoleLabels: @MainActor () -> Bool
+    let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
 
     init(
         toolName: String,
@@ -20,8 +20,8 @@ struct AgentManageMCPToolService {
         resolveSpawnSourceTabID: @escaping (_ metadata: RequestMetadata) async -> UUID?,
         resolveSpawnParentSessionID: @escaping (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?,
         bindCurrentRequestToTab: @escaping (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void,
-        restrictDiscoveryToRoleLabels: @escaping @MainActor () -> Bool = {
-            GlobalSettingsStore.shared.restrictMCPAgentDiscoveryToRoleLabels()
+        restrictDiscoveryToRoleLabels: @escaping @MainActor (_ workspaceID: UUID?) -> Bool = { workspaceID in
+            GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
         }
     ) {
         self.toolName = toolName
@@ -50,6 +50,7 @@ struct AgentManageMCPToolService {
         let tabID: UUID?
         let isLive: Bool
         let isMCPOriginated: Bool
+        let origin: AgentSessionOrigin?
         let runStateRaw: String?
         let isEffectivelyActive: Bool
     }
@@ -83,8 +84,9 @@ struct AgentManageMCPToolService {
     private func executeListAgents(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let availability = targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+        let workspaceID = targetWindow.workspaceManager.activeWorkspace?.id
         let rolesOnly = try parseBool(args["roles_only"], name: "roles_only", defaultValue: false)
-        let restrictedDiscovery = restrictDiscoveryToRoleLabels()
+        let restrictedDiscovery = restrictDiscoveryToRoleLabels(workspaceID)
         let omitAgentCatalog = rolesOnly || restrictedDiscovery
         let agents: [Value] = omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability).map { entry -> Value in
             // Flatten all models — each start target becomes its own entry.
@@ -98,18 +100,26 @@ struct AgentManageMCPToolService {
             for model in entry.models {
                 if model.hasMultipleTargets {
                     for target in model.startTargets {
-                        var obj: [String: Value] = [
-                            "model_id": .string(target.selectionID.rawValue),
-                            "name": .string(target.name)
-                        ]
-                        if let effort = target.reasoningEffort {
-                            obj["reasoning_effort"] = .string(effort.rawValue)
-                        }
-                        modelObjects.append(.object(obj))
+                        modelObjects.append(.object(listAgentsModelObject(
+                            agent: entry.agent,
+                            model: model,
+                            target: target,
+                            legacyName: target.name
+                        )))
                     }
+                } else if let target = model.startTargets.first {
+                    modelObjects.append(.object(listAgentsModelObject(
+                        agent: entry.agent,
+                        model: model,
+                        target: target,
+                        legacyName: model.name
+                    )))
                 } else {
                     var obj: [String: Value] = [
-                        "name": .string(model.name)
+                        "name": .string(model.name),
+                        "agent_id": .string(entry.agent.rawValue),
+                        "base_model_id": .string(model.id),
+                        "model_display_name": .string(model.name)
                     ]
                     if let modelID = model.modelID {
                         obj["model_id"] = .string(modelID)
@@ -129,11 +139,11 @@ struct AgentManageMCPToolService {
             }
             return .object(agentObj)
         }
-        // Build task labels with effective global role defaults. These remain
+        // Build task labels with effective workspace/global role defaults. These remain
         // visible even when restricted discovery hides the extra per-agent
         // catalog, because callers need to understand which concrete model each
         // role label resolves to.
-        let taskLabelEntries = MCPAgentRoleDefaultsService.resolutions(availability: availability).map { res -> Value in
+        let taskLabelEntries = MCPAgentRoleDefaultsService.resolutions(availability: availability, workspaceID: workspaceID).map { res -> Value in
             let recommendedID = AgentModelSelectionID(
                 agentRaw: res.recommended.agent.rawValue,
                 modelRaw: res.recommended.modelRaw
@@ -160,13 +170,90 @@ struct AgentManageMCPToolService {
         return .object(result)
     }
 
+    private func listAgentsModelObject(
+        agent: AgentProviderKind,
+        model: AgentModelCatalog.DiscoveryModel,
+        target: AgentModelCatalog.DiscoveryStartTarget,
+        legacyName: String
+    ) -> [String: Value] {
+        var obj: [String: Value] = [
+            "model_id": .string(target.selectionID.rawValue),
+            "name": .string(legacyName),
+            "agent_id": .string(agent.rawValue),
+            "base_model_id": .string(model.id),
+            "model_display_name": .string(model.name),
+            "is_default": .bool(target.isDefault)
+        ]
+        if let effort = listAgentsEffortRaw(agent: agent, modelRaw: target.modelRaw, fallback: target.reasoningEffort) {
+            obj["effort"] = .string(effort)
+            obj["effort_display_name"] = .string(RemoteHostAgentCatalog.displayName(forEffort: effort))
+            obj["reasoning_effort"] = .string(effort)
+        }
+        return obj
+    }
+
+    private func listAgentsEffortRaw(
+        agent: AgentProviderKind,
+        modelRaw: String,
+        fallback: CodexReasoningEffort?
+    ) -> String? {
+        if agent.usesClaudeTooling {
+            return ClaudeModelSpecifier(raw: modelRaw).effortLevel?.rawValue
+        }
+        if agent == .codexExec {
+            return CodexModelSpecifier(raw: modelRaw).reasoningEffort?.rawValue ?? fallback?.rawValue
+        }
+        return fallback?.rawValue
+    }
+
+    /// Host-generated `workspace_mismatch` failure message for workspace-scoped
+    /// `list_sessions`. The gateway has no structured error channel from app
+    /// tools, so `RemoteGatewayRuntimeError.code` normalizes this by sniffing
+    /// the `workspace_mismatch` marker in the message — keep the
+    /// `workspace_mismatch: ` prefix stable. Locked end-to-end by
+    /// `GatewayRuntimeBindingTests.testWorkspaceScopedListSessionsNormalizesRealHostWorkspaceMismatchMessage`.
+    /// (`AgentRunMCPToolService`'s start-path variant carries the same prefix
+    /// with an extra remediation sentence and is not derived from this helper.)
+    nonisolated static func workspaceMismatchMessage(
+        activeWorkspaceName: String,
+        activeWorkspaceID: UUID,
+        requestedWorkspaceID: UUID
+    ) -> String {
+        "workspace_mismatch: the target window's active workspace is '\(activeWorkspaceName)' (\(activeWorkspaceID.uuidString)), not \(requestedWorkspaceID.uuidString)."
+    }
+
     private func executeListSessions(args: [String: Value]) async throws -> Value {
         let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_manage.list_sessions.")
         }
+        if let workspaceIDValue = args["workspace_id"] {
+            let requestedWorkspaceID = try requireNonEmptyString(workspaceIDValue, name: "workspace_id")
+            guard let requestedUUID = UUID(uuidString: requestedWorkspaceID) else {
+                throw MCPError.invalidParams("workspace_id must be a workspace UUID.")
+            }
+            guard workspace.id == requestedUUID else {
+                throw MCPError.invalidParams(
+                    Self.workspaceMismatchMessage(
+                        activeWorkspaceName: workspace.name,
+                        activeWorkspaceID: workspace.id,
+                        requestedWorkspaceID: requestedUUID
+                    )
+                )
+            }
+        }
         let agentModeVM = targetWindow.agentModeViewModel
+        let explicitParentSessionID: UUID?
+        if args["parent_session_id"] != nil {
+            let rawParentSessionID = try requireNonEmptyString(args["parent_session_id"], name: "parent_session_id")
+            guard let parsedParentSessionID = UUID(uuidString: rawParentSessionID) else {
+                throw MCPError.invalidParams("parent_session_id must be a valid UUID.")
+            }
+            explicitParentSessionID = parsedParentSessionID
+        } else {
+            explicitParentSessionID = nil
+        }
         let scopedParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
         let agentFilter = normalizedString(args["agent"])?.lowercased()
         let stateFilter = normalizedString(args["state"])
@@ -185,7 +272,8 @@ struct AgentManageMCPToolService {
                 stateRaw: meta.lastRunState,
                 isLive: false,
                 parentSessionID: meta.parentSessionID,
-                isMCPOriginated: meta.isMCPOriginated
+                isMCPOriginated: meta.isMCPOriginated,
+                origin: meta.origin
             )
         }
 
@@ -200,7 +288,8 @@ struct AgentManageMCPToolService {
                 stateRaw: entry.lastRunStateRaw,
                 isLive: agentModeVM.sessions[entry.tabID] != nil,
                 parentSessionID: entry.parentSessionID,
-                isMCPOriginated: entry.isMCPOriginated
+                isMCPOriginated: entry.isMCPOriginated,
+                origin: entry.origin
             )
         }
 
@@ -217,13 +306,25 @@ struct AgentManageMCPToolService {
                 stateRaw: session.runState.rawValue,
                 isLive: true,
                 parentSessionID: session.parentSessionID,
-                isMCPOriginated: session.isMCPOriginated
+                isMCPOriginated: session.isMCPOriginated,
+                origin: session.origin
             )
         }
 
-        // Scope to direct children when called from agent mode
+        // Scope to direct children when called from agent mode. An explicit
+        // parent_session_id narrows discovery, but it must never widen a
+        // connection-scoped child session: mismatched explicit/scoped parents
+        // are treated as an empty intersection.
         let scoped: [[String: Value]] = {
-            guard let parentID = scopedParentSessionID else { return Array(entriesByID.values) }
+            if let explicitParentSessionID,
+               let scopedParentSessionID,
+               explicitParentSessionID != scopedParentSessionID
+            {
+                return []
+            }
+            guard let parentID = explicitParentSessionID ?? scopedParentSessionID else {
+                return Array(entriesByID.values)
+            }
             return entriesByID.values.filter { object in
                 object["parent_session_id"]?.stringValue == parentID.uuidString
             }
@@ -248,7 +349,11 @@ struct AgentManageMCPToolService {
         }
 
         return .object([
-            "sessions": .array(Array(filtered.prefix(limit)).map(Value.object))
+            "sessions": .array(Array(filtered.prefix(limit)).map(Value.object)),
+            "workspace": .object([
+                "id": .string(workspace.id.uuidString),
+                "name": .string(workspace.name)
+            ])
         ])
     }
 
@@ -268,6 +373,10 @@ struct AgentManageMCPToolService {
             agentModeVM: agentModeVM
         )
         let totalTurns = transcriptInfo.transcript.turns.count
+        var completedTurnCount = completedTurnCount(in: transcriptInfo.transcript)
+        if transcriptInfo.liveRunState?.isActive == true {
+            completedTurnCount = min(completedTurnCount, max(0, totalTurns - 1))
+        }
         let slicedTurns = Array(transcriptInfo.transcript.turns.dropFirst(offset).prefix(limit))
         let slicedTranscript = AgentTranscript(
             version: transcriptInfo.transcript.version,
@@ -282,6 +391,7 @@ struct AgentManageMCPToolService {
             "turn_limit": .int(limit),
             "returned_turn_count": .int(slicedTurns.count),
             "total_turns": .int(totalTurns),
+            "completed_turn_count": .int(completedTurnCount),
             "transcript_xml": .string(
                 AgentTranscriptIO.buildSpartanLogXML(from: slicedTranscript)
             )
@@ -290,6 +400,11 @@ struct AgentManageMCPToolService {
             result["name"] = .string(name)
         }
         return .object(result)
+    }
+
+    private func completedTurnCount(in transcript: AgentTranscript) -> Int {
+        guard let finalTurn = transcript.turns.last else { return 0 }
+        return max(0, transcript.turns.count - 1) + (finalTurn.isCompleted ? 1 : 0)
     }
 
     private func executeExtractHandoff(args: [String: Value]) async throws -> Value {
@@ -424,12 +539,13 @@ struct AgentManageMCPToolService {
         let sourceTabID = await resolveSpawnSourceTabID(metadata)
         try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
         let spawnParentSessionID = await resolveSpawnParentSessionID(metadata, targetWindow)
-        // create_session always creates a new session — default to the global engineer role when model_id is omitted.
+        // create_session always creates a new session — default to the effective engineer role when model_id is omitted.
         // Validate selection before creating a target to avoid phantom sessions on bad model_id.
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
             defaultTaskLabel: .engineer,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: targetWindow.workspaceManager.activeWorkspace?.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
@@ -455,6 +571,7 @@ struct AgentManageMCPToolService {
                 forTabID: target.tabID,
                 sessionID: sessionID,
                 originatingConnectionID: metadata.connectionID,
+                origin: AgentSessionOrigin.fromClientIdentity(metadata.clientName),
                 taskLabelKind: selection.taskLabelKind,
                 startPending: false
             )
@@ -477,7 +594,8 @@ struct AgentManageMCPToolService {
             stateRaw: session.runState.rawValue,
             isLive: true,
             parentSessionID: session.parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin
         ))
     }
 
@@ -497,7 +615,8 @@ struct AgentManageMCPToolService {
         }
         let selection = try AgentMCPSelectionResolver.resolve(
             modelID: normalizedString(args["model_id"]),
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
         )
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
@@ -517,6 +636,7 @@ struct AgentManageMCPToolService {
                     forTabID: target.tabID,
                     sessionID: sessionID,
                     originatingConnectionID: metadata.connectionID,
+                    origin: AgentSessionOrigin.fromClientIdentity(metadata.clientName),
                     taskLabelKind: selection.taskLabelKind,
                     startPending: false
                 )
@@ -553,7 +673,8 @@ struct AgentManageMCPToolService {
             stateRaw: session.runState.rawValue,
             isLive: true,
             parentSessionID: session.parentSessionID,
-            isMCPOriginated: session.isMCPOriginated
+            isMCPOriginated: session.isMCPOriginated,
+            origin: session.origin
         ))
     }
 
@@ -649,6 +770,7 @@ struct AgentManageMCPToolService {
                     tabID: liveSession.tabID,
                     isLive: true,
                     isMCPOriginated: liveSession.isMCPOriginated,
+                    origin: liveSession.origin,
                     runStateRaw: liveSession.runState.rawValue,
                     isEffectivelyActive: isEffectivelyActive
                 )
@@ -660,6 +782,7 @@ struct AgentManageMCPToolService {
                     tabID: indexEntry.tabID,
                     isLive: agentModeVM.sessions[indexEntry.tabID] != nil,
                     isMCPOriginated: indexEntry.isMCPOriginated,
+                    origin: indexEntry.origin,
                     runStateRaw: indexEntry.lastRunStateRaw,
                     isEffectivelyActive: runState?.isActive == true
                 )
@@ -692,6 +815,7 @@ struct AgentManageMCPToolService {
                         tabID: meta.composeTabID,
                         isLive: false,
                         isMCPOriginated: meta.isMCPOriginated,
+                        origin: meta.origin,
                         runStateRaw: meta.lastRunState,
                         isEffectivelyActive: runState?.isActive == true
                     )
@@ -709,7 +833,10 @@ struct AgentManageMCPToolService {
                 continue
             }
 
-            guard candidate.isMCPOriginated else {
+            // Plan §6.4: cleanup eligibility is provenance-scoped — `.mcp` and
+            // `.remote` sessions are eligible, `.user` sessions never are.
+            let candidateOrigin = candidate.origin ?? AgentSessionOrigin(legacyIsMCPOriginated: candidate.isMCPOriginated)
+            guard candidateOrigin.isMCPOriginated else {
                 skippedSessions.append([
                     "session_id": .string(sessionID.uuidString),
                     "name": .string(candidate.name),
@@ -857,7 +984,7 @@ struct AgentManageMCPToolService {
         reference: String,
         workspace: WorkspaceModel,
         agentModeVM: AgentModeViewModel
-    ) async throws -> (sessionID: UUID, name: String?, transcript: AgentTranscript) {
+    ) async throws -> (sessionID: UUID, name: String?, transcript: AgentTranscript, liveRunState: AgentSessionRunState?) {
         let normalizedReference = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         let referenceUUID = UUID(uuidString: normalizedReference)
         if let referenceUUID,
@@ -865,13 +992,25 @@ struct AgentManageMCPToolService {
            let sessionID = liveSession.activeAgentSessionID
         {
             let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
+            if !hydrated.runState.isActive {
+                // Safe on every terminal get_log: canReuseDerivedTranscriptForSave makes this
+                // a no-op when already synchronized.
+                await agentModeVM.ensureDerivedTranscriptCurrentForExport(tabID: liveSession.tabID)
+            }
             let liveName = agentModeVM.sessionIndex[sessionID]?.name
-            return (sessionID, liveName, hydrated.transcript)
+            return (sessionID, liveName, hydrated.transcript, hydrated.runState)
+        }
+        let persistedRunStateRawFromStorage = if let referenceUUID {
+            try? await AgentSessionDataService.shared.rawLastRunStateForAgentSession(id: referenceUUID, for: workspace)
+        } else {
+            String?.none
         }
         guard let persisted = try await AgentSessionDataService.shared.loadAgentSession(reference: reference, for: workspace) else {
             throw MCPError.invalidParams("Session '\(reference)' was not found in the active workspace.")
         }
-        return (persisted.id, persisted.name, persisted.transcript ?? .empty)
+        let persistedRunStateRaw = persistedRunStateRawFromStorage ?? persisted.lastRunState
+        let persistedRunState = persistedRunStateRaw.flatMap(AgentSessionRunState.init(rawValue:))
+        return (persisted.id, persisted.name, persisted.transcript ?? .empty, persistedRunState)
     }
 
     private func resolveHandoffSession(
@@ -947,7 +1086,8 @@ struct AgentManageMCPToolService {
         stateRaw: String?,
         isLive: Bool,
         parentSessionID: UUID? = nil,
-        isMCPOriginated: Bool = false
+        isMCPOriginated: Bool = false,
+        origin: AgentSessionOrigin? = nil
     ) -> [String: Value] {
         let publicState = publicSessionState(raw: stateRaw)
         var obj: [String: Value] = [
@@ -974,6 +1114,9 @@ struct AgentManageMCPToolService {
         }
         if isMCPOriginated {
             obj["is_mcp_originated"] = .bool(true)
+        }
+        if let origin {
+            obj["origin"] = .string(origin.summaryString)
         }
         return obj
     }

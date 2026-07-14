@@ -8,6 +8,7 @@ struct AgentModeView: View {
     let agentModeVM: AgentModeViewModel
     @ObservedObject var promptManager: PromptViewModel
     @ObservedObject private var workspaceManager: WorkspaceManagerViewModel
+    @ObservedObject private var remoteStartPicker: AgentRemoteStartPickerUIStore
 
     @StateObject private var navigationController: AgentModeNavigationController
     @StateObject private var rootsSidebarStore: AgentWorkspaceRootsSidebarStore
@@ -30,6 +31,7 @@ struct AgentModeView: View {
         self.agentModeVM = agentModeVM
         self.promptManager = promptManager
         _workspaceManager = ObservedObject(wrappedValue: windowState.workspaceManager)
+        _remoteStartPicker = ObservedObject(wrappedValue: agentModeVM.ui.remoteStartPicker)
 
         let isSystem = windowState.workspaceManager.activeWorkspace?.isSystemWorkspace ?? true
         _navigationController = StateObject(wrappedValue: AgentModeNavigationController(isSystemWorkspaceMode: isSystem))
@@ -139,6 +141,22 @@ struct AgentModeView: View {
             {
                 toggleAgentSessionSidebar()
             }
+        }
+        .sheet(
+            item: Binding(
+                get: { remoteStartPicker.pending },
+                set: { newValue in
+                    if newValue == nil, remoteStartPicker.pending != nil {
+                        agentModeVM.cancelRemoteStartWindowPicker()
+                    }
+                }
+            )
+        ) { state in
+            RemoteStartWindowPickerSheet(
+                state: state,
+                onSelect: { option in agentModeVM.selectRemoteStartWindow(option) },
+                onCancel: { agentModeVM.cancelRemoteStartWindowPicker() }
+            )
         }
     }
 
@@ -2710,7 +2728,32 @@ struct AgentModeChatDetailView: View {
         let showCancel = showRunScopedToolCancel(for: item, in: block)
         let cancelAction = showCancel ? cancelActiveToolsAction : nil
         let ownerTabID = transcriptSnapshot.presentation.tabID ?? transcriptSnapshot.currentTabID ?? currentTabID
+        let isRemoteSession = ownerTabID.flatMap { agentModeVM.sessions[$0]?.remoteHost } != nil
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
+        let runLocallyInsteadAction: (() -> Void)? = if let ownerTabID,
+                                                        agentModeVM.shouldOfferRunLocallyInstead(
+                                                            tabID: ownerTabID,
+                                                            itemID: item.id
+                                                        )
+        {
+            { [weak agentModeVM] in
+                agentModeVM?.runLocallyInsteadAfterRemoteFailure(tabID: ownerTabID)
+            }
+        } else {
+            nil
+        }
+        let resendUndeliveredAction: (() -> Void)? = if let ownerTabID,
+                                                        agentModeVM.undeliveredPresentation(
+                                                            for: item,
+                                                            tabID: ownerTabID
+                                                        ).resendActionLabel != nil
+        {
+            { [weak agentModeVM] in
+                agentModeVM?.resendUndeliveredRemoteUserTurn(tabID: ownerTabID, itemID: item.id)
+            }
+        } else {
+            nil
+        }
         return AgentMessageBubble(
             item: item,
             isMostRecentEditBubble: item.id == renderContext.mostRecentEditID,
@@ -2729,15 +2772,19 @@ struct AgentModeChatDetailView: View {
                     tabID: ownerTabID
                 ),
                 showRunScopedToolCancel: showCancel,
-                cancelActiveToolsAction: cancelAction
+                cancelActiveToolsAction: cancelAction,
+                isRemoteSession: isRemoteSession
             ),
             promptManager: promptManager,
             handoffConfig: runInteractionSnapshot.canForkCurrentSession ? handoffConfig(for: item.id) : nil,
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
-            rawToolResultPayloadRenderRevision: transcriptSnapshot.presentation.rawToolResultPayloadRenderRevision,
+            rawToolResultPayloadRenderRevision: transcriptSnapshot.presentation
+                .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
             showRunScopedToolCancel: showCancel,
             cancelActiveToolsAction: cancelAction,
-            codexManagedLoginAction: codexManagedLoginAction
+            codexManagedLoginAction: codexManagedLoginAction,
+            runLocallyInsteadAction: runLocallyInsteadAction,
+            resendUndeliveredAction: resendUndeliveredAction
         )
         .id(item.id)
         .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)

@@ -25,6 +25,7 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "ZAIAPI",
                 "ClaudeCompatibleBackend.kimi.apiKey",
                 "ClaudeCompatibleBackend.custom.apiKey",
+                "RemoteGateway.staticToken.v1",
                 "rp.agent.permissions.subagent.v1",
                 "rp.agent.permissions.codex.v1",
                 "rp.agent.permissions.claude.v1",
@@ -32,7 +33,7 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
                 "rp.agent.permissions.cursor.v1"
             ]
         )
-        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 23)
+        XCTAssertEqual(Set(SecureStorageAccountCatalog.allAccounts.map(\.identifier)).count, 24)
     }
 
     func testProviderMappingsUseCatalogAccounts() {
