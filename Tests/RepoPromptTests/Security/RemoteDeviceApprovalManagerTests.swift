@@ -31,7 +31,7 @@ final class RemoteDeviceApprovalManagerTests: XCTestCase {
         XCTAssertNil(manager.pendingRequest)
     }
 
-    func testCancellingActiveApprovalResolvesDeniedAndClearsOverlay() async {
+    func testCancellingActiveApprovalResolvesCancelledAndClearsOverlay() async {
         let manager = RemoteDeviceApprovalManager(bringWindowToFront: { _ in })
         let request = makeRequest(deviceID: "remote:cccc3333")
 
@@ -42,7 +42,7 @@ final class RemoteDeviceApprovalManagerTests: XCTestCase {
 
         task.cancel()
         let result = await task.value
-        XCTAssertEqual(result, .denied)
+        XCTAssertEqual(result, .cancelled)
         await waitUntil { manager.pendingRequest == nil }
         XCTAssertFalse(manager.isApprovalOverlayVisible)
     }
@@ -64,7 +64,7 @@ final class RemoteDeviceApprovalManagerTests: XCTestCase {
 
         queuedTask.cancel()
         let queuedResult = await queuedTask.value
-        XCTAssertEqual(queuedResult, .denied)
+        XCTAssertEqual(queuedResult, .cancelled)
         XCTAssertEqual(manager.pendingRequest?.id, active.id)
         XCTAssertTrue(manager.isApprovalOverlayVisible)
 
@@ -73,14 +73,27 @@ final class RemoteDeviceApprovalManagerTests: XCTestCase {
         XCTAssertEqual(activeResult, .approved(grantedScopes: active.requestedScopes))
     }
 
-    private func makeRequest(deviceID: String) -> RemoteDeviceApprovalRequest {
+    func testClosingTargetWindowResolvesTargetStale() async {
+        let manager = RemoteDeviceApprovalManager(bringWindowToFront: { _ in })
+        let request = makeRequest(deviceID: "remote:ffff6666", windowID: 42)
+        let task = Task { @MainActor in await manager.requestApproval(for: request) }
+        await waitUntil { manager.pendingRequest?.id == request.id }
+
+        manager.cancelPending(forWindowID: 42)
+
+        let result = await task.value
+        XCTAssertEqual(result, .targetStale)
+        XCTAssertNil(manager.pendingRequest)
+    }
+
+    private func makeRequest(deviceID: String, windowID: Int? = nil) -> RemoteDeviceApprovalRequest {
         RemoteDeviceApprovalRequest(
             deviceID: deviceID,
             displayName: "Device \(deviceID.suffix(4))",
             devicePublicKeyFingerprint: "sha256:\(String(repeating: "a", count: 64))",
             requestedScopes: [.sessionsObserve, .interactionsRespond],
             hostFingerprint: "sha256:\(String(repeating: "b", count: 64))",
-            windowID: nil
+            windowID: windowID
         )
     }
 

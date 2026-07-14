@@ -237,7 +237,7 @@ struct MCPSettingsView: View {
     }
 
     private var remoteGatewaySection: some View {
-        RemoteControlSettingsView(windowID: windowID) { message, isError in
+        RemoteControlSettingsView { message, isError in
             showFeedback(message, isError: isError)
         }
     }

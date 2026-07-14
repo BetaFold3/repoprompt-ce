@@ -25,6 +25,7 @@ struct RemotePairingChallenge: Identifiable, Equatable {
     let challenge: String
     let createdAt: Date
     let expiresAt: Date
+    let approvalContext: RemotePairingApprovalContext?
     var consumedAt: Date?
 
     var id: UUID {
@@ -242,14 +243,23 @@ actor RemotePairingChallengeStore {
         self.challengeGenerator = challengeGenerator
     }
 
-    func issue(now: Date = Date(), ttl: TimeInterval = RemotePairingCrypto.maximumPairingChallengeTTL) throws -> RemotePairingChallenge {
+    func issue(
+        now: Date = Date(),
+        ttl: TimeInterval = RemotePairingCrypto.maximumPairingChallengeTTL,
+        approvalContext: RemotePairingApprovalContext? = nil,
+        expiresAtLimit: Date? = nil
+    ) throws -> RemotePairingChallenge {
         prune(now: now)
         let resolvedTTL = min(max(ttl, 1), RemotePairingCrypto.maximumPairingChallengeTTL)
+        let requestedExpiration = now.addingTimeInterval(resolvedTTL)
+        let expiresAt = expiresAtLimit.map { min(requestedExpiration, $0) } ?? requestedExpiration
+        guard expiresAt > now else { throw RemotePairingCryptoError.expiredChallenge }
         let challenge = try RemotePairingChallenge(
             pairingID: UUID(),
             challenge: challengeGenerator(),
             createdAt: now,
-            expiresAt: now.addingTimeInterval(resolvedTTL),
+            expiresAt: expiresAt,
+            approvalContext: approvalContext,
             consumedAt: nil
         )
         challenges[challenge.pairingID] = challenge

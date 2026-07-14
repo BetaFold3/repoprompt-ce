@@ -176,6 +176,7 @@ for key, value in {
     "__BUNDLE_ID__": bundle_id,
     "__MARKETING_VERSION__": version,
     "__BUILD_NUMBER__": build,
+    "__URL_SCHEME__": "repoprompt-ce",
     "__DEBUG_SECURE_STORAGE_BACKEND__": "alternate-in-memory",
     "__SIGNING_MODE__": "release-candidate-adhoc",
     "__LOCAL_SIGNING_CERTIFICATE_SHA256__": "",

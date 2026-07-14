@@ -15,11 +15,11 @@ protocol RemoteHostConnectionHTTPTransport: Sendable {
     ) async throws -> RemoteHostConnectionHTTPResponse
 }
 
-struct URLSessionRemoteHostConnectionHTTPTransport: RemoteHostConnectionHTTPTransport, @unchecked Sendable {
-    var session: URLSession
+struct URLSessionRemoteHostConnectionHTTPTransport: RemoteHostConnectionHTTPTransport {
+    private let client: RemoteHostHTTPClient
 
-    init(session: URLSession = .shared) {
-        self.session = session
+    init(session: URLSession? = nil) {
+        client = session.map(RemoteHostHTTPClient.init(session:)) ?? .shared
     }
 
     func postJSON(
@@ -27,18 +27,13 @@ struct URLSessionRemoteHostConnectionHTTPTransport: RemoteHostConnectionHTTPTran
         body: [String: JSONValue],
         timeout: TimeInterval
     ) async throws -> RemoteHostConnectionHTTPResponse {
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = timeout
-        request.httpBody = try JSONEncoder().encode(JSONValue.object(body))
-
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw RemoteClientError.transport("Ticket endpoint returned a non-HTTP response.")
-        }
-        return RemoteHostConnectionHTTPResponse(statusCode: httpResponse.statusCode, data: data)
+        let response = try await client.postJSON(
+            to: url,
+            body: RemoteWireProtocol.canonicalData(for: .object(body)),
+            timeout: timeout,
+            maximumResponseBytes: 256 * 1024
+        )
+        return RemoteHostConnectionHTTPResponse(statusCode: response.statusCode, data: response.body)
     }
 }
 
@@ -389,7 +384,12 @@ actor RemoteHostConnection {
             deviceID: ticket.deviceID,
             lastCounter: counterFloor(for: record)
         )
-        let webSocketURL = try Self.webSocketURL(for: record.gatewayURL)
+        let webSocketURL: URL
+        do {
+            webSocketURL = try RemoteGatewayOrigin(record.gatewayURL).webSocketEndpoint()
+        } catch {
+            throw RemoteClientError.protocolViolation("Gateway URL is not a normalized root origin.")
+        }
         acknowledgedSubscriptions.removeAll()
         let task = webSocketSession.webSocketTask(with: webSocketURL)
         transition(to: .connecting)
@@ -466,7 +466,7 @@ actor RemoteHostConnection {
         let response: RemoteHostConnectionHTTPResponse
         do {
             response = try await httpTransport.postJSON(
-                to: Self.endpoint(base: record.gatewayURL, pathComponents: ["api", "ticket"]),
+                to: RemoteGatewayOrigin(record.gatewayURL).endpoint(path: "/api/ticket"),
                 body: [
                     "device_id": .string(record.deviceID),
                     "scopes": .array(record.grantedScopes.sorted().map(JSONValue.string)),
@@ -1000,37 +1000,6 @@ actor RemoteHostConnection {
         let reason = object["reason"]?.stringValue ?? "channel_closing"
         let message = object["message"]?.stringValue ?? reason
         return RemoteClientError.fromCommandError(code: reason, message: message, details: frame.payload)
-    }
-
-    private static func endpoint(base: URL, pathComponents: [String]) -> URL {
-        pathComponents.reduce(base) { url, component in
-            url.appendingPathComponent(component, isDirectory: false)
-        }
-    }
-
-    private static func webSocketURL(for gatewayURL: URL) throws -> URL {
-        guard var components = URLComponents(url: gatewayURL, resolvingAgainstBaseURL: false),
-              let scheme = components.scheme?.lowercased()
-        else {
-            throw RemoteClientError.protocolViolation("Gateway URL is invalid.")
-        }
-        switch scheme {
-        case "http":
-            components.scheme = "ws"
-        case "https":
-            components.scheme = "wss"
-        case "ws", "wss":
-            break
-        default:
-            throw RemoteClientError.protocolViolation("Gateway URL must use http or https.")
-        }
-        let trimmedPath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        components.percentEncodedPath = trimmedPath.isEmpty ? "/ws" : "/\(trimmedPath)/ws"
-        components.percentEncodedQuery = nil
-        guard let url = components.url else {
-            throw RemoteClientError.protocolViolation("Could not build gateway WebSocket URL.")
-        }
-        return url
     }
 
     private static func makeRequestID(prefix: String) -> String {

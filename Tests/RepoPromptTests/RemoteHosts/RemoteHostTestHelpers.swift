@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptRemoteWire
 import XCTest
 
 final class InMemoryRemoteClientKeychain: RemoteClientKeychainStoring, @unchecked Sendable {
@@ -92,11 +93,11 @@ enum RemoteHostTestSupport {
         hostName: String? = "Studio"
     ) throws -> RemotePairingPayload {
         try RemotePairingPayload(
-            windowID: 7,
-            gatewayURL: gatewayURL,
+            gatewayOrigin: RemoteGatewayOrigin(gatewayURL),
             hostPublicKey: hostSigner.publicKey.rawRepresentation,
             hostFingerprint: RemotePairingCrypto.fingerprint(for: hostSigner.publicKey),
-            hostName: hostName
+            hostName: hostName,
+            approvalContext: "test-approval-context"
         )
     }
 

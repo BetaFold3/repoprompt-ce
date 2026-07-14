@@ -88,6 +88,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App` in the `RepoPromptApp` target.
 - Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support`, owned by `RepoPromptApp`, unless `Package.swift` is updated in the same change.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
+- Native Remote Control host discovery/client transport and persistence belong under `Infrastructure/RemoteHosts`; app-owned pairing keys, discovery authority, and approval routing belong under `Infrastructure/Security/RemotePairing`; gateway admission/relay stays in `RepoPromptGateway`; shared signed discovery wire DTOs stay in `RepoPromptRemoteWire`; onboarding presentation stays under `Features/Settings`.
 - Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
 - New generic extensions/helpers should prefer a narrow feature or infrastructure owner first; otherwise use `Sources/RepoPrompt/Infrastructure/Utilities`.

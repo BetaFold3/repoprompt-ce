@@ -28,13 +28,12 @@ protocol RemoteHostsPairingClientProtocol {
 
 extension RemoteHostPairingClient: RemoteHostsPairingClientProtocol {}
 
-struct RemoteHostsSettingsPairingPreview: Equatable {
-    var displayName: String
-    var gatewayURLString: String
-    var hostFingerprint: String
-    var hostFingerprintShort: String
-    var hostPublicKeyBase64: String
+protocol RemoteHostsDiscovering: Sendable {
+    func search() async throws -> RemoteHostDiscoveryResult
+    func revalidateForPairing(_ selected: VerifiedRemoteHostCandidate) async throws -> RemotePairingPayload
 }
+
+extension RemoteHostDiscoveryService: RemoteHostsDiscovering {}
 
 struct RemoteHostsSettingsScopeRow: Identifiable, Equatable {
     var id: String {
@@ -90,9 +89,21 @@ struct RemoteHostsSettingsHostRow: Identifiable, Equatable {
     }
 }
 
+enum RemoteHostsSettingsDiscoveryState: Equatable {
+    case idle
+    case searching
+    case noHosts(RemoteHostDiscoveryDiagnostics)
+    case results(RemoteHostDiscoveryDiagnostics)
+    case failed(message: String)
+
+    var isSearching: Bool {
+        if case .searching = self { return true }
+        return false
+    }
+}
+
 enum RemoteHostsSettingsPairingState: Equatable {
     case idle
-    case ready
     case waitingForApproval(hostName: String)
     case paired(hostName: String)
     case failed(message: String)
@@ -106,9 +117,8 @@ enum RemoteHostsSettingsPairingState: Equatable {
 @MainActor
 final class RemoteHostsSettingsViewModel: ObservableObject {
     @Published private(set) var hostRows: [RemoteHostsSettingsHostRow] = []
-    @Published var pairingPayloadText: String = ""
-    @Published var gatewayURLString: String = ""
-    @Published private(set) var pairingPreview: RemoteHostsSettingsPairingPreview?
+    @Published private(set) var discoveredHosts: [VerifiedRemoteHostCandidate] = []
+    @Published private(set) var discoveryState: RemoteHostsSettingsDiscoveryState = .idle
     @Published private(set) var pairingState: RemoteHostsSettingsPairingState = .idle
     @Published private(set) var errorMessage: String?
     @Published private(set) var statusMessage: String?
@@ -117,15 +127,18 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
     private let registry: RemoteHostsRegistryManaging
     private let keyStore: RemoteHostsClientKeyDeleting
     private let pairingClient: any RemoteHostsPairingClientProtocol
+    private let discoveryService: any RemoteHostsDiscovering
     private let connectionTester: (any RemoteHostsConnectionTesting)?
     private let connectionManagerProvider: @MainActor () -> any RemoteHostsConnectionManaging
     private let clientDisplayName: @MainActor () -> String
-    private var parsedPayload: RemotePairingPayload?
+    private var discoveryTask: Task<Void, Never>?
+    private var discoveryGeneration = 0
 
     init(
         registry: RemoteHostsRegistryManaging = RemoteHostRegistry.shared,
         keyStore: RemoteHostsClientKeyDeleting = RemoteClientKeyStore.shared,
         pairingClient: any RemoteHostsPairingClientProtocol = RemoteHostPairingClient(),
+        discoveryService: any RemoteHostsDiscovering = RemoteHostDiscoveryService(),
         connectionTester: (any RemoteHostsConnectionTesting)? = nil,
         connectionManager: (any RemoteHostsConnectionManaging)? = nil,
         clientDisplayName: @escaping @MainActor () -> String = RemoteHostsSettingsViewModel.defaultClientDisplayName
@@ -133,6 +146,7 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         self.registry = registry
         self.keyStore = keyStore
         self.pairingClient = pairingClient
+        self.discoveryService = discoveryService
         self.connectionTester = connectionTester
         if let connectionManager {
             connectionManagerProvider = { connectionManager }
@@ -143,19 +157,12 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         refreshHosts()
     }
 
-    var hasHosts: Bool {
-        !hostRows.isEmpty
+    deinit {
+        discoveryTask?.cancel()
     }
 
-    var canPair: Bool {
-        guard parsedPayload != nil,
-              !pairingState.isPairing,
-              let url = URL(string: gatewayURLString),
-              RemoteHostRegistry.isValidGatewayURL(url)
-        else {
-            return false
-        }
-        return true
+    var hasHosts: Bool {
+        !hostRows.isEmpty
     }
 
     func refreshHosts() {
@@ -168,76 +175,54 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         }
     }
 
-    func isTestingConnection(hostID: String) -> Bool {
-        testingConnectionHostIDs.contains(hostID)
-    }
-
-    func resetPairing() {
-        pairingPayloadText = ""
-        gatewayURLString = ""
-        pairingPreview = nil
-        parsedPayload = nil
+    func findHosts() {
+        cancelDiscovery(resetState: false)
+        discoveryGeneration += 1
+        let generation = discoveryGeneration
+        discoveredHosts = []
+        discoveryState = .searching
         pairingState = .idle
-        statusMessage = nil
         errorMessage = nil
-    }
-
-    func parsePairingPayloadText() {
-        let trimmed = pairingPayloadText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            parsedPayload = nil
-            pairingPreview = nil
-            gatewayURLString = ""
-            pairingState = .idle
-            errorMessage = nil
-            return
-        }
-
-        do {
-            let payload = try RemotePairingPayload.parse(trimmed)
-            parsedPayload = payload
-            gatewayURLString = payload.gatewayURL.absoluteString
-            pairingPreview = RemoteHostsSettingsPairingPreview(
-                displayName: payload.hostDisplayName,
-                gatewayURLString: payload.gatewayURL.absoluteString,
-                hostFingerprint: payload.hostFingerprint,
-                hostFingerprintShort: payload.fingerprintShort,
-                hostPublicKeyBase64: payload.hostPublicKey.base64EncodedString()
-            )
-            pairingState = .ready
-            errorMessage = nil
-        } catch {
-            parsedPayload = nil
-            pairingPreview = nil
-            gatewayURLString = ""
-            pairingState = .failed(message: Self.message(for: error))
-            errorMessage = Self.message(for: error)
-        }
-    }
-
-    func pairCurrentPayload() async {
-        guard let parsedPayload else {
-            parsePairingPayloadText()
-            if parsedPayload == nil, errorMessage == nil {
-                let message = "Paste a remote pairing payload first."
-                pairingState = .failed(message: message)
+        statusMessage = "Searching your tailnet for RepoPrompt hosts…"
+        discoveryTask = Task { [weak self, discoveryService] in
+            do {
+                let result = try await discoveryService.search()
+                guard !Task.isCancelled, let self, generation == discoveryGeneration else { return }
+                discoveredHosts = result.hosts
+                discoveryState = result.hosts.isEmpty ? .noHosts(result.diagnostics) : .results(result.diagnostics)
+                statusMessage = result.hosts.isEmpty
+                    ? "No signed RepoPrompt hosts responded."
+                    : "Found \(result.hosts.count) RepoPrompt host\(result.hosts.count == 1 ? "" : "s")."
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self, generation == discoveryGeneration else { return }
+                let message = Self.message(for: error)
+                discoveryState = .failed(message: message)
+                statusMessage = nil
                 errorMessage = message
             }
-            return
         }
-        guard let gatewayURL = URL(string: gatewayURLString), RemoteHostRegistry.isValidGatewayURL(gatewayURL) else {
-            let message = "Enter a valid http or https gateway URL before pairing."
-            pairingState = .failed(message: message)
-            errorMessage = message
-            return
-        }
+    }
 
+    func cancelDiscovery(resetState: Bool = true) {
+        discoveryTask?.cancel()
+        discoveryTask = nil
+        discoveryGeneration += 1
+        if resetState, discoveryState.isSearching {
+            discoveryState = .idle
+            statusMessage = nil
+        }
+    }
+
+    func requestAccess(to selected: VerifiedRemoteHostCandidate) async {
+        guard !pairingState.isPairing else { return }
+        cancelDiscovery(resetState: false)
+        pairingState = .waitingForApproval(hostName: selected.signedHostName)
+        errorMessage = nil
+        statusMessage = "Waiting for approval on \(selected.signedHostName)…"
         do {
-            let payload = try parsedPayload.withGatewayURL(gatewayURL)
-            pairingState = .waitingForApproval(hostName: payload.hostDisplayName)
-            errorMessage = nil
-            statusMessage = "Waiting for approval on \(payload.hostDisplayName)…"
-
+            let payload = try await discoveryService.revalidateForPairing(selected)
             let record = try await pairingClient.pair(
                 payload: payload,
                 displayName: clientDisplayName(),
@@ -245,14 +230,19 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
             )
             try registry.upsertHost(record)
             refreshHosts()
-            statusMessage = "Paired \(record.displayName)."
+            discoveredHosts.removeAll { $0.hostFingerprint == record.id }
             pairingState = .paired(hostName: record.displayName)
+            statusMessage = "Paired \(record.displayName)."
         } catch {
             let message = Self.message(for: error)
             pairingState = .failed(message: message)
             statusMessage = nil
             errorMessage = message
         }
+    }
+
+    func isTestingConnection(hostID: String) -> Bool {
+        testingConnectionHostIDs.contains(hostID)
     }
 
     @discardableResult
@@ -304,10 +294,7 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
         testingConnectionHostIDs.insert(id)
         statusMessage = "Testing remote host connection…"
         errorMessage = nil
-        defer {
-            testingConnectionHostIDs.remove(id)
-        }
-
+        defer { testingConnectionHostIDs.remove(id) }
         do {
             let tester = connectionTester ?? connectionManagerProvider()
             let result = try await tester.testConnection(hostID: id)
@@ -317,7 +304,6 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
                 ? hostName!
                 : (hostRows.first { $0.id == id }?.displayName ?? "remote host")
             statusMessage = "Connected to \(displayName)."
-            errorMessage = nil
             return true
         } catch {
             refreshHosts()
@@ -329,11 +315,7 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
     }
 
     static func defaultClientDisplayName() -> String {
-        let candidates = [
-            Host.current().localizedName,
-            Host.current().name,
-            ProcessInfo.processInfo.hostName
-        ]
+        let candidates = [Host.current().localizedName, Host.current().name, ProcessInfo.processInfo.hostName]
         for candidate in candidates {
             if let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
                 return trimmed
@@ -344,61 +326,39 @@ final class RemoteHostsSettingsViewModel: ObservableObject {
 
     static func message(for error: Error) -> String {
         switch error {
-        case RemotePairingPayloadError.invalidJSON:
-            return "Pairing payload must be valid JSON copied from the host's Remote Control settings."
         case let RemotePairingPayloadError.unsupportedVersion(version):
-            return "Pairing payload version \(version) is not supported."
+            "Pairing payload version \(version) is not supported."
         case RemotePairingPayloadError.invalidKind:
-            return "Pairing payload is not a RepoPrompt remote pairing payload."
+            "Pairing payload is not a RepoPrompt remote pairing payload."
         case let RemotePairingPayloadError.invalidGatewayURL(value):
-            return "Pairing payload gateway URL is invalid: \(value)."
+            "Pairing gateway origin is invalid: \(value)."
         case let RemotePairingPayloadError.invalidHostFingerprint(value):
-            return "Pairing payload host fingerprint is invalid: \(value)."
+            "Pairing host fingerprint is invalid: \(value)."
         case RemotePairingPayloadError.invalidHostPublicKey:
-            return "Pairing payload host public key is invalid."
+            "Pairing host public key is invalid."
         case RemotePairingPayloadError.fingerprintMismatch:
-            return "Pairing payload fingerprint does not match the host public key."
+            "Pairing fingerprint does not match the signed host public key."
+        case RemotePairingPayloadError.missingApprovalContext:
+            "Pairing approval expired; search again."
         case let RemoteHostPairingError.invalidRequest(message):
-            return message
+            message
         case let RemoteHostPairingError.invalidResponse(message):
-            return "Pairing response was invalid: \(message)"
-        case let RemoteHostPairingError.hostIdentityMismatch(message):
-            return message
-        case let RemoteHostPairingError.consentDenied(message):
-            return message
+            "Pairing response was invalid: \(message)"
+        case let RemoteHostPairingError.hostIdentityMismatch(message),
+             let RemoteHostPairingError.consentDenied(message):
+            message
         case RemoteHostPairingError.timeout:
-            return "Timed out contacting the host's gateway."
+            "Timed out contacting the host gateway."
         case let RemoteHostPairingError.completionUnconfirmed(reason):
-            return "Pairing wasn't confirmed: \(reason). The host may have already added this device. It's safe to retry — this Mac kept its device key — or you can revoke the device in the host's Remote Control settings."
+            "Pairing was not confirmed: \(reason). It is safe to search and retry."
         case let RemoteHostPairingError.httpError(statusCode, code, message):
-            let suffix = message ?? code ?? "HTTP \(statusCode)"
-            return "Pairing failed: \(suffix)."
+            "Pairing failed: \(message ?? code ?? "HTTP \(statusCode)")."
         case let RemoteHostPairingError.transport(message):
-            return "Pairing transport failed: \(message)"
-        case let RemoteHostRegistryError.hostNotFound(id):
-            return "Remote host not found: \(id)."
-        case RemoteHostRegistryError.missing:
-            return "Remote hosts registry is missing."
-        case RemoteHostRegistryError.notRegularFile,
-             RemoteHostRegistryError.wrongOwner,
-             RemoteHostRegistryError.insecurePermissions,
-             RemoteHostRegistryError.unreadable,
-             RemoteHostRegistryError.invalidRegistry:
-            return "Remote hosts registry failed validation."
-        case let RemoteHostRegistryError.writeFailed(message):
-            return "Failed to save remote hosts: \(message)"
-        case let RemoteClientKeyStoreError.invalidHostID(id):
-            return "Remote host fingerprint is invalid: \(id)."
-        case let RemoteClientKeyStoreError.missingKey(id):
-            return "No device key was found for remote host \(id)."
-        case RemoteClientKeyStoreError.invalidPrivateKey:
-            return "Stored remote host device key is invalid."
-        case let RemoteClientKeyStoreError.keychainUnavailable(message):
-            return "Remote host device keychain is unavailable: \(message)"
-        case let remoteError as RemoteClientError:
-            return remoteError.errorDescription ?? "Remote host connection failed."
+            "Pairing transport failed: \(message)"
+        case let localized as LocalizedError:
+            localized.errorDescription ?? error.localizedDescription
         default:
-            return error.localizedDescription
+            error.localizedDescription
         }
     }
 }

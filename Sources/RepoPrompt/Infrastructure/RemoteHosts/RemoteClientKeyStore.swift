@@ -19,7 +19,9 @@ enum RemoteClientKeyStoreError: Error, Equatable {
 final class RemoteClientKeyStore: @unchecked Sendable {
     static let shared = RemoteClientKeyStore()
 
-    static let accountPrefix = "remote-client-device-key-v1-"
+    static var accountPrefix: String {
+        RemoteControlStorageNamespace.clientKeyAccountPrefix()
+    }
 
     private let keychain: RemoteClientKeychainStoring
     private let accessMode: KeychainAccessMode
@@ -114,10 +116,11 @@ final class RemoteClientKeyStore: @unchecked Sendable {
     }
 
     static func account(forHostID hostID: String) throws -> String {
-        guard let short = RemoteHostRegistry.hostFingerprintShort(hostID) else {
+        guard RemoteHostRegistry.isValidHostFingerprint(hostID) else {
             throw RemoteClientKeyStoreError.invalidHostID(hostID)
         }
-        return accountPrefix + short
+        let fullDigest = String(hostID.dropFirst("sha256:".count))
+        return accountPrefix + fullDigest
     }
 
     private func withLock<T>(_ body: () throws -> T) rethrows -> T {

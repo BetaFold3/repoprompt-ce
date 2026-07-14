@@ -207,6 +207,7 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
     private var requestHead: HTTPRequestHead?
     private var requestBody = Data()
     private var bodyTooLarge = false
+    private var requestBodyLimit = maximumBodyBytes
 
     init(configuration: GatewayConfiguration, pairingRelay: GatewayPairingRelay? = nil) {
         self.configuration = configuration
@@ -220,9 +221,10 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
             requestHead = head
             requestBody = Data()
             bodyTooLarge = false
+            requestBodyLimit = Self.bodyLimit(for: head)
         case var .body(buffer):
             guard !bodyTooLarge else { return }
-            if requestBody.count + buffer.readableBytes > Self.maximumBodyBytes {
+            if requestBody.count + buffer.readableBytes > requestBodyLimit {
                 bodyTooLarge = true
                 requestBody = Data()
                 return
@@ -272,6 +274,11 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
             return
         }
 
+        if head.method == .GET, path == "/readyz" {
+            handleReadiness(context: context)
+            return
+        }
+
         if head.method == .GET || head.method == .HEAD, let asset = Self.pwaAsset(forPath: path) {
             servePWAAsset(asset, context: context)
             return
@@ -301,6 +308,40 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
             contentType: "text/plain; charset=utf-8",
             context: context
         )
+    }
+
+    private func handleReadiness(context: ChannelHandlerContext) {
+        guard let pairingRelay else {
+            sendResponse(
+                status: .serviceUnavailable,
+                body: "{\"status\":\"starting\",\"app_link\":\"unavailable\"}\n",
+                contentType: "application/json; charset=utf-8",
+                context: context
+            )
+            return
+        }
+        let channel = context.channel
+        Task {
+            let ready = await pairingRelay.isAppLinkReady()
+            Self.writeResponse(
+                on: channel,
+                status: ready ? .ok : .serviceUnavailable,
+                bodyData: Data(
+                    ready
+                        ? "{\"status\":\"ready\",\"app_link\":\"connected\"}\n".utf8
+                        : "{\"status\":\"starting\",\"app_link\":\"connecting\"}\n".utf8
+                ),
+                contentType: "application/json; charset=utf-8"
+            )
+        }
+    }
+
+    static func bodyLimit(for head: HTTPRequestHead) -> Int {
+        let path = pathOnly(from: head.uri)
+        if head.method == .POST, path == GatewayPairingRelay.discoveryPath {
+            return GatewayPairingRelay.maximumDiscoveryRequestBytes
+        }
+        return maximumBodyBytes
     }
 
     /// Maps request paths onto packaged PWA assets. The PWA is served from the
@@ -351,7 +392,11 @@ final class GatewayHTTPHandler: ChannelInboundHandler, RemovableChannelHandler {
         }
         let channel = context.channel
         Task {
-            let response = await pairingRelay.handle(path: path, body: body)
+            let response = await pairingRelay.handle(
+                path: path,
+                body: body,
+                peerAddress: channel.remoteAddress?.ipAddress
+            )
             let data = (try? RemoteWireProtocol.canonicalData(for: response.body)) ?? Data("{}".utf8)
             Self.writeResponse(
                 on: channel,

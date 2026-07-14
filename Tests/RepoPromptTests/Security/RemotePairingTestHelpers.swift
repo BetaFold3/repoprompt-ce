@@ -26,6 +26,12 @@ final class InMemoryRemotePairingKeychain: RemotePairingKeychainStoring, @unchec
         defer { lock.unlock() }
         values[key] = value
     }
+
+    func setValueForTesting(_ value: String, for key: String) {
+        lock.lock()
+        values[key] = value
+        lock.unlock()
+    }
 }
 
 enum RemotePairingTestSupport {

@@ -15,11 +15,11 @@ protocol RemoteHostPairingTransport: Sendable {
     ) async throws -> RemoteHostPairingHTTPResponse
 }
 
-struct URLSessionRemoteHostPairingTransport: RemoteHostPairingTransport, @unchecked Sendable {
-    var session: URLSession
+struct URLSessionRemoteHostPairingTransport: RemoteHostPairingTransport {
+    private let client: RemoteHostHTTPClient
 
-    init(session: URLSession = .shared) {
-        self.session = session
+    init(session: URLSession? = nil) {
+        client = session.map(RemoteHostHTTPClient.init(session:)) ?? .shared
     }
 
     func postJSON(
@@ -27,18 +27,13 @@ struct URLSessionRemoteHostPairingTransport: RemoteHostPairingTransport, @unchec
         body: [String: JSONValue],
         timeout: TimeInterval
     ) async throws -> RemoteHostPairingHTTPResponse {
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.timeoutInterval = timeout
-        request.httpBody = try JSONEncoder().encode(JSONValue.object(body))
-
-        let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw RemoteHostPairingError.invalidResponse("Pairing endpoint returned a non-HTTP response.")
-        }
-        return RemoteHostPairingHTTPResponse(statusCode: httpResponse.statusCode, data: data)
+        let response = try await client.postJSON(
+            to: url,
+            body: RemoteWireProtocol.canonicalData(for: .object(body)),
+            timeout: timeout,
+            maximumResponseBytes: 256 * 1024
+        )
+        return RemoteHostPairingHTTPResponse(statusCode: response.statusCode, data: response.body)
     }
 }
 
@@ -123,8 +118,8 @@ struct RemoteHostPairingClient {
 
     private func beginPairing(payload: RemotePairingPayload) async throws -> BeginPairingResponse {
         let data = try await post(
-            endpoint(base: payload.gatewayURL, pathComponents: ["api", "pair", "begin"]),
-            body: pairingRelayBody(payload: payload),
+            payload.gatewayOrigin.endpoint(path: "/api/pair/begin"),
+            body: ["approval_context": .string(payload.approvalContext)],
             timeout: Self.beginTimeout,
             phase: .begin
         )
@@ -144,7 +139,7 @@ struct RemoteHostPairingClient {
         proof: Data,
         requestedScopes: Set<String>
     ) async throws -> CompletePairingResponse {
-        var body = pairingRelayBody(payload: payload)
+        var body: [String: JSONValue] = [:]
         body["pairing_id"] = .string(begin.pairingID.uuidString)
         body["display_name"] = .string(displayName)
         body["device_id"] = .string(deviceID)
@@ -152,7 +147,7 @@ struct RemoteHostPairingClient {
         body["proof"] = .string(proof.base64EncodedString())
         body["scopes"] = .array(requestedScopes.sorted().map(JSONValue.string))
         let data = try await post(
-            endpoint(base: payload.gatewayURL, pathComponents: ["api", "pair", "complete"]),
+            payload.gatewayOrigin.endpoint(path: "/api/pair/complete"),
             body: body,
             timeout: Self.completeTimeout,
             phase: .complete
@@ -276,23 +271,15 @@ struct RemoteHostPairingClient {
         return trimmed
     }
 
-    private func pairingRelayBody(payload: RemotePairingPayload) -> [String: JSONValue] {
-        guard let windowID = payload.windowID else { return [:] }
-        return ["window_id": .int(windowID)]
-    }
-
-    private func endpoint(base: URL, pathComponents: [String]) -> URL {
-        pathComponents.reduce(base) { url, component in
-            url.appendingPathComponent(component, isDirectory: false)
-        }
-    }
-
     private func error(for response: RemoteHostPairingHTTPResponse, phase: PairingPhase) -> RemoteHostPairingError {
         let object = try? JSONDecoder().decode(JSONValue.self, from: response.data).objectValue
         let message = object?["error"]?.stringValue
             ?? object?["message"]?.stringValue
             ?? object?["text"]?.stringValue
         let code = object?["code"]?.stringValue
+        if response.statusCode == 403, code == "pairing_denied" {
+            return .consentDenied(message ?? "Remote device pairing was denied by the user.")
+        }
         if response.statusCode == 400,
            let message,
            message.localizedCaseInsensitiveContains("denied") || message.localizedCaseInsensitiveContains("rejected")

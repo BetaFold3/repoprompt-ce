@@ -104,16 +104,21 @@ class ReleaseToolingTests(unittest.TestCase):
             policy,
         )
 
-    def test_info_plist_registers_canonical_ce_url_scheme_only(self) -> None:
-        info_plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template").read_bytes())
-        url_types = info_plist.get("CFBundleURLTypes", [])
-        registered_schemes = [
-            scheme
-            for url_type in url_types
-            for scheme in url_type.get("CFBundleURLSchemes", [])
-        ]
+    def test_info_plist_url_scheme_is_rendered_per_build_channel(self) -> None:
+        template = (SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template").read_text(encoding="utf-8")
+        self.assertIn("__URL_SCHEME__", template)
+        for expected in ("repoprompt-ce", "repoprompt-ce-debug"):
+            info_plist = plistlib.loads(template.replace("__URL_SCHEME__", expected).encode("utf-8"))
+            registered_schemes = [
+                scheme
+                for url_type in info_plist.get("CFBundleURLTypes", [])
+                for scheme in url_type.get("CFBundleURLSchemes", [])
+            ]
+            self.assertEqual(registered_schemes, [expected])
 
-        self.assertEqual(registered_schemes, ["repoprompt-ce"])
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        self.assertIn('URL_SCHEME="repoprompt-ce"', package_script)
+        self.assertIn('URL_SCHEME="repoprompt-ce-debug"', package_script)
 
     def test_local_self_signed_outer_codesign_uses_equals_requirement_argv(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
@@ -2720,6 +2725,7 @@ SIGNING_TEAM_ID=648A27MST5
             "__BUNDLE_ID__": "com.pvncher.repoprompt.ce",
             "__MARKETING_VERSION__": "1.0.0",
             "__BUILD_NUMBER__": "1",
+            "__URL_SCHEME__": "repoprompt-ce",
             "__DEBUG_SECURE_STORAGE_BACKEND__": "alternate-in-memory",
             "__SIGNING_MODE__": "release-candidate-adhoc",
             "__LOCAL_SIGNING_CERTIFICATE_SHA256__": "",

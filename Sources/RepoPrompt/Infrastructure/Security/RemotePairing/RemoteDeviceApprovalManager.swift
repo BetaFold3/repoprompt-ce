@@ -36,6 +36,8 @@ struct RemoteDeviceApprovalRequest: Identifiable, Equatable {
 enum RemoteDeviceApprovalResult: Equatable {
     case approved(grantedScopes: Set<RemoteScope>)
     case denied
+    case cancelled
+    case targetStale
 
     var grantedScopes: Set<RemoteScope>? {
         guard case let .approved(scopes) = self else { return nil }
@@ -70,7 +72,7 @@ final class RemoteDeviceApprovalManager: ObservableObject {
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 if Task.isCancelled {
-                    continuation.resume(returning: .denied)
+                    continuation.resume(returning: .cancelled)
                     return
                 }
 
@@ -116,7 +118,7 @@ final class RemoteDeviceApprovalManager: ObservableObject {
 
     func cancelPending(requestID: UUID) {
         if pendingRequest?.id == requestID {
-            currentContinuation?.resume(returning: .denied)
+            currentContinuation?.resume(returning: .cancelled)
             currentContinuation = nil
             pendingRequest = nil
             isApprovalOverlayVisible = false
@@ -126,12 +128,12 @@ final class RemoteDeviceApprovalManager: ObservableObject {
 
         guard let index = pendingQueue.firstIndex(where: { $0.0.id == requestID }) else { return }
         let (_, continuation) = pendingQueue.remove(at: index)
-        continuation.resume(returning: .denied)
+        continuation.resume(returning: .cancelled)
     }
 
     func cancelPending(forWindowID windowID: Int) {
         if pendingRequest?.windowID == windowID {
-            currentContinuation?.resume(returning: .denied)
+            currentContinuation?.resume(returning: .targetStale)
             currentContinuation = nil
             pendingRequest = nil
             isApprovalOverlayVisible = false
@@ -140,7 +142,7 @@ final class RemoteDeviceApprovalManager: ObservableObject {
         var remainingQueue: [(RemoteDeviceApprovalRequest, CheckedContinuation<RemoteDeviceApprovalResult, Never>)] = []
         for (request, continuation) in pendingQueue {
             if request.windowID == windowID {
-                continuation.resume(returning: .denied)
+                continuation.resume(returning: .targetStale)
             } else {
                 remainingQueue.append((request, continuation))
             }
@@ -153,9 +155,9 @@ final class RemoteDeviceApprovalManager: ObservableObject {
     }
 
     func cancelAllPending() {
-        currentContinuation?.resume(returning: .denied)
+        currentContinuation?.resume(returning: .cancelled)
         for (_, continuation) in pendingQueue {
-            continuation.resume(returning: .denied)
+            continuation.resume(returning: .cancelled)
         }
         currentContinuation = nil
         pendingRequest = nil

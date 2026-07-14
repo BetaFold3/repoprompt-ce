@@ -10,6 +10,7 @@ import Darwin
 import Foundation
 import Logging
 import OSLog
+import RepoPromptRemoteWire
 import RepoPromptShared
 import SwiftUI
 
@@ -70,17 +71,12 @@ final actor ServerController: ObservableObject {
     private var powerActivity: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
 
-    private struct RemoteGatewayLaunchConfiguration: Equatable {
-        let bindHost: String
-        let port: Int
-        let staticToken: String
-        let appSupportRoot: String
-    }
-
-    private var remoteGatewayProcess: Process?
-    private var remoteGatewayLaunchConfiguration: RemoteGatewayLaunchConfiguration?
-    private var remoteGatewayLaunchDate: Date?
     private var remoteGatewayRestartAttempts = 0
+    private let remoteGatewayActivationGate: RemoteGatewayActivationGate
+    private let remoteGatewayProcessLifecycle: RemoteGatewayProcessLifecycle
+    private let tailscaleStatusProvider: any TailscaleStatusProviding
+    private let remoteGatewayHealthClient: RemoteHostHTTPClient
+    private let discoveryAuthority: RemotePairingDiscoveryAuthority
     private static let remoteGatewayMaxRestartAttempts = 6
     private static let remoteGatewayStableUptimeSeconds: TimeInterval = 60
 
@@ -94,7 +90,18 @@ final actor ServerController: ObservableObject {
     }
 
     /// –––––  Init: wire approval-flow & kick off the listener  –––––
-    init() {
+    init(
+        tailscaleStatusProvider: any TailscaleStatusProviding = TailscaleStatusClient(),
+        remoteGatewayHealthClient: RemoteHostHTTPClient = .shared,
+        discoveryAuthority: RemotePairingDiscoveryAuthority = .shared
+    ) {
+        self.tailscaleStatusProvider = tailscaleStatusProvider
+        self.remoteGatewayHealthClient = remoteGatewayHealthClient
+        self.discoveryAuthority = discoveryAuthority
+        remoteGatewayActivationGate = RemoteGatewayActivationGate(authority: discoveryAuthority)
+        remoteGatewayProcessLifecycle = RemoteGatewayProcessLifecycle(
+            dependencies: Self.remoteGatewayProcessDependencies(networkManager: ServerNetworkManager.shared)
+        )
         Task { [weak self] in
             await self?.bootstrapCallbacks()
         }
@@ -462,146 +469,244 @@ final actor ServerController: ObservableObject {
     // MARK: – public API –
 
     func applyRemoteGatewaySettings() async {
-        let settings = await MainActor.run { () -> (enabled: Bool, bindHost: String, port: Int) in
-            let store = GlobalSettingsStore.shared
-            return (
-                enabled: store.mcpRemoteGatewayEnabled(),
-                bindHost: store.mcpRemoteGatewayBindAddress(),
-                port: store.mcpRemoteGatewayPort()
-            )
+        let generation = await remoteGatewayActivationGate.begin()
+        await remoteGatewayProcessLifecycle.selectGeneration(generation)
+        let enabled = await MainActor.run {
+            GlobalSettingsStore.shared.mcpRemoteGatewayEnabled()
         }
 
-        guard settings.enabled else {
-            await stopRemoteGateway()
+        guard enabled else {
+            try? await remoteGatewayProcessLifecycle.stop(generation: generation)
+            await publishRemoteGatewayStatus(.disabled)
             return
         }
 
+        await publishRemoteGatewayStatus(.resolvingTailscale)
+        var configuredLaunchID: UUID?
         do {
-            let staticToken = try RemoteGatewayTokenStore.shared.ensureToken()
-            let appSupportRoot = MCPFilesystemConstants.identity.applicationSupportRootURL().path
+            let snapshot = try await tailscaleStatusProvider.status()
+            try await ensureRemoteGatewayGeneration(generation)
+            guard let bindHost = snapshot.selectedSelfIPv4 else {
+                throw TailscaleStatusError.noEligibleSelfIPv4
+            }
+            let buildIdentity = RemoteControlBuildIdentity.current
+            let origin = try RemoteGatewayOrigin(tailscaleIPv4: bindHost, channel: buildIdentity.channel)
             let launchConfiguration = RemoteGatewayLaunchConfiguration(
-                bindHost: settings.bindHost,
-                port: settings.port,
-                staticToken: staticToken,
-                appSupportRoot: appSupportRoot
+                bindHost: bindHost,
+                port: buildIdentity.fixedPort,
+                appSupportRoot: RemoteControlStorageNamespace.gatewayRuntimeRootURL().path
             )
-            try await startRemoteGatewayIfNeeded(launchConfiguration)
+            await publishRemoteGatewayStatus(.starting(origin))
+            try await ensureRemoteGatewayGeneration(generation)
+            let processIdentity = try await remoteGatewayProcessLifecycle.startIfNeeded(
+                launchConfiguration,
+                generation: generation,
+                didTerminate: { [weak self] identity in
+                    Task { await self?.remoteGatewayDidTerminate(identity) }
+                }
+            )
+            try await waitForRemoteGatewayReadiness(origin: origin, generation: generation)
+            try await ensureRemoteGatewayGeneration(generation)
+            guard await remoteGatewayProcessLifecycle.isCurrent(
+                processIdentity,
+                configuration: launchConfiguration,
+                generation: generation
+            ) else {
+                throw CancellationError()
+            }
+            let launchID = UUID()
+            configuredLaunchID = launchID
+            let authorityConfiguration = RemotePairingDiscoveryAuthority.Configuration(
+                launchID: launchID,
+                origin: origin,
+                buildIdentity: buildIdentity,
+                hostName: Self.remoteGatewayHostName()
+            )
+            do {
+                try await remoteGatewayActivationGate.activate(
+                    authorityConfiguration,
+                    generation: generation,
+                    processIsCurrent: { [weak self] in
+                        guard let self else { return false }
+                        return await remoteGatewayProcessLifecycle.isCurrent(
+                            processIdentity,
+                            configuration: launchConfiguration,
+                            generation: generation
+                        )
+                    }
+                )
+            } catch {
+                throw CancellationError()
+            }
+            await publishRemoteGatewayStatus(.discoverable(origin))
+        } catch is CancellationError {
+            if let configuredLaunchID {
+                await discoveryAuthority.clear(ifLaunchID: configuredLaunchID)
+            }
+            return
         } catch {
+            if let configuredLaunchID {
+                await discoveryAuthority.clear(ifLaunchID: configuredLaunchID)
+            }
+            do {
+                try await remoteGatewayActivationGate.ensureCurrent(generation)
+            } catch {
+                return
+            }
             log.error("Failed to apply remote gateway settings: \(String(describing: error))")
-            await stopRemoteGateway()
+            do {
+                try await remoteGatewayProcessLifecycle.stop(generation: generation)
+            } catch {
+                return
+            }
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            if error is TailscaleStatusError {
+                await publishRemoteGatewayStatus(.unavailable(message))
+            } else {
+                await publishRemoteGatewayStatus(.failed(message))
+            }
         }
     }
 
-    private func startRemoteGatewayIfNeeded(_ launchConfiguration: RemoteGatewayLaunchConfiguration) async throws {
-        if let process = remoteGatewayProcess,
-           process.isRunning,
-           remoteGatewayLaunchConfiguration == launchConfiguration
-        {
-            return
-        }
-
-        await stopRemoteGateway()
-
-        guard let executableURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-gateway") else {
-            log.error("Cannot start remote gateway: bundled repoprompt-gateway executable not found")
-            return
-        }
-        await stopOrphanedRemoteGatewayIfNeeded(launchConfiguration, executableURL: executableURL)
-
-        let launchCredential = try RemoteGatewayTokenStore.generateToken()
-        await networkManager.setGatewayLaunchCredential(launchCredential)
-
-        let process = Process()
-        process.executableURL = executableURL
-        var environment = ProcessInfo.processInfo.environment
-        environment["REPOPROMPT_GATEWAY_BIND_HOST"] = launchConfiguration.bindHost
-        environment["REPOPROMPT_GATEWAY_PORT"] = String(launchConfiguration.port)
-        environment["REPOPROMPT_GATEWAY_STATIC_TOKEN"] = launchConfiguration.staticToken
-        environment["REPOPROMPT_GATEWAY_APP_SUPPORT_ROOT"] = launchConfiguration.appSupportRoot
-        environment["REPOPROMPT_GATEWAY_BOOTSTRAP_TOKEN"] = "gateway-\(UUID().uuidString)"
-        environment["REPOPROMPT_GATEWAY_APP_LEG_CREDENTIAL"] = launchCredential
-        environment["REPOPROMPT_GATEWAY_PARENT_PID"] = String(getpid())
-        environment["REPOPROMPT_GATEWAY_PROCESS_LEASE_FILE"] = remoteGatewayProcessLeaseFileURL(for: launchConfiguration).path
-        environment["REPOPROMPT_GATEWAY_APP_LINK_MAX_RECONNECT_ATTEMPTS"] = "24"
-        process.environment = environment
-        process.terminationHandler = { [weak self] process in
-            Task { await self?.remoteGatewayDidTerminate(pid: process.processIdentifier) }
-        }
-
+    private func ensureRemoteGatewayGeneration(_ generation: UInt64) async throws {
         do {
-            try process.run()
-            remoteGatewayProcess = process
-            remoteGatewayLaunchConfiguration = launchConfiguration
-            remoteGatewayLaunchDate = Date()
-            serverControllerDebugLog("Started repoprompt-gateway pid=\(process.processIdentifier)")
-            serverControllerDebugLog("Started repoprompt-gateway pid=\(process.processIdentifier)")
+            try await remoteGatewayActivationGate.ensureCurrent(generation)
         } catch {
-            await networkManager.setGatewayLaunchCredential(nil)
-            throw error
+            throw CancellationError()
         }
     }
 
-    private func stopRemoteGateway() async {
-        let process = remoteGatewayProcess
-        let launchConfiguration = remoteGatewayLaunchConfiguration
-        remoteGatewayProcess = nil
-        remoteGatewayLaunchConfiguration = nil
-        await networkManager.setGatewayLaunchCredential(nil)
-        guard let process, process.isRunning else { return }
-        process.terminate()
-        try? await Task.sleep(for: .seconds(2))
-        if process.isRunning {
-            kill(process.processIdentifier, SIGKILL)
+    private func waitForRemoteGatewayReadiness(
+        origin: RemoteGatewayOrigin,
+        generation: UInt64
+    ) async throws {
+        let endpoint = origin.endpoint(path: "/readyz")
+        let deadline = Date().addingTimeInterval(5)
+        var lastError: Error?
+        while Date() < deadline {
+            try await ensureRemoteGatewayGeneration(generation)
+            do {
+                let response = try await remoteGatewayHealthClient.get(
+                    endpoint,
+                    timeout: 0.75,
+                    maximumResponseBytes: 4 * 1024
+                )
+                if response.statusCode == 200, response.finalURL == endpoint {
+                    return
+                }
+            } catch {
+                lastError = error
+            }
+            try await Task.sleep(for: .milliseconds(200))
         }
-        if let launchConfiguration {
-            RemoteGatewayProcessLeaseFile.removeIfOwned(
-                fileURL: remoteGatewayProcessLeaseFileURL(for: launchConfiguration),
-                pid: process.processIdentifier
-            )
+        throw lastError ?? RemoteHostHTTPClientError.invalidResponse
+    }
+
+    private func publishRemoteGatewayStatus(_ status: RemoteGatewayStatusStore.Status) async {
+        await MainActor.run {
+            RemoteGatewayStatusStore.shared.publish(status)
         }
     }
 
-    private func stopOrphanedRemoteGatewayIfNeeded(
-        _ launchConfiguration: RemoteGatewayLaunchConfiguration,
-        executableURL: URL
-    ) async {
-        let leaseFileURL = remoteGatewayProcessLeaseFileURL(for: launchConfiguration)
-        guard let lease = try? RemoteGatewayProcessLeaseFile.read(from: leaseFileURL),
-              lease.matches(
-                  bindHost: launchConfiguration.bindHost,
-                  port: launchConfiguration.port,
-                  appSupportRoot: launchConfiguration.appSupportRoot,
-                  executablePath: executableURL.path
-              ),
-              isProcessRunning(pid: lease.pid)
-        else { return }
-
-        let expectedExecutablePath = executableURL.standardizedFileURL.path
-        guard let actualExecutablePath = executablePath(forPID: lease.pid),
-              URL(fileURLWithPath: actualExecutablePath).standardizedFileURL.path == expectedExecutablePath
-        else {
-            log.warning("Remote gateway process lease exists but pid \(lease.pid) no longer resolves to bundled gateway; leaving it untouched")
-            return
-        }
-
-        log.notice("Stopping orphaned repoprompt-gateway pid=\(lease.pid) before relaunch")
-        kill(lease.pid, SIGTERM)
-        try? await Task.sleep(for: .seconds(2))
-        if isProcessRunning(pid: lease.pid) {
-            kill(lease.pid, SIGKILL)
-        }
-        RemoteGatewayProcessLeaseFile.removeIfOwned(fileURL: leaseFileURL, pid: lease.pid)
+    private nonisolated static func remoteGatewayHostName() -> String {
+        let candidates = [Host.current().localizedName, Host.current().name, ProcessInfo.processInfo.hostName]
+        return candidates.compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? "RepoPrompt Host"
     }
 
-    private func remoteGatewayProcessLeaseFileURL(for launchConfiguration: RemoteGatewayLaunchConfiguration) -> URL {
-        RemoteGatewayProcessLeaseFile.defaultURL(appSupportRoot: URL(fileURLWithPath: launchConfiguration.appSupportRoot))
+    private nonisolated static func remoteGatewayProcessDependencies(
+        networkManager: ServerNetworkManager
+    ) -> RemoteGatewayProcessLifecycle.Dependencies {
+        .init(
+            generateCredential: { try RemoteGatewayTokenStore.generateToken() },
+            setCredential: { credential in
+                await networkManager.setGatewayLaunchCredential(credential)
+            },
+            findOrphan: { configuration in
+                guard let executableURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-gateway") else {
+                    return nil
+                }
+                let leaseFileURL = remoteGatewayProcessLeaseFileURL(for: configuration)
+                guard let lease = try? RemoteGatewayProcessLeaseFile.read(from: leaseFileURL),
+                      lease.matches(
+                          bindHost: configuration.bindHost,
+                          port: configuration.port,
+                          appSupportRoot: configuration.appSupportRoot,
+                          executablePath: executableURL.path
+                      ),
+                      isProcessRunning(pid: lease.pid)
+                else { return nil }
+
+                let expectedExecutablePath = executableURL.standardizedFileURL.path
+                guard let actualExecutablePath = executablePath(forPID: lease.pid),
+                      URL(fileURLWithPath: actualExecutablePath).standardizedFileURL.path == expectedExecutablePath
+                else {
+                    log.warning(
+                        "Remote gateway process lease exists but pid \(lease.pid) no longer resolves to bundled gateway; leaving it untouched"
+                    )
+                    return nil
+                }
+                return lease.pid
+            },
+            launch: { configuration, credential, token, didTerminate in
+                guard let executableURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-gateway") else {
+                    log.error("Cannot start remote gateway: bundled repoprompt-gateway executable not found")
+                    throw CocoaError(.fileNoSuchFile)
+                }
+                let process = Process()
+                process.executableURL = executableURL
+                var environment = ProcessInfo.processInfo.environment
+                environment["REPOPROMPT_GATEWAY_BIND_HOST"] = configuration.bindHost
+                environment["REPOPROMPT_GATEWAY_PORT"] = String(configuration.port)
+                environment["REPOPROMPT_GATEWAY_APP_SUPPORT_ROOT"] = configuration.appSupportRoot
+                environment["REPOPROMPT_GATEWAY_BOOTSTRAP_TOKEN"] = "gateway-\(UUID().uuidString)"
+                environment["REPOPROMPT_GATEWAY_APP_LEG_CREDENTIAL"] = credential
+                environment["REPOPROMPT_GATEWAY_PARENT_PID"] = String(getpid())
+                environment["REPOPROMPT_GATEWAY_PROCESS_LEASE_FILE"] = remoteGatewayProcessLeaseFileURL(for: configuration).path
+                environment["REPOPROMPT_GATEWAY_APP_LINK_MAX_RECONNECT_ATTEMPTS"] = "24"
+                process.environment = environment
+                process.terminationHandler = { process in
+                    didTerminate(.init(token: token, pid: process.processIdentifier))
+                }
+                try process.run()
+                let identity = RemoteGatewayProcessIdentity(token: token, pid: process.processIdentifier)
+                serverControllerDebugLog("Started repoprompt-gateway pid=\(identity.pid)")
+                return RemoteGatewayProcessHandle(
+                    identity: identity,
+                    isRunning: { process.isRunning },
+                    terminate: { process.terminate() }
+                )
+            },
+            terminateOrphan: { pid in
+                log.notice("Stopping orphaned repoprompt-gateway pid=\(pid) before relaunch")
+                kill(pid, SIGTERM)
+            },
+            forceKill: { pid in kill(pid, SIGKILL) },
+            isProcessRunning: { pid in isProcessRunning(pid: pid) },
+            removeLease: { configuration, pid in
+                RemoteGatewayProcessLeaseFile.removeIfOwned(
+                    fileURL: remoteGatewayProcessLeaseFileURL(for: configuration),
+                    pid: pid
+                )
+            },
+            waitForTermination: { try? await Task.sleep(for: .seconds(2)) },
+            now: { Date() }
+        )
     }
 
-    private func isProcessRunning(pid: Int32) -> Bool {
+    private nonisolated static func remoteGatewayProcessLeaseFileURL(
+        for launchConfiguration: RemoteGatewayLaunchConfiguration
+    ) -> URL {
+        RemoteGatewayProcessLeaseFile.defaultURL(
+            appSupportRoot: URL(fileURLWithPath: launchConfiguration.appSupportRoot)
+        )
+    }
+
+    private nonisolated static func isProcessRunning(pid: Int32) -> Bool {
         kill(pid, 0) == 0 || errno == EPERM
     }
 
-    private func executablePath(forPID pid: Int32) -> String? {
+    private nonisolated static func executablePath(forPID pid: Int32) -> String? {
         var buffer = [CChar](repeating: 0, count: 4096)
         let result = buffer.withUnsafeMutableBufferPointer { pointer in
             proc_pidpath(pid, pointer.baseAddress, UInt32(pointer.count))
@@ -610,14 +715,11 @@ final actor ServerController: ObservableObject {
         return String(cString: buffer)
     }
 
-    private func remoteGatewayDidTerminate(pid: Int32) async {
-        guard let process = remoteGatewayProcess,
-              process.processIdentifier == pid else { return }
-        remoteGatewayProcess = nil
-        remoteGatewayLaunchConfiguration = nil
-        let launchDate = remoteGatewayLaunchDate
-        remoteGatewayLaunchDate = nil
-        await networkManager.setGatewayLaunchCredential(nil)
+    private func remoteGatewayDidTerminate(_ identity: RemoteGatewayProcessIdentity) async {
+        guard let termination = await remoteGatewayProcessLifecycle.didTerminate(identity),
+              await remoteGatewayActivationGate.invalidate(ifGeneration: termination.generation)
+        else { return }
+        await publishRemoteGatewayStatus(.unavailable("Gateway process exited."))
         let shouldRestart = await MainActor.run {
             GlobalSettingsStore.shared.mcpRemoteGatewayEnabled()
         }
@@ -625,7 +727,7 @@ final actor ServerController: ObservableObject {
             remoteGatewayRestartAttempts = 0
             return
         }
-        if let launchDate, Date().timeIntervalSince(launchDate) >= Self.remoteGatewayStableUptimeSeconds {
+        if Date().timeIntervalSince(termination.launchedAt) >= Self.remoteGatewayStableUptimeSeconds {
             // A stable run resets the crash-loop budget; this exit is treated as the first failure.
             remoteGatewayRestartAttempts = 0
         }
@@ -641,7 +743,7 @@ final actor ServerController: ObservableObject {
         }
         let backoffSeconds = min(pow(2.0, Double(remoteGatewayRestartAttempts - 1)), 30.0)
         serverControllerDebugLog(
-            "repoprompt-gateway pid=\(pid) exited; restart attempt \(remoteGatewayRestartAttempts)/"
+            "repoprompt-gateway pid=\(identity.pid) exited; restart attempt \(remoteGatewayRestartAttempts)/"
                 + "\(Self.remoteGatewayMaxRestartAttempts) in \(backoffSeconds)s"
         )
         try? await Task.sleep(for: .seconds(backoffSeconds))
@@ -663,16 +765,20 @@ final actor ServerController: ObservableObject {
 
     /// Disable the listener.
     func stopServer() async {
+        let generation = await remoteGatewayActivationGate.invalidate()
+        await remoteGatewayProcessLifecycle.selectGeneration(generation)
         await networkManager.setEnabled(false)
-        await stopRemoteGateway()
+        try? await remoteGatewayProcessLifecycle.stop(generation: generation)
         endPowerActivity()
         updateServerStatus("Disabled")
     }
 
     /// Completely shut down the listener.
     func fullShutdown() async {
+        let generation = await remoteGatewayActivationGate.invalidate()
+        await remoteGatewayProcessLifecycle.selectGeneration(generation)
         await networkManager.stop()
-        await stopRemoteGateway()
+        try? await remoteGatewayProcessLifecycle.stop(generation: generation)
         endPowerActivity()
         updateServerStatus("Stopped")
     }

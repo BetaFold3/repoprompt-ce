@@ -16,7 +16,8 @@ final class RemoteHostPairingClientTests: XCTestCase {
         let stub = StubRemoteHostPairingTransport(handlers: [
             { url, body, timeout in
                 XCTAssertEqual(url.path, "/api/pair/begin")
-                XCTAssertEqual(body["window_id"], .int(7))
+                XCTAssertEqual(body["approval_context"], .string(payload.approvalContext))
+                XCTAssertNil(body["window_id"])
                 XCTAssertEqual(timeout, RemoteHostPairingClient.beginTimeout)
                 return try Self.response([
                     "ok": true,
@@ -30,7 +31,7 @@ final class RemoteHostPairingClientTests: XCTestCase {
             { url, body, timeout in
                 XCTAssertEqual(url.path, "/api/pair/complete")
                 XCTAssertEqual(timeout, RemoteHostPairingClient.completeTimeout)
-                XCTAssertEqual(body["window_id"], .int(7))
+                XCTAssertNil(body["window_id"])
                 let publicKey = try XCTUnwrap(body["public_key"]?.stringValue)
                 let deviceID = try XCTUnwrap(body["device_id"]?.stringValue)
                 let scopes = try XCTUnwrap(body["scopes"]?.arrayValue?.compactMap(\.stringValue))
@@ -127,8 +128,13 @@ final class RemoteHostPairingClientTests: XCTestCase {
             },
             { _, _, _ in
                 try Self.response(
-                    ["error": "Remote device pairing was denied by the user."],
-                    statusCode: 400
+                    [
+                        "ok": false,
+                        "code": "pairing_denied",
+                        "error": "Remote device pairing was denied by the user.",
+                        "status": 403
+                    ],
+                    statusCode: 403
                 )
             }
         ])

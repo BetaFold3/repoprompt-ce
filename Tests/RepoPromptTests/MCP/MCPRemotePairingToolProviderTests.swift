@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import MCP
 @testable import RepoPromptApp
+import RepoPromptRemoteWire
 import XCTest
 
 @MainActor
@@ -27,16 +28,22 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
         let manager = RemoteDeviceApprovalManager(bringWindowToFront: { _ in })
         let challengeStore = RemotePairingChallengeStore(challengeGenerator: { "fixed-challenge" })
         let now = Date(timeIntervalSince1970: 10000)
+        let authority = try await makeConfiguredAuthority(identityStore: store, now: { now })
+        let approvalContext = try await makeApprovalContext(authority)
         let deps = makeDependencies(
             identityStore: store,
             approvalManager: manager,
+            discoveryAuthority: authority,
             challengeStore: challengeStore,
             now: { now }
         )
         let context = MCPWindowToolContext(toolName: MCPWindowToolName.remotePairing, windowID: 7)
 
         let begin = try await MCPRemotePairingToolProvider.execute(
-            args: ["op": .string(RemotePairingOperation.beginPairing.rawValue)],
+            args: [
+                "op": .string(RemotePairingOperation.beginPairing.rawValue),
+                "approval_context": .string(approvalContext)
+            ],
             context: context,
             dependencies: deps
         )
@@ -89,9 +96,11 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
         let store = makeStore(url: RemotePairingTestSupport.registryURL(in: directory))
         let manager = RemoteDeviceApprovalManager(bringWindowToFront: { _ in })
         let challengeStore = RemotePairingChallengeStore(challengeGenerator: { UUID().uuidString })
+        let authority = try await makeConfiguredAuthority(identityStore: store)
         let deps = makeDependencies(
             identityStore: store,
             approvalManager: manager,
+            discoveryAuthority: authority,
             challengeStore: challengeStore
         )
         let context = MCPWindowToolContext(toolName: MCPWindowToolName.remotePairing, windowID: 7)
@@ -100,8 +109,12 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
         let requestedScopes: Set<RemoteScope> = [.sessionsObserve, .interactionsRespond]
 
         func completePairing(displayName: String) async throws -> Value {
+            let approvalContext = try await makeApprovalContext(authority)
             let begin = try await MCPRemotePairingToolProvider.execute(
-                args: ["op": .string(RemotePairingOperation.beginPairing.rawValue)],
+                args: [
+                    "op": .string(RemotePairingOperation.beginPairing.rawValue),
+                    "approval_context": .string(approvalContext)
+                ],
                 context: context,
                 dependencies: deps
             )
@@ -188,6 +201,7 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
         isGateway: Bool = true,
         identityStore: RemotePairingIdentityStore,
         approvalManager: RemoteDeviceApprovalManager,
+        discoveryAuthority: RemotePairingDiscoveryAuthority = .shared,
         challengeStore: RemotePairingChallengeStore = RemotePairingChallengeStore(challengeGenerator: { "fixed-challenge" }),
         now: @escaping @Sendable () -> Date = { Date() }
     ) -> MCPRemotePairingToolProvider.ExecutionDependencies {
@@ -201,10 +215,30 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
             captureRequestMetadata: { metadata },
             isGatewayPrincipalConnection: { candidate in isGateway && candidate == connectionID },
             identityStore: identityStore,
-            approvalManager: approvalManager,
+            approvalRouter: ApprovalManagerRouterStub(manager: approvalManager),
+            discoveryAuthority: discoveryAuthority,
             challengeStore: challengeStore,
             now: now
         )
+    }
+
+    private func makeConfiguredAuthority(
+        identityStore: RemotePairingIdentityStore,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) async throws -> RemotePairingDiscoveryAuthority {
+        let authority = RemotePairingDiscoveryAuthority(identityStore: identityStore, now: now)
+        try await authority.configure(.init(
+            launchID: UUID(),
+            origin: RemoteGatewayOrigin(tailscaleIPv4: "100.64.0.8", channel: .release),
+            buildIdentity: .forTesting(channel: .release),
+            hostName: "Studio"
+        ))
+        return authority
+    }
+
+    private func makeApprovalContext(_ authority: RemotePairingDiscoveryAuthority) async throws -> String {
+        let request = try RemoteDiscoveryRequest.make(channel: .release)
+        return try await authority.discover(request).approvalContext
     }
 
     private func waitUntil(
@@ -217,6 +251,42 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
             await Task.yield()
         }
         XCTFail("Timed out waiting for predicate", file: file, line: line)
+    }
+}
+
+@MainActor
+private final class ApprovalManagerRouterStub: RemotePairingApprovalRouting {
+    private let manager: RemoteDeviceApprovalManager
+
+    init(manager: RemoteDeviceApprovalManager) {
+        self.manager = manager
+    }
+
+    func requestApproval(
+        deviceID: String,
+        displayName: String,
+        devicePublicKeyFingerprint: String,
+        requestedScopes: Set<RemoteScope>,
+        hostFingerprint: String
+    ) async throws -> Set<RemoteScope>? {
+        let result = await manager.requestApproval(for: RemoteDeviceApprovalRequest(
+            deviceID: deviceID,
+            displayName: displayName,
+            devicePublicKeyFingerprint: devicePublicKeyFingerprint,
+            requestedScopes: requestedScopes,
+            hostFingerprint: hostFingerprint,
+            windowID: 7
+        ))
+        switch result {
+        case let .approved(scopes):
+            return scopes
+        case .denied:
+            return nil
+        case .targetStale:
+            throw RemotePairingApprovalRouterError.approvalTargetStale
+        case .cancelled:
+            throw RemotePairingApprovalRouterError.cancelled
+        }
     }
 }
 

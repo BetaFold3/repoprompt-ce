@@ -1,11 +1,12 @@
 import CryptoKit
 import Foundation
 @testable import RepoPromptApp
+import RepoPromptRemoteWire
 import XCTest
 
 @MainActor
 final class RemoteHostsSettingsViewModelTests: XCTestCase {
-    func testPairingStateMachineUsesEditableGatewayURLAndPersistsHost() async throws {
+    func testDiscoveryRequiresExplicitSelectionRevalidatesAndPersistsOnlyAfterPairing() async throws {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
         let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
         let keyStore = RemoteClientKeyStore(
@@ -14,35 +15,47 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
         )
         let pairingClient = SuspendedRemoteHostsPairingClient()
         let hostSigner = P256.Signing.PrivateKey()
-        let payloadJSON = try RemoteHostTestSupport.pairingPayloadJSON(
-            hostSigner: hostSigner,
-            gatewayURL: XCTUnwrap(URL(string: "https://127.0.0.1:8765")),
-            hostName: "Studio"
+        let origin = try RemoteGatewayOrigin(string: "http://100.64.0.8:47391")
+        let candidate = Self.candidate(hostSigner: hostSigner, origin: origin)
+        let payload = try RemotePairingPayload(
+            gatewayOrigin: origin,
+            hostPublicKey: hostSigner.publicKey.rawRepresentation,
+            hostFingerprint: RemotePairingCrypto.fingerprint(for: hostSigner.publicKey),
+            hostName: "Studio",
+            approvalContext: "fresh-context"
+        )
+        let discovery = StubRemoteHostsDiscovery(
+            result: RemoteHostDiscoveryResult(
+                hosts: [candidate],
+                diagnostics: .init(candidateCount: 4, verifiedCount: 1, failedProbeCount: 3)
+            ),
+            payload: payload
         )
         let viewModel = RemoteHostsSettingsViewModel(
             registry: registry,
             keyStore: keyStore,
             pairingClient: pairingClient,
+            discoveryService: discovery,
             clientDisplayName: { "Client MacBook" }
         )
 
-        viewModel.pairingPayloadText = payloadJSON
-        viewModel.parsePairingPayloadText()
+        viewModel.findHosts()
+        await waitForDiscovery(viewModel)
 
-        XCTAssertEqual(viewModel.pairingPreview?.displayName, "Studio")
-        XCTAssertEqual(viewModel.gatewayURLString, "https://127.0.0.1:8765")
-        XCTAssertEqual(viewModel.pairingState, .ready)
-        XCTAssertTrue(viewModel.canPair)
+        XCTAssertEqual(viewModel.discoveredHosts, [candidate])
+        XCTAssertEqual(viewModel.discoveryState, .results(.init(candidateCount: 4, verifiedCount: 1, failedProbeCount: 3)))
+        XCTAssertFalse(registry.hasHosts)
 
-        viewModel.gatewayURLString = "https://studio.tailnet.example:8765"
-        let pairTask = Task { await viewModel.pairCurrentPayload() }
+        let pairTask = Task { await viewModel.requestAccess(to: candidate) }
         await waitForPairingRequest(pairingClient)
 
         XCTAssertEqual(viewModel.pairingState, .waitingForApproval(hostName: "Studio"))
         let request = try XCTUnwrap(pairingClient.requests.first)
-        XCTAssertEqual(request.payload.gatewayURL.absoluteString, "https://studio.tailnet.example:8765")
+        XCTAssertEqual(request.payload.gatewayOrigin, origin)
+        XCTAssertEqual(request.payload.approvalContext, "fresh-context")
         XCTAssertEqual(request.displayName, "Client MacBook")
         XCTAssertEqual(request.scopes, RemoteHostPairingClient.defaultRequestedScopes)
+        XCTAssertFalse(registry.hasHosts)
 
         let record = try Self.record(from: request.payload)
         pairingClient.complete(with: record)
@@ -50,7 +63,9 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
 
         XCTAssertEqual(viewModel.pairingState, .paired(hostName: "Studio"))
         XCTAssertEqual(viewModel.hostRows.map(\.id), [record.id])
-        XCTAssertEqual(try registry.host(id: record.id)?.gatewayURL.absoluteString, "https://studio.tailnet.example:8765")
+        XCTAssertEqual(try registry.host(id: record.id)?.gatewayURL.absoluteString, origin.string)
+        let revalidationCount = await discovery.revalidationCount()
+        XCTAssertEqual(revalidationCount, 1)
     }
 
     func testForgetRemovesRegistryRecordAndClientKey() async throws {
@@ -224,38 +239,49 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.errorMessage, "Host name cannot be empty.")
     }
 
-    func testPairingErrorMessagesIncludeCompletionUnconfirmedGuidance() {
+    func testPairingErrorMessagesIncludeRetryGuidance() {
         let completionMessage = RemoteHostsSettingsViewModel.message(for: RemoteHostPairingError.completionUnconfirmed("x"))
-        XCTAssertTrue(completionMessage.contains("Pairing wasn't confirmed: x"))
-        XCTAssertTrue(completionMessage.contains("It's safe to retry"))
-        XCTAssertTrue(completionMessage.contains("kept its device key"))
-        XCTAssertTrue(completionMessage.contains("revoke the device"))
+        XCTAssertTrue(completionMessage.contains("Pairing was not confirmed: x"))
+        XCTAssertTrue(completionMessage.contains("safe to search and retry"))
         XCTAssertEqual(
             RemoteHostsSettingsViewModel.message(for: RemoteHostPairingError.timeout),
-            "Timed out contacting the host's gateway."
+            "Timed out contacting the host gateway."
         )
     }
 
-    func testInvalidPairingPayloadSurfacesFriendlyError() throws {
+    func testDiscoveryFailureSurfacesFriendlyErrorWithoutPersisting() async throws {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
+        let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
+        let discovery = StubRemoteHostsDiscovery(error: TailscaleStatusError.backendUnavailable("Stopped"))
         let viewModel = RemoteHostsSettingsViewModel(
-            registry: RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory)),
+            registry: registry,
             keyStore: RemoteClientKeyStore(
                 keychain: InMemoryRemoteClientKeychain(),
                 accessMode: .nonInteractive(reason: .test)
             ),
-            pairingClient: ImmediateRemoteHostsPairingClient()
+            pairingClient: ImmediateRemoteHostsPairingClient(),
+            discoveryService: discovery
         )
 
-        viewModel.pairingPayloadText = "{\"kind\":\"not_repoprompt\"}"
-        viewModel.parsePairingPayloadText()
+        viewModel.findHosts()
+        await waitForDiscovery(viewModel)
 
-        XCTAssertNil(viewModel.pairingPreview)
-        XCTAssertEqual(
-            viewModel.errorMessage,
-            "Pairing payload must be valid JSON copied from the host's Remote Control settings."
-        )
-        XCTAssertFalse(viewModel.canPair)
+        XCTAssertEqual(viewModel.discoveryState, .failed(message: "Tailscale is not ready (Stopped)."))
+        XCTAssertEqual(viewModel.errorMessage, "Tailscale is not ready (Stopped).")
+        XCTAssertTrue(viewModel.discoveredHosts.isEmpty)
+        XCTAssertFalse(registry.hasHosts)
+    }
+
+    private func waitForDiscovery(
+        _ viewModel: RemoteHostsSettingsViewModel,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0 ..< 50 {
+            if !viewModel.discoveryState.isSearching { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for discovery", file: file, line: line)
     }
 
     private func waitForPairingRequest(
@@ -270,6 +296,27 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
         XCTFail("Timed out waiting for pairing request", file: file, line: line)
     }
 
+    private static func candidate(
+        hostSigner: P256.Signing.PrivateKey,
+        origin: RemoteGatewayOrigin
+    ) -> VerifiedRemoteHostCandidate {
+        VerifiedRemoteHostCandidate(
+            tailscalePeerID: "peer-1",
+            tailscalePeerName: "studio.tailnet.ts.net",
+            tailscaleDNSName: "studio.tailnet.ts.net",
+            tailscaleIPv4: "100.64.0.8",
+            channel: .release,
+            origin: origin,
+            signedHostName: "Studio",
+            hostFingerprint: RemotePairingCrypto.fingerprint(for: hostSigner.publicKey),
+            hostPublicKey: hostSigner.publicKey.rawRepresentation,
+            bundleID: "com.pvncher.repoprompt.ce",
+            marketingVersion: "1.0",
+            buildVersion: "1",
+            capabilities: ["approval_context_v1", "native_pairing_v1"]
+        )
+    }
+
     fileprivate nonisolated static func record(from payload: RemotePairingPayload) throws -> PairedHostRecord {
         let deviceKey = P256.Signing.PrivateKey()
         return try PairedHostRecord(
@@ -281,6 +328,42 @@ final class RemoteHostsSettingsViewModelTests: XCTestCase {
             grantedScopes: RemoteHostPairingClient.defaultRequestedScopes,
             pairedAt: Date(timeIntervalSince1970: 1_800_000_000)
         )
+    }
+}
+
+private actor StubRemoteHostsDiscovery: RemoteHostsDiscovering {
+    private let result: RemoteHostDiscoveryResult?
+    private let payload: RemotePairingPayload?
+    private let error: (any Error)?
+    private var revalidations = 0
+
+    init(result: RemoteHostDiscoveryResult, payload: RemotePairingPayload) {
+        self.result = result
+        self.payload = payload
+        error = nil
+    }
+
+    init(error: any Error) {
+        result = nil
+        payload = nil
+        self.error = error
+    }
+
+    func search() async throws -> RemoteHostDiscoveryResult {
+        if let error { throw error }
+        guard let result else { throw RemoteHostDiscoveryError.invalidResponse }
+        return result
+    }
+
+    func revalidateForPairing(_: VerifiedRemoteHostCandidate) async throws -> RemotePairingPayload {
+        revalidations += 1
+        if let error { throw error }
+        guard let payload else { throw RemoteHostDiscoveryError.invalidResponse }
+        return payload
+    }
+
+    func revalidationCount() -> Int {
+        revalidations
     }
 }
 

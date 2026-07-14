@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptRemoteWire
 
 protocol RemotePairingKeychainStoring: Sendable {
     func get(for key: String, accessMode: KeychainAccessMode) throws -> String
@@ -25,9 +26,11 @@ enum RemotePairingIdentityStoreError: Error, Equatable {
 final class RemotePairingIdentityStore: @unchecked Sendable {
     static let shared = RemotePairingIdentityStore()
 
-    static let directoryComponents = ["RepoPrompt CE", "RemoteControl"]
+    static let directoryComponents = RemoteControlStorageNamespace.rootComponents
     static let fileName = "paired-devices-v1.json"
-    static let hostSigningKeyAccount = "remote-control-host-signing-key-v1"
+    static var hostSigningKeyAccount: String {
+        RemoteControlStorageNamespace.hostSigningKeyAccount()
+    }
 
     let url: URL
 
@@ -54,13 +57,11 @@ final class RemotePairingIdentityStore: @unchecked Sendable {
         self.keychain = keychain
     }
 
-    static func defaultURL(fileManager: FileManager = .default) -> URL {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
-        return directoryComponents.reduce(base) { url, component in
-            url.appendingPathComponent(component, isDirectory: true)
-        }
-        .appendingPathComponent(fileName, isDirectory: false)
+    static func defaultURL(
+        channel: RemoteControlBuildChannel = RemoteControlBuildIdentity.current.channel,
+        fileManager: FileManager = .default
+    ) -> URL {
+        RemoteControlStorageNamespace.pairedDevicesURL(channel: channel, fileManager: fileManager)
     }
 
     func hostPublicKeyInfo() throws -> RemoteHostPublicKeyInfo {

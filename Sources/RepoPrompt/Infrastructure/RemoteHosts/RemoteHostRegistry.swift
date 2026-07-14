@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import RepoPromptRemoteWire
 
 enum RemoteHostRegistryError: Error, Equatable {
     case missing
@@ -15,7 +16,7 @@ enum RemoteHostRegistryError: Error, Equatable {
 final class RemoteHostRegistry: @unchecked Sendable {
     static let shared = RemoteHostRegistry()
 
-    static let directoryComponents = ["RepoPrompt CE", "RemoteControl"]
+    static let directoryComponents = RemoteControlStorageNamespace.rootComponents
     static let fileName = "remote-hosts-v1.json"
 
     let url: URL
@@ -34,13 +35,11 @@ final class RemoteHostRegistry: @unchecked Sendable {
         self.expectedOwnerID = expectedOwnerID
     }
 
-    static func defaultURL(fileManager: FileManager = .default) -> URL {
-        let base = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support", isDirectory: true)
-        return directoryComponents.reduce(base) { url, component in
-            url.appendingPathComponent(component, isDirectory: true)
-        }
-        .appendingPathComponent(fileName, isDirectory: false)
+    static func defaultURL(
+        channel: RemoteControlBuildChannel = RemoteControlBuildIdentity.current.channel,
+        fileManager: FileManager = .default
+    ) -> URL {
+        RemoteControlStorageNamespace.hostRegistryURL(channel: channel, fileManager: fileManager)
     }
 
     var hasHosts: Bool {
@@ -247,10 +246,7 @@ final class RemoteHostRegistry: @unchecked Sendable {
     }
 
     static func isValidGatewayURL(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
-            return false
-        }
-        return !(url.host(percentEncoded: false)?.isEmpty ?? true)
+        (try? RemoteGatewayOrigin(url)) != nil
     }
 
     static func isValidHostFingerprint(_ value: String) -> Bool {

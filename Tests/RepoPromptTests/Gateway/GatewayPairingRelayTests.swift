@@ -1,6 +1,7 @@
 import Foundation
 import Logging
 @testable import RepoPromptGateway
+import RepoPromptRemoteWire
 import XCTest
 
 final class GatewayPairingRelayTests: XCTestCase {
@@ -50,7 +51,34 @@ final class GatewayPairingRelayTests: XCTestCase {
         XCTAssertTrue(response.body.objectValue?["error"]?.stringValue?.contains("The app link is unavailable") == true)
     }
 
-    func testRelayedCallsForwardWindowIDAsPublicPairingContext() async throws {
+    func testPairingDenialPreservesCanonical403Response() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let payload: JSONValue = .object([
+            "ok": .bool(false),
+            "code": .string("pairing_denied"),
+            "error": .string("Remote device pairing was denied by the user."),
+            "status": .int(403)
+        ])
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: payload))
+        ])
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let relay = GatewayPairingRelay(appLink: appLink)
+
+        let response = await relay.handle(path: GatewayPairingRelay.completePairingPath, body: Data())
+
+        XCTAssertEqual(response.status, 403)
+        XCTAssertEqual(response.body, payload)
+    }
+
+    func testRelayedCallsRemoveWindowIDAndForwardApprovalContext() async throws {
         let root = try GatewayTestHelpers.temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
         let config = try GatewayTestHelpers.configuration(root: root)
@@ -66,7 +94,7 @@ final class GatewayPairingRelayTests: XCTestCase {
             (
                 GatewayPairingRelay.beginPairingPath,
                 "begin_pairing",
-                ["window_id": 7]
+                ["window_id": 7, "approval_context": "fresh-context"]
             ),
             (
                 GatewayPairingRelay.completePairingPath,
@@ -102,9 +130,50 @@ final class GatewayPairingRelayTests: XCTestCase {
         for (call, request) in zip(calls, requests) {
             XCTAssertEqual(call.name, "remote_pairing", request.op)
             XCTAssertEqual(call.arguments["op"]?.stringValue, request.op)
-            XCTAssertEqual(call.arguments["window_id"], .int(7), request.op)
+            XCTAssertNil(call.arguments["window_id"], request.op)
             XCTAssertNil(call.arguments["_windowID"], request.op)
         }
+        XCTAssertEqual(calls.first?.arguments["approval_context"], .string("fresh-context"))
+    }
+
+    func testDiscoveryRouteValidatesBoundsAndForwardsOnlyNonceAndChannel() async throws {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let connection = RecordingAppLinkConnection()
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let relay = GatewayPairingRelay(appLink: appLink)
+        let body = try JSONSerialization.data(withJSONObject: [
+            "v": 1,
+            "kind": "repoprompt_remote_discovery",
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "channel": "release",
+            "forwarded_for": "untrusted"
+        ])
+
+        let response = await relay.handle(
+            path: GatewayPairingRelay.discoveryPath,
+            body: body,
+            peerAddress: "100.64.0.9"
+        )
+        XCTAssertEqual(response.status, 200)
+        let calls = await connection.calls
+        let call = try XCTUnwrap(calls.first)
+        XCTAssertEqual(call.arguments["op"], .string("discover_host"))
+        XCTAssertEqual(call.arguments["channel"], .string("release"))
+        XCTAssertNil(call.arguments["forwarded_for"])
+
+        let oversized = await relay.handle(
+            path: GatewayPairingRelay.discoveryPath,
+            body: Data(repeating: 0, count: GatewayPairingRelay.maximumDiscoveryRequestBytes + 1),
+            peerAddress: "100.64.0.9"
+        )
+        XCTAssertEqual(oversized.status, 413)
     }
 
     func testRelayedPairingCallsRequestRawJSONToolOutput() async throws {
