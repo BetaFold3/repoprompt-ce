@@ -126,13 +126,17 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
     }
 
     func testWorkspaceCatalogUnionThenWarmAffinityWatchAndSteerWithoutRediscovery() async throws {
+        let validationGate = RecordingAppLinkResponseGate()
         let connection = RecordingAppLinkConnection(responses: [
             .result(twoWindowSharedWorkspaceListResponse()),
             .result(workspaceSessionListResponse(windowOneSessions())),
             .result(workspaceSessionListResponse(windowTwoSessions())),
-            .result(GatewayTestHelpers.toolResult(
-                json: GatewayTestHelpers.snapshot(sessionID: windowOneNewerID, status: "running")
-            ))
+            .gated(
+                GatewayTestHelpers.toolResult(
+                    json: GatewayTestHelpers.snapshot(sessionID: windowOneNewerID, status: "running")
+                ),
+                validationGate
+            )
         ])
         let runtime = try await makeRuntime(
             connection: connection,
@@ -160,10 +164,16 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
 
         // Subscribe to a window-one session the gateway never started: warm
         // affinity recorded by the fan-out routes the watch without rediscovery.
+        let subscribeRequest = RemoteClientFrame(
+            type: "subscribe",
+            requestID: "integration-warm-subscribe",
+            sessionID: windowOneNewerID
+        )
+        let subscribeSinkID = UUID()
         let subscribeResponse = await runtime.handle(
-            RemoteClientFrame(type: "subscribe", requestID: "integration-warm-subscribe", sessionID: windowOneNewerID),
+            subscribeRequest,
             deviceID: "device",
-            sinkID: UUID(),
+            sinkID: subscribeSinkID,
             sink: sink
         )
         XCTAssertEqual(subscribeResponse?.type, "command_result")
@@ -171,6 +181,17 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
             subscribeResponse?.payload?.objectValue?["subscribed_session_ids"]?.arrayValue,
             [.string(windowOneNewerID)]
         )
+        let queuedSubscribeResponse = try XCTUnwrap(subscribeResponse)
+        await sink.send(queuedSubscribeResponse)
+        await runtime.didQueueResponse(
+            for: subscribeRequest,
+            response: queuedSubscribeResponse,
+            deviceID: "device",
+            sinkID: subscribeSinkID
+        )
+        await validationGate.waitUntilEntered()
+        await validationGate.release()
+
         var calls = await connection.calls
         let warmPoll = try XCTUnwrap(calls.last { $0.name == "agent_run" && $0.arguments["op"] == .string("poll") })
         XCTAssertEqual(warmPoll.arguments["_windowID"], .int(1))
@@ -220,13 +241,17 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         // Simulated gateway restart: a fresh runtime and connection carry no
         // affinity, so pickup of a never-started session must succeed through
         // the discovery sweep alone (Decision 5: affinity is only latency).
+        let validationGate = RecordingAppLinkResponseGate()
         let connection = RecordingAppLinkConnection(responses: [
             .result(twoWindowSharedWorkspaceListResponse()),
             .result(workspaceSessionListResponse(windowOneSessions())),
             .result(workspaceSessionListResponse(windowTwoSessions())),
-            .result(GatewayTestHelpers.toolResult(
-                json: GatewayTestHelpers.snapshot(sessionID: windowTwoOlderID, status: "running")
-            ))
+            .gated(
+                GatewayTestHelpers.toolResult(
+                    json: GatewayTestHelpers.snapshot(sessionID: windowTwoOlderID, status: "running")
+                ),
+                validationGate
+            )
         ])
         let runtime = try await makeRuntime(
             connection: connection,
@@ -234,10 +259,16 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         )
         let sink = RecordingFrameSink()
 
+        let subscribeRequest = RemoteClientFrame(
+            type: "subscribe",
+            requestID: "integration-cold-subscribe",
+            sessionID: windowTwoOlderID
+        )
+        let subscribeSinkID = UUID()
         let subscribeResponse = await runtime.handle(
-            RemoteClientFrame(type: "subscribe", requestID: "integration-cold-subscribe", sessionID: windowTwoOlderID),
+            subscribeRequest,
             deviceID: "device",
-            sinkID: UUID(),
+            sinkID: subscribeSinkID,
             sink: sink
         )
         XCTAssertEqual(subscribeResponse?.type, "command_result")
@@ -245,6 +276,17 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
             subscribeResponse?.payload?.objectValue?["subscribed_session_ids"]?.arrayValue,
             [.string(windowTwoOlderID)]
         )
+        let queuedSubscribeResponse = try XCTUnwrap(subscribeResponse)
+        await sink.send(queuedSubscribeResponse)
+        await runtime.didQueueResponse(
+            for: subscribeRequest,
+            response: queuedSubscribeResponse,
+            deviceID: "device",
+            sinkID: subscribeSinkID
+        )
+        await validationGate.waitUntilEntered()
+        await validationGate.release()
+
         var calls = await connection.calls
         XCTAssertEqual(calls.count(where: { $0.name == "bind_context" }), 1)
         let discoveryCalls = calls.filter { $0.name == "agent_manage" && $0.arguments["op"] == .string("list_sessions") }
