@@ -110,6 +110,7 @@ final class RemoteWorkspaceSessionCatalogStore: RemoteWorkspaceSessionCatalogSto
     func invalidate(hostID: String) {
         invalidationGenerationByHostID[hostID, default: 0] &+= 1
         cache = cache.filter { $0.key.hostID != hostID }
+        learnedHostWorkspaceIDByKey = learnedHostWorkspaceIDByKey.filter { $0.key.hostID != hostID }
     }
 
     func learnedHostWorkspaceID(hostID: String, clientWorkspaceID: UUID) -> String? {

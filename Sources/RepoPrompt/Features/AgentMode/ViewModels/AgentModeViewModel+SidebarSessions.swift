@@ -593,6 +593,18 @@ extension AgentModeViewModel {
             workspaceName: context.workspaceName,
             forceRefresh: forceRefresh
         )
+        if case .loaded = state,
+           let episode = remoteCoordinator.workspaceOpenEpisodeState(
+               hostID: context.hostRecord.id,
+               clientWorkspaceID: context.clientWorkspaceID
+           ),
+           case .failed = episode
+        {
+            remoteCoordinator.resetWorkspaceOpenEpisode(
+                hostID: context.hostRecord.id,
+                clientWorkspaceID: context.clientWorkspaceID
+            )
+        }
         if case .workspaceNotOpen = state {
             await remoteCoordinator.autoOpenWorkspaceIfNeeded(
                 hostRecord: context.hostRecord,

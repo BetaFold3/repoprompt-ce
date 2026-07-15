@@ -2390,6 +2390,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         return items.map { $0.formattedCount() }.joined(separator: ", ")
     }
 
+    /// Requests a workspace switch. When `bypassSessionCancellationConfirmation` is true,
+    /// active sessions cause an automatic decline (`.cancelled`); they are never ended implicitly.
     @MainActor
     func requestWorkspaceSwitch(
         to newWorkspace: WorkspaceModel,

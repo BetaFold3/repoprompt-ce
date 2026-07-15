@@ -161,6 +161,57 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     }
 
     @MainActor
+    func testStaleLearnedIDSuccessfulNameRetryDoesNotLoopWhenCatalogRemainsNotOpen() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+        store.learnedWorkspaceID = "deleted-workspace-id"
+        let connection = WorkspaceOpenRecordingConnection(outcomes: [
+            .failure(.fromCommandError(code: "workspace_not_found", message: "Deleted workspace")),
+            .success
+        ])
+        let fixture = try await makeFixture(store: store, workspaceOpenConnection: connection)
+
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+
+        let frames = await connection.frames()
+        XCTAssertEqual(frames.count, 2)
+        XCTAssertEqual(frames[0].payload?.objectValue?["workspace_id"], .string("deleted-workspace-id"))
+        XCTAssertNil(frames[1].payload?.objectValue?["workspace_id"])
+        guard case .error = try XCTUnwrap(fixture.viewModel.remoteWorkspaceSidebarSection()).content else {
+            return XCTFail("Expected the still-not-open state to remain terminal until Retry or recovery")
+        }
+    }
+
+    @MainActor
+    func testLoadedCatalogClearsFailedAutoOpenEpisode() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+        let failure = RemoteClientError.fromCommandError(code: "unsupported_frame_type", message: "Unsupported")
+        let connection = WorkspaceOpenRecordingConnection(outcomes: [.failure(failure)])
+        let fixture = try await makeFixture(store: store, workspaceOpenConnection: connection)
+
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+        guard case .error = try XCTUnwrap(fixture.viewModel.remoteWorkspaceSidebarSection()).content else {
+            return XCTFail("Expected failed auto-open episode")
+        }
+
+        store.state = .loaded(.init(
+            hostWorkspaceID: "recovered-workspace-id",
+            hostWorkspaceName: "Project Alpha",
+            sessions: [],
+            fetchedAt: Date()
+        ))
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+
+        XCTAssertEqual(
+            try XCTUnwrap(fixture.viewModel.remoteWorkspaceSidebarSection()).content,
+            .sessions([])
+        )
+        let commandCount = await connection.commandCount()
+        XCTAssertEqual(commandCount, 1)
+    }
+
+    @MainActor
     func testAutoOpenEpisodeRequiresRetryOrEligibleReconnect() async throws {
         let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
         let failure = RemoteClientError.fromCommandError(code: "unsupported_frame_type", message: "Unsupported")

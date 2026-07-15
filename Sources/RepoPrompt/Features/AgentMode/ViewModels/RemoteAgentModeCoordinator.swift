@@ -923,13 +923,26 @@ final class RemoteAgentModeCoordinator {
                 )
             }
             workspaceSessionCatalogStore.invalidate(hostID: hostRecord.id)
-            _ = await workspaceSessionCatalogStore.fetch(
+            let refreshedState = await workspaceSessionCatalogStore.fetch(
                 hostID: hostRecord.id,
                 clientWorkspaceID: clientWorkspaceID,
                 workspaceName: workspaceName,
                 forceRefresh: true
             )
-            workspaceOpenEpisodes.removeValue(forKey: key)
+            switch refreshedState {
+            case .loaded:
+                workspaceOpenEpisodes.removeValue(forKey: key)
+            case .workspaceNotOpen:
+                workspaceOpenEpisodes[key] = .failed(
+                    "Workspace '\(workspaceName)' is still not open on \(hostRecord.displayName). Try again."
+                )
+            case .unsupported:
+                workspaceOpenEpisodes[key] = .failed(
+                    "\(hostRecord.displayName) doesn't support workspace browsing (update RepoPrompt on the host)."
+                )
+            case let .error(message):
+                workspaceOpenEpisodes[key] = .failed(message)
+            }
         } catch {
             workspaceOpenEpisodes[key] = .failed(Self.describe(
                 error,

@@ -1594,6 +1594,7 @@ final class WindowRoutingService: Service {
         guard windowStates.allWindows.isEmpty else { return nil }
 
         let flightID = UUID()
+        workspaceBootstrapClaimedWorkspaceID = nil
         let task = Task { @MainActor [self] in try await openInitializedWindow() }
         workspaceBootstrapFlight = WorkspaceBootstrapFlight(id: flightID, task: task)
         do {
@@ -1655,11 +1656,16 @@ final class WindowRoutingService: Service {
                workspaceBootstrapClaimedWorkspaceID == nil || workspaceBootstrapClaimedWorkspaceID == targetWorkspace.id
             {
                 workspaceBootstrapClaimedWorkspaceID = targetWorkspace.id
-                try await switchWindowToWorkspace(
-                    bootstrapWindow,
-                    workspace: targetWorkspace,
-                    bypassSessionCancellationConfirmation: true
-                )
+                do {
+                    try await switchWindowToWorkspace(
+                        bootstrapWindow,
+                        workspace: targetWorkspace,
+                        bypassSessionCancellationConfirmation: true
+                    )
+                } catch {
+                    workspaceBootstrapClaimedWorkspaceID = nil
+                    throw error
+                }
                 targetWindow = bootstrapWindow
             } else {
                 targetWindow = try await openNewWindowShowingWorkspace(
