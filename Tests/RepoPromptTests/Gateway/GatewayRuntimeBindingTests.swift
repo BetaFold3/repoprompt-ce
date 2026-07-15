@@ -34,7 +34,9 @@ private final class BindingProbeRecorder: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         callCount += 1
-        if states.isEmpty { return .ambiguousStartTarget("multiple windows") }
+        if states.isEmpty {
+            return .ambiguousStartTarget("multiple windows")
+        }
         return states.removeFirst()
     }
 
@@ -241,6 +243,136 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             await runtime.resolveSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
         }
         return runtime
+    }
+
+    func testWarmObservationAffinityBypassesAppLinkLookupBindingRefreshAndDiscovery() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let canonicalSessionID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+        do {
+            let connection = RecordingAppLinkConnection(responses: [
+                .result(GatewayTestHelpers.toolResult(json: .object([
+                    "session_id": .string(canonicalSessionID),
+                    "status": .string("running")
+                ])))
+            ])
+            let root = try GatewayTestHelpers.temporaryRoot()
+            let config = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+            let probe = BindingProbeRecorder([.bound])
+            let pool = AppLinkPool(
+                configuration: config,
+                connector: BindingRuntimeConnector(connection: connection),
+                bindingProbe: { _ in probe.next() }
+            )
+            _ = try await pool.ensureLink(forDevice: deviceID)
+            let defaultAppLink = AppLinkSession(
+                config: config,
+                connector: StaticAppLinkConnector(connection: RecordingAppLinkConnection())
+            )
+            try await defaultAppLink.connect()
+            let watchManager = SessionWatchManager(appLink: defaultAppLink, appLinkPool: pool)
+            let runtime = try RemoteGatewayRuntime(
+                appLink: defaultAppLink,
+                ledger: CommandLedger(),
+                watchManager: watchManager,
+                auditLog: nil,
+                appLinkPool: pool
+            )
+
+            let start = await runtime.handle(
+                RemoteClientFrame(
+                    type: "start",
+                    requestID: "warm-unavailable-start",
+                    payload: .object([
+                        "message": .string("go"),
+                        "window_id": .int(2)
+                    ])
+                ),
+                deviceID: deviceID,
+                sinkID: UUID(),
+                sink: RecordingFrameSink()
+            )
+            XCTAssertEqual(start?.type, "command_result")
+            let callCountBeforeTeardown = await connection.calls.count
+            XCTAssertEqual(callCountBeforeTeardown, 1)
+            let didTeardown = await pool.teardown(deviceID: deviceID)
+            XCTAssertTrue(didTeardown)
+
+            let resolved = await runtime.resolveSessionWindowForObservation(
+                deviceID: deviceID,
+                sessionID: "  \(canonicalSessionID)  "
+            )
+            XCTAssertEqual(resolved, 2)
+            let callCountAfterResolution = await connection.calls.count
+            XCTAssertEqual(callCountAfterResolution, 1)
+            XCTAssertEqual(probe.count, 1)
+        }
+
+        do {
+            let refreshSessionID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+            let connection = RecordingAppLinkConnection(responses: [
+                .result(GatewayTestHelpers.toolResult(json: .object([
+                    "session_id": .string(refreshSessionID),
+                    "status": .string("running")
+                ])))
+            ])
+            let root = try GatewayTestHelpers.temporaryRoot()
+            let config = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+            let initialProbe = BindingProbeRecorder([.bound])
+            let refreshProbe = BindingProbeRecorder([.bound])
+            let pool = AppLinkPool(
+                configuration: config,
+                connector: BindingRuntimeConnector(connection: connection),
+                bindingProbe: { _ in initialProbe.next() },
+                refreshBindingProbe: { _ in refreshProbe.next() },
+                unknownBindingRefreshCooldown: 0
+            )
+            _ = try await pool.ensureLink(forDevice: deviceID)
+            let defaultAppLink = AppLinkSession(
+                config: config,
+                connector: StaticAppLinkConnector(connection: RecordingAppLinkConnection())
+            )
+            try await defaultAppLink.connect()
+            let watchManager = SessionWatchManager(appLink: defaultAppLink, appLinkPool: pool)
+            let runtime = try RemoteGatewayRuntime(
+                appLink: defaultAppLink,
+                ledger: CommandLedger(),
+                watchManager: watchManager,
+                auditLog: nil,
+                appLinkPool: pool
+            )
+
+            let start = await runtime.handle(
+                RemoteClientFrame(
+                    type: "start",
+                    requestID: "warm-refresh-start",
+                    payload: .object([
+                        "message": .string("go"),
+                        "window_id": .int(2)
+                    ])
+                ),
+                deviceID: deviceID,
+                sinkID: UUID(),
+                sink: RecordingFrameSink()
+            )
+            XCTAssertEqual(start?.type, "command_result")
+            await pool.setBindingState(.bound, forDevice: deviceID, refreshOnNextResolve: true)
+            let callsBeforeResolution = await connection.calls
+            let refreshCountBeforeResolution = refreshProbe.count
+
+            let resolved = await runtime.resolveSessionWindowForObservation(
+                deviceID: deviceID,
+                sessionID: "\n\(refreshSessionID)\t"
+            )
+            XCTAssertEqual(resolved, 2)
+            XCTAssertEqual(refreshProbe.count, refreshCountBeforeResolution)
+            let callsAfterResolution = await connection.calls
+            XCTAssertEqual(callsAfterResolution, callsBeforeResolution)
+            XCTAssertFalse(callsBeforeResolution.contains {
+                $0.name == "bind_context"
+                    || $0.name == "agent_manage" && $0.arguments["op"] == .string("list_sessions")
+            })
+        }
     }
 
     func testSubscribeAcknowledgesBeforeDeferredValidationCanEmit() async throws {
@@ -1723,7 +1855,9 @@ final class GatewayRuntimeBindingTests: XCTestCase {
     ) async -> [RemoteServerFrame] {
         for _ in 0 ..< 100 {
             let frames = await sink.frames.filter { $0.type == "session_update" }
-            if frames.count >= minimumCount { return frames }
+            if frames.count >= minimumCount {
+                return frames
+            }
             try? await Task.sleep(for: .milliseconds(10))
         }
         let frames = await sink.frames.filter { $0.type == "session_update" }

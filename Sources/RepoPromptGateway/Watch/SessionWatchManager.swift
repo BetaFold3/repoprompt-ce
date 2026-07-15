@@ -219,6 +219,7 @@ actor SessionWatchManager {
                       token: token
                   )
             else { continue }
+            logger.info("watch validation started device_id=\(validation.deviceID) session_id=\(sessionID) stage=subscribe")
             await validateAndAddSession(
                 deviceID: validation.deviceID,
                 sessionID: sessionID,
@@ -769,13 +770,25 @@ actor SessionWatchManager {
 
     private func callAgentRunPollPartition(deviceID: String, sessionIDs: [String], windowID: Int?) async throws -> JSONValue {
         var args = agentRunSessionArgs(op: "poll", sessionIDs: sessionIDs, windowID: windowID)
-        let result = try await appLink(forDevice: deviceID).callTool(name: "agent_run", arguments: args, timeout: 15)
-        let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
-        if result.isError == true {
-            // Tool-level errors are retryable observation pauses, never expiry.
-            throw SessionWatchError.toolCallFailed(Self.toolErrorMessage(from: payload))
+        logger.info("watch validation poll issued device_id=\(deviceID) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none")")
+        var didLogReturn = false
+        do {
+            let result = try await appLink(forDevice: deviceID).callTool(name: "agent_run", arguments: args, timeout: 15)
+            let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
+            let outcome = result.isError == true ? "tool_error" : "success"
+            logger.info("watch validation poll returned device_id=\(deviceID) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none") outcome=\(outcome)")
+            didLogReturn = true
+            if result.isError == true {
+                // Tool-level errors are retryable observation pauses, never expiry.
+                throw SessionWatchError.toolCallFailed(Self.toolErrorMessage(from: payload))
+            }
+            return payload
+        } catch {
+            if !didLogReturn {
+                logger.info("watch validation poll returned device_id=\(deviceID) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none") outcome=error")
+            }
+            throw error
         }
-        return payload
     }
 
     private func callAgentRunWait(

@@ -17,6 +17,27 @@ extension RemoteAgentSessionConnection {
 
 extension RemoteHostConnection: RemoteAgentSessionConnection {}
 
+protocol RemoteAgentSessionRecoveryScheduling: Sendable {
+    func sleep(seconds: TimeInterval) async throws
+}
+
+struct RemoteAgentSessionTaskRecoveryScheduler: RemoteAgentSessionRecoveryScheduling {
+    func sleep(seconds: TimeInterval) async throws {
+        let milliseconds = Int64((max(0, seconds) * 1000).rounded(.up))
+        try await Task.sleep(for: .milliseconds(milliseconds))
+    }
+}
+
+struct RemoteAgentSessionRecoveryPolicy: Sendable {
+    var staleIntervalSeconds: TimeInterval
+    var retryDelaySeconds: [TimeInterval]
+
+    static let `default` = RemoteAgentSessionRecoveryPolicy(
+        staleIntervalSeconds: 30,
+        retryDelaySeconds: [5, 10]
+    )
+}
+
 struct RemoteChannelState: Equatable {
     enum Kind: Equatable {
         case connected
@@ -74,6 +95,8 @@ actor RemoteAgentSessionController {
     private let hostID: String
     private let hostDisplayName: String
     private let connection: any RemoteAgentSessionConnection
+    private let recoveryScheduler: any RemoteAgentSessionRecoveryScheduling
+    private let recoveryPolicy: RemoteAgentSessionRecoveryPolicy
     private let eventsContinuation: AsyncStream<RemoteSessionEvent>.Continuation
     private var remoteSessionID: String?
     private var lastAppliedSeq: UInt64
@@ -84,10 +107,20 @@ actor RemoteAgentSessionController {
     private var lastKnownRunState: AgentSessionRunState = .idle
     private var scheduledLogCatchUpTask: Task<Void, Never>?
     private var scheduledLogCatchUpDirty = false
+    private var catchUpTask: Task<Void, Error>?
+    private var catchUpTaskID: UUID?
+    private var catchUpTaskSessionID: String?
+    private var catchUpTaskLifecycleGeneration: UUID?
+    private var catchUpTaskPollsHost: Bool?
     private var observationRecoveryTask: Task<Void, Never>?
     private var observationRecoveryGeneration: UUID?
     private var observationLifecycleGeneration = UUID()
     private var observationEnabled = true
+    private var attachedObservationSessionID: String?
+    private var staleRecoveryTask: Task<Void, Never>?
+    private var staleRecoveryGeneration: UUID?
+    private var staleProgressGeneration: UInt64 = 0
+    private var observationPaused = false
     private var didReportObservationFailure = false
     private var didReportLogCatchUpFailure = false
     private var didYieldSessionExpired = false
@@ -99,7 +132,9 @@ actor RemoteAgentSessionController {
 
     init(
         binding: AgentSessionRemoteHostBinding,
-        connection: any RemoteAgentSessionConnection
+        connection: any RemoteAgentSessionConnection,
+        recoveryScheduler: any RemoteAgentSessionRecoveryScheduling = RemoteAgentSessionTaskRecoveryScheduler(),
+        recoveryPolicy: RemoteAgentSessionRecoveryPolicy = .default
     ) {
         hostID = binding.hostID
         hostDisplayName = binding.hostDisplayName
@@ -109,6 +144,8 @@ actor RemoteAgentSessionController {
         seqEpoch = Self.normalizedSequenceEpoch(binding.seqEpoch)
         nextLogOffset = binding.nextLogOffset
         self.connection = connection
+        self.recoveryScheduler = recoveryScheduler
+        self.recoveryPolicy = recoveryPolicy
         if !binding.remoteSessionID.isEmpty {
             projector = RemoteTranscriptProjector(remoteSessionID: binding.remoteSessionID)
         }
@@ -128,10 +165,15 @@ actor RemoteAgentSessionController {
         isShutdown = true
         observationEnabled = false
         observationLifecycleGeneration = UUID()
+        attachedObservationSessionID = nil
         scheduledLogCatchUpTask?.cancel()
+        scheduledLogCatchUpTask = nil
+        scheduledLogCatchUpDirty = false
+        cancelCatchUpTask()
         observationRecoveryTask?.cancel()
         observationRecoveryTask = nil
         observationRecoveryGeneration = nil
+        stopStaleRecovery(reason: "shutdown")
         eventsContinuation.finish()
     }
 
@@ -147,6 +189,13 @@ actor RemoteAgentSessionController {
         observationRecoveryTask?.cancel()
         observationRecoveryTask = nil
         observationRecoveryGeneration = nil
+        attachedObservationSessionID = nil
+        stopStaleRecovery(reason: "start")
+        scheduledLogCatchUpTask?.cancel()
+        scheduledLogCatchUpTask = nil
+        scheduledLogCatchUpDirty = false
+        cancelCatchUpTask()
+        observationPaused = false
         observationEnabled = true
         observationLifecycleGeneration = UUID()
         let observationGeneration = observationLifecycleGeneration
@@ -314,9 +363,15 @@ actor RemoteAgentSessionController {
     func unsubscribe() async {
         observationEnabled = false
         observationLifecycleGeneration = UUID()
+        attachedObservationSessionID = nil
         observationRecoveryTask?.cancel()
         observationRecoveryTask = nil
         observationRecoveryGeneration = nil
+        stopStaleRecovery(reason: "unsubscribe")
+        scheduledLogCatchUpTask?.cancel()
+        scheduledLogCatchUpTask = nil
+        scheduledLogCatchUpDirty = false
+        cancelCatchUpTask()
         guard let sessionID = remoteSessionID?.trimmingCharacters(in: .whitespacesAndNewlines), !sessionID.isEmpty else {
             return
         }
@@ -393,6 +448,7 @@ actor RemoteAgentSessionController {
             emitBinding()
         }
         logInboundFrameHandled(frame)
+        recordStaleObservationProgress(reason: "push")
         switch frame.type {
         case "session_update":
             if let payload = frame.payload {
@@ -434,13 +490,17 @@ actor RemoteAgentSessionController {
         guard !isShutdown else { return }
         switch state {
         case .connected:
+            observationPaused = false
             eventsContinuation.yield(.channel(.init(kind: .connected)))
+            scheduleStaleRecoveryIfEligible(reason: "connected")
         case let .degraded(code, _):
+            pauseStaleRecovery(reason: "degraded")
             eventsContinuation.yield(.channel(.init(kind: .degraded(reason: code))))
         case .revoked:
+            pauseStaleRecovery(reason: "revoked")
             eventsContinuation.yield(.channel(.init(kind: .revoked)))
         case .idle, .mintingTicket, .connecting:
-            break
+            pauseStaleRecovery(reason: "disconnected")
         }
     }
 
@@ -476,6 +536,8 @@ actor RemoteAgentSessionController {
             eventsContinuation.yield(.systemMessage("Remote observation restored."))
         }
         didReportObservationFailure = false
+        attachedObservationSessionID = sessionID
+        scheduleStaleRecoveryIfEligible(reason: "attached")
         return true
     }
 
@@ -498,6 +560,7 @@ actor RemoteAgentSessionController {
         guard isObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID),
               observationRecoveryTask == nil
         else { return }
+        stopStaleRecovery(reason: "transient_recovery")
         let generation = UUID()
         observationRecoveryGeneration = generation
         observationRecoveryTask = Task { [weak self] in
@@ -518,6 +581,7 @@ actor RemoteAgentSessionController {
             if observationRecoveryGeneration == generation {
                 observationRecoveryTask = nil
                 observationRecoveryGeneration = nil
+                scheduleStaleRecoveryIfEligible(reason: "transient_recovery_released")
             }
         }
         for attempt in 1 ... 3 {
@@ -602,9 +666,83 @@ actor RemoteAgentSessionController {
         }
     }
 
-    private func catchUpFromHost() async throws {
+    private func catchUpFromHost(pollHost: Bool = true) async throws {
         try ensureNotShutdown()
         guard let sessionID = remoteSessionID else { return }
+        let lifecycleGeneration = observationLifecycleGeneration
+        if let existingTask = catchUpTask {
+            let existingTaskID = catchUpTaskID
+            let isCurrentTask = catchUpTaskSessionID == sessionID
+                && catchUpTaskLifecycleGeneration == lifecycleGeneration
+            let existingModeCoversRequest = catchUpTaskPollsHost == true || !pollHost
+            if isCurrentTask, existingModeCoversRequest {
+                try await existingTask.value
+                return
+            }
+            if !isCurrentTask {
+                existingTask.cancel()
+                _ = try? await existingTask.value
+            } else {
+                try await existingTask.value
+            }
+            clearCatchUpTaskIfCurrent(id: existingTaskID)
+            try await catchUpFromHost(pollHost: pollHost)
+            return
+        }
+
+        let taskID = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            if pollHost {
+                try await performCatchUpFromHost(
+                    sessionID: sessionID,
+                    lifecycleGeneration: lifecycleGeneration
+                )
+            } else {
+                try await performLogCatchUpFromHost(
+                    sessionID: sessionID,
+                    lifecycleGeneration: lifecycleGeneration
+                )
+            }
+        }
+        catchUpTask = task
+        catchUpTaskID = taskID
+        catchUpTaskSessionID = sessionID
+        catchUpTaskLifecycleGeneration = lifecycleGeneration
+        catchUpTaskPollsHost = pollHost
+        do {
+            try await task.value
+            clearCatchUpTaskIfCurrent(id: taskID)
+        } catch {
+            clearCatchUpTaskIfCurrent(id: taskID)
+            throw error
+        }
+    }
+
+    private func clearCatchUpTaskIfCurrent(id: UUID?) {
+        guard catchUpTaskID == id else { return }
+        catchUpTask = nil
+        catchUpTaskID = nil
+        catchUpTaskSessionID = nil
+        catchUpTaskLifecycleGeneration = nil
+        catchUpTaskPollsHost = nil
+    }
+
+    private func cancelCatchUpTask() {
+        let task = catchUpTask
+        catchUpTask = nil
+        catchUpTaskID = nil
+        catchUpTaskSessionID = nil
+        catchUpTaskLifecycleGeneration = nil
+        catchUpTaskPollsHost = nil
+        task?.cancel()
+    }
+
+    private func performCatchUpFromHost(
+        sessionID: String,
+        lifecycleGeneration: UUID
+    ) async throws {
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
         let poll = RemoteClientFrame(
             type: "poll",
             requestID: makeRequestID(prefix: "poll"),
@@ -613,25 +751,49 @@ actor RemoteAgentSessionController {
         )
         do {
             let snapshot = try await connection.command(poll)
+            try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
             applySnapshot(snapshot, frameType: "session_update")
         } catch RemoteClientError.sessionExpired {
+            try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
             yieldSessionExpiredOnce()
             return
         }
 
-        try await pageLogsFromHost()
-        try await performTerminalSettleReReadIfNeeded()
+        try await performLogCatchUpFromHost(
+            sessionID: sessionID,
+            lifecycleGeneration: lifecycleGeneration
+        )
     }
 
-    private func pageLogsFromHost() async throws {
-        try ensureNotShutdown()
-        guard remoteSessionID != nil else { return }
+    private func performLogCatchUpFromHost(
+        sessionID: String,
+        lifecycleGeneration: UUID
+    ) async throws {
+        try await pageLogsFromHost(sessionID: sessionID, lifecycleGeneration: lifecycleGeneration)
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+        try await performTerminalSettleReReadIfNeeded(
+            sessionID: sessionID,
+            lifecycleGeneration: lifecycleGeneration
+        )
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+    }
+
+    private func pageLogsFromHost(
+        sessionID: String,
+        lifecycleGeneration: UUID
+    ) async throws {
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
         var keepPaging = true
         while keepPaging {
-            try ensureNotShutdown()
+            try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
             let offset = nextLogOffset
-            let page = try await fetchLogPage(offset: offset, limit: 20)
-            try ensureNotShutdown()
+            let page = try await fetchLogPage(
+                offset: offset,
+                limit: 20,
+                sessionID: sessionID,
+                lifecycleGeneration: lifecycleGeneration
+            )
+            try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
             guard page.returnedTurnCount > 0 else {
                 logLogPageResult(page, branch: "empty", emittedRowCount: 0)
                 return
@@ -666,8 +828,13 @@ actor RemoteAgentSessionController {
                 logLogPageResult(page, branch: "parked", emittedRowCount: page.items.count)
                 keepPaging = false
             } else {
-                let completedPage = try await fetchLogPage(offset: offset, limit: consumableOffset - offset)
-                try ensureNotShutdown()
+                let completedPage = try await fetchLogPage(
+                    offset: offset,
+                    limit: consumableOffset - offset,
+                    sessionID: sessionID,
+                    lifecycleGeneration: lifecycleGeneration
+                )
+                try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
                 let completedPageConsumableOffset = effectiveConsumableOffset(for: completedPage)
                 guard completedPageConsumableOffset >= completedPage.nextLogOffset else {
                     logLogPageResult(page, branch: "mixed-discarded", emittedRowCount: 0)
@@ -685,8 +852,11 @@ actor RemoteAgentSessionController {
         }
     }
 
-    private func performTerminalSettleReReadIfNeeded() async throws {
-        try ensureNotShutdown()
+    private func performTerminalSettleReReadIfNeeded(
+        sessionID: String,
+        lifecycleGeneration: UUID
+    ) async throws {
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
         guard !lastKnownRunState.isActive, !didTerminalSettleReRead else { return }
         let settleOffset: Int
         let settleLimit: Int
@@ -702,17 +872,25 @@ actor RemoteAgentSessionController {
         } else {
             return
         }
-        let page = try await fetchLogPage(offset: settleOffset, limit: settleLimit)
-        try ensureNotShutdown()
+        let page = try await fetchLogPage(
+            offset: settleOffset,
+            limit: settleLimit,
+            sessionID: sessionID,
+            lifecycleGeneration: lifecycleGeneration
+        )
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
         didTerminalSettleReRead = true
         emitLogPage(page, reconciliation: reconciliation)
         logLogPageResult(page, branch: "terminal-settle", emittedRowCount: page.items.count)
     }
 
-    private func fetchLogPage(offset: Int, limit: Int) async throws -> RemoteProjectedLogPage {
-        guard let sessionID = remoteSessionID else {
-            throw RemoteLogPagingError.missingSession
-        }
+    private func fetchLogPage(
+        offset: Int,
+        limit: Int,
+        sessionID: String,
+        lifecycleGeneration: UUID
+    ) async throws -> RemoteProjectedLogPage {
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
         Self.logger.log("remote get_log fetch session_id=\(sessionID, privacy: .public) offset=\(offset) limit=\(limit)")
         let logFrame = RemoteClientFrame(
             type: "get_log",
@@ -724,6 +902,7 @@ actor RemoteAgentSessionController {
             ])
         )
         let pagePayload = try await connection.command(logFrame)
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
         guard let page = projector?.projectGetLogResponse(pagePayload) else {
             throw RemoteLogPagingError.missingProjector
         }
@@ -791,7 +970,11 @@ actor RemoteAgentSessionController {
         nextLogOffset = max(nextLogOffset, offset)
         pruneProjectedRowRegistry()
         emitBinding()
-        return nextLogOffset > previousOffset
+        let didAdvance = nextLogOffset > previousOffset
+        if didAdvance {
+            recordStaleObservationProgress(reason: "log_offset_advanced")
+        }
+        return didAdvance
     }
 
     private func pruneProjectedRowRegistry() {
@@ -816,6 +999,9 @@ actor RemoteAgentSessionController {
     }
 
     private func reportLogCatchUpFailure(_ error: Error) {
+        if error is CancellationError {
+            return
+        }
         if let remoteError = error as? RemoteClientError,
            case .sessionExpired = remoteError
         {
@@ -833,11 +1019,147 @@ actor RemoteAgentSessionController {
 
     private func yieldSessionExpiredOnce() {
         lastKnownRunState = .failed
+        stopStaleRecovery(reason: "expired")
         guard !didYieldSessionExpired else { return }
         didYieldSessionExpired = true
         let sessionID = remoteSessionID ?? ""
         Self.logger.notice("remote session expired session_id=\(sessionID, privacy: .public)")
         eventsContinuation.yield(.sessionExpired)
+    }
+
+    private func scheduleStaleRecoveryIfEligible(reason: String) {
+        guard !isShutdown,
+              !observationPaused,
+              observationEnabled,
+              lastKnownRunState.isActive,
+              let sessionID = remoteSessionID,
+              attachedObservationSessionID == sessionID
+        else { return }
+        guard observationRecoveryTask == nil else {
+            Self.logger.notice("remote stale recovery deferred session_id=\(sessionID, privacy: .public) reason=transient_recovery")
+            return
+        }
+        guard staleRecoveryTask == nil else { return }
+
+        let generation = UUID()
+        let lifecycleGeneration = observationLifecycleGeneration
+        staleRecoveryGeneration = generation
+        let delay = recoveryPolicy.staleIntervalSeconds
+        Self.logger.notice("remote stale recovery scheduled session_id=\(sessionID, privacy: .public) reason=\(reason, privacy: .public) delay_seconds=\(delay)")
+        staleRecoveryTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await recoveryScheduler.sleep(seconds: delay)
+            } catch {
+                return
+            }
+            await runStaleRecovery(
+                for: sessionID,
+                generation: generation,
+                lifecycleGeneration: lifecycleGeneration
+            )
+        }
+    }
+
+    private func runStaleRecovery(
+        for sessionID: String,
+        generation: UUID,
+        lifecycleGeneration: UUID
+    ) async {
+        defer {
+            if staleRecoveryGeneration == generation {
+                staleRecoveryTask = nil
+                staleRecoveryGeneration = nil
+            }
+        }
+        let retryDelays = recoveryPolicy.retryDelaySeconds
+        let attemptCount = retryDelays.count + 1
+        for attempt in 1 ... attemptCount {
+            guard isStaleRecoveryCurrent(
+                generation: generation,
+                lifecycleGeneration: lifecycleGeneration,
+                sessionID: sessionID
+            ) else { return }
+            if observationRecoveryTask != nil {
+                Self.logger.notice("remote stale recovery deferred session_id=\(sessionID, privacy: .public) reason=transient_recovery attempt=\(attempt)")
+                return
+            }
+            if attempt > 1 {
+                let delay = retryDelays[attempt - 2]
+                do {
+                    try await recoveryScheduler.sleep(seconds: delay)
+                } catch {
+                    return
+                }
+                guard isStaleRecoveryCurrent(
+                    generation: generation,
+                    lifecycleGeneration: lifecycleGeneration,
+                    sessionID: sessionID
+                ) else { return }
+            }
+
+            let progressBeforeAttempt = staleProgressGeneration
+            Self.logger.notice("remote stale recovery attempted session_id=\(sessionID, privacy: .public) attempt=\(attempt) max_attempts=\(attemptCount)")
+            do {
+                try await catchUpFromHost()
+            } catch {
+                guard isStaleRecoveryCurrent(
+                    generation: generation,
+                    lifecycleGeneration: lifecycleGeneration,
+                    sessionID: sessionID
+                ) else { return }
+            }
+            guard isStaleRecoveryCurrent(
+                generation: generation,
+                lifecycleGeneration: lifecycleGeneration,
+                sessionID: sessionID
+            ) else { return }
+            if staleProgressGeneration != progressBeforeAttempt {
+                return
+            }
+            if attempt == attemptCount {
+                Self.logger.notice("remote stale recovery stopped session_id=\(sessionID, privacy: .public) reason=attempts_exhausted attempts=\(attemptCount)")
+            }
+        }
+    }
+
+    private func isStaleRecoveryCurrent(
+        generation: UUID,
+        lifecycleGeneration: UUID,
+        sessionID: String
+    ) -> Bool {
+        !Task.isCancelled
+            && staleRecoveryGeneration == generation
+            && !observationPaused
+            && attachedObservationSessionID == sessionID
+            && lastKnownRunState.isActive
+            && isObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+    }
+
+    private func recordStaleObservationProgress(reason: String) {
+        staleProgressGeneration &+= 1
+        guard lastKnownRunState.isActive else {
+            stopStaleRecovery(reason: "terminal")
+            return
+        }
+        stopStaleRecovery(reason: reason)
+        scheduleStaleRecoveryIfEligible(reason: reason)
+    }
+
+    private func pauseStaleRecovery(reason: String) {
+        observationPaused = true
+        let sessionID = remoteSessionID ?? ""
+        Self.logger.notice("remote stale recovery paused session_id=\(sessionID, privacy: .public) reason=\(reason, privacy: .public)")
+        stopStaleRecovery(reason: reason)
+    }
+
+    private func stopStaleRecovery(reason: String) {
+        guard staleRecoveryTask != nil else { return }
+        let sessionID = remoteSessionID ?? ""
+        Self.logger.notice("remote stale recovery stopped session_id=\(sessionID, privacy: .public) reason=\(reason, privacy: .public)")
+        staleRecoveryTask?.cancel()
+        staleRecoveryTask = nil
+        staleRecoveryGeneration = nil
     }
 
     private func scheduleLogCatchUp() {
@@ -848,8 +1170,7 @@ actor RemoteAgentSessionController {
             while self.scheduledLogCatchUpDirty, !self.isShutdown {
                 self.scheduledLogCatchUpDirty = false
                 do {
-                    try await self.pageLogsFromHost()
-                    try await self.performTerminalSettleReReadIfNeeded()
+                    try await self.catchUpFromHost(pollHost: false)
                     self.didReportLogCatchUpFailure = false
                 } catch {
                     self.reportLogCatchUpFailure(error)
@@ -874,9 +1195,13 @@ actor RemoteAgentSessionController {
             ))
         }
         let sessionID = remoteSessionID ?? ""
+        let wasActive = lastKnownRunState.isActive
         lastKnownRunState = projection.runState
         if projection.runState.isActive {
             didTerminalSettleReRead = false
+        } else if wasActive {
+            staleProgressGeneration &+= 1
+            stopStaleRecovery(reason: "terminal")
         }
         Self.logger.log("remote snapshot projected frame_type=\(frameType ?? "", privacy: .public) session_id=\(sessionID, privacy: .public) run_state=\(projection.runState.rawValue, privacy: .public) has_status_text=\(projection.statusText != nil)")
         eventsContinuation.yield(.runState(
@@ -912,6 +1237,12 @@ actor RemoteAgentSessionController {
         if isShutdown {
             throw RemoteClientError.protocolViolation("Remote controller is shut down.")
         }
+    }
+
+    private func ensureObservationCurrent(generation: UUID, sessionID: String) throws {
+        guard !Task.isCancelled,
+              isObservationCurrent(generation: generation, sessionID: sessionID)
+        else { throw CancellationError() }
     }
 
     private func missingSessionError() -> RemoteClientError {

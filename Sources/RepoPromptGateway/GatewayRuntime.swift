@@ -144,6 +144,7 @@ actor RemoteGatewayRuntime {
             pendingSubscriptionValidations[key] = validations
         }
         let watchManager = watchManager
+        logger.info("watch validation activation queued device_id=\(deviceID) session_count=\(sessionIDs.count)")
         Task {
             await watchManager.validateSubscription(validation)
         }
@@ -898,6 +899,11 @@ actor RemoteGatewayRuntime {
     }
 
     func resolveSessionWindowForObservation(deviceID: String, sessionID: String) async -> Int? {
+        if let cachedWindowID = await sessionWindowAffinity.windowID(forSession: sessionID) {
+            logger.info("observation window resolution stage=warm_hit device_id=\(deviceID) session_id=\(sessionID.trimmingCharacters(in: .whitespacesAndNewlines)) window_id=\(cachedWindowID)")
+            return cachedWindowID
+        }
+        logger.info("observation window resolution stage=cold_path device_id=\(deviceID) session_id=\(sessionID.trimmingCharacters(in: .whitespacesAndNewlines))")
         guard let (_, bindingState) = try? await resolveAppLink(deviceID: deviceID) else { return nil }
         return await resolvedWindowID(forSession: sessionID, deviceID: deviceID, bindingState: bindingState)
     }
