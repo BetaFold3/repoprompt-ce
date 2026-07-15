@@ -189,6 +189,8 @@ struct RemoteCommandTranslator {
                 allowedPayloadKeys: Self.listSessionsPayloadKeys,
                 resolvedWindowID: resolvedWindowID
             )
+        case "open_workspace":
+            return try translateOpenWorkspace(payload: payload)
         case "get_log":
             return try translateAgentManage(
                 frame: frame,
@@ -204,6 +206,9 @@ struct RemoteCommandTranslator {
     }
 
     private func enforceBinding(for operation: String, payload: [String: JSONValue], resolvedWindowID: Int?) throws {
+        // open_workspace names its own workspace target and is intentionally binding-exempt.
+        if operation == "open_workspace" { return }
+
         switch bindingState {
         case .bound:
             return
@@ -326,6 +331,39 @@ struct RemoteCommandTranslator {
         )
     }
 
+    private func translateOpenWorkspace(payload: [String: JSONValue]) throws -> RemoteToolCall {
+        try validateAllowedPayloadKeys(
+            payload,
+            operation: "open_workspace",
+            allowed: Self.openWorkspacePayloadKeys
+        )
+        let rawWorkspaceID = payload["workspace_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawWorkspaceName = payload["workspace_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let workspaceID = rawWorkspaceID?.isEmpty == false ? rawWorkspaceID : nil
+        let workspaceName = rawWorkspaceName?.isEmpty == false ? rawWorkspaceName : nil
+        guard workspaceID != nil || workspaceName != nil else {
+            throw RemoteCommandTranslatorError.invalidPayload(
+                "open_workspace requires a nonblank payload.workspace_id or payload.workspace_name."
+            )
+        }
+
+        var arguments: [String: Value] = [
+            "action": .string("open"),
+            "_rawJSON": .bool(true)
+        ]
+        if let workspaceID {
+            // ID precedence is encoded by forwarding only the ID when both selectors are present.
+            arguments["workspace_id"] = .string(workspaceID)
+        } else if let workspaceName {
+            arguments["workspace_name"] = .string(workspaceName)
+        }
+        return RemoteToolCall(
+            toolName: "manage_workspaces",
+            arguments: arguments,
+            timeout: AppLinkCallTimeoutPolicy.timeout(op: "manage_workspaces", payload: payload)
+        )
+    }
+
     private func commonArguments(op: String) -> [String: Value] {
         [
             "op": .string(op),
@@ -418,6 +456,11 @@ struct RemoteCommandTranslator {
     ]
 
     private static let listAgentsPayloadKeys: Set<String> = []
+
+    private static let openWorkspacePayloadKeys: Set<String> = [
+        "workspace_id",
+        "workspace_name"
+    ]
 
     private static let listSessionsPayloadKeys: Set<String> = [
         "agent",

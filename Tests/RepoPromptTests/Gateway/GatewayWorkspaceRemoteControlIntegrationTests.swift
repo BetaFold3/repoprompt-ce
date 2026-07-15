@@ -310,4 +310,104 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         let calls = await connection.calls
         XCTAssertFalse(calls.contains { $0.name == "agent_manage" }, "Zero matches must not fan out to any window")
     }
+
+    func testClosedWorkspaceOpenThenWorkspaceScopedListSessionsSucceeds() async throws {
+        let closedWorkspaceID = "88888888-8888-8888-8888-888888888888"
+        let closedWorkspaceName = "Closed Workspace"
+        let openedWindowList = GatewayTestHelpers.toolResult(json: .object([
+            "windows": .array([
+                .object([
+                    "window_id": .int(7),
+                    "workspace": .object([
+                        "id": .string(closedWorkspaceID),
+                        "name": .string(closedWorkspaceName)
+                    ])
+                ])
+            ]),
+            "binding": .object(["state": .string("unbound")])
+        ]))
+        let openedSessions = GatewayTestHelpers.toolResult(json: .object([
+            "sessions": .array([
+                .object([
+                    "session_id": .string(windowOneNewerID),
+                    "name": .string("Opened Session"),
+                    "last_modified": .string("2026-07-15T01:00:00.000Z"),
+                    "state": .string("running")
+                ])
+            ]),
+            "workspace": .object([
+                "id": .string(closedWorkspaceID),
+                "name": .string(closedWorkspaceName)
+            ])
+        ]))
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(twoWindowSharedWorkspaceListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "status": .string("opened"),
+                "window_id": .int(7),
+                "workspace": .object([
+                    "id": .string(closedWorkspaceID),
+                    "name": .string(closedWorkspaceName)
+                ])
+            ]))),
+            .result(openedWindowList),
+            .result(openedSessions)
+        ])
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .ambiguousStartTarget("multiple windows")
+        )
+
+        let before = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "integration-before-open",
+                payload: .object(["workspace_name": .string(closedWorkspaceName)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(before?.payload?.objectValue?["code"], .string("workspace_not_open"))
+
+        let open = await runtime.handle(
+            RemoteClientFrame(
+                type: "open_workspace",
+                requestID: "integration-open",
+                payload: .object(["workspace_name": .string(closedWorkspaceName)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(open?.type, "command_result")
+        XCTAssertEqual(open?.payload?.objectValue?["status"], .string("opened"))
+
+        let after = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "integration-after-open",
+                payload: .object(["workspace_name": .string(closedWorkspaceName)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(after?.type, "command_result")
+        XCTAssertEqual(
+            after?.payload?.objectValue?["sessions"]?.arrayValue?.first?.objectValue?["session_id"],
+            .string(windowOneNewerID)
+        )
+
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), [
+            "bind_context",
+            "manage_workspaces",
+            "bind_context",
+            "agent_manage"
+        ])
+        XCTAssertEqual(calls[1].arguments["action"], .string("open"))
+        XCTAssertEqual(calls[3].arguments["op"], .string("list_sessions"))
+        XCTAssertEqual(calls[3].arguments["_windowID"], .int(7))
+    }
 }

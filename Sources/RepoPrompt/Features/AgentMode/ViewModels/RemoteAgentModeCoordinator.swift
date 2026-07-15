@@ -24,6 +24,16 @@ final class RemoteAgentModeCoordinator {
         var remoteSessionID: String
     }
 
+    struct WorkspaceOpenEpisodeKey: Hashable {
+        var hostID: String
+        var clientWorkspaceID: UUID
+    }
+
+    enum WorkspaceOpenEpisodeState: Equatable {
+        case opening
+        case failed(String)
+    }
+
     struct RestorableInteractionState {
         let interactionID: String
         let priorRunState: AgentSessionRunState
@@ -43,6 +53,7 @@ final class RemoteAgentModeCoordinator {
     private let connectionManagerProvider: @MainActor () -> RemoteHostConnectionManager
     private let catalogProvider: @MainActor (String) -> RemoteHostAgentCatalog?
     private let workspaceSessionCatalogStore: any RemoteWorkspaceSessionCatalogStoring
+    private let workspaceOpenConnectionProvider: @MainActor (String) throws -> any RemoteWorkspaceSessionCatalogConnection
     private var controllersByTabID: [UUID: RemoteAgentSessionController] = [:]
     private var eventTasksByTabID: [UUID: Task<Void, Never>] = [:]
     private var hostIDByTabID: [UUID: String] = [:]
@@ -59,6 +70,7 @@ final class RemoteAgentModeCoordinator {
     private var discoveryKeyByTabID: [UUID: String] = [:]
     private var reportedChildMaterializationFailuresByDiscoveryKey: [String: Set<String>] = [:]
     private var workspacePickupInFlightKeys: Set<WorkspacePickupKey> = []
+    private var workspaceOpenEpisodes: [WorkspaceOpenEpisodeKey: WorkspaceOpenEpisodeState] = [:]
     private var stashedAskUserStateByTabID: [UUID: StashedAskUserState] = [:]
     private var childDiscoveryPendingContextsByKey: [String: RemoteChildDiscoveryContext] = [:]
     private var childDiscoveryTasksByKey: [String: Task<Void, Never>] = [:]
@@ -75,11 +87,15 @@ final class RemoteAgentModeCoordinator {
         connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared },
         catalogProvider: @escaping @MainActor (String) -> RemoteHostAgentCatalog? = { RemoteHostCatalog.shared.cachedNonDegradedCatalog(for: $0) },
         workspaceSessionCatalogStore: (any RemoteWorkspaceSessionCatalogStoring)? = nil,
+        workspaceOpenConnectionProvider: (@MainActor (String) throws -> any RemoteWorkspaceSessionCatalogConnection)? = nil,
         childDiscoveryDebounceInterval: TimeInterval = 3
     ) {
         self.connectionManagerProvider = connectionManagerProvider
         self.catalogProvider = catalogProvider
         self.workspaceSessionCatalogStore = workspaceSessionCatalogStore ?? RemoteWorkspaceSessionCatalogStore.shared
+        self.workspaceOpenConnectionProvider = workspaceOpenConnectionProvider ?? {
+            try RemoteHostConnectionManager.shared.connection(for: $0)
+        }
         self.childDiscoveryDebounceInterval = childDiscoveryDebounceInterval
     }
 
@@ -311,8 +327,11 @@ final class RemoteAgentModeCoordinator {
     }
 
     private func deliver(_ state: RemoteHostConnection.State, hostID: String) async {
-        if case .connected = state {
+        if case let .connected(scopes) = state {
             workspaceSessionCatalogStore.invalidate(hostID: hostID)
+            if scopes.contains("sessions:operate") {
+                workspaceOpenEpisodes = workspaceOpenEpisodes.filter { $0.key.hostID != hostID }
+            }
             viewModel?.refreshRemoteHostCatalogAfterConnect(hostID: hostID)
         }
         let controllers = controllersByTabID.compactMap { tabID, controller in
@@ -853,6 +872,92 @@ final class RemoteAgentModeCoordinator {
 
     func invalidateWorkspaceSessionCatalog(hostID: String, clientWorkspaceID: UUID) {
         workspaceSessionCatalogStore.invalidate(hostID: hostID, clientWorkspaceID: clientWorkspaceID)
+    }
+
+    func workspaceOpenEpisodeState(
+        hostID: String,
+        clientWorkspaceID: UUID
+    ) -> WorkspaceOpenEpisodeState? {
+        workspaceOpenEpisodes[WorkspaceOpenEpisodeKey(
+            hostID: hostID,
+            clientWorkspaceID: clientWorkspaceID
+        )]
+    }
+
+    func resetWorkspaceOpenEpisode(hostID: String, clientWorkspaceID: UUID) {
+        workspaceOpenEpisodes.removeValue(forKey: WorkspaceOpenEpisodeKey(
+            hostID: hostID,
+            clientWorkspaceID: clientWorkspaceID
+        ))
+    }
+
+    func autoOpenWorkspaceIfNeeded(
+        hostRecord: PairedHostRecord,
+        clientWorkspaceID: UUID,
+        workspaceName: String
+    ) async {
+        guard hostRecord.grantedScopes.contains("sessions:operate") else { return }
+        let key = WorkspaceOpenEpisodeKey(hostID: hostRecord.id, clientWorkspaceID: clientWorkspaceID)
+        guard workspaceOpenEpisodes[key] == nil else { return }
+
+        workspaceOpenEpisodes[key] = .opening
+        viewModel?.publishRemoteWorkspaceSidebarChange()
+        let learnedID = workspaceSessionCatalogStore.learnedHostWorkspaceID(
+            hostID: hostRecord.id,
+            clientWorkspaceID: clientWorkspaceID
+        )
+        do {
+            do {
+                try await openWorkspace(
+                    hostID: hostRecord.id,
+                    workspaceID: learnedID,
+                    workspaceName: workspaceName
+                )
+            } catch {
+                let code = (error as? RemoteClientError)?.commandError?.code
+                guard learnedID != nil, code == "workspace_not_found" else { throw error }
+                try await openWorkspace(
+                    hostID: hostRecord.id,
+                    workspaceID: nil,
+                    workspaceName: workspaceName
+                )
+            }
+            workspaceSessionCatalogStore.invalidate(hostID: hostRecord.id)
+            _ = await workspaceSessionCatalogStore.fetch(
+                hostID: hostRecord.id,
+                clientWorkspaceID: clientWorkspaceID,
+                workspaceName: workspaceName,
+                forceRefresh: true
+            )
+            workspaceOpenEpisodes.removeValue(forKey: key)
+        } catch {
+            workspaceOpenEpisodes[key] = .failed(Self.describe(
+                error,
+                workspaceName: workspaceName,
+                hostName: hostRecord.displayName
+            ))
+        }
+        viewModel?.publishRemoteWorkspaceSidebarChange()
+    }
+
+    private func openWorkspace(
+        hostID: String,
+        workspaceID: String?,
+        workspaceName: String
+    ) async throws {
+        var payload: [String: JSONValue] = ["workspace_name": .string(workspaceName)]
+        if let workspaceID {
+            payload["workspace_id"] = .string(workspaceID)
+        }
+        let connection = try workspaceOpenConnectionProvider(hostID)
+        _ = try await connection.command(
+            RemoteClientFrame(
+                type: "open_workspace",
+                requestID: "open-workspace-\(UUID().uuidString.lowercased())",
+                payload: .object(payload)
+            ),
+            timeout: RemoteHostConnection.commandTimeout
+        )
     }
 
     /// Materializes a client projection of a host-authoritative workspace session.
@@ -1569,6 +1674,11 @@ final class RemoteAgentModeCoordinator {
                     return "Workspace '\(resolvedWorkspaceName)' is not open on \(hostPhrase). Open it there and try again."
                 }
                 return "The requested workspace is not open on \(hostPhrase). Open it there and try again."
+            }
+            if commandError.code == "workspace_not_found" {
+                let workspace = normalizedFriendlyName(workspaceName) ?? "requested workspace"
+                let host = normalizedFriendlyName(hostName) ?? "the host"
+                return "Workspace '\(workspace)' was not found on \(host)."
             }
         }
         if let localized = (error as? LocalizedError)?.errorDescription, !localized.isEmpty {

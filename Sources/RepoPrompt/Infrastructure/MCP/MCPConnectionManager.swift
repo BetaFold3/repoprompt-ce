@@ -52,6 +52,11 @@ import SwiftUI
     private func mcpToolTrackingDiagnostic(_ message: @autoclosure () -> String) {}
 #endif
 
+protocol MCPStructuredToolError: LocalizedError {
+    var code: String { get }
+    var message: String { get }
+}
+
 // MARK: - Bundle helpers for safe metadata access
 
 private extension Bundle {
@@ -951,6 +956,17 @@ actor ServerNetworkManager {
             "error": .string(message)
         ])
         return CallTool.Result(content: [.text(text: ToolOutputFormatter.rawJSONString(value), annotations: nil, _meta: nil)], isError: true)
+    }
+
+    static func toolErrorResult(rawJSON: Bool, error: Error) -> CallTool.Result {
+        guard let structured = error as? any MCPStructuredToolError else {
+            return toolErrorResult(rawJSON: rawJSON, message: "Error: \(error)")
+        }
+        return executionContractToolErrorResult(
+            rawJSON: rawJSON,
+            code: structured.code,
+            message: structured.message
+        )
     }
 
     fileprivate final class ToolEventObserverDeliveryBarrier: @unchecked Sendable {
@@ -11975,7 +11991,7 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
                                             )
                                             return handlerResult(
-                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)"),
+                                                Self.toolErrorResult(rawJSON: capturedRawJSON, error: error),
                                                 outcome: "dispatchError"
                                             )
                                         }
@@ -12097,7 +12113,7 @@ actor ServerNetworkManager {
                                                 EditFlowPerf.Dimensions(toolName: toolName, status: "dispatchError")
                                             )
                                             return handlerResult(
-                                                Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)"),
+                                                Self.toolErrorResult(rawJSON: capturedRawJSON, error: error),
                                                 outcome: "dispatchError"
                                             )
                                         }

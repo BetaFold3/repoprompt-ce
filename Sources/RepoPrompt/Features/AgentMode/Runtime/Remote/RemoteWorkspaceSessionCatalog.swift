@@ -18,6 +18,13 @@ protocol RemoteWorkspaceSessionCatalogStoring: AnyObject {
     ) async -> RemoteWorkspaceSessionCatalogStore.State
     func invalidate(hostID: String, clientWorkspaceID: UUID)
     func invalidate(hostID: String)
+    func learnedHostWorkspaceID(hostID: String, clientWorkspaceID: UUID) -> String?
+}
+
+extension RemoteWorkspaceSessionCatalogStoring {
+    func learnedHostWorkspaceID(hostID _: String, clientWorkspaceID _: UUID) -> String? {
+        nil
+    }
 }
 
 @MainActor
@@ -103,6 +110,10 @@ final class RemoteWorkspaceSessionCatalogStore: RemoteWorkspaceSessionCatalogSto
     func invalidate(hostID: String) {
         invalidationGenerationByHostID[hostID, default: 0] &+= 1
         cache = cache.filter { $0.key.hostID != hostID }
+    }
+
+    func learnedHostWorkspaceID(hostID: String, clientWorkspaceID: UUID) -> String? {
+        learnedHostWorkspaceIDByKey[CacheKey(hostID: hostID, clientWorkspaceID: clientWorkspaceID)]
     }
 
     private func cachedEntry(for key: CacheKey, at date: Date) -> CacheEntry? {

@@ -437,6 +437,10 @@ actor RemoteGatewayRuntime {
             await recordExplicitStartAffinityIfNeeded(frame: frame, payload: payload)
             outcome = .success(payload)
             await ledger.complete(key: key, outcome: outcome)
+            if frame.type == "open_workspace" {
+                lastEligibleWindowDetailsByDevice.removeValue(forKey: deviceID)
+                _ = await appLinkPool?.refreshBindingState(forDevice: deviceID)
+            }
             audit(frame: frame, deviceID: deviceID, outcome: "success", responsePayload: payload)
             if frame.type == "steer" || frame.type == "respond" {
                 await watchManager.rearm(deviceID: deviceID, sessionID: frame.sessionID)
@@ -1332,6 +1336,7 @@ actor RemoteGatewayRuntime {
         let isWorkspaceSelectorFailure = ["start", "list_sessions"].contains(frame.type)
             && outcome == "failure"
             && ["binding_required", "ambiguous_start_target", "workspace_not_open", "workspace_mismatch"].contains(code)
+        let recordsWorkspaceSelector = frame.type == "open_workspace" || isWorkspaceSelectorFailure
         let hasWorkspaceName = requestPayload["workspace_name"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty == false
@@ -1351,8 +1356,11 @@ actor RemoteGatewayRuntime {
             completedTurnCount: frame.type == "get_log" ? responseObject["completed_turn_count"]?.intValue : nil,
             transcriptXMLChars: frame.type == "get_log" ? responseObject["transcript_xml"]?.stringValue?.count : nil,
             autoRoutedWindowID: autoRoutedWindowID,
-            hasWorkspaceName: isWorkspaceSelectorFailure ? hasWorkspaceName : nil,
-            hasWorkspaceID: isWorkspaceSelectorFailure ? hasWorkspaceID : nil,
+            windowID: frame.type == "open_workspace" && outcome == "success"
+                ? responseObject["window_id"]?.intValue
+                : nil,
+            hasWorkspaceName: recordsWorkspaceSelector ? hasWorkspaceName : nil,
+            hasWorkspaceID: recordsWorkspaceSelector ? hasWorkspaceID : nil,
             workspaceMatchCount: ["start", "list_sessions"].contains(frame.type) ? workspaceMatchCount : nil,
             workspaceMatchSkipped: frame.type == "start" ? workspaceMatchSkipped : nil,
             workspaceMatchUnavailableReason: ["start", "list_sessions"].contains(frame.type)

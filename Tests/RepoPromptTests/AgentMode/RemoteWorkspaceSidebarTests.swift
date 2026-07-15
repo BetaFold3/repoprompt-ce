@@ -64,6 +64,185 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     }
 
     @MainActor
+    func testClosedWorkspaceAutoOpenPublishesInterimThenInvalidatesAndRefreshes() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+        store.stateAfterHostInvalidation = .loaded(.init(
+            hostWorkspaceID: "host-workspace",
+            hostWorkspaceName: "Project Alpha",
+            sessions: [],
+            fetchedAt: Date()
+        ))
+        let gate = WorkspaceOpenCommandGate()
+        let connection = WorkspaceOpenRecordingConnection(outcomes: [.gatedSuccess(gate)])
+        let fixture = try await makeFixture(store: store, workspaceOpenConnection: connection)
+
+        let refresh = Task { await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true) }
+        await gate.waitUntilEntered()
+
+        let interim = try XCTUnwrap(fixture.viewModel.remoteWorkspaceSidebarSection())
+        XCTAssertEqual(interim.content, .openingWorkspace("Opening 'Project Alpha' on Studio Mac…"))
+        let interimCommandCount = await connection.commandCount()
+        XCTAssertEqual(interimCommandCount, 1)
+
+        await gate.release()
+        await refresh.value
+        XCTAssertEqual(store.invalidatedHostIDs, [fixture.host.id])
+        XCTAssertEqual(store.invalidatedWorkspaceIDs, [])
+        XCTAssertEqual(store.fetchForceRefreshValues, [true, true])
+        XCTAssertEqual(store.operationLog.suffix(2), ["invalidate-host", "fetch:true"])
+        let final = try XCTUnwrap(fixture.viewModel.remoteWorkspaceSidebarSection())
+        XCTAssertEqual(final.content, .sessions([]))
+    }
+
+    @MainActor
+    func testAutoOpenFailureCodesExposeRetryBearingCopy() async throws {
+        let cases = [
+            ("workspace_not_found", "Workspace 'Project Alpha' was not found on Studio Mac."),
+            ("insufficient_scope", "Denied"),
+            ("timeout", "Timed out"),
+            ("unsupported_frame_type", "Unsupported")
+        ]
+        for (code, expected) in cases {
+            let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+            let error = RemoteClientError.fromCommandError(code: code, message: expected)
+            let connection = WorkspaceOpenRecordingConnection(outcomes: [.failure(error)])
+            let fixture = try await makeFixture(store: store, workspaceOpenConnection: connection)
+
+            await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+
+            let section = try XCTUnwrap(fixture.viewModel.remoteWorkspaceSidebarSection())
+            guard case let .error(message) = section.content else {
+                return XCTFail("Expected retry-bearing error content for \(code)")
+            }
+            XCTAssertEqual(message, expected)
+        }
+    }
+
+    @MainActor
+    func testAutoOpenRetriesStaleLearnedIDOnceWithoutID() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+        store.learnedWorkspaceID = "stale-workspace-id"
+        store.stateAfterHostInvalidation = .loaded(.init(
+            hostWorkspaceID: "current-workspace-id",
+            hostWorkspaceName: "Project Alpha",
+            sessions: [],
+            fetchedAt: Date()
+        ))
+        let connection = WorkspaceOpenRecordingConnection(outcomes: [
+            .failure(.fromCommandError(code: "workspace_not_found", message: "Missing stale ID")),
+            .success
+        ])
+        let fixture = try await makeFixture(store: store, workspaceOpenConnection: connection)
+
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+
+        let frames = await connection.frames()
+        XCTAssertEqual(frames.count, 2)
+        XCTAssertEqual(frames[0].payload?.objectValue?["workspace_id"], .string("stale-workspace-id"))
+        XCTAssertEqual(frames[0].payload?.objectValue?["workspace_name"], .string("Project Alpha"))
+        XCTAssertNil(frames[1].payload?.objectValue?["workspace_id"])
+        XCTAssertEqual(frames[1].payload?.objectValue?["workspace_name"], .string("Project Alpha"))
+        XCTAssertEqual(store.invalidatedHostIDs, [fixture.host.id])
+
+        let terminalStore = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+        terminalStore.learnedWorkspaceID = "another-stale-id"
+        let terminalConnection = WorkspaceOpenRecordingConnection(outcomes: [
+            .failure(.fromCommandError(code: "workspace_not_found", message: "Missing ID")),
+            .failure(.fromCommandError(code: "workspace_not_found", message: "Missing name"))
+        ])
+        let terminalFixture = try await makeFixture(
+            store: terminalStore,
+            workspaceOpenConnection: terminalConnection
+        )
+        await terminalFixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+        await terminalFixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+        let terminalCount = await terminalConnection.commandCount()
+        XCTAssertEqual(terminalCount, 2, "Name-only failure is terminal for the episode")
+    }
+
+    @MainActor
+    func testAutoOpenEpisodeRequiresRetryOrEligibleReconnect() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+        let failure = RemoteClientError.fromCommandError(code: "unsupported_frame_type", message: "Unsupported")
+        let connection = WorkspaceOpenRecordingConnection(outcomes: [
+            .failure(failure), .failure(failure), .failure(failure)
+        ])
+        let fixture = try await makeFixture(store: store, workspaceOpenConnection: connection)
+
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar()
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar()
+        var commandCount = await connection.commandCount()
+        XCTAssertEqual(commandCount, 1)
+
+        await fixture.coordinator.test_deliverConnectionState(
+            .connected(scopes: ["sessions:observe"]),
+            hostID: fixture.host.id
+        )
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+        commandCount = await connection.commandCount()
+        XCTAssertEqual(commandCount, 1)
+
+        await fixture.coordinator.test_deliverConnectionState(.idle, hostID: fixture.host.id)
+        await fixture.coordinator.test_deliverConnectionState(
+            .connected(scopes: ["sessions:operate"]),
+            hostID: fixture.host.id
+        )
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+        commandCount = await connection.commandCount()
+        XCTAssertEqual(commandCount, 2)
+
+        await fixture.viewModel.retryRemoteWorkspaceSidebar()
+        commandCount = await connection.commandCount()
+        XCTAssertEqual(commandCount, 3)
+    }
+
+    @MainActor
+    func testAutoOpenEpisodeKeyRotatesWithClientWorkspaceID() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+        let failure = RemoteClientError.fromCommandError(code: "unsupported_frame_type", message: "Unsupported")
+        let connection = WorkspaceOpenRecordingConnection(outcomes: [.failure(failure), .failure(failure)])
+        let fixture = try await makeFixture(store: store, workspaceOpenConnection: connection)
+
+        await fixture.coordinator.autoOpenWorkspaceIfNeeded(
+            hostRecord: fixture.host,
+            clientWorkspaceID: fixture.workspace.id,
+            workspaceName: fixture.workspace.name
+        )
+        await fixture.coordinator.autoOpenWorkspaceIfNeeded(
+            hostRecord: fixture.host,
+            clientWorkspaceID: UUID(),
+            workspaceName: "Another Workspace"
+        )
+
+        let commandCount = await connection.commandCount()
+        XCTAssertEqual(commandCount, 2)
+    }
+
+    @MainActor
+    func testAutoOpenWithoutOperateScopeKeepsExistingNotOpenFallback() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .workspaceNotOpen(message: "closed"))
+        let connection = WorkspaceOpenRecordingConnection()
+        let fixture = try await makeFixture(
+            store: store,
+            workspaceOpenConnection: connection,
+            grantedScopes: ["sessions:observe"]
+        )
+
+        await fixture.viewModel.refreshRemoteWorkspaceSidebar(forceRefresh: true)
+
+        let commandCount = await connection.commandCount()
+        XCTAssertEqual(commandCount, 0)
+        let section = try XCTUnwrap(fixture.viewModel.remoteWorkspaceSidebarSection())
+        XCTAssertEqual(
+            section.content,
+            .workspaceNotOpen(
+                "Workspace 'Project Alpha' is not open on Studio Mac. Open it there and try again."
+            )
+        )
+    }
+
+    @MainActor
     func testWorkspacePickupMaterializesFocusedUserTabOnceAndAttaches() async throws {
         let store = StubWorkspaceSessionCatalogStore(state: .loaded(.init(
             hostWorkspaceID: nil,
@@ -1568,11 +1747,16 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
 
     @MainActor
     private func makeFixture(
-        store: StubWorkspaceSessionCatalogStore
+        store: StubWorkspaceSessionCatalogStore,
+        workspaceOpenConnection: (any RemoteWorkspaceSessionCatalogConnection)? = nil,
+        grantedScopes: Set<String>? = nil
     ) async throws -> Fixture {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
         let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
-        let host = try RemoteHostTestSupport.hostRecord(displayName: "Studio Mac")
+        var host = try RemoteHostTestSupport.hostRecord(displayName: "Studio Mac")
+        if let grantedScopes {
+            host.grantedScopes = grantedScopes
+        }
         try registry.upsertHost(host)
 
         let initialTabID = UUID()
@@ -1610,7 +1794,12 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         workspaceManager.activeWorkspace = workspace
         prompt.loadComposeTabsFromWorkspace(workspace)
 
-        let coordinator = RemoteAgentModeCoordinator(workspaceSessionCatalogStore: store)
+        let coordinator = RemoteAgentModeCoordinator(
+            workspaceSessionCatalogStore: store,
+            workspaceOpenConnectionProvider: workspaceOpenConnection.map { connection in
+                { _ in connection }
+            }
+        )
         let lifecycleRecorder = LifecycleRecorder()
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
@@ -1715,8 +1904,12 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
 @MainActor
 private final class StubWorkspaceSessionCatalogStore: RemoteWorkspaceSessionCatalogStoring {
     var state: RemoteWorkspaceSessionCatalogStore.State
+    var stateAfterHostInvalidation: RemoteWorkspaceSessionCatalogStore.State?
+    var learnedWorkspaceID: String?
     private(set) var invalidatedWorkspaceIDs: [UUID] = []
+    private(set) var invalidatedHostIDs: [String] = []
     private(set) var fetchForceRefreshValues: [Bool] = []
+    private(set) var operationLog: [String] = []
 
     init(state: RemoteWorkspaceSessionCatalogStore.State) {
         self.state = state
@@ -1735,19 +1928,94 @@ private final class StubWorkspaceSessionCatalogStore: RemoteWorkspaceSessionCata
         workspaceName _: String,
         forceRefresh: Bool
     ) async -> RemoteWorkspaceSessionCatalogStore.State {
+        operationLog.append("fetch:\(forceRefresh)")
         fetchForceRefreshValues.append(forceRefresh)
         return state
     }
 
     func invalidate(hostID _: String, clientWorkspaceID: UUID) {
+        operationLog.append("invalidate-workspace")
         invalidatedWorkspaceIDs.append(clientWorkspaceID)
     }
 
-    func invalidate(hostID _: String) {}
+    func invalidate(hostID: String) {
+        operationLog.append("invalidate-host")
+        invalidatedHostIDs.append(hostID)
+        if let stateAfterHostInvalidation {
+            state = stateAfterHostInvalidation
+        }
+    }
+
+    func learnedHostWorkspaceID(hostID _: String, clientWorkspaceID _: UUID) -> String? {
+        learnedWorkspaceID
+    }
 }
 
 private enum WorkspacePickupTestError: Error {
     case attachFailed
+}
+
+private actor WorkspaceOpenCommandGate {
+    private var entered = false
+    private var released = false
+    private var enteredContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { enteredContinuation = $0 }
+    }
+
+    func enterAndWait() async {
+        entered = true
+        enteredContinuation?.resume()
+        enteredContinuation = nil
+        guard !released else { return }
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func release() {
+        released = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor WorkspaceOpenRecordingConnection: RemoteWorkspaceSessionCatalogConnection {
+    enum Outcome {
+        case success
+        case failure(RemoteClientError)
+        case gatedSuccess(WorkspaceOpenCommandGate)
+    }
+
+    private var outcomes: [Outcome]
+    private var recordedFrames: [RemoteClientFrame] = []
+
+    init(outcomes: [Outcome] = []) {
+        self.outcomes = outcomes
+    }
+
+    func command(_ frame: RemoteClientFrame, timeout _: TimeInterval) async throws -> JSONValue {
+        recordedFrames.append(frame)
+        let outcome = outcomes.isEmpty ? .success : outcomes.removeFirst()
+        switch outcome {
+        case .success:
+            return .object(["status": .string("opened"), "window_id": .int(7)])
+        case let .failure(error):
+            throw error
+        case let .gatedSuccess(gate):
+            await gate.enterAndWait()
+            return .object(["status": .string("opened"), "window_id": .int(7)])
+        }
+    }
+
+    func commandCount() -> Int {
+        recordedFrames.count
+    }
+
+    func frames() -> [RemoteClientFrame] {
+        recordedFrames
+    }
 }
 
 private actor ResendRecordingConnection: RemoteAgentSessionConnection {

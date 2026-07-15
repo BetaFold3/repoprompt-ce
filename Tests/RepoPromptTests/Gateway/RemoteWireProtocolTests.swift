@@ -34,12 +34,19 @@ final class RemoteWireProtocolTests: XCTestCase {
     }
 
     func testMutatingOperationsRequireRequestID() throws {
-        for type in ["start", "steer", "respond", "cancel"] {
+        for type in ["start", "steer", "respond", "cancel", "open_workspace"] {
             let data = "{\"v\":1,\"type\":\"\(type)\",\"payload\":{},\"sig\":null}".data(using: .utf8)!
             XCTAssertThrowsError(try RemoteWireProtocol.decodeClientFrame(from: data), type) { error in
                 XCTAssertEqual(error as? RemoteWireProtocolError, .missingRequestID(type))
             }
         }
+    }
+
+    func testOpenWorkspaceIsARecognizedMutatingFrame() throws {
+        XCTAssertTrue(RemoteWireProtocol.clientFrameTypes.contains("open_workspace"))
+        XCTAssertTrue(RemoteWireProtocol.mutatingClientFrameTypes.contains("open_workspace"))
+        let data = #"{"v":1,"type":"open_workspace","request_id":"open-1","payload":{"workspace_name":"Project"},"sig":null}"#.data(using: .utf8)!
+        XCTAssertEqual(try RemoteWireProtocol.decodeClientFrame(from: data).type, "open_workspace")
     }
 
     func testListAgentsFrameIsAcceptedWithoutRequestID() throws {
