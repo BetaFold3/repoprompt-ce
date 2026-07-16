@@ -52,6 +52,16 @@ struct RemoteStartWindowPickerState: Identifiable, Equatable {
     let optimisticUserItemID: UUID
     let windows: [RemoteStartWindowOption]
 
+    var openableWorkspaceName: String? {
+        guard let workspaceName else { return nil }
+        let matchesExisting = windows.contains { option in
+            option.workspaceName?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(workspaceName) == .orderedSame
+        }
+        return matchesExisting ? nil : workspaceName
+    }
+
     init(
         id: UUID = UUID(),
         tabID: UUID,

@@ -220,7 +220,17 @@ actor RemoteAgentSessionController {
             payload: .object(payload)
         )
         Self.logger.log("remote start request sent request_id=\(frame.requestID ?? "", privacy: .public) has_window_id=\(windowID != nil) has_workspace_id=\(workspaceID?.isEmpty == false) has_workspace_name=\(payload["workspace_name"] != nil)")
-        let response = try await commandWithTransportRetry(frame, operation: "start", mayRetryTransportLoss: true)
+        let response: JSONValue
+        do {
+            response = try await commandWithTransportRetry(frame, operation: "start", mayRetryTransportLoss: true)
+        } catch {
+            let commandError = (error as? RemoteClientError)?.commandError
+            let code = commandError?.code ?? Self.errorLogMetadata(error).code
+            let hasWindowsDetails = commandError?.details?.objectValue?["windows"]?.arrayValue != nil
+            let windowsCount = RemoteStartWindowOption.options(from: commandError?.details).count
+            Self.logger.notice("remote start request failed request_id=\(frame.requestID ?? "", privacy: .public) code=\(code, privacy: .public) has_windows_details=\(hasWindowsDetails) windows_count=\(windowsCount)")
+            throw error
+        }
         let sessionID = try Self.remoteSessionID(from: response)
         let didResetCursor = sessionID != remoteSessionID
         if didResetCursor {

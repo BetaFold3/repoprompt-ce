@@ -155,6 +155,7 @@ struct AgentModeView: View {
             RemoteStartWindowPickerSheet(
                 state: state,
                 onSelect: { option in agentModeVM.selectRemoteStartWindow(option) },
+                onOpenWorkspace: { agentModeVM.recoverRemoteStartByOpeningWorkspace() },
                 onCancel: { agentModeVM.cancelRemoteStartWindowPicker() }
             )
         }

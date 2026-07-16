@@ -578,7 +578,7 @@ actor ServerNetworkManager {
         }
         guard toolName == "manage_workspaces" else { return false }
         let action = args["action"]?.stringValue?.lowercased()
-        if action == "list" {
+        if action == "list" || action == "open" {
             return true
         }
         if action == "switch" || action == "create",

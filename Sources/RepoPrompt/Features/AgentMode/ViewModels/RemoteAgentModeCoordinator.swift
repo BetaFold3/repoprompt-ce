@@ -953,6 +953,18 @@ final class RemoteAgentModeCoordinator {
         viewModel?.publishRemoteWorkspaceSidebarChange()
     }
 
+    func openWorkspaceForStartRecovery(
+        hostID: String,
+        workspaceName: String
+    ) async throws {
+        try await openWorkspace(
+            hostID: hostID,
+            workspaceID: nil,
+            workspaceName: workspaceName
+        )
+        workspaceSessionCatalogStore.invalidate(hostID: hostID)
+    }
+
     private func openWorkspace(
         hostID: String,
         workspaceID: String?,

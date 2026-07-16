@@ -53,6 +53,30 @@ private final class BindingProbeRecorder: @unchecked Sendable {
 final class GatewayRuntimeBindingTests: XCTestCase {
     private let sessionID = "11111111-1111-1111-1111-111111111111"
 
+    func testBindWindowMessageClassificationExemptsOpenWorkspaceButPreservesStart() {
+        let error = RemoteGatewayRuntimeError.appToolError(payload: .object([
+            "error": .string("Bind this connection to a window before continuing.")
+        ]))
+
+        XCTAssertEqual(
+            error.code(frame: RemoteClientFrame(type: "open_workspace")),
+            "app_tool_error"
+        )
+        XCTAssertEqual(
+            error.code(frame: RemoteClientFrame(type: "start")),
+            "binding_required"
+        )
+
+        let structured = RemoteGatewayRuntimeError.appToolError(payload: .object([
+            "code": .string("explicit_code"),
+            "error": .string("Bind this connection to a window before continuing.")
+        ]))
+        XCTAssertEqual(
+            structured.code(frame: RemoteClientFrame(type: "open_workspace")),
+            "explicit_code"
+        )
+    }
+
     private func windowListResponse() -> MCPToolResult {
         GatewayTestHelpers.toolResult(json: .object([
             "windows": .array([

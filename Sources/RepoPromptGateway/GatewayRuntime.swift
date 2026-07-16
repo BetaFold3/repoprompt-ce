@@ -1423,7 +1423,10 @@ enum RemoteGatewayRuntimeError: Error, Equatable {
             if let code = payload.objectValue?["code"]?.stringValue {
                 return code
             }
-            if normalized.contains("bind") && normalized.contains("window") {
+            if frame.type != "open_workspace",
+               normalized.contains("bind"),
+               normalized.contains("window")
+            {
                 return "binding_required"
             }
             if frame.type == "start", normalized.contains("ambiguous") || normalized.contains("multiple") {
