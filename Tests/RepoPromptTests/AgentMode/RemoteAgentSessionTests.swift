@@ -530,6 +530,295 @@ final class RemoteAgentSessionTests: XCTestCase {
         await assertCommandCount(connection, type: "cancel", equals: 0)
     }
 
+    func testSteerAfterTerminalReArmsStaleRecoveryAndCompletesParkedTurnWithoutPush() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "remote-session-terminal-steer"
+        let completePage = Self.logPayload(
+            offset: 1,
+            returned: 1,
+            total: 2,
+            xml: "<assistant>Recovered reply</assistant>",
+            completed: 2
+        )
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "steer": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+            "poll": [
+                Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                Self.snapshotPayload(status: "running", sessionID: sessionID),
+                Self.snapshotPayload(status: "completed", sessionID: sessionID)
+            ],
+            "get_log": [
+                Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                Self.logPayload(
+                    offset: 1,
+                    returned: 1,
+                    total: 2,
+                    xml: "<assistant>Still working</assistant>",
+                    completed: 1
+                ),
+                completePage,
+                completePage
+            ]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        try await controller.attachAndCatchUp()
+        XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+
+        try await controller.steer("Continue")
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+        let parkedBinding = await controller.currentBinding()
+        XCTAssertEqual(parkedBinding?.nextLogOffset, 1)
+
+        scheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            let rows = await recorder.upsertedTranscriptRows()
+            let runStates = await recorder.recordedRunStates()
+            return await connection.commandCount(type: "get_log") == 4
+                && scheduler.pendingSleeperCount() == 0
+                && rows.contains { $0.text == "Recovered reply" }
+                && runStates.last == .completed
+        }
+
+        let binding = await controller.currentBinding()
+        let rows = await recorder.upsertedTranscriptRows()
+        let runStates = await recorder.recordedRunStates()
+        XCTAssertEqual(binding?.nextLogOffset, 2)
+        XCTAssertTrue(rows.contains { $0.text == "Recovered reply" })
+        XCTAssertEqual(runStates.last, .completed)
+        await assertCommandCount(connection, type: "steer", equals: 1)
+
+        let pollCountAtTerminal = await connection.commandCount(type: "poll")
+        scheduler.advance(by: 100)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+        await assertCommandCount(connection, type: "poll", equals: pollCountAtTerminal)
+    }
+
+    func testSteerInDoubtCatchUpReArmsStaleRecoveryWithoutResending() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "remote-session-in-doubt-steer"
+        let connection = RecordingRemoteAgentSessionConnection(
+            responses: [
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                    Self.logPayload(
+                        offset: 1,
+                        returned: 1,
+                        total: 2,
+                        xml: "<assistant>Still working</assistant>",
+                        completed: 1
+                    )
+                ]
+            ],
+            commandErrors: [
+                "steer": [
+                    .inDoubt(.init(code: "in_doubt", message: "Outcome uncertain"))
+                ]
+            ]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        defer { Task { await controller.shutdown() } }
+
+        try await controller.attachAndCatchUp()
+        XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+
+        do {
+            try await controller.steer("Continue")
+            XCTFail("Expected the steer outcome to remain in doubt")
+        } catch RemoteClientError.inDoubt {}
+
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+        let binding = await controller.currentBinding()
+        XCTAssertEqual(binding?.nextLogOffset, 1)
+        await assertCommandCount(connection, type: "steer", equals: 1)
+        await assertCommandCount(connection, type: "poll", equals: 2)
+    }
+
+    func testRespondAlreadyResolvedReArmsStaleRecoveryAndCompletesWithoutResending() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "remote-session-resolved-respond"
+        let completePage = Self.logPayload(
+            offset: 1,
+            returned: 1,
+            total: 2,
+            xml: "<assistant>Authoritative reply</assistant>",
+            completed: 2
+        )
+        let connection = RecordingRemoteAgentSessionConnection(
+            responses: [
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID),
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                    Self.logPayload(
+                        offset: 1,
+                        returned: 1,
+                        total: 2,
+                        xml: "<assistant>Pending reply</assistant>",
+                        completed: 1
+                    ),
+                    completePage,
+                    completePage
+                ]
+            ],
+            commandErrors: [
+                "respond": [
+                    .interactionAlreadyResolved(.init(
+                        code: "interaction_already_resolved",
+                        message: "Already resolved"
+                    ))
+                ]
+            ]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        try await controller.attachAndCatchUp()
+        XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+
+        try await controller.respond(
+            interactionID: "interaction-1",
+            payload: .init(response: "Approved")
+        )
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+
+        scheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await connection.commandCount(type: "get_log") == 4
+                && scheduler.pendingSleeperCount() == 0
+        }
+
+        let rows = await recorder.upsertedTranscriptRows()
+        let binding = await controller.currentBinding()
+        XCTAssertTrue(rows.contains { $0.text == "Authoritative reply" })
+        XCTAssertEqual(binding?.nextLogOffset, 2)
+        await assertCommandCount(connection, type: "respond", equals: 1)
+    }
+
+    func testCancelCommandTailKeepsTerminalSettledAndReArmsWhileStillRunning() async throws {
+        do {
+            let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+            let sessionID = "remote-session-terminal-cancel"
+            let connection = RecordingRemoteAgentSessionConnection(responses: [
+                "cancel": [Self.snapshotPayload(status: "cancelled", sessionID: sessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                    Self.snapshotPayload(status: "cancelled", sessionID: sessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1)
+                ]
+            ])
+            let controller = RemoteAgentSessionController(
+                binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+                connection: connection,
+                recoveryScheduler: scheduler,
+                recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            )
+            defer { Task { await controller.shutdown() } }
+
+            try await controller.attachAndCatchUp()
+            try await controller.cancel()
+            XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+
+            scheduler.advance(by: 100)
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            await assertCommandCount(connection, type: "cancel", equals: 1)
+            await assertCommandCount(connection, type: "poll", equals: 2)
+            await controller.shutdown()
+        }
+
+        do {
+            let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+            let sessionID = "remote-session-running-cancel"
+            let connection = RecordingRemoteAgentSessionConnection(responses: [
+                "cancel": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                    Self.logPayload(
+                        offset: 1,
+                        returned: 1,
+                        total: 2,
+                        xml: "<assistant>Cancelling</assistant>",
+                        completed: 1
+                    )
+                ]
+            ])
+            let controller = RemoteAgentSessionController(
+                binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+                connection: connection,
+                recoveryScheduler: scheduler,
+                recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            )
+            defer { Task { await controller.shutdown() } }
+
+            try await controller.attachAndCatchUp()
+            try await controller.cancel()
+            await waitForDeterministicRemoteAgentSessionCondition {
+                scheduler.pendingSleeperCount() == 1
+            }
+            await assertCommandCount(connection, type: "cancel", equals: 1)
+            await controller.shutdown()
+        }
+    }
+
     func testStaleRecoveryBackoffIsBoundedSingleFlightAndDeduplicatesRows() async throws {
         let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
         let sessionID = "remote-session-stale-bounded"
@@ -3057,6 +3346,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
     private actor RecordingRemoteAgentSessionConnection: RemoteAgentSessionConnection {
         private var responses: [String: [JSONValue]]
+        private var commandErrors: [String: [RemoteClientError]]
         private let getLogDelayNanoseconds: UInt64
         private let commandDelayNanosecondsByType: [String: UInt64]
         private var subscribeErrors: [RemoteClientError]
@@ -3073,6 +3363,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         init(
             responses: [String: [JSONValue]] = [:],
+            commandErrors: [String: [RemoteClientError]] = [:],
             getLogDelayNanoseconds: UInt64 = 0,
             commandDelayNanosecondsByType: [String: UInt64] = [:],
             subscribeErrors: [RemoteClientError] = [],
@@ -3080,6 +3371,7 @@ final class RemoteAgentSessionTests: XCTestCase {
             unsubscribeError: Error? = nil
         ) {
             self.responses = responses
+            self.commandErrors = commandErrors
             self.getLogDelayNanoseconds = getLogDelayNanoseconds
             self.commandDelayNanosecondsByType = commandDelayNanosecondsByType
             self.subscribeErrors = subscribeErrors
@@ -3110,6 +3402,11 @@ final class RemoteAgentSessionTests: XCTestCase {
             }
             if let delay = commandDelayNanosecondsByType[frame.type], delay > 0 {
                 try? await Task.sleep(nanoseconds: delay)
+            }
+            if var queued = commandErrors[frame.type], !queued.isEmpty {
+                let error = queued.removeFirst()
+                commandErrors[frame.type] = queued
+                throw error
             }
             if var queued = responses[frame.type], !queued.isEmpty {
                 let response = queued.removeFirst()

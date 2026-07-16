@@ -269,6 +269,9 @@ actor RemoteAgentSessionController {
     func steer(_ text: String) async throws {
         try ensureNotShutdown()
         guard let sessionID = remoteSessionID else { throw missingSessionError() }
+        // Register before sending so throw paths also re-arm; .inDoubt catch-up can adopt
+        // a parked active run before rethrowing.
+        defer { recordStaleObservationProgress(reason: "steer") }
         let frame = RemoteClientFrame(
             type: "steer",
             requestID: makeRequestID(prefix: "steer"),
@@ -285,6 +288,7 @@ actor RemoteAgentSessionController {
     func respond(interactionID: String, payload: RemoteInteractionResponsePayload) async throws {
         try ensureNotShutdown()
         guard let sessionID = remoteSessionID else { throw missingSessionError() }
+        defer { recordStaleObservationProgress(reason: "respond") }
         let frame = RemoteClientFrame(
             type: "respond",
             requestID: makeRequestID(prefix: "respond"),
@@ -304,6 +308,7 @@ actor RemoteAgentSessionController {
     func cancel() async throws {
         try ensureNotShutdown()
         guard let sessionID = remoteSessionID else { return }
+        defer { recordStaleObservationProgress(reason: "cancel") }
         let frame = RemoteClientFrame(
             type: "cancel",
             requestID: makeRequestID(prefix: "cancel"),
