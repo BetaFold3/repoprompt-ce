@@ -6,6 +6,7 @@ import SwiftUI
 
 struct AgentContextUsage: Codable, Equatable {
     var modelContextWindow: Int?
+    var configuredContextWindow: Int? = nil
     var lastTotalTokens: Int?
     var totalTotalTokens: Int?
 }
@@ -324,6 +325,12 @@ final class AgentModeViewModel: ObservableObject {
             if let session = activeSession {
                 let previousAgent = session.selectedAgent
                 if previousAgent != selectedAgent {
+                    session.codexContextUsage = nil
+                    clearContextUsageSnapshot(for: session)
+                    if session.tabID == currentTabID {
+                        contextUsage = nil
+                        contextUsageSnapshot = nil
+                    }
                     codexCoordinator.handleProviderSwitch(from: previousAgent, to: selectedAgent, session: session)
                     claudeCoordinator.handleProviderIdentityTransitionSync(
                         session: session,
@@ -342,6 +349,7 @@ final class AgentModeViewModel: ObservableObject {
             persistLastUsedModelIfNeeded(agent: selectedAgent, modelRaw: selectedModelRaw)
             refreshAutoEditPermissionGuidanceForActiveSession()
             updateDynamicModelPolling()
+            scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "selected_agent_changed")
             syncAllActiveUIState()
         }
     }
@@ -378,6 +386,7 @@ final class AgentModeViewModel: ObservableObject {
                     reason: "selected_model_changed"
                 )
             }
+            scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "selected_model_changed")
             syncComposerUIState()
             syncRuntimeMetricsUIState()
             syncRunInteractionUIState()
@@ -635,6 +644,8 @@ final class AgentModeViewModel: ObservableObject {
     private var pendingUIRefreshScopesByTabID: [UUID: Set<UIRefreshScope>] = [:]
     private var pendingAssistantPresentationByTabID: [UUID: AssistantPresentationRequest] = [:]
     private var uiRefreshTask: Task<Void, Never>?
+    var provisionalClaudeContextWindowResolver = ClaudeProvisionalContextWindowResolver()
+    var provisionalClaudeContextWindowInFlightKeys: Set<ClaudeProvisionalContextWindowResolver.Key> = []
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var remoteCatalogLoadTasksByHostID: [String: Task<Void, Never>] = [:]
@@ -795,6 +806,55 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_installLiveSession(_ session: TabSession) {
             sessions[session.tabID] = session
+        }
+
+        func test_setProvisionalClaudeConfiguredContextWindow(
+            _ value: Int?,
+            launchKey: ClaudeProvisionalContextWindowResolver.Key,
+            for session: TabSession
+        ) {
+            syncSpawnResolvedClaudeConfiguredContextWindow(value, launchKey: launchKey, for: session)
+        }
+
+        func test_sidebarConfiguredContextWindow(for session: TabSession) -> Int? {
+            sidebarConfiguredContextWindow(for: session)
+        }
+
+        func test_cachedProvisionalClaudeConfiguredContextWindow(for session: TabSession) -> Int? {
+            guard let key = provisionalClaudeContextWindowKey(for: session) else { return nil }
+            return provisionalClaudeContextWindowResolver.cachedConfiguredContextWindow(for: key)
+        }
+
+        func test_provisionalClaudeContextWindowKey(
+            for session: TabSession
+        ) -> ClaudeProvisionalContextWindowResolver.Key? {
+            provisionalClaudeContextWindowKey(for: session)
+        }
+
+        func test_storeCachedProvisionalClaudeConfiguredContextWindow(
+            _ value: Int?,
+            for key: ClaudeProvisionalContextWindowResolver.Key
+        ) {
+            provisionalClaudeContextWindowResolver.store(value, for: key)
+        }
+
+        func test_markProvisionalClaudeContextWindowInFlight(
+            for key: ClaudeProvisionalContextWindowResolver.Key
+        ) {
+            provisionalClaudeContextWindowInFlightKeys.insert(key)
+        }
+
+        func test_isProvisionalClaudeContextWindowInFlight(
+            for key: ClaudeProvisionalContextWindowResolver.Key
+        ) -> Bool {
+            provisionalClaudeContextWindowInFlightKeys.contains(key)
+        }
+
+        func test_completeProvisionalClaudeContextWindowResolution(
+            _ value: Int?,
+            for key: ClaudeProvisionalContextWindowResolver.Key
+        ) {
+            completeProvisionalClaudeContextWindowResolution(value, for: key)
         }
 
         func test_installPersistentSessionBinding(
@@ -2172,8 +2232,12 @@ final class AgentModeViewModel: ObservableObject {
 
     lazy var claudeContextUsageEstimator = ClaudeContextUsageEstimator(
         tokenEstimator: { Self.estimateRuntimeTokens(for: $0) },
-        contextUsageBuilder: { usage, modelContextWindow in
-            Self.contextUsageFromClaudeProviderTokens(usage, modelContextWindow: modelContextWindow)
+        contextUsageBuilder: { usage, modelContextWindow, configuredContextWindow in
+            Self.contextUsageFromClaudeProviderTokens(
+                usage,
+                modelContextWindow: modelContextWindow,
+                configuredContextWindow: configuredContextWindow
+            )
         }
     )
 
@@ -3252,6 +3316,7 @@ final class AgentModeViewModel: ObservableObject {
             workspaceSwitchInFlight = false
             activeSessionLoadInProgressTabID = nil
             applySessionToBindings(session)
+            scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "workspace_switch_completed")
             return
         }
 
@@ -3267,6 +3332,7 @@ final class AgentModeViewModel: ObservableObject {
             workspaceSwitchInFlight = false
             applySessionToBindings(session)
             activeSessionLoadInProgressTabID = nil
+            scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "workspace_switch_completed")
             if session.remoteHost == nil, session.selectedAgent == .codexExec, session.runState.isActive {
                 await codexCoordinator.ensureCodexNativeSession(session: session)
             }
@@ -4454,7 +4520,8 @@ final class AgentModeViewModel: ObservableObject {
             if session.codexContextUsage?.lastTotalTokens == nil {
                 session.codexContextUsage = Self.contextUsageFromClaudeProviderTokens(
                     session.providerTokenUsageByTurn,
-                    modelContextWindow: session.codexContextUsage?.modelContextWindow
+                    modelContextWindow: session.codexContextUsage?.modelContextWindow,
+                    configuredContextWindow: session.claudeConfiguredContextWindow
                 )
             }
         case .codexExec, .openCode, .cursor:
@@ -4693,6 +4760,8 @@ final class AgentModeViewModel: ObservableObject {
         session.locallyAttributedStartItemID = nil
         session.remoteHost = nil
         session.providerTokenUsageByTurn.removeAll()
+        session.claudeConfiguredContextWindow = nil
+        session.claudeConfiguredContextWindowKey = nil
         session.lastUserMessageAt = nil
         session.isDirty = false
     }
@@ -6651,6 +6720,12 @@ final class AgentModeViewModel: ObservableObject {
 
         let previousAgent = session.selectedAgent
         if previousAgent != normalized.agent {
+            session.codexContextUsage = nil
+            clearContextUsageSnapshot(for: session)
+            if session.tabID == currentTabID {
+                contextUsage = nil
+                contextUsageSnapshot = nil
+            }
             codexCoordinator.handleProviderSwitch(from: previousAgent, to: normalized.agent, session: session)
             await claudeCoordinator.handleProviderIdentityTransition(
                 session: session,
@@ -8225,6 +8300,7 @@ final class AgentModeViewModel: ObservableObject {
 
         refreshAutoEditPermissionGuidanceForActiveSession(syncUI: false)
         updateDynamicModelPolling()
+        scheduleProvisionalClaudeContextWindowResolutionForActiveSession(reason: "session_activated")
         syncAllActiveUIState(tabID: session.tabID)
     }
 
@@ -16775,6 +16851,8 @@ final class AgentModeViewModel: ObservableObject {
         claudeCoordinator.prepareForConversationResetSync(session)
         session.providerSessionID = nil
         session.providerTokenUsageByTurn.removeAll()
+        session.claudeConfiguredContextWindow = nil
+        session.claudeConfiguredContextWindowKey = nil
         session.pendingNonCodexUserInputTokenQueue.removeAll()
         session.activeNonCodexTurnTokenAccumulator = nil
         session.contextUsageSnapshot = nil
