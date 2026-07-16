@@ -23,6 +23,7 @@ final class GatewayAuthScopeEnforcerTests: XCTestCase {
         ("start", GatewayRemoteScope.sessionsOperate),
         ("steer", GatewayRemoteScope.sessionsOperate),
         ("cancel", GatewayRemoteScope.sessionsOperate),
+        ("open_workspace", GatewayRemoteScope.sessionsOperate),
         ("respond", GatewayRemoteScope.interactionsRespond)
     ]
 

@@ -205,6 +205,64 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         }
     }
 
+    func testOpenWorkspaceTranslatesClosedPayloadAndUsesFastTimeout() throws {
+        let call = try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "open_workspace",
+            requestID: "open-1",
+            payload: .object(["workspace_name": .string("Project Alpha")])
+        ))
+
+        XCTAssertEqual(call.toolName, "manage_workspaces")
+        XCTAssertEqual(call.arguments["action"], .string("open"))
+        XCTAssertEqual(call.arguments["workspace_name"], .string("Project Alpha"))
+        XCTAssertEqual(call.arguments["_rawJSON"], .bool(true))
+        XCTAssertNil(call.arguments["op"])
+        XCTAssertEqual(call.timeout, 60)
+    }
+
+    func testOpenWorkspaceIsBindingExemptAndIDTakesPrecedence() throws {
+        let workspaceID = "33333333-3333-3333-3333-333333333333"
+        let frame = RemoteClientFrame(
+            type: "open_workspace",
+            requestID: "open-2",
+            payload: .object([
+                "workspace_id": .string(workspaceID),
+                "workspace_name": .string("Stale Name")
+            ])
+        )
+
+        for bindingState in [
+            RemoteGatewayBindingState.bindingRequired("bind first"),
+            .ambiguousStartTarget("multiple windows")
+        ] {
+            let call = try RemoteCommandTranslator(bindingState: bindingState).translate(frame)
+            XCTAssertEqual(call.arguments["workspace_id"], .string(workspaceID))
+            XCTAssertNil(call.arguments["workspace_name"], "ID precedence must be encoded before the host call")
+        }
+    }
+
+    func testOpenWorkspaceRejectsMissingBlankUnknownAndPassthroughPayloads() {
+        let invalidPayloads: [JSONValue] = [
+            .object([:]),
+            .object(["workspace_id": .string("  "), "workspace_name": .string("\n")]),
+            .object(["workspace_name": .string("Project"), "extra": .bool(true)]),
+            .object(["workspace_name": .string("Project"), "tool": .string("manage_workspaces")]),
+            .object(["workspace_name": .string("Project"), "arguments": .object([:])]),
+            .object(["workspace_name": .string("Project"), "op": .string("open")])
+        ]
+
+        for (index, payload) in invalidPayloads.enumerated() {
+            XCTAssertThrowsError(
+                try RemoteCommandTranslator().translate(RemoteClientFrame(
+                    type: "open_workspace",
+                    requestID: "invalid-\(index)",
+                    payload: payload
+                )),
+                "case \(index)"
+            )
+        }
+    }
+
     // MARK: - Plan §6.1: request_id forwarding to the app idempotency registry
 
     func testForwardsRequestIDForMutatingOpsOnly() throws {

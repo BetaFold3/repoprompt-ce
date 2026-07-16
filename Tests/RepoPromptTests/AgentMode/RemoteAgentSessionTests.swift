@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPromptApp
 import RepoPromptRemoteWire
 import XCTest
@@ -441,6 +442,918 @@ final class RemoteAgentSessionTests: XCTestCase {
         let unsubscribed = await connection.unsubscribedSessionIDBatches()
         XCTAssertEqual(pollCount, 0)
         XCTAssertEqual(unsubscribed.last, ["remote-session-recovery-cancel"])
+    }
+
+    func testWithheldPushStaleRecoveryCompletesParkedTurnWithoutResending() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "remote-session-stale-complete"
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "start": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+            "poll": [
+                Self.snapshotPayload(status: "running", sessionID: sessionID),
+                Self.snapshotPayload(status: "completed", sessionID: sessionID)
+            ],
+            "get_log": [
+                Self.logPayload(
+                    offset: 0,
+                    returned: 1,
+                    total: 1,
+                    xml: "<user>Prompt</user>",
+                    completed: 0
+                ),
+                Self.logPayload(
+                    offset: 0,
+                    returned: 1,
+                    total: 1,
+                    xml: "<user>Prompt</user>\n<assistant>Completed reply</assistant>",
+                    completed: 1
+                ),
+                Self.logPayload(
+                    offset: 0,
+                    returned: 1,
+                    total: 1,
+                    xml: "<user>Prompt</user>\n<assistant>Completed reply</assistant>",
+                    completed: 1
+                )
+            ]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        _ = try await controller.start(
+            message: "Prompt",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: nil,
+            workspaceID: nil,
+            workspaceName: nil
+        )
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+        await assertCommandCount(connection, type: "poll", equals: 1)
+        await assertCommandCount(connection, type: "get_log", equals: 1)
+
+        scheduler.advance(by: 9)
+        await Task.yield()
+        await assertCommandCount(connection, type: "poll", equals: 1)
+
+        scheduler.advance(by: 1)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await connection.commandCount(type: "get_log") == 3
+        }
+
+        let binding = await controller.currentBinding()
+        let rows = await recorder.upsertedTranscriptRows()
+        let runStates = await recorder.recordedRunStates()
+        XCTAssertEqual(binding?.nextLogOffset, 1)
+        XCTAssertEqual(rows.map(\.text), ["Prompt", "Completed reply"])
+        XCTAssertEqual(runStates.last, .completed)
+        await assertCommandCount(connection, type: "start", equals: 1)
+        await assertSubscribeCount(connection, equals: 1)
+        await assertCommandCount(connection, type: "steer", equals: 0)
+        await assertCommandCount(connection, type: "respond", equals: 0)
+        await assertCommandCount(connection, type: "cancel", equals: 0)
+    }
+
+    func testSteerAfterTerminalReArmsStaleRecoveryAndCompletesParkedTurnWithoutPush() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "remote-session-terminal-steer"
+        let completePage = Self.logPayload(
+            offset: 1,
+            returned: 1,
+            total: 2,
+            xml: "<assistant>Recovered reply</assistant>",
+            completed: 2
+        )
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "steer": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+            "poll": [
+                Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                Self.snapshotPayload(status: "running", sessionID: sessionID),
+                Self.snapshotPayload(status: "completed", sessionID: sessionID)
+            ],
+            "get_log": [
+                Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                Self.logPayload(
+                    offset: 1,
+                    returned: 1,
+                    total: 2,
+                    xml: "<assistant>Still working</assistant>",
+                    completed: 1
+                ),
+                completePage,
+                completePage
+            ]
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        try await controller.attachAndCatchUp()
+        XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+
+        try await controller.steer("Continue")
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+        let parkedBinding = await controller.currentBinding()
+        XCTAssertEqual(parkedBinding?.nextLogOffset, 1)
+
+        scheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            let rows = await recorder.upsertedTranscriptRows()
+            let runStates = await recorder.recordedRunStates()
+            return await connection.commandCount(type: "get_log") == 4
+                && scheduler.pendingSleeperCount() == 0
+                && rows.contains { $0.text == "Recovered reply" }
+                && runStates.last == .completed
+        }
+
+        let binding = await controller.currentBinding()
+        let rows = await recorder.upsertedTranscriptRows()
+        let runStates = await recorder.recordedRunStates()
+        XCTAssertEqual(binding?.nextLogOffset, 2)
+        XCTAssertTrue(rows.contains { $0.text == "Recovered reply" })
+        XCTAssertEqual(runStates.last, .completed)
+        await assertCommandCount(connection, type: "steer", equals: 1)
+
+        let pollCountAtTerminal = await connection.commandCount(type: "poll")
+        scheduler.advance(by: 100)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+        await assertCommandCount(connection, type: "poll", equals: pollCountAtTerminal)
+    }
+
+    func testSteerInDoubtCatchUpReArmsStaleRecoveryWithoutResending() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "remote-session-in-doubt-steer"
+        let connection = RecordingRemoteAgentSessionConnection(
+            responses: [
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                    Self.logPayload(
+                        offset: 1,
+                        returned: 1,
+                        total: 2,
+                        xml: "<assistant>Still working</assistant>",
+                        completed: 1
+                    )
+                ]
+            ],
+            commandErrors: [
+                "steer": [
+                    .inDoubt(.init(code: "in_doubt", message: "Outcome uncertain"))
+                ]
+            ]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        defer { Task { await controller.shutdown() } }
+
+        try await controller.attachAndCatchUp()
+        XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+
+        do {
+            try await controller.steer("Continue")
+            XCTFail("Expected the steer outcome to remain in doubt")
+        } catch RemoteClientError.inDoubt {}
+
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+        let binding = await controller.currentBinding()
+        XCTAssertEqual(binding?.nextLogOffset, 1)
+        await assertCommandCount(connection, type: "steer", equals: 1)
+        await assertCommandCount(connection, type: "poll", equals: 2)
+    }
+
+    func testRespondAlreadyResolvedReArmsStaleRecoveryAndCompletesWithoutResending() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "remote-session-resolved-respond"
+        let completePage = Self.logPayload(
+            offset: 1,
+            returned: 1,
+            total: 2,
+            xml: "<assistant>Authoritative reply</assistant>",
+            completed: 2
+        )
+        let connection = RecordingRemoteAgentSessionConnection(
+            responses: [
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID),
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                    Self.logPayload(
+                        offset: 1,
+                        returned: 1,
+                        total: 2,
+                        xml: "<assistant>Pending reply</assistant>",
+                        completed: 1
+                    ),
+                    completePage,
+                    completePage
+                ]
+            ],
+            commandErrors: [
+                "respond": [
+                    .interactionAlreadyResolved(.init(
+                        code: "interaction_already_resolved",
+                        message: "Already resolved"
+                    ))
+                ]
+            ]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        try await controller.attachAndCatchUp()
+        XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+
+        try await controller.respond(
+            interactionID: "interaction-1",
+            payload: .init(response: "Approved")
+        )
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+
+        scheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await connection.commandCount(type: "get_log") == 4
+                && scheduler.pendingSleeperCount() == 0
+        }
+
+        let rows = await recorder.upsertedTranscriptRows()
+        let binding = await controller.currentBinding()
+        XCTAssertTrue(rows.contains { $0.text == "Authoritative reply" })
+        XCTAssertEqual(binding?.nextLogOffset, 2)
+        await assertCommandCount(connection, type: "respond", equals: 1)
+    }
+
+    func testCancelCommandTailKeepsTerminalSettledAndReArmsWhileStillRunning() async throws {
+        do {
+            let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+            let sessionID = "remote-session-terminal-cancel"
+            let connection = RecordingRemoteAgentSessionConnection(responses: [
+                "cancel": [Self.snapshotPayload(status: "cancelled", sessionID: sessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                    Self.snapshotPayload(status: "cancelled", sessionID: sessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1)
+                ]
+            ])
+            let controller = RemoteAgentSessionController(
+                binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+                connection: connection,
+                recoveryScheduler: scheduler,
+                recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            )
+            defer { Task { await controller.shutdown() } }
+
+            try await controller.attachAndCatchUp()
+            try await controller.cancel()
+            XCTAssertEqual(scheduler.pendingSleeperCount(), 0)
+
+            scheduler.advance(by: 100)
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            await assertCommandCount(connection, type: "cancel", equals: 1)
+            await assertCommandCount(connection, type: "poll", equals: 2)
+            await controller.shutdown()
+        }
+
+        do {
+            let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+            let sessionID = "remote-session-running-cancel"
+            let connection = RecordingRemoteAgentSessionConnection(responses: [
+                "cancel": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 1, returned: 0, total: 1, xml: "<transcript/>", completed: 1),
+                    Self.logPayload(
+                        offset: 1,
+                        returned: 1,
+                        total: 2,
+                        xml: "<assistant>Cancelling</assistant>",
+                        completed: 1
+                    )
+                ]
+            ])
+            let controller = RemoteAgentSessionController(
+                binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 1),
+                connection: connection,
+                recoveryScheduler: scheduler,
+                recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            )
+            defer { Task { await controller.shutdown() } }
+
+            try await controller.attachAndCatchUp()
+            try await controller.cancel()
+            await waitForDeterministicRemoteAgentSessionCondition {
+                scheduler.pendingSleeperCount() == 1
+            }
+            await assertCommandCount(connection, type: "cancel", equals: 1)
+            await controller.shutdown()
+        }
+    }
+
+    func testStaleRecoveryBackoffIsBoundedSingleFlightAndDeduplicatesRows() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "remote-session-stale-bounded"
+        let parked = Self.logPayload(
+            offset: 0,
+            returned: 1,
+            total: 1,
+            xml: "<user>Prompt</user>\n<assistant>Still working</assistant>",
+            completed: 0
+        )
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "start": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+            "poll": Array(repeating: Self.snapshotPayload(status: "running", sessionID: sessionID), count: 4),
+            "get_log": Array(repeating: parked, count: 4)
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        let recorder = RemoteSessionEventRecorder()
+        let eventTask = Task {
+            for await event in controller.events {
+                await recorder.record(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            Task { await controller.shutdown() }
+        }
+
+        _ = try await controller.start(
+            message: "Prompt",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: nil,
+            workspaceID: nil,
+            workspaceName: nil
+        )
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+
+        scheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await connection.commandCount(type: "poll") == 2
+                && scheduler.pendingSleeperCount() == 1
+        }
+        scheduler.advance(by: 5)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await connection.commandCount(type: "poll") == 3
+                && scheduler.pendingSleeperCount() == 1
+        }
+        scheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await connection.commandCount(type: "poll") == 4
+        }
+        scheduler.advance(by: 100)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        let rows = await recorder.upsertedTranscriptRows()
+        await assertCommandCount(connection, type: "poll", equals: 4)
+        await assertCommandCount(connection, type: "get_log", equals: 4)
+        await assertCommandCount(connection, type: "start", equals: 1)
+        await assertSubscribeCount(connection, equals: 1)
+        await assertCommandCount(connection, type: "steer", equals: 0)
+        await assertCommandCount(connection, type: "respond", equals: 0)
+        await assertCommandCount(connection, type: "cancel", equals: 0)
+        await assertMaximumObservationConcurrency(connection, equals: 1)
+        XCTAssertEqual(rows.map(\.text), ["Prompt", "Still working"])
+        XCTAssertEqual(Set(rows.map(\.id)).count, rows.count)
+    }
+
+    func testObservationProgressResetsStaleDeadlineAndCoalescesPushScheduledAndCommandCatchUp() async throws {
+        let parked = Self.logPayload(
+            offset: 0,
+            returned: 1,
+            total: 1,
+            xml: "<user>Prompt</user>\n<assistant>Working</assistant>",
+            completed: 0
+        )
+
+        do {
+            let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+            let sessionID = "remote-session-unrelated-progress"
+            let connection = RecordingRemoteAgentSessionConnection(responses: [
+                "start": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "running", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID)
+                ],
+                "get_log": [parked, parked]
+            ])
+            let controller = RemoteAgentSessionController(
+                binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+                connection: connection,
+                recoveryScheduler: scheduler,
+                recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            )
+
+            _ = try await controller.start(
+                message: "Prompt",
+                modelSelectionRaw: nil,
+                sessionName: nil,
+                windowID: nil,
+                workspaceID: nil,
+                workspaceName: nil
+            )
+            await waitForDeterministicRemoteAgentSessionCondition {
+                scheduler.pendingSleeperCount() == 1
+            }
+            scheduler.advance(by: 9)
+            await controller.handleInboundFrame(RemoteServerFrame(
+                type: "session_update",
+                sessionID: "unrelated-session",
+                seq: 1,
+                payload: Self.snapshotPayload(status: "running", sessionID: "unrelated-session")
+            ))
+            scheduler.advance(by: 1)
+            await waitForDeterministicRemoteAgentSessionCondition {
+                let pollCount = await connection.commandCount(type: "poll")
+                let getLogCount = await connection.commandCount(type: "get_log")
+                return pollCount == 2 && getLogCount == 2
+            }
+            await controller.shutdown()
+        }
+
+        do {
+            let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+            let sessionID = "remote-session-current-progress"
+            let connection = RecordingRemoteAgentSessionConnection(responses: [
+                "start": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "running", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID)
+                ],
+                "get_log": [parked, parked, parked]
+            ])
+            let controller = RemoteAgentSessionController(
+                binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+                connection: connection,
+                recoveryScheduler: scheduler,
+                recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            )
+
+            _ = try await controller.start(
+                message: "Prompt",
+                modelSelectionRaw: nil,
+                sessionName: nil,
+                windowID: nil,
+                workspaceID: nil,
+                workspaceName: nil
+            )
+            await waitForDeterministicRemoteAgentSessionCondition {
+                scheduler.pendingSleeperCount() == 1
+            }
+            scheduler.advance(by: 9)
+            await controller.handleInboundFrame(RemoteServerFrame(
+                type: "session_update",
+                sessionID: sessionID,
+                seq: 1,
+                payload: Self.snapshotPayload(status: "running", sessionID: sessionID)
+            ))
+            await waitForDeterministicRemoteAgentSessionCondition {
+                await connection.commandCount(type: "get_log") == 2
+                    && scheduler.pendingSleeperCount() == 1
+            }
+
+            scheduler.advance(by: 1)
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            await assertCommandCount(connection, type: "poll", equals: 1)
+
+            scheduler.advance(by: 9)
+            await waitForDeterministicRemoteAgentSessionCondition {
+                let pollCount = await connection.commandCount(type: "poll")
+                let getLogCount = await connection.commandCount(type: "get_log")
+                return pollCount == 2 && getLogCount == 3
+            }
+            await controller.shutdown()
+        }
+
+        do {
+            let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+            let sessionID = "remote-session-catchup-coalescing"
+            let connection = RecordingRemoteAgentSessionConnection(responses: [
+                "start": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+                "steer": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+                "respond": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "running", sessionID: sessionID),
+                    Self.snapshotPayload(status: "running", sessionID: sessionID)
+                ],
+                "get_log": [parked, parked, parked]
+            ])
+            let controller = RemoteAgentSessionController(
+                binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+                connection: connection,
+                recoveryScheduler: scheduler,
+                recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            )
+            let recorder = RemoteSessionEventRecorder()
+            let eventTask = Task {
+                for await event in controller.events {
+                    await recorder.record(event)
+                }
+            }
+            defer {
+                eventTask.cancel()
+                Task { await controller.shutdown() }
+            }
+
+            _ = try await controller.start(
+                message: "Prompt",
+                modelSelectionRaw: nil,
+                sessionName: nil,
+                windowID: nil,
+                workspaceID: nil,
+                workspaceName: nil
+            )
+            await waitForDeterministicRemoteAgentSessionCondition {
+                scheduler.pendingSleeperCount() == 1
+            }
+
+            let gate = RemoteObservationCommandGate()
+            await connection.setObservationGate(gate, type: "get_log")
+            await controller.handleInboundFrame(RemoteServerFrame(
+                type: "session_update",
+                sessionID: sessionID,
+                seq: 1,
+                payload: Self.snapshotPayload(status: "running", sessionID: sessionID)
+            ))
+            await gate.waitUntilEntered()
+
+            let steerTask = Task { try await controller.steer("Continue") }
+            let respondTask = Task {
+                try await controller.respond(
+                    interactionID: "interaction-1",
+                    payload: .init(response: "Approved")
+                )
+            }
+            await waitForDeterministicRemoteAgentSessionCondition {
+                let steerCount = await connection.commandCount(type: "steer")
+                let respondCount = await connection.commandCount(type: "respond")
+                return steerCount == 1 && respondCount == 1
+            }
+            await assertCommandCount(connection, type: "poll", equals: 1)
+            await assertCommandCount(connection, type: "get_log", equals: 2)
+            await assertMaximumObservationConcurrency(connection, equals: 1)
+
+            await gate.release()
+            try await steerTask.value
+            try await respondTask.value
+            await waitForDeterministicRemoteAgentSessionCondition {
+                let pollCount = await connection.commandCount(type: "poll")
+                let getLogCount = await connection.commandCount(type: "get_log")
+                return pollCount == 2 && getLogCount == 3
+            }
+            let rowsAfterOverlap = await recorder.upsertedTranscriptRows()
+            XCTAssertEqual(rowsAfterOverlap.map(\.text), ["Prompt", "Working"])
+            XCTAssertEqual(Set(rowsAfterOverlap.map(\.id)).count, rowsAfterOverlap.count)
+            await assertMaximumObservationConcurrency(connection, equals: 1)
+
+            await connection.setObservationGate(nil, type: nil)
+            await controller.handleInboundFrame(RemoteServerFrame(
+                type: "session_terminal",
+                sessionID: sessionID,
+                seq: 2,
+                payload: Self.snapshotPayload(status: "completed", sessionID: sessionID)
+            ))
+            await waitForDeterministicRemoteAgentSessionCondition {
+                await (recorder.recordedTerminalStatuses()).contains("completed")
+            }
+            let pollCountAtTerminal = await connection.commandCount(type: "poll")
+            scheduler.advance(by: 100)
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            await assertCommandCount(connection, type: "poll", equals: pollCountAtTerminal)
+            await controller.shutdown()
+            eventTask.cancel()
+        }
+    }
+
+    func testStaleRecoveryCancelsAcrossTerminalExpiredStartUnsubscribeShutdownAndReplacement() async throws {
+        func makeAttached(
+            sessionID: String
+        ) async throws -> (
+            RemoteAgentSessionController,
+            RecordingRemoteAgentSessionConnection,
+            ManualRemoteAgentSessionRecoveryScheduler
+        ) {
+            let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+            let connection = RecordingRemoteAgentSessionConnection(responses: [
+                "poll": [Self.snapshotPayload(status: "running", sessionID: sessionID)],
+                "get_log": [Self.logPayload(offset: 0, returned: 0, total: 0, xml: "<transcript/>")]
+            ])
+            let controller = RemoteAgentSessionController(
+                binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 0),
+                connection: connection,
+                recoveryScheduler: scheduler,
+                recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            )
+            try await controller.attachAndCatchUp()
+            await waitForDeterministicRemoteAgentSessionCondition {
+                scheduler.pendingSleeperCount() == 1
+            }
+            return (controller, connection, scheduler)
+        }
+
+        do {
+            let (controller, connection, scheduler) = try await makeAttached(sessionID: "terminal-session")
+            await connection.enqueue(
+                Self.snapshotPayload(status: "completed", sessionID: "terminal-session"),
+                forType: "poll"
+            )
+            await controller.handleInboundFrame(RemoteServerFrame(
+                type: "session_terminal",
+                sessionID: "terminal-session",
+                seq: 1,
+                payload: Self.snapshotPayload(status: "completed", sessionID: "terminal-session")
+            ))
+            await waitForDeterministicRemoteAgentSessionCondition {
+                await connection.commandCount(type: "get_log", sessionID: "terminal-session") == 2
+            }
+            scheduler.advance(by: 100)
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            await assertCommandCount(connection, type: "poll", sessionID: "terminal-session", equals: 1)
+            await controller.shutdown()
+        }
+
+        do {
+            let (controller, connection, scheduler) = try await makeAttached(sessionID: "expired-session")
+            await controller.handleInboundFrame(RemoteServerFrame(
+                type: "session_expired",
+                sessionID: "expired-session",
+                seq: 1,
+                payload: Self.snapshotPayload(status: "expired", sessionID: "expired-session")
+            ))
+            scheduler.advance(by: 100)
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            await assertCommandCount(connection, type: "poll", sessionID: "expired-session", equals: 1)
+            await controller.shutdown()
+        }
+
+        for replacementID in ["same-start-session", "replacement-session"] {
+            let oldSessionID = replacementID == "same-start-session" ? replacementID : "old-session"
+            let (controller, connection, scheduler) = try await makeAttached(sessionID: oldSessionID)
+            await connection.enqueue(
+                Self.snapshotPayload(status: "running", sessionID: replacementID),
+                forType: "start"
+            )
+            await connection.enqueue(
+                Self.snapshotPayload(status: "running", sessionID: replacementID),
+                forType: "poll"
+            )
+            await connection.enqueue(
+                Self.logPayload(offset: 0, returned: 0, total: 0, xml: "<transcript/>"),
+                forType: "get_log"
+            )
+            _ = try await controller.start(
+                message: "New turn",
+                modelSelectionRaw: nil,
+                sessionName: nil,
+                windowID: nil,
+                workspaceID: nil,
+                workspaceName: nil
+            )
+            if replacementID == oldSessionID {
+                let countAfterStart = await connection.commandCount(type: "poll")
+                scheduler.advance(by: 9)
+                for _ in 0 ..< 20 {
+                    await Task.yield()
+                }
+                await assertCommandCount(connection, type: "poll", equals: countAfterStart)
+            } else {
+                scheduler.advance(by: 100)
+                await waitForDeterministicRemoteAgentSessionCondition {
+                    await connection.commandCount(type: "poll") >= 2
+                }
+                await assertCommandCount(connection, type: "poll", sessionID: oldSessionID, equals: 1)
+            }
+            await controller.shutdown()
+        }
+
+        do {
+            let (controller, connection, scheduler) = try await makeAttached(sessionID: "unsubscribe-session")
+            let gate = RemoteObservationCommandGate()
+            await connection.setObservationGate(gate, type: "get_log")
+            await controller.handleInboundFrame(RemoteServerFrame(
+                type: "session_update",
+                sessionID: "unsubscribe-session",
+                seq: 1,
+                payload: Self.snapshotPayload(status: "running", sessionID: "unsubscribe-session")
+            ))
+            await gate.waitUntilEntered()
+            await controller.unsubscribe()
+            await gate.release()
+            scheduler.advance(by: 100)
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            await assertCommandCount(connection, type: "poll", sessionID: "unsubscribe-session", equals: 1)
+            await assertCommandCount(connection, type: "get_log", sessionID: "unsubscribe-session", equals: 2)
+            await controller.shutdown()
+        }
+
+        do {
+            let (controller, connection, scheduler) = try await makeAttached(sessionID: "shutdown-session")
+            await controller.shutdown()
+            scheduler.advance(by: 100)
+            for _ in 0 ..< 20 {
+                await Task.yield()
+            }
+            await assertCommandCount(connection, type: "poll", sessionID: "shutdown-session", equals: 1)
+        }
+    }
+
+    func testStaleRecoveryPausesOnDisconnectResumesSameSessionAndDefersToTransientRecovery() async throws {
+        let scheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let sessionID = "pause-resume-session"
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "poll": Array(repeating: Self.snapshotPayload(status: "running", sessionID: sessionID), count: 4),
+            "get_log": Array(
+                repeating: Self.logPayload(offset: 0, returned: 0, total: 0, xml: "<transcript/>"),
+                count: 4
+            )
+        ])
+        let controller = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: connection,
+            recoveryScheduler: scheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        defer { Task { await controller.shutdown() } }
+
+        try await controller.attachAndCatchUp()
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+
+        await controller.handleConnectionState(.degraded(code: "network", retryAt: Date()))
+        scheduler.advance(by: 100)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await assertCommandCount(connection, type: "poll", equals: 1)
+
+        await controller.handleConnectionState(.connected(scopes: []))
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+        scheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await connection.commandCount(type: "poll") == 2
+        }
+
+        await controller.handleConnectionState(.idle)
+        scheduler.advance(by: 100)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await assertCommandCount(connection, type: "poll", equals: 2)
+
+        await controller.handleConnectionState(.connected(scopes: []))
+        await waitForDeterministicRemoteAgentSessionCondition {
+            scheduler.pendingSleeperCount() == 1
+        }
+        scheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await connection.commandCount(type: "poll") == 3
+        }
+        await assertMaximumObservationConcurrency(connection, equals: 1)
+
+        let transientScheduler = ManualRemoteAgentSessionRecoveryScheduler()
+        let transientSessionID = "transient-owner-session"
+        let subscribeGate = RemoteSubscribeGate()
+        let transientConnection = RecordingRemoteAgentSessionConnection(
+            responses: [
+                "start": [Self.snapshotPayload(status: "running", sessionID: transientSessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "running", sessionID: transientSessionID),
+                    Self.snapshotPayload(status: "running", sessionID: transientSessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 0, returned: 0, total: 0, xml: "<transcript/>"),
+                    Self.logPayload(offset: 0, returned: 0, total: 0, xml: "<transcript/>")
+                ]
+            ],
+            subscribeErrors: [.timeout(operation: "subscribe", seconds: 30)],
+            subscribeGate: subscribeGate
+        )
+        let transientController = RemoteAgentSessionController(
+            binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: transientConnection,
+            recoveryScheduler: transientScheduler,
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+        )
+        defer { Task { await transientController.shutdown() } }
+
+        _ = try await transientController.start(
+            message: "Prompt",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: nil,
+            workspaceID: nil,
+            workspaceName: nil
+        )
+        await subscribeGate.waitUntilEntered()
+        transientScheduler.advance(by: 100)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await assertCommandCount(transientConnection, type: "poll", equals: 0)
+
+        await subscribeGate.release()
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await transientConnection.commandCount(type: "poll") == 1
+                && transientScheduler.pendingSleeperCount() == 1
+        }
+        transientScheduler.advance(by: 10)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await transientConnection.commandCount(type: "poll") == 2
+        }
+        await assertSubscribeCount(transientConnection, equals: 2)
+        await assertCommandCount(transientConnection, type: "start", equals: 1)
+        await assertMaximumObservationConcurrency(transientConnection, equals: 1)
     }
 
     func testEpochChangeResetsEventCursorKeepsLogOffsetAndRejectsRetiredEpoch() async throws {
@@ -2023,7 +2936,9 @@ final class RemoteAgentSessionTests: XCTestCase {
         line: UInt = #line
     ) async {
         for _ in 0 ..< 100 {
-            if predicate() { return }
+            if predicate() {
+                return
+            }
             await Task.yield()
         }
         XCTAssertTrue(predicate(), "Timed out waiting for remote coordinator lifecycle cleanup", file: file, line: line)
@@ -2075,10 +2990,18 @@ final class RemoteAgentSessionTests: XCTestCase {
             payload["session_id"] = .string(sessionID)
         }
         var agent: [String: JSONValue] = [:]
-        if let agentID { agent["id"] = .string(agentID) }
-        if let agentModel { agent["model"] = .string(agentModel) }
-        if let agentReasoningEffort { agent["reasoning_effort"] = .string(agentReasoningEffort) }
-        if !agent.isEmpty { payload["agent"] = .object(agent) }
+        if let agentID {
+            agent["id"] = .string(agentID)
+        }
+        if let agentModel {
+            agent["model"] = .string(agentModel)
+        }
+        if let agentReasoningEffort {
+            agent["reasoning_effort"] = .string(agentReasoningEffort)
+        }
+        if !agent.isEmpty {
+            payload["agent"] = .object(agent)
+        }
         return .object(payload)
     }
 
@@ -2138,17 +3061,153 @@ final class RemoteAgentSessionTests: XCTestCase {
         )
     }
 
+    private func assertCommandCount(
+        _ connection: RecordingRemoteAgentSessionConnection,
+        type: String,
+        sessionID: String? = nil,
+        equals expected: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let actual: Int = if let sessionID {
+            await connection.commandCount(type: type, sessionID: sessionID)
+        } else {
+            await connection.commandCount(type: type)
+        }
+        XCTAssertEqual(actual, expected, file: file, line: line)
+    }
+
+    private func assertSubscribeCount(
+        _ connection: RecordingRemoteAgentSessionConnection,
+        equals expected: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let actual = await connection.subscribeCallCount()
+        XCTAssertEqual(actual, expected, file: file, line: line)
+    }
+
+    private func assertMaximumObservationConcurrency(
+        _ connection: RecordingRemoteAgentSessionConnection,
+        equals expected: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        let actual = await connection.maximumConcurrentObservationCommands()
+        XCTAssertEqual(actual, expected, file: file, line: line)
+    }
+
+    private func waitForDeterministicRemoteAgentSessionCondition(
+        _ predicate: @escaping () async -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0 ..< 1000 {
+            if await predicate() {
+                return
+            }
+            await Task.yield()
+        }
+        let finalResult = await predicate()
+        XCTAssertTrue(finalResult, "Timed out waiting for deterministic remote agent session condition", file: file, line: line)
+    }
+
     private func waitForRemoteAgentSessionCondition(
         _ predicate: @escaping () async -> Bool,
         file: StaticString = #filePath,
         line: UInt = #line
     ) async {
         for _ in 0 ..< 100 {
-            if await predicate() { return }
+            if await predicate() {
+                return
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         let finalResult = await predicate()
         XCTAssertTrue(finalResult, "Timed out waiting for remote agent session condition", file: file, line: line)
+    }
+
+    private final class ManualRemoteAgentSessionRecoveryScheduler: RemoteAgentSessionRecoveryScheduling, @unchecked Sendable {
+        private struct Waiter {
+            let deadline: TimeInterval
+            let continuation: CheckedContinuation<Void, Error>
+        }
+
+        private let lock = NSLock()
+        private var now: TimeInterval = 0
+        private var waiters: [UUID: Waiter] = [:]
+
+        func sleep(seconds: TimeInterval) async throws {
+            let id = UUID()
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                    let shouldWait = lock.withLock {
+                        guard !Task.isCancelled else { return false }
+                        let deadline = now + max(0, seconds)
+                        guard deadline > now else { return false }
+                        waiters[id] = Waiter(deadline: deadline, continuation: continuation)
+                        return true
+                    }
+                    guard !shouldWait else { return }
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            } onCancel: {
+                self.cancel(id: id)
+            }
+        }
+
+        func advance(by seconds: TimeInterval) {
+            let ready = lock.withLock {
+                now += max(0, seconds)
+                let ready = waiters.filter { $0.value.deadline <= now }
+                for id in ready.keys {
+                    waiters.removeValue(forKey: id)
+                }
+                return Array(ready.values)
+            }
+            ready.forEach { $0.continuation.resume() }
+        }
+
+        func pendingSleeperCount() -> Int {
+            lock.withLock { waiters.count }
+        }
+
+        private func cancel(id: UUID) {
+            let waiter = lock.withLock { waiters.removeValue(forKey: id) }
+            waiter?.continuation.resume(throwing: CancellationError())
+        }
+    }
+
+    private actor RemoteObservationCommandGate {
+        private var entered = false
+        private var released = false
+        private var enterWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func waitUntilEntered() async {
+            if entered {
+                return
+            }
+            await withCheckedContinuation { enterWaiters.append($0) }
+        }
+
+        func enterAndWaitForRelease() async {
+            entered = true
+            enterWaiters.forEach { $0.resume() }
+            enterWaiters.removeAll()
+            guard !released else { return }
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+
+        func release() {
+            released = true
+            releaseWaiters.forEach { $0.resume() }
+            releaseWaiters.removeAll()
+        }
     }
 
     private actor RemoteSubscribeGate {
@@ -2158,7 +3217,9 @@ final class RemoteAgentSessionTests: XCTestCase {
         private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
         func waitUntilEntered() async {
-            if entered { return }
+            if entered {
+                return
+            }
             await withCheckedContinuation { enterWaiters.append($0) }
         }
 
@@ -2181,6 +3242,8 @@ final class RemoteAgentSessionTests: XCTestCase {
         private var transcriptRows: [[AgentChatItem]] = []
         private var systemMessages: [String] = []
         private var metadata: [RemoteSessionEvent] = []
+        private var runStates: [AgentSessionRunState] = []
+        private var terminalStatuses: [String] = []
         private var expiredCount = 0
 
         func record(_ event: RemoteSessionEvent) {
@@ -2191,6 +3254,10 @@ final class RemoteAgentSessionTests: XCTestCase {
                 systemMessages.append(message)
             case .metadata:
                 metadata.append(event)
+            case let .runState(runState, _, _):
+                runStates.append(runState)
+            case let .terminal(status):
+                terminalStatuses.append(status)
             case .sessionExpired:
                 expiredCount += 1
             default:
@@ -2232,6 +3299,14 @@ final class RemoteAgentSessionTests: XCTestCase {
             metadata
         }
 
+        func recordedRunStates() -> [AgentSessionRunState] {
+            runStates
+        }
+
+        func recordedTerminalStatuses() -> [String] {
+            terminalStatuses
+        }
+
         func sessionExpiredCount() -> Int {
             expiredCount
         }
@@ -2271,11 +3346,16 @@ final class RemoteAgentSessionTests: XCTestCase {
 
     private actor RecordingRemoteAgentSessionConnection: RemoteAgentSessionConnection {
         private var responses: [String: [JSONValue]]
+        private var commandErrors: [String: [RemoteClientError]]
         private let getLogDelayNanoseconds: UInt64
         private let commandDelayNanosecondsByType: [String: UInt64]
         private var subscribeErrors: [RemoteClientError]
         private let subscribeGate: RemoteSubscribeGate?
         private let unsubscribeError: Error?
+        private var observationGate: RemoteObservationCommandGate?
+        private var gatedObservationType: String?
+        private var activeObservationCommandCount = 0
+        private var maximumConcurrentObservationCommandCount = 0
         private var frames: [RemoteClientFrame] = []
         private var subscribedSessionIDs: [[String]] = []
         private var unsubscribedSessionIDs: [[String]] = []
@@ -2283,6 +3363,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         init(
             responses: [String: [JSONValue]] = [:],
+            commandErrors: [String: [RemoteClientError]] = [:],
             getLogDelayNanoseconds: UInt64 = 0,
             commandDelayNanosecondsByType: [String: UInt64] = [:],
             subscribeErrors: [RemoteClientError] = [],
@@ -2290,6 +3371,7 @@ final class RemoteAgentSessionTests: XCTestCase {
             unsubscribeError: Error? = nil
         ) {
             self.responses = responses
+            self.commandErrors = commandErrors
             self.getLogDelayNanoseconds = getLogDelayNanoseconds
             self.commandDelayNanosecondsByType = commandDelayNanosecondsByType
             self.subscribeErrors = subscribeErrors
@@ -2299,11 +3381,32 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func command(_ frame: RemoteClientFrame, timeout _: TimeInterval) async throws -> JSONValue {
             frames.append(frame)
+            let isObservationCommand = frame.type == "poll" || frame.type == "get_log"
+            if isObservationCommand {
+                activeObservationCommandCount += 1
+                maximumConcurrentObservationCommandCount = max(
+                    maximumConcurrentObservationCommandCount,
+                    activeObservationCommandCount
+                )
+            }
+            defer {
+                if isObservationCommand {
+                    activeObservationCommandCount -= 1
+                }
+            }
+            if frame.type == gatedObservationType, let observationGate {
+                await observationGate.enterAndWaitForRelease()
+            }
             if frame.type == "get_log", getLogDelayNanoseconds > 0 {
                 try? await Task.sleep(nanoseconds: getLogDelayNanoseconds)
             }
             if let delay = commandDelayNanosecondsByType[frame.type], delay > 0 {
                 try? await Task.sleep(nanoseconds: delay)
+            }
+            if var queued = commandErrors[frame.type], !queued.isEmpty {
+                let error = queued.removeFirst()
+                commandErrors[frame.type] = queued
+                throw error
             }
             if var queued = responses[frame.type], !queued.isEmpty {
                 let response = queued.removeFirst()
@@ -2346,6 +3449,23 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func commandCount(type: String) -> Int {
             frames.count { $0.type == type }
+        }
+
+        func commandCount(type: String, sessionID: String) -> Int {
+            frames.count { $0.type == type && $0.sessionID == sessionID }
+        }
+
+        func maximumConcurrentObservationCommands() -> Int {
+            maximumConcurrentObservationCommandCount
+        }
+
+        func setObservationGate(_ gate: RemoteObservationCommandGate?, type: String?) {
+            observationGate = gate
+            gatedObservationType = type
+        }
+
+        func enqueue(_ response: JSONValue, forType type: String) {
+            responses[type, default: []].append(response)
         }
 
         func frames(type: String) -> [RemoteClientFrame] {

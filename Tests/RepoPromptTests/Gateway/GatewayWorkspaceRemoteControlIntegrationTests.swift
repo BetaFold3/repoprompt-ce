@@ -4,6 +4,51 @@ import Logging
 import RepoPromptRemoteWire
 import XCTest
 
+private final class WorkspaceRemoteDeviceConnector: AppLinkConnecting, @unchecked Sendable {
+    let connection: RecordingAppLinkConnection
+    private let lock = NSLock()
+    private var clientNames: [String] = []
+
+    init(connection: RecordingAppLinkConnection) {
+        self.connection = connection
+    }
+
+    func connect(
+        configuration _: GatewayConfiguration,
+        clientName: String,
+        logger _: Logger
+    ) async throws -> any AppLinkConnection {
+        lock.withLock {
+            clientNames.append(clientName)
+        }
+        return connection
+    }
+
+    var recordedClientNames: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return clientNames
+    }
+}
+
+private final class WorkspaceBindingProbeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func record() -> AppLinkPool.BindingProbeResult {
+        lock.lock()
+        value += 1
+        lock.unlock()
+        return .bound
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 /// V1-11 gateway-level integration lock for workspace-scoped remote control:
 /// a two-window host sharing one workspace yields a unioned catalog, a session
 /// the gateway never started is watchable with cold affinity (discovery sweep
@@ -125,14 +170,210 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         )
     }
 
+    func testRemoteOpenThenAutoRoutedStartSubscribeDidQueuePushesFromSecondWindow() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let sessionID = "99999999-9999-9999-9999-999999999999"
+        let validationGate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "status": .string("opened"),
+                "window_id": .int(2),
+                "workspace": .object([
+                    "id": .string(sharedWorkspaceID),
+                    "name": .string("Shared Workspace")
+                ])
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "windows": .array([
+                    .object([
+                        "window_id": .int(1),
+                        "workspace": .object([
+                            "id": .string("11111111-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+                            "name": .string("Initial Workspace")
+                        ])
+                    ]),
+                    .object([
+                        "window_id": .int(2),
+                        "workspace": .object([
+                            "id": .string(sharedWorkspaceID),
+                            "name": .string("Shared Workspace")
+                        ])
+                    ])
+                ]),
+                "binding": .object(["state": .string("unbound")])
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(sessionID),
+                "status": .string("running")
+            ]))),
+            .gated(
+                GatewayTestHelpers.toolResult(
+                    json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")
+                ),
+                validationGate
+            ),
+            .result(GatewayTestHelpers.toolResult(
+                json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input")
+            ))
+        ])
+        let root = try GatewayTestHelpers.temporaryRoot()
+        let config = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let connector = WorkspaceRemoteDeviceConnector(connection: connection)
+        let bindingProbe = WorkspaceBindingProbeCounter()
+        let refreshProbe = WorkspaceBindingProbeCounter()
+        let pool = AppLinkPool(
+            configuration: config,
+            connector: connector,
+            bindingProbe: { _ in bindingProbe.record() },
+            refreshBindingProbe: { _ in refreshProbe.record() }
+        )
+        _ = try await pool.ensureLink(forDevice: deviceID)
+        XCTAssertEqual(connector.recordedClientNames, [deviceID])
+        XCTAssertEqual(bindingProbe.count, 1)
+
+        let defaultAppLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: RecordingAppLinkConnection())
+        )
+        try await defaultAppLink.connect()
+        let watchManager = SessionWatchManager(
+            appLink: defaultAppLink,
+            appLinkPool: pool,
+            waitTimeoutSeconds: 0.2,
+            pollRefreshSeconds: 0.2,
+            terminalQuarantineSeconds: 0
+        )
+        let runtime = try RemoteGatewayRuntime(
+            appLink: defaultAppLink,
+            ledger: CommandLedger(),
+            watchManager: watchManager,
+            auditLog: nil,
+            appLinkPool: pool
+        )
+        await watchManager.setWindowResolver { resolvedDeviceID, resolvedSessionID in
+            await runtime.resolveSessionWindowForObservation(
+                deviceID: resolvedDeviceID,
+                sessionID: resolvedSessionID
+            )
+        }
+        defer {
+            Task {
+                await watchManager.shutdown()
+                await pool.shutdownAll()
+                await defaultAppLink.shutdown()
+            }
+        }
+
+        let open = await runtime.handle(
+            RemoteClientFrame(
+                type: "open_workspace",
+                requestID: "topology-open",
+                payload: .object(["workspace_name": .string("Shared Workspace")])
+            ),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(open?.type, "command_result")
+        XCTAssertEqual(open?.payload?.objectValue?["window_id"], .int(2))
+        XCTAssertEqual(refreshProbe.count, 1)
+
+        let start = await runtime.handle(
+            RemoteClientFrame(
+                type: "start",
+                requestID: "topology-start",
+                payload: .object([
+                    "message": .string("Run in the opened workspace"),
+                    "workspace_name": .string("Shared Workspace")
+                ])
+            ),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(start?.type, "command_result")
+        XCTAssertEqual(start?.payload?.objectValue?["session_id"], .string(sessionID))
+        let callsAfterStart = await connection.calls
+        let startCall = try XCTUnwrap(callsAfterStart.last {
+            $0.name == "agent_run" && $0.arguments["op"] == .string("start")
+        })
+        XCTAssertEqual(startCall.arguments["_windowID"], .int(2))
+
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+        let subscribeRequest = RemoteClientFrame(
+            type: "subscribe",
+            requestID: "topology-subscribe",
+            sessionID: sessionID
+        )
+        let handledSubscribeResult = await runtime.handle(
+            subscribeRequest,
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink
+        )
+        let subscribeResult = try XCTUnwrap(handledSubscribeResult)
+        XCTAssertEqual(subscribeResult.type, "command_result")
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        let enteredBeforeQueue = await validationGate.hasEntered()
+        XCTAssertFalse(enteredBeforeQueue)
+
+        await sink.send(subscribeResult)
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        let enteredBeforeDidQueue = await validationGate.hasEntered()
+        let frameTypesBeforeDidQueue = await sink.frames.map(\.type)
+        XCTAssertFalse(enteredBeforeDidQueue)
+        XCTAssertEqual(frameTypesBeforeDidQueue, ["command_result"])
+
+        await runtime.didQueueResponse(
+            for: subscribeRequest,
+            response: subscribeResult,
+            deviceID: deviceID,
+            sinkID: sinkID
+        )
+        await validationGate.waitUntilEntered()
+        let frameTypesWhileValidationBlocked = await sink.frames.map(\.type)
+        XCTAssertEqual(frameTypesWhileValidationBlocked, ["command_result"])
+        await validationGate.release()
+
+        for _ in 0 ..< 1000 {
+            if await sink.frames.contains(where: { $0.type == "session_update" }) {
+                break
+            }
+            await Task.yield()
+        }
+        let frames = await sink.frames
+        XCTAssertEqual(frames.first?.type, "command_result")
+        XCTAssertTrue(frames.dropFirst().contains {
+            ($0.type == "session_update" || $0.type == "session_terminal")
+                && $0.sessionID == sessionID
+        })
+
+        let observationCalls = await connection.calls.filter {
+            $0.name == "agent_run"
+                && ($0.arguments["op"] == .string("poll") || $0.arguments["op"] == .string("wait"))
+        }
+        XCTAssertFalse(observationCalls.isEmpty)
+        XCTAssertTrue(observationCalls.allSatisfy { $0.arguments["_windowID"] == .int(2) })
+        XCTAssertFalse(observationCalls.contains { $0.arguments["_windowID"] == nil })
+    }
+
     func testWorkspaceCatalogUnionThenWarmAffinityWatchAndSteerWithoutRediscovery() async throws {
+        let validationGate = RecordingAppLinkResponseGate()
         let connection = RecordingAppLinkConnection(responses: [
             .result(twoWindowSharedWorkspaceListResponse()),
             .result(workspaceSessionListResponse(windowOneSessions())),
             .result(workspaceSessionListResponse(windowTwoSessions())),
-            .result(GatewayTestHelpers.toolResult(
-                json: GatewayTestHelpers.snapshot(sessionID: windowOneNewerID, status: "running")
-            ))
+            .gated(
+                GatewayTestHelpers.toolResult(
+                    json: GatewayTestHelpers.snapshot(sessionID: windowOneNewerID, status: "running")
+                ),
+                validationGate
+            )
         ])
         let runtime = try await makeRuntime(
             connection: connection,
@@ -160,10 +401,16 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
 
         // Subscribe to a window-one session the gateway never started: warm
         // affinity recorded by the fan-out routes the watch without rediscovery.
+        let subscribeRequest = RemoteClientFrame(
+            type: "subscribe",
+            requestID: "integration-warm-subscribe",
+            sessionID: windowOneNewerID
+        )
+        let subscribeSinkID = UUID()
         let subscribeResponse = await runtime.handle(
-            RemoteClientFrame(type: "subscribe", requestID: "integration-warm-subscribe", sessionID: windowOneNewerID),
+            subscribeRequest,
             deviceID: "device",
-            sinkID: UUID(),
+            sinkID: subscribeSinkID,
             sink: sink
         )
         XCTAssertEqual(subscribeResponse?.type, "command_result")
@@ -171,6 +418,17 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
             subscribeResponse?.payload?.objectValue?["subscribed_session_ids"]?.arrayValue,
             [.string(windowOneNewerID)]
         )
+        let queuedSubscribeResponse = try XCTUnwrap(subscribeResponse)
+        await sink.send(queuedSubscribeResponse)
+        await runtime.didQueueResponse(
+            for: subscribeRequest,
+            response: queuedSubscribeResponse,
+            deviceID: "device",
+            sinkID: subscribeSinkID
+        )
+        await validationGate.waitUntilEntered()
+        await validationGate.release()
+
         var calls = await connection.calls
         let warmPoll = try XCTUnwrap(calls.last { $0.name == "agent_run" && $0.arguments["op"] == .string("poll") })
         XCTAssertEqual(warmPoll.arguments["_windowID"], .int(1))
@@ -220,13 +478,17 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         // Simulated gateway restart: a fresh runtime and connection carry no
         // affinity, so pickup of a never-started session must succeed through
         // the discovery sweep alone (Decision 5: affinity is only latency).
+        let validationGate = RecordingAppLinkResponseGate()
         let connection = RecordingAppLinkConnection(responses: [
             .result(twoWindowSharedWorkspaceListResponse()),
             .result(workspaceSessionListResponse(windowOneSessions())),
             .result(workspaceSessionListResponse(windowTwoSessions())),
-            .result(GatewayTestHelpers.toolResult(
-                json: GatewayTestHelpers.snapshot(sessionID: windowTwoOlderID, status: "running")
-            ))
+            .gated(
+                GatewayTestHelpers.toolResult(
+                    json: GatewayTestHelpers.snapshot(sessionID: windowTwoOlderID, status: "running")
+                ),
+                validationGate
+            )
         ])
         let runtime = try await makeRuntime(
             connection: connection,
@@ -234,10 +496,16 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         )
         let sink = RecordingFrameSink()
 
+        let subscribeRequest = RemoteClientFrame(
+            type: "subscribe",
+            requestID: "integration-cold-subscribe",
+            sessionID: windowTwoOlderID
+        )
+        let subscribeSinkID = UUID()
         let subscribeResponse = await runtime.handle(
-            RemoteClientFrame(type: "subscribe", requestID: "integration-cold-subscribe", sessionID: windowTwoOlderID),
+            subscribeRequest,
             deviceID: "device",
-            sinkID: UUID(),
+            sinkID: subscribeSinkID,
             sink: sink
         )
         XCTAssertEqual(subscribeResponse?.type, "command_result")
@@ -245,6 +513,17 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
             subscribeResponse?.payload?.objectValue?["subscribed_session_ids"]?.arrayValue,
             [.string(windowTwoOlderID)]
         )
+        let queuedSubscribeResponse = try XCTUnwrap(subscribeResponse)
+        await sink.send(queuedSubscribeResponse)
+        await runtime.didQueueResponse(
+            for: subscribeRequest,
+            response: queuedSubscribeResponse,
+            deviceID: "device",
+            sinkID: subscribeSinkID
+        )
+        await validationGate.waitUntilEntered()
+        await validationGate.release()
+
         var calls = await connection.calls
         XCTAssertEqual(calls.count(where: { $0.name == "bind_context" }), 1)
         let discoveryCalls = calls.filter { $0.name == "agent_manage" && $0.arguments["op"] == .string("list_sessions") }
@@ -309,5 +588,105 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         XCTAssertTrue(windows.allSatisfy { $0.objectValue?["workspace_name"]?.stringValue == "Shared Workspace" })
         let calls = await connection.calls
         XCTAssertFalse(calls.contains { $0.name == "agent_manage" }, "Zero matches must not fan out to any window")
+    }
+
+    func testClosedWorkspaceOpenThenWorkspaceScopedListSessionsSucceeds() async throws {
+        let closedWorkspaceID = "88888888-8888-8888-8888-888888888888"
+        let closedWorkspaceName = "Closed Workspace"
+        let openedWindowList = GatewayTestHelpers.toolResult(json: .object([
+            "windows": .array([
+                .object([
+                    "window_id": .int(7),
+                    "workspace": .object([
+                        "id": .string(closedWorkspaceID),
+                        "name": .string(closedWorkspaceName)
+                    ])
+                ])
+            ]),
+            "binding": .object(["state": .string("unbound")])
+        ]))
+        let openedSessions = GatewayTestHelpers.toolResult(json: .object([
+            "sessions": .array([
+                .object([
+                    "session_id": .string(windowOneNewerID),
+                    "name": .string("Opened Session"),
+                    "last_modified": .string("2026-07-15T01:00:00.000Z"),
+                    "state": .string("running")
+                ])
+            ]),
+            "workspace": .object([
+                "id": .string(closedWorkspaceID),
+                "name": .string(closedWorkspaceName)
+            ])
+        ]))
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(twoWindowSharedWorkspaceListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "status": .string("opened"),
+                "window_id": .int(7),
+                "workspace": .object([
+                    "id": .string(closedWorkspaceID),
+                    "name": .string(closedWorkspaceName)
+                ])
+            ]))),
+            .result(openedWindowList),
+            .result(openedSessions)
+        ])
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .ambiguousStartTarget("multiple windows")
+        )
+
+        let before = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "integration-before-open",
+                payload: .object(["workspace_name": .string(closedWorkspaceName)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(before?.payload?.objectValue?["code"], .string("workspace_not_open"))
+
+        let open = await runtime.handle(
+            RemoteClientFrame(
+                type: "open_workspace",
+                requestID: "integration-open",
+                payload: .object(["workspace_name": .string(closedWorkspaceName)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(open?.type, "command_result")
+        XCTAssertEqual(open?.payload?.objectValue?["status"], .string("opened"))
+
+        let after = await runtime.handle(
+            RemoteClientFrame(
+                type: "list_sessions",
+                requestID: "integration-after-open",
+                payload: .object(["workspace_name": .string(closedWorkspaceName)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(after?.type, "command_result")
+        XCTAssertEqual(
+            after?.payload?.objectValue?["sessions"]?.arrayValue?.first?.objectValue?["session_id"],
+            .string(windowOneNewerID)
+        )
+
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), [
+            "bind_context",
+            "manage_workspaces",
+            "bind_context",
+            "agent_manage"
+        ])
+        XCTAssertEqual(calls[1].arguments["action"], .string("open"))
+        XCTAssertEqual(calls[3].arguments["op"], .string("list_sessions"))
+        XCTAssertEqual(calls[3].arguments["_windowID"], .int(7))
     }
 }

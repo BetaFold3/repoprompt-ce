@@ -2390,8 +2390,15 @@ class WorkspaceManagerViewModel: ObservableObject {
         return items.map { $0.formattedCount() }.joined(separator: ", ")
     }
 
+    /// Requests a workspace switch. When `bypassSessionCancellationConfirmation` is true,
+    /// active sessions cause an automatic decline (`.cancelled`); they are never ended implicitly.
     @MainActor
-    func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
+    func requestWorkspaceSwitch(
+        to newWorkspace: WorkspaceModel,
+        saveState: Bool = true,
+        reason: String = "userOrInternal",
+        bypassSessionCancellationConfirmation: Bool = false
+    ) async -> WorkspaceSwitchResult {
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace) {
             return userVisibleWorkspaceSwitchResult(
                 concurrentResult,
@@ -2422,6 +2429,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             to: newWorkspace,
             saveState: saveState,
             reason: reason,
+            bypassSessionCancellationConfirmation: bypassSessionCancellationConfirmation,
             operationID: operationID
         )
         let finalResult = await completeWorkspaceSwitchOperation(
@@ -2448,10 +2456,16 @@ class WorkspaceManagerViewModel: ObservableObject {
         to newWorkspace: WorkspaceModel,
         saveState: Bool,
         reason: String,
+        bypassSessionCancellationConfirmation: Bool,
         operationID: UUID
     ) async -> WorkspaceSwitchResult {
         let snapshot = activeSessionSnapshot()
         if snapshot.hasActiveSessions {
+            guard !bypassSessionCancellationConfirmation else {
+                return .cancelled(
+                    "Workspace switch to \"\(newWorkspace.name)\" requires ending active sessions; unattended workspace opening does not present confirmation UI."
+                )
+            }
             advanceWorkspaceSwitchOperation(operationID, to: .awaitingConfirmation)
             let confirmation = WorkspaceSwitchConfirmation(
                 targetWorkspaceName: newWorkspace.name,

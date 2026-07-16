@@ -3,6 +3,7 @@ import SwiftUI
 struct RemoteStartWindowPickerSheet: View {
     let state: RemoteStartWindowPickerState
     let onSelect: (RemoteStartWindowOption) -> Void
+    let onOpenWorkspace: (() -> Void)?
     let onCancel: () -> Void
 
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -22,6 +23,20 @@ struct RemoteStartWindowPickerSheet: View {
                     Text("\(state.hostName) needs a target window before starting this run.")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                         .foregroundStyle(.secondary)
+                }
+            }
+
+            if let workspaceName = state.openableWorkspaceName,
+               let onOpenWorkspace
+            {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("This workspace isn't open on the host.")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                        .foregroundStyle(.secondary)
+                    Button("Open '\(workspaceName)' on \(state.hostName)") {
+                        onOpenWorkspace()
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
             }
 

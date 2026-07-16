@@ -14,6 +14,7 @@ struct RemoteAuditRecord: Codable, Equatable {
     let completedTurnCount: Int?
     let transcriptXMLChars: Int?
     let autoRoutedWindowID: Int?
+    let windowID: Int?
     let hasWorkspaceName: Bool?
     let hasWorkspaceID: Bool?
     let workspaceMatchCount: Int?
@@ -34,6 +35,7 @@ struct RemoteAuditRecord: Codable, Equatable {
         completedTurnCount: Int? = nil,
         transcriptXMLChars: Int? = nil,
         autoRoutedWindowID: Int? = nil,
+        windowID: Int? = nil,
         hasWorkspaceName: Bool? = nil,
         hasWorkspaceID: Bool? = nil,
         workspaceMatchCount: Int? = nil,
@@ -53,6 +55,7 @@ struct RemoteAuditRecord: Codable, Equatable {
         self.completedTurnCount = completedTurnCount
         self.transcriptXMLChars = transcriptXMLChars
         self.autoRoutedWindowID = autoRoutedWindowID
+        self.windowID = windowID
         self.hasWorkspaceName = hasWorkspaceName
         self.hasWorkspaceID = hasWorkspaceID
         self.workspaceMatchCount = workspaceMatchCount
@@ -74,6 +77,7 @@ struct RemoteAuditRecord: Codable, Equatable {
         case completedTurnCount = "completed_turn_count"
         case transcriptXMLChars = "transcript_xml_chars"
         case autoRoutedWindowID = "auto_routed_window_id"
+        case windowID = "window_id"
         case hasWorkspaceName = "has_workspace_name"
         case hasWorkspaceID = "has_workspace_id"
         case workspaceMatchCount = "workspace_match_count"

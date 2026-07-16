@@ -26,7 +26,7 @@ struct ScopeEnforcementError: Error, Equatable, CustomStringConvertible {
 /// | Frame | Required scope |
 /// |---|---|
 /// | subscribe, unsubscribe, poll, list_agents, list_sessions, get_log | sessions:observe |
-/// | start, steer, cancel | sessions:operate |
+/// | start, steer, cancel, open_workspace | sessions:operate |
 /// | respond | interactions:respond |
 /// | future workspace browsing/read-only context | workspace:read (reserved) |
 enum ScopeEnforcer {
@@ -47,7 +47,7 @@ enum ScopeEnforcer {
             // Push wake registration is observation-adjacent: it only lets the
             // authenticated device be woken to observe, never to operate.
             GatewayRemoteScope.sessionsObserve
-        case "start", "steer", "cancel":
+        case "start", "steer", "cancel", "open_workspace":
             GatewayRemoteScope.sessionsOperate
         case "respond":
             GatewayRemoteScope.interactionsRespond

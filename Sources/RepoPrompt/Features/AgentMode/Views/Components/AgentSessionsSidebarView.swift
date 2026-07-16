@@ -609,6 +609,14 @@ private struct RemoteWorkspaceSessionsSidebarSection: View {
                 }
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
+            case let .openingWorkspace(message):
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(message)
+                        .foregroundStyle(.secondary)
+                }
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .padding(.horizontal, fontPreset.scaledClamped(10, max: 14))
             case let .sessions(descriptors):
                 if descriptors.isEmpty {
                     Text("No other sessions in this workspace.")

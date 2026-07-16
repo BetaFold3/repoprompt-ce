@@ -17,7 +17,9 @@ actor RecordingAppLinkResponseGate {
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
     func waitUntilEntered() async {
-        if entered { return }
+        if entered {
+            return
+        }
         await withCheckedContinuation { continuation in
             enterWaiters.append(continuation)
         }
@@ -37,6 +39,10 @@ actor RecordingAppLinkResponseGate {
         released = true
         releaseWaiters.forEach { $0.resume() }
         releaseWaiters.removeAll()
+    }
+
+    func hasEntered() -> Bool {
+        entered
     }
 }
 

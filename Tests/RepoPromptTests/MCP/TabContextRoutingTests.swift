@@ -608,6 +608,29 @@ final class TabContextRoutingTests: XCTestCase {
         }
     }
 
+    func testManageWorkspacesOpenIsWindowSelectionExemptWithoutBroadeningOtherActions() {
+        XCTAssertTrue(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "manage_workspaces",
+            args: ["action": .string("open")]
+        ))
+        XCTAssertTrue(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "manage_workspaces",
+            args: ["action": .string("Open")]
+        ))
+        XCTAssertFalse(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "manage_workspaces",
+            args: ["action": .string("switch")]
+        ))
+        XCTAssertFalse(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "manage_workspaces",
+            args: [:]
+        ))
+        XCTAssertFalse(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "read_file",
+            args: ["action": .string("open")]
+        ))
+    }
+
     func testBindContextParticipatesInHiddenWindowRoutingWithoutImplicitPublicInjection() {
         XCTAssertFalse(ServerNetworkManager.shouldBypassWindowRouting(for: "bind_context"))
         XCTAssertFalse(ServerNetworkManager.shouldAutoInjectPublicWindowID(for: "bind_context"))

@@ -30,6 +30,7 @@ extension AgentModeViewModel {
     struct RemoteWorkspaceSidebarSection: Equatable {
         enum Content: Equatable {
             case loading
+            case openingWorkspace(String)
             case sessions([RemoteAgentSessionDescriptor])
             case workspaceNotOpen(String)
             case unsupported(String)
@@ -532,35 +533,46 @@ extension AgentModeViewModel {
             hostID: context.hostRecord.id,
             clientWorkspaceID: context.clientWorkspaceID
         )
-        let content: RemoteWorkspaceSidebarSection.Content = switch state {
-        case let .loaded(catalog):
-            .sessions(
-                catalog.sessions
-                    .filter {
-                        !remoteCoordinator.localSessionExists(
-                            hostID: context.hostRecord.id,
-                            remoteSessionID: $0.sessionID
-                        )
-                    }
-                    .sorted {
-                        let lhs = $0.lastModified ?? .distantPast
-                        let rhs = $1.lastModified ?? .distantPast
-                        if lhs != rhs { return lhs > rhs }
-                        return $0.sessionID < $1.sessionID
-                    }
-            )
-        case .workspaceNotOpen:
-            .workspaceNotOpen(
-                "Workspace '\(context.workspaceName)' is not open on \(context.hostRecord.displayName). Open it there and try again."
-            )
-        case .unsupported:
-            .unsupported(
-                "\(context.hostRecord.displayName) doesn't support workspace browsing (update RepoPrompt on the host)."
-            )
-        case let .error(message):
+        let episodeState = remoteCoordinator.workspaceOpenEpisodeState(
+            hostID: context.hostRecord.id,
+            clientWorkspaceID: context.clientWorkspaceID
+        )
+        let content: RemoteWorkspaceSidebarSection.Content = switch episodeState {
+        case .opening:
+            .openingWorkspace("Opening '\(context.workspaceName)' on \(context.hostRecord.displayName)…")
+        case let .failed(message):
             .error(message)
         case nil:
-            .loading
+            switch state {
+            case let .loaded(catalog):
+                .sessions(
+                    catalog.sessions
+                        .filter {
+                            !remoteCoordinator.localSessionExists(
+                                hostID: context.hostRecord.id,
+                                remoteSessionID: $0.sessionID
+                            )
+                        }
+                        .sorted {
+                            let lhs = $0.lastModified ?? .distantPast
+                            let rhs = $1.lastModified ?? .distantPast
+                            if lhs != rhs { return lhs > rhs }
+                            return $0.sessionID < $1.sessionID
+                        }
+                )
+            case .workspaceNotOpen:
+                .workspaceNotOpen(
+                    "Workspace '\(context.workspaceName)' is not open on \(context.hostRecord.displayName). Open it there and try again."
+                )
+            case .unsupported:
+                .unsupported(
+                    "\(context.hostRecord.displayName) doesn't support workspace browsing (update RepoPrompt on the host)."
+                )
+            case let .error(message):
+                .error(message)
+            case nil:
+                .loading
+            }
         }
         return RemoteWorkspaceSidebarSection(
             hostRecord: context.hostRecord,
@@ -575,18 +587,41 @@ extension AgentModeViewModel {
             publishRemoteWorkspaceSidebarChange()
             return
         }
-        _ = await remoteCoordinator.fetchWorkspaceSessionCatalog(
+        let state = await remoteCoordinator.fetchWorkspaceSessionCatalog(
             hostID: context.hostRecord.id,
             clientWorkspaceID: context.clientWorkspaceID,
             workspaceName: context.workspaceName,
             forceRefresh: forceRefresh
         )
+        if case .loaded = state,
+           let episode = remoteCoordinator.workspaceOpenEpisodeState(
+               hostID: context.hostRecord.id,
+               clientWorkspaceID: context.clientWorkspaceID
+           ),
+           case .failed = episode
+        {
+            remoteCoordinator.resetWorkspaceOpenEpisode(
+                hostID: context.hostRecord.id,
+                clientWorkspaceID: context.clientWorkspaceID
+            )
+        }
+        if case .workspaceNotOpen = state {
+            await remoteCoordinator.autoOpenWorkspaceIfNeeded(
+                hostRecord: context.hostRecord,
+                clientWorkspaceID: context.clientWorkspaceID,
+                workspaceName: context.workspaceName
+            )
+        }
         guard !Task.isCancelled else { return }
         publishRemoteWorkspaceSidebarChange()
     }
 
     func retryRemoteWorkspaceSidebar() async {
         guard let context = remoteWorkspaceCatalogContext() else { return }
+        remoteCoordinator.resetWorkspaceOpenEpisode(
+            hostID: context.hostRecord.id,
+            clientWorkspaceID: context.clientWorkspaceID
+        )
         remoteCoordinator.invalidateWorkspaceSessionCatalog(
             hostID: context.hostRecord.id,
             clientWorkspaceID: context.clientWorkspaceID
