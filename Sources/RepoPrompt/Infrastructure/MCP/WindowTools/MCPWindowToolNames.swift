@@ -25,6 +25,8 @@ enum MCPWindowToolName {
     static let contextBuilder = "context_builder"
     static let askUser = "ask_user"
 
+    static let remotePairing = "remote_pairing"
+
     static let agentExplore = "agent_explore"
     static let agentRun = "agent_run"
     static let agentManage = "agent_manage"

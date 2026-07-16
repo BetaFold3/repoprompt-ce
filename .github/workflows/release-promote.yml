@@ -96,7 +96,7 @@ jobs:
           ditto -x -k "${archives[0]}" extracted
           ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
             "extracted/RepoPrompt CE.app" \
-            "Reviewed ZIP MCP helper layout"
+            "Reviewed ZIP embedded helper layout"
           ./trusted-control-plane/Scripts/validate_app_architectures.sh \
             "extracted/RepoPrompt CE.app" \
             "arm64,x86_64" \

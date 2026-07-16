@@ -182,6 +182,8 @@ struct AgentMessageBubble: View {
     let showRunScopedToolCancel: Bool
     let cancelActiveToolsAction: (() -> Void)?
     let codexManagedLoginAction: CodexManagedLoginAction?
+    let runLocallyInsteadAction: (() -> Void)?
+    let resendUndeliveredAction: (() -> Void)?
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
@@ -207,7 +209,9 @@ struct AgentMessageBubble: View {
         rawToolResultPayloadRenderRevision: Int = 0,
         showRunScopedToolCancel: Bool = false,
         cancelActiveToolsAction: (() -> Void)? = nil,
-        codexManagedLoginAction: CodexManagedLoginAction? = nil
+        codexManagedLoginAction: CodexManagedLoginAction? = nil,
+        runLocallyInsteadAction: (() -> Void)? = nil,
+        resendUndeliveredAction: (() -> Void)? = nil
     ) {
         self.item = item
         self.isMostRecentEditBubble = isMostRecentEditBubble
@@ -223,6 +227,8 @@ struct AgentMessageBubble: View {
         self.showRunScopedToolCancel = showRunScopedToolCancel
         self.cancelActiveToolsAction = cancelActiveToolsAction
         self.codexManagedLoginAction = codexManagedLoginAction
+        self.runLocallyInsteadAction = runLocallyInsteadAction
+        self.resendUndeliveredAction = resendUndeliveredAction
     }
 
     private var runtimeFooter: AgentMessageRuntimeFooter? {
@@ -331,6 +337,17 @@ struct AgentMessageBubble: View {
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
+                    if item.isUndeliveredRemoteSend {
+                        HStack(spacing: 6) {
+                            Text("Undelivered")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                                .foregroundStyle(.red)
+                            if let resendUndeliveredAction {
+                                Button("Resend", action: resendUndeliveredAction)
+                                    .buttonStyle(.plain)
+                            }
+                        }
+                    }
                     if item.codexGoalMode != nil || item.workflow != nil {
                         HStack(spacing: 6) {
                             if let codexGoalMode = item.codexGoalMode {
@@ -349,6 +366,7 @@ struct AgentMessageBubble: View {
                 .padding(12)
                 .background(BubbleColors.lightBlue)
                 .cornerRadius(20)
+                .opacity(item.isUndeliveredRemoteSend ? 0.65 : 1)
 
                 MessageFooterStrip(text: item.text, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
             }
@@ -770,16 +788,25 @@ struct AgentMessageBubble: View {
                         .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
                 )
             } else {
-                HStack(spacing: 6) {
-                    Text(item.text)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                        .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Text(item.text)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                            .foregroundColor(.secondary)
 
-                    Spacer()
+                        Spacer()
 
-                    MessageTimestampText(date: item.timestamp)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                        .foregroundColor(.secondary.opacity(0.7))
+                        MessageTimestampText(date: item.timestamp)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                            .foregroundColor(.secondary.opacity(0.7))
+                    }
+
+                    if let runLocallyInsteadAction {
+                        Button("Run locally instead", action: runLocallyInsteadAction)
+                            .buttonStyle(.plain)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                            .foregroundStyle(.tint)
+                    }
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)

@@ -27,6 +27,7 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
     case claudeCompatibleCustomAPIKey
 
     // Agent permission document accounts.
+    case remoteGatewayStaticToken
     case agentPermissionSubagentDocument
     case agentPermissionCodexDocument
     case agentPermissionClaudeDocument
@@ -71,6 +72,8 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
             "ClaudeCompatibleBackend.kimi.apiKey"
         case .claudeCompatibleCustomAPIKey:
             "ClaudeCompatibleBackend.custom.apiKey"
+        case .remoteGatewayStaticToken:
+            "RemoteGateway.staticToken.v1"
         case .agentPermissionSubagentDocument:
             Self.decode([
                 40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
@@ -123,6 +126,7 @@ enum SecureStorageAccount: CaseIterable, Hashable, Identifiable {
         case .zAIAPI: "Z.AI API key"
         case .claudeCompatibleKimiAPIKey: "Kimi compatible API key"
         case .claudeCompatibleCustomAPIKey: "Custom Claude-compatible API key"
+        case .remoteGatewayStaticToken: "Remote Gateway static token"
         case .agentPermissionSubagentDocument: "Subagent permissions"
         case .agentPermissionCodexDocument: "Codex permissions"
         case .agentPermissionClaudeDocument: "Claude permissions"

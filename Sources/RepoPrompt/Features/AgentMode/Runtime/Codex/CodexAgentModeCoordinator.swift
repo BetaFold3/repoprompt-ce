@@ -226,6 +226,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let commandRunningStatusCoalesceDelayNanos: UInt64 = 75_000_000
     private let commandRunningLiveOutputCoalesceDelayNanos: UInt64 = 225_000_000
     private let assistantDeltaFlushDelayNanos: UInt64 = 75_000_000
+    private let codexTerminalAssistantSettleDelayNanos: UInt64 = 1_750_000_000
     private let bashLivenessPollIntervalNanos: UInt64 = 350_000_000
     private let bashUnobservedProcessFinalizeGraceInterval: TimeInterval = 1.2
     private let bashSignalQuietPollGraceInterval: TimeInterval = 1.0
@@ -247,6 +248,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private var codexAuthRecoveryAttemptedRunIDs: Set<UUID> = []
     private var pendingCodexThreadNameSyncByTabID: [UUID: PendingCodexThreadNameSync] = [:]
     private var codexThreadNameSyncTaskByTabID: [UUID: (generation: UUID, task: Task<Void, Never>)] = [:]
+    private var observedCodexAssistantCompletionScopesByTabID: [UUID: Set<CodexNativeSessionController.ItemScope>] = [:]
+    private var pendingCodexTerminalSettleByTabID: [UUID: PendingCodexTerminalSettle] = [:]
 
     private enum CodexRecoveryTrigger: Equatable {
         case unexpectedStreamEnd
@@ -310,6 +313,25 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let explicitThreadID: String?
         let source: String
         let controller: any CodexSessionControlling
+    }
+
+    private struct PendingCodexTerminalSettle {
+        let generation: UUID
+        let expectedRunID: UUID?
+        let turnID: String?
+        let turnStatus: CodexNativeSessionController.TurnStatus
+        let reason: String
+        let errorMessage: String?
+        let providerSuccessor: AgentRunTerminalCommitBarrier.ProviderSuccessor?
+        let assistantScope: CodexNativeSessionController.ItemScope
+        let assistantRowID: UUID?
+        let task: Task<Void, Never>
+    }
+
+    private struct CodexAssistantSettleCandidate {
+        let scope: CodexNativeSessionController.ItemScope
+        let rowID: UUID?
+        let reason: String
     }
 
     private struct RunningBashProcessScanEntry {
@@ -1985,6 +2007,72 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    private static let maxDeliveredMCPFallbackAttemptIDs = 32
+
+    private func recordDeliveredMCPFallbackAttempt(
+        _ attemptID: UUID,
+        session: AgentModeViewModel.TabSession
+    ) {
+        guard session.codexDeliveredMCPFallbackAttemptIDs.insert(attemptID).inserted else { return }
+        session.codexDeliveredMCPFallbackAttemptOrder.append(attemptID)
+        while session.codexDeliveredMCPFallbackAttemptOrder.count > Self.maxDeliveredMCPFallbackAttemptIDs {
+            let expired = session.codexDeliveredMCPFallbackAttemptOrder.removeFirst()
+            session.codexDeliveredMCPFallbackAttemptIDs.remove(expired)
+        }
+    }
+
+    @discardableResult
+    private func removeQueuedCodexFallbackForDeliveredAttempt(
+        _ attemptID: UUID,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        recordDeliveredMCPFallbackAttempt(attemptID, session: session)
+        guard let index = session.codexFallbackQueue.firstIndex(where: { entry in
+            if case let .mcp(entryAttemptID) = entry.origin {
+                return entryAttemptID == attemptID
+            }
+            return false
+        }) else { return false }
+        let removed = session.codexFallbackQueue.remove(at: index)
+        if session.codexFallbackQueue.isEmpty, session.codexFallbackDispatchInFlight == nil {
+            session.codexFallbackPumpTask?.cancel()
+            session.codexFallbackPumpTask = nil
+            session.codexFallbackSuccessorRetryTask?.cancel()
+            session.codexFallbackSuccessorRetryTask = nil
+            session.mcpFollowUpRunPending = false
+        }
+        logCodex("[AgentModeVM] sendCodexNativeMessage: removed queued Codex fallback after provider accepted attempt \(attemptID) queueID=\(removed.id)")
+        session.isDirty = true
+        viewModel?.publishMCPStateChange(for: session)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+        return true
+    }
+
+    @discardableResult
+    private func dropDeliveredClaimedCodexFallbackIfNeeded(
+        _ head: AgentModeViewModel.TabSession.CodexFallbackQueueEntry,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        guard case let .mcp(attemptID) = head.origin,
+              session.codexDeliveredMCPFallbackAttemptIDs.contains(attemptID)
+        else { return false }
+        if session.codexFallbackDispatchInFlight?.id == head.id {
+            session.codexFallbackDispatchInFlight = nil
+        }
+        viewModel?.finalizeAttachmentsForTurn(
+            for: session,
+            reservationID: head.attachmentReservationID,
+            disposition: .keepFiles
+        )
+        session.codexSteerAckTracker.resolve(attemptID: attemptID, state: .startAccepted)
+        logCodex("[AgentModeVM] dispatchClaimedCodexFallback: dropped queued fallback \(head.id) because provider already accepted MCP attempt \(attemptID)")
+        viewModel?.publishMCPStateChange(for: session)
+        viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.scheduleSave(for: session.tabID)
+        return true
+    }
+
     private func enqueueCodexFallback(
         session: AgentModeViewModel.TabSession,
         context: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext?,
@@ -2180,6 +2268,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ head: AgentModeViewModel.TabSession.CodexFallbackQueueEntry,
         session: AgentModeViewModel.TabSession
     ) async {
+        if dropDeliveredClaimedCodexFallbackIfNeeded(head, session: session) {
+            return
+        }
         guard let controller = session.codexController,
               ObjectIdentifier(controller) == head.originControllerInstanceID
         else {
@@ -4295,6 +4386,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             wasRunAlreadyActive: wasRunAlreadyActive,
             session: session
         )
+        let sendThreadID = session.codexConversationID
         if case let .fallback(decision) = dispatchPlan {
             clearCodexPendingAuthRetryTurn(session)
             return enqueueCodexFallback(
@@ -4404,6 +4496,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   Self.sameCodexControllerInstance(activeController, controller)
             else {
                 if case let .mcp(attemptID) = fallbackContext?.origin {
+                    if sendThreadID == session.codexConversationID {
+                        removeQueuedCodexFallbackForDeliveredAttempt(attemptID, session: session)
+                    } else {
+                        logCodex("[AgentModeVM] sendCodexNativeMessage: keeping queued fallback after stale-controller acceptance because the accepted Codex thread is no longer the persisted session thread")
+                    }
                     let state: CodexSteerAckTracker.TerminalState = switch dispatchPlan {
                     case .start:
                         .startAccepted
@@ -4429,6 +4526,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 attachmentReservationID: attachmentReservationID
             )
             if case let .mcp(attemptID) = fallbackContext?.origin {
+                removeQueuedCodexFallbackForDeliveredAttempt(attemptID, session: session)
                 let state: CodexSteerAckTracker.TerminalState = switch dispatchPlan {
                 case .start:
                     .startAccepted
@@ -4585,8 +4683,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         recordCodexWatchdogProgress(for: session)
         updateCodexStallWatchdogState(for: session)
+        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else {
+            flushPendingAssistantDelta(session)
+            return
+        }
         sealAssistantBoundary(session)
-        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         let argsJSON = Self.encodeArgsToJSON(args)
         let toolItem = AgentChatItem.toolCall(
             name: toolName,
@@ -4614,8 +4715,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         recordCodexWatchdogProgress(for: session)
         updateCodexStallWatchdogState(for: session)
+        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else {
+            flushPendingAssistantDelta(session)
+            return
+        }
         sealAssistantBoundary(session)
-        guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         let argsJSON = Self.encodeArgsToJSON(args)
         let canonicalToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
         var correlationPath = "none"
@@ -5317,6 +5421,225 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.providerTerminalDrainGeneration &+= 1
     }
 
+    private func recordObservedCodexAssistantCompletion(
+        _ scope: CodexNativeSessionController.ItemScope,
+        session: AgentModeViewModel.TabSession
+    ) {
+        var scopes = observedCodexAssistantCompletionScopesByTabID[session.tabID] ?? []
+        scopes.insert(scope)
+        observedCodexAssistantCompletionScopesByTabID[session.tabID] = scopes
+    }
+
+    private func latestCodexAssistantSettleCandidate(
+        session: AgentModeViewModel.TabSession,
+        turnID: String?
+    ) -> CodexAssistantSettleCandidate? {
+        let latestStreamingAssistant = session.items.reversed().first {
+            $0.kind == .assistant && $0.isStreaming
+        }
+        let hasPendingAssistantBuffer = !session.pendingAssistantDelta.isEmpty
+            || session.assistantDeltaFlushTask != nil
+        guard hasPendingAssistantBuffer || latestStreamingAssistant != nil else {
+            return nil
+        }
+
+        let scope = session.pendingCodexAssistantScope ?? latestStreamingAssistant.flatMap { item in
+            session.codexAssistantRowIDByScope.first(where: { $0.value == item.id })?.key
+        }
+        guard let scope else { return nil }
+        if let turnID,
+           !scope.turnID.isEmpty,
+           scope.turnID != turnID
+        {
+            return nil
+        }
+        guard observedCodexAssistantCompletionScopesByTabID[session.tabID]?.contains(scope) != true else {
+            return nil
+        }
+
+        let reason = if hasPendingAssistantBuffer {
+            "pending-assistant-buffer"
+        } else {
+            "streaming-assistant-item"
+        }
+        return CodexAssistantSettleCandidate(
+            scope: scope,
+            rowID: latestStreamingAssistant?.id ?? session.codexAssistantRowIDByScope[scope],
+            reason: reason
+        )
+    }
+
+    private func pendingCodexTerminalSettleStillNeedsWait(
+        _ pending: PendingCodexTerminalSettle,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        if session.pendingCodexAssistantScope == pending.assistantScope,
+           !session.pendingAssistantDelta.isEmpty || session.assistantDeltaFlushTask != nil
+        {
+            return true
+        }
+        if let rowID = pending.assistantRowID,
+           session.items.first(where: { $0.id == rowID })?.isStreaming == true
+        {
+            return true
+        }
+        return false
+    }
+
+    private func cancelPendingCodexTerminalSettle(for tabID: UUID, reason: String) {
+        guard let pending = pendingCodexTerminalSettleByTabID.removeValue(forKey: tabID) else {
+            return
+        }
+        pending.task.cancel()
+        logCodex(
+            "[AgentModeVM][CodexUI] cancel terminal assistant settle tab=\(tabID) reason=\(reason) turnID=\(pending.turnID ?? "nil")"
+        )
+    }
+
+    private func clearCodexTerminalSettleState(for tabID: UUID) {
+        cancelPendingCodexTerminalSettle(for: tabID, reason: "clear-state")
+        observedCodexAssistantCompletionScopesByTabID.removeValue(forKey: tabID)
+    }
+
+    private func completePendingCodexTerminalSettle(
+        tabID: UUID,
+        session: AgentModeViewModel.TabSession?,
+        generation: UUID,
+        trigger: String
+    ) async {
+        guard let pending = pendingCodexTerminalSettleByTabID[tabID],
+              pending.generation == generation
+        else {
+            return
+        }
+        pendingCodexTerminalSettleByTabID.removeValue(forKey: tabID)
+        pending.task.cancel()
+
+        guard let session,
+              session.runID == pending.expectedRunID,
+              session.runState.isActive,
+              session.activeRunOwnership != nil
+        else {
+            logCodex(
+                "[AgentModeVM][CodexUI] drop terminal assistant settle tab=\(tabID) trigger=\(trigger) reason=stale-run"
+            )
+            return
+        }
+
+        logCodex(
+            "[AgentModeVM][CodexUI] complete terminal assistant settle tab=\(tabID) trigger=\(trigger) turnID=\(pending.turnID ?? "nil")"
+        )
+        await finalizeCodexRun(
+            session,
+            turnStatus: pending.turnStatus,
+            reason: "\(pending.reason)-settled-\(trigger)",
+            errorMessage: pending.errorMessage,
+            providerSuccessor: pending.providerSuccessor
+        )
+    }
+
+    private func completePendingCodexTerminalSettleIfReady(
+        session: AgentModeViewModel.TabSession,
+        completedScope: CodexNativeSessionController.ItemScope
+    ) async {
+        guard let pending = pendingCodexTerminalSettleByTabID[session.tabID] else {
+            return
+        }
+        guard completedScope == pending.assistantScope
+            || !pendingCodexTerminalSettleStillNeedsWait(pending, session: session)
+        else {
+            return
+        }
+        await completePendingCodexTerminalSettle(
+            tabID: session.tabID,
+            session: session,
+            generation: pending.generation,
+            trigger: "assistant-completed"
+        )
+    }
+
+    private func completePendingCodexTerminalSettleIfPresent(
+        session: AgentModeViewModel.TabSession,
+        trigger: String
+    ) async {
+        guard let pending = pendingCodexTerminalSettleByTabID[session.tabID] else {
+            return
+        }
+        await completePendingCodexTerminalSettle(
+            tabID: session.tabID,
+            session: session,
+            generation: pending.generation,
+            trigger: trigger
+        )
+    }
+
+    private func deferCodexTerminalFinalizeIfNeeded(
+        session: AgentModeViewModel.TabSession,
+        turnID: String?,
+        status: CodexNativeSessionController.TurnStatus,
+        failureMessage: String?,
+        providerSuccessor: AgentRunTerminalCommitBarrier.ProviderSuccessor?
+    ) async -> Bool {
+        guard status == .completed,
+              session.runState.isActive,
+              session.activeRunOwnership != nil,
+              terminalCommitBarrier != nil
+        else {
+            return false
+        }
+        if let pending = pendingCodexTerminalSettleByTabID[session.tabID] {
+            if pending.turnID == turnID {
+                return true
+            }
+            await completePendingCodexTerminalSettle(
+                tabID: session.tabID,
+                session: session,
+                generation: pending.generation,
+                trigger: "superseded-turn-completed"
+            )
+        }
+        guard let candidate = latestCodexAssistantSettleCandidate(session: session, turnID: turnID) else {
+            return false
+        }
+
+        let tabID = session.tabID
+        let generation = UUID()
+        let expectedRunID = session.runID
+        let delayNanos = codexTerminalAssistantSettleDelayNanos
+        let task = Task { @MainActor [weak self, weak session] in
+            do {
+                try await Task.sleep(nanoseconds: delayNanos)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await self?.completePendingCodexTerminalSettle(
+                tabID: tabID,
+                session: session,
+                generation: generation,
+                trigger: "timeout"
+            )
+        }
+        pendingCodexTerminalSettleByTabID[tabID] = PendingCodexTerminalSettle(
+            generation: generation,
+            expectedRunID: expectedRunID,
+            turnID: turnID,
+            turnStatus: status,
+            reason: "turn-completed-\(status)",
+            errorMessage: failureMessage,
+            providerSuccessor: providerSuccessor,
+            assistantScope: candidate.scope,
+            assistantRowID: candidate.rowID,
+            task: task
+        )
+        // Remote truncation incident 2026-07-08: Codex can report turn/completed
+        // before the matching item/completed full assistant payload reaches the app.
+        logCodex(
+            "[AgentModeVM][CodexUI] defer terminal assistant settle tab=\(tabID) turnID=\(turnID ?? "nil") itemID=\(candidate.scope.itemID) reason=\(candidate.reason)"
+        )
+        return true
+    }
+
     private func finalizeCodexRun(
         _ session: AgentModeViewModel.TabSession,
         turnStatus: CodexNativeSessionController.TurnStatus,
@@ -5326,6 +5649,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         deleteDeferredFilesWhenFailureHasNoInFlight: Bool = false,
         providerSuccessor: AgentRunTerminalCommitBarrier.ProviderSuccessor? = nil
     ) async {
+        cancelPendingCodexTerminalSettle(for: session.tabID, reason: "finalize-\(reason)")
         guard let ownership = session.activeRunOwnership,
               let terminalCommitBarrier
         else {
@@ -5346,6 +5670,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.codexReasoningSegmentsByKey.removeAll()
         session.pendingCodexAssistantScope = nil
         session.codexAssistantRowIDByScope.removeAll()
+        observedCodexAssistantCompletionScopesByTabID.removeValue(forKey: session.tabID)
         clearCodexPendingInteractions(in: session)
 
         let terminalState: AgentSessionRunState = switch turnStatus {
@@ -5440,6 +5765,27 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             nil
         }
         guard let scope else { return true }
+        let scopedTurnID = scope.turnID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let scopedItemID = scope.itemID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let scopedThreadID = scope.threadID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let itemScope = CodexNativeSessionController.ItemScope(
+            turnID: scopedTurnID,
+            itemID: scopedItemID
+        )
+        if let pending = pendingCodexTerminalSettleByTabID[session.tabID],
+           !scopedTurnID.isEmpty,
+           !scopedItemID.isEmpty,
+           pending.assistantScope == itemScope,
+           session.runID == pending.expectedRunID,
+           session.runState.isActive
+        {
+            if !scopedThreadID.isEmpty,
+               scopedThreadID != session.codexConversationID
+            {
+                return false
+            }
+            return true
+        }
         if let threadID = scope.threadID?.trimmingCharacters(in: .whitespacesAndNewlines),
            !threadID.isEmpty,
            threadID != session.codexConversationID
@@ -5568,7 +5914,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case let .assistantCompleted(payload):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
+            recordObservedCodexAssistantCompletion(payload.scope, session: session)
             reconcileAssistantCompletion(payload, session: session)
+            await completePendingCodexTerminalSettleIfReady(
+                session: session,
+                completedScope: payload.scope
+            )
             return
         case let .reasoningDelta(payload):
             guard session.runState.isActive else { return }
@@ -5880,6 +6231,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             enqueueCommandExecutionRunningUpdate(runningUpdate, session: session)
         case let .turnStarted(turnID):
+            await completePendingCodexTerminalSettleIfPresent(
+                session: session,
+                trigger: "turn-started"
+            )
             cancelCodexIdleShutdown(for: session.tabID)
             clearStaleCodexPendingInteractionsForNewTurn(turnID, session: session)
             guard let turnKind = installAuthoritativeCodexTurnForStart(
@@ -5946,6 +6301,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             if session.runState == .cancelled, status != .interrupted { return }
             if session.runState == .failed, status != .failed { return }
+            if await deferCodexTerminalFinalizeIfNeeded(
+                session: session,
+                turnID: turnID,
+                status: status,
+                failureMessage: failureMessage,
+                providerSuccessor: providerSuccessor
+            ) {
+                return
+            }
             await finalizeCodexRun(
                 session,
                 turnStatus: status,
@@ -6925,6 +7289,87 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
 
         @_spi(TestSupport)
+        public func test_handleCodexTrackerToolCall(
+            invocationID: UUID?,
+            toolName: String,
+            args: [String: Value]? = nil,
+            session: AgentModeViewModel.TabSession
+        ) {
+            handleCodexToolCall(
+                invocationID: invocationID,
+                toolName: toolName,
+                args: args,
+                session: session
+            )
+        }
+
+        @_spi(TestSupport)
+        public func test_handleCodexTrackerToolResult(
+            invocationID: UUID?,
+            toolName: String,
+            args: [String: Value]? = nil,
+            resultJSON: String,
+            isError: Bool,
+            session: AgentModeViewModel.TabSession
+        ) {
+            handleCodexToolResult(
+                invocationID: invocationID,
+                toolName: toolName,
+                args: args,
+                resultJSON: resultJSON,
+                isError: isError,
+                session: session
+            )
+        }
+
+        @_spi(TestSupport)
+        public func test_hasPendingCodexTerminalSettle(tabID: UUID) -> Bool {
+            pendingCodexTerminalSettleByTabID[tabID] != nil
+        }
+
+        @_spi(TestSupport)
+        public func test_forcePendingCodexTerminalSettleTimeout(
+            session: AgentModeViewModel.TabSession
+        ) async {
+            guard let pending = pendingCodexTerminalSettleByTabID[session.tabID] else {
+                return
+            }
+            await completePendingCodexTerminalSettle(
+                tabID: session.tabID,
+                session: session,
+                generation: pending.generation,
+                trigger: "test-timeout"
+            )
+        }
+
+        @_spi(TestSupport)
+        public func test_claimCodexFallbackHead(
+            session: AgentModeViewModel.TabSession,
+            expectedQueueID: UUID,
+            beginsSuccessorAttempt: Bool
+        ) -> Bool {
+            claimCodexFallbackHead(
+                session: session,
+                expectedQueueID: expectedQueueID,
+                beginsSuccessorAttempt: beginsSuccessorAttempt
+            ) != nil
+        }
+
+        @_spi(TestSupport)
+        public func test_recordDeliveredCodexFallbackAttempt(
+            _ attemptID: UUID,
+            session: AgentModeViewModel.TabSession
+        ) {
+            removeQueuedCodexFallbackForDeliveredAttempt(attemptID, session: session)
+        }
+
+        @_spi(TestSupport)
+        public func test_dispatchClaimedCodexFallback(session: AgentModeViewModel.TabSession) async {
+            guard let head = session.codexFallbackDispatchInFlight else { return }
+            await dispatchClaimedCodexFallback(head, session: session)
+        }
+
+        @_spi(TestSupport)
         public static func test_mergeCommandRunningUpdates(
             existing: CodexNativeSessionController.CommandExecutionRunningUpdate,
             incoming: CodexNativeSessionController.CommandExecutionRunningUpdate
@@ -7859,6 +8304,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         viewModel?.reconcileInteractiveRunState(session)
         handleRunInteractionStateChange(for: session, reason: .permissionsResponseSubmitted)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
+        viewModel?.recordMCPInteractionResolution(for: session, interactionID: request.id)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
             await controller.respondToServerRequest(id: request.requestID, result: result)
@@ -7888,6 +8334,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         handleRunInteractionStateChange(for: session, reason: .mcpElicitationResponseSubmitted)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         viewModel?.publishMCPStateChange(for: session)
+        viewModel?.recordMCPInteractionResolution(for: session, interactionID: request.id)
         let authoritativeTurnID = session.codexAuthoritativeActiveTurn?.turnID
         Task { [controller] in
             await controller.respondToServerRequest(id: request.requestID, result: response.jsonObject)
@@ -7989,6 +8436,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     }
 
     func clearCodexSessionState(_ session: AgentModeViewModel.TabSession) {
+        clearCodexTerminalSettleState(for: session.tabID)
         cancelCodexThreadNameSync(for: session.tabID)
         cancelCodexIdleShutdown(for: session.tabID)
         stopCodexStallWatchdog(for: session.tabID)
@@ -8041,6 +8489,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func drainCodexTerminalBuffersForCancellation(_ session: AgentModeViewModel.TabSession) {
         guard session.selectedAgent == .codexExec else { return }
+        clearCodexTerminalSettleState(for: session.tabID)
         drainCodexTerminalOutput(session, turnStatus: .interrupted)
         abandonCodexFallbackQueue(
             session: session,

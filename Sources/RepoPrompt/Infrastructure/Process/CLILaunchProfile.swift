@@ -60,6 +60,18 @@ enum CLILaunchProfiles {
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
     )
 
+    static let tailscaleAppBundleExecutablePath = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+
+    static let tailscale = CLILaunchProfile(
+        commandName: "tailscale",
+        preferredBasenames: ["tailscale"],
+        supplementalSearchPaths: orderedUnique([
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin"
+        ] + CLINativePathDefaults.defaultAdditionalPaths)
+    )
+
     static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {
         orderedUnique(CLINativePathDefaults.defaultAdditionalPaths + providerSpecificPaths)
     }

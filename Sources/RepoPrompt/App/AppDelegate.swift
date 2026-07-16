@@ -23,6 +23,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     // New global routing/settings services (kept alive by the AppDelegate)
     private var windowRoutingService: WindowRoutingService?
     private var appSettingsMCPService: AppSettingsMCPService?
+    private var remotePairingMCPService: MCPRemotePairingToolService?
 
     // MARK: - Global references
 
@@ -84,6 +85,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         let appSettingsMCPService = AppSettingsMCPService()
         ServiceRegistry.register(appSettingsMCPService)
         self.appSettingsMCPService = appSettingsMCPService
+
+        let remotePairingMCPService = MCPRemotePairingToolService()
+        ServiceRegistry.register(remotePairingMCPService)
+        self.remotePairingMCPService = remotePairingMCPService
 
         // Register global MCP window-routing helpers
         windowRoutingService = WindowRoutingService(

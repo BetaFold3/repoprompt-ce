@@ -38,6 +38,7 @@ actor AgentRunSessionStore {
     enum WakeReason: String, Equatable {
         case instructionDelivered = "instruction_delivered"
         case steeringRequested = "steering_requested"
+        case interactionResolved = "interaction_resolved"
     }
 
     private struct Waiter {

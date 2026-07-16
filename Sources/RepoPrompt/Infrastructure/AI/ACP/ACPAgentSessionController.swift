@@ -1094,6 +1094,16 @@ actor ACPAgentSessionController {
             lastStderrPreview = Self.truncatedDiagnosticPreview(text)
             recordActivePromptStderrLine(text)
             diagnose(.stderrLine(text))
+            #if DEBUG
+                captureFragmentDiagnosticIfEnabled(
+                    source: "stderr",
+                    streamType: "system",
+                    sampleSource: text,
+                    plainLength: text.count,
+                    thoughtLength: 0,
+                    sourceSessionUpdate: nil
+                )
+            #endif
             emit(.stream(AIStreamResult(type: "system", text: text)))
         }
     }
@@ -1224,6 +1234,7 @@ actor ACPAgentSessionController {
         let normalizedEvents = provider.normalizeSessionUpdate(update, sessionID: sessionID)
         #if DEBUG
             captureNormalizedACPEvents(normalizedEvents, sessionID: sessionID, sourceUpdate: update)
+            captureFragmentDiagnosticsIfEnabled(normalizedEvents, sourceUpdate: update)
         #endif
         recordActivePromptTraceUpdate(sourceUpdate: update, normalizedEvents: normalizedEvents)
         for event in normalizedEvents {
@@ -3247,6 +3258,10 @@ actor ACPAgentSessionController {
             rawACPCaptureURL != nil
         }
 
+        private var isACPFragmentDiagnosticsEnabled: Bool {
+            isRawACPCaptureEnabled && Self.resolveACPFragmentDiagnosticsEnabled(for: provider.providerID)
+        }
+
         private func captureNormalizedACPEvents(
             _ events: [NormalizedAgentRuntimeEvent],
             sessionID: String,
@@ -3262,6 +3277,71 @@ actor ACPAgentSessionController {
                 payload["sourceSessionUpdate"] = sourceSessionUpdate
             }
             captureRawACPEvent(kind: "session.update.normalized", payload: payload)
+        }
+
+        private func captureFragmentDiagnosticsIfEnabled(
+            _ events: [NormalizedAgentRuntimeEvent],
+            sourceUpdate: [String: Any]
+        ) {
+            guard isACPFragmentDiagnosticsEnabled else { return }
+            let sourceSessionUpdate = sourceUpdate["sessionUpdate"] as? String
+            for event in events {
+                guard case let .stream(result) = event else { continue }
+                captureFragmentDiagnosticIfEnabled(
+                    source: "normalized",
+                    streamType: result.type,
+                    sampleSource: result.text ?? result.reasoning,
+                    plainLength: result.text?.count ?? 0,
+                    thoughtLength: result.reasoning?.count ?? 0,
+                    sourceSessionUpdate: sourceSessionUpdate
+                )
+            }
+        }
+
+        private func captureFragmentDiagnosticIfEnabled(
+            source: String,
+            streamType: String,
+            sampleSource: String?,
+            plainLength: Int,
+            thoughtLength: Int,
+            sourceSessionUpdate: String?
+        ) {
+            guard isACPFragmentDiagnosticsEnabled,
+                  let payload = Self.fragmentDiagnosticPayload(
+                      source: source,
+                      streamType: streamType,
+                      sampleSource: sampleSource,
+                      plainLength: plainLength,
+                      thoughtLength: thoughtLength,
+                      sourceSessionUpdate: sourceSessionUpdate
+                  )
+            else { return }
+            captureRawACPEvent(kind: "fragment.diagnostic", payload: payload)
+        }
+
+        private static func fragmentDiagnosticPayload(
+            source: String,
+            streamType: String,
+            sampleSource: String?,
+            plainLength: Int,
+            thoughtLength: Int,
+            sourceSessionUpdate: String?
+        ) -> [String: Any]? {
+            guard let sampleSource else { return nil }
+            let sample = sampleSource.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sample.isEmpty, sample.count <= 80 else { return nil }
+            var payload: [String: Any] = [
+                "source": source,
+                "streamType": streamType,
+                "plainLength": plainLength,
+                "thoughtLength": thoughtLength,
+                "sample": sample,
+                "scalars": sample.unicodeScalars.map { String(format: "U+%04X", Int($0.value)) }
+            ]
+            if let sourceSessionUpdate, !sourceSessionUpdate.isEmpty {
+                payload["sourceSessionUpdate"] = sourceSessionUpdate
+            }
+            return payload
         }
 
         private func normalizedACPEventSummary(_ event: NormalizedAgentRuntimeEvent) -> [String: Any] {
@@ -3359,6 +3439,30 @@ actor ACPAgentSessionController {
                 return text
             }
             return String(text.suffix(limit))
+        }
+
+        private static func resolveACPFragmentDiagnosticsEnabled(for providerID: ACPProviderID) -> Bool {
+            let env = ProcessInfo.processInfo.environment
+            if isTruthyEnvironmentFlag(env["RP_ACP_FRAGMENT_DIAGNOSTICS"]) {
+                return true
+            }
+            let providerSpecificKey = switch providerID {
+            case .cursor:
+                "RP_CURSOR_ACP_FRAGMENT_DIAGNOSTICS"
+            case .openCode:
+                "RP_OPENCODE_ACP_FRAGMENT_DIAGNOSTICS"
+            }
+            return isTruthyEnvironmentFlag(env[providerSpecificKey])
+        }
+
+        private static func isTruthyEnvironmentFlag(_ rawValue: String?) -> Bool {
+            guard let rawValue else { return false }
+            switch rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "1", "true", "yes", "on":
+                return true
+            default:
+                return false
+            }
         }
 
         private func captureRawACPEvent(kind: String, payload: [String: Any]) {

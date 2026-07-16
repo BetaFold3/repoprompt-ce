@@ -5,6 +5,7 @@ struct AgentWorkspaceBranchSwitchActions {
     let preflight: (AgentWorkspaceRootRow, String) async throws -> GitBranchSwitchPreflight
     let switchBranch: (AgentWorkspaceRootRow, GitBranchSwitchPreflight) async throws -> GitBranchSwitchResult
     let isAgentRunActive: () -> Bool
+    var disabledReason: () -> String? = { nil }
 
     static let unavailable = AgentWorkspaceBranchSwitchActions(
         loadOptions: { _ in
@@ -16,7 +17,8 @@ struct AgentWorkspaceBranchSwitchActions {
         switchBranch: { _, _ in
             throw GitBranchSwitchError.unavailable("Branch switching is unavailable in this context.")
         },
-        isAgentRunActive: { false }
+        isAgentRunActive: { false },
+        disabledReason: { "Branch switching is unavailable in this context." }
     )
 }
 
@@ -140,7 +142,9 @@ struct GitContextBranchSwitchCapsule: View {
     }
 
     var body: some View {
+        let disabledReason = actions.disabledReason()
         Button {
+            guard disabledReason == nil else { return }
             showPopover.toggle()
         } label: {
             HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
@@ -166,9 +170,9 @@ struct GitContextBranchSwitchCapsule: View {
             .fixedSize(horizontal: true, vertical: true)
         }
         .buttonStyle(.plain)
-        .disabled(isSwitching)
+        .disabled(isSwitching || disabledReason != nil)
         .onHover { isCapsuleHovered = $0 }
-        .hoverTooltip(context.tooltipText, .top)
+        .hoverTooltip(disabledReason ?? context.tooltipText, .top)
         .accessibilityLabel(context.accessibilityText)
         .popover(isPresented: $showPopover, arrowEdge: .trailing) {
             popoverContent

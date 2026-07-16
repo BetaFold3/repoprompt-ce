@@ -106,6 +106,8 @@ public struct ManageWorkspacesResponse: Codable, Sendable {
     public let status: String?
     public let windowID: Int? // For switch/create with open_in_new_window
     public let closedWindowID: Int? // For delete with close_window
+    public let workspaceID: UUID? // For open
+    public let workspaceName: String? // For open
 
     public init(
         action: String,
@@ -113,7 +115,9 @@ public struct ManageWorkspacesResponse: Codable, Sendable {
         tabs: [MCPComposeTabSummary]? = nil,
         status: String?,
         windowID: Int? = nil,
-        closedWindowID: Int? = nil
+        closedWindowID: Int? = nil,
+        workspaceID: UUID? = nil,
+        workspaceName: String? = nil
     ) {
         self.action = action
         self.workspaces = workspaces
@@ -121,12 +125,33 @@ public struct ManageWorkspacesResponse: Codable, Sendable {
         self.status = status
         self.windowID = windowID
         self.closedWindowID = closedWindowID
+        self.workspaceID = workspaceID
+        self.workspaceName = workspaceName
     }
 
     private enum CodingKeys: String, CodingKey {
         case action, workspaces, tabs, status
         case windowID = "window_id"
         case closedWindowID = "closed_window_id"
+        case workspaceID = "workspace_id"
+        case workspaceName = "workspace_name"
+    }
+}
+
+struct WorkspaceOpenToolError: MCPStructuredToolError, Equatable {
+    let code: String
+    let message: String
+
+    var errorDescription: String? {
+        message
+    }
+
+    static func notFound(_ selector: String) -> Self {
+        Self(code: "workspace_not_found", message: "Workspace '\(selector)' was not found.")
+    }
+
+    static func ambiguous(_ name: String) -> Self {
+        Self(code: "workspace_ambiguous", message: "Workspace name '\(name)' matches multiple visible workspaces; use a workspace UUID.")
     }
 }
 
@@ -315,14 +340,65 @@ final class WindowRoutingService: Service {
         explicitWindowIDProvided
     }
 
+    nonisolated static func workspaceSwitchReachedTarget(
+        _ result: WorkspaceSwitchResult,
+        activeWorkspaceID: UUID?,
+        targetWorkspaceID: UUID
+    ) -> Bool {
+        result.didSwitch || activeWorkspaceID == targetWorkspaceID
+    }
+
+    nonisolated static func shouldBindConnectionAfterWorkspaceOpen(
+        connectionID: UUID?,
+        clientName: String?
+    ) -> Bool {
+        guard connectionID != nil else { return false }
+        guard clientName != "repoprompt-gateway", clientName?.hasPrefix("remote:") != true else {
+            return false
+        }
+        return true
+    }
+
+    nonisolated static func test_workspaceSwitchReachedTarget(
+        _ result: WorkspaceSwitchResult,
+        activeWorkspaceID: UUID?,
+        targetWorkspaceID: UUID
+    ) -> Bool {
+        workspaceSwitchReachedTarget(
+            result,
+            activeWorkspaceID: activeWorkspaceID,
+            targetWorkspaceID: targetWorkspaceID
+        )
+    }
+
+    nonisolated static func test_shouldBindConnectionAfterWorkspaceOpen(
+        connectionID: UUID?,
+        clientName: String?
+    ) -> Bool {
+        shouldBindConnectionAfterWorkspaceOpen(connectionID: connectionID, clientName: clientName)
+    }
+
     // ---------------------------------------------------------------------
 
     // MARK: Stored references
 
-    // ---------------------------------------------------------------------
+    /// ---------------------------------------------------------------------
+    private struct WorkspaceOpenFlight {
+        let id: UUID
+        let task: Task<ManageWorkspacesResponse, Error>
+    }
+
+    private struct WorkspaceBootstrapFlight {
+        let id: UUID
+        let task: Task<WindowState, Error>
+    }
+
     private let windowStates: WindowStatesManager
     private let networkMgr: ServerNetworkManager
     private var previousDisabledTools: Set<String>
+    private var workspaceOpenFlights: [String: WorkspaceOpenFlight] = [:]
+    private var workspaceBootstrapFlight: WorkspaceBootstrapFlight?
+    private var workspaceBootstrapClaimedWorkspaceID: UUID?
 
     /// Thread-safe tools storage
     private let toolsCache = ToolsCache()
@@ -452,6 +528,49 @@ final class WindowRoutingService: Service {
         case unhide
     }
 
+    private struct WorkspaceOpenSelector {
+        let workspaceID: UUID?
+        let workspaceName: String?
+
+        var displayValue: String {
+            workspaceID?.uuidString ?? workspaceName ?? "workspace"
+        }
+
+        var preliminaryFlightKey: String {
+            if let workspaceID {
+                return "selector:id:\(workspaceID.uuidString.lowercased())"
+            }
+            return "selector:name:\(Self.normalizedName(workspaceName ?? ""))"
+        }
+
+        static func normalizedName(_ name: String) -> String {
+            name.folding(options: [.caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        }
+
+        static func parse(_ args: [String: Value]) throws -> Self {
+            let rawID = args["workspace_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawName = args["workspace_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawWorkspace = args["workspace"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if let rawID, !rawID.isEmpty {
+                guard let workspaceID = UUID(uuidString: rawID) else {
+                    throw WorkspaceOpenToolError.notFound(rawID)
+                }
+                return Self(workspaceID: workspaceID, workspaceName: rawName?.isEmpty == false ? rawName : nil)
+            }
+            if let rawName, !rawName.isEmpty {
+                return Self(workspaceID: nil, workspaceName: rawName)
+            }
+            if let rawWorkspace, !rawWorkspace.isEmpty {
+                if let workspaceID = UUID(uuidString: rawWorkspace) {
+                    return Self(workspaceID: workspaceID, workspaceName: nil)
+                }
+                return Self(workspaceID: nil, workspaceName: rawWorkspace)
+            }
+            throw MCPError.invalidParams("Action 'open' requires a nonblank workspace, workspace_id, or workspace_name selector.")
+        }
+    }
+
     private func loadWorkspaceDiskSnapshot() async throws -> [WorkspaceModel] {
         guard let referenceManager = await MainActor.run(body: {
             self.windowStates.allWindows.first?.workspaceManager
@@ -538,6 +657,31 @@ final class WindowRoutingService: Service {
         }
     }
 
+    private nonisolated static func resolveWorkspaceForOpen(
+        selector: WorkspaceOpenSelector,
+        in diskWorkspaces: [WorkspaceModel]
+    ) throws -> WorkspaceModel {
+        if let workspaceID = selector.workspaceID {
+            guard let workspace = diskWorkspaces.first(where: { $0.id == workspaceID }) else {
+                throw WorkspaceOpenToolError.notFound(workspaceID.uuidString)
+            }
+            return workspace
+        }
+
+        let workspaceName = selector.workspaceName ?? ""
+        let normalizedName = WorkspaceOpenSelector.normalizedName(workspaceName)
+        let visibleMatches = diskWorkspaces.filter {
+            !$0.isHiddenInMenus && WorkspaceOpenSelector.normalizedName($0.name) == normalizedName
+        }
+        guard visibleMatches.count <= 1 else {
+            throw WorkspaceOpenToolError.ambiguous(workspaceName)
+        }
+        guard let workspace = visibleMatches.first else {
+            throw WorkspaceOpenToolError.notFound(workspaceName)
+        }
+        return workspace
+    }
+
     private func resolveWorkspaceForSwitch(rawWorkspaceParam: String, includeHidden: Bool) async throws -> WorkspaceModel {
         let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
         return try Self.resolveWorkspaceReference(
@@ -575,6 +719,17 @@ final class WindowRoutingService: Service {
             rawWorkspaceParam,
             in: workspaces,
             mode: .visibleNameByDefault(action: action, includeHidden: includeHiddenForName)
+        )
+    }
+
+    nonisolated static func test_resolveWorkspaceForOpen(
+        workspaceID: UUID? = nil,
+        workspaceName: String? = nil,
+        workspaces: [WorkspaceModel]
+    ) throws -> WorkspaceModel {
+        try resolveWorkspaceForOpen(
+            selector: WorkspaceOpenSelector(workspaceID: workspaceID, workspaceName: workspaceName),
+            in: workspaces
         )
     }
 
@@ -1372,15 +1527,196 @@ final class WindowRoutingService: Service {
         return newWindow
     }
 
-    private func openNewWindowShowingWorkspace(_ workspace: WorkspaceModel) async throws -> WindowState {
+    private func switchWindowToWorkspace(
+        _ window: WindowState,
+        workspace: WorkspaceModel,
+        bypassSessionCancellationConfirmation: Bool
+    ) async throws {
+        let switchResult = await window.workspaceManager.requestWorkspaceSwitch(
+            to: workspace,
+            saveState: true,
+            reason: "mcpWorkspaceOpen",
+            bypassSessionCancellationConfirmation: bypassSessionCancellationConfirmation
+        )
+        guard Self.workspaceSwitchReachedTarget(
+            switchResult,
+            activeWorkspaceID: window.workspaceManager.activeWorkspace?.id,
+            targetWorkspaceID: workspace.id
+        ) else {
+            throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
+        }
+    }
+
+    private func openNewWindowShowingWorkspace(
+        _ workspace: WorkspaceModel,
+        bypassSessionCancellationConfirmation: Bool = false
+    ) async throws -> WindowState {
         let newWindow = try await openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
         defer { newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral() }
         await newWindow.workspaceManager.awaitInitialized()
-        let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true)
-        if !switchResult.didSwitch {
-            throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
-        }
+        try await switchWindowToWorkspace(
+            newWindow,
+            workspace: workspace,
+            bypassSessionCancellationConfirmation: bypassSessionCancellationConfirmation
+        )
         return newWindow
+    }
+
+    private func withWorkspaceOpenSingleFlight(
+        key: String,
+        operation: @escaping @MainActor () async throws -> ManageWorkspacesResponse
+    ) async throws -> ManageWorkspacesResponse {
+        if let existing = workspaceOpenFlights[key] {
+            return try await existing.task.value
+        }
+
+        let flightID = UUID()
+        let task = Task { @MainActor in try await operation() }
+        workspaceOpenFlights[key] = WorkspaceOpenFlight(id: flightID, task: task)
+        do {
+            let response = try await task.value
+            if workspaceOpenFlights[key]?.id == flightID {
+                workspaceOpenFlights.removeValue(forKey: key)
+            }
+            return response
+        } catch {
+            if workspaceOpenFlights[key]?.id == flightID {
+                workspaceOpenFlights.removeValue(forKey: key)
+            }
+            throw error
+        }
+    }
+
+    private func bootstrapWorkspaceOpenWindowIfNeeded() async throws -> WindowState? {
+        if let existing = workspaceBootstrapFlight {
+            return try await existing.task.value
+        }
+        guard windowStates.allWindows.isEmpty else { return nil }
+
+        let flightID = UUID()
+        workspaceBootstrapClaimedWorkspaceID = nil
+        let task = Task { @MainActor [self] in try await openInitializedWindow() }
+        workspaceBootstrapFlight = WorkspaceBootstrapFlight(id: flightID, task: task)
+        do {
+            let window = try await task.value
+            if workspaceBootstrapFlight?.id == flightID {
+                workspaceBootstrapFlight = nil
+            }
+            return window
+        } catch {
+            if workspaceBootstrapFlight?.id == flightID {
+                workspaceBootstrapFlight = nil
+            }
+            throw error
+        }
+    }
+
+    private func performWorkspaceOpen(selector: WorkspaceOpenSelector) async throws -> ManageWorkspacesResponse {
+        let preexistingWindowIDs = Set(windowStates.allWindows.map(\.windowID))
+        let bootstrapWindow = try await bootstrapWorkspaceOpenWindowIfNeeded()
+        let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
+        let targetWorkspace = try Self.resolveWorkspaceForOpen(selector: selector, in: diskWorkspaces)
+
+        return try await withWorkspaceOpenSingleFlight(key: "workspace:\(targetWorkspace.id.uuidString.lowercased())") { [self] in
+            let preexistingMatches = windowStates.allWindows
+                .filter {
+                    preexistingWindowIDs.contains($0.windowID)
+                        && $0.workspaceManager.activeWorkspace?.id == targetWorkspace.id
+                }
+                .sorted { $0.windowID < $1.windowID }
+            if let existingWindow = preexistingMatches.first {
+                return ManageWorkspacesResponse(
+                    action: "open",
+                    workspaces: nil,
+                    status: "already_open",
+                    windowID: existingWindow.windowID,
+                    workspaceID: targetWorkspace.id,
+                    workspaceName: targetWorkspace.name
+                )
+            }
+
+            if let currentMatch = windowStates.allWindows
+                .filter({ $0.workspaceManager.activeWorkspace?.id == targetWorkspace.id })
+                .sorted(by: { $0.windowID < $1.windowID })
+                .first
+            {
+                let status = bootstrapWindow?.windowID == currentMatch.windowID ? "opened" : "already_open"
+                return ManageWorkspacesResponse(
+                    action: "open",
+                    workspaces: nil,
+                    status: status,
+                    windowID: currentMatch.windowID,
+                    workspaceID: targetWorkspace.id,
+                    workspaceName: targetWorkspace.name
+                )
+            }
+
+            let targetWindow: WindowState
+            if let bootstrapWindow,
+               workspaceBootstrapClaimedWorkspaceID == nil || workspaceBootstrapClaimedWorkspaceID == targetWorkspace.id
+            {
+                workspaceBootstrapClaimedWorkspaceID = targetWorkspace.id
+                do {
+                    try await switchWindowToWorkspace(
+                        bootstrapWindow,
+                        workspace: targetWorkspace,
+                        bypassSessionCancellationConfirmation: true
+                    )
+                } catch {
+                    workspaceBootstrapClaimedWorkspaceID = nil
+                    throw error
+                }
+                targetWindow = bootstrapWindow
+            } else {
+                targetWindow = try await openNewWindowShowingWorkspace(
+                    targetWorkspace,
+                    bypassSessionCancellationConfirmation: true
+                )
+            }
+
+            return ManageWorkspacesResponse(
+                action: "open",
+                workspaces: nil,
+                status: "opened",
+                windowID: targetWindow.windowID,
+                workspaceID: targetWorkspace.id,
+                workspaceName: targetWorkspace.name
+            )
+        }
+    }
+
+    private func openWorkspace(selector: WorkspaceOpenSelector) async throws -> ManageWorkspacesResponse {
+        let response = try await withWorkspaceOpenSingleFlight(key: selector.preliminaryFlightKey) { [self] in
+            try await performWorkspaceOpen(selector: selector)
+        }
+
+        let connectionID = await networkMgr.currentConnectionUUID()
+        let clientName = await networkMgr.currentClientIdentifier()
+        if Self.shouldBindConnectionAfterWorkspaceOpen(connectionID: connectionID, clientName: clientName) {
+            guard let windowID = response.windowID else {
+                throw MCPError.internalError("Workspace open completed without a window_id.")
+            }
+            try await networkMgr.setActiveWindowForCurrentConnection(windowID)
+        }
+        return response
+    }
+
+    func test_openWorkspace(
+        workspaceID: UUID? = nil,
+        workspaceName: String? = nil
+    ) async throws -> ManageWorkspacesResponse {
+        try await openWorkspace(selector: WorkspaceOpenSelector(workspaceID: workspaceID, workspaceName: workspaceName))
+    }
+
+    func test_openNewWindowShowingWorkspace(_ workspace: WorkspaceModel) async throws -> WindowState {
+        try await openNewWindowShowingWorkspace(workspace)
+    }
+
+    func test_withWorkspaceOpenSingleFlight(
+        key: String,
+        operation: @escaping @MainActor () async throws -> ManageWorkspacesResponse
+    ) async throws -> ManageWorkspacesResponse {
+        try await withWorkspaceOpenSingleFlight(key: key, operation: operation)
     }
 
     private func resolveWorkspaceApprovalWindow(
@@ -2141,6 +2477,7 @@ final class WindowRoutingService: Service {
 
                 Actions:
                 • list         – Return known visible workspaces by default (id, name, repoPaths, showing window IDs, is_hidden)
+                • open         – Idempotently locate or open a workspace in a window
                 • switch       – Switch a window to a specified workspace
                 • create       – Create a new workspace (optional folder_path)
                 • hide         – Hide a workspace from default workspace lists without deleting it
@@ -2154,8 +2491,10 @@ final class WindowRoutingService: Service {
                 • close_tab    – Close a compose tab safely
 
                 Parameters:
-                - action: "list" | "switch" | "create" | "hide" | "unhide" | "delete" | "add_folder" | "remove_folder" | "list_tabs" | "select_tab" | "create_tab" | "close_tab" (required)
-                - workspace: string                             (required for 'switch', 'hide', 'unhide', 'delete'; optional for 'add_folder', 'remove_folder' - defaults to active workspace; UUID or name)
+                - action: "list" | "open" | "switch" | "create" | "hide" | "unhide" | "delete" | "add_folder" | "remove_folder" | "list_tabs" | "select_tab" | "create_tab" | "close_tab" (required)
+                - workspace: string                             (required for local 'open', 'switch', 'hide', 'unhide', 'delete'; optional for 'add_folder', 'remove_folder' - defaults to active workspace; UUID or name)
+                - workspace_id: string                          (gateway form for 'open'; takes precedence over workspace_name)
+                - workspace_name: string                        (gateway form for 'open'; case-insensitive visible-workspace name)
                 - name: string                                  (required for 'create'; optional for 'create_tab')
                 - folder_path: string                           (required for 'add_folder', 'remove_folder'; optional for 'create' to initialize with a root folder; absolute path)
                 - tab: string                                   (required for 'select_tab'; optional for 'close_tab'; UUID or name)
@@ -2183,8 +2522,10 @@ final class WindowRoutingService: Service {
                 """,
                 inputSchema: .object(
                     properties: [
-                        "action": .string(description: "Action to perform. Legacy compatibility: prefer bind_context for list_tabs/select_tab when building new integrations.", enum: ["list", "switch", "create", "hide", "unhide", "delete", "add_folder", "remove_folder", "list_tabs", "select_tab", "create_tab", "close_tab"]),
-                        "workspace": .string(description: "Workspace UUID or name (required for 'switch', 'hide', 'unhide', 'delete'; optional for 'add_folder', 'remove_folder' - defaults to active workspace)"),
+                        "action": .string(description: "Action to perform. Legacy compatibility: prefer bind_context for list_tabs/select_tab when building new integrations.", enum: ["list", "open", "switch", "create", "hide", "unhide", "delete", "add_folder", "remove_folder", "list_tabs", "select_tab", "create_tab", "close_tab"]),
+                        "workspace": .string(description: "Workspace UUID or name (required for local open/switch/hide/unhide/delete; optional for add_folder/remove_folder)"),
+                        "workspace_id": .string(description: "For open: explicit workspace UUID; takes precedence over workspace_name"),
+                        "workspace_name": .string(description: "For open: visible workspace name, matched case-insensitively"),
                         "name": .string(description: "Name for new workspace (required for 'create'; optional for 'create_tab')"),
                         "folder_path": .string(description: "Absolute folder path (required for 'add_folder', 'remove_folder'; optional for 'create' to initialize with a root folder)"),
                         "tab": .string(description: "Compose tab UUID or name (required for 'select_tab'; optional for 'close_tab')"),
@@ -2265,6 +2606,11 @@ final class WindowRoutingService: Service {
 
                     return ManageWorkspacesResponse(action: "list", workspaces: summaries, status: "ok")
 
+                case "open":
+                    let selector = try WorkspaceOpenSelector.parse(args)
+                    // WorkspaceApproval intentionally gates create/delete/folder mutation only. Open is locate-first and ungated, matching bind_context auto-open behavior.
+                    return try await routingService.openWorkspace(selector: selector)
+
                 case "switch":
                     // Validate required 'workspace' param for switch
                     guard let rawWorkspaceParam = args["workspace"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -2285,30 +2631,8 @@ final class WindowRoutingService: Service {
                         // First, resolve the workspace model from disk (don't require an existing window)
                         let targetWorkspace = try await routingService.resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
-                        // Open a new window
-                        let newWindow: WindowState
-                        do {
-                            newWindow = try await routingService.openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
-                        } catch let error as WindowOpenError {
-                            throw MCPError.internalError("Failed to open new window: \(error.localizedDescription)")
-                        } catch {
-                            throw MCPError.internalError("Failed to open new window: \(error)")
-                        }
-
-                        defer {
-                            Task { @MainActor [newWindow] in
-                                newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral()
-                            }
-                        }
-
-                        // Wait for initial workspace setup before switching
-                        await newWindow.workspaceManager.awaitInitialized()
-
-                        // Switch the new window to the target workspace
-                        let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
-                        if !switchResult.didSwitch {
-                            throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
-                        }
+                        // Always create a new window for this legacy switch mode, even if the target is already open elsewhere.
+                        let newWindow = try await routingService.openNewWindowShowingWorkspace(targetWorkspace)
 
                         // Bind this MCP connection to the new window
                         try await routingService.networkMgr.setActiveWindowForCurrentConnection(newWindow.windowID)
@@ -2354,7 +2678,12 @@ final class WindowRoutingService: Service {
 
                     // Perform the switch on the target window
                     let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: targetModel, saveState: true)
-                    if !switchResult.didSwitch {
+                    let activeWorkspaceID = await MainActor.run { targetWindow.workspaceManager.activeWorkspace?.id }
+                    guard Self.workspaceSwitchReachedTarget(
+                        switchResult,
+                        activeWorkspaceID: activeWorkspaceID,
+                        targetWorkspaceID: targetModel.id
+                    ) else {
                         throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                     }
 
@@ -3097,7 +3426,7 @@ final class WindowRoutingService: Service {
                     return ManageWorkspacesResponse(action: "close_tab", workspaces: nil, tabs: [summary], status: "ok")
 
                 default:
-                    throw MCPError.invalidParams("Unsupported action '\(action)'. Use 'list', 'switch', 'create', 'hide', 'unhide', 'delete', 'add_folder', 'remove_folder', 'list_tabs', 'select_tab', 'create_tab', or 'close_tab'.")
+                    throw MCPError.invalidParams("Unsupported action '\(action)'. Use 'list', 'open', 'switch', 'create', 'hide', 'unhide', 'delete', 'add_folder', 'remove_folder', 'list_tabs', 'select_tab', 'create_tab', or 'close_tab'.")
                 }
             }
         )

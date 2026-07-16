@@ -112,7 +112,7 @@ final class GitBlobIdentityServiceTests: XCTestCase {
             encoding: .utf8
         )
 
-        let service = GitBlobIdentityService()
+        let service = hermeticGitBlobIdentityService()
         let outer = await service.classify(
             workspaceRoot: repository,
             relativePaths: [
@@ -325,7 +325,7 @@ final class GitBlobIdentityServiceTests: XCTestCase {
         )
         _ = try fixture.runGit(["config", "filter.lfs.clean", "cat"], at: repository)
         _ = try fixture.runGit(["config", "filter.lfs.smudge", "cat"], at: repository)
-        let service = GitBlobIdentityService()
+        let service = hermeticGitBlobIdentityService()
 
         let text = await classify(service, root: repository, path: "Text.swift")
         XCTAssertEqual(text.outcome, .requiresValidatedWorktreeBytes(.checkoutTransformation))
@@ -787,6 +787,19 @@ final class GitBlobIdentityServiceTests: XCTestCase {
                 .unavailable(.missing),
                 .unsupported(.nonRegularFile)
             ]
+        )
+    }
+
+    private func hermeticGitBlobIdentityService(
+        hooks: GitBlobIdentityServiceHooks = .none
+    ) -> GitBlobIdentityService {
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        return GitBlobIdentityService(
+            gitService: GitService(inheritedProcessEnvironment: environment),
+            hooks: hooks
         )
     }
 

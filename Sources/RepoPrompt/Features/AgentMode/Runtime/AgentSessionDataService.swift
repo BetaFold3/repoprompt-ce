@@ -23,7 +23,13 @@ struct AgentSessionMeta {
     let agentModel: String?
     let lastRunState: String?
     let parentSessionID: UUID?
+    let remoteHostID: String?
+    let remoteHostName: String?
+    let remoteSessionID: String?
     let isMCPOriginated: Bool
+    /// Session provenance (plan §6.4); `nil` only when built from legacy data
+    /// that predates origin tracking.
+    let origin: AgentSessionOrigin?
     let worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     let activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
 }
@@ -133,6 +139,10 @@ actor AgentSessionDataService {
 
     // MARK: - Lightweight decode helpers
 
+    private struct AgentSessionLastRunStateHeader: Decodable {
+        let lastRunState: String?
+    }
+
     private struct AgentSessionHeader: Decodable {
         let id: UUID
         let serializationVersion: Int?
@@ -148,6 +158,7 @@ actor AgentSessionDataService {
         let agentReasoningEffort: String?
         let lastRunState: String?
         let providerSessionID: String?
+        let remoteHost: AgentSessionRemoteHostBinding?
         let autoEditEnabled: Bool
         let codexConversationID: String?
         let codexRolloutPath: String?
@@ -165,6 +176,7 @@ actor AgentSessionDataService {
         let pendingHandoffSourceItemID: UUID?
         let pendingHandoffDefersProviderLockUntilSend: Bool?
         let isMCPOriginated: Bool?
+        let origin: AgentSessionOrigin?
     }
 
     private func computeLastUserMessageAt(in items: [AgentChatItemPersist]) -> Date? {
@@ -961,6 +973,14 @@ actor AgentSessionDataService {
         _ = try await saveAgentSession(session, for: workspace)
     }
 
+    func rawLastRunStateForAgentSession(id: UUID, for workspace: WorkspaceModel) async throws -> String? {
+        let agentSessionsFolder = try ensureAgentSessionsFolder(for: workspace)
+        let fileURL = agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        return try decoder.decode(AgentSessionLastRunStateHeader.self, from: data).lastRunState
+    }
+
     /// Load an AgentSession from disk.
     func loadAgentSession(from fileURL: URL) async throws -> AgentSession {
         let filename = fileURL.lastPathComponent
@@ -1075,6 +1095,7 @@ actor AgentSessionDataService {
                 agentReasoningEffort: header.agentReasoningEffort,
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
                 providerSessionID: header.providerSessionID,
+                remoteHost: header.remoteHost,
                 autoEditEnabled: header.autoEditEnabled,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
@@ -1090,6 +1111,7 @@ actor AgentSessionDataService {
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
                 pendingHandoffDefersProviderLockUntilSend: header.pendingHandoffDefersProviderLockUntilSend ?? false,
                 isMCPOriginated: header.isMCPOriginated ?? false,
+                origin: header.origin,
                 worktreeBindings: header.worktreeBindings ?? [],
                 worktreeMergeOperations: header.worktreeMergeOperations ?? []
             )
@@ -1146,7 +1168,11 @@ actor AgentSessionDataService {
                         agentModel: session.agentModel,
                         lastRunState: session.lastRunState,
                         parentSessionID: session.parentSessionID,
+                        remoteHostID: session.remoteHost?.hostID,
+                        remoteHostName: session.remoteHost?.hostDisplayName,
+                        remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
                         isMCPOriginated: session.isMCPOriginated,
+                        origin: session.origin,
                         worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
                         activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
                     )
@@ -1200,7 +1226,11 @@ actor AgentSessionDataService {
                             agentModel: session.agentModel,
                             lastRunState: session.lastRunState,
                             parentSessionID: session.parentSessionID,
+                            remoteHostID: session.remoteHost?.hostID,
+                            remoteHostName: session.remoteHost?.hostDisplayName,
+                            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
                             isMCPOriginated: session.isMCPOriginated,
+                            origin: session.origin,
                             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
                             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
                         )

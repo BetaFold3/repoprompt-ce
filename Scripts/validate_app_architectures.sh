@@ -41,15 +41,18 @@ require_arches() {
 
 MAIN="$APP_BUNDLE/Contents/MacOS/RepoPrompt"
 HELPER="$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
+GATEWAY="$APP_BUNDLE/Contents/MacOS/repoprompt-gateway"
 require_regular_executable "$MAIN"
 require_regular_executable "$HELPER"
+require_regular_executable "$GATEWAY"
 MAIN_ARCHES="$(architectures "$MAIN")" || fail "could not read main executable architectures"
 HELPER_ARCHES="$(architectures "$HELPER")" || fail "could not read MCP helper architectures"
-[[ -n "$MAIN_ARCHES" && "$MAIN_ARCHES" == "$HELPER_ARCHES" ]] ||
-    fail "$LABEL requires matching app/helper architectures: app=${MAIN_ARCHES:-<none>} helper=${HELPER_ARCHES:-<none>}"
+GATEWAY_ARCHES="$(architectures "$GATEWAY")" || fail "could not read gateway helper architectures"
+[[ -n "$MAIN_ARCHES" && "$MAIN_ARCHES" == "$HELPER_ARCHES" && "$MAIN_ARCHES" == "$GATEWAY_ARCHES" ]] ||
+    fail "$LABEL requires matching app/helper/gateway architectures: app=${MAIN_ARCHES:-<none>} helper=${HELPER_ARCHES:-<none>} gateway=${GATEWAY_ARCHES:-<none>}"
 
 if [[ "$EXPECTED" == "matching" ]]; then
-    printf 'OK: %s passed with matching app/helper architectures: %s\n' "$LABEL" "$MAIN_ARCHES"
+    printf 'OK: %s passed with matching app/helper/gateway architectures: %s\n' "$LABEL" "$MAIN_ARCHES"
     exit 0
 fi
 
@@ -59,6 +62,7 @@ EXPECTED="$(normalize_list "$EXPECTED")"
 MACHO_PATHS=(
     "$MAIN"
     "$HELPER"
+    "$GATEWAY"
     "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle"
     "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate"
     "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater"

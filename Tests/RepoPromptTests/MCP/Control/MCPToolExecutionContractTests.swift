@@ -27,7 +27,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
                 MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames,
                 caseLabel
             )
-            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 27, caseLabel)
+            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 28, caseLabel)
             XCTAssertEqual(
                 Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames).count,
                 MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count,
@@ -98,6 +98,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
             XCTAssertEqual(names(for: .interactiveCancellable), [
                 MCPWindowToolName.applyEdits,
                 MCPWindowToolName.askUser,
+                MCPWindowToolName.remotePairing,
                 MCPWindowToolName.waitForNextInstruction
             ], caseLabel)
             assertNoWatchdogDeadline(for: names(for: .interactiveCancellable), label: caseLabel)

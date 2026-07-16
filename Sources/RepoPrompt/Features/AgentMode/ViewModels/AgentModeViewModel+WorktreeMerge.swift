@@ -573,6 +573,12 @@ extension AgentModeViewModel {
               let continuation = session.worktreeMergeReviewContinuation
         else { return }
         finishPendingWorktreeMergeReview(session: session)
+        let fallbackResolvedBy = if case .timeout = decision { "system" } else { "user" }
+        recordMCPInteractionResolution(
+            for: session,
+            interactionID: reviewID,
+            fallbackResolvedBy: fallbackResolvedBy
+        )
         continuation.resume(returning: decision)
     }
 

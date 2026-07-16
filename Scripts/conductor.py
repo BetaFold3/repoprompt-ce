@@ -132,7 +132,7 @@ Operation commands:
   ./conductor format-tools-status    # inspect SwiftFormat/SwiftLint availability
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
-  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-gateway|all
   ./conductor build
   ./conductor package debug|release
   ./conductor test [--list | --filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
@@ -3747,10 +3747,19 @@ def _print_captured(stdout: str, stderr: str) -> None:
         print(stderr, end="" if stderr.endswith("\n") else "\n", flush=True)
 
 
-def is_already_on_workspace(stderr: str, workspace: str) -> bool:
-    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+def is_already_on_workspace(output: str, workspace: str) -> bool:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
     expected = f'Already on workspace "{workspace}"'
     return expected in lines or f"Error: [-32600] Invalid Request: {expected}." in lines
+
+
+def is_workspace_restore_in_progress(output: str, workspace: str) -> bool:
+    normalized = " ".join(line.strip() for line in output.splitlines() if line.strip()).lower()
+    return (
+        f'workspace switch to "{workspace.lower()}"' in normalized
+        and "blocked by a active switch" in normalized
+        and "reason: restore" in normalized
+    )
 
 
 def routed_structured_cli_argv(cli: str, window_id: int, command: str, payload: Dict[str, Any]) -> List[str]:
@@ -4241,7 +4250,7 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
-    for product in ["RepoPrompt", "repoprompt-mcp"]:
+    for product in ["RepoPrompt", "repoprompt-mcp", "repoprompt-gateway"]:
         code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
         if code != 0:
             return code
@@ -4319,14 +4328,26 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
     ]
     for name, argv in stages:
         allow_exit_codes = {0, 1} if name == "workspace switch" else None
-        code, _stdout, stderr = run_operation_command(name, argv, repo_root, env=env, allow_exit_codes=allow_exit_codes)
-        if name == "workspace switch" and code == 1 and is_already_on_workspace(stderr, workspace):
-            print(f'Already on workspace "{workspace}"; continuing smoke flow.', flush=True)
-            continue
-        if code != 0:
-            if name == "workspace switch" and code == 1:
-                print(f"FAILED stage '{name}' with status {code}", flush=True)
-            return code
+        restore_retry_deadline = min(deadline, now() + 8.0)
+        while True:
+            code, stdout, stderr = run_operation_command(name, argv, repo_root, env=env, allow_exit_codes=allow_exit_codes)
+            combined_output = "\n".join(part for part in (stderr, stdout) if part)
+            if name == "workspace switch" and code == 1 and is_already_on_workspace(combined_output, workspace):
+                print(f'Already on workspace "{workspace}"; continuing smoke flow.', flush=True)
+                code = 0
+            elif name == "workspace switch" and code == 1 and is_workspace_restore_in_progress(combined_output, workspace):
+                if now() < restore_retry_deadline:
+                    print(
+                        f'Workspace restore for "{workspace}" is still in progress; retrying switch.',
+                        flush=True,
+                    )
+                    time.sleep(0.5)
+                    continue
+            if code != 0:
+                if name == "workspace switch" and code == 1:
+                    print(f"FAILED stage '{name}' with status {code}", flush=True)
+                return code
+            break
 
     if args.get("executionLocationUI"):
         debug_pids = find_debug_app_pids()
@@ -4624,7 +4645,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parse_no_args(f"conductor {operation}", rest)
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
-        parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
+        parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "repoprompt-gateway", "all"])
         ns = parser.parse_args(rest)
         args["product"] = ns.product
     elif operation == "package":

@@ -6,7 +6,7 @@ import XCTest
 final class MCPToolAdmissionPolicyTests: XCTestCase {
     func testClassificationExhaustivelyCoversCanonicalCatalogWithoutDefault() {
         let canonicalTools = MCPToolExecutionContractCatalog.orderedAdvertisedToolNames
-        XCTAssertEqual(canonicalTools.count, 27)
+        XCTAssertEqual(canonicalTools.count, 28)
         XCTAssertEqual(Set(MCPToolAdmissionPolicy.classifications.keys), Set(canonicalTools))
         XCTAssertEqual(MCPToolAdmissionPolicy.classifications.count, canonicalTools.count)
         XCTAssertNil(MCPToolAdmissionPolicy.classification(forCanonicalToolName: "future_unreviewed_tool"))
@@ -30,6 +30,7 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
             MCPWindowToolName.oracleSend,
             MCPWindowToolName.contextBuilder,
             MCPWindowToolName.askUser,
+            MCPWindowToolName.remotePairing,
             MCPWindowToolName.agentExplore,
             MCPWindowToolName.agentRun,
             MCPWindowToolName.agentManage,

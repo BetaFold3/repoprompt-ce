@@ -21,6 +21,28 @@ extension AgentModeViewModel {
         let activityDate: Date?
     }
 
+    struct RemoteWorkspaceCatalogContext: Equatable {
+        let clientWorkspaceID: UUID
+        let workspaceName: String
+        let hostRecord: PairedHostRecord
+    }
+
+    struct RemoteWorkspaceSidebarSection: Equatable {
+        enum Content: Equatable {
+            case loading
+            case openingWorkspace(String)
+            case sessions([RemoteAgentSessionDescriptor])
+            case workspaceNotOpen(String)
+            case unsupported(String)
+            case error(String)
+        }
+
+        let hostRecord: PairedHostRecord
+        let workspaceID: UUID
+        let workspaceName: String
+        let content: Content
+    }
+
     struct ArchivedSidebarSessionTabsSnapshot {
         let filteredTabs: [StashedTab]
         let sortedTabs: [StashedTab]
@@ -394,6 +416,7 @@ extension AgentModeViewModel {
                 entries: candidateEntries
             ) != nil
         }
+        let pairedDeviceDisplayNameByBareID = pairedDeviceDisplayNameByBareIDForSidebar()
         return AgentModeSidebarSessionBuilder(
             allTabs: tabs,
             linkedTabs: linkedTabs,
@@ -403,8 +426,224 @@ extension AgentModeViewModel {
             sessionListSortDates: ownerValidatedSessionListSortDates,
             sessionListCacheReady: ownerValidatedSessionListCacheReady,
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
-            mcpControlledTabIDs: mcpControlledTabIDs
+            mcpControlledTabIDs: mcpControlledTabIDs,
+            registeredRemoteHosts: registeredRemoteHostsForSidebar(currentIndex: currentIndex),
+            pairedDeviceDisplayNameByBareID: pairedDeviceDisplayNameByBareID
         ).build()
+    }
+
+    /// Bare-8-hex device ID → pairing-time display name, for the remote-controlled
+    /// session badge; also feeds the sidebar content fingerprint so renames refresh
+    /// the sidebar. Gated on remote-origin sessions being visible at all: the pairing
+    /// store's first Keychain access mints the host key, which read-only sidebar
+    /// rendering must never trigger for users who have not used remote control.
+    /// Results (including failed loads) are memoized for a short TTL so an unhealthy
+    /// store cannot degrade every fingerprint pass into synchronous Keychain IPC.
+    func pairedDeviceDisplayNameByBareIDForSidebar() -> [String: String] {
+        let observedDeviceIDs = Set(
+            sessions.values.compactMap { session -> String? in
+                if case let .remote(deviceID) = session.origin { return deviceID }
+                return nil
+            }
+        ).union(
+            ownerValidatedSessionIndex.values.compactMap { entry -> String? in
+                if case let .remote(deviceID) = entry.origin { return deviceID }
+                return nil
+            }
+        )
+        guard !observedDeviceIDs.isEmpty else {
+            sidebarPairedDeviceNamesCache = nil
+            return [:]
+        }
+        if let cache = sidebarPairedDeviceNamesCache,
+           cache.observedDeviceIDs == observedDeviceIDs,
+           Date().timeIntervalSince(cache.refreshedAt) < Self.sidebarPairedDeviceNamesCacheTTL
+        {
+            return cache.names
+        }
+        let names: [String: String] = if let records = try? RemotePairingIdentityStore.shared
+            .listDevices(includeRevoked: true)
+        {
+            Dictionary(
+                records.compactMap { record in
+                    MCPClientIdentity.remoteDeviceID(from: record.id).map { ($0, record.displayName) }
+                },
+                uniquingKeysWith: { current, _ in current }
+            )
+        } else {
+            [:]
+        }
+        sidebarPairedDeviceNamesCache = (observedDeviceIDs, names, Date())
+        return names
+    }
+
+    private static let sidebarPairedDeviceNamesCacheTTL: TimeInterval = 30
+
+    private func registeredRemoteHostsForSidebar(
+        currentIndex: [UUID: AgentSessionIndexEntry]
+    ) -> [(id: String, displayName: String)] {
+        let observedRemoteHostIDs = Set(
+            sessions.values.compactMap { $0.remoteHost?.hostID }
+        ).union(currentIndex.values.compactMap(\.remoteHostID))
+        guard !observedRemoteHostIDs.isEmpty else {
+            sidebarRegisteredRemoteHostsCache = nil
+            return []
+        }
+        if let cache = sidebarRegisteredRemoteHostsCache,
+           cache.remoteHostIDs == observedRemoteHostIDs
+        {
+            return cache.hosts
+        }
+
+        let hosts = ((try? remoteHostRegistry.listHosts()) ?? [])
+            .filter { !$0.isRevokedByHost }
+            .map { (id: $0.id, displayName: $0.displayName) }
+        sidebarRegisteredRemoteHostsCache = (remoteHostIDs: observedRemoteHostIDs, hosts: hosts)
+        return hosts
+    }
+
+    func remoteWorkspaceCatalogContext(
+        hostID: String? = nil,
+        workspace: WorkspaceModel? = nil
+    ) -> RemoteWorkspaceCatalogContext? {
+        guard let workspace = workspace ?? workspaceManager?.activeWorkspace,
+              !workspace.isSystemWorkspace,
+              let boundHostID = workspace.defaultRemoteHostID,
+              hostID == nil || hostID == boundHostID,
+              let hostRecord = try? remoteHostRegistry.host(id: boundHostID),
+              !hostRecord.isRevokedByHost
+        else { return nil }
+        return RemoteWorkspaceCatalogContext(
+            clientWorkspaceID: workspace.id,
+            workspaceName: workspace.name,
+            hostRecord: hostRecord
+        )
+    }
+
+    func remoteWorkspaceSidebarRefreshKey() -> String? {
+        guard let context = remoteWorkspaceCatalogContext() else { return nil }
+        return "\(context.clientWorkspaceID.uuidString)|\(context.hostRecord.id)"
+    }
+
+    func remoteWorkspaceSidebarSection(
+        workspace: WorkspaceModel? = nil
+    ) -> RemoteWorkspaceSidebarSection? {
+        guard let context = remoteWorkspaceCatalogContext(workspace: workspace) else { return nil }
+        let state = remoteCoordinator.cachedWorkspaceSessionCatalogState(
+            hostID: context.hostRecord.id,
+            clientWorkspaceID: context.clientWorkspaceID
+        )
+        let episodeState = remoteCoordinator.workspaceOpenEpisodeState(
+            hostID: context.hostRecord.id,
+            clientWorkspaceID: context.clientWorkspaceID
+        )
+        let content: RemoteWorkspaceSidebarSection.Content = switch episodeState {
+        case .opening:
+            .openingWorkspace("Opening '\(context.workspaceName)' on \(context.hostRecord.displayName)…")
+        case let .failed(message):
+            .error(message)
+        case nil:
+            switch state {
+            case let .loaded(catalog):
+                .sessions(
+                    catalog.sessions
+                        .filter {
+                            !remoteCoordinator.localSessionExists(
+                                hostID: context.hostRecord.id,
+                                remoteSessionID: $0.sessionID
+                            )
+                        }
+                        .sorted {
+                            let lhs = $0.lastModified ?? .distantPast
+                            let rhs = $1.lastModified ?? .distantPast
+                            if lhs != rhs { return lhs > rhs }
+                            return $0.sessionID < $1.sessionID
+                        }
+                )
+            case .workspaceNotOpen:
+                .workspaceNotOpen(
+                    "Workspace '\(context.workspaceName)' is not open on \(context.hostRecord.displayName). Open it there and try again."
+                )
+            case .unsupported:
+                .unsupported(
+                    "\(context.hostRecord.displayName) doesn't support workspace browsing (update RepoPrompt on the host)."
+                )
+            case let .error(message):
+                .error(message)
+            case nil:
+                .loading
+            }
+        }
+        return RemoteWorkspaceSidebarSection(
+            hostRecord: context.hostRecord,
+            workspaceID: context.clientWorkspaceID,
+            workspaceName: context.workspaceName,
+            content: content
+        )
+    }
+
+    func refreshRemoteWorkspaceSidebar(forceRefresh: Bool = false) async {
+        guard let context = remoteWorkspaceCatalogContext() else {
+            publishRemoteWorkspaceSidebarChange()
+            return
+        }
+        let state = await remoteCoordinator.fetchWorkspaceSessionCatalog(
+            hostID: context.hostRecord.id,
+            clientWorkspaceID: context.clientWorkspaceID,
+            workspaceName: context.workspaceName,
+            forceRefresh: forceRefresh
+        )
+        if case .loaded = state,
+           let episode = remoteCoordinator.workspaceOpenEpisodeState(
+               hostID: context.hostRecord.id,
+               clientWorkspaceID: context.clientWorkspaceID
+           ),
+           case .failed = episode
+        {
+            remoteCoordinator.resetWorkspaceOpenEpisode(
+                hostID: context.hostRecord.id,
+                clientWorkspaceID: context.clientWorkspaceID
+            )
+        }
+        if case .workspaceNotOpen = state {
+            await remoteCoordinator.autoOpenWorkspaceIfNeeded(
+                hostRecord: context.hostRecord,
+                clientWorkspaceID: context.clientWorkspaceID,
+                workspaceName: context.workspaceName
+            )
+        }
+        guard !Task.isCancelled else { return }
+        publishRemoteWorkspaceSidebarChange()
+    }
+
+    func retryRemoteWorkspaceSidebar() async {
+        guard let context = remoteWorkspaceCatalogContext() else { return }
+        remoteCoordinator.resetWorkspaceOpenEpisode(
+            hostID: context.hostRecord.id,
+            clientWorkspaceID: context.clientWorkspaceID
+        )
+        remoteCoordinator.invalidateWorkspaceSessionCatalog(
+            hostID: context.hostRecord.id,
+            clientWorkspaceID: context.clientWorkspaceID
+        )
+        await refreshRemoteWorkspaceSidebar(forceRefresh: true)
+    }
+
+    func publishRemoteWorkspaceSidebarChange() {
+        ui.sessionSidebar.refresh()
+    }
+
+    @discardableResult
+    func pickUpRemoteWorkspaceSession(
+        _ descriptor: RemoteAgentSessionDescriptor,
+        hostRecord: PairedHostRecord
+    ) async -> TabSession? {
+        let session = await remoteCoordinator.pickUpWorkspaceSession(
+            descriptor: descriptor,
+            hostRecord: hostRecord
+        )
+        publishRemoteWorkspaceSidebarChange()
+        return session
     }
 
     func collapsibleSidebarThreadKeys(
@@ -658,6 +897,10 @@ extension AgentModeViewModel {
             parentSessionID: row.parentSessionID,
             depth: row.depth,
             isMCPControlled: row.isMCPControlled,
+            remoteHostName: row.remoteHostName,
+            remoteHostAbbreviation: row.remoteHostAbbreviation,
+            remoteControlDeviceID: row.remoteControlDeviceID,
+            remoteControlDeviceDisplayName: row.remoteControlDeviceDisplayName,
             worktree: row.worktree,
             worktreeMergeAttention: row.worktreeMergeAttention,
             threadKey: threadKey,

@@ -3837,6 +3837,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
     }
 
+    #if DEBUG
+        func test_mapStreamResultToLogEntry(_ result: AIStreamResult) -> (entry: AgentLogEntry, dedupeKey: String?)? {
+            guard let mapping = mapStreamResultToLogEntry(result) else { return nil }
+            return (mapping.entry, mapping.dedupeKey)
+        }
+    #endif
+
     private func toolDedupeKey(for result: AIStreamResult) -> String? {
         guard let invocationID = result.toolInvocationID else {
             return nil

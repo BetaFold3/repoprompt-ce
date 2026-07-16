@@ -69,6 +69,7 @@ struct ContextBuilderCardContext {
     let oracleOpenContext: AgentOracleOpenContext?
     let showRunScopedToolCancel: Bool
     let cancelActiveToolsAction: (() -> Void)?
+    var isRemoteSession: Bool = false
 
     init(
         tabID: UUID?,
@@ -77,7 +78,8 @@ struct ContextBuilderCardContext {
         activeContextBuilderResultItemID: UUID?,
         oracleOpenContext: AgentOracleOpenContext?,
         showRunScopedToolCancel: Bool = false,
-        cancelActiveToolsAction: (() -> Void)? = nil
+        cancelActiveToolsAction: (() -> Void)? = nil,
+        isRemoteSession: Bool = false
     ) {
         self.tabID = tabID
         self.contextBuilderAgentVM = contextBuilderAgentVM
@@ -86,6 +88,7 @@ struct ContextBuilderCardContext {
         self.oracleOpenContext = oracleOpenContext
         self.showRunScopedToolCancel = showRunScopedToolCancel
         self.cancelActiveToolsAction = cancelActiveToolsAction
+        self.isRemoteSession = isRemoteSession
     }
 }
 

@@ -23,7 +23,7 @@ import RepoPromptShared
 #endif
 
 // Note: MCPBootstrapRequest and MCPBootstrapResponse are defined in
-// RepoPrompt/Shared/MCPBootstrapMessages.swift for sharing with the CLI.
+// RepoPromptShared/MCP/MCPBootstrapMessages.swift for sharing with clients.
 
 // MARK: - Bootstrap Socket Server
 
@@ -217,10 +217,10 @@ actor BootstrapSocketServer {
         }
     }
 
-    /// Callback when a new CLI connects and completes handshake
-    /// Parameters: (clientFD, sessionToken, clientPid, clientName)
+    /// Callback when a new CLI connects and completes handshake.
+    /// Parameters: (clientFD, sessionToken, clientPid, clientName, gatewayCredential)
     /// Returns: Admission decision with optional postAccept hook for MCP startup
-    private var onNewConnection: ((Int32, String, Int, String?) async -> Admission)?
+    private var onNewConnection: ((Int32, String, Int, String?, String?) async -> Admission)?
 
     init(socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(), logger: Logger? = nil) {
         self.socketURL = socketURL
@@ -241,6 +241,14 @@ actor BootstrapSocketServer {
     /// - Parameter onNewConnection: Callback invoked for each new CLI connection.
     ///   Return an Admission with postAccept closure for MCP startup.
     func start(onNewConnection: @escaping (Int32, String, Int, String?) async -> Admission) throws {
+        try start { clientFD, sessionToken, clientPid, clientName, _ in
+            await onNewConnection(clientFD, sessionToken, clientPid, clientName)
+        }
+    }
+
+    /// Starts listening on the bootstrap socket and passes the optional gateway credential
+    /// from the local handshake to the admission layer.
+    func start(onNewConnection: @escaping (Int32, String, Int, String?, String?) async -> Admission) throws {
         #if DEBUG
             print("[MCPStartup] BootstrapSocketServer.start entered socket=\(socketURL.path)")
         #endif
@@ -795,7 +803,7 @@ actor BootstrapSocketServer {
             EditFlowPerf.Stage.Bootstrap.admission,
             EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
         )
-        let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName)
+        let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName, request.gatewayCredential)
         EditFlowPerf.end(
             EditFlowPerf.Stage.Bootstrap.admission,
             admissionState,

@@ -1550,6 +1550,7 @@ class WindowState: ObservableObject {
         await workspaceManager.cancelActiveSessions()
         await agentModeViewModel.prepareForWindowClose()
         WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
+        RemoteDeviceApprovalManager.shared.cancelPending(forWindowID: windowID)
 
         // Stop the local MCP server
         await mcpServer.stopServer()

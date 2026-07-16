@@ -2765,21 +2765,11 @@ extension MCPServerViewModel {
         let binding = metadata.connectionID.map(connectionBindingSnapshot(forConnection:))
         let explicitWindowRoutingHint = metadata.explicitWindowRoutingHint
 
-        for candidateWindowID in [
-            metadata.windowID,
-            metadata.tabContextHint?.windowID,
-            binding?.windowID,
-            explicitWindowRoutingHint?.windowID
-        ].compactMap(\.self) {
-            guard candidateWindowID == targetWindow.windowID else {
-                throw MCPError.invalidParams(
-                    "agent_run.start launch-source routing conflicts with the target window. Bind or hint the intended window before retrying."
-                )
-            }
-        }
-
         let hasValidatedExplicitWindowRoute: Bool
         if let explicitWindowRoutingHint {
+            // Check 4 (`hint.windowID == metadata.windowID`) is satisfied by construction
+            // when dispatch installs `currentEffectiveWindowID`; keep it as defense-in-depth
+            // for direct/test paths that do not install the TaskLocal envelope.
             guard explicitWindowRoutingHint.connectionID == metadata.connectionID,
                   explicitWindowRoutingHint.toolName == "agent_run",
                   explicitWindowRoutingHint.provenance == .hiddenWindowArgument,
@@ -2797,10 +2787,27 @@ extension MCPServerViewModel {
             hasValidatedExplicitWindowRoute = false
         }
 
+        // A dispatcher-validated hidden `_windowID` is a one-shot explicit route.
+        // It must not be defeated by stale/default connection binding discovered
+        // earlier on this AppLink connection, but explicit tab/run-scoped routing
+        // still wins and remains fail-closed below.
+        for candidateWindowID in [
+            metadata.windowID,
+            metadata.tabContextHint?.windowID,
+            hasValidatedExplicitWindowRoute ? nil : binding?.windowID,
+            explicitWindowRoutingHint?.windowID
+        ].compactMap(\.self) {
+            guard candidateWindowID == targetWindow.windowID else {
+                throw MCPError.invalidParams(
+                    "agent_run.start launch-source routing conflicts with the target window. Bind or hint the intended window before retrying."
+                )
+            }
+        }
+
         let isRunScoped = purpose == .agentModeRun || purpose == .discoverRun
         let resolved: ResolvedTabContextSnapshot
         let route: AgentRunOracleReviewLaunchRoute
-        if metadata.tabContextHint != nil || binding?.bindingKind == .tabContext || isRunScoped {
+        if metadata.tabContextHint != nil || (!hasValidatedExplicitWindowRoute && binding?.bindingKind == .tabContext) || isRunScoped {
             resolved = try resolveTabContextSnapshot(
                 from: metadata,
                 toolName: "agent_run.start review source",

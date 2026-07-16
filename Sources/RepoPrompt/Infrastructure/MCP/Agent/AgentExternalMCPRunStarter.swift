@@ -76,6 +76,7 @@ enum AgentExternalMCPRunStarter {
             forTabID: target.tabID,
             sessionID: sessionID,
             originatingConnectionID: metadata.connectionID,
+            origin: AgentSessionOrigin.fromClientIdentity(metadata.clientName),
             taskLabelKind: taskLabelKind,
             startPending: true
         )

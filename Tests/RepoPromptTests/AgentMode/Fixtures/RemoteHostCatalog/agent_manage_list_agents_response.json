@@ -1,0 +1,640 @@
+{
+    "agents": [
+        {
+            "available": true,
+            "capabilities": [
+                "agent_conversation_send",
+                "agent_session_control",
+                "conversation_log",
+                "user_interaction"
+            ],
+            "default_model_id": "claudeCode:opus",
+            "models": [
+                {
+                    "model_id": "claudeCode:default",
+                    "name": "Default"
+                },
+                {
+                    "model_id": "claudeCode:claude-fable-5:low",
+                    "name": "Claude Code Fable 5 Low"
+                },
+                {
+                    "model_id": "claudeCode:claude-fable-5:medium",
+                    "name": "Claude Code Fable 5 Medium"
+                },
+                {
+                    "model_id": "claudeCode:claude-fable-5:high",
+                    "name": "Claude Code Fable 5 High"
+                },
+                {
+                    "model_id": "claudeCode:claude-fable-5:max",
+                    "name": "Claude Code Fable 5 Max"
+                },
+                {
+                    "model_id": "claudeCode:claude-fable-5:xhigh",
+                    "name": "Claude Code Fable 5 XHigh"
+                },
+                {
+                    "model_id": "claudeCode:opus[1m]:low",
+                    "name": "Claude Code Opus Latest (1M) Low"
+                },
+                {
+                    "model_id": "claudeCode:opus[1m]:medium",
+                    "name": "Claude Code Opus Latest (1M) Medium"
+                },
+                {
+                    "model_id": "claudeCode:opus[1m]:high",
+                    "name": "Claude Code Opus Latest (1M) High"
+                },
+                {
+                    "model_id": "claudeCode:opus[1m]:max",
+                    "name": "Claude Code Opus Latest (1M) Max"
+                },
+                {
+                    "model_id": "claudeCode:opus[1m]:xhigh",
+                    "name": "Claude Code Opus Latest (1M) XHigh"
+                },
+                {
+                    "model_id": "claudeCode:opus:low",
+                    "name": "Claude Code Opus Latest Low"
+                },
+                {
+                    "model_id": "claudeCode:opus:medium",
+                    "name": "Claude Code Opus Latest Medium"
+                },
+                {
+                    "model_id": "claudeCode:opus:high",
+                    "name": "Claude Code Opus Latest High"
+                },
+                {
+                    "model_id": "claudeCode:opus:max",
+                    "name": "Claude Code Opus Latest Max"
+                },
+                {
+                    "model_id": "claudeCode:opus:xhigh",
+                    "name": "Claude Code Opus Latest XHigh"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-7:low",
+                    "name": "Claude Code Opus 4.7 Low"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-7:medium",
+                    "name": "Claude Code Opus 4.7 Medium"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-7:high",
+                    "name": "Claude Code Opus 4.7 High"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-7:max",
+                    "name": "Claude Code Opus 4.7 Max"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-7:xhigh",
+                    "name": "Claude Code Opus 4.7 XHigh"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-6:low",
+                    "name": "Claude Code Opus 4.6 Low"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-6:medium",
+                    "name": "Claude Code Opus 4.6 Medium"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-6:high",
+                    "name": "Claude Code Opus 4.6 High"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-6:max",
+                    "name": "Claude Code Opus 4.6 Max"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-6:xhigh",
+                    "name": "Claude Code Opus 4.6 XHigh"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-5:low",
+                    "name": "Claude Code Opus 4.5 Low"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-5:medium",
+                    "name": "Claude Code Opus 4.5 Medium"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-5:high",
+                    "name": "Claude Code Opus 4.5 High"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-5:max",
+                    "name": "Claude Code Opus 4.5 Max"
+                },
+                {
+                    "model_id": "claudeCode:claude-opus-4-5:xhigh",
+                    "name": "Claude Code Opus 4.5 XHigh"
+                },
+                {
+                    "model_id": "claudeCode:sonnet:low",
+                    "name": "Claude Code Sonnet Latest Low"
+                },
+                {
+                    "model_id": "claudeCode:sonnet:medium",
+                    "name": "Claude Code Sonnet Latest Medium"
+                },
+                {
+                    "model_id": "claudeCode:sonnet:high",
+                    "name": "Claude Code Sonnet Latest High"
+                },
+                {
+                    "model_id": "claudeCode:sonnet:max",
+                    "name": "Claude Code Sonnet Latest Max"
+                },
+                {
+                    "model_id": "claudeCode:claude-sonnet-4-6:low",
+                    "name": "Claude Code Sonnet 4.6 Low"
+                },
+                {
+                    "model_id": "claudeCode:claude-sonnet-4-6:medium",
+                    "name": "Claude Code Sonnet 4.6 Medium"
+                },
+                {
+                    "model_id": "claudeCode:claude-sonnet-4-6:high",
+                    "name": "Claude Code Sonnet 4.6 High"
+                },
+                {
+                    "model_id": "claudeCode:claude-sonnet-4-6:max",
+                    "name": "Claude Code Sonnet 4.6 Max"
+                },
+                {
+                    "model_id": "claudeCode:claude-sonnet-4-5:low",
+                    "name": "Claude Code Sonnet 4.5 Low"
+                },
+                {
+                    "model_id": "claudeCode:claude-sonnet-4-5:medium",
+                    "name": "Claude Code Sonnet 4.5 Medium"
+                },
+                {
+                    "model_id": "claudeCode:claude-sonnet-4-5:high",
+                    "name": "Claude Code Sonnet 4.5 High"
+                },
+                {
+                    "model_id": "claudeCode:claude-sonnet-4-5:max",
+                    "name": "Claude Code Sonnet 4.5 Max"
+                },
+                {
+                    "model_id": "claudeCode:haiku:low",
+                    "name": "Claude Code Haiku Latest Low"
+                },
+                {
+                    "model_id": "claudeCode:haiku:medium",
+                    "name": "Claude Code Haiku Latest Medium"
+                },
+                {
+                    "model_id": "claudeCode:haiku:high",
+                    "name": "Claude Code Haiku Latest High"
+                },
+                {
+                    "model_id": "claudeCode:haiku:max",
+                    "name": "Claude Code Haiku Latest Max"
+                },
+                {
+                    "model_id": "claudeCode:claude-haiku-4-5:low",
+                    "name": "Claude Code Haiku 4.5 Low"
+                },
+                {
+                    "model_id": "claudeCode:claude-haiku-4-5:medium",
+                    "name": "Claude Code Haiku 4.5 Medium"
+                },
+                {
+                    "model_id": "claudeCode:claude-haiku-4-5:high",
+                    "name": "Claude Code Haiku 4.5 High"
+                },
+                {
+                    "model_id": "claudeCode:claude-haiku-4-5:max",
+                    "name": "Claude Code Haiku 4.5 Max"
+                }
+            ],
+            "name": "Claude Code"
+        },
+        {
+            "available": true,
+            "capabilities": [
+                "agent_conversation_send",
+                "agent_session_control",
+                "conversation_log",
+                "user_interaction"
+            ],
+            "default_model_id": "codexExec:default",
+            "models": [
+                {
+                    "model_id": "codexExec:default",
+                    "name": "Default"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.5-low",
+                    "name": "Codex CLI GPT-5.5 Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.5-medium",
+                    "name": "Codex CLI GPT-5.5 Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.5-high",
+                    "name": "Codex CLI GPT-5.5 High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.5-xhigh",
+                    "name": "Codex CLI GPT-5.5 XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.5-fast-low",
+                    "name": "Codex CLI GPT-5.5 Fast Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.5-fast-medium",
+                    "name": "Codex CLI GPT-5.5 Fast Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.5-fast-high",
+                    "name": "Codex CLI GPT-5.5 Fast High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.5-fast-xhigh",
+                    "name": "Codex CLI GPT-5.5 Fast XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-low",
+                    "name": "Codex CLI GPT-5.4 Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-medium",
+                    "name": "Codex CLI GPT-5.4 Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-high",
+                    "name": "Codex CLI GPT-5.4 High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-xhigh",
+                    "name": "Codex CLI GPT-5.4 XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-fast-low",
+                    "name": "Codex CLI GPT-5.4 Fast Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-fast-medium",
+                    "name": "Codex CLI GPT-5.4 Fast Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-fast-high",
+                    "name": "Codex CLI GPT-5.4 Fast High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-fast-xhigh",
+                    "name": "Codex CLI GPT-5.4 Fast XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-mini-low",
+                    "name": "Codex CLI GPT-5.4 Mini Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-mini-medium",
+                    "name": "Codex CLI GPT-5.4 Mini Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-mini-high",
+                    "name": "Codex CLI GPT-5.4 Mini High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-mini-xhigh",
+                    "name": "Codex CLI GPT-5.4 Mini XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-mini-fast-low",
+                    "name": "Codex CLI GPT-5.4 Mini Fast Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-mini-fast-medium",
+                    "name": "Codex CLI GPT-5.4 Mini Fast Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-mini-fast-high",
+                    "name": "Codex CLI GPT-5.4 Mini Fast High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.4-mini-fast-xhigh",
+                    "name": "Codex CLI GPT-5.4 Mini Fast XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-low",
+                    "name": "Codex CLI GPT-5.3 Codex Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-medium",
+                    "name": "Codex CLI GPT-5.3 Codex Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-high",
+                    "name": "Codex CLI GPT-5.3 Codex High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-xhigh",
+                    "name": "Codex CLI GPT-5.3 Codex XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-fast-low",
+                    "name": "Codex CLI GPT-5.3 Codex Fast Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-fast-high",
+                    "name": "Codex CLI GPT-5.3 Codex Fast High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-fast-xhigh",
+                    "name": "Codex CLI GPT-5.3 Codex Fast XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-spark-low",
+                    "name": "Codex CLI GPT-5.3 Codex Spark Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-spark-medium",
+                    "name": "Codex CLI GPT-5.3 Codex Spark Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-spark-high",
+                    "name": "Codex CLI GPT-5.3 Codex Spark High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-spark-xhigh",
+                    "name": "Codex CLI GPT-5.3 Codex Spark XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-spark-fast-low",
+                    "name": "Codex CLI GPT-5.3 Codex Spark Fast Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-spark-fast-medium",
+                    "name": "Codex CLI GPT-5.3 Codex Spark Fast Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-spark-fast-high",
+                    "name": "Codex CLI GPT-5.3 Codex Spark Fast High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.3-codex-spark-fast-xhigh",
+                    "name": "Codex CLI GPT-5.3 Codex Spark Fast XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.2-low",
+                    "name": "Codex CLI GPT-5.2 Low",
+                    "reasoning_effort": "low"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.2-medium",
+                    "name": "Codex CLI GPT-5.2 Medium",
+                    "reasoning_effort": "medium"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.2-high",
+                    "name": "Codex CLI GPT-5.2 High",
+                    "reasoning_effort": "high"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.2-xhigh",
+                    "name": "Codex CLI GPT-5.2 XHigh",
+                    "reasoning_effort": "xhigh"
+                },
+                {
+                    "model_id": "codexExec:gpt-5.1-codex-mini",
+                    "name": "GPT-5.1 Codex Mini"
+                }
+            ],
+            "name": "Codex CLI"
+        },
+        {
+            "available": true,
+            "capabilities": [
+                "agent_conversation_send",
+                "agent_session_control",
+                "conversation_log",
+                "user_interaction"
+            ],
+            "default_model_id": "openCode:opencode/big-pickle",
+            "models": [
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/deepseek-v4-flash",
+                    "name": "Fireworks AI/DeepSeek V4 Flash"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/deepseek-v4-pro",
+                    "name": "Fireworks AI/DeepSeek V4 Pro"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/glm-5p1",
+                    "name": "Fireworks AI/GLM 5.1"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/glm-5p2",
+                    "name": "Fireworks AI/GLM 5.2"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/gpt-oss-120b",
+                    "name": "Fireworks AI/GPT OSS 120B"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/gpt-oss-20b",
+                    "name": "Fireworks AI/GPT OSS 20B"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/kimi-k2p6",
+                    "name": "Fireworks AI/Kimi K2.6"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/kimi-k2p7-code",
+                    "name": "Fireworks AI/Kimi K2.7 Code"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/minimax-m2p7",
+                    "name": "Fireworks AI/MiniMax-M2.7"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/minimax-m3",
+                    "name": "Fireworks AI/MiniMax-M3"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/models/qwen3p7-plus",
+                    "name": "Fireworks AI/Qwen 3.7 Plus"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/routers/glm-5p1-fast",
+                    "name": "Fireworks AI/GLM 5.1 Fast"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/routers/glm-5p2-fast",
+                    "name": "Fireworks AI/GLM 5.2 Fast"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/routers/kimi-k2p6-fast",
+                    "name": "Fireworks AI/Kimi K2.6 Fast"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/routers/kimi-k2p6-turbo",
+                    "name": "Fireworks AI/Kimi K2.6 Turbo"
+                },
+                {
+                    "model_id": "openCode:fireworks-ai/accounts/fireworks/routers/kimi-k2p7-code-fast",
+                    "name": "Fireworks AI/Kimi K2.7 Code Fast"
+                },
+                {
+                    "model_id": "openCode:opencode/big-pickle",
+                    "name": "OpenCode Zen/Big Pickle"
+                },
+                {
+                    "model_id": "openCode:opencode/deepseek-v4-flash-free",
+                    "name": "OpenCode Zen/DeepSeek V4 Flash Free"
+                },
+                {
+                    "model_id": "openCode:opencode/mimo-v2.5-free",
+                    "name": "OpenCode Zen/MiMo V2.5 Free"
+                },
+                {
+                    "model_id": "openCode:opencode/nemotron-3-ultra-free",
+                    "name": "OpenCode Zen/Nemotron 3 Ultra Free"
+                },
+                {
+                    "model_id": "openCode:opencode/north-mini-code-free",
+                    "name": "OpenCode Zen/North Mini Code Free"
+                }
+            ],
+            "name": "OpenCode"
+        },
+        {
+            "available": false,
+            "capabilities": [
+                "agent_conversation_send",
+                "agent_session_control",
+                "conversation_log",
+                "user_interaction"
+            ],
+            "models": [],
+            "name": "Cursor CLI"
+        },
+        {
+            "available": false,
+            "capabilities": [
+                "agent_conversation_send",
+                "agent_session_control",
+                "conversation_log",
+                "user_interaction"
+            ],
+            "models": [],
+            "name": "CC Zai"
+        },
+        {
+            "available": false,
+            "capabilities": [
+                "agent_conversation_send",
+                "agent_session_control",
+                "conversation_log",
+                "user_interaction"
+            ],
+            "models": [],
+            "name": "CC Moonshot"
+        },
+        {
+            "available": false,
+            "capabilities": [
+                "agent_conversation_send",
+                "agent_session_control",
+                "conversation_log",
+                "user_interaction"
+            ],
+            "models": [],
+            "name": "CC Custom"
+        }
+    ],
+    "task_labels": [
+        {
+            "description": "Fast exploration and codebase mapping",
+            "has_custom_override": true,
+            "label": "explore",
+            "model_id": "codexExec:gpt-5.5-medium",
+            "name": "Codex CLI GPT-5.5 Medium",
+            "override_unavailable": false,
+            "recommended_model_id": "codexExec:gpt-5.5-low",
+            "recommended_name": "Codex CLI GPT-5.5 Low"
+        },
+        {
+            "description": "Balanced engineering work",
+            "has_custom_override": true,
+            "label": "engineer",
+            "model_id": "codexExec:gpt-5.5-high",
+            "name": "Codex CLI GPT-5.5 High",
+            "override_unavailable": false,
+            "recommended_model_id": "codexExec:gpt-5.5-low",
+            "recommended_name": "Codex CLI GPT-5.5 Low"
+        },
+        {
+            "description": "Interactive pair programming with highest-tier models",
+            "has_custom_override": true,
+            "label": "pair",
+            "model_id": "codexExec:gpt-5.5-xhigh",
+            "name": "Codex CLI GPT-5.5 XHigh",
+            "override_unavailable": false,
+            "recommended_model_id": "codexExec:gpt-5.5-high",
+            "recommended_name": "Codex CLI GPT-5.5 High"
+        },
+        {
+            "description": "Architecture, design discussions, and creative problem solving",
+            "has_custom_override": true,
+            "label": "design",
+            "model_id": "codexExec:gpt-5.5-xhigh",
+            "name": "Codex CLI GPT-5.5 XHigh",
+            "override_unavailable": false,
+            "recommended_model_id": "claudeCode:opus",
+            "recommended_name": "Claude Code Opus Latest"
+        }
+    ]
+}

@@ -5,6 +5,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var viewModel: ContentViewModel
     @StateObject private var workspaceApprovalManager = WorkspaceApprovalManager.shared
+    @StateObject private var remoteDeviceApprovalManager = RemoteDeviceApprovalManager.shared
 
     @State private var showWorkspaceSetup = false
 
@@ -30,6 +31,7 @@ struct ContentView: View {
         ContentRootShellView(
             viewModel: viewModel,
             workspaceApprovalManager: workspaceApprovalManager,
+            remoteDeviceApprovalManager: remoteDeviceApprovalManager,
             showWorkspaceSwitchOverlay: $showWorkspaceSwitchOverlay
         )
         .toolbar {
@@ -99,6 +101,12 @@ struct ContentView: View {
         }
         // Close all sheets when a workspace approval request comes in
         .onChange(of: workspaceApprovalManager.isApprovalOverlayVisible) { _, isVisible in
+            if isVisible {
+                closeAllSheets()
+            }
+        }
+        // Close all sheets when a remote pairing approval request comes in
+        .onChange(of: remoteDeviceApprovalManager.isApprovalOverlayVisible) { _, isVisible in
             if isVisible {
                 closeAllSheets()
             }

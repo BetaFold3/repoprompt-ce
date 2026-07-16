@@ -29,6 +29,8 @@ STYLE_PATHS=(
     "Sources/RepoPrompt"
     "Sources/RepoPromptExecutable"
     "Sources/RepoPromptMCP"
+    "Sources/RepoPromptMCPClientKit"
+    "Sources/RepoPromptGateway"
     "Sources/RepoPromptShared"
     "Tests/RepoPromptTests"
     "Packages/RepoPromptAgentProviders/Package.swift"

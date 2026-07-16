@@ -15,6 +15,9 @@ extension AgentModeViewModel {
         gitViewModel: GitViewModel,
         currentTabID: UUID?
     ) async throws -> GitBranchSwitchResult {
+        if let disabledReason = localSessionMutationDisabledReason(tabID: currentTabID) {
+            throw GitBranchSwitchError.unavailable(disabledReason)
+        }
         let activeRunAtSwitchStart = isAgentRunActive(tabID: currentTabID)
         let result = try await gitViewModel.switchGitBranch(
             GitBranchSwitchRequest(

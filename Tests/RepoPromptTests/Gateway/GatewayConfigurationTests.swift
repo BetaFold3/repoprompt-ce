@@ -1,0 +1,151 @@
+import Foundation
+@testable import RepoPromptGateway
+import RepoPromptShared
+import XCTest
+
+final class GatewayConfigurationTests: XCTestCase {
+    func testLoopbackDefaultIsSecurityDefault() throws {
+        let config = try GatewayConfiguration.parse(arguments: [], environment: [:])
+        XCTAssertEqual(config.bindHost, "127.0.0.1")
+        XCTAssertEqual(config.port, GatewayConfiguration.defaultPort)
+        XCTAssertFalse(config.allowWildcardBind)
+    }
+
+    func testArgumentsOverrideEnvironment() throws {
+        let config = try GatewayConfiguration.parse(
+            arguments: [
+                "--bind-host", "127.0.0.2",
+                "--port=45678",
+                "--static-token", "arg-token",
+                "--bootstrap-token", "arg-bootstrap"
+            ],
+            environment: [
+                GatewayConfiguration.EnvironmentKey.bindHost: "127.0.0.9",
+                GatewayConfiguration.EnvironmentKey.port: "12345",
+                GatewayConfiguration.EnvironmentKey.staticToken: "env-token",
+                GatewayConfiguration.EnvironmentKey.bootstrapToken: "env-bootstrap"
+            ]
+        )
+
+        XCTAssertEqual(config.bindHost, "127.0.0.2")
+        XCTAssertEqual(config.port, 45678)
+        XCTAssertEqual(config.staticToken, "arg-token")
+        XCTAssertEqual(config.bootstrapToken, "arg-bootstrap")
+    }
+
+    func testEnvironmentAppliesWhenArgumentsAreAbsent() throws {
+        let config = try GatewayConfiguration.parse(
+            arguments: [],
+            environment: [
+                GatewayConfiguration.EnvironmentKey.bindHost: "127.0.0.3",
+                GatewayConfiguration.EnvironmentKey.port: "34567",
+                GatewayConfiguration.EnvironmentKey.staticToken: "env-token",
+                GatewayConfiguration.EnvironmentKey.allowWildcardBind: "false"
+            ]
+        )
+
+        XCTAssertEqual(config.bindHost, "127.0.0.3")
+        XCTAssertEqual(config.port, 34567)
+        XCTAssertEqual(config.staticToken, "env-token")
+        XCTAssertFalse(config.allowWildcardBind)
+    }
+
+    func testWildcardBindIsRejectedWithoutExplicitOptIn() throws {
+        XCTAssertThrowsError(try GatewayConfiguration.parse(
+            arguments: ["--bind-host", "0.0.0.0"],
+            environment: [:]
+        )) { error in
+            XCTAssertEqual(
+                error as? GatewayConfigurationError,
+                .wildcardBindRequiresExplicitOptIn("0.0.0.0")
+            )
+        }
+    }
+
+    func testWildcardBindCanBeExplicitlyEnabled() throws {
+        let config = try GatewayConfiguration.parse(
+            arguments: ["--bind-host", "0.0.0.0", "--allow-wildcard-bind"],
+            environment: [:]
+        )
+
+        XCTAssertEqual(config.bindHost, "0.0.0.0")
+        XCTAssertTrue(config.allowWildcardBind)
+    }
+
+    func testInvalidPortIsRejected() throws {
+        XCTAssertThrowsError(try GatewayConfiguration.parse(
+            arguments: ["--port", "70000"],
+            environment: [:]
+        )) { error in
+            XCTAssertEqual(error as? GatewayConfigurationError, .invalidPort("70000"))
+        }
+    }
+
+    func testParentPIDDefaultsLeasePathAndBoundedReconnectBudget() throws {
+        let root = try GatewayTestHelpers.temporaryRoot("gateway-config-parent")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let config = try GatewayConfiguration.parse(
+            arguments: ["--app-support-root", root.path],
+            environment: [GatewayConfiguration.EnvironmentKey.parentPID: "12345"]
+        )
+
+        XCTAssertEqual(config.parentPID, 12345)
+        XCTAssertEqual(config.appLinkMaximumReconnectAttempts, 24)
+        XCTAssertEqual(
+            config.processLeaseFileURL.standardizedFileURL.path,
+            RemoteGatewayProcessLeaseFile.defaultURL(appSupportRoot: root).standardizedFileURL.path
+        )
+    }
+
+    func testProcessLeaseRoundTripsAndRemovesOnlyOwnedPID() throws {
+        let root = try GatewayTestHelpers.temporaryRoot("gateway-process-lease")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = RemoteGatewayProcessLeaseFile.defaultURL(appSupportRoot: root)
+        let lease = RemoteGatewayProcessLease(
+            pid: 123,
+            parentPID: 456,
+            executablePath: "/tmp/repoprompt-gateway",
+            bindHost: "127.0.0.1",
+            port: 47391,
+            appSupportRoot: root.path,
+            createdAt: Date(timeIntervalSince1970: 0)
+        )
+
+        try RemoteGatewayProcessLeaseFile.write(lease, to: fileURL)
+        let decoded = try XCTUnwrap(RemoteGatewayProcessLeaseFile.read(from: fileURL))
+        XCTAssertEqual(decoded, lease)
+        XCTAssertTrue(decoded.matches(
+            bindHost: "127.0.0.1",
+            port: 47391,
+            appSupportRoot: root.path,
+            executablePath: "/tmp/repoprompt-gateway"
+        ))
+
+        RemoteGatewayProcessLeaseFile.removeIfOwned(fileURL: fileURL, pid: 999)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+        RemoteGatewayProcessLeaseFile.removeIfOwned(fileURL: fileURL, pid: 123)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+    }
+
+    func testStaticTokenAuthIsDisabledByDefaultAndRequiresExplicitDevOptIn() throws {
+        // M4: a configured static token alone no longer authorizes remote WS hello.
+        let withoutFlag = try GatewayConfiguration.parse(
+            arguments: ["--static-token", "dev-token"],
+            environment: [:]
+        )
+        XCTAssertFalse(withoutFlag.allowStaticTokenAuth)
+
+        let viaArgument = try GatewayConfiguration.parse(
+            arguments: ["--static-token", "dev-token", "--allow-static-token-auth"],
+            environment: [:]
+        )
+        XCTAssertTrue(viaArgument.allowStaticTokenAuth)
+
+        let viaEnvironment = try GatewayConfiguration.parse(
+            arguments: [],
+            environment: [GatewayConfiguration.EnvironmentKey.allowStaticTokenAuth: "true"]
+        )
+        XCTAssertTrue(viaEnvironment.allowStaticTokenAuth)
+    }
+}

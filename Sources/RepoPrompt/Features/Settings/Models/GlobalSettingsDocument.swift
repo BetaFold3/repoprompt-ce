@@ -459,15 +459,27 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var autoStart: Bool?
         var showModelPresets: Bool?
         var temporarilyDisablePresets: Bool?
+        var remoteGatewayEnabled: Bool?
+        var remoteGatewayBindAddress: String?
+        var remoteGatewayPort: Int?
+        var remoteControlShowPairingDetails: Bool?
 
         init(
             autoStart: Bool? = nil,
             showModelPresets: Bool? = nil,
-            temporarilyDisablePresets: Bool? = nil
+            temporarilyDisablePresets: Bool? = nil,
+            remoteGatewayEnabled: Bool? = nil,
+            remoteGatewayBindAddress: String? = nil,
+            remoteGatewayPort: Int? = nil,
+            remoteControlShowPairingDetails: Bool? = nil
         ) {
             self.autoStart = autoStart
             self.showModelPresets = showModelPresets
             self.temporarilyDisablePresets = temporarilyDisablePresets
+            self.remoteGatewayEnabled = remoteGatewayEnabled
+            self.remoteGatewayBindAddress = remoteGatewayBindAddress
+            self.remoteGatewayPort = remoteGatewayPort
+            self.remoteControlShowPairingDetails = remoteControlShowPairingDetails
         }
     }
 

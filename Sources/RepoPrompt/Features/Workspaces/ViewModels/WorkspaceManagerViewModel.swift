@@ -2040,7 +2040,8 @@ class WorkspaceManagerViewModel: ObservableObject {
 
         let newWorkspace = createWorkspace(
             name: workspaceName,
-            repoPaths: creationDraft.selectedRepoPaths
+            repoPaths: creationDraft.selectedRepoPaths,
+            defaultRemoteHostID: creationDraft.defaultRemoteHostID
         )
         creationDraft = WorkspaceCreationDraft()
         return newWorkspace
@@ -2049,13 +2050,23 @@ class WorkspaceManagerViewModel: ObservableObject {
     struct WorkspaceCreationDraft {
         var name: String = ""
         var selectedRepoPaths: [String] = []
+        var defaultRemoteHostID: String?
     }
 
     // MARK: - CREATE
 
     @discardableResult
-    func createWorkspace(name: String, repoPaths: [String], ephemeral: Bool = false) -> WorkspaceModel {
-        var newWorkspace = WorkspaceModel(name: name, repoPaths: repoPaths)
+    func createWorkspace(
+        name: String,
+        repoPaths: [String],
+        ephemeral: Bool = false,
+        defaultRemoteHostID: String? = nil
+    ) -> WorkspaceModel {
+        var newWorkspace = WorkspaceModel(
+            name: name,
+            repoPaths: repoPaths,
+            defaultRemoteHostID: defaultRemoteHostID
+        )
 
         // Mark as ephemeral if needed
         newWorkspace.isEphemeral = ephemeral
@@ -2430,8 +2441,15 @@ class WorkspaceManagerViewModel: ObservableObject {
         return items.map { $0.formattedCount() }.joined(separator: ", ")
     }
 
+    /// Requests a workspace switch. When `bypassSessionCancellationConfirmation` is true,
+    /// active sessions cause an automatic decline (`.cancelled`); they are never ended implicitly.
     @MainActor
-    func requestWorkspaceSwitch(to newWorkspace: WorkspaceModel, saveState: Bool = true, reason: String = "userOrInternal") async -> WorkspaceSwitchResult {
+    func requestWorkspaceSwitch(
+        to newWorkspace: WorkspaceModel,
+        saveState: Bool = true,
+        reason: String = "userOrInternal",
+        bypassSessionCancellationConfirmation: Bool = false
+    ) async -> WorkspaceSwitchResult {
         if let concurrentResult = concurrentWorkspaceSwitchResult(requestedWorkspace: newWorkspace) {
             return userVisibleWorkspaceSwitchResult(
                 concurrentResult,
@@ -2462,6 +2480,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             to: newWorkspace,
             saveState: saveState,
             reason: reason,
+            bypassSessionCancellationConfirmation: bypassSessionCancellationConfirmation,
             operationID: operationID
         )
         let finalResult = await completeWorkspaceSwitchOperation(
@@ -2488,10 +2507,16 @@ class WorkspaceManagerViewModel: ObservableObject {
         to newWorkspace: WorkspaceModel,
         saveState: Bool,
         reason: String,
+        bypassSessionCancellationConfirmation: Bool,
         operationID: UUID
     ) async -> WorkspaceSwitchResult {
         let snapshot = activeSessionSnapshot()
         if snapshot.hasActiveSessions {
+            guard !bypassSessionCancellationConfirmation else {
+                return .cancelled(
+                    "Workspace switch to \"\(newWorkspace.name)\" requires ending active sessions; unattended workspace opening does not present confirmation UI."
+                )
+            }
             advanceWorkspaceSwitchOperation(operationID, to: .awaitingConfirmation)
             let confirmation = WorkspaceSwitchConfirmation(
                 targetWorkspaceName: newWorkspace.name,
@@ -5936,6 +5961,34 @@ class WorkspaceManagerViewModel: ObservableObject {
                 }
             } catch {
                 print("Error saving renamed workspace: \(error)")
+            }
+        }
+    }
+
+    func setWorkspaceDefaultRemoteHost(_ workspace: WorkspaceModel, hostID: String?) {
+        guard let index = workspaces.firstIndex(where: { $0.id == workspace.id }),
+              workspaces[index].defaultRemoteHostID != hostID
+        else { return }
+        workspaces[index].defaultRemoteHostID = hostID
+        workspaces[index].dateModified = Date()
+        let workspaceToSave = workspaces[index]
+
+        Task {
+            do {
+                let finalURL = try await saveWorkspaceToFileAsync(
+                    workspaceToSave,
+                    source: .setWorkspaceDefaultRemoteHost
+                )
+                await WorkspaceDiskWriter.shared.flush(url: finalURL)
+                await MainActor.run {
+                    NotificationCenter.default.post(
+                        name: .workspaceListDidChange,
+                        object: nil,
+                        userInfo: ["managerID": instanceID]
+                    )
+                }
+            } catch {
+                print("Error saving workspace run location: \(error)")
             }
         }
     }

@@ -2,6 +2,7 @@ import Dispatch
 import Foundation
 import Logging
 import MCP
+import RepoPromptMCPClientKit
 import RepoPromptShared
 import ServiceLifecycle
 import SystemPackage
@@ -1971,13 +1972,13 @@ actor MCPService: Service {
 
     /// Helper-owned MCP initialize replay state for app-socket reconnects after
     /// the host session is already initialized.
-    private let initializeReplayState = MCPInitializeReplayState()
+    private let initializeReplayState = MCPInitializeReplayState(debugLog: { debugLog($0) })
 
     /// Helper-owned cache of host-originated requests that were forwarded to an
     /// app socket but have not yet produced a host-visible response. These are
     /// replayed after an app restart so active host requests do not surface as a
     /// transport close.
-    private let outstandingRequestReplayState = MCPOutstandingRequestReplayState()
+    private let outstandingRequestReplayState = MCPOutstandingRequestReplayState(debugLog: { debugLog($0) })
 
     /// Process-lifetime correlation ledger. It deliberately survives reconnect attempts
     /// so fully correlated bridge states can be resumed and ambiguous states fail closed.

@@ -8,11 +8,18 @@ extension AgentModeViewModel {
         else {
             return
         }
+        let interactionID = request.id
         switch request.requestID {
         case .codex:
             codexCoordinator.submitApprovalDecision(session: session, decision: decision)
         case .claudeControl:
             claudeCoordinator.submitApprovalDecision(session: session, decision: decision)
+        case let .remoteGateway(remoteInteractionID):
+            remoteCoordinator.submitApprovalDecision(
+                session: session,
+                interactionID: remoteInteractionID,
+                decision: decision
+            )
         case let .acp(requestID):
             session.pendingApproval = nil
             if session.runState == .waitingForApproval {
@@ -22,6 +29,11 @@ extension AgentModeViewModel {
             Task { [controller = session.acpController] in
                 await controller?.respondToPermissionRequest(id: requestID, decision: decision)
             }
+        }
+        // The provider coordinators clear `pendingApproval` synchronously only when
+        // their guards pass; emit the resolution event only for an actual resolution.
+        if session.pendingApproval?.id != interactionID {
+            recordMCPInteractionResolution(for: session, interactionID: interactionID)
         }
     }
 
@@ -34,6 +46,11 @@ extension AgentModeViewModel {
               let request = session.pendingMCPElicitationRequest,
               request.id == requestID
         else {
+            return
+        }
+        if session.remoteHost != nil {
+            remoteCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)
+            recordMCPInteractionResolution(for: session, interactionID: request.id)
             return
         }
         codexCoordinator.submitMCPElicitationResponse(session: session, request: request, response: response)

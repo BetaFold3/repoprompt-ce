@@ -9,6 +9,7 @@ enum AgentSessionError: Error, LocalizedError {
     case loadFailed(Error)
     case noActiveWorkspace
     case invalidHandoffCutoff
+    case remoteManaged(String)
 
     var localizedDescription: String {
         switch self {
@@ -24,6 +25,8 @@ enum AgentSessionError: Error, LocalizedError {
             "No active workspace for agent session"
         case .invalidHandoffCutoff:
             "The selected handoff point is no longer available in this session transcript."
+        case let .remoteManaged(reason):
+            reason
         }
     }
 
@@ -121,7 +124,90 @@ struct AgentTokenUsagePersist: Codable, Equatable {
     }
 }
 
+// MARK: - Remote Session Binding
+
+struct AgentSessionRemoteHostBinding: Codable, Equatable {
+    var hostID: String
+    var hostDisplayName: String
+    var remoteSessionID: String
+    var lastAppliedSeq: UInt64
+    var seqEpoch: String?
+    var nextLogOffset: Int
+
+    var normalizedRemoteSessionID: String? {
+        let trimmed = remoteSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    init(
+        hostID: String,
+        hostDisplayName: String,
+        remoteSessionID: String,
+        lastAppliedSeq: UInt64 = 0,
+        seqEpoch: String? = nil,
+        nextLogOffset: Int = 0
+    ) {
+        self.hostID = hostID
+        self.hostDisplayName = hostDisplayName
+        self.remoteSessionID = remoteSessionID
+        self.lastAppliedSeq = lastAppliedSeq
+        self.seqEpoch = seqEpoch
+        self.nextLogOffset = nextLogOffset
+    }
+}
+
 // MARK: - Agent Session
+
+// swiftformat:disable:next redundantSendable
+struct PersistedRemoteResendPayload: Codable, Sendable, Equatable {
+    let providerText: String
+    let wasStart: Bool
+    let modelSelectionRaw: String?
+    let sessionName: String?
+    let workspaceName: String?
+    let windowID: Int?
+    let workspaceID: String?
+
+    init(
+        providerText: String,
+        wasStart: Bool,
+        modelSelectionRaw: String?,
+        sessionName: String?,
+        workspaceName: String?,
+        windowID: Int? = nil,
+        workspaceID: String? = nil
+    ) {
+        self.providerText = providerText
+        self.wasStart = wasStart
+        self.modelSelectionRaw = modelSelectionRaw
+        self.sessionName = sessionName
+        // A window ID is the routing authority. For mixed legacy input, prefer
+        // that explicit target and discard the name rather than ANDing conflicting selectors.
+        let normalizedWorkspaceID = workspaceID.flatMap { $0.isEmpty ? nil : $0 }
+        if let windowID {
+            self.workspaceName = nil
+            self.windowID = windowID
+            self.workspaceID = normalizedWorkspaceID
+        } else {
+            self.workspaceName = workspaceName
+            self.windowID = nil
+            self.workspaceID = nil
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            providerText: container.decode(String.self, forKey: .providerText),
+            wasStart: container.decode(Bool.self, forKey: .wasStart),
+            modelSelectionRaw: container.decodeIfPresent(String.self, forKey: .modelSelectionRaw),
+            sessionName: container.decodeIfPresent(String.self, forKey: .sessionName),
+            workspaceName: container.decodeIfPresent(String.self, forKey: .workspaceName),
+            windowID: container.decodeIfPresent(Int.self, forKey: .windowID),
+            workspaceID: container.decodeIfPresent(String.self, forKey: .workspaceID)
+        )
+    }
+}
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
@@ -167,6 +253,16 @@ struct AgentSession: Codable, Identifiable {
     /// Provider-specific resumable session identifier (e.g., Claude CLI session_id)
     /// Used to resume conversations with --resume instead of replaying history
     var providerSessionID: String?
+
+    /// Remote host/session binding for client-projected gateway sessions.
+    var remoteHost: AgentSessionRemoteHostBinding?
+
+    /// Safe resend recovery data for undelivered remote user turns.
+    var remoteResendPayloadsByItemID: [String: PersistedRemoteResendPayload]
+
+    /// Optimistic item whose locally successful remote start produced the adopted session.
+    var locallyAttributedStartItemID: UUID?
+
     var autoEditEnabled: Bool
 
     /// Persisted per-turn token usage for non-Codex providers.
@@ -190,7 +286,13 @@ struct AgentSession: Codable, Identifiable {
 
     /// Whether this session was originally created by an MCP client (vs the user in the UI).
     /// Used to scope cleanup operations to MCP-originated sessions only.
+    /// Legacy compatibility flag — derived from `origin` and kept serialized so
+    /// older builds keep decoding it (plan §6.4).
     var isMCPOriginated: Bool
+
+    /// Session provenance (plan §6.4): `.user`, `.mcp(clientID:)`, or
+    /// `.remote(deviceID:)`. Source of truth for `isMCPOriginated`.
+    var origin: AgentSessionOrigin
 
     /// Persisted per-session logical-root to worktree bindings.
     /// Runtime cwd/path projection is resolved by downstream worktree-system layers.
@@ -225,6 +327,9 @@ struct AgentSession: Codable, Identifiable {
         agentReasoningEffort: String? = nil,
         lastRunState: String? = nil,
         providerSessionID: String? = nil,
+        remoteHost: AgentSessionRemoteHostBinding? = nil,
+        remoteResendPayloadsByItemID: [String: PersistedRemoteResendPayload] = [:],
+        locallyAttributedStartItemID: UUID? = nil,
         autoEditEnabled: Bool = true,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
         codexConversationID: String? = nil,
@@ -241,6 +346,7 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffSourceItemID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
         isMCPOriginated: Bool = false,
+        origin: AgentSessionOrigin? = nil,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
         worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
     ) {
@@ -261,6 +367,9 @@ struct AgentSession: Codable, Identifiable {
         self.agentReasoningEffort = agentReasoningEffort
         self.lastRunState = lastRunState
         self.providerSessionID = providerSessionID
+        self.remoteHost = remoteHost
+        self.remoteResendPayloadsByItemID = remoteResendPayloadsByItemID
+        self.locallyAttributedStartItemID = locallyAttributedStartItemID
         self.autoEditEnabled = autoEditEnabled
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
         self.codexConversationID = codexConversationID
@@ -276,7 +385,9 @@ struct AgentSession: Codable, Identifiable {
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
-        self.isMCPOriginated = isMCPOriginated
+        let resolvedOrigin = origin ?? AgentSessionOrigin(legacyIsMCPOriginated: isMCPOriginated)
+        self.origin = resolvedOrigin
+        self.isMCPOriginated = resolvedOrigin.isMCPOriginated
         self.worktreeBindings = worktreeBindings
         self.worktreeMergeOperations = worktreeMergeOperations
     }
@@ -299,6 +410,9 @@ struct AgentSession: Codable, Identifiable {
         case agentReasoningEffort
         case lastRunState
         case providerSessionID
+        case remoteHost
+        case remoteResendPayloadsByItemID
+        case locallyAttributedStartItemID
         case autoEditEnabled
         case providerTokenUsageByTurn
         case codexConversationID
@@ -315,6 +429,7 @@ struct AgentSession: Codable, Identifiable {
         case pendingHandoffSourceItemID
         case pendingHandoffDefersProviderLockUntilSend
         case isMCPOriginated
+        case origin
         case worktreeBindings
         case worktreeMergeOperations
     }
@@ -340,6 +455,12 @@ struct AgentSession: Codable, Identifiable {
         agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
+        remoteHost = try container.decodeIfPresent(AgentSessionRemoteHostBinding.self, forKey: .remoteHost)
+        remoteResendPayloadsByItemID = try container.decodeIfPresent(
+            [String: PersistedRemoteResendPayload].self,
+            forKey: .remoteResendPayloadsByItemID
+        ) ?? [:]
+        locallyAttributedStartItemID = try container.decodeIfPresent(UUID.self, forKey: .locallyAttributedStartItemID)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
@@ -355,7 +476,11 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
-        isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
+        let legacyIsMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
+        let decodedOrigin = try container.decodeIfPresent(AgentSessionOrigin.self, forKey: .origin)
+            ?? AgentSessionOrigin(legacyIsMCPOriginated: legacyIsMCPOriginated)
+        origin = decodedOrigin
+        isMCPOriginated = decodedOrigin.isMCPOriginated
         worktreeBindings = try container.decodeIfPresent([AgentSessionWorktreeBinding].self, forKey: .worktreeBindings) ?? []
         worktreeMergeOperations = try container.decodeIfPresent([AgentSessionWorktreeMergeOperation].self, forKey: .worktreeMergeOperations) ?? []
     }

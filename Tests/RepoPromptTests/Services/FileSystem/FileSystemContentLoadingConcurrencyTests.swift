@@ -590,6 +590,9 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
 
         func testCancelledQueuedContentReadWorkerPermitWaitRecordsCancellationWithoutAcquisitionOrLeak() async throws {
+            let initialIdle = await waitForProcessContentReadWorkerLimiterSnapshot { $0.isIdle }
+            XCTAssertTrue(initialIdle.isIdle)
+
             let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingPermitCancellation")
             let service = try await makeService(root: root)
             let gate = AsyncGate()
@@ -631,7 +634,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             }
             let laterContent = try await service.loadContent(ofRelativePath: "Later.txt")
             XCTAssertEqual(laterContent, "later")
-            let limiterSnapshot = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
+            let limiterSnapshot = await waitForProcessContentReadWorkerLimiterSnapshot { $0.isIdle }
             XCTAssertEqual(limiterSnapshot.activePermitCount, 0)
             XCTAssertEqual(limiterSnapshot.queuedWaiterCount, 0)
             XCTAssertEqual(limiterSnapshot.ownerLaneCount, 0)

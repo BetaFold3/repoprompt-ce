@@ -5,6 +5,35 @@ import MCP
 import XCTest
 
 final class TabContextRoutingTests: XCTestCase {
+    private final class DispatchMetadataProbe: @unchecked Sendable {
+        private let lock = NSLock()
+        private var events: [(connectionID: UUID?, windowID: Int?, hintWindowID: Int?)] = []
+
+        func record(connectionID: UUID?, windowID: Int?, hintWindowID: Int?) {
+            lock.lock()
+            events.append((connectionID: connectionID, windowID: windowID, hintWindowID: hintWindowID))
+            lock.unlock()
+        }
+
+        func count(for connectionID: UUID) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return events.count(where: { $0.connectionID == connectionID })
+        }
+
+        func lastWindowID(for connectionID: UUID) -> Int? {
+            lock.lock()
+            defer { lock.unlock() }
+            return events.last { $0.connectionID == connectionID }?.windowID
+        }
+
+        func lastHintWindowID(for connectionID: UUID) -> Int? {
+            lock.lock()
+            defer { lock.unlock() }
+            return events.last { $0.connectionID == connectionID }?.hintWindowID
+        }
+    }
+
     private var cancellables: Set<AnyCancellable> = []
 
     override func tearDown() {
@@ -579,12 +608,43 @@ final class TabContextRoutingTests: XCTestCase {
         }
     }
 
+    func testManageWorkspacesOpenIsWindowSelectionExemptWithoutBroadeningOtherActions() {
+        XCTAssertTrue(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "manage_workspaces",
+            args: ["action": .string("open")]
+        ))
+        XCTAssertTrue(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "manage_workspaces",
+            args: ["action": .string("Open")]
+        ))
+        XCTAssertFalse(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "manage_workspaces",
+            args: ["action": .string("switch")]
+        ))
+        XCTAssertFalse(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "manage_workspaces",
+            args: [:]
+        ))
+        XCTAssertFalse(ServerNetworkManager.isWindowSelectionExempt(
+            toolName: "read_file",
+            args: ["action": .string("open")]
+        ))
+    }
+
     func testBindContextParticipatesInHiddenWindowRoutingWithoutImplicitPublicInjection() {
         XCTAssertFalse(ServerNetworkManager.shouldBypassWindowRouting(for: "bind_context"))
         XCTAssertFalse(ServerNetworkManager.shouldAutoInjectPublicWindowID(for: "bind_context"))
         XCTAssertTrue(ServerNetworkManager.shouldRehydrateExplicitWindowID(for: "bind_context"))
         XCTAssertTrue(ServerNetworkManager.isWindowSelectionExempt(toolName: "bind_context", args: ["op": .string("list")]))
         XCTAssertTrue(ServerNetworkManager.shouldBypassLogicalContextPreResolution(for: "bind_context"))
+    }
+
+    func testRemotePairingBypassesWindowRoutingForGatewayPrincipalRelay() {
+        XCTAssertTrue(ServerNetworkManager.shouldBypassWindowRouting(for: MCPWindowToolName.remotePairing))
+        XCTAssertFalse(ServerNetworkManager.shouldAutoInjectPublicWindowID(for: MCPWindowToolName.remotePairing))
+        XCTAssertFalse(ServerNetworkManager.shouldPersistResolvedLogicalContextWindowMapping(for: MCPWindowToolName.remotePairing))
+        XCTAssertTrue(ServerNetworkManager.isWindowSelectionExempt(toolName: MCPWindowToolName.remotePairing, args: ["op": .string("mint_ticket")]))
+        XCTAssertTrue(ServerNetworkManager.shouldBypassLogicalContextPreResolution(for: MCPWindowToolName.remotePairing))
     }
 
     func testMigratedToolContextPreResolutionPersistsWindowAffinity() {
@@ -1949,6 +2009,325 @@ final class TabContextRoutingTests: XCTestCase {
 
     #if DEBUG
         @MainActor
+        func testGatewayPrincipalExplicitWindowIDRoutesWithoutPersistingDefaultMapping() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                fixture.contextA.window.mcpServer.windowToolsEnabled = true
+                fixture.contextB.window.mcpServer.windowToolsEnabled = true
+                let manager = fixture.networkManager
+                let probe = DispatchMetadataProbe()
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
+                    let connectionID = await manager.currentConnectionUUID()
+                    let metadata = await fixture.contextB.window.mcpServer.captureRequestMetadata()
+                    probe.record(
+                        connectionID: connectionID,
+                        windowID: metadata.windowID,
+                        hintWindowID: metadata.explicitWindowRoutingHint?.windowID
+                    )
+                    return .string("ok")
+                }
+                do {
+                    let endpoint = try await fixture.makeAdditionalEndpoint(
+                        label: "gateway-explicit-window",
+                        principal: .gateway
+                    )
+                    await manager.debugSetAdditionalTools(
+                        for: endpoint.connectionID,
+                        additionalTools: [MCPWindowToolName.readFile]
+                    )
+                    let initialSelectedWindow = await manager.selectedWindow(for: endpoint.connectionID)
+                    XCTAssertNil(initialSelectedWindow)
+
+                    _ = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": "/tmp/noop",
+                            "_windowID": fixture.contextB.window.windowID
+                        ]
+                    )
+
+                    XCTAssertEqual(probe.count(for: endpoint.connectionID), 1)
+                    XCTAssertEqual(probe.lastWindowID(for: endpoint.connectionID), fixture.contextB.window.windowID)
+                    XCTAssertEqual(probe.lastHintWindowID(for: endpoint.connectionID), fixture.contextB.window.windowID)
+                    let selectedWindowAfterExplicitCall = await manager.selectedWindow(for: endpoint.connectionID)
+                    XCTAssertNil(selectedWindowAfterExplicitCall)
+
+                    _ = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: ["path": "/tmp/noop"]
+                    )
+
+                    XCTAssertEqual(probe.count(for: endpoint.connectionID), 1)
+                    let selectedWindowAfterUnroutedCall = await manager.selectedWindow(for: endpoint.connectionID)
+                    XCTAssertNil(selectedWindowAfterUnroutedCall)
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        @MainActor
+        func testOrdinaryExplicitWindowIDStillPersistsDefaultMapping() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                fixture.contextA.window.mcpServer.windowToolsEnabled = true
+                fixture.contextB.window.mcpServer.windowToolsEnabled = true
+                let manager = fixture.networkManager
+                let probe = DispatchMetadataProbe()
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
+                    let connectionID = await manager.currentConnectionUUID()
+                    let metadata = await fixture.contextB.window.mcpServer.captureRequestMetadata()
+                    probe.record(
+                        connectionID: connectionID,
+                        windowID: metadata.windowID,
+                        hintWindowID: metadata.explicitWindowRoutingHint?.windowID
+                    )
+                    return .string("ok")
+                }
+                do {
+                    let endpoint = try await fixture.makeAdditionalEndpoint(label: "ordinary-explicit-window")
+                    await manager.debugSetAdditionalTools(
+                        for: endpoint.connectionID,
+                        additionalTools: [MCPWindowToolName.readFile]
+                    )
+                    let initialSelectedWindow = await manager.selectedWindow(for: endpoint.connectionID)
+                    XCTAssertNil(initialSelectedWindow)
+
+                    _ = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": "/tmp/noop",
+                            "_windowID": fixture.contextB.window.windowID
+                        ]
+                    )
+
+                    XCTAssertEqual(probe.count(for: endpoint.connectionID), 1)
+                    XCTAssertEqual(probe.lastWindowID(for: endpoint.connectionID), fixture.contextB.window.windowID)
+                    let selectedWindowAfterExplicitCall = await manager.selectedWindow(for: endpoint.connectionID)
+                    XCTAssertEqual(selectedWindowAfterExplicitCall, fixture.contextB.window.windowID)
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        @MainActor
+        func testGatewayPrincipalUnroutedCallDoesNotSeedFromClientNameReuse() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                fixture.contextA.window.mcpServer.windowToolsEnabled = true
+                fixture.contextB.window.mcpServer.windowToolsEnabled = true
+                let manager = fixture.networkManager
+                let probe = DispatchMetadataProbe()
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
+                    let connectionID = await manager.currentConnectionUUID()
+                    let metadata = await fixture.contextA.window.mcpServer.captureRequestMetadata()
+                    probe.record(
+                        connectionID: connectionID,
+                        windowID: metadata.windowID,
+                        hintWindowID: metadata.explicitWindowRoutingHint?.windowID
+                    )
+                    return .string("ok")
+                }
+                do {
+                    let reusableClientName = "remote:\(UUID().uuidString.prefix(8))"
+                    let gatewayReusable = try await fixture.makeAdditionalEndpoint(
+                        label: "gateway-reusable-affinity",
+                        clientName: reusableClientName,
+                        principal: .gateway
+                    )
+                    let ordinaryReusable = try await fixture.makeAdditionalEndpoint(
+                        label: "ordinary-reusable-affinity",
+                        clientName: reusableClientName
+                    )
+
+                    _ = try await ordinaryReusable.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": "/tmp/noop",
+                            "_windowID": fixture.contextA.window.windowID
+                        ]
+                    )
+                    let ordinaryReusableSelectedWindow = await manager.selectedWindow(for: ordinaryReusable.connectionID)
+                    XCTAssertEqual(ordinaryReusableSelectedWindow, fixture.contextA.window.windowID)
+
+                    _ = try await gatewayReusable.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: ["path": "/tmp/noop"]
+                    )
+                    XCTAssertEqual(probe.count(for: gatewayReusable.connectionID), 0)
+                    let gatewayReusableSelectedWindow = await manager.selectedWindow(for: gatewayReusable.connectionID)
+                    XCTAssertNil(gatewayReusableSelectedWindow)
+
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        @MainActor
+        func testGatewayPrincipalSetupIgnoresPersistedAffinityRecord() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                fixture.contextA.window.mcpServer.windowToolsEnabled = true
+                fixture.contextB.window.mcpServer.windowToolsEnabled = true
+                let manager = fixture.networkManager
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
+                    .string("ok")
+                }
+                do {
+                    let persistedClientName = "remote:\(UUID().uuidString.prefix(8))"
+                    let persistedSessionToken = "gateway-persisted-affinity-\(UUID().uuidString)"
+                    let ordinaryPersisted = try await fixture.makeAdditionalEndpoint(
+                        label: "ordinary-persisted-affinity",
+                        clientName: persistedClientName,
+                        sessionToken: persistedSessionToken
+                    )
+                    _ = try await ordinaryPersisted.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: [
+                            "path": "/tmp/noop",
+                            "_windowID": fixture.contextB.window.windowID
+                        ]
+                    )
+                    let ordinaryPersistedSelectedWindow = await manager.selectedWindow(for: ordinaryPersisted.connectionID)
+                    XCTAssertEqual(ordinaryPersistedSelectedWindow, fixture.contextB.window.windowID)
+                    ordinaryPersisted.client.close()
+                    await ordinaryPersisted.connectionManager.stop()
+                    await manager.debugRemoveConnection(ordinaryPersisted.connectionID)
+                    fixture.forgetAdditionalEndpoint(ordinaryPersisted)
+
+                    let gatewayPersisted = try await fixture.makeAdditionalEndpoint(
+                        label: "gateway-persisted-affinity",
+                        clientName: persistedClientName,
+                        sessionToken: persistedSessionToken,
+                        principal: .gateway,
+                        clearPersistedRoutingState: false
+                    )
+                    let gatewayPersistedInitialWindow = await manager.selectedWindow(for: gatewayPersisted.connectionID)
+                    XCTAssertNil(gatewayPersistedInitialWindow)
+
+                    _ = try await gatewayPersisted.callTool(
+                        name: "bind_context",
+                        arguments: ["op": "list"],
+                        timeoutSeconds: 3
+                    )
+                    let gatewayPersistedFinalWindow = await manager.selectedWindow(for: gatewayPersisted.connectionID)
+                    XCTAssertNil(gatewayPersistedFinalWindow)
+
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        @MainActor
+        func testGatewayPrincipalPriority3SingleWindowRoutingDoesNotPersistDefaultMapping() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                fixture.contextA.window.mcpServer.windowToolsEnabled = true
+                fixture.contextB.window.mcpServer.windowToolsEnabled = true
+                let manager = fixture.networkManager
+                let probe = DispatchMetadataProbe()
+                var contextBRegistered = true
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
+                    let connectionID = await manager.currentConnectionUUID()
+                    let metadata = await fixture.contextA.window.mcpServer.captureRequestMetadata()
+                    probe.record(
+                        connectionID: connectionID,
+                        windowID: metadata.windowID,
+                        hintWindowID: metadata.explicitWindowRoutingHint?.windowID
+                    )
+                    return .string("ok")
+                }
+
+                do {
+                    WindowStatesManager.shared.unregisterWindowState(fixture.contextB.window)
+                    contextBRegistered = false
+
+                    let gatewayEndpoint = try await fixture.makeAdditionalEndpoint(
+                        label: "gateway-priority3-single-window",
+                        principal: .gateway
+                    )
+                    await manager.debugSetConnectionWindowCountAtConnectionTimeForTesting(
+                        connectionID: gatewayEndpoint.connectionID,
+                        count: 1
+                    )
+                    await manager.debugSetAdditionalTools(
+                        for: gatewayEndpoint.connectionID,
+                        additionalTools: [MCPWindowToolName.readFile]
+                    )
+
+                    let initialSelectedWindow = await manager.selectedWindow(for: gatewayEndpoint.connectionID)
+                    XCTAssertNil(initialSelectedWindow)
+
+                    _ = try await gatewayEndpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: ["path": "/tmp/noop"]
+                    )
+                    // Auto-routed calls do not install explicit routing metadata; while context B is
+                    // unregistered, reaching the override proves per-call dispatch to context A's window.
+                    XCTAssertEqual(probe.count(for: gatewayEndpoint.connectionID), 1)
+                    let selectedWindowAfterSingleWindowCall = await manager.selectedWindow(for: gatewayEndpoint.connectionID)
+                    XCTAssertNil(selectedWindowAfterSingleWindowCall)
+
+                    WindowStatesManager.shared.registerWindowState(fixture.contextB.window)
+                    contextBRegistered = true
+
+                    let blockedResponse = try await gatewayEndpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: ["path": "/tmp/noop"],
+                        timeoutSeconds: 3
+                    )
+                    XCTAssertEqual(probe.count(for: gatewayEndpoint.connectionID), 1)
+                    let selectedWindowAfterSecondWindow = await manager.selectedWindow(for: gatewayEndpoint.connectionID)
+                    XCTAssertNil(selectedWindowAfterSecondWindow)
+                    XCTAssertTrue(blockedResponse.rawJSON.contains("\"isError\":true"), blockedResponse.rawJSON)
+                    XCTAssertTrue(
+                        blockedResponse.rawJSON.contains("Multiple RepoPrompt windows detected"),
+                        blockedResponse.rawJSON
+                    )
+                    XCTAssertTrue(blockedResponse.rawJSON.contains("_windowID"), blockedResponse.rawJSON)
+
+                    await manager.debugSetConnectionWindowCountAtConnectionTimeForTesting(
+                        connectionID: gatewayEndpoint.connectionID,
+                        count: nil
+                    )
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    if !contextBRegistered {
+                        WindowStatesManager.shared.registerWindowState(fixture.contextB.window)
+                    }
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile, operation: nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        @MainActor
         func testRequestMetadataBridgesExplicitWindowHintWithoutInferringFromEffectiveAffinity() async throws {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -2097,6 +2476,163 @@ final class TabContextRoutingTests: XCTestCase {
             let parentSourceTabID = await window.mcpServer
                 .resolveSpawnParentSourceTabIDForAgentSessionCreation(metadata: metadata)
             XCTAssertNil(parentSourceTabID)
+        }
+
+        @MainActor
+        func testAgentRunExplicitWindowRouteOverridesStickyTabContextBinding() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            let workspaceID = UUID()
+            let activeTabID = UUID()
+            let staleTabID = UUID()
+            let activeSelection = StoredSelection(
+                selectedPaths: ["/tmp/active-explicit-window-source.swift"],
+                codemapAutoEnabled: false
+            )
+            let staleSelection = StoredSelection(
+                selectedPaths: ["/tmp/stale-bound-tab-source.swift"],
+                codemapAutoEnabled: false
+            )
+            let workspace = WorkspaceModel(
+                id: workspaceID,
+                name: "Explicit window overrides sticky binding",
+                repoPaths: [],
+                ephemeralFlag: true,
+                composeTabs: [
+                    ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
+                    ComposeTabState(id: staleTabID, name: "Stale", selection: staleSelection)
+                ],
+                activeComposeTabID: activeTabID
+            )
+            window.workspaceManager.workspaces = [workspace]
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "explicitWindowOverridesStickyBindingTest"
+            )
+            try window.promptManager.loadComposeTabsFromWorkspace(
+                XCTUnwrap(window.workspaceManager.activeWorkspace),
+                syncPromptText: true
+            )
+            let connectionID = UUID()
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "sticky-tab-agent-run",
+                tabID: staleTabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID
+            )
+            XCTAssertEqual(
+                window.mcpServer.connectionBindingSnapshot(forConnection: connectionID).bindingKind,
+                .tabContext
+            )
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "sticky-tab-agent-run",
+                windowID: window.windowID,
+                runPurpose: .unknown,
+                explicitWindowRoutingHint: MCPExplicitWindowRoutingHint(
+                    connectionID: connectionID,
+                    toolName: "agent_run",
+                    windowID: window.windowID,
+                    windowStateIdentity: ObjectIdentifier(window),
+                    serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
+                    provenance: .hiddenWindowArgument
+                )
+            )
+
+            let snapshot = try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                metadata: metadata,
+                targetWindow: window
+            )
+
+            XCTAssertEqual(snapshot.route, .windowOnlyActiveCompose)
+            XCTAssertEqual(snapshot.tabID, activeTabID)
+            XCTAssertNotEqual(snapshot.tabID, staleTabID)
+            XCTAssertEqual(snapshot.workspaceID, workspaceID)
+        }
+
+        @MainActor
+        func testExplicitWindowIDOverrideUsesPerCallWindowWhenConnectionHasStaleDefaultMapping() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let windowA = WindowState()
+            let windowB = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(windowA)
+            WindowStatesManager.shared.registerWindowState(windowB)
+            defer {
+                WindowStatesManager.shared.unregisterWindowState(windowA)
+                WindowStatesManager.shared.unregisterWindowState(windowB)
+            }
+
+            let root = try makeTemporaryDirectory(named: "explicit-window-per-call-override")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            let workspace = windowB.workspaceManager.createWorkspace(
+                name: "Explicit window per-call override",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await windowB.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "explicitWindowPerCallOverride"
+            )
+            let activeWorkspace = try XCTUnwrap(windowB.workspaceManager.activeWorkspace)
+            windowB.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            let connectionID = UUID()
+            try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await ServerNetworkManager.shared.setActiveWindowForCurrentConnection(windowA.windowID)
+            }
+            let initialStickyWindow = await ServerNetworkManager.shared.selectedWindow(for: connectionID)
+            XCTAssertEqual(initialStickyWindow, windowA.windowID)
+
+            let hint = MCPExplicitWindowRoutingHint(
+                connectionID: connectionID,
+                toolName: "agent_run",
+                windowID: windowB.windowID,
+                windowStateIdentity: ObjectIdentifier(windowB),
+                serverViewModelIdentity: ObjectIdentifier(windowB.mcpServer),
+                provenance: .hiddenWindowArgument
+            )
+            var dispatchCount = 0
+            var effectiveWindowDuringDispatch: Int?
+            windowB.mcpServer.setAgentRunDispatchOverrideForTesting {
+                _, _, message, _, _ in
+                dispatchCount += 1
+                XCTAssertEqual(message, "start in window b")
+                let metadata = await windowB.mcpServer.captureRequestMetadata()
+                effectiveWindowDuringDispatch = metadata.windowID
+                return .startedRun
+            }
+            defer {
+                windowB.mcpServer.setAgentRunDispatchOverrideForTesting(nil)
+                windowB.mcpServer.setRequestMetadataOverrideForTesting(nil)
+            }
+
+            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await ServerNetworkManager.$currentExplicitWindowRoutingHint.withValue(hint) {
+                    try await ServerNetworkManager.$currentEffectiveWindowID.withValue(windowB.windowID) {
+                        let metadata = await windowB.mcpServer.captureRequestMetadata()
+                        XCTAssertEqual(metadata.windowID, windowB.windowID)
+                        XCTAssertEqual(metadata.explicitWindowRoutingHint, hint)
+                        return try await windowB.mcpServer.executeAgentRunForTesting(args: [
+                            "op": .string("start"),
+                            "message": .string("start in window b")
+                        ])
+                    }
+                }
+            }
+
+            XCTAssertEqual(dispatchCount, 1)
+            XCTAssertEqual(effectiveWindowDuringDispatch, windowB.windowID)
+            let finalStickyWindow = await ServerNetworkManager.shared.selectedWindow(for: connectionID)
+            XCTAssertEqual(finalStickyWindow, windowA.windowID)
+            try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await ServerNetworkManager.shared.clearActiveWindowForCurrentConnection()
+            }
         }
 
         @MainActor

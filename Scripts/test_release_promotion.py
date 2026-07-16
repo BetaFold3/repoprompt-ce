@@ -236,8 +236,14 @@ class ReleasePromotionTests(unittest.TestCase):
             "repoprompt-mcp",
             "printf 'ERROR: fixture packaged helper must not execute\\n' >&2\nexit 137\n",
         )
-        (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
-        (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
+        self.write_stub(
+            app / "Contents" / "MacOS",
+            "repoprompt-gateway",
+            "printf 'ERROR: fixture packaged gateway must not execute\\n' >&2\nexit 137\n",
+        )
+        for helper_name in ("repoprompt-mcp", "repoprompt-gateway"):
+            (app / "Contents" / "Resources" / helper_name).symlink_to(f"../MacOS/{helper_name}")
+            (app / "Contents" / "Resources" / "bin" / helper_name).symlink_to(f"../../MacOS/{helper_name}")
         self.write_legal_tree(root, app)
         shutil.copytree(app, dmg_app, symlinks=True)
         if mismatched_dmg_app:

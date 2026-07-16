@@ -1,0 +1,1031 @@
+import CryptoKit
+import Foundation
+import RepoPromptRemoteWire
+
+struct RemoteHostConnectionHTTPResponse: Equatable {
+    var statusCode: Int
+    var data: Data
+}
+
+protocol RemoteHostConnectionHTTPTransport: Sendable {
+    func postJSON(
+        to url: URL,
+        body: [String: JSONValue],
+        timeout: TimeInterval
+    ) async throws -> RemoteHostConnectionHTTPResponse
+}
+
+struct URLSessionRemoteHostConnectionHTTPTransport: RemoteHostConnectionHTTPTransport {
+    private let client: RemoteHostHTTPClient
+
+    init(session: URLSession? = nil) {
+        client = session.map(RemoteHostHTTPClient.init(session:)) ?? .shared
+    }
+
+    func postJSON(
+        to url: URL,
+        body: [String: JSONValue],
+        timeout: TimeInterval
+    ) async throws -> RemoteHostConnectionHTTPResponse {
+        let response = try await client.postJSON(
+            to: url,
+            body: RemoteWireProtocol.canonicalData(for: .object(body)),
+            timeout: timeout,
+            maximumResponseBytes: 256 * 1024
+        )
+        return RemoteHostConnectionHTTPResponse(statusCode: response.statusCode, data: response.body)
+    }
+}
+
+struct RemoteHostConnectionTestResult: Equatable {
+    var hostID: String
+    var hostName: String?
+    var scopes: Set<String>
+    var pongPayload: JSONValue
+}
+
+actor RemoteHostConnection {
+    enum State: Equatable {
+        case idle
+        case mintingTicket
+        case connecting
+        case connected(scopes: Set<String>)
+        case degraded(code: String, retryAt: Date)
+        case revoked
+    }
+
+    static let ticketTimeout: TimeInterval = 20
+    static let connectTimeout: TimeInterval = 10
+    static let commandTimeout: TimeInterval = 30
+    static let initialReconnectBackoff: TimeInterval = 0.5
+    static let maximumReconnectBackoff: TimeInterval = 30
+    static let counterWriteCoalescingDelay: TimeInterval = 0.25
+
+    nonisolated let inboundFrames: AsyncStream<RemoteServerFrame>
+    nonisolated let stateEvents: AsyncStream<State>
+
+    let hostID: String
+
+    private let registry: RemoteHostRegistry
+    private let keyStore: RemoteClientKeyStore
+    private let httpTransport: any RemoteHostConnectionHTTPTransport
+    private let webSocketSession: URLSession
+    private let counterWriteCoalescingDelay: TimeInterval
+    private let initialReconnectBackoff: TimeInterval
+    private let maximumReconnectBackoff: TimeInterval
+    private let now: @Sendable () -> Date
+
+    private let inboundContinuation: AsyncStream<RemoteServerFrame>.Continuation
+    private let stateContinuation: AsyncStream<State>.Continuation
+
+    private var state: State = .idle
+    private var webSocketTask: URLSessionWebSocketTask?
+    private var signer: RemoteFrameSigner?
+    private var readTask: Task<Void, Never>?
+    private var connectTask: Task<Void, Error>?
+    private var reconnectTask: Task<Void, Never>?
+    private var pendingCommands: [String: PendingCommand] = [:]
+    private var desiredSubscriptions: Set<String> = []
+    private var parkedSubscriptions: Set<String> = []
+    private var acknowledgedSubscriptions: Set<String> = []
+    private var subscriptionReconciliationInFlight = false
+    private var subscriptionReconciliationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var connectedHostName: String?
+    private var connectedScopes: Set<String> = []
+    private var reconnectBackoff: TimeInterval
+    private var pendingCounterWrite: UInt64?
+    private var counterWriteTask: Task<Void, Never>?
+    #if DEBUG
+        private var reconnectScheduleCount = 0
+        private var subscribeCommandHandlerForTesting: (@Sendable ([String]) async throws -> JSONValue)?
+    #endif
+
+    init(
+        hostID: String,
+        registry: RemoteHostRegistry = .shared,
+        keyStore: RemoteClientKeyStore = .shared,
+        httpTransport: any RemoteHostConnectionHTTPTransport = URLSessionRemoteHostConnectionHTTPTransport(),
+        webSocketSession: URLSession = .shared,
+        counterWriteCoalescingDelay: TimeInterval = RemoteHostConnection.counterWriteCoalescingDelay,
+        initialReconnectBackoff: TimeInterval = RemoteHostConnection.initialReconnectBackoff,
+        maximumReconnectBackoff: TimeInterval = RemoteHostConnection.maximumReconnectBackoff,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) {
+        self.hostID = hostID
+        self.registry = registry
+        self.keyStore = keyStore
+        self.httpTransport = httpTransport
+        self.webSocketSession = webSocketSession
+        self.counterWriteCoalescingDelay = counterWriteCoalescingDelay
+        self.initialReconnectBackoff = initialReconnectBackoff
+        self.maximumReconnectBackoff = maximumReconnectBackoff
+        self.now = now
+        reconnectBackoff = initialReconnectBackoff
+
+        let inbound = AsyncStream.makeStream(of: RemoteServerFrame.self)
+        inboundFrames = inbound.stream
+        inboundContinuation = inbound.continuation
+
+        let states = AsyncStream.makeStream(of: State.self)
+        stateEvents = states.stream
+        stateContinuation = states.continuation
+        stateContinuation.yield(.idle)
+    }
+
+    deinit {
+        if let counter = pendingCounterWrite {
+            _ = try? registry.updateLastCounter(hostID: hostID, counter: counter)
+        }
+        inboundContinuation.finish()
+        stateContinuation.finish()
+        readTask?.cancel()
+        reconnectTask?.cancel()
+        connectTask?.cancel()
+        counterWriteTask?.cancel()
+        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+    }
+
+    func currentState() -> State {
+        state
+    }
+
+    func ensureConnected() async throws {
+        if case .connected = state, webSocketTask != nil {
+            return
+        }
+        if case .revoked = state {
+            throw RemoteClientError.hostRevoked(hostID)
+        }
+        if let connectTask {
+            do {
+                try await connectTask.value
+            } catch is CancellationError {
+                throw RemoteClientError.connectionClosed
+            }
+            return
+        }
+
+        let task = Task { [weak self] in
+            guard let self else { throw RemoteClientError.connectionClosed }
+            try await openConnectionWithImmediateRetries()
+        }
+        connectTask = task
+        do {
+            try await task.value
+            connectTask = nil
+        } catch is CancellationError {
+            connectTask = nil
+            throw RemoteClientError.connectionClosed
+        } catch {
+            connectTask = nil
+            throw error
+        }
+    }
+
+    func command(_ frame: RemoteClientFrame, timeout: TimeInterval = RemoteHostConnection.commandTimeout) async throws -> JSONValue {
+        try await ensureConnected()
+        return try await sendConnectedCommand(frame, timeout: timeout)
+    }
+
+    func supportsAgentCatalog() async throws -> Bool {
+        // The catalog capability is learned from hello_ack.host_name, so this is
+        // intentionally connect-on-demand. Empty/whitespace names degrade with
+        // older hosts instead of attempting an uncorrelatable list_agents probe.
+        try await ensureConnected()
+        return connectedHostName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    func subscribe(sessionIDs: [String]) async throws {
+        let normalized = Self.normalizedSessionIDs(sessionIDs)
+        guard !normalized.isEmpty else { return }
+        desiredSubscriptions.formUnion(normalized)
+        parkedSubscriptions.subtract(normalized)
+        try await ensureConnected()
+        try await reconcileDesiredSubscriptions(throwingFor: normalized)
+        let missing = normalized.subtracting(acknowledgedSubscriptions)
+        if !missing.isEmpty {
+            throw RemoteClientError.fromCommandError(
+                code: "binding_required",
+                message: "The host could not route one or more requested subscriptions."
+            )
+        }
+    }
+
+    func unsubscribe(sessionIDs: [String]) async throws {
+        let normalized = Self.normalizedSessionIDs(sessionIDs)
+        guard !normalized.isEmpty else { return }
+        desiredSubscriptions.subtract(normalized)
+        parkedSubscriptions.subtract(normalized)
+        guard case .connected = state, webSocketTask != nil else { return }
+        _ = try await sendUnsubscribeCommand(sessionIDs: normalized.sorted())
+        acknowledgedSubscriptions.subtract(normalized)
+    }
+
+    func testConnection(timeout: TimeInterval = RemoteHostConnection.connectTimeout) async throws -> RemoteHostConnectionTestResult {
+        do {
+            try await ensureConnected()
+            let pongPayload: JSONValue = .object([
+                "probe": .string("settings_test_connection"),
+                "host_id": .string(hostID)
+            ])
+            let response = try await command(
+                RemoteClientFrame(
+                    type: "ping",
+                    requestID: Self.makeRequestID(prefix: "ping"),
+                    payload: pongPayload
+                ),
+                timeout: timeout
+            )
+            let result = RemoteHostConnectionTestResult(
+                hostID: hostID,
+                hostName: connectedHostName,
+                scopes: connectedScopes,
+                pongPayload: response
+            )
+            await disconnect()
+            return result
+        } catch {
+            await disconnect()
+            throw error
+        }
+    }
+
+    func disconnect() async {
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        connectTask?.cancel()
+        connectTask = nil
+        readTask?.cancel()
+        readTask = nil
+        flushPendingCounter()
+        webSocketTask?.cancel(with: .normalClosure, reason: nil)
+        webSocketTask = nil
+        signer = nil
+        connectedScopes = []
+        connectedHostName = nil
+        acknowledgedSubscriptions.removeAll()
+        failAllPending(with: RemoteClientError.connectionClosed)
+        transition(to: .idle)
+    }
+
+    #if DEBUG
+        func handleServerFrameForTesting(_ frame: RemoteServerFrame) async {
+            await handleIncomingFrame(frame)
+        }
+
+        func persistCounterForTesting(_ counter: UInt64) {
+            persistCounter(counter)
+        }
+
+        func flushPendingCounterForTesting() {
+            flushPendingCounter()
+        }
+
+        func reconnectScheduleCountForTesting() -> Int {
+            reconnectScheduleCount
+        }
+
+        func hasReconnectTaskForTesting() -> Bool {
+            reconnectTask != nil
+        }
+
+        func desiredSubscriptionsForTesting() -> [String] {
+            desiredSubscriptions.sorted()
+        }
+
+        func parkedSubscriptionsForTesting() -> [String] {
+            parkedSubscriptions.sorted()
+        }
+
+        func acknowledgedSubscriptionsForTesting() -> [String] {
+            acknowledgedSubscriptions.sorted()
+        }
+
+        func setDesiredSubscriptionsForTesting(_ sessionIDs: [String]) {
+            desiredSubscriptions = Self.normalizedSessionIDs(sessionIDs)
+            acknowledgedSubscriptions.removeAll()
+        }
+
+        func setSubscribeCommandHandlerForTesting(
+            _ handler: (@Sendable ([String]) async throws -> JSONValue)?
+        ) {
+            subscribeCommandHandlerForTesting = handler
+        }
+    #endif
+
+    // MARK: - Connect
+
+    private func openConnectionWithImmediateRetries() async throws {
+        var retriedTicket = false
+        var retriedCounter = false
+
+        while true {
+            do {
+                try await openConnectionOnce()
+                return
+            } catch let error as RemoteClientError {
+                if case .revoked = error {
+                    markRevoked()
+                    throw error
+                }
+                if let commandError = error.commandError {
+                    switch commandError.code {
+                    case "ticket_expired", "ticket_already_used" where !retriedTicket:
+                        retriedTicket = true
+                        continue
+                    case "counter_replayed" where !retriedCounter:
+                        retriedCounter = true
+                        persistCounter(UInt64(max(0, currentEpochMilliseconds(date: now()))) + 1)
+                        continue
+                    case "device_revoked":
+                        markRevoked()
+                        throw RemoteClientError.revoked(commandError)
+                    default:
+                        break
+                    }
+                }
+                throw error
+            }
+        }
+    }
+
+    private func openConnectionOnce() async throws {
+        let record = try currentHostRecord()
+        guard record.revokedByHostAt == nil else {
+            transition(to: .revoked)
+            throw RemoteClientError.hostRevoked(hostID)
+        }
+
+        transition(to: .mintingTicket)
+        let ticket = try await mintTicket(for: record)
+
+        guard ticket.deviceID == record.deviceID else {
+            throw RemoteClientError.security("Ticket device ID did not match the paired host record.")
+        }
+        guard ticket.hostFingerprint == record.id else {
+            throw RemoteClientError.security("Ticket host fingerprint did not match the pinned host fingerprint.")
+        }
+        guard ticket.scopes.isSubset(of: record.grantedScopes) else {
+            throw RemoteClientError.security("Ticket scopes exceeded the granted paired-host scopes.")
+        }
+
+        let signingMaterial: P256.Signing.PrivateKey
+        do {
+            signingMaterial = try keyStore.privateKey(forHostID: record.id)
+        } catch RemoteClientKeyStoreError.missingKey {
+            throw RemoteClientError.missingDeviceKey(record.id)
+        } catch {
+            throw error
+        }
+
+        var localSigner = RemoteFrameSigner(
+            deviceSigner: signingMaterial,
+            ticketID: ticket.ticketID,
+            deviceID: ticket.deviceID,
+            lastCounter: counterFloor(for: record)
+        )
+        let webSocketURL: URL
+        do {
+            webSocketURL = try RemoteGatewayOrigin(record.gatewayURL).webSocketEndpoint()
+        } catch {
+            throw RemoteClientError.protocolViolation("Gateway URL is not a normalized root origin.")
+        }
+        acknowledgedSubscriptions.removeAll()
+        let task = webSocketSession.webSocketTask(with: webSocketURL)
+        transition(to: .connecting)
+        task.resume()
+
+        do {
+            let hello = RemoteClientFrame(
+                type: "hello",
+                payload: .object(["ticket": ticket.jsonValue])
+            )
+            let signedHello = try localSigner.sign(hello, nowMs: currentEpochMilliseconds(date: now()))
+            persistCounter(signedHello.signature.counter)
+            try await send(signedHello.data, over: task)
+
+            let response = try await receiveServerFrame(over: task, timeout: Self.connectTimeout)
+            switch response.type {
+            case "hello_ack":
+                try handleHelloAck(response, expectedRecord: record, task: task, signer: localSigner)
+            case "command_error":
+                throw try Self.clientError(fromCommandErrorFrame: response)
+            case "channel_closing":
+                throw clientError(fromChannelClosingFrame: response)
+            default:
+                throw RemoteClientError.protocolViolation("Expected hello_ack, got \(response.type).")
+            }
+        } catch {
+            task.cancel(with: .goingAway, reason: nil)
+            webSocketTask = nil
+            signer = nil
+            if case .revoked = state {
+                throw error
+            }
+            if let remoteError = error as? RemoteClientError {
+                throw remoteError
+            }
+            throw RemoteClientError.transport(String(describing: error))
+        }
+
+        stageParkedSubscriptionsForReconnect()
+        if hasTrackedSubscriptions {
+            do {
+                try await reconcileDesiredSubscriptions(throwingFor: [])
+            } catch let error as RemoteClientError where error.commandError != nil {
+                throw error
+            } catch {
+                await disconnect()
+                throw error
+            }
+        }
+    }
+
+    private func handleHelloAck(
+        _ frame: RemoteServerFrame,
+        expectedRecord record: PairedHostRecord,
+        task: URLSessionWebSocketTask,
+        signer localSigner: RemoteFrameSigner
+    ) throws {
+        let payload = frame.payload?.objectValue ?? [:]
+        if let deviceID = payload["device_id"]?.stringValue, deviceID != record.deviceID {
+            throw RemoteClientError.security("hello_ack device ID did not match the paired host record.")
+        }
+        let scopes = Set(payload["scopes"]?.arrayValue?.compactMap(\.stringValue) ?? Array(record.grantedScopes))
+        webSocketTask = task
+        signer = localSigner
+        connectedScopes = scopes
+        connectedHostName = payload["host_name"]?.stringValue
+        reconnectBackoff = initialReconnectBackoff
+        _ = try? registry.updateLastConnected(hostID: record.id, at: now())
+        transition(to: .connected(scopes: scopes))
+        startReadLoop(for: task)
+    }
+
+    private func mintTicket(for record: PairedHostRecord) async throws -> RemoteTicket {
+        let response: RemoteHostConnectionHTTPResponse
+        do {
+            response = try await httpTransport.postJSON(
+                to: RemoteGatewayOrigin(record.gatewayURL).endpoint(path: "/api/ticket"),
+                body: [
+                    "device_id": .string(record.deviceID),
+                    "scopes": .array(record.grantedScopes.sorted().map(JSONValue.string)),
+                    "ttl_seconds": .int(Int(RemoteTicket.maximumTTLMilliseconds / 1000))
+                ],
+                timeout: Self.ticketTimeout
+            )
+        } catch let error as RemoteClientError {
+            throw error
+        } catch let error as URLError where error.code == .timedOut {
+            throw RemoteClientError.timeout(operation: "ticket mint", seconds: Self.ticketTimeout)
+        } catch {
+            throw RemoteClientError.transport(error.localizedDescription)
+        }
+
+        guard (200 ..< 300).contains(response.statusCode) else {
+            throw ticketHTTPError(response)
+        }
+
+        let root: JSONValue
+        do {
+            root = try JSONDecoder().decode(JSONValue.self, from: response.data)
+        } catch {
+            throw RemoteClientError.invalidTicket("Ticket endpoint returned malformed JSON.")
+        }
+        guard let ticketValue = root.objectValue?["ticket"] else {
+            throw RemoteClientError.invalidTicket("Ticket endpoint did not include a ticket object.")
+        }
+        do {
+            let ticket = try RemoteTicket.parse(from: ticketValue)
+            try ticket.verify(hostPublicKeyRaw: record.hostPublicKey, nowMs: currentEpochMilliseconds(date: now()))
+            return ticket
+        } catch let error as RemoteTicketError {
+            throw RemoteClientError.invalidTicket(error.description)
+        }
+    }
+
+    private func ticketHTTPError(_ response: RemoteHostConnectionHTTPResponse) -> RemoteClientError {
+        Self.classifyTicketHTTPError(statusCode: response.statusCode, data: response.data)
+    }
+
+    static func classifyTicketHTTPError(statusCode: Int, data: Data) -> RemoteClientError {
+        let object = try? JSONDecoder().decode(JSONValue.self, from: data).objectValue
+        let code = object?["code"]?.stringValue
+        let message = object?["error"]?.stringValue
+            ?? object?["message"]?.stringValue
+            ?? object?["text"]?.stringValue
+            ?? "Ticket endpoint returned HTTP \(statusCode)."
+        if statusCode == 429 || code == "rate_limited" {
+            return .rateLimited(message: message)
+        }
+        if let code {
+            return RemoteClientError.fromCommandError(code: code, message: message)
+        }
+        return .transport(message)
+    }
+
+    private func currentHostRecord() throws -> PairedHostRecord {
+        guard registry.hasHosts else {
+            throw RemoteClientError.hostNotFound(hostID)
+        }
+        guard let record = try registry.host(id: hostID) else {
+            throw RemoteClientError.hostNotFound(hostID)
+        }
+        return record
+    }
+
+    // MARK: - Commands
+
+    private var hasTrackedSubscriptions: Bool {
+        !desiredSubscriptions.isEmpty || !parkedSubscriptions.isEmpty
+    }
+
+    private func stageParkedSubscriptionsForReconnect() {
+        guard !parkedSubscriptions.isEmpty else { return }
+        desiredSubscriptions.formUnion(parkedSubscriptions)
+        parkedSubscriptions.removeAll()
+    }
+
+    private func reconcileDesiredSubscriptions(throwingFor requestedSessionIDs: Set<String>) async throws {
+        await acquireSubscriptionReconciliationPermit()
+        defer { releaseSubscriptionReconciliationPermit() }
+
+        let pending = desiredSubscriptions.subtracting(acknowledgedSubscriptions)
+        guard !pending.isEmpty else { return }
+        do {
+            _ = try await sendSubscribeCommand(sessionIDs: pending.sorted())
+            let stillDesired = pending.intersection(desiredSubscriptions)
+            acknowledgedSubscriptions.formUnion(stillDesired)
+            parkedSubscriptions.subtract(stillDesired)
+        } catch {
+            guard Self.isBindingRequired(error) else { throw error }
+            try await subscribeIndividuallyAfterBindingRequired(
+                sessionIDs: pending,
+                throwingFor: requestedSessionIDs
+            )
+        }
+    }
+
+    private func subscribeIndividuallyAfterBindingRequired(
+        sessionIDs: Set<String>,
+        throwingFor requestedSessionIDs: Set<String>
+    ) async throws {
+        var retained: Set<String> = []
+        var requestedFailure: Error?
+        for sessionID in sessionIDs.sorted() {
+            guard desiredSubscriptions.contains(sessionID) else { continue }
+            do {
+                _ = try await sendSubscribeCommand(sessionIDs: [sessionID])
+                guard desiredSubscriptions.contains(sessionID) else { continue }
+                acknowledgedSubscriptions.insert(sessionID)
+                retained.insert(sessionID)
+            } catch {
+                if !Self.isCommandLevel(error) { throw error }
+                if requestedSessionIDs.contains(sessionID), requestedFailure == nil {
+                    requestedFailure = error
+                }
+            }
+        }
+        let failed = sessionIDs.subtracting(retained)
+        let stillDesiredFailures = failed.intersection(desiredSubscriptions)
+        desiredSubscriptions.subtract(stillDesiredFailures)
+        acknowledgedSubscriptions.subtract(stillDesiredFailures)
+        parkedSubscriptions.formUnion(stillDesiredFailures)
+        parkedSubscriptions.subtract(retained)
+        if let requestedFailure {
+            throw requestedFailure
+        }
+    }
+
+    private func acquireSubscriptionReconciliationPermit() async {
+        if !subscriptionReconciliationInFlight {
+            subscriptionReconciliationInFlight = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            subscriptionReconciliationWaiters.append(continuation)
+        }
+    }
+
+    private func releaseSubscriptionReconciliationPermit() {
+        if subscriptionReconciliationWaiters.isEmpty {
+            subscriptionReconciliationInFlight = false
+        } else {
+            subscriptionReconciliationWaiters.removeFirst().resume()
+        }
+    }
+
+    private func sendSubscribeCommand(sessionIDs: [String]) async throws -> JSONValue {
+        #if DEBUG
+            if let subscribeCommandHandlerForTesting {
+                return try await subscribeCommandHandlerForTesting(sessionIDs)
+            }
+        #endif
+        return try await sendConnectedCommand(
+            RemoteClientFrame(
+                type: "subscribe",
+                requestID: Self.makeRequestID(prefix: "sub"),
+                payload: .object([
+                    "session_ids": .array(sessionIDs.map(JSONValue.string))
+                ])
+            ),
+            timeout: Self.commandTimeout
+        )
+    }
+
+    private func sendUnsubscribeCommand(sessionIDs: [String]) async throws -> JSONValue {
+        try await sendConnectedCommand(
+            RemoteClientFrame(
+                type: "unsubscribe",
+                requestID: Self.makeRequestID(prefix: "unsub"),
+                payload: .object([
+                    "session_ids": .array(sessionIDs.map(JSONValue.string))
+                ])
+            ),
+            timeout: Self.commandTimeout
+        )
+    }
+
+    private func sendConnectedCommand(_ frame: RemoteClientFrame, timeout: TimeInterval) async throws -> JSONValue {
+        guard let task = webSocketTask, var localSigner = signer else {
+            throw RemoteClientError.connectionClosed
+        }
+        let requestID = frame.requestID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? frame.requestID!
+            : Self.makeRequestID(prefix: frame.type)
+        let frameWithRequestID = RemoteClientFrame(
+            v: frame.v,
+            type: frame.type,
+            requestID: requestID,
+            sessionID: frame.sessionID,
+            payload: frame.payload,
+            clientTime: frame.clientTime,
+            sig: frame.sig
+        )
+        let signed: RemoteSignedFrame
+        do {
+            signed = try localSigner.sign(frameWithRequestID, nowMs: currentEpochMilliseconds(date: now()))
+        } catch {
+            throw RemoteClientError.transport(String(describing: error))
+        }
+        signer = localSigner
+        persistCounter(signed.signature.counter)
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let timeoutTask = Task { [weak self] in
+                    do {
+                        try await Self.sleep(seconds: timeout)
+                        await self?.timeoutPendingCommand(
+                            requestID: requestID,
+                            operation: frame.type,
+                            timeout: timeout
+                        )
+                    } catch {
+                        // Cancellation is expected once the command resolves.
+                    }
+                }
+                pendingCommands[requestID] = PendingCommand(
+                    continuation: continuation,
+                    timeoutTask: timeoutTask
+                )
+                Task { [weak self] in
+                    do {
+                        try await task.send(.string(String(decoding: signed.data, as: UTF8.self)))
+                    } catch {
+                        await self?.failPendingCommand(
+                            requestID: requestID,
+                            with: RemoteClientError.transport(error.localizedDescription)
+                        )
+                    }
+                }
+            }
+        } onCancel: {
+            Task { [weak self] in
+                await self?.failPendingCommand(requestID: requestID, with: RemoteClientError.connectionClosed)
+            }
+        }
+    }
+
+    private func completePendingCommand(requestID: String, payload: JSONValue) {
+        guard let pending = pendingCommands.removeValue(forKey: requestID) else { return }
+        pending.timeoutTask.cancel()
+        pending.continuation.resume(returning: payload)
+    }
+
+    private func failPendingCommand(requestID: String, with error: Error) {
+        guard let pending = pendingCommands.removeValue(forKey: requestID) else { return }
+        pending.timeoutTask.cancel()
+        pending.continuation.resume(throwing: error)
+    }
+
+    private func timeoutPendingCommand(requestID: String, operation: String, timeout: TimeInterval) {
+        failPendingCommand(
+            requestID: requestID,
+            with: RemoteClientError.timeout(operation: operation, seconds: timeout)
+        )
+    }
+
+    private func failAllPending(with error: Error) {
+        let pending = pendingCommands
+        pendingCommands.removeAll()
+        for command in pending.values {
+            command.timeoutTask.cancel()
+            command.continuation.resume(throwing: error)
+        }
+    }
+
+    // MARK: - Read loop
+
+    private func startReadLoop(for task: URLSessionWebSocketTask) {
+        readTask?.cancel()
+        readTask = Task { [weak self] in
+            guard let self else { return }
+            await readLoop(task: task)
+        }
+    }
+
+    private func readLoop(task: URLSessionWebSocketTask) async {
+        while !Task.isCancelled {
+            do {
+                let frame = try await receiveServerFrame(over: task, timeout: nil)
+                await handleIncomingFrame(frame)
+            } catch {
+                await handleReadLoopTermination(error)
+                return
+            }
+        }
+    }
+
+    private func handleIncomingFrame(_ frame: RemoteServerFrame) async {
+        guard RemoteWireProtocol.serverFrameTypes.contains(frame.type) else {
+            // Additive-evolution rule: unknown server frames are ignored.
+            return
+        }
+
+        switch frame.type {
+        case "command_result":
+            if let requestID = frame.requestID {
+                completePendingCommand(requestID: requestID, payload: frame.payload ?? .null)
+            }
+        case "pong":
+            if let requestID = frame.requestID {
+                completePendingCommand(requestID: requestID, payload: frame.payload ?? .object([:]))
+            }
+        case "command_error":
+            do {
+                let error = try Self.clientError(fromCommandErrorFrame: frame)
+                if let requestID = frame.requestID, pendingCommands[requestID] != nil {
+                    failPendingCommand(requestID: requestID, with: error)
+                } else {
+                    handleUncorrelatedCommandError(error)
+                }
+            } catch {
+                if let requestID = frame.requestID, pendingCommands[requestID] != nil {
+                    failPendingCommand(requestID: requestID, with: error)
+                }
+            }
+        case "channel_closing":
+            let error = clientError(fromChannelClosingFrame: frame)
+            if case .revoked = error {
+                markRevoked()
+            } else {
+                let code = error.commandError?.code ?? "channel_closing"
+                webSocketTask?.cancel(with: .goingAway, reason: nil)
+                webSocketTask = nil
+                signer = nil
+                connectedScopes = []
+                connectedHostName = nil
+                acknowledgedSubscriptions.removeAll()
+                readTask?.cancel()
+                readTask = nil
+                scheduleReconnectIfNeeded(reason: code)
+            }
+            failAllPending(with: error)
+        default:
+            inboundContinuation.yield(frame)
+        }
+    }
+
+    private func handleUncorrelatedCommandError(_ error: RemoteClientError) {
+        guard let commandError = error.commandError else { return }
+        switch commandError.code {
+        case "device_revoked":
+            markRevoked()
+            failAllPending(with: error)
+        case "unknown_device":
+            transition(to: .degraded(code: commandError.code, retryAt: now().addingTimeInterval(reconnectBackoff)))
+            failAllPending(with: error)
+            scheduleReconnectIfNeeded(reason: commandError.code)
+        case "counter_replayed":
+            persistCounter(UInt64(max(0, currentEpochMilliseconds(date: now()))) + 1)
+            transition(to: .degraded(code: commandError.code, retryAt: now().addingTimeInterval(reconnectBackoff)))
+            failAllPending(with: error)
+            scheduleReconnectIfNeeded(reason: commandError.code)
+        case "unsupported_frame_type":
+            // Unknown/unmatched server-side command errors can arrive for probes from
+            // older hosts. They are intentionally uncorrelated and safe to ignore here.
+            return
+        default:
+            return
+        }
+    }
+
+    private func handleReadLoopTermination(_ error: Error) async {
+        if Task.isCancelled { return }
+        if case .revoked = state { return }
+        webSocketTask = nil
+        signer = nil
+        connectedScopes = []
+        connectedHostName = nil
+        acknowledgedSubscriptions.removeAll()
+        failAllPending(with: RemoteClientError.connectionClosed)
+        guard hasTrackedSubscriptions else {
+            transition(to: .idle)
+            return
+        }
+        let code: String = if let remoteError = error as? RemoteClientError, let commandError = remoteError.commandError {
+            commandError.code
+        } else {
+            "transport_closed"
+        }
+        scheduleReconnectIfNeeded(reason: code)
+    }
+
+    private func scheduleReconnectIfNeeded(reason: String) {
+        guard reconnectTask == nil, hasTrackedSubscriptions else { return }
+        let delay = reconnectBackoff
+        reconnectBackoff = min(reconnectBackoff * 2, maximumReconnectBackoff)
+        #if DEBUG
+            reconnectScheduleCount += 1
+        #endif
+        transition(to: .degraded(code: reason, retryAt: now().addingTimeInterval(delay)))
+        reconnectTask = Task { [weak self] in
+            do {
+                try await Self.sleep(seconds: delay)
+            } catch {
+                return
+            }
+            await self?.retryAfterBackoff()
+        }
+    }
+
+    private func retryAfterBackoff() async {
+        reconnectTask = nil
+        guard hasTrackedSubscriptions else {
+            transition(to: .idle)
+            return
+        }
+        do {
+            try await ensureConnected()
+        } catch {
+            if case .revoked = state { return }
+            let reason = (error as? RemoteClientError)?.commandError?.code ?? "reconnect_failed"
+            scheduleReconnectIfNeeded(reason: reason)
+        }
+    }
+
+    // MARK: - Revocation / counters / state
+
+    private func markRevoked() {
+        _ = try? registry.markRevokedByHost(hostID: hostID, at: now())
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        connectTask?.cancel()
+        connectTask = nil
+        flushPendingCounter()
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+        signer = nil
+        connectedScopes = []
+        connectedHostName = nil
+        acknowledgedSubscriptions.removeAll()
+        failAllPending(with: RemoteClientError.hostRevoked(hostID))
+        transition(to: .revoked)
+    }
+
+    private func counterFloor(for record: PairedHostRecord) -> UInt64 {
+        max(record.lastCounter, pendingCounterWrite ?? 0)
+    }
+
+    private func persistCounter(_ counter: UInt64) {
+        pendingCounterWrite = max(pendingCounterWrite ?? 0, counter)
+        scheduleCounterFlushIfNeeded()
+    }
+
+    private func scheduleCounterFlushIfNeeded() {
+        guard counterWriteTask == nil else { return }
+        counterWriteTask = Task { [weak self] in
+            do {
+                try await Self.sleep(seconds: counterWriteCoalescingDelay)
+            } catch {
+                return
+            }
+            await self?.flushPendingCounter()
+        }
+    }
+
+    private func flushPendingCounter() {
+        counterWriteTask?.cancel()
+        counterWriteTask = nil
+        guard let counter = pendingCounterWrite else { return }
+        pendingCounterWrite = nil
+        _ = try? registry.updateLastCounter(hostID: hostID, counter: counter)
+    }
+
+    private func transition(to newState: State) {
+        guard state != newState else { return }
+        state = newState
+        stateContinuation.yield(newState)
+    }
+
+    // MARK: - Wire helpers
+
+    private func send(_ data: Data, over task: URLSessionWebSocketTask) async throws {
+        try await task.send(.string(String(decoding: data, as: UTF8.self)))
+    }
+
+    private func receiveServerFrame(
+        over task: URLSessionWebSocketTask,
+        timeout: TimeInterval?
+    ) async throws -> RemoteServerFrame {
+        let message: URLSessionWebSocketTask.Message = if let timeout {
+            try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+                group.addTask {
+                    try await task.receive()
+                }
+                group.addTask {
+                    try await Self.sleep(seconds: timeout)
+                    throw RemoteClientError.timeout(operation: "receive", seconds: timeout)
+                }
+                guard let first = try await group.next() else {
+                    throw RemoteClientError.connectionClosed
+                }
+                group.cancelAll()
+                return first
+            }
+        } else {
+            try await task.receive()
+        }
+        let data: Data = switch message {
+        case let .string(text):
+            Data(text.utf8)
+        case let .data(payload):
+            payload
+        @unknown default:
+            Data()
+        }
+        do {
+            return try RemoteWireProtocol.decodeServerFrame(from: data)
+        } catch {
+            throw RemoteClientError.protocolViolation(String(describing: error))
+        }
+    }
+
+    private static func clientError(fromCommandErrorFrame frame: RemoteServerFrame) throws -> RemoteClientError {
+        guard let object = frame.payload?.objectValue,
+              let code = object["code"]?.stringValue
+        else {
+            throw RemoteClientError.protocolViolation("command_error missing code.")
+        }
+        let message = object["message"]?.stringValue ?? code
+        return RemoteClientError.fromCommandError(
+            code: code,
+            message: message,
+            details: object["details"]
+        )
+    }
+
+    private func clientError(fromChannelClosingFrame frame: RemoteServerFrame) -> RemoteClientError {
+        let object = frame.payload?.objectValue ?? [:]
+        let reason = object["reason"]?.stringValue ?? "channel_closing"
+        let message = object["message"]?.stringValue ?? reason
+        return RemoteClientError.fromCommandError(code: reason, message: message, details: frame.payload)
+    }
+
+    private static func makeRequestID(prefix: String) -> String {
+        "\(prefix)-\(UUID().uuidString.lowercased())"
+    }
+
+    private static func normalizedSessionIDs(_ sessionIDs: [String]) -> Set<String> {
+        Set(sessionIDs.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })
+    }
+
+    private static func isBindingRequired(_ error: Error) -> Bool {
+        (error as? RemoteClientError)?.commandError?.code == "binding_required"
+    }
+
+    private static func isCommandLevel(_ error: Error) -> Bool {
+        (error as? RemoteClientError)?.commandError != nil
+    }
+
+    private static func sleep(seconds: TimeInterval) async throws {
+        let nanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
+        try await Task.sleep(nanoseconds: nanoseconds)
+    }
+}
+
+private struct PendingCommand {
+    let continuation: CheckedContinuation<JSONValue, Error>
+    let timeoutTask: Task<Void, Never>
+}

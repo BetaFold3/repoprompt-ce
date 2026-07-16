@@ -263,7 +263,7 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
         XCTAssertTrue(state.eofResiduals.isEmpty)
     }
 
-    func testAppAndCLISocketReaderCopiesRemainIdentical() throws {
+    func testAppAndClientKitSocketReaderCopiesRemainIdentical() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0 ..< 4 {
             root.deleteLastPathComponent()
@@ -274,12 +274,12 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
                 "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift"
             )
         )
-        let cliCopy = try Data(
+        let clientKitCopy = try Data(
             contentsOf: root.appendingPathComponent(
-                "Sources/RepoPromptMCP/Shared/NewlineDelimitedSocketReader.swift"
+                "Sources/RepoPromptMCPClientKit/Shared/NewlineDelimitedSocketReader.swift"
             )
         )
-        XCTAssertEqual(appCopy, cliCopy)
+        XCTAssertEqual(appCopy, clientKitCopy)
     }
 
     private func makeReader(

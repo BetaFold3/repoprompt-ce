@@ -280,16 +280,22 @@ final class GitBlobCapabilityBoundCatFileTests: XCTestCase {
         at root: URL,
         gitService: GitService
     ) async throws -> GitCodemapRootCapability {
-        let state = await WorkspaceCodemapGitCapabilityService(
+        let service = WorkspaceCodemapGitCapabilityService(
             gitService: gitService,
             namespaceSalt: Data(repeating: 0x42, count: GitBlobRepositoryNamespace.saltByteCount)
-        ).resolve(
-            root: WorkspaceCodemapGitCapabilityRequest(
-                rootID: UUID(),
-                rootLifetimeID: UUID(),
-                loadedRootURL: root
-            )
         )
+        let request = WorkspaceCodemapGitCapabilityRequest(
+            rootID: UUID(),
+            rootLifetimeID: UUID(),
+            loadedRootURL: root
+        )
+        var state = await service.resolve(root: request)
+        for _ in 0 ..< 10 {
+            if case let .eligible(capability) = state { return capability }
+            guard case .transientUnavailable(reason: .repositoryChanging, retryGeneration: _) = state else { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+            state = await service.resolve(root: request)
+        }
         guard case let .eligible(capability) = state else {
             throw NSError(
                 domain: "GitBlobCapabilityBoundCatFileTests.capability",

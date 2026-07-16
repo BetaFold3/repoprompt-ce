@@ -1224,6 +1224,9 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil) }
             return await captureRequestMetadata()
         },
+        isGatewayPrincipalConnection: { connectionID in
+            await ServerNetworkManager.shared.isGatewayPrincipalConnection(connectionID)
+        },
         resolveImplicitContextBuilderGitTarget: { [weak self] metadata in
             guard let self else {
                 throw MCPError.internalError("Window deallocated while resolving the Context Builder Git target")
@@ -1599,6 +1602,7 @@ final class MCPServerViewModel: ObservableObject {
             MCPWorktreeToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPContextBuilderToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAskUserToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            MCPRemotePairingToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)

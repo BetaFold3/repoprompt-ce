@@ -8,7 +8,7 @@ CONFIGURATION="${CONFIGURATION:-Debug}"
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 usage(){
     cat >&2 <<'EOF'
-Usage: Scripts/xcode_developer_workflow.sh {app|mcp|test|prepare-app-run}
+Usage: Scripts/xcode_developer_workflow.sh {app|mcp|gateway|test|prepare-app-run}
 This debug-only Xcode convenience delegates to conductor by default.
 REPOPROMPT_XCODE_UNCOORDINATED=1 is build/test-only; Xcode Run requires conductor.
 EOF
@@ -55,7 +55,7 @@ sanitize_xcode_build_environment(){
 }
 
 [[ -n "$ACTION" ]] || usage
-case "$ACTION" in app|mcp|test|prepare-app-run) ;; *) usage ;; esac
+case "$ACTION" in app|mcp|gateway|test|prepare-app-run) ;; *) usage ;; esac
 [[ "$CONFIGURATION" == "Debug" ]] || fail "The generated Xcode workflow is Debug-only; use the repository release workflow for '$CONFIGURATION'."
 
 cd "$ROOT_DIR"
@@ -74,6 +74,7 @@ case "$ACTION" in
         fi
         [[ -x .build/debug/RepoPrompt.app/Contents/MacOS/RepoPrompt ]] || fail "packaged RepoPrompt executable is missing"
         [[ -x .build/debug/RepoPrompt.app/Contents/MacOS/repoprompt-mcp ]] || fail "embedded repoprompt-mcp is missing"
+        [[ -x .build/debug/RepoPrompt.app/Contents/MacOS/repoprompt-gateway ]] || fail "embedded repoprompt-gateway is missing"
         ;;
     mcp)
         if [[ "${REPOPROMPT_XCODE_UNCOORDINATED:-0}" == "1" ]]; then
@@ -82,6 +83,14 @@ case "$ACTION" in
             ./conductor swift-build --product repoprompt-mcp
         fi
         [[ -x .build/debug/repoprompt-mcp ]] || fail "debug repoprompt-mcp executable is missing"
+        ;;
+    gateway)
+        if [[ "${REPOPROMPT_XCODE_UNCOORDINATED:-0}" == "1" ]]; then
+            ./Scripts/run_without_github_tokens.sh swift build -c debug --product repoprompt-gateway
+        else
+            ./conductor swift-build --product repoprompt-gateway
+        fi
+        [[ -x .build/debug/repoprompt-gateway ]] || fail "debug repoprompt-gateway executable is missing"
         ;;
     test)
         if [[ "${REPOPROMPT_XCODE_UNCOORDINATED:-0}" == "1" ]]; then

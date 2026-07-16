@@ -1,0 +1,11 @@
+{
+  "name": "RepoPrompt Remote",
+  "short_name": "RP Remote",
+  "description": "Remote control for RepoPrompt CE agent sessions.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1216",
+  "theme_color": "#0f1216",
+  "icons": []
+}
