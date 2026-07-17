@@ -2822,6 +2822,117 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testTwoCoordinatorsOnSharedConnectionReceiveFramesAndReleaseSubscriptionsOnDeinit() async throws {
+        let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
+        let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
+        let keyStore = RemoteClientKeyStore(
+            keychain: InMemoryRemoteClientKeychain(),
+            accessMode: .nonInteractive(reason: .test)
+        )
+        let record = try RemoteHostTestSupport.hostRecord(displayName: "Studio Mac")
+        try registry.upsertHost(record)
+        let fanoutConnection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        let firstSessionConnection = RecordingRemoteAgentSessionConnection()
+        let secondSessionConnection = RecordingRemoteAgentSessionConnection()
+        let firstController = RemoteAgentSessionController(
+            binding: makeBinding(hostID: record.id, remoteSessionID: "remote-session-1", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: firstSessionConnection
+        )
+        let secondController = RemoteAgentSessionController(
+            binding: makeBinding(hostID: record.id, remoteSessionID: "remote-session-2", lastAppliedSeq: 0, nextLogOffset: 0),
+            connection: secondSessionConnection
+        )
+        let firstTabID = UUID()
+        let secondTabID = UUID()
+        var firstCoordinator: RemoteAgentModeCoordinator? = RemoteAgentModeCoordinator()
+        var secondCoordinator: RemoteAgentModeCoordinator? = RemoteAgentModeCoordinator()
+        let weakFirstCoordinator = RemoteAgentSessionWeakBox(firstCoordinator)
+        var firstConnectionStates: [RemoteHostConnection.State] = []
+        var secondConnectionStates: [RemoteHostConnection.State] = []
+        firstCoordinator?.test_setConnectionStateDeliveryObserver { _, state in
+            firstConnectionStates.append(state)
+        }
+        secondCoordinator?.test_setConnectionStateDeliveryObserver { _, state in
+            secondConnectionStates.append(state)
+        }
+        defer {
+            firstCoordinator?.stop(tabID: firstTabID)
+            secondCoordinator?.stop(tabID: secondTabID)
+            Task {
+                await firstController.shutdown()
+                await secondController.shutdown()
+            }
+        }
+
+        firstCoordinator?.test_attachController(
+            tabID: firstTabID,
+            hostID: record.id,
+            controller: firstController,
+            connection: fanoutConnection
+        )
+        secondCoordinator?.test_attachController(
+            tabID: secondTabID,
+            hostID: record.id,
+            controller: secondController,
+            connection: fanoutConnection
+        )
+        await waitForDeterministicRemoteAgentSessionCondition {
+            let inboundCount = await fanoutConnection.inboundSubscriberCountForTesting()
+            let stateCount = await fanoutConnection.stateSubscriberCountForTesting()
+            return inboundCount == 2 && stateCount == 2
+        }
+
+        let degradedState = RemoteHostConnection.State.degraded(
+            code: "test_reconnect",
+            retryAt: Date(timeIntervalSince1970: 0)
+        )
+        await fanoutConnection.transitionForTesting(to: degradedState)
+        await waitForDeterministicRemoteAgentSessionCondition {
+            firstConnectionStates.contains(degradedState)
+                && secondConnectionStates.contains(degradedState)
+        }
+
+        await fanoutConnection.handleServerFrameForTesting(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-2",
+            seq: 1,
+            payload: Self.snapshotPayload()
+        ))
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await secondController.currentBinding()?.lastAppliedSeq == 1
+        }
+        let firstSequenceAfterSecondFrame = await firstController.currentBinding()?.lastAppliedSeq
+        XCTAssertEqual(firstSequenceAfterSecondFrame, 0)
+
+        await fanoutConnection.handleServerFrameForTesting(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-1",
+            seq: 1,
+            payload: Self.snapshotPayload()
+        ))
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await firstController.currentBinding()?.lastAppliedSeq == 1
+        }
+
+        firstCoordinator = nil
+        await waitForDeterministicRemoteAgentSessionCondition {
+            let inboundCount = await fanoutConnection.inboundSubscriberCountForTesting()
+            let stateCount = await fanoutConnection.stateSubscriberCountForTesting()
+            return weakFirstCoordinator.value == nil && inboundCount == 1 && stateCount == 1
+        }
+
+        await fanoutConnection.handleServerFrameForTesting(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "remote-session-2",
+            seq: 2,
+            payload: Self.snapshotPayload()
+        ))
+        await waitForDeterministicRemoteAgentSessionCondition {
+            await secondController.currentBinding()?.lastAppliedSeq == 2
+        }
+    }
+
+    @MainActor
     private func makeRemoteNamingFixture(
         tabTitle: String,
         childDiscoveryDebounceInterval: TimeInterval = 3,

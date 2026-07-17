@@ -81,6 +81,7 @@ final class RemoteAgentModeCoordinator {
         private var materializedRemoteWorkspaceAttachHandler: (@MainActor (AgentModeViewModel.TabSession) async throws -> Void)?
         private var childDiscoveryRequestObserver: ((UUID, Bool) -> Void)?
         private var syntheticSettlementRevertScanObserver: ((UUID) -> Void)?
+        private var connectionStateDeliveryObserver: ((String, RemoteHostConnection.State) -> Void)?
     #endif
 
     init(
@@ -97,6 +98,19 @@ final class RemoteAgentModeCoordinator {
             try RemoteHostConnectionManager.shared.connection(for: $0)
         }
         self.childDiscoveryDebounceInterval = childDiscoveryDebounceInterval
+    }
+
+    deinit {
+        for tasks in connectionTasksByHostID.values {
+            tasks.inbound.cancel()
+            tasks.state.cancel()
+        }
+        for task in eventTasksByTabID.values {
+            task.cancel()
+        }
+        for task in childDiscoveryTasksByKey.values {
+            task.cancel()
+        }
     }
 
     func attach(viewModel: AgentModeViewModel) {
@@ -298,13 +312,18 @@ final class RemoteAgentModeCoordinator {
     private func startConnectionFanoutIfNeeded(hostID: String, connection: RemoteHostConnection) {
         guard connectionTasksByHostID[hostID] == nil else { return }
         let inbound = Task { [weak self] in
-            for await frame in connection.inboundFrames {
-                await self?.deliver(frame, hostID: hostID)
+            // Frames before subscription are reconciled by the controller's attach-and-catch-up path.
+            let frames = await connection.inboundFramesStream()
+            for await frame in frames {
+                guard let self else { return }
+                await deliver(frame, hostID: hostID)
             }
         }
         let state = Task { [weak self] in
-            for await state in connection.stateEvents {
-                await self?.deliver(state, hostID: hostID)
+            let states = await connection.stateEventsStream()
+            for await state in states {
+                guard let self else { return }
+                await deliver(state, hostID: hostID)
             }
         }
         connectionTasksByHostID[hostID] = HostConnectionTasks(inbound: inbound, state: state)
@@ -321,13 +340,21 @@ final class RemoteAgentModeCoordinator {
         let controllers = controllersByTabID.compactMap { tabID, controller in
             hostIDByTabID[tabID] == hostID ? controller : nil
         }
+        guard !controllers.isEmpty else {
+            Self.logger.notice("remote inbound frame dropped host_id=\(hostID, privacy: .public) type=\(frame.type, privacy: .public) session_id=\(frame.sessionID ?? "", privacy: .public) seq=\(frame.seq ?? 0) has_seq=\(frame.seq != nil) reason=no_matching_controller")
+            return
+        }
         for controller in controllers {
             await controller.handleInboundFrame(frame)
         }
     }
 
     private func deliver(_ state: RemoteHostConnection.State, hostID: String) async {
+        #if DEBUG
+            connectionStateDeliveryObserver?(hostID, state)
+        #endif
         if case let .connected(scopes) = state {
+            // Late coordinators receive a replayed connected state, so these refreshes must remain idempotent.
             workspaceSessionCatalogStore.invalidate(hostID: hostID)
             if scopes.contains("sessions:operate") {
                 workspaceOpenEpisodes = workspaceOpenEpisodes.filter { $0.key.hostID != hostID }
@@ -1575,6 +1602,12 @@ final class RemoteAgentModeCoordinator {
                 hostFanoutTasks: connectionTasksByHostID.count,
                 tabHostBindings: hostIDByTabID.count
             )
+        }
+
+        func test_setConnectionStateDeliveryObserver(
+            _ observer: ((String, RemoteHostConnection.State) -> Void)?
+        ) {
+            connectionStateDeliveryObserver = observer
         }
 
         func test_applyMetadata(

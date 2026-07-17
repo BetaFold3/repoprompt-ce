@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 import RepoPromptRemoteWire
 
 struct RemoteHostConnectionHTTPResponse: Equatable {
@@ -45,6 +46,8 @@ struct RemoteHostConnectionTestResult: Equatable {
 }
 
 actor RemoteHostConnection {
+    private static let logger = Logger(subsystem: "com.repoprompt.remote-hosts", category: "RemoteHostConnection")
+
     enum State: Equatable {
         case idle
         case mintingTicket
@@ -61,9 +64,6 @@ actor RemoteHostConnection {
     static let maximumReconnectBackoff: TimeInterval = 30
     static let counterWriteCoalescingDelay: TimeInterval = 0.25
 
-    nonisolated let inboundFrames: AsyncStream<RemoteServerFrame>
-    nonisolated let stateEvents: AsyncStream<State>
-
     let hostID: String
 
     private let registry: RemoteHostRegistry
@@ -75,9 +75,8 @@ actor RemoteHostConnection {
     private let maximumReconnectBackoff: TimeInterval
     private let now: @Sendable () -> Date
 
-    private let inboundContinuation: AsyncStream<RemoteServerFrame>.Continuation
-    private let stateContinuation: AsyncStream<State>.Continuation
-
+    private var inboundSubscribers: [UUID: AsyncStream<RemoteServerFrame>.Continuation] = [:]
+    private var stateSubscribers: [UUID: AsyncStream<State>.Continuation] = [:]
     private var state: State = .idle
     private var webSocketTask: URLSessionWebSocketTask?
     private var signer: RemoteFrameSigner?
@@ -122,23 +121,18 @@ actor RemoteHostConnection {
         self.maximumReconnectBackoff = maximumReconnectBackoff
         self.now = now
         reconnectBackoff = initialReconnectBackoff
-
-        let inbound = AsyncStream.makeStream(of: RemoteServerFrame.self)
-        inboundFrames = inbound.stream
-        inboundContinuation = inbound.continuation
-
-        let states = AsyncStream.makeStream(of: State.self)
-        stateEvents = states.stream
-        stateContinuation = states.continuation
-        stateContinuation.yield(.idle)
     }
 
     deinit {
         if let counter = pendingCounterWrite {
             _ = try? registry.updateLastCounter(hostID: hostID, counter: counter)
         }
-        inboundContinuation.finish()
-        stateContinuation.finish()
+        for continuation in inboundSubscribers.values {
+            continuation.finish()
+        }
+        for continuation in stateSubscribers.values {
+            continuation.finish()
+        }
         readTask?.cancel()
         reconnectTask?.cancel()
         connectTask?.cancel()
@@ -148,6 +142,35 @@ actor RemoteHostConnection {
 
     func currentState() -> State {
         state
+    }
+
+    func inboundFramesStream() -> AsyncStream<RemoteServerFrame> {
+        let subscriberID = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(of: RemoteServerFrame.self)
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeInboundSubscriber(subscriberID) }
+        }
+        inboundSubscribers[subscriberID] = continuation
+        return stream
+    }
+
+    func stateEventsStream() -> AsyncStream<State> {
+        let subscriberID = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(of: State.self)
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeStateSubscriber(subscriberID) }
+        }
+        continuation.yield(state)
+        stateSubscribers[subscriberID] = continuation
+        return stream
+    }
+
+    private func removeInboundSubscriber(_ subscriberID: UUID) {
+        inboundSubscribers.removeValue(forKey: subscriberID)
+    }
+
+    private func removeStateSubscriber(_ subscriberID: UUID) {
+        stateSubscribers.removeValue(forKey: subscriberID)
     }
 
     func ensureConnected() async throws {
@@ -282,6 +305,10 @@ actor RemoteHostConnection {
             await handleIncomingFrame(frame)
         }
 
+        func transitionForTesting(to state: State) {
+            transition(to: state)
+        }
+
         func persistCounterForTesting(_ counter: UInt64) {
             persistCounter(counter)
         }
@@ -292,6 +319,14 @@ actor RemoteHostConnection {
 
         func reconnectScheduleCountForTesting() -> Int {
             reconnectScheduleCount
+        }
+
+        func inboundSubscriberCountForTesting() -> Int {
+            inboundSubscribers.count
+        }
+
+        func stateSubscriberCountForTesting() -> Int {
+            stateSubscribers.count
         }
 
         func hasReconnectTaskForTesting() -> Bool {
@@ -819,7 +854,14 @@ actor RemoteHostConnection {
             }
             failAllPending(with: error)
         default:
-            inboundContinuation.yield(frame)
+            guard !inboundSubscribers.isEmpty else {
+                let droppedHostID = hostID
+                Self.logger.notice("remote inbound frame dropped host_id=\(droppedHostID, privacy: .public) type=\(frame.type, privacy: .public) session_id=\(frame.sessionID ?? "", privacy: .public) seq=\(frame.seq ?? 0) has_seq=\(frame.seq != nil) reason=no_subscribers")
+                return
+            }
+            for continuation in inboundSubscribers.values {
+                continuation.yield(frame)
+            }
         }
     }
 
@@ -960,7 +1002,9 @@ actor RemoteHostConnection {
     private func transition(to newState: State) {
         guard state != newState else { return }
         state = newState
-        stateContinuation.yield(newState)
+        for continuation in stateSubscribers.values {
+            continuation.yield(newState)
+        }
     }
 
     // MARK: - Wire helpers

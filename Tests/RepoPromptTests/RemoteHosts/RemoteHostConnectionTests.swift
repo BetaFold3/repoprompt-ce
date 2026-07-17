@@ -511,7 +511,8 @@ final class RemoteHostConnectionTests: XCTestCase {
     func testUnknownServerFramesAreIgnored() async throws {
         let record = try upsertClientRecord()
         let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
-        let frameTask = nextFrameTask(from: connection.inboundFrames, timeout: 0.2)
+        let inboundFrames = await connection.inboundFramesStream()
+        let frameTask = nextFrameTask(from: inboundFrames, timeout: 0.2)
 
         await connection.handleServerFrameForTesting(RemoteServerFrame(type: "future_frame"))
 
@@ -528,7 +529,8 @@ final class RemoteHostConnectionTests: XCTestCase {
     func testInboundStreamYieldsKnownServerFrames() async throws {
         let record = try upsertClientRecord()
         let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
-        let frameTask = nextFrameTask(from: connection.inboundFrames, ofType: "session_update", timeout: 1)
+        let inboundFrames = await connection.inboundFramesStream()
+        let frameTask = nextFrameTask(from: inboundFrames, ofType: "session_update", timeout: 1)
 
         await connection.handleServerFrameForTesting(RemoteServerFrame(
             type: "session_update",
@@ -540,6 +542,118 @@ final class RemoteHostConnectionTests: XCTestCase {
         let frame = try await frameTask.value
         XCTAssertEqual(frame.type, "session_update")
         XCTAssertEqual(frame.sessionID, "session-a")
+    }
+
+    func testInboundFramesMulticastToAllSubscribers() async throws {
+        let record = try upsertClientRecord()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        let firstFrames = await connection.inboundFramesStream()
+        let secondFrames = await connection.inboundFramesStream()
+        let firstFrameTask = nextFrameTask(from: firstFrames, ofType: "session_update", timeout: 1)
+        let secondFrameTask = nextFrameTask(from: secondFrames, ofType: "session_update", timeout: 1)
+        let expectedFrame = RemoteServerFrame(
+            type: "session_update",
+            sessionID: "session-a",
+            seq: 1,
+            payload: GatewayTestHelpers.snapshot(sessionID: "session-a", status: "running")
+        )
+
+        await connection.handleServerFrameForTesting(expectedFrame)
+
+        let firstFrame = try await firstFrameTask.value
+        let secondFrame = try await secondFrameTask.value
+        XCTAssertEqual(firstFrame.type, expectedFrame.type)
+        XCTAssertEqual(firstFrame.sessionID, expectedFrame.sessionID)
+        XCTAssertEqual(firstFrame.seq, expectedFrame.seq)
+        XCTAssertEqual(secondFrame.type, expectedFrame.type)
+        XCTAssertEqual(secondFrame.sessionID, expectedFrame.sessionID)
+        XCTAssertEqual(secondFrame.seq, expectedFrame.seq)
+    }
+
+    func testStateEventsReplayCurrentStateAndMulticastTransitions() async throws {
+        let record = try upsertClientRecord()
+        await enqueueTicket()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        let firstStates = await connection.stateEventsStream()
+        let secondStates = await connection.stateEventsStream()
+        let firstStateTask = nextConnectedStateTask(from: firstStates, timeout: 5)
+        let secondStateTask = nextConnectedStateTask(from: secondStates, timeout: 5)
+
+        try await connection.ensureConnected()
+
+        let firstObservation = try await firstStateTask.value
+        let secondObservation = try await secondStateTask.value
+        XCTAssertEqual(firstObservation.initial, .idle)
+        XCTAssertEqual(secondObservation.initial, .idle)
+        XCTAssertEqual(firstObservation.connected, .connected(scopes: record.grantedScopes))
+        XCTAssertEqual(secondObservation.connected, .connected(scopes: record.grantedScopes))
+
+        let lateStates = await connection.stateEventsStream()
+        var lateIterator = lateStates.makeAsyncIterator()
+        let replayedState = await lateIterator.next()
+        XCTAssertEqual(replayedState, .connected(scopes: record.grantedScopes))
+        await connection.disconnect()
+    }
+
+    func testCancelledInboundSubscriberIsRemovedAndRemainingSubscriberReceivesFrames() async throws {
+        let record = try upsertClientRecord()
+        let connection = RemoteHostConnection(hostID: record.id, registry: registry, keyStore: keyStore)
+        let cancelledFrames = await connection.inboundFramesStream()
+        let remainingFrames = await connection.inboundFramesStream()
+        let cancelledStates = await connection.stateEventsStream()
+        let cancelledTask = Task {
+            var iterator = cancelledFrames.makeAsyncIterator()
+            return await iterator.next()
+        }
+        let cancelledStateTask = Task {
+            var iterator = cancelledStates.makeAsyncIterator()
+            _ = await iterator.next()
+            return await iterator.next()
+        }
+        await Task.yield()
+
+        cancelledTask.cancel()
+        cancelledStateTask.cancel()
+        let cancelledFrame = await cancelledTask.value
+        let cancelledState = await cancelledStateTask.value
+        XCTAssertNil(cancelledFrame)
+        XCTAssertNil(cancelledState)
+        await waitForInboundSubscriberCount(1, connection: connection)
+        await waitForStateSubscriberCount(0, connection: connection)
+
+        let remainingTask = nextFrameTask(from: remainingFrames, ofType: "session_update", timeout: 1)
+        await connection.handleServerFrameForTesting(RemoteServerFrame(
+            type: "session_update",
+            sessionID: "session-a",
+            seq: 1,
+            payload: GatewayTestHelpers.snapshot(sessionID: "session-a", status: "running")
+        ))
+
+        let remainingFrame = try await remainingTask.value
+        XCTAssertEqual(remainingFrame.sessionID, "session-a")
+        XCTAssertEqual(remainingFrame.seq, 1)
+    }
+
+    func testConnectionDeinitFinishesSubscriberStreams() async throws {
+        let record = try upsertClientRecord()
+        var connection: RemoteHostConnection? = RemoteHostConnection(
+            hostID: record.id,
+            registry: registry,
+            keyStore: keyStore
+        )
+        let inboundFrames = try await requiredInboundFramesStream(from: connection)
+        let frameTask = nextFrameTask(from: inboundFrames, timeout: 1)
+
+        connection = nil
+
+        do {
+            _ = try await frameTask.value
+            XCTFail("Connection deinit should finish inbound subscriber streams")
+        } catch RemoteClientError.connectionClosed {
+            // Expected.
+        } catch {
+            throw error
+        }
     }
 
     @MainActor
@@ -694,6 +808,76 @@ final class RemoteHostConnectionTests: XCTestCase {
             "ticket": ticket.jsonValue
         ]))))
         return ticket
+    }
+
+    private func requiredInboundFramesStream(
+        from connection: RemoteHostConnection?
+    ) async throws -> AsyncStream<RemoteServerFrame> {
+        guard let connection else { throw RemoteClientError.connectionClosed }
+        return await connection.inboundFramesStream()
+    }
+
+    private func waitForInboundSubscriberCount(
+        _ expectedCount: Int,
+        connection: RemoteHostConnection,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0 ..< 100 {
+            if await connection.inboundSubscriberCountForTesting() == expectedCount {
+                return
+            }
+            await Task.yield()
+        }
+        let actualCount = await connection.inboundSubscriberCountForTesting()
+        XCTAssertEqual(actualCount, expectedCount, "Timed out waiting for inbound subscriber cleanup", file: file, line: line)
+    }
+
+    private func waitForStateSubscriberCount(
+        _ expectedCount: Int,
+        connection: RemoteHostConnection,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        for _ in 0 ..< 100 {
+            if await connection.stateSubscriberCountForTesting() == expectedCount {
+                return
+            }
+            await Task.yield()
+        }
+        let actualCount = await connection.stateSubscriberCountForTesting()
+        XCTAssertEqual(actualCount, expectedCount, "Timed out waiting for state subscriber cleanup", file: file, line: line)
+    }
+
+    private func nextConnectedStateTask(
+        from stream: AsyncStream<RemoteHostConnection.State>,
+        timeout: TimeInterval
+    ) -> Task<(initial: RemoteHostConnection.State?, connected: RemoteHostConnection.State), Error> {
+        Task {
+            try await withThrowingTaskGroup(
+                of: (initial: RemoteHostConnection.State?, connected: RemoteHostConnection.State).self
+            ) { group in
+                group.addTask {
+                    var iterator = stream.makeAsyncIterator()
+                    let initial = await iterator.next()
+                    while let state = await iterator.next() {
+                        if case .connected = state {
+                            return (initial, state)
+                        }
+                    }
+                    throw RemoteClientError.connectionClosed
+                }
+                group.addTask {
+                    try await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                    throw RemoteClientError.timeout(operation: "connection state", seconds: timeout)
+                }
+                guard let first = try await group.next() else {
+                    throw RemoteClientError.connectionClosed
+                }
+                group.cancelAll()
+                return first
+            }
+        }
     }
 
     private func nextFrameTask(
