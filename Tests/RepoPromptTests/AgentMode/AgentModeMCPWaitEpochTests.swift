@@ -686,6 +686,67 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testMCPSnapshotUpdatedAtIsStableAcrossUnchangedReads() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil
+        )
+        defer {
+            Task { await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true) }
+        }
+        session.runState = .completed
+        session.lastActivityAt = Date(timeIntervalSince1970: 1_720_000_000)
+
+        let first = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        let second = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+
+        XCTAssertEqual(first.updatedAt, second.updatedAt)
+        XCTAssertEqual(first.asObject()["updated_at"], second.asObject()["updated_at"])
+    }
+
+    func testSemanticMutationIsAcceptedBySessionStoreAndSerializedAtStableTimeBoundary() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil
+        )
+        defer {
+            Task { await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true) }
+        }
+        let semanticTime = Date().addingTimeInterval(60)
+        session.lastActivityAt = semanticTime
+        session.runState = .completed
+        let context = try XCTUnwrap(session.mcpControlContext)
+        let cursor = AgentRunSessionStore.WaitCursor(
+            registration: context.registration,
+            epoch: context.currentEpoch
+        )
+        let baseline = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        await AgentRunSessionStore.signalSnapshot(baseline, cursor: cursor)
+
+        session.replaceItems([.user("semantic mutation", sequenceIndex: 0)])
+        session.lastActivityAt = semanticTime
+        let mutated = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(mutated.updatedAt, baseline.updatedAt, "This pins the equal-time semantic acceptance branch")
+        XCTAssertGreaterThan(mutated.transcriptItemCount, baseline.transcriptItemCount)
+        await AgentRunSessionStore.signalSnapshot(mutated, cursor: cursor)
+
+        let storedSnapshot = await AgentRunSessionStore.snapshot(for: cursor)
+        let accepted = try XCTUnwrap(storedSnapshot)
+        XCTAssertEqual(accepted.transcriptItemCount, mutated.transcriptItemCount)
+        XCTAssertEqual(accepted.asObject()["updated_at"], mutated.asObject()["updated_at"])
+        XCTAssertEqual(accepted.toValue(), mutated.toValue())
+    }
+
     private func waitForWaiter(registration: AgentRunSessionStore.Registration) async throws {
         for _ in 0 ..< 200 {
             if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
@@ -755,7 +816,9 @@ private actor EpochBeginGate {
     }
 
     func waitUntilPaused() async {
-        if isPaused { return }
+        if isPaused {
+            return
+        }
         await withCheckedContinuation { continuation in
             pauseWaiters.append(continuation)
         }

@@ -120,6 +120,44 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
         XCTAssertGreaterThan(secondSeq, firstSeq)
     }
 
+    func testProductionShapedStableUpdatedAtDeduplicatesThenSemanticMutationReemits() async throws {
+        let stableTime = "2026-07-16T10:00:00.000Z"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 1,
+                updatedAt: stableTime
+            ))),
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 1,
+                updatedAt: stableTime
+            ))),
+            .result(GatewayTestHelpers.toolResult(json: snapshot(
+                status: "completed",
+                transcriptItemCount: 2,
+                updatedAt: stableTime
+            )))
+        ])
+        let (manager, _) = try await makeManager(connection: connection)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        let frames = await waitForFrames(sink, containing: "session_terminal", minimum: 2)
+        await manager.shutdown()
+
+        let terminalFrames = frames.filter { $0.type == "session_terminal" }
+        XCTAssertEqual(terminalFrames.count, 2)
+        XCTAssertEqual(
+            terminalFrames.map { $0.payload?.objectValue?["transcript_item_count"]?.intValue },
+            [1, 2]
+        )
+        XCTAssertEqual(
+            terminalFrames.compactMap { $0.payload?.objectValue?["updated_at"]?.stringValue },
+            [stableTime, stableTime]
+        )
+    }
+
     func testFingerprintChangedTerminalReemitPushesWakeForDisconnectedPushOnlyDevice() async throws {
         let deviceID = "device"
         let sinkID = UUID()
@@ -482,7 +520,9 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
     ) async -> [RecordedGatewayToolCall] {
         for _ in 0 ..< (timeoutMilliseconds / 20) {
             let calls = await connection.calls
-            if calls.count >= minimum { return calls }
+            if calls.count >= minimum {
+                return calls
+            }
             try? await Task.sleep(for: .milliseconds(20))
         }
         return await connection.calls
@@ -495,7 +535,9 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
     ) async -> [RecordingPushNotifier.Wake] {
         for _ in 0 ..< (timeoutMilliseconds / 20) {
             let wakes = await notifier.wakes
-            if wakes.count >= minimum { return wakes }
+            if wakes.count >= minimum {
+                return wakes
+            }
             try? await Task.sleep(for: .milliseconds(20))
         }
         return await notifier.wakes
@@ -509,7 +551,9 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
     ) async -> [RemoteServerFrame] {
         for _ in 0 ..< (timeoutMilliseconds / 20) {
             let frames = await sink.frames
-            if frames.count(where: { $0.type == type }) >= minimum { return frames }
+            if frames.count(where: { $0.type == type }) >= minimum {
+                return frames
+            }
             try? await Task.sleep(for: .milliseconds(20))
         }
         return await sink.frames
@@ -524,7 +568,9 @@ final class SessionWatchManagerRevalidationTests: XCTestCase {
         for _ in 0 ..< (timeoutMilliseconds / 20) {
             let frames = await sink.frames
             let matches = frames.filter { $0.payload?.objectValue?["status"]?.stringValue == status }
-            if matches.count >= minimum { return frames }
+            if matches.count >= minimum {
+                return frames
+            }
             try? await Task.sleep(for: .milliseconds(20))
         }
         return await sink.frames

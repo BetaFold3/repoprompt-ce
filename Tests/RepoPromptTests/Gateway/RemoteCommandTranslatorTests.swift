@@ -78,6 +78,34 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         }
     }
 
+    func testGetLogForwardsIncludeRowTimestampsAndStillRejectsUnknownKeys() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let call = try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "get_log",
+            sessionID: sid,
+            payload: .object([
+                "offset": .int(0),
+                "limit": .int(20),
+                "include_row_timestamps": .bool(true)
+            ])
+        ))
+        XCTAssertEqual(call.toolName, "agent_manage")
+        XCTAssertEqual(call.arguments["op"], .string("get_log"))
+        XCTAssertEqual(call.arguments["include_row_timestamps"], .bool(true))
+
+        // The whitelist still rejects any other unknown key.
+        XCTAssertThrowsError(try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "get_log",
+            sessionID: sid,
+            payload: .object(["offset": .int(0), "verbose": .bool(true)])
+        ))) { error in
+            XCTAssertEqual(
+                error as? RemoteCommandTranslatorError,
+                .unsupportedPayloadKey(operation: "get_log", key: "verbose")
+            )
+        }
+    }
+
     func testRejectsArbitraryToolPassthrough() throws {
         let frame = RemoteClientFrame(
             type: "start",

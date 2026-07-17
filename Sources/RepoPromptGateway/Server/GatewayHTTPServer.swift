@@ -795,7 +795,8 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
                 "auth": .string("ticket"),
                 "ticket_id": .string(device.ticketID.uuidString.lowercased()),
                 "scopes": .array(device.scopes.sorted().map(JSONValue.string)),
-                "host_name": .string(hostName)
+                "host_name": .string(hostName),
+                "features": .array(RemoteWireFeatures.all.map(JSONValue.string))
             ]
             if let vapidPublicKeyBase64URL {
                 helloAckPayload["vapid_public_key"] = .string(vapidPublicKeyBase64URL)
@@ -845,7 +846,8 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
                 "device_id": .string(deviceID),
                 "auth": .string("static_token"),
                 "host_name": .string(hostName),
-                "sig": .null
+                "sig": .null,
+                "features": .array(RemoteWireFeatures.all.map(JSONValue.string))
             ]
             if let vapidPublicKeyBase64URL {
                 helloAckPayload["vapid_public_key"] = .string(vapidPublicKeyBase64URL)
@@ -981,14 +983,18 @@ private final class GatewayWebSocketFrameHandler: ChannelInboundHandler, @unchec
 
     private func sendAndMaybeClose(_ frame: RemoteServerFrame, close: Bool, context: ChannelHandlerContext) {
         guard let data = try? RemoteWireProtocol.encodeServerFrame(frame) else {
-            if close { context.close(promise: nil) }
+            if close {
+                context.close(promise: nil)
+            }
             return
         }
         var buffer = context.channel.allocator.buffer(capacity: data.count)
         buffer.writeBytes(data)
         let wsFrame = WebSocketFrame(fin: true, opcode: .text, data: buffer)
         context.writeAndFlush(wrapOutboundOut(wsFrame)).whenComplete { _ in
-            if close { context.close(promise: nil) }
+            if close {
+                context.close(promise: nil)
+            }
         }
     }
 }

@@ -10,4 +10,10 @@ enum AgentSessionRecencySanity {
         guard let date, date >= syntheticTimestampFloor else { return nil }
         return date
     }
+
+    /// Display invariant: synthetic (pre-floor) dates are never formatted for the user.
+    /// `MessageTimestampText` enforces this centrally for every message/tool footer.
+    static func isDisplayable(_ date: Date) -> Bool {
+        date >= syntheticTimestampFloor
+    }
 }

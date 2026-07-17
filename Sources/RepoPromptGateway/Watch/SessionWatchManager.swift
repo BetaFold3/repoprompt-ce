@@ -1,24 +1,50 @@
+import CryptoKit
 import Foundation
 import Logging
 import MCP
 import RepoPromptRemoteWire
 
-private enum SessionWatchError: Error, Equatable, CustomStringConvertible {
-    case pairedAppLinkUnavailable(String)
-    case toolCallFailed(String)
-
-    var description: String {
-        switch self {
-        case let .pairedAppLinkUnavailable(deviceID):
-            "No paired-device app link is available for \(deviceID); observation is paused."
-        case let .toolCallFailed(message):
-            "agent_run tool call failed: \(message)"
-        }
-    }
+private enum SessionWatchError: Error, Equatable {
+    case observationFailure(RemoteObservationFailureReason)
 }
 
 actor SessionWatchManager {
     typealias WindowResolver = @Sendable (_ deviceID: String, _ sessionID: String) async -> Int?
+    typealias WaitDeadlineSleep = @Sendable (_ seconds: TimeInterval) async throws -> Void
+    typealias WaitRetrySleep = @Sendable (_ seconds: TimeInterval) async throws -> Void
+    typealias WindowRecovery = @Sendable (
+        _ deviceID: String,
+        _ sessionID: String,
+        _ invalidate: Bool
+    ) async -> Int?
+
+    struct ObservationFailureBudgets {
+        let routingUnavailable: Int
+        let linkUnavailable: Int
+        let toolFailure: Int
+        let invalidSnapshot: Int
+
+        init(
+            routingUnavailable: Int = 2,
+            linkUnavailable: Int = 2,
+            toolFailure: Int = 3,
+            invalidSnapshot: Int = 2
+        ) {
+            self.routingUnavailable = max(1, routingUnavailable)
+            self.linkUnavailable = max(1, linkUnavailable)
+            self.toolFailure = max(1, toolFailure)
+            self.invalidSnapshot = max(1, invalidSnapshot)
+        }
+
+        func limit(for reason: RemoteObservationFailureReason) -> Int {
+            switch reason {
+            case .routingUnavailable: routingUnavailable
+            case .linkUnavailable: linkUnavailable
+            case .toolFailure: toolFailure
+            case .invalidSnapshot: invalidSnapshot
+            }
+        }
+    }
 
     struct SubscriptionValidation {
         let deviceID: String
@@ -44,6 +70,25 @@ actor SessionWatchManager {
         /// Whether the device has a registered Web Push subscription; refreshed on
         /// subscribe, sink removal, and explicit push (un)subscription changes.
         var pushEligible = false
+    }
+
+    private struct ObservationHealthState {
+        let token: UUID
+        var counts: [RemoteObservationFailureReason: Int] = [:]
+        var failureEmitted = false
+        var routingRecoveryAttempted = false
+    }
+
+    private struct RoutingRecoveryFlight {
+        let id: UUID
+        let task: Task<Void, Never>
+    }
+
+    private struct WaitCycle {
+        let id: UUID
+        let owningTaskID: UUID
+        let sessionTokens: [String: UUID]
+        let watchdogTask: Task<Void, Never>
     }
 
     private struct QuarantinedTerminal {
@@ -76,10 +121,15 @@ actor SessionWatchManager {
     private let logger: Logger
     private let sequenceEpoch: String
     private let waitTimeoutSeconds: TimeInterval
+    private let waitWatchdogMarginSeconds: TimeInterval
+    private let waitDeadlineSleep: WaitDeadlineSleep
+    private let waitRetrySleep: WaitRetrySleep
     private let pollRefreshSeconds: TimeInterval
     private let revalidationIntervalSeconds: TimeInterval
     private let terminalQuarantineSeconds: TimeInterval
+    private let observationFailureBudgets: ObservationFailureBudgets
     private var windowResolver: WindowResolver?
+    private var windowRecovery: WindowRecovery?
     private var devices: [String: DeviceState] = [:]
     private var seqByDeviceSession: [String: UInt64] = [:]
     /// Last wake kind pushed per (device, session); prevents duplicate pushes for
@@ -92,6 +142,9 @@ actor SessionWatchManager {
     private var lastEmittedIsTerminalByDeviceSession: [String: Bool] = [:]
     private var lastEmittedTerminalFingerprintByDeviceSession: [String: TerminalFingerprint] = [:]
     private var pendingTerminalQuarantineByDeviceSession: [String: QuarantinedTerminal] = [:]
+    private var observationHealthByDeviceSession: [String: ObservationHealthState] = [:]
+    private var routingRecoveryByDeviceSession: [String: RoutingRecoveryFlight] = [:]
+    private var waitCycleByDevice: [String: WaitCycle] = [:]
     private var appLinkStateTask: Task<Void, Never>?
 
     init(
@@ -102,9 +155,17 @@ actor SessionWatchManager {
         logger: Logger = Logger(label: "com.repoprompt.gateway.watch"),
         sequenceEpoch: String = UUID().uuidString.lowercased(),
         waitTimeoutSeconds: TimeInterval = 30,
+        waitWatchdogMarginSeconds: TimeInterval = 10,
+        waitDeadlineSleep: @escaping WaitDeadlineSleep = { seconds in
+            try await Task.sleep(for: .milliseconds(Int64((seconds * 1000).rounded(.up))))
+        },
+        waitRetrySleep: @escaping WaitRetrySleep = { seconds in
+            try await Task.sleep(for: .milliseconds(Int64((seconds * 1000).rounded(.up))))
+        },
         pollRefreshSeconds: TimeInterval = 5,
         revalidationIntervalSeconds: TimeInterval = 30,
-        terminalQuarantineSeconds: TimeInterval = 5
+        terminalQuarantineSeconds: TimeInterval = 5,
+        observationFailureBudgets: ObservationFailureBudgets = ObservationFailureBudgets()
     ) {
         self.appLink = appLink
         self.appLinkPool = appLinkPool
@@ -113,13 +174,27 @@ actor SessionWatchManager {
         self.logger = logger
         self.sequenceEpoch = sequenceEpoch
         self.waitTimeoutSeconds = waitTimeoutSeconds
+        // The app call allows its transport up to waitTimeoutSeconds + 5; keep the
+        // independent watchdog strictly outside that allowance so it cannot win early.
+        self.waitWatchdogMarginSeconds = max(5.001, waitWatchdogMarginSeconds)
+        self.waitDeadlineSleep = waitDeadlineSleep
+        self.waitRetrySleep = waitRetrySleep
         self.pollRefreshSeconds = pollRefreshSeconds
         self.revalidationIntervalSeconds = revalidationIntervalSeconds
         self.terminalQuarantineSeconds = terminalQuarantineSeconds
+        self.observationFailureBudgets = observationFailureBudgets
     }
 
     func setWindowResolver(_ resolver: WindowResolver?) {
         windowResolver = resolver
+    }
+
+    func setObservationRouting(
+        windowResolver: WindowResolver?,
+        windowRecovery: WindowRecovery?
+    ) {
+        self.windowResolver = windowResolver
+        self.windowRecovery = windowRecovery
     }
 
     /// Paired devices observe through their own bootstrap app leg when one exists.
@@ -132,7 +207,7 @@ actor SessionWatchManager {
         if deviceID == RemoteGatewayRuntime.phase0DeviceID || !deviceID.hasPrefix("remote:") {
             return appLink
         }
-        throw SessionWatchError.pairedAppLinkUnavailable(deviceID)
+        throw SessionWatchError.observationFailure(.linkUnavailable)
     }
 
     func start() {
@@ -156,6 +231,15 @@ actor SessionWatchManager {
             quarantine.task.cancel()
         }
         pendingTerminalQuarantineByDeviceSession.removeAll()
+        for recovery in routingRecoveryByDeviceSession.values {
+            recovery.task.cancel()
+        }
+        routingRecoveryByDeviceSession.removeAll()
+        for cycle in waitCycleByDevice.values {
+            cycle.watchdogTask.cancel()
+        }
+        waitCycleByDevice.removeAll()
+        observationHealthByDeviceSession.removeAll()
         lastEmittedIsTerminalByDeviceSession.removeAll()
         lastEmittedTerminalFingerprintByDeviceSession.removeAll()
         devices.removeAll()
@@ -173,6 +257,7 @@ actor SessionWatchManager {
         if state.sinks.isEmpty, state.watchedSessionIDs.isEmpty {
             state.waitTask?.cancel()
             state.revalidationTask?.cancel()
+            cancelWaitCycle(deviceID: deviceID)
             devices.removeValue(forKey: deviceID)
             return
         }
@@ -196,7 +281,9 @@ actor SessionWatchManager {
         var state = devices[deviceID] ?? DeviceState()
         state.sinks[sinkID] = sink
         var sessionTokens: [String: UUID] = [:]
-        for sessionID in requestedSessionIDs {
+        for requestedSessionID in requestedSessionIDs {
+            let sessionID = normalizedSessionID(requestedSessionID)
+            guard !sessionID.isEmpty else { continue }
             let token = state.subscriptionTokenBySessionID[sessionID] ?? UUID()
             state.watchedSessionIDs.insert(sessionID)
             state.subscriptionTokenBySessionID[sessionID] = token
@@ -219,7 +306,7 @@ actor SessionWatchManager {
                       token: token
                   )
             else { continue }
-            logger.info("watch validation started device_id=\(validation.deviceID) session_id=\(sessionID) stage=subscribe")
+            logger.info("watch validation started device_id=\(boundedLogIdentifier(validation.deviceID)) session_id=\(boundedLogIdentifier(sessionID)) stage=subscribe")
             await validateAndAddSession(
                 deviceID: validation.deviceID,
                 sessionID: sessionID,
@@ -257,6 +344,7 @@ actor SessionWatchManager {
             state.parkedActionableSessionIDs.remove(sessionID)
             state.parkedTerminalSessionIDs.remove(sessionID)
             clearTerminalObservationState(deviceID: deviceID, sessionID: sessionID)
+            clearObservationHealth(deviceID: deviceID, sessionID: sessionID)
         }
         devices[deviceID] = state
         ensureWaitLoop(deviceID: deviceID)
@@ -267,6 +355,7 @@ actor SessionWatchManager {
         guard let state = devices.removeValue(forKey: deviceID) else { return }
         state.waitTask?.cancel()
         state.revalidationTask?.cancel()
+        cancelWaitCycle(deviceID: deviceID)
         for sessionID in state.watchedSessionIDs {
             let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
             lastPushKindByDeviceSession.removeValue(forKey: key)
@@ -276,6 +365,7 @@ actor SessionWatchManager {
             if let quarantine = pendingTerminalQuarantineByDeviceSession.removeValue(forKey: key) {
                 quarantine.task.cancel()
             }
+            clearObservationHealth(deviceID: deviceID, sessionID: sessionID)
         }
         let frame = RemoteServerFrame(
             type: "channel_closing",
@@ -291,10 +381,12 @@ actor SessionWatchManager {
     }
 
     func rearm(deviceID: String, sessionID: String?) {
-        logger.debug("watch rearm device=\(deviceID) session=\(sessionID ?? "-")")
         guard let sessionID, var state = devices[deviceID], state.watchedSessionIDs.contains(sessionID) else {
             return
         }
+        logger.debug(
+            "watch_accountability event=rearm outcome=rearm trigger=steer device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID))"
+        )
         state.parkedActionableSessionIDs.remove(sessionID)
         state.parkedTerminalSessionIDs.remove(sessionID)
         state.activeWaitSessionIDs.insert(sessionID)
@@ -302,6 +394,7 @@ actor SessionWatchManager {
         // The session left its wake-worthy state via respond/steer; the next
         // wake-worthy transition should push again for a disconnected device.
         lastPushKindByDeviceSession.removeValue(forKey: deviceSessionKey(deviceID: deviceID, sessionID: sessionID))
+        preserveObservationHealthForRearm(deviceID: deviceID, sessionID: sessionID)
         ensureWaitLoop(deviceID: deviceID)
         ensureRevalidationLoop(deviceID: deviceID)
     }
@@ -324,7 +417,9 @@ actor SessionWatchManager {
 
     func pollCatchUp(deviceID: String) async {
         guard let state = devices[deviceID] else { return }
-        for sessionID in state.watchedSessionIDs.sorted() {
+        for sessionID in state.watchedSessionIDs.sorted()
+            where !hasExhaustedRoutingEpoch(deviceID: deviceID, sessionID: sessionID)
+        {
             await validateAndAddSession(deviceID: deviceID, sessionID: sessionID, trigger: .pollCatchUp)
         }
         ensureWaitLoop(deviceID: deviceID)
@@ -343,7 +438,8 @@ actor SessionWatchManager {
         sessionID: String,
         trigger: EmissionTrigger,
         catchUpSinkID: UUID? = nil,
-        subscriptionToken: UUID? = nil
+        subscriptionToken: UUID? = nil,
+        exhaustRoutingFailure: Bool = false
     ) async {
         guard isCurrentSubscription(
             deviceID: deviceID,
@@ -357,14 +453,27 @@ actor SessionWatchManager {
                 sessionID: sessionID,
                 token: subscriptionToken
             ) else { return }
-            guard let snapshot = snapshots.first else {
-                // No parseable snapshot is NOT authoritative expiry: the app may be
-                // mid-workspace-switch or returned a partial/odd-shaped response.
-                // Only an explicit `status == "expired"` snapshot may expire a session.
-                logger.debug("Pausing remote subscription \(sessionID): poll returned no parseable snapshot")
-                markSessionPendingObservation(deviceID: deviceID, sessionID: sessionID)
-                scheduleWaitLoopRetry(deviceID: deviceID)
+            let requestedSessionID = normalizedSessionID(sessionID)
+            let requestedMatchKey = canonicalSessionMatchKey(requestedSessionID)
+            guard var snapshot = snapshots.first(where: {
+                canonicalSessionMatchKey($0.sessionID) == requestedMatchKey
+            }) else {
+                await pauseObservation(
+                    deviceID: deviceID,
+                    sessionID: sessionID,
+                    token: subscriptionToken,
+                    reason: .invalidSnapshot
+                )
                 return
+            }
+            if snapshot.sessionID != requestedSessionID {
+                var payload = snapshot.payload.objectValue ?? [:]
+                payload["session_id"] = .string(requestedSessionID)
+                snapshot = RemoteSessionSnapshot(
+                    sessionID: requestedSessionID,
+                    status: snapshot.status,
+                    payload: .object(payload)
+                )
             }
             let catchUpSink = catchUpSinkID.flatMap { sinkID in
                 subscriptionToken.flatMap { token in
@@ -380,34 +489,29 @@ actor SessionWatchManager {
                 await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: trigger, catchUpSink: catchUpSink)
                 return
             }
-            guard var state = devices[deviceID],
-                  state.watchedSessionIDs.contains(sessionID)
-            else { return }
-            state.watchedSessionIDs.insert(snapshot.sessionID)
-            devices[deviceID] = state
             guard isCurrentSubscription(
                 deviceID: deviceID,
                 sessionID: sessionID,
                 token: subscriptionToken
             ) else { return }
+            clearObservationHealthAfterSuccess(deviceID: deviceID, sessionID: sessionID, token: subscriptionToken)
             await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: trigger, catchUpSink: catchUpSink)
-        } catch let error as SessionWatchError {
-            guard isCurrentSubscription(
-                deviceID: deviceID,
-                sessionID: sessionID,
-                token: subscriptionToken
-            ) else { return }
-            logger.debug("Pausing remote subscription \(sessionID): \(error.description)")
-            markSessionPendingObservation(deviceID: deviceID, sessionID: sessionID)
-            scheduleWaitLoopRetry(deviceID: deviceID)
+        } catch is CancellationError {
+            return
         } catch {
             guard isCurrentSubscription(
                 deviceID: deviceID,
                 sessionID: sessionID,
                 token: subscriptionToken
             ) else { return }
-            logger.debug("Pausing remote subscription \(sessionID) after app-link/tool error: \(String(describing: error))")
-            await pauseObservationAfterToolError(deviceID: deviceID, sessionID: sessionID, error: error)
+            let reason = observationFailureReason(for: error)
+            await pauseObservation(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: subscriptionToken,
+                reason: reason,
+                exhaustBudget: exhaustRoutingFailure && reason == .routingUnavailable
+            )
         }
     }
 
@@ -437,8 +541,234 @@ actor SessionWatchManager {
         return state.subscriptionTokenBySessionID[sessionID] == token
     }
 
+    private func currentSubscriptionToken(
+        deviceID: String,
+        sessionID: String,
+        expected: UUID?
+    ) -> UUID? {
+        guard let state = devices[deviceID],
+              state.watchedSessionIDs.contains(sessionID),
+              let current = state.subscriptionTokenBySessionID[sessionID],
+              expected == nil || expected == current
+        else { return nil }
+        return current
+    }
+
+    private func recordObservationFailure(
+        deviceID: String,
+        sessionID: String,
+        token: UUID,
+        reason: RemoteObservationFailureReason,
+        exhaustBudget: Bool = false
+    ) async {
+        guard currentSubscriptionToken(deviceID: deviceID, sessionID: sessionID, expected: token) != nil else {
+            return
+        }
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        var health = observationHealthByDeviceSession[key]
+        if health?.token != token {
+            health = ObservationHealthState(token: token)
+        }
+        guard var health else { return }
+        let priorCount = health.counts[reason] ?? 0
+        let limit = observationFailureBudgets.limit(for: reason)
+        let count = exhaustBudget ? max(priorCount + 1, limit) : priorCount + 1
+        health.counts[reason] = count
+        let shouldEmit = count >= limit && !health.failureEmitted
+        if shouldEmit {
+            health.failureEmitted = true
+        }
+        observationHealthByDeviceSession[key] = health
+        let accountingOutcome = shouldEmit ? "exhausted" : "transition"
+        logger.debug(
+            "watch_accountability event=failure_accounting outcome=\(accountingOutcome) reason=\(reason.rawValue) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) attempt=\(count) attempt_limit=\(limit)"
+        )
+        if priorCount == 0 {
+            logger.notice(
+                "observation event=issue outcome=\(reason.rawValue) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) attempt=\(count) attempt_limit=\(limit)"
+            )
+        } else {
+            logger.debug(
+                "observation event=retry outcome=\(reason.rawValue) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) attempt=\(count) attempt_limit=\(limit)"
+            )
+        }
+        guard shouldEmit,
+              currentSubscriptionToken(deviceID: deviceID, sessionID: sessionID, expected: token) != nil
+        else { return }
+        let frame = RemoteServerFrame.observationFailure(
+            sessionID: sessionID,
+            reason: reason,
+            attempt: count,
+            attemptLimit: limit,
+            seq: nextSeq(deviceID: deviceID, sessionID: sessionID),
+            seqEpoch: sequenceEpoch
+        )
+        await broadcast(frame, deviceID: deviceID)
+        logger.notice(
+            "watch_accountability event=failure_accounting outcome=emitted reason=\(reason.rawValue) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) attempt=\(count) attempt_limit=\(limit) frame_type=observation_failure seq=\(frame.seq.map(String.init) ?? "-") seq_epoch=\(boundedLogIdentifier(sequenceEpoch))"
+        )
+        logger.notice(
+            "observation event=exhaustion outcome=emitted device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) reason=\(reason.rawValue)"
+        )
+    }
+
+    private func clearObservationHealthAfterSuccess(
+        deviceID: String,
+        sessionID: String,
+        token: UUID?
+    ) {
+        guard currentSubscriptionToken(deviceID: deviceID, sessionID: sessionID, expected: token) != nil else {
+            return
+        }
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        let wasUnhealthy = observationHealthByDeviceSession[key] != nil
+        clearObservationHealth(deviceID: deviceID, sessionID: sessionID)
+        if wasUnhealthy {
+            logger.notice(
+                "observation event=return outcome=healthy device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID))"
+            )
+        } else {
+            logger.debug(
+                "observation event=return outcome=success device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID))"
+            )
+        }
+    }
+
+    private func hasExhaustedRoutingEpoch(deviceID: String, sessionID: String) -> Bool {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        guard let health = observationHealthByDeviceSession[key],
+              health.failureEmitted,
+              health.routingRecoveryAttempted
+        else { return false }
+        return (health.counts[.routingUnavailable] ?? 0) >= observationFailureBudgets.routingUnavailable
+    }
+
+    private func clearObservationHealth(deviceID: String, sessionID: String) {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        observationHealthByDeviceSession.removeValue(forKey: key)
+        if let recovery = routingRecoveryByDeviceSession.removeValue(forKey: key) {
+            recovery.task.cancel()
+        }
+    }
+
+    private func preserveObservationHealthForRearm(deviceID: String, sessionID: String) {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        guard var health = observationHealthByDeviceSession[key],
+              currentSubscriptionToken(deviceID: deviceID, sessionID: sessionID, expected: health.token) != nil
+        else { return }
+        health.failureEmitted = false
+        observationHealthByDeviceSession[key] = health
+    }
+
+    private func scheduleRoutingRecovery(
+        deviceID: String,
+        sessionID: String,
+        token: UUID,
+        invalidate: Bool
+    ) {
+        guard let windowRecovery,
+              currentSubscriptionToken(deviceID: deviceID, sessionID: sessionID, expected: token) != nil
+        else { return }
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        var health = observationHealthByDeviceSession[key]
+        if health?.token != token {
+            health = ObservationHealthState(token: token)
+        }
+        guard var health, !health.routingRecoveryAttempted else { return }
+        health.routingRecoveryAttempted = true
+        observationHealthByDeviceSession[key] = health
+        let recoveryID = UUID()
+        logger.notice(
+            "observation event=affinity_recovery outcome=issued device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID))"
+        )
+        let task = Task { [weak self] in
+            let windowID = await windowRecovery(deviceID, sessionID, invalidate)
+            guard !Task.isCancelled else { return }
+            await self?.finishRoutingRecovery(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: token,
+                recoveryID: recoveryID,
+                windowID: windowID
+            )
+        }
+        routingRecoveryByDeviceSession[key] = RoutingRecoveryFlight(id: recoveryID, task: task)
+    }
+
+    private func finishRoutingRecovery(
+        deviceID: String,
+        sessionID: String,
+        token: UUID,
+        recoveryID: UUID,
+        windowID: Int?
+    ) async {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        guard routingRecoveryByDeviceSession[key]?.id == recoveryID else { return }
+        routingRecoveryByDeviceSession.removeValue(forKey: key)
+        guard currentSubscriptionToken(deviceID: deviceID, sessionID: sessionID, expected: token) != nil else {
+            return
+        }
+        guard windowID != nil else {
+            await recordObservationFailure(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: token,
+                reason: .routingUnavailable,
+                exhaustBudget: true
+            )
+            ensureWaitLoop(deviceID: deviceID)
+            return
+        }
+        logger.notice(
+            "observation event=affinity_recovery outcome=recovered device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) window_id=\(windowID.map(String.init) ?? "none")"
+        )
+        await validateAndAddSession(
+            deviceID: deviceID,
+            sessionID: sessionID,
+            trigger: .pollCatchUp,
+            subscriptionToken: token,
+            exhaustRoutingFailure: true
+        )
+        ensureWaitLoop(deviceID: deviceID)
+    }
+
+    private func observationFailureReason(for error: Error) -> RemoteObservationFailureReason {
+        if let error = error as? SessionWatchError,
+           case let .observationFailure(reason) = error
+        {
+            return reason
+        }
+        if error is AppLinkError {
+            return .linkUnavailable
+        }
+        return .toolFailure
+    }
+
+    private func normalizedSessionID(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func canonicalSessionMatchKey(_ value: String) -> String {
+        let normalized = normalizedSessionID(value)
+        guard let uuid = UUID(uuidString: normalized) else { return normalized }
+        return uuid.uuidString.lowercased()
+    }
+
+    private func boundedLogIdentifier(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return "id_" + digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func suspendSessionForRoutingRecovery(deviceID: String, sessionID: String) {
+        guard var state = devices[deviceID], state.watchedSessionIDs.contains(sessionID) else { return }
+        state.activeWaitSessionIDs.remove(sessionID)
+        state.parkedActionableSessionIDs.remove(sessionID)
+        state.parkedTerminalSessionIDs.remove(sessionID)
+        devices[deviceID] = state
+    }
+
     private func markSessionPendingObservation(deviceID: String, sessionID: String) {
-        logger.debug("watch mark_pending_observation device=\(deviceID) session=\(sessionID)")
+        logger.debug("watch mark_pending_observation device=\(boundedLogIdentifier(deviceID)) session=\(boundedLogIdentifier(sessionID))")
         guard var state = devices[deviceID], state.watchedSessionIDs.contains(sessionID) else { return }
         state.parkedActionableSessionIDs.remove(sessionID)
         state.parkedTerminalSessionIDs.remove(sessionID)
@@ -451,13 +781,113 @@ actor SessionWatchManager {
         lastPushKindByDeviceSession.removeValue(forKey: deviceSessionKey(deviceID: deviceID, sessionID: sessionID))
     }
 
-    private func pauseObservationAfterToolError(deviceID: String, sessionID: String, error: Error) async {
-        if await appLinkReconnectBudgetExhausted(deviceID: deviceID) {
-            await emitChannelClosing(deviceID: deviceID, reason: "app_link_failed", message: String(describing: error))
+    private func pauseObservation(
+        deviceID: String,
+        sessionID: String,
+        token: UUID?,
+        reason: RemoteObservationFailureReason,
+        exhaustBudget: Bool = false
+    ) async {
+        guard let currentToken = currentSubscriptionToken(
+            deviceID: deviceID,
+            sessionID: sessionID,
+            expected: token
+        ) else { return }
+        if reason == .linkUnavailable, await appLinkReconnectBudgetExhausted(deviceID: deviceID) {
+            await emitChannelClosing(
+                deviceID: deviceID,
+                reason: "app_link_failed",
+                message: "The paired app link exhausted its reconnect budget."
+            )
             return
         }
-        markSessionPendingObservation(deviceID: deviceID, sessionID: sessionID)
-        scheduleWaitLoopRetry(deviceID: deviceID)
+        if reason == .routingUnavailable {
+            suspendSessionForRoutingRecovery(deviceID: deviceID, sessionID: sessionID)
+        } else {
+            markSessionPendingObservation(deviceID: deviceID, sessionID: sessionID)
+        }
+        await recordObservationFailure(
+            deviceID: deviceID,
+            sessionID: sessionID,
+            token: currentToken,
+            reason: reason,
+            exhaustBudget: exhaustBudget
+        )
+        if reason == .routingUnavailable, !exhaustBudget {
+            scheduleRoutingRecovery(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: currentToken,
+                invalidate: true
+            )
+        } else {
+            scheduleWaitLoopRetry(deviceID: deviceID)
+        }
+    }
+
+    private func beginWaitCycle(
+        deviceID: String,
+        taskID: UUID,
+        sessionTokens: [String: UUID]
+    ) -> UUID {
+        cancelWaitCycle(deviceID: deviceID)
+        let cycleID = UUID()
+        let deadlineSeconds = waitTimeoutSeconds + waitWatchdogMarginSeconds
+        let deadlineSleep = waitDeadlineSleep
+        let watchdogTask = Task { [weak self] in
+            do {
+                try await deadlineSleep(deadlineSeconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await self?.expireWaitCycle(deviceID: deviceID, cycleID: cycleID)
+        }
+        waitCycleByDevice[deviceID] = WaitCycle(
+            id: cycleID,
+            owningTaskID: taskID,
+            sessionTokens: sessionTokens,
+            watchdogTask: watchdogTask
+        )
+        return cycleID
+    }
+
+    private func endWaitCycle(deviceID: String, cycleID: UUID) {
+        guard let cycle = waitCycleByDevice[deviceID], cycle.id == cycleID else { return }
+        cycle.watchdogTask.cancel()
+        waitCycleByDevice.removeValue(forKey: deviceID)
+    }
+
+    private func cancelWaitCycle(deviceID: String) {
+        guard let cycle = waitCycleByDevice.removeValue(forKey: deviceID) else { return }
+        cycle.watchdogTask.cancel()
+    }
+
+    private func expireWaitCycle(deviceID: String, cycleID: UUID) async {
+        guard let cycle = waitCycleByDevice[deviceID],
+              cycle.id == cycleID,
+              var state = devices[deviceID],
+              state.waitTaskID == cycle.owningTaskID
+        else { return }
+        waitCycleByDevice.removeValue(forKey: deviceID)
+        state.waitTask?.cancel()
+        state.waitTask = nil
+        state.waitTaskID = nil
+        devices[deviceID] = state
+        let durationMilliseconds = Int64(((waitTimeoutSeconds + waitWatchdogMarginSeconds) * 1000).rounded(.up))
+        logger.notice(
+            "watch_accountability event=wait_deadline outcome=deadline_exceeded duration_ms=\(durationMilliseconds) device_id=\(boundedLogIdentifier(deviceID)) correlation_id=\(boundedLogIdentifier(cycleID.uuidString))"
+        )
+        for sessionID in cycle.sessionTokens.keys.sorted() {
+            guard let token = cycle.sessionTokens[sessionID] else { continue }
+            await pauseObservation(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: token,
+                reason: .toolFailure
+            )
+        }
+        ensureWaitLoop(deviceID: deviceID)
     }
 
     private func ensureWaitLoop(deviceID: String) {
@@ -465,6 +895,7 @@ actor SessionWatchManager {
         if state.waitTask?.isCancelled == true {
             state.waitTask = nil
             state.waitTaskID = nil
+            cancelWaitCycle(deviceID: deviceID)
         }
         // Wake-push semantics: a disconnected device with a push subscription keeps
         // its wait loop so wake-worthy transitions can trigger Web Push.
@@ -491,6 +922,7 @@ actor SessionWatchManager {
         devices[deviceID]?.waitTask?.cancel()
         devices[deviceID]?.waitTask = nil
         devices[deviceID]?.waitTaskID = nil
+        cancelWaitCycle(deviceID: deviceID)
     }
 
     private func ensureRevalidationLoop(deviceID: String) {
@@ -557,8 +989,9 @@ actor SessionWatchManager {
     }
 
     private func runWaitLoop(deviceID: String, taskID: UUID) async {
+        var shouldRearmAfterExit = false
         defer {
-            clearWaitTask(deviceID: deviceID, taskID: taskID)
+            clearWaitTask(deviceID: deviceID, taskID: taskID, rearm: shouldRearmAfterExit)
         }
         while !Task.isCancelled {
             guard let state = devices[deviceID],
@@ -573,43 +1006,48 @@ actor SessionWatchManager {
                     taskID: taskID,
                     includeStatusUpdates: !state.sinks.isEmpty
                 )
-                if waitResult == .paused {
+                switch waitResult {
+                case .snapshots:
+                    break
+                case .retryScheduled:
                     return
-                }
-                if waitResult == .empty {
-                    try await Task.sleep(for: .milliseconds(Int64((pollRefreshSeconds * 1000).rounded(.up))))
-                    continue
+                case .rearmImmediately:
+                    shouldRearmAfterExit = true
+                    return
                 }
             } catch is CancellationError {
                 return
-            } catch let error as SessionWatchError {
-                logger.debug("Pausing remote wait loop for \(deviceID): \(error.description)")
-                scheduleWaitLoopRetry(deviceID: deviceID)
-                return
             } catch {
-                logger.debug("Remote wait loop paused for \(deviceID) after app-link/tool error: \(String(describing: error))")
-                if await appLinkReconnectBudgetExhausted(deviceID: deviceID) {
-                    await emitChannelClosing(deviceID: deviceID, reason: "app_link_failed", message: String(describing: error))
-                } else {
-                    scheduleWaitLoopRetry(deviceID: deviceID)
-                }
+                logger.notice(
+                    "observation event=return outcome=loop_error device_id=\(boundedLogIdentifier(deviceID))"
+                )
+                scheduleWaitLoopRetry(deviceID: deviceID)
                 return
             }
             try? await Task.sleep(for: .milliseconds(50))
         }
     }
 
-    private func clearWaitTask(deviceID: String, taskID: UUID) {
+    private func clearWaitTask(deviceID: String, taskID: UUID, rearm: Bool) {
         guard var state = devices[deviceID], state.waitTaskID == taskID else { return }
+        cancelWaitCycle(deviceID: deviceID)
         state.waitTask = nil
         state.waitTaskID = nil
         devices[deviceID] = state
+        if rearm {
+            ensureWaitLoop(deviceID: deviceID)
+        }
     }
 
     private func scheduleWaitLoopRetry(deviceID: String, delay: TimeInterval? = nil) {
         let retryDelay = max(0.05, delay ?? pollRefreshSeconds)
+        let retrySleep = waitRetrySleep
         Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int64((retryDelay * 1000).rounded(.up))))
+            do {
+                try await retrySleep(retryDelay)
+            } catch {
+                return
+            }
             await self?.retryWaitLoopIfStillWatched(deviceID: deviceID)
         }
     }
@@ -637,17 +1075,17 @@ actor SessionWatchManager {
     }
 
     private func handleAppLinkState(_ state: AppLinkState) async {
+        let defaultLinkDeviceIDs = devices.keys.sorted().filter(usesDefaultAppLink)
         switch state {
-        case let .disconnected(reason), let .reconnecting(_, reason):
-            for deviceID in devices.keys.sorted() {
+        case .disconnected, .reconnecting:
+            for deviceID in defaultLinkDeviceIDs {
                 cancelWaitTask(deviceID: deviceID)
-                logger.debug("Pausing remote wait loop for \(deviceID) while app link reconnects: \(reason)")
+                logger.notice(
+                    "observation event=paired_link_recovery outcome=reconnecting device_id=\(boundedLogIdentifier(deviceID))"
+                )
                 scheduleWaitLoopRetry(deviceID: deviceID)
             }
         case let .closing(reason, message):
-            // M6.3: graceful app-announced teardown — forward `channel_closing`
-            // BEFORE the transport drop arrives so remote clients can distinguish
-            // an orderly shutdown from an abrupt link loss.
             for deviceID in devices.keys.sorted() {
                 cancelWaitTask(deviceID: deviceID)
                 await emitChannelClosing(
@@ -657,15 +1095,26 @@ actor SessionWatchManager {
                 )
             }
         case .connected, .reconnected:
-            for deviceID in devices.keys.sorted() {
+            for deviceID in defaultLinkDeviceIDs {
+                logger.notice(
+                    "observation event=paired_link_recovery outcome=recovered device_id=\(boundedLogIdentifier(deviceID))"
+                )
                 await pollCatchUp(deviceID: deviceID)
             }
-        case let .failed(reason):
-            for deviceID in devices.keys.sorted() {
+        case .failed:
+            for deviceID in defaultLinkDeviceIDs {
                 cancelWaitTask(deviceID: deviceID)
-                await emitChannelClosing(deviceID: deviceID, reason: "app_link_failed", message: reason)
+                await emitChannelClosing(
+                    deviceID: deviceID,
+                    reason: "app_link_failed",
+                    message: "The app link exhausted its reconnect budget."
+                )
             }
         }
+    }
+
+    private func usesDefaultAppLink(_ deviceID: String) -> Bool {
+        deviceID == RemoteGatewayRuntime.phase0DeviceID || !deviceID.hasPrefix("remote:")
     }
 
     private func poll(deviceID: String, sessionIDs: [String]) async throws -> [RemoteSessionSnapshot] {
@@ -675,18 +1124,22 @@ actor SessionWatchManager {
 
     private enum WaitPartitionResult: Equatable {
         case snapshots
-        case empty
-        case paused
+        case retryScheduled
+        case rearmImmediately
     }
 
     private struct SessionWindowPartition {
         let windowID: Int?
-        let sessionIDs: [String]
+        let sessionTokens: [String: UUID]
+
+        var sessionIDs: [String] {
+            sessionTokens.keys.sorted()
+        }
     }
 
     private enum WaitGroupOutcome {
-        case success(sessionIDs: [String], payload: JSONValue)
-        case toolError(sessionIDs: [String], message: String)
+        case success(sessionTokens: [String: UUID], payload: JSONValue)
+        case failure(sessionTokens: [String: UUID], reason: RemoteObservationFailureReason)
     }
 
     private func waitAndHandlePartitions(
@@ -696,10 +1149,21 @@ actor SessionWatchManager {
         includeStatusUpdates: Bool
     ) async throws -> WaitPartitionResult {
         let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
-        var sawSnapshot = false
-        var paused = false
+        guard !partitions.isEmpty else { return .rearmImmediately }
+        let cycleSessionTokens = partitions.reduce(into: [String: UUID]()) { tokens, partition in
+            tokens.merge(partition.sessionTokens) { current, _ in current }
+        }
+        let cycleID = beginWaitCycle(
+            deviceID: deviceID,
+            taskID: taskID,
+            sessionTokens: cycleSessionTokens
+        )
+        defer { endWaitCycle(deviceID: deviceID, cycleID: cycleID) }
+        var sawMatchedSnapshot = false
+        var retryScheduled = false
+        var shouldRearmImmediately = false
 
-        try await withThrowingTaskGroup(of: WaitGroupOutcome.self) { group in
+        await withTaskGroup(of: WaitGroupOutcome.self) { group in
             for partition in partitions {
                 group.addTask {
                     do {
@@ -709,46 +1173,110 @@ actor SessionWatchManager {
                             windowID: partition.windowID,
                             includeStatusUpdates: includeStatusUpdates
                         )
-                        return .success(sessionIDs: partition.sessionIDs, payload: payload)
-                    } catch let error as SessionWatchError {
-                        return .toolError(sessionIDs: partition.sessionIDs, message: error.description)
+                        return .success(sessionTokens: partition.sessionTokens, payload: payload)
+                    } catch {
+                        return await .failure(
+                            sessionTokens: partition.sessionTokens,
+                            reason: self.observationFailureReason(for: error)
+                        )
                     }
                 }
             }
 
-            while let outcome = try await group.next() {
+            while let outcome = await group.next() {
                 guard devices[deviceID]?.waitTaskID == taskID else {
                     group.cancelAll()
                     return
                 }
                 switch outcome {
-                case let .success(_, payload):
+                case let .success(sessionTokens, payload):
                     let snapshots = RemoteSessionSnapshot.extractSnapshots(from: payload)
-                    if !snapshots.isEmpty {
-                        sawSnapshot = true
+                    let tokensByMatchKey = sessionTokens.keys.sorted().reduce(
+                        into: [String: [(sessionID: String, token: UUID)]]()
+                    ) { lookup, sessionID in
+                        guard let token = sessionTokens[sessionID] else { return }
+                        lookup[canonicalSessionMatchKey(sessionID), default: []].append((sessionID, token))
                     }
+                    var matchedCurrentCount = 0
                     for snapshot in snapshots {
-                        await handleWaitSnapshot(deviceID: deviceID, snapshot: snapshot)
+                        let matchKey = canonicalSessionMatchKey(snapshot.sessionID)
+                        guard let matches = tokensByMatchKey[matchKey] else { continue }
+                        for match in matches {
+                            guard currentSubscriptionToken(
+                                deviceID: deviceID,
+                                sessionID: match.sessionID,
+                                expected: match.token
+                            ) != nil else { continue }
+                            var subscribedSnapshot = snapshot
+                            if subscribedSnapshot.sessionID != match.sessionID {
+                                var rewrittenPayload = subscribedSnapshot.payload.objectValue ?? [:]
+                                rewrittenPayload["session_id"] = .string(match.sessionID)
+                                subscribedSnapshot = RemoteSessionSnapshot(
+                                    sessionID: match.sessionID,
+                                    status: subscribedSnapshot.status,
+                                    payload: .object(rewrittenPayload)
+                                )
+                            }
+                            matchedCurrentCount += 1
+                            clearObservationHealthAfterSuccess(
+                                deviceID: deviceID,
+                                sessionID: match.sessionID,
+                                token: match.token
+                            )
+                            await handleWaitSnapshot(deviceID: deviceID, snapshot: subscribedSnapshot)
+                        }
                     }
-                case let .toolError(sessionIDs, message):
-                    paused = true
-                    for sessionID in sessionIDs {
-                        await pauseObservationAfterToolError(
+                    if matchedCurrentCount > 0 {
+                        sawMatchedSnapshot = true
+                        logger.debug(
+                            "watch_accountability event=wait_disposition outcome=accepted device_id=\(boundedLogIdentifier(deviceID)) correlation_id=\(boundedLogIdentifier(cycleID.uuidString))"
+                        )
+                    } else {
+                        retryScheduled = true
+                        let returnedRowCount = payload.objectValue?["snapshots"]?.arrayValue?.count
+                            ?? (payload.objectValue == nil ? 0 : 1)
+                        let disposition = returnedRowCount == 0 ? "empty" : "rejected"
+                        logger.notice(
+                            "watch_accountability event=wait_disposition outcome=\(disposition) reason=invalid_snapshot device_id=\(boundedLogIdentifier(deviceID)) correlation_id=\(boundedLogIdentifier(cycleID.uuidString))"
+                        )
+                        for sessionID in sessionTokens.keys.sorted() {
+                            guard let token = sessionTokens[sessionID] else { continue }
+                            await pauseObservation(
+                                deviceID: deviceID,
+                                sessionID: sessionID,
+                                token: token,
+                                reason: .invalidSnapshot
+                            )
+                        }
+                    }
+                case let .failure(sessionTokens, reason):
+                    shouldRearmImmediately = true
+                    for (sessionID, token) in sessionTokens {
+                        await pauseObservation(
                             deviceID: deviceID,
                             sessionID: sessionID,
-                            error: SessionWatchError.toolCallFailed(message)
+                            token: token,
+                            reason: reason
                         )
                     }
                 }
             }
         }
 
-        if paused { return .paused }
-        return sawSnapshot ? .snapshots : .empty
+        if shouldRearmImmediately {
+            return .rearmImmediately
+        }
+        if retryScheduled {
+            return .retryScheduled
+        }
+        return sawMatchedSnapshot ? .snapshots : .rearmImmediately
     }
 
     private func callAgentRunPoll(deviceID: String, sessionIDs: [String]) async throws -> JSONValue {
         let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
+        guard !partitions.isEmpty else {
+            throw SessionWatchError.observationFailure(.routingUnavailable)
+        }
         if partitions.count == 1 {
             return try await callAgentRunPollPartition(
                 deviceID: deviceID,
@@ -769,23 +1297,33 @@ actor SessionWatchManager {
     }
 
     private func callAgentRunPollPartition(deviceID: String, sessionIDs: [String], windowID: Int?) async throws -> JSONValue {
-        var args = agentRunSessionArgs(op: "poll", sessionIDs: sessionIDs, windowID: windowID)
-        logger.info("watch validation poll issued device_id=\(deviceID) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none")")
+        let args = agentRunSessionArgs(op: "poll", sessionIDs: sessionIDs, windowID: windowID)
+        logger.debug(
+            "observation event=issue operation=poll device_id=\(boundedLogIdentifier(deviceID)) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none")"
+        )
         var didLogReturn = false
         do {
             let result = try await appLink(forDevice: deviceID).callTool(name: "agent_run", arguments: args, timeout: 15)
-            let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
+            let payload: JSONValue
+            do {
+                payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
+            } catch {
+                throw SessionWatchError.observationFailure(.invalidSnapshot)
+            }
             let outcome = result.isError == true ? "tool_error" : "success"
-            logger.info("watch validation poll returned device_id=\(deviceID) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none") outcome=\(outcome)")
+            logger.debug(
+                "observation event=return operation=poll device_id=\(boundedLogIdentifier(deviceID)) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none") outcome=\(outcome)"
+            )
             didLogReturn = true
             if result.isError == true {
-                // Tool-level errors are retryable observation pauses, never expiry.
-                throw SessionWatchError.toolCallFailed(Self.toolErrorMessage(from: payload))
+                throw SessionWatchError.observationFailure(Self.toolFailureReason(from: payload))
             }
             return payload
         } catch {
             if !didLogReturn {
-                logger.info("watch validation poll returned device_id=\(deviceID) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none") outcome=error")
+                logger.debug(
+                    "observation event=return operation=poll device_id=\(boundedLogIdentifier(deviceID)) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none") outcome=error"
+                )
             }
             throw error
         }
@@ -797,6 +1335,9 @@ actor SessionWatchManager {
         includeStatusUpdates: Bool = false
     ) async throws -> JSONValue {
         let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
+        guard !partitions.isEmpty else {
+            throw SessionWatchError.observationFailure(.routingUnavailable)
+        }
         if partitions.count == 1 {
             return try await callAgentRunWaitPartition(
                 deviceID: deviceID,
@@ -835,34 +1376,55 @@ actor SessionWatchManager {
         if includeStatusUpdates {
             args["include_status_updates"] = .bool(true)
         }
+        logger.debug(
+            "observation event=issue operation=wait device_id=\(boundedLogIdentifier(deviceID)) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none")"
+        )
         let result = try await appLink(forDevice: deviceID)
             .callTool(name: "agent_run", arguments: args, timeout: waitTimeoutSeconds + 5)
-        let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
+        let payload: JSONValue
+        do {
+            payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
+        } catch {
+            throw SessionWatchError.observationFailure(.invalidSnapshot)
+        }
+        logger.debug(
+            "observation event=return operation=wait device_id=\(boundedLogIdentifier(deviceID)) session_count=\(sessionIDs.count) window_id=\(windowID.map(String.init) ?? "none") outcome=\(result.isError == true ? "tool_error" : "success")"
+        )
         if result.isError == true {
-            // Tool-level errors are retryable observation pauses, never expiry.
-            throw SessionWatchError.toolCallFailed(Self.toolErrorMessage(from: payload))
+            throw SessionWatchError.observationFailure(Self.toolFailureReason(from: payload))
         }
         return payload
     }
 
     private func partitions(deviceID: String, sessionIDs: [String]) async -> [SessionWindowPartition] {
         guard let windowResolver else {
-            return [SessionWindowPartition(windowID: nil, sessionIDs: sessionIDs)]
+            let tokens = Dictionary(uniqueKeysWithValues: sessionIDs.compactMap { sessionID in
+                currentSubscriptionToken(deviceID: deviceID, sessionID: sessionID, expected: nil)
+                    .map { (sessionID, $0) }
+            })
+            return tokens.isEmpty ? [] : [SessionWindowPartition(windowID: nil, sessionTokens: tokens)]
         }
-        var byWindow: [Int: [String]] = [:]
-        var legacy: [String] = []
+        var byWindow: [Int: [String: UUID]] = [:]
         for sessionID in sessionIDs {
+            guard let token = currentSubscriptionToken(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                expected: nil
+            ) else { continue }
             if let windowID = await windowResolver(deviceID, sessionID) {
-                byWindow[windowID, default: []].append(sessionID)
+                byWindow[windowID, default: [:]][sessionID] = token
             } else {
-                legacy.append(sessionID)
+                scheduleRoutingRecovery(
+                    deviceID: deviceID,
+                    sessionID: sessionID,
+                    token: token,
+                    invalidate: false
+                )
             }
         }
-        var result = byWindow.keys.sorted().map { SessionWindowPartition(windowID: $0, sessionIDs: byWindow[$0] ?? []) }
-        if !legacy.isEmpty {
-            result.append(SessionWindowPartition(windowID: nil, sessionIDs: legacy))
+        return byWindow.keys.sorted().map {
+            SessionWindowPartition(windowID: $0, sessionTokens: byWindow[$0] ?? [:])
         }
-        return result
     }
 
     private func agentRunSessionArgs(op: String, sessionIDs: [String], windowID: Int?) -> [String: Value] {
@@ -881,11 +1443,22 @@ actor SessionWatchManager {
         return args
     }
 
-    private static func toolErrorMessage(from payload: JSONValue) -> String {
-        payload.objectValue?["error"]?.stringValue
-            ?? payload.objectValue?["message"]?.stringValue
-            ?? payload.objectValue?["text"]?.stringValue
-            ?? "agent_run returned an error result"
+    private static func toolFailureReason(from payload: JSONValue) -> RemoteObservationFailureReason {
+        let object = payload.objectValue
+        let code = object?["code"]?.stringValue?.lowercased() ?? ""
+        let category = object?["error"]?.stringValue?.lowercased()
+            ?? object?["message"]?.stringValue?.lowercased()
+            ?? ""
+        let routingCodes = ["binding_required", "ambiguous_start_target"]
+        if routingCodes.contains(code)
+            || category.contains("binding_required")
+            || category.contains("multiple window")
+            || category.contains("window-only")
+            || category.contains("bound to the target window")
+        {
+            return .routingUnavailable
+        }
+        return .toolFailure
     }
 
     private func emitSnapshot(
@@ -1155,12 +1728,15 @@ actor SessionWatchManager {
         deviceID: String,
         sessionID: String,
         trigger: EmissionTrigger,
-        status: String,
+        status _: String,
         type: String,
         seq: UInt64?,
-        suffix: String = ""
+        suffix _: String = ""
     ) {
-        logger.debug("watch emit device=\(deviceID) session=\(sessionID) trigger=\(trigger.rawValue) status=\(status) type=\(type) seq=\(seq.map(String.init) ?? "-")\(suffix)")
+        let outcome = ["held", "suppressed"].contains(type) ? type : "emitted"
+        logger.debug(
+            "watch_accountability event=snapshot_emission outcome=\(outcome) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) frame_type=\(type) seq=\(seq.map(String.init) ?? "-") seq_epoch=\(boundedLogIdentifier(sequenceEpoch)) trigger=\(trigger.rawValue)"
+        )
     }
 
     /// Wake-only push semantics (M5): push fires only when the device is
@@ -1243,6 +1819,7 @@ actor SessionWatchManager {
             state.parkedActionableSessionIDs.remove(sessionID)
             state.parkedTerminalSessionIDs.remove(sessionID)
             clearTerminalObservationState(deviceID: deviceID, sessionID: sessionID)
+            clearObservationHealth(deviceID: deviceID, sessionID: sessionID)
             devices[deviceID] = state
             ensureWaitLoop(deviceID: deviceID)
             ensureRevalidationLoop(deviceID: deviceID)

@@ -4,6 +4,17 @@ struct RemoteGatewayLaunchConfiguration: Equatable {
     let bindHost: String
     let port: Int
     let appSupportRoot: String
+
+    static func production(
+        bindHost: String,
+        buildIdentity: RemoteControlBuildIdentity = .current
+    ) -> Self {
+        .init(
+            bindHost: bindHost,
+            port: buildIdentity.fixedPort,
+            appSupportRoot: RemoteControlStorageNamespace.gatewayRuntimeRootURL().path
+        )
+    }
 }
 
 struct RemoteGatewayProcessIdentity: Equatable, Hashable {

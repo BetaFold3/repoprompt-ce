@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Logging
 import MCP
@@ -10,6 +11,8 @@ protocol RemoteFrameSink: Sendable {
 }
 
 actor RemoteGatewayRuntime {
+    typealias ObservationWindowDiscovery = @Sendable (_ deviceID: String, _ sessionID: String) async -> Int?
+
     static let phase0DeviceID = "phase0:static-token"
 
     private struct SubscriptionValidationKey: Hashable {
@@ -55,6 +58,24 @@ actor RemoteGatewayRuntime {
         case explicitWindowID = "explicit_window_id"
     }
 
+    private enum ListAgentsRecoveryMode: Equatable {
+        case armed
+        case retrying
+        case disabled
+    }
+
+    private struct ListAgentsRoutingDiagnostics {
+        var bindingStateInitial: String?
+        var bindingStateRetry: String?
+        var fallbackInitial: String?
+        var fallbackRetry: String?
+        var windowIDInjectedInitial: Bool?
+        var windowIDInjectedRetry: Bool?
+        var errorOriginInitial: String?
+        var errorOriginRetry: String?
+        var recoveryRetried: Bool?
+    }
+
     private let appLink: AppLinkSession
     private let appLinkPool: AppLinkPool?
     private let ledger: CommandLedger
@@ -64,12 +85,15 @@ actor RemoteGatewayRuntime {
     private let logger: Logger
     private let defaultBindingState: RemoteGatewayBindingState
     private let pushSubscriptionStore: WebPushSubscriptionStore?
+    private let observationWindowDiscovery: ObservationWindowDiscovery?
+    private let observationDiscoveryTimeoutSeconds: TimeInterval
     private let now: @Sendable () -> Date
     private var lastEligibleWindowDetailsByDevice: [String: JSONValue] = [:]
     private var autoRoutedStartWindowIDByCommandKey: [String: Int] = [:]
     private var workspaceMatchCountByCommandKey: [String: Int] = [:]
     private var workspaceStartMatchSkippedByCommandKey: [String: String] = [:]
     private var workspaceMatchUnavailableReasonByCommandKey: [String: String] = [:]
+    private var listAgentsRoutingDiagnosticsByCommandKey: [String: ListAgentsRoutingDiagnostics] = [:]
     private var pendingSubscriptionValidations: [
         SubscriptionValidationKey: [SessionWatchManager.SubscriptionValidation]
     ] = [:]
@@ -84,6 +108,8 @@ actor RemoteGatewayRuntime {
         appLinkPool: AppLinkPool? = nil,
         pushSubscriptionStore: WebPushSubscriptionStore? = nil,
         sessionWindowAffinity: GatewaySessionWindowAffinity = GatewaySessionWindowAffinity(),
+        observationWindowDiscovery: ObservationWindowDiscovery? = nil,
+        observationDiscoveryTimeoutSeconds: TimeInterval = 5,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.appLink = appLink
@@ -95,6 +121,8 @@ actor RemoteGatewayRuntime {
         self.logger = logger
         defaultBindingState = bindingState
         self.pushSubscriptionStore = pushSubscriptionStore
+        self.observationWindowDiscovery = observationWindowDiscovery
+        self.observationDiscoveryTimeoutSeconds = max(0.01, observationDiscoveryTimeoutSeconds)
         self.now = now
     }
 
@@ -502,6 +530,7 @@ actor RemoteGatewayRuntime {
             deviceID: deviceID,
             link: link,
             bindingState: bindingState,
+            listAgentsRecoveryMode: .armed,
             allowCorrectiveRetry: true,
             allowStartRoutingRetry: true
         )
@@ -512,9 +541,16 @@ actor RemoteGatewayRuntime {
         deviceID: String,
         link: AppLinkSession,
         bindingState: RemoteGatewayBindingState,
+        listAgentsRecoveryMode: ListAgentsRecoveryMode,
         allowCorrectiveRetry: Bool,
         allowStartRoutingRetry: Bool
     ) async throws -> JSONValue {
+        rememberListAgentsAttemptStart(
+            frame: frame,
+            deviceID: deviceID,
+            bindingState: bindingState,
+            mode: listAgentsRecoveryMode
+        )
         let sessionID = singleSessionIDIfSessionAddressed(frame)
         var resolvedWindowID = await resolvedWindowID(
             forSession: sessionID,
@@ -523,10 +559,24 @@ actor RemoteGatewayRuntime {
         )
         if frame.type == "list_agents",
            resolvedWindowID == nil,
-           bindingState != .bound,
-           let fallbackWindowID = await eligibleStartTargetWindowInfo(deviceID: deviceID)?.windowIDs.first
+           bindingState != .bound || listAgentsRecoveryMode == .retrying
         {
-            resolvedWindowID = fallbackWindowID
+            if let fallbackWindowID = await eligibleStartTargetWindowInfo(deviceID: deviceID)?.windowIDs.first {
+                resolvedWindowID = fallbackWindowID
+                rememberListAgentsFallback(
+                    frame: frame,
+                    deviceID: deviceID,
+                    outcome: "resolved",
+                    mode: listAgentsRecoveryMode
+                )
+            } else {
+                rememberListAgentsFallback(
+                    frame: frame,
+                    deviceID: deviceID,
+                    outcome: "unavailable",
+                    mode: listAgentsRecoveryMode
+                )
+            }
         }
         var effectiveFrame = frame
         if frame.type == "start",
@@ -550,6 +600,7 @@ actor RemoteGatewayRuntime {
             bindingState: bindingState,
             resolvedWindowID: resolvedWindowID,
             retrySessionID: sessionID,
+            listAgentsRecoveryMode: listAgentsRecoveryMode,
             allowCorrectiveRetry: allowCorrectiveRetry,
             allowStartRoutingRetry: allowStartRoutingRetry
         )
@@ -618,6 +669,7 @@ actor RemoteGatewayRuntime {
                 bindingState: bindingState,
                 resolvedWindowID: summary.windowID,
                 retrySessionID: nil,
+                listAgentsRecoveryMode: .disabled,
                 allowCorrectiveRetry: false,
                 allowStartRoutingRetry: false
             )
@@ -648,7 +700,9 @@ actor RemoteGatewayRuntime {
             await sessionWindowAffinity.record(sessionID: candidate.sessionID, windowID: candidate.windowID)
         }
         let sessions = candidatesBySessionID.values.sorted {
-            if $0.lastModified != $1.lastModified { return $0.lastModified > $1.lastModified }
+            if $0.lastModified != $1.lastModified {
+                return $0.lastModified > $1.lastModified
+            }
             return $0.sessionID < $1.sessionID
         }
         let limit = max(1, payload["limit"]?.intValue ?? 100)
@@ -735,11 +789,52 @@ actor RemoteGatewayRuntime {
         bindingState: RemoteGatewayBindingState,
         resolvedWindowID: Int?,
         retrySessionID: String?,
+        listAgentsRecoveryMode: ListAgentsRecoveryMode,
         allowCorrectiveRetry: Bool,
         allowStartRoutingRetry: Bool
     ) async throws -> JSONValue {
         let translator = RemoteCommandTranslator(bindingState: bindingState)
-        let toolCall = try translator.translate(frame, resolvedWindowID: resolvedWindowID)
+        let toolCall: RemoteToolCall
+        do {
+            toolCall = try translator.translate(frame, resolvedWindowID: resolvedWindowID)
+            rememberListAgentsWindowIDInjection(
+                frame: frame,
+                deviceID: deviceID,
+                injected: toolCall.arguments["_windowID"] != nil,
+                mode: listAgentsRecoveryMode
+            )
+        } catch {
+            rememberListAgentsWindowIDInjection(
+                frame: frame,
+                deviceID: deviceID,
+                injected: false,
+                mode: listAgentsRecoveryMode
+            )
+            rememberListAgentsErrorOrigin(
+                frame: frame,
+                deviceID: deviceID,
+                origin: "translator",
+                mode: listAgentsRecoveryMode
+            )
+            if frame.type == "list_agents",
+               listAgentsRecoveryMode == .armed,
+               let translatorError = error as? RemoteCommandTranslatorError,
+               case .bindingRequired = translatorError,
+               let refreshedBindingState = await appLinkPool?.refreshBindingState(forDevice: deviceID)
+            {
+                return try await callTranslatedToolSingle(
+                    for: frame,
+                    deviceID: deviceID,
+                    link: link,
+                    bindingState: refreshedBindingState,
+                    listAgentsRecoveryMode: .retrying,
+                    allowCorrectiveRetry: false,
+                    allowStartRoutingRetry: false
+                )
+            }
+            throw error
+        }
+
         let result = try await link.callTool(
             name: toolCall.toolName,
             arguments: toolCall.arguments,
@@ -748,8 +843,34 @@ actor RemoteGatewayRuntime {
         let payload = try RemoteMCPToolResultCodec.jsonValue(from: result)
         if result.isError == true {
             let runtimeError = RemoteGatewayRuntimeError.appToolError(payload: payload)
-            if runtimeError.code(frame: frame) == "binding_required" {
-                await appLinkPool?.refreshBindingState(forDevice: deviceID)
+            let errorCode = runtimeError.code(frame: frame)
+            rememberListAgentsErrorOrigin(
+                frame: frame,
+                deviceID: deviceID,
+                origin: "app",
+                mode: listAgentsRecoveryMode
+            )
+
+            var refreshedBindingState: RemoteGatewayBindingState?
+            if errorCode == "binding_required",
+               !(frame.type == "list_agents" && listAgentsRecoveryMode == .retrying)
+            {
+                refreshedBindingState = await appLinkPool?.refreshBindingState(forDevice: deviceID)
+            }
+            if frame.type == "list_agents",
+               errorCode == "binding_required",
+               listAgentsRecoveryMode == .armed,
+               let refreshedBindingState
+            {
+                return try await callTranslatedToolSingle(
+                    for: frame,
+                    deviceID: deviceID,
+                    link: link,
+                    bindingState: refreshedBindingState,
+                    listAgentsRecoveryMode: .retrying,
+                    allowCorrectiveRetry: false,
+                    allowStartRoutingRetry: false
+                )
             }
             if Self.isStartRoutingTargetError(runtimeError, frame: frame) {
                 let refreshedBindingState = await appLinkPool?.refreshBindingState(forDevice: deviceID)
@@ -763,6 +884,7 @@ actor RemoteGatewayRuntime {
                             deviceID: deviceID,
                             link: link,
                             bindingState: refreshedBindingState,
+                            listAgentsRecoveryMode: .disabled,
                             allowCorrectiveRetry: false,
                             allowStartRoutingRetry: false
                         )
@@ -789,6 +911,7 @@ actor RemoteGatewayRuntime {
                     bindingState: bindingState,
                     resolvedWindowID: rediscovered,
                     retrySessionID: nil,
+                    listAgentsRecoveryMode: .disabled,
                     allowCorrectiveRetry: false,
                     allowStartRoutingRetry: false
                 )
@@ -856,6 +979,7 @@ actor RemoteGatewayRuntime {
                 deviceID: deviceID,
                 link: link,
                 bindingState: bindingState,
+                listAgentsRecoveryMode: .disabled,
                 allowCorrectiveRetry: false,
                 allowStartRoutingRetry: false
             )
@@ -871,6 +995,7 @@ actor RemoteGatewayRuntime {
                 bindingState: bindingState,
                 resolvedWindowID: partition.windowID,
                 retrySessionID: nil,
+                listAgentsRecoveryMode: .disabled,
                 allowCorrectiveRetry: false,
                 allowStartRoutingRetry: false
             )
@@ -898,14 +1023,57 @@ actor RemoteGatewayRuntime {
         throw RemoteGatewayRuntimeError.deviceAppLinkUnavailable(deviceID: deviceID)
     }
 
-    func resolveSessionWindowForObservation(deviceID: String, sessionID: String) async -> Int? {
-        if let cachedWindowID = await sessionWindowAffinity.windowID(forSession: sessionID) {
-            logger.info("observation window resolution stage=warm_hit device_id=\(deviceID) session_id=\(sessionID.trimmingCharacters(in: .whitespacesAndNewlines)) window_id=\(cachedWindowID)")
+    func cachedSessionWindowForObservation(deviceID: String, sessionID: String) async -> Int? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return nil }
+        if let cachedWindowID = await sessionWindowAffinity.windowID(forSession: normalizedSessionID) {
+            logger.debug(
+                "observation event=affinity_lookup outcome=warm_hit device_id=\(Self.boundedLogIdentifier(deviceID)) session_id=\(Self.boundedLogIdentifier(normalizedSessionID)) window_id=\(cachedWindowID)"
+            )
             return cachedWindowID
         }
-        logger.info("observation window resolution stage=cold_path device_id=\(deviceID) session_id=\(sessionID.trimmingCharacters(in: .whitespacesAndNewlines))")
-        guard let (_, bindingState) = try? await resolveAppLink(deviceID: deviceID) else { return nil }
-        return await resolvedWindowID(forSession: sessionID, deviceID: deviceID, bindingState: bindingState)
+        logger.notice(
+            "observation event=affinity_lookup outcome=miss device_id=\(Self.boundedLogIdentifier(deviceID)) session_id=\(Self.boundedLogIdentifier(normalizedSessionID))"
+        )
+        return nil
+    }
+
+    func resolveSessionWindowForObservation(deviceID: String, sessionID: String) async -> Int? {
+        if let cached = await cachedSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID) {
+            return cached
+        }
+        return await recoverSessionWindowForObservation(
+            deviceID: deviceID,
+            sessionID: sessionID,
+            invalidate: false
+        )
+    }
+
+    func recoverSessionWindowForObservation(
+        deviceID: String,
+        sessionID: String,
+        invalidate: Bool
+    ) async -> Int? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return nil }
+        if invalidate {
+            await sessionWindowAffinity.invalidate(sessionID: normalizedSessionID)
+        }
+        logger.notice(
+            "observation event=affinity_recovery outcome=issued device_id=\(Self.boundedLogIdentifier(deviceID)) session_id=\(Self.boundedLogIdentifier(normalizedSessionID))"
+        )
+        let result = await withBoundedObservationResolution(seconds: observationDiscoveryTimeoutSeconds) {
+            await self.sessionWindowAffinity.resolvingWindowID(forSession: normalizedSessionID) {
+                if let observationWindowDiscovery = await self.observationWindowDiscovery {
+                    return await observationWindowDiscovery(deviceID, normalizedSessionID)
+                }
+                return await self.discoverSessionWindow(sessionID: normalizedSessionID, deviceID: deviceID)
+            }
+        }
+        logger.notice(
+            "observation event=affinity_recovery outcome=\(result == nil ? "exhausted" : "recovered") device_id=\(Self.boundedLogIdentifier(deviceID)) session_id=\(Self.boundedLogIdentifier(normalizedSessionID)) window_id=\(result.map(String.init) ?? "none")"
+        )
+        return result
     }
 
     private func resolvedWindowID(
@@ -1207,7 +1375,9 @@ actor RemoteGatewayRuntime {
         if let values = frame.payload?.objectValue?["session_ids"]?.arrayValue {
             let ids = values.compactMap { $0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
-            if !ids.isEmpty { return ids }
+            if !ids.isEmpty {
+                return ids
+            }
         }
         throw RemoteCommandTranslatorError.missingSessionID(frame.type)
     }
@@ -1265,8 +1435,12 @@ actor RemoteGatewayRuntime {
 
     private func explicitStartWindowID(_ frame: RemoteClientFrame) -> Int? {
         guard frame.type == "start", let value = frame.payload?.objectValue?["window_id"] else { return nil }
-        if let intValue = value.intValue { return intValue }
-        if let stringValue = value.stringValue { return Int(stringValue) }
+        if let intValue = value.intValue {
+            return intValue
+        }
+        if let stringValue = value.stringValue {
+            return Int(stringValue)
+        }
         return nil
     }
 
@@ -1283,6 +1457,124 @@ actor RemoteGatewayRuntime {
     private func commandKey(frame: RemoteClientFrame, deviceID: String) -> String? {
         guard let requestID = frame.requestID else { return nil }
         return "\(deviceID)|\(requestID)"
+    }
+
+    private func rememberListAgentsAttemptStart(
+        frame: RemoteClientFrame,
+        deviceID: String,
+        bindingState: RemoteGatewayBindingState,
+        mode: ListAgentsRecoveryMode
+    ) {
+        guard frame.type == "list_agents",
+              mode != .disabled,
+              let key = commandKey(frame: frame, deviceID: deviceID)
+        else { return }
+        var diagnostics = listAgentsRoutingDiagnosticsByCommandKey[key] ?? ListAgentsRoutingDiagnostics()
+        switch mode {
+        case .armed:
+            diagnostics.bindingStateInitial = bindingStateCategory(bindingState)
+            diagnostics.fallbackInitial = "not_run"
+            diagnostics.recoveryRetried = false
+        case .retrying:
+            diagnostics.bindingStateRetry = bindingStateCategory(bindingState)
+            diagnostics.fallbackRetry = "not_run"
+            diagnostics.recoveryRetried = true
+        case .disabled:
+            return
+        }
+        listAgentsRoutingDiagnosticsByCommandKey[key] = diagnostics
+    }
+
+    private func rememberListAgentsFallback(
+        frame: RemoteClientFrame,
+        deviceID: String,
+        outcome: String,
+        mode: ListAgentsRecoveryMode
+    ) {
+        guard frame.type == "list_agents",
+              mode != .disabled,
+              let key = commandKey(frame: frame, deviceID: deviceID)
+        else { return }
+        var diagnostics = listAgentsRoutingDiagnosticsByCommandKey[key] ?? ListAgentsRoutingDiagnostics()
+        switch mode {
+        case .armed:
+            diagnostics.fallbackInitial = outcome
+        case .retrying:
+            diagnostics.fallbackRetry = outcome
+        case .disabled:
+            return
+        }
+        listAgentsRoutingDiagnosticsByCommandKey[key] = diagnostics
+    }
+
+    private func rememberListAgentsWindowIDInjection(
+        frame: RemoteClientFrame,
+        deviceID: String,
+        injected: Bool,
+        mode: ListAgentsRecoveryMode
+    ) {
+        guard frame.type == "list_agents",
+              mode != .disabled,
+              let key = commandKey(frame: frame, deviceID: deviceID)
+        else { return }
+        var diagnostics = listAgentsRoutingDiagnosticsByCommandKey[key] ?? ListAgentsRoutingDiagnostics()
+        switch mode {
+        case .armed:
+            diagnostics.windowIDInjectedInitial = injected
+        case .retrying:
+            diagnostics.windowIDInjectedRetry = injected
+        case .disabled:
+            return
+        }
+        listAgentsRoutingDiagnosticsByCommandKey[key] = diagnostics
+    }
+
+    private func rememberListAgentsErrorOrigin(
+        frame: RemoteClientFrame,
+        deviceID: String,
+        origin: String,
+        mode: ListAgentsRecoveryMode
+    ) {
+        guard frame.type == "list_agents",
+              mode != .disabled,
+              let key = commandKey(frame: frame, deviceID: deviceID)
+        else { return }
+        var diagnostics = listAgentsRoutingDiagnosticsByCommandKey[key] ?? ListAgentsRoutingDiagnostics()
+        switch mode {
+        case .armed:
+            diagnostics.errorOriginInitial = origin
+        case .retrying:
+            diagnostics.errorOriginRetry = origin
+        case .disabled:
+            return
+        }
+        listAgentsRoutingDiagnosticsByCommandKey[key] = diagnostics
+    }
+
+    private func takeListAgentsRoutingDiagnostics(
+        frame: RemoteClientFrame,
+        deviceID: String
+    ) -> ListAgentsRoutingDiagnostics? {
+        guard frame.type == "list_agents",
+              let key = commandKey(frame: frame, deviceID: deviceID)
+        else { return nil }
+        return listAgentsRoutingDiagnosticsByCommandKey.removeValue(forKey: key)
+    }
+
+    private nonisolated static func boundedLogIdentifier(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return "id_" + digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func bindingStateCategory(_ state: RemoteGatewayBindingState) -> String {
+        switch state {
+        case .bound:
+            "bound"
+        case .bindingRequired:
+            "binding_required"
+        case .ambiguousStartTarget:
+            "ambiguous_start_target"
+        }
     }
 
     private func rememberWorkspaceMatchCount(frame: RemoteClientFrame, deviceID: String, count: Int) {
@@ -1339,6 +1631,9 @@ actor RemoteGatewayRuntime {
         let workspaceMatchUnavailableReason = shouldConsumeWorkspaceDiagnostics
             ? takeWorkspaceMatchUnavailableReason(frame: frame, deviceID: deviceID)
             : nil
+        let listAgentsDiagnostics = shouldConsumeWorkspaceDiagnostics
+            ? takeListAgentsRoutingDiagnostics(frame: frame, deviceID: deviceID)
+            : nil
         let isWorkspaceSelectorFailure = ["start", "list_sessions"].contains(frame.type)
             && outcome == "failure"
             && ["binding_required", "ambiguous_start_target", "workspace_not_open", "workspace_mismatch"].contains(code)
@@ -1371,9 +1666,64 @@ actor RemoteGatewayRuntime {
             workspaceMatchSkipped: frame.type == "start" ? workspaceMatchSkipped : nil,
             workspaceMatchUnavailableReason: ["start", "list_sessions"].contains(frame.type)
                 ? workspaceMatchUnavailableReason
-                : nil
+                : nil,
+            bindingStateInitial: listAgentsDiagnostics?.bindingStateInitial,
+            bindingStateRetry: listAgentsDiagnostics?.bindingStateRetry,
+            fallbackInitial: listAgentsDiagnostics?.fallbackInitial,
+            fallbackRetry: listAgentsDiagnostics?.fallbackRetry,
+            windowIDInjectedInitial: listAgentsDiagnostics?.windowIDInjectedInitial,
+            windowIDInjectedRetry: listAgentsDiagnostics?.windowIDInjectedRetry,
+            errorOriginInitial: listAgentsDiagnostics?.errorOriginInitial,
+            errorOriginRetry: listAgentsDiagnostics?.errorOriginRetry,
+            recoveryRetried: listAgentsDiagnostics?.recoveryRetried
         ))
     }
+}
+
+private actor BoundedObservationResolutionGate {
+    private var resolved = false
+    private var result: Int?
+    private var waiters: [CheckedContinuation<Int?, Never>] = []
+
+    func resolve(_ result: Int?) {
+        guard !resolved else { return }
+        resolved = true
+        self.result = result
+        waiters.forEach { $0.resume(returning: result) }
+        waiters.removeAll()
+    }
+
+    func value() async -> Int? {
+        if resolved {
+            return result
+        }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+private func withBoundedObservationResolution(
+    seconds: TimeInterval,
+    operation: @escaping @Sendable () async -> Int?
+) async -> Int? {
+    let gate = BoundedObservationResolutionGate()
+    let discoveryTask = Task {
+        await gate.resolve(operation())
+    }
+    let timeoutTask = Task {
+        try? await Task.sleep(for: .milliseconds(Int64((max(0.01, seconds) * 1000).rounded(.up))))
+        guard !Task.isCancelled else { return }
+        await gate.resolve(nil)
+    }
+    let result = await withTaskCancellationHandler {
+        await gate.value()
+    } onCancel: {
+        Task { await gate.resolve(nil) }
+    }
+    timeoutTask.cancel()
+    discoveryTask.cancel()
+    return result
 }
 
 enum RemoteGatewayRuntimeError: Error, Equatable {
@@ -1386,8 +1736,12 @@ enum RemoteGatewayRuntimeError: Error, Equatable {
         switch self {
         case let .appToolError(payload):
             if let object = payload.objectValue {
-                if let error = object["error"]?.stringValue { return error }
-                if let message = object["message"]?.stringValue { return message }
+                if let error = object["error"]?.stringValue {
+                    return error
+                }
+                if let message = object["message"]?.stringValue {
+                    return message
+                }
             }
             return "App tool returned an error."
         case let .deviceAppLinkUnavailable(deviceID):

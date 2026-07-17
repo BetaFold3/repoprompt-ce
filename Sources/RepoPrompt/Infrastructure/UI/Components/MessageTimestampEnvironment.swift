@@ -92,10 +92,14 @@ struct MessageTimestampText: View {
     @Environment(\.messageTimestampNow) private var messageTimestampNow
 
     var body: some View {
-        Text(MessageTimestampFormatter.string(
-            from: date,
-            includeDateContext: showDatesInMessageTimestamps,
-            now: messageTimestampNow
-        ))
+        // Synthetic pre-floor dates (legacy remote projection sequence-index epochs)
+        // must never render as wall-clock times; collapse the view instead.
+        if AgentSessionRecencySanity.isDisplayable(date) {
+            Text(MessageTimestampFormatter.string(
+                from: date,
+                includeDateContext: showDatesInMessageTimestamps,
+                now: messageTimestampNow
+            ))
+        }
     }
 }

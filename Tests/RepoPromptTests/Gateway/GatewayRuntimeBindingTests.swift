@@ -241,7 +241,8 @@ final class GatewayRuntimeBindingTests: XCTestCase {
     private func makeRuntime(
         connection: RecordingAppLinkConnection,
         bindingState: RemoteGatewayBindingState,
-        auditLog: RemoteAuditLog? = nil
+        auditLog: RemoteAuditLog? = nil,
+        configureObservationRouting: Bool = false
     ) async throws -> RemoteGatewayRuntime {
         let root = try GatewayTestHelpers.temporaryRoot()
         let config = try GatewayTestHelpers.configuration(root: root)
@@ -263,10 +264,338 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             auditLog: auditLog,
             bindingState: bindingState
         )
-        await watchManager.setWindowResolver { deviceID, sessionID in
-            await runtime.resolveSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+        if configureObservationRouting {
+            await watchManager.setObservationRouting(
+                windowResolver: { deviceID, sessionID in
+                    await runtime.cachedSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+                },
+                windowRecovery: { deviceID, sessionID, invalidate in
+                    await runtime.recoverSessionWindowForObservation(
+                        deviceID: deviceID,
+                        sessionID: sessionID,
+                        invalidate: invalidate
+                    )
+                }
+            )
         }
         return runtime
+    }
+
+    private func makePooledRuntime(
+        connection: RecordingAppLinkConnection,
+        configuration: GatewayConfiguration,
+        deviceID: String,
+        auditLog: RemoteAuditLog,
+        initialProbe: BindingProbeRecorder,
+        refreshProbe: BindingProbeRecorder
+    ) async throws -> RemoteGatewayRuntime {
+        let pool = AppLinkPool(
+            configuration: configuration,
+            connector: BindingRuntimeConnector(connection: connection),
+            bindingProbe: { _ in initialProbe.next() },
+            refreshBindingProbe: { _ in refreshProbe.next() }
+        )
+        _ = try await pool.ensureLink(forDevice: deviceID)
+
+        let defaultAppLink = AppLinkSession(
+            config: configuration,
+            connector: StaticAppLinkConnector(connection: RecordingAppLinkConnection())
+        )
+        try await defaultAppLink.connect()
+        return try RemoteGatewayRuntime(
+            appLink: defaultAppLink,
+            ledger: CommandLedger(),
+            watchManager: SessionWatchManager(appLink: defaultAppLink, appLinkPool: pool),
+            auditLog: auditLog,
+            appLinkPool: pool
+        )
+    }
+
+    private func makeObservationRuntime(
+        connection: RecordingAppLinkConnection,
+        affinity: GatewaySessionWindowAffinity = GatewaySessionWindowAffinity(),
+        discovery: @escaping RemoteGatewayRuntime.ObservationWindowDiscovery,
+        timeoutSeconds: TimeInterval = 0.2,
+        logger: Logger = Logger(label: "test.gateway.observation")
+    ) async throws -> (RemoteGatewayRuntime, SessionWatchManager) {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let manager = SessionWatchManager(
+            appLink: appLink,
+            logger: logger,
+            waitTimeoutSeconds: 0.05,
+            pollRefreshSeconds: 0.05,
+            observationFailureBudgets: .init(
+                routingUnavailable: 2,
+                linkUnavailable: 2,
+                toolFailure: 2,
+                invalidSnapshot: 2
+            )
+        )
+        let runtime = try RemoteGatewayRuntime(
+            appLink: appLink,
+            ledger: CommandLedger(),
+            watchManager: manager,
+            auditLog: nil,
+            logger: logger,
+            bindingState: .bound,
+            sessionWindowAffinity: affinity,
+            observationWindowDiscovery: discovery,
+            observationDiscoveryTimeoutSeconds: timeoutSeconds
+        )
+        await manager.setObservationRouting(
+            windowResolver: { deviceID, sessionID in
+                await runtime.cachedSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+            },
+            windowRecovery: { deviceID, sessionID, invalidate in
+                await runtime.recoverSessionWindowForObservation(
+                    deviceID: deviceID,
+                    sessionID: sessionID,
+                    invalidate: invalidate
+                )
+            }
+        )
+        return (runtime, manager)
+    }
+
+    private func assertListAgentsRoutingAuditIsRedacted(
+        _ record: [String: Any],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let routingKeys = [
+            "binding_state_initial",
+            "binding_state_retry",
+            "fallback_initial",
+            "fallback_retry",
+            "window_id_injected_initial",
+            "window_id_injected_retry",
+            "error_origin_initial",
+            "error_origin_retry",
+            "recovery_retried"
+        ]
+        for key in routingKeys {
+            guard let value = record[key] else { continue }
+            XCTAssertTrue(
+                value is String || value is Bool,
+                "Routing audit field \(key) must be a bounded string or Boolean",
+                file: file,
+                line: line
+            )
+        }
+
+        XCTAssertNil(record["auto_routed_window_id"], file: file, line: line)
+        XCTAssertNil(record["window_id"], file: file, line: line)
+        for forbiddenKey in ["payload", "arguments", "model", "token", "secret"] {
+            XCTAssertNil(record[forbiddenKey], file: file, line: line)
+        }
+    }
+
+    func testObservationNilAffinityDiscoversBeforeCallAndNeverCallsWithoutWindowID() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "running"
+            )))
+        ])
+        let (_, manager) = try await makeObservationRuntime(
+            connection: connection,
+            discovery: { _, _ in 7 }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForSessionUpdateCount(1, sink: sink)
+        await manager.shutdown()
+
+        let observationCalls = await connection.calls.filter { call in
+            call.name == "agent_run"
+                && (call.arguments["op"] == .string("poll") || call.arguments["op"] == .string("wait"))
+        }
+        XCTAssertFalse(observationCalls.isEmpty)
+        XCTAssertTrue(observationCalls.allSatisfy { $0.arguments["_windowID"] == .int(7) })
+    }
+
+    func testObservationStaleAffinityBindingErrorInvalidatesAndRetriesOnceWithRecoveredWindowID() async throws {
+        let affinity = GatewaySessionWindowAffinity()
+        await affinity.record(sessionID: sessionID, windowID: 1)
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: .object(["code": .string("binding_required")]),
+                isError: true
+            )),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "running"
+            )))
+        ])
+        let (_, manager) = try await makeObservationRuntime(
+            connection: connection,
+            affinity: affinity,
+            discovery: { _, _ in 2 }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForSessionUpdateCount(1, sink: sink)
+        await manager.shutdown()
+
+        let pollWindows = await connection.calls
+            .filter { $0.arguments["op"] == .string("poll") }
+            .compactMap { $0.arguments["_windowID"]?.intValue }
+        XCTAssertEqual(pollWindows, [1, 2])
+    }
+
+    func testObservationMultiWindowErrorRecoversOnceWithRecoveredWindowID() async throws {
+        let affinity = GatewaySessionWindowAffinity()
+        await affinity.record(sessionID: sessionID, windowID: 3)
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: .object(["message": .string("multiple windows require binding_required")]),
+                isError: true
+            )),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "running"
+            )))
+        ])
+        let (_, manager) = try await makeObservationRuntime(
+            connection: connection,
+            affinity: affinity,
+            discovery: { _, _ in 4 }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForSessionUpdateCount(1, sink: sink)
+        await manager.shutdown()
+
+        let pollWindows = await connection.calls
+            .filter { $0.arguments["op"] == .string("poll") }
+            .compactMap { $0.arguments["_windowID"]?.intValue }
+        XCTAssertEqual(pollWindows, [3, 4])
+    }
+
+    func testObservationDiscoveryTimeoutReturnsBoundedFailureAndLateDiscoveryCannotRoute() async throws {
+        let gate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection()
+        let (runtime, manager) = try await makeObservationRuntime(
+            connection: connection,
+            discovery: { _, _ in
+                await gate.enterAndWaitForRelease()
+                return 9
+            },
+            timeoutSeconds: 0.01
+        )
+
+        let result = await runtime.recoverSessionWindowForObservation(
+            deviceID: "device",
+            sessionID: sessionID,
+            invalidate: false
+        )
+        XCTAssertNil(result)
+        await gate.release()
+        await Task.yield()
+        await manager.shutdown()
+
+        let calls = await connection.calls
+        XCTAssertFalse(calls.contains { $0.name == "agent_run" })
+    }
+
+    func testAffinityRecoveryOperationalEventsAreStructuredAndRedacted() async throws {
+        let recorder = BindingLogRecorder()
+        let logger = Logger(label: "test.gateway.observation") { _ in recorder.handler() }
+        let connection = RecordingAppLinkConnection()
+        let (runtime, manager) = try await makeObservationRuntime(
+            connection: connection,
+            discovery: { _, _ in 8 },
+            logger: logger
+        )
+
+        let result = await runtime.recoverSessionWindowForObservation(
+            deviceID: "device-secret\npayload",
+            sessionID: "session-secret\nprompt",
+            invalidate: false
+        )
+        await manager.shutdown()
+
+        XCTAssertEqual(result, 8)
+        let messages = recorder.messages.joined(separator: " ")
+        XCTAssertTrue(messages.contains("event=affinity_recovery"))
+        XCTAssertTrue(messages.contains("outcome=issued"))
+        XCTAssertTrue(messages.contains("outcome=recovered"))
+        XCTAssertFalse(messages.contains("\n"))
+        XCTAssertFalse(messages.contains("raw MCP"))
+    }
+
+    func testAffinityNoticeIdentifiersUseSafeEncodingAndRejectFieldInjection() async throws {
+        let recorder = BindingLogRecorder()
+        let logger = Logger(label: "test.gateway.observation.safe-identifiers") { _ in recorder.handler() }
+        let deviceID = "remote:secret-device\r\n outcome=forged\tapi_key=alpha"
+        let sessionID = "secret-session\r\n session_id=forged authorization=bearer"
+        let (runtime, manager) = try await makeObservationRuntime(
+            connection: RecordingAppLinkConnection(),
+            discovery: { _, _ in 8 },
+            logger: logger
+        )
+
+        let result = await runtime.recoverSessionWindowForObservation(
+            deviceID: deviceID,
+            sessionID: sessionID,
+            invalidate: false
+        )
+        await manager.shutdown()
+
+        XCTAssertEqual(result, 8)
+        let notices = recorder.noticeMessages
+        let joined = notices.joined(separator: " ")
+        XCTAssertFalse(joined.contains("secret-device"))
+        XCTAssertFalse(joined.contains("secret-session"))
+        XCTAssertFalse(joined.contains("outcome=forged"))
+        XCTAssertFalse(joined.contains("api_key=alpha"))
+        XCTAssertFalse(joined.contains("authorization=bearer"))
+        XCTAssertFalse(joined.contains("\r"))
+        XCTAssertFalse(joined.contains("\n"))
+        XCTAssertFalse(joined.contains("\t"))
+        for message in notices {
+            for key in ["device_id=", "session_id="] {
+                guard let range = message.range(of: key) else { continue }
+                let value = message[range.upperBound...].prefix { !$0.isWhitespace }
+                XCTAssertEqual(value.count, 27)
+                XCTAssertTrue(value.hasPrefix("id_"))
+                XCTAssertTrue(value.dropFirst(3).allSatisfy {
+                    $0.isNumber || "abcdef".contains($0)
+                })
+            }
+        }
+    }
+
+    func testAffinityOperationalEventsAvoidWarmHitNoticeAmplification() async throws {
+        let recorder = BindingLogRecorder()
+        let logger = Logger(label: "test.gateway.observation.warm-hit") { _ in recorder.handler() }
+        let affinity = GatewaySessionWindowAffinity()
+        await affinity.record(sessionID: sessionID, windowID: 7)
+        let (runtime, manager) = try await makeObservationRuntime(
+            connection: RecordingAppLinkConnection(),
+            affinity: affinity,
+            discovery: { _, _ in 9 },
+            logger: logger
+        )
+
+        let first = await runtime.cachedSessionWindowForObservation(deviceID: "device", sessionID: sessionID)
+        let second = await runtime.cachedSessionWindowForObservation(deviceID: "device", sessionID: sessionID)
+        XCTAssertEqual(first, 7)
+        XCTAssertEqual(second, 7)
+        await manager.shutdown()
+
+        XCTAssertEqual(recorder.noticeMessages.count(where: { $0.contains("outcome=warm_hit") }), 0)
+        XCTAssertEqual(recorder.messages.count(where: { $0.contains("outcome=warm_hit") }), 2)
     }
 
     func testWarmObservationAffinityBypassesAppLinkLookupBindingRefreshAndDiscovery() async throws {
@@ -586,7 +915,11 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             .result(sessionListResponse([sessionID])),
             .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
         ])
-        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .bindingRequired("bind first"),
+            configureObservationRouting: true
+        )
         let sink = RecordingFrameSink()
 
         let request = RemoteClientFrame(type: "subscribe", requestID: "r1", sessionID: sessionID)
@@ -1723,6 +2056,268 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(probe.count, 2, "Start routing app errors should refresh stale bound state")
     }
 
+    func testListAgentsInitialSuccessDoesNotRetry() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let initialProbe = BindingProbeRecorder([.bound])
+        let refreshProbe = BindingProbeRecorder([.bound])
+        let agentsPayload = JSONValue.object([
+            "agents": .array([.object(["id": .string("pair"), "name": .string("Pair")])])
+        ])
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: agentsPayload))
+        ])
+        let runtime = try await makePooledRuntime(
+            connection: connection,
+            configuration: configuration,
+            deviceID: deviceID,
+            auditLog: auditLog,
+            initialProbe: initialProbe,
+            refreshProbe: refreshProbe
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_agents", requestID: "list-agents-r1"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(response?.payload, agentsPayload)
+        XCTAssertEqual(initialProbe.count, 1)
+        XCTAssertEqual(refreshProbe.count, 0)
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["agent_manage"])
+        XCTAssertEqual(calls[0].arguments["op"], .string("list_agents"))
+        XCTAssertNil(calls[0].arguments["_windowID"])
+
+        let record = try await waitForAuditRecord(in: auditDirectory, op: "list_agents")
+        XCTAssertEqual(auditRecords(in: auditDirectory, op: "list_agents").count, 1)
+        XCTAssertEqual(record["outcome"] as? String, "success")
+        XCTAssertEqual(record["binding_state_initial"] as? String, "bound")
+        XCTAssertEqual(record["fallback_initial"] as? String, "not_run")
+        XCTAssertEqual(record["window_id_injected_initial"] as? Bool, false)
+        XCTAssertEqual(record["recovery_retried"] as? Bool, false)
+        XCTAssertNil(record["binding_state_retry"])
+        XCTAssertNil(record["fallback_retry"])
+        XCTAssertNil(record["window_id_injected_retry"])
+        XCTAssertNil(record["error_origin_initial"])
+        XCTAssertNil(record["error_origin_retry"])
+        assertListAgentsRoutingAuditIsRedacted(record)
+    }
+
+    func testListAgentsRecoversFromTranslatorBindingRequiredWithOneRetry() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let initialProbe = BindingProbeRecorder([.bindingRequired("multiple windows")])
+        let refreshProbe = BindingProbeRecorder([
+            .bindingRequired("multiple windows"),
+            .bindingRequired("multiple windows"),
+            .bound
+        ])
+        let agentsPayload = JSONValue.object([
+            "agents": .array([.object(["id": .string("pair"), "name": .string("Pair")])])
+        ])
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: .object(["error": .string("window inventory unavailable")]),
+                isError: true
+            )),
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: agentsPayload))
+        ])
+        let runtime = try await makePooledRuntime(
+            connection: connection,
+            configuration: configuration,
+            deviceID: deviceID,
+            auditLog: auditLog,
+            initialProbe: initialProbe,
+            refreshProbe: refreshProbe
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_agents", requestID: "list-agents-r2"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(response?.payload, agentsPayload)
+        XCTAssertEqual(initialProbe.count, 1)
+        XCTAssertEqual(refreshProbe.count, 3)
+        // Connection calls are app MCP calls; binding-probe calls above are captured separately.
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["bind_context", "bind_context", "agent_manage"])
+        let catalogCalls = calls.filter {
+            $0.name == "agent_manage" && $0.arguments["op"] == .string("list_agents")
+        }
+        XCTAssertEqual(catalogCalls.count, 1)
+        XCTAssertEqual(catalogCalls[0].arguments["_windowID"], .int(1))
+
+        let record = try await waitForAuditRecord(in: auditDirectory, op: "list_agents")
+        XCTAssertEqual(auditRecords(in: auditDirectory, op: "list_agents").count, 1)
+        XCTAssertEqual(record["outcome"] as? String, "success")
+        XCTAssertEqual(record["binding_state_initial"] as? String, "binding_required")
+        XCTAssertEqual(record["binding_state_retry"] as? String, "bound")
+        XCTAssertEqual(record["fallback_initial"] as? String, "unavailable")
+        XCTAssertEqual(record["fallback_retry"] as? String, "resolved")
+        XCTAssertEqual(record["window_id_injected_initial"] as? Bool, false)
+        XCTAssertEqual(record["window_id_injected_retry"] as? Bool, true)
+        XCTAssertEqual(record["error_origin_initial"] as? String, "translator")
+        XCTAssertNil(record["error_origin_retry"])
+        XCTAssertEqual(record["recovery_retried"] as? Bool, true)
+        assertListAgentsRoutingAuditIsRedacted(record)
+    }
+
+    func testListAgentsRecoversFromAppBindingRequiredWithOneRetry() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let initialProbe = BindingProbeRecorder([.bound])
+        let refreshProbe = BindingProbeRecorder([.bound])
+        let agentsPayload = JSONValue.object([
+            "agents": .array([.object(["id": .string("pair"), "name": .string("Pair")])])
+        ])
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: .object([
+                    "code": .string("binding_required"),
+                    "error": .string("Bind this connection to a window before continuing.")
+                ]),
+                isError: true
+            )),
+            .result(windowListResponse()),
+            .result(GatewayTestHelpers.toolResult(json: agentsPayload))
+        ])
+        let runtime = try await makePooledRuntime(
+            connection: connection,
+            configuration: configuration,
+            deviceID: deviceID,
+            auditLog: auditLog,
+            initialProbe: initialProbe,
+            refreshProbe: refreshProbe
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_agents", requestID: "list-agents-r3"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        XCTAssertEqual(response?.type, "command_result")
+        XCTAssertEqual(response?.payload, agentsPayload)
+        XCTAssertEqual(initialProbe.count, 1)
+        XCTAssertEqual(refreshProbe.count, 1)
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["agent_manage", "bind_context", "agent_manage"])
+        let catalogCalls = calls.filter {
+            $0.name == "agent_manage" && $0.arguments["op"] == .string("list_agents")
+        }
+        XCTAssertEqual(catalogCalls.count, 2)
+        XCTAssertNil(catalogCalls[0].arguments["_windowID"])
+        XCTAssertEqual(catalogCalls[1].arguments["_windowID"], .int(1))
+
+        let record = try await waitForAuditRecord(in: auditDirectory, op: "list_agents")
+        XCTAssertEqual(auditRecords(in: auditDirectory, op: "list_agents").count, 1)
+        XCTAssertEqual(record["outcome"] as? String, "success")
+        XCTAssertEqual(record["binding_state_initial"] as? String, "bound")
+        XCTAssertEqual(record["binding_state_retry"] as? String, "bound")
+        XCTAssertEqual(record["fallback_initial"] as? String, "not_run")
+        XCTAssertEqual(record["fallback_retry"] as? String, "resolved")
+        XCTAssertEqual(record["window_id_injected_initial"] as? Bool, false)
+        XCTAssertEqual(record["window_id_injected_retry"] as? Bool, true)
+        XCTAssertEqual(record["error_origin_initial"] as? String, "app")
+        XCTAssertNil(record["error_origin_retry"])
+        XCTAssertEqual(record["recovery_retried"] as? Bool, true)
+        assertListAgentsRoutingAuditIsRedacted(record)
+    }
+
+    func testListAgentsPersistentAppBindingRequiredStopsAfterOneRetry() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let root = try GatewayTestHelpers.temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let auditDirectory = root.appendingPathComponent("audit", isDirectory: true)
+        let auditLog = try RemoteAuditLog(directoryURL: auditDirectory, processID: 123)
+        let initialProbe = BindingProbeRecorder([.bound])
+        let refreshProbe = BindingProbeRecorder([.bound])
+        let bindingRequired = GatewayTestHelpers.toolResult(
+            json: .object([
+                "code": .string("binding_required"),
+                "error": .string("Bind this connection to a window before continuing.")
+            ]),
+            isError: true
+        )
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(bindingRequired),
+            .result(windowListResponse()),
+            .result(bindingRequired),
+            .result(windowListResponse())
+        ])
+        let runtime = try await makePooledRuntime(
+            connection: connection,
+            configuration: configuration,
+            deviceID: deviceID,
+            auditLog: auditLog,
+            initialProbe: initialProbe,
+            refreshProbe: refreshProbe
+        )
+
+        let response = await runtime.handle(
+            RemoteClientFrame(type: "list_agents", requestID: "list-agents-r4"),
+            deviceID: deviceID,
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+
+        let frame = try XCTUnwrap(response)
+        XCTAssertEqual(frame.type, "command_error")
+        XCTAssertEqual(frame.payload?.objectValue?["code"]?.stringValue, "binding_required")
+        XCTAssertEqual(frame.payload?.objectValue?["details"]?.objectValue?["windows"]?.arrayValue?.count, 2)
+        XCTAssertEqual(initialProbe.count, 1)
+        XCTAssertEqual(refreshProbe.count, 1)
+
+        let calls = await connection.calls
+        XCTAssertEqual(calls.map(\.name), ["agent_manage", "bind_context", "agent_manage", "bind_context"])
+        let catalogCalls = calls.filter {
+            $0.name == "agent_manage" && $0.arguments["op"] == .string("list_agents")
+        }
+        XCTAssertEqual(catalogCalls.count, 2)
+        XCTAssertNil(catalogCalls[0].arguments["_windowID"])
+        XCTAssertEqual(catalogCalls[1].arguments["_windowID"], .int(1))
+        XCTAssertEqual(calls[1].arguments["op"], .string("list"))
+        XCTAssertEqual(calls[3].arguments["op"], .string("list"))
+
+        let record = try await waitForAuditRecord(in: auditDirectory, op: "list_agents")
+        XCTAssertEqual(auditRecords(in: auditDirectory, op: "list_agents").count, 1)
+        XCTAssertEqual(record["outcome"] as? String, "failure")
+        XCTAssertEqual(record["code"] as? String, "binding_required")
+        XCTAssertEqual(record["binding_state_initial"] as? String, "bound")
+        XCTAssertEqual(record["binding_state_retry"] as? String, "bound")
+        XCTAssertEqual(record["fallback_initial"] as? String, "not_run")
+        XCTAssertEqual(record["fallback_retry"] as? String, "resolved")
+        XCTAssertEqual(record["window_id_injected_initial"] as? Bool, false)
+        XCTAssertEqual(record["window_id_injected_retry"] as? Bool, true)
+        XCTAssertEqual(record["error_origin_initial"] as? String, "app")
+        XCTAssertEqual(record["error_origin_retry"] as? String, "app")
+        XCTAssertEqual(record["recovery_retried"] as? Bool, true)
+        assertListAgentsRoutingAuditIsRedacted(record)
+    }
+
     func testListAgentsOnAmbiguousConnectionUsesFallbackWindow() async throws {
         let connection = RecordingAppLinkConnection(responses: [
             .result(windowListResponse()),
@@ -1887,5 +2482,59 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         let frames = await sink.frames.filter { $0.type == "session_update" }
         XCTAssertGreaterThanOrEqual(frames.count, minimumCount, file: file, line: line)
         return frames
+    }
+}
+
+private final class BindingLogRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var records: [(level: Logger.Level, message: String)] = []
+
+    var messages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return records.map(\.message)
+    }
+
+    var noticeMessages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return records.filter { $0.level >= .notice }.map(\.message)
+    }
+
+    func handler() -> BindingCaptureLogHandler {
+        BindingCaptureLogHandler(recorder: self)
+    }
+
+    func record(level: Logger.Level, message: String) {
+        lock.lock()
+        records.append((level, message))
+        lock.unlock()
+    }
+}
+
+private struct BindingCaptureLogHandler: LogHandler {
+    var metadata: Logger.Metadata = [:]
+    var logLevel: Logger.Level = .trace
+    private let recorder: BindingLogRecorder
+
+    init(recorder: BindingLogRecorder) {
+        self.recorder = recorder
+    }
+
+    subscript(metadataKey key: String) -> Logger.Metadata.Value? {
+        get { metadata[key] }
+        set { metadata[key] = newValue }
+    }
+
+    func log(
+        level: Logger.Level,
+        message: Logger.Message,
+        metadata _: Logger.Metadata?,
+        source _: String,
+        file _: String,
+        function _: String,
+        line _: UInt
+    ) {
+        recorder.record(level: level, message: message.description)
     }
 }

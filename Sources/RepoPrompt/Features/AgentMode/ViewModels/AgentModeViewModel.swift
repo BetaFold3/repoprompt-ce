@@ -3524,7 +3524,9 @@ final class AgentModeViewModel: ObservableObject {
         let upperBound = explicitMaxSequenceIndexExclusive ?? nextAnchorUpperBound
         guard let target = session.items.last(where: { item in
             guard item.sequenceIndex > anchor.userSequenceIndex else { return false }
-            if let upperBound, item.sequenceIndex >= upperBound { return false }
+            if let upperBound, item.sequenceIndex >= upperBound {
+                return false
+            }
             return item.hasDisplayableAssistantBody
         }) else {
             return
@@ -5490,8 +5492,12 @@ final class AgentModeViewModel: ObservableObject {
         }()
         let resolvedSessionID = context.sessionID
         let resolvedSessionName: String? = {
-            if let name = workspaceManager?.composeTabName(with: session.tabID) { return name }
-            if let name = ownerValidatedSessionIndex[resolvedSessionID]?.name { return name }
+            if let name = workspaceManager?.composeTabName(with: session.tabID) {
+                return name
+            }
+            if let name = ownerValidatedSessionIndex[resolvedSessionID]?.name {
+                return name
+            }
             return "Agent Session"
         }()
         let failureReason = AgentRunMCPSnapshot.FailureReason.classify(status: status, statusText: resolvedStatusText)
@@ -5517,7 +5523,7 @@ final class AgentModeViewModel: ObservableObject {
             latestAssistantPreview: mcpResolvedAssistantPreview(session: session, status: status),
             interaction: interaction,
             transcriptItemCount: transcriptItemCount,
-            updatedAt: Date(),
+            updatedAt: session.lastActivityAt,
             parentSessionID: session.parentSessionID,
             failureReason: failureReason,
             followUpPending: followUpPending,
@@ -6150,7 +6156,9 @@ final class AgentModeViewModel: ObservableObject {
             .map(Self.executionWorktreeSelection(from:))
         return Self.dedupedExecutionWorktreeSelections(selections)
             .sorted { lhs, rhs in
-                if lhs.isPrunable != rhs.isPrunable { return !lhs.isPrunable }
+                if lhs.isPrunable != rhs.isPrunable {
+                    return !lhs.isPrunable
+                }
                 let labelOrder = lhs.label.localizedCaseInsensitiveCompare(rhs.label)
                 return labelOrder == .orderedSame ? lhs.path < rhs.path : labelOrder == .orderedAscending
             }
@@ -8445,7 +8453,9 @@ final class AgentModeViewModel: ObservableObject {
             var recorded: [UUID] = []
             recorded.reserveCapacity(sessions.count)
             for session in sessions.values {
-                if let tabIDs, !tabIDs.contains(session.tabID) { continue }
+                if let tabIDs, !tabIDs.contains(session.tabID) {
+                    continue
+                }
                 recordAgentPerfSessionSnapshot(session, source: source)
                 recorded.append(session.tabID)
             }
@@ -12488,8 +12498,12 @@ final class AgentModeViewModel: ObservableObject {
         // template is nil → wrapUserText is a no-op; actual expansion happens later
         // via expandSlashSkillInvocationIfNeeded in the augmentation path.
         let bubbleWorkflow: AgentWorkflowDefinition? = {
-            if let nativePreparedTurn { return nativePreparedTurn.bubbleWorkflow }
-            if activeWorkflow != nil { return activeWorkflow }
+            if let nativePreparedTurn {
+                return nativePreparedTurn.bubbleWorkflow
+            }
+            if activeWorkflow != nil {
+                return activeWorkflow
+            }
             guard let invocation = resolvedSlashSkillInvocations(in: trimmedText).first else { return nil }
             return invocation.definition.asBubbleWorkflowDefinition()
         }()
@@ -16748,7 +16762,9 @@ final class AgentModeViewModel: ObservableObject {
                 let latestAssistant = session.items.reversed().first(where: { $0.hasDisplayableAssistantBody })
                 let latestUser = session.items.reversed().first(where: { $0.kind == .user })
                 guard let assistant = latestAssistant else { return nil }
-                if let user = latestUser, user.timestamp >= assistant.timestamp { return nil }
+                if let user = latestUser, user.timestamp >= assistant.timestamp {
+                    return nil
+                }
                 return assistant.text
             }
             if lastTurn.isCompleted, status == .running {
@@ -17616,7 +17632,9 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
 
     var enforcesActiveWorkspaceIDForSessionIndexOwnership: Bool {
         #if DEBUG
-            if test_activeWorkspaceIDForSessionIndexOverride != nil { return true }
+            if test_activeWorkspaceIDForSessionIndexOverride != nil {
+                return true
+            }
         #endif
         return workspaceManager != nil
     }

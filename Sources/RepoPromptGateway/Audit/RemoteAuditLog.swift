@@ -20,6 +20,15 @@ struct RemoteAuditRecord: Codable, Equatable {
     let workspaceMatchCount: Int?
     let workspaceMatchSkipped: String?
     let workspaceMatchUnavailableReason: String?
+    let bindingStateInitial: String?
+    let bindingStateRetry: String?
+    let fallbackInitial: String?
+    let fallbackRetry: String?
+    let windowIDInjectedInitial: Bool?
+    let windowIDInjectedRetry: Bool?
+    let errorOriginInitial: String?
+    let errorOriginRetry: String?
+    let recoveryRetried: Bool?
 
     init(
         date: Date = Date(),
@@ -40,7 +49,16 @@ struct RemoteAuditRecord: Codable, Equatable {
         hasWorkspaceID: Bool? = nil,
         workspaceMatchCount: Int? = nil,
         workspaceMatchSkipped: String? = nil,
-        workspaceMatchUnavailableReason: String? = nil
+        workspaceMatchUnavailableReason: String? = nil,
+        bindingStateInitial: String? = nil,
+        bindingStateRetry: String? = nil,
+        fallbackInitial: String? = nil,
+        fallbackRetry: String? = nil,
+        windowIDInjectedInitial: Bool? = nil,
+        windowIDInjectedRetry: Bool? = nil,
+        errorOriginInitial: String? = nil,
+        errorOriginRetry: String? = nil,
+        recoveryRetried: Bool? = nil
     ) {
         ts = RemoteAuditLog.timestampFormatter.string(from: date)
         self.deviceID = deviceID
@@ -61,6 +79,15 @@ struct RemoteAuditRecord: Codable, Equatable {
         self.workspaceMatchCount = workspaceMatchCount
         self.workspaceMatchSkipped = workspaceMatchSkipped
         self.workspaceMatchUnavailableReason = workspaceMatchUnavailableReason
+        self.bindingStateInitial = bindingStateInitial
+        self.bindingStateRetry = bindingStateRetry
+        self.fallbackInitial = fallbackInitial
+        self.fallbackRetry = fallbackRetry
+        self.windowIDInjectedInitial = windowIDInjectedInitial
+        self.windowIDInjectedRetry = windowIDInjectedRetry
+        self.errorOriginInitial = errorOriginInitial
+        self.errorOriginRetry = errorOriginRetry
+        self.recoveryRetried = recoveryRetried
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -83,6 +110,15 @@ struct RemoteAuditRecord: Codable, Equatable {
         case workspaceMatchCount = "workspace_match_count"
         case workspaceMatchSkipped = "workspace_match_skipped"
         case workspaceMatchUnavailableReason = "workspace_match_unavailable_reason"
+        case bindingStateInitial = "binding_state_initial"
+        case bindingStateRetry = "binding_state_retry"
+        case fallbackInitial = "fallback_initial"
+        case fallbackRetry = "fallback_retry"
+        case windowIDInjectedInitial = "window_id_injected_initial"
+        case windowIDInjectedRetry = "window_id_injected_retry"
+        case errorOriginInitial = "error_origin_initial"
+        case errorOriginRetry = "error_origin_retry"
+        case recoveryRetried = "recovery_retried"
     }
 }
 

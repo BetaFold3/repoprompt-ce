@@ -53,8 +53,12 @@ private func waitForTermination(parentPID: Int32?, appLink: AppLinkSession) asyn
 
 private func waitForParentExit(_ parentPID: Int32) async {
     while !Task.isCancelled {
-        if getppid() != parentPID { return }
-        if kill(parentPID, 0) != 0, errno == ESRCH { return }
+        if getppid() != parentPID {
+            return
+        }
+        if kill(parentPID, 0) != 0, errno == ESRCH {
+            return
+        }
         try? await Task.sleep(for: .seconds(2))
     }
 }
@@ -177,9 +181,18 @@ do {
         appLinkPool: appLinkPool,
         pushSubscriptionStore: pushSubscriptionStore
     )
-    await watchManager.setWindowResolver { deviceID, sessionID in
-        await runtime.resolveSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
-    }
+    await watchManager.setObservationRouting(
+        windowResolver: { deviceID, sessionID in
+            await runtime.cachedSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+        },
+        windowRecovery: { deviceID, sessionID, invalidate in
+            await runtime.recoverSessionWindowForObservation(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                invalidate: invalidate
+            )
+        }
+    )
 
     let pairingRelay = GatewayPairingRelay(appLink: appLink, auditLog: auditLog, logger: logger)
 

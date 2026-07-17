@@ -352,6 +352,81 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
         XCTAssertEqual(session.transcript.turns.last?.isCompleted, true)
     }
 
+    func testFetchLogPageSendsIncludeRowTimestampsOnlyWhenHostAdvertisesFeature() async throws {
+        // Legacy host: no advertised features, so the payload key must be omitted —
+        // old gateways hard-reject unknown get_log payload keys.
+        let legacyConnection = ScriptedRemoteAgentSessionConnection(responses: [
+            "poll": [Self.snapshotPayload(status: "completed")],
+            "get_log": [
+                Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1)
+            ]
+        ])
+        let legacyController = RemoteAgentSessionController(
+            binding: Self.makeBinding(nextLogOffset: 0),
+            connection: legacyConnection
+        )
+        defer { Task { await legacyController.shutdown() } }
+        try await legacyController.attachAndCatchUp()
+        let legacyFlags = await legacyConnection.getLogIncludeRowTimestampsFlags()
+        XCTAssertFalse(legacyFlags.isEmpty)
+        XCTAssertTrue(legacyFlags.allSatisfy { $0 == nil }, String(describing: legacyFlags))
+
+        // Upgraded host: the hello_ack feature enables the opt-in flag on every fetch.
+        let upgradedConnection = ScriptedRemoteAgentSessionConnection(
+            responses: [
+                "poll": [Self.snapshotPayload(status: "completed")],
+                "get_log": [
+                    Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1)
+                ]
+            ],
+            advertisedFeatures: [RemoteWireFeatures.getLogRowTimestamps]
+        )
+        let upgradedController = RemoteAgentSessionController(
+            binding: Self.makeBinding(nextLogOffset: 0),
+            connection: upgradedConnection
+        )
+        defer { Task { await upgradedController.shutdown() } }
+        try await upgradedController.attachAndCatchUp()
+        let upgradedFlags = await upgradedConnection.getLogIncludeRowTimestampsFlags()
+        XCTAssertFalse(upgradedFlags.isEmpty)
+        XCTAssertTrue(upgradedFlags.allSatisfy { $0 == true }, String(describing: upgradedFlags))
+    }
+
+    func testFetchLogPageRetriesWithoutRowTimestampsAfterUnsupportedPayloadKeyAndLatches() async throws {
+        // Version-skew: the host advertises the feature but rejects the payload key
+        // (for example a stale gateway). The fetch must retry once without the key and
+        // latch legacy behavior for every later fetch instead of failing catch-up.
+        let connection = ScriptedRemoteAgentSessionConnection(
+            scriptedResponses: [
+                "poll": [.payload(Self.snapshotPayload(status: "completed"))],
+                "get_log": [
+                    .commandFailure(
+                        code: "unsupported_payload_key",
+                        message: "Remote operation 'get_log' does not support payload key 'include_row_timestamps'."
+                    ),
+                    .payload(Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1)),
+                    .payload(Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1))
+                ]
+            ],
+            advertisedFeatures: [RemoteWireFeatures.getLogRowTimestamps]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: Self.makeBinding(nextLogOffset: 0),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+
+        try await controller.attachAndCatchUp()
+
+        let requests = await connection.getLogRequests()
+        let flags = await connection.getLogIncludeRowTimestampsFlags()
+        XCTAssertGreaterThanOrEqual(requests.count, 2, String(describing: requests))
+        // First attempt opts in; the immediate retry and every later fetch omit the key.
+        XCTAssertEqual(flags.first, true, String(describing: flags))
+        XCTAssertEqual(requests[0].offset, requests[1].offset)
+        XCTAssertTrue(flags.dropFirst().allSatisfy { $0 == nil }, String(describing: flags))
+    }
+
     private static func makeBinding(
         hostID: String = "host-abc",
         remoteSessionID: String = "remote-session-abc",
@@ -399,7 +474,9 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
         line: UInt = #line
     ) async {
         for _ in 0 ..< 100 {
-            if await predicate() { return }
+            if await predicate() {
+                return
+            }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
         let finalResult = await predicate()
@@ -436,6 +513,7 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
 private enum ScriptedRemoteResponse {
     case payload(JSONValue)
     case transportFailure(String)
+    case commandFailure(code: String, message: String)
 }
 
 private actor RemoteSessionEventRecorder {
@@ -496,15 +574,18 @@ private actor RemoteSessionEventRecorder {
 private actor ScriptedRemoteAgentSessionConnection: RemoteAgentSessionConnection {
     private var responses: [String: [ScriptedRemoteResponse]]
     private var frames: [RemoteClientFrame] = []
+    private let advertisedFeatures: Set<String>
 
-    init(responses: [String: [JSONValue]]) {
+    init(responses: [String: [JSONValue]], advertisedFeatures: Set<String> = []) {
         self.responses = responses.mapValues { values in
             values.map { .payload($0) }
         }
+        self.advertisedFeatures = advertisedFeatures
     }
 
-    init(scriptedResponses: [String: [ScriptedRemoteResponse]]) {
+    init(scriptedResponses: [String: [ScriptedRemoteResponse]], advertisedFeatures: Set<String> = []) {
         responses = scriptedResponses
+        self.advertisedFeatures = advertisedFeatures
     }
 
     func command(_ frame: RemoteClientFrame, timeout _: TimeInterval) async throws -> JSONValue {
@@ -517,6 +598,8 @@ private actor ScriptedRemoteAgentSessionConnection: RemoteAgentSessionConnection
                 return payload
             case let .transportFailure(message):
                 throw RemoteClientError.transport(message)
+            case let .commandFailure(code, message):
+                throw RemoteClientError.fromCommandError(code: code, message: message)
             }
         }
         return defaultResponse(for: frame)
@@ -525,6 +608,10 @@ private actor ScriptedRemoteAgentSessionConnection: RemoteAgentSessionConnection
     func ensureConnected() async throws {}
     func subscribe(sessionIDs _: [String]) async throws {}
     func unsubscribe(sessionIDs _: [String]) async throws {}
+
+    func supportsHostFeature(_ feature: String) -> Bool {
+        advertisedFeatures.contains(feature)
+    }
 
     func commandCount(type: String) -> Int {
         frames.count { $0.type == type }
@@ -538,6 +625,14 @@ private actor ScriptedRemoteAgentSessionConnection: RemoteAgentSessionConnection
                 offset: payload["offset"]?.intValue ?? 0,
                 limit: payload["limit"]?.intValue ?? 0
             )
+        }
+    }
+
+    /// One entry per get_log request: the raw `include_row_timestamps` payload value
+    /// (nil when the key was omitted).
+    func getLogIncludeRowTimestampsFlags() -> [Bool?] {
+        frames.filter { $0.type == "get_log" }.map { frame in
+            frame.payload?.objectValue?["include_row_timestamps"]?.boolValue
         }
     }
 

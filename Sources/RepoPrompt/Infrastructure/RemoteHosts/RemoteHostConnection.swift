@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 import RepoPromptRemoteWire
 
 struct RemoteHostConnectionHTTPResponse: Equatable {
@@ -45,6 +46,8 @@ struct RemoteHostConnectionTestResult: Equatable {
 }
 
 actor RemoteHostConnection {
+    private static let logger = Logger(subsystem: "com.repoprompt.remote-hosts", category: "RemoteHostConnection")
+
     enum State: Equatable {
         case idle
         case mintingTicket
@@ -61,9 +64,6 @@ actor RemoteHostConnection {
     static let maximumReconnectBackoff: TimeInterval = 30
     static let counterWriteCoalescingDelay: TimeInterval = 0.25
 
-    nonisolated let inboundFrames: AsyncStream<RemoteServerFrame>
-    nonisolated let stateEvents: AsyncStream<State>
-
     let hostID: String
 
     private let registry: RemoteHostRegistry
@@ -75,9 +75,8 @@ actor RemoteHostConnection {
     private let maximumReconnectBackoff: TimeInterval
     private let now: @Sendable () -> Date
 
-    private let inboundContinuation: AsyncStream<RemoteServerFrame>.Continuation
-    private let stateContinuation: AsyncStream<State>.Continuation
-
+    private var inboundSubscribers: [UUID: AsyncStream<RemoteServerFrame>.Continuation] = [:]
+    private var stateSubscribers: [UUID: AsyncStream<State>.Continuation] = [:]
     private var state: State = .idle
     private var webSocketTask: URLSessionWebSocketTask?
     private var signer: RemoteFrameSigner?
@@ -92,6 +91,7 @@ actor RemoteHostConnection {
     private var subscriptionReconciliationWaiters: [CheckedContinuation<Void, Never>] = []
     private var connectedHostName: String?
     private var connectedScopes: Set<String> = []
+    private var connectedFeatures: Set<String> = []
     private var reconnectBackoff: TimeInterval
     private var pendingCounterWrite: UInt64?
     private var counterWriteTask: Task<Void, Never>?
@@ -121,23 +121,18 @@ actor RemoteHostConnection {
         self.maximumReconnectBackoff = maximumReconnectBackoff
         self.now = now
         reconnectBackoff = initialReconnectBackoff
-
-        let inbound = AsyncStream.makeStream(of: RemoteServerFrame.self)
-        inboundFrames = inbound.stream
-        inboundContinuation = inbound.continuation
-
-        let states = AsyncStream.makeStream(of: State.self)
-        stateEvents = states.stream
-        stateContinuation = states.continuation
-        stateContinuation.yield(.idle)
     }
 
     deinit {
         if let counter = pendingCounterWrite {
             _ = try? registry.updateLastCounter(hostID: hostID, counter: counter)
         }
-        inboundContinuation.finish()
-        stateContinuation.finish()
+        for continuation in inboundSubscribers.values {
+            continuation.finish()
+        }
+        for continuation in stateSubscribers.values {
+            continuation.finish()
+        }
         readTask?.cancel()
         reconnectTask?.cancel()
         connectTask?.cancel()
@@ -147,6 +142,35 @@ actor RemoteHostConnection {
 
     func currentState() -> State {
         state
+    }
+
+    func inboundFramesStream() -> AsyncStream<RemoteServerFrame> {
+        let subscriberID = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(of: RemoteServerFrame.self)
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeInboundSubscriber(subscriberID) }
+        }
+        inboundSubscribers[subscriberID] = continuation
+        return stream
+    }
+
+    func stateEventsStream() -> AsyncStream<State> {
+        let subscriberID = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(of: State.self)
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeStateSubscriber(subscriberID) }
+        }
+        continuation.yield(state)
+        stateSubscribers[subscriberID] = continuation
+        return stream
+    }
+
+    private func removeInboundSubscriber(_ subscriberID: UUID) {
+        inboundSubscribers.removeValue(forKey: subscriberID)
+    }
+
+    private func removeStateSubscriber(_ subscriberID: UUID) {
+        stateSubscribers.removeValue(forKey: subscriberID)
     }
 
     func ensureConnected() async throws {
@@ -193,6 +217,13 @@ actor RemoteHostConnection {
         // older hosts instead of attempting an uncorrelatable list_agents probe.
         try await ensureConnected()
         return connectedHostName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    /// Whether the currently connected host advertised an optional feature in its
+    /// `hello_ack` `features` array. Returns false when disconnected or for legacy
+    /// hosts that advertise nothing; callers degrade to legacy behavior in both cases.
+    func supportsHostFeature(_ feature: String) -> Bool {
+        connectedFeatures.contains(feature)
     }
 
     func subscribe(sessionIDs: [String]) async throws {
@@ -263,6 +294,7 @@ actor RemoteHostConnection {
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        connectedFeatures = []
         acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.connectionClosed)
         transition(to: .idle)
@@ -271,6 +303,10 @@ actor RemoteHostConnection {
     #if DEBUG
         func handleServerFrameForTesting(_ frame: RemoteServerFrame) async {
             await handleIncomingFrame(frame)
+        }
+
+        func transitionForTesting(to state: State) {
+            transition(to: state)
         }
 
         func persistCounterForTesting(_ counter: UInt64) {
@@ -283,6 +319,14 @@ actor RemoteHostConnection {
 
         func reconnectScheduleCountForTesting() -> Int {
             reconnectScheduleCount
+        }
+
+        func inboundSubscriberCountForTesting() -> Int {
+            inboundSubscribers.count
+        }
+
+        func stateSubscriberCountForTesting() -> Int {
+            stateSubscribers.count
         }
 
         func hasReconnectTaskForTesting() -> Bool {
@@ -456,6 +500,10 @@ actor RemoteHostConnection {
         signer = localSigner
         connectedScopes = scopes
         connectedHostName = payload["host_name"]?.stringValue
+        // Missing or non-array features (every legacy host) is the empty set; unknown
+        // strings are retained but only known constants are ever queried. Reassigned on
+        // every hello_ack so reconnects can observe an upgraded or downgraded host.
+        connectedFeatures = Set(payload["features"]?.arrayValue?.compactMap(\.stringValue) ?? [])
         reconnectBackoff = initialReconnectBackoff
         _ = try? registry.updateLastConnected(hostID: record.id, at: now())
         transition(to: .connected(scopes: scopes))
@@ -580,7 +628,9 @@ actor RemoteHostConnection {
                 acknowledgedSubscriptions.insert(sessionID)
                 retained.insert(sessionID)
             } catch {
-                if !Self.isCommandLevel(error) { throw error }
+                if !Self.isCommandLevel(error) {
+                    throw error
+                }
                 if requestedSessionIDs.contains(sessionID), requestedFailure == nil {
                     requestedFailure = error
                 }
@@ -796,6 +846,7 @@ actor RemoteHostConnection {
                 signer = nil
                 connectedScopes = []
                 connectedHostName = nil
+                connectedFeatures = []
                 acknowledgedSubscriptions.removeAll()
                 readTask?.cancel()
                 readTask = nil
@@ -803,7 +854,14 @@ actor RemoteHostConnection {
             }
             failAllPending(with: error)
         default:
-            inboundContinuation.yield(frame)
+            guard !inboundSubscribers.isEmpty else {
+                let droppedHostID = hostID
+                Self.logger.notice("remote inbound frame dropped host_id=\(droppedHostID, privacy: .public) type=\(frame.type, privacy: .public) session_id=\(frame.sessionID ?? "", privacy: .public) seq=\(frame.seq ?? 0) has_seq=\(frame.seq != nil) reason=no_subscribers")
+                return
+            }
+            for continuation in inboundSubscribers.values {
+                continuation.yield(frame)
+            }
         }
     }
 
@@ -832,12 +890,17 @@ actor RemoteHostConnection {
     }
 
     private func handleReadLoopTermination(_ error: Error) async {
-        if Task.isCancelled { return }
-        if case .revoked = state { return }
+        if Task.isCancelled {
+            return
+        }
+        if case .revoked = state {
+            return
+        }
         webSocketTask = nil
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        connectedFeatures = []
         acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.connectionClosed)
         guard hasTrackedSubscriptions else {
@@ -879,7 +942,9 @@ actor RemoteHostConnection {
         do {
             try await ensureConnected()
         } catch {
-            if case .revoked = state { return }
+            if case .revoked = state {
+                return
+            }
             let reason = (error as? RemoteClientError)?.commandError?.code ?? "reconnect_failed"
             scheduleReconnectIfNeeded(reason: reason)
         }
@@ -899,6 +964,7 @@ actor RemoteHostConnection {
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        connectedFeatures = []
         acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.hostRevoked(hostID))
         transition(to: .revoked)
@@ -936,7 +1002,9 @@ actor RemoteHostConnection {
     private func transition(to newState: State) {
         guard state != newState else { return }
         state = newState
-        stateContinuation.yield(newState)
+        for continuation in stateSubscribers.values {
+            continuation.yield(newState)
+        }
     }
 
     // MARK: - Wire helpers

@@ -82,6 +82,48 @@ final class RemoteWireProtocolTests: XCTestCase {
         XCTAssertNil(legacy.seqEpoch)
     }
 
+    func testObservationFailureFrameRoundTripsAsAdditiveV1SessionFrame() throws {
+        for reason in RemoteObservationFailureReason.allCases {
+            let frame = RemoteServerFrame.observationFailure(
+                sessionID: "session-1",
+                reason: reason,
+                attempt: 2,
+                attemptLimit: 2,
+                seq: 7,
+                seqEpoch: "epoch-1"
+            )
+            let decoded = try RemoteWireProtocol.decodeServerFrame(
+                from: RemoteWireProtocol.encodeServerFrame(frame)
+            )
+            XCTAssertEqual(decoded, frame)
+            XCTAssertEqual(decoded.v, 1)
+            XCTAssertEqual(decoded.type, "observation_failure")
+            XCTAssertEqual(decoded.sessionID, "session-1")
+            XCTAssertEqual(decoded.payload?.objectValue?["reason"]?.stringValue, reason.rawValue)
+        }
+        XCTAssertEqual(
+            Set(RemoteObservationFailureReason.allCases.map(\.rawValue)),
+            Set(["routing_unavailable", "link_unavailable", "tool_failure", "invalid_snapshot"])
+        )
+    }
+
+    func testLegacyDecoderToleranceAndExistingServerFrameMeaningsRemainUnchanged() throws {
+        XCTAssertTrue(RemoteWireProtocol.serverFrameTypes.contains("observation_failure"))
+        XCTAssertEqual(RemoteWireProtocol.version, 1)
+        for type in ["session_update", "session_terminal", "session_expired", "channel_closing"] {
+            let frame = RemoteServerFrame(type: type, sessionID: "session-1", payload: .object(["status": .string(type)]))
+            let decoded = try RemoteWireProtocol.decodeServerFrame(
+                from: RemoteWireProtocol.encodeServerFrame(frame)
+            )
+            XCTAssertEqual(decoded, frame)
+        }
+        let unknown = RemoteServerFrame(type: "future_server_frame", payload: .object(["ok": .bool(true)]))
+        XCTAssertEqual(
+            try RemoteWireProtocol.decodeServerFrame(from: RemoteWireProtocol.encodeServerFrame(unknown)),
+            unknown
+        )
+    }
+
     func testCanonicalJSONEncodingSortsObjectKeys() throws {
         let value: JSONValue = .object(["b": .int(2), "a": .int(1)])
         let canonical = try RemoteWireProtocol.canonicalJSONString(for: value)
