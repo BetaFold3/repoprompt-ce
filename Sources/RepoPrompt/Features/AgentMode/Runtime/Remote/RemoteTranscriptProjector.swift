@@ -120,8 +120,10 @@ struct RemoteTranscriptProjector: Equatable {
         var byID = Dictionary(uniqueKeysWithValues: existingItems.map { ($0.id, $0) })
         for item in newItems {
             if let existing = byID[item.id] {
-                // Projected rows carry synthetic sequence-index timestamps; max-merge preserves the
-                // optimistic-rescue timestamp across re-projections and self-heals if real wire timestamps ship later.
+                // Legacy rows carry synthetic 1970-era sequence-index timestamps; max-merge
+                // preserves the optimistic-rescue timestamp across re-projections and lets a
+                // real wire `ts` (always past the synthetic floor) heal previously projected
+                // or persisted synthetic dates.
                 byID[item.id] = item.replacingTimestamp(max(existing.timestamp, item.timestamp))
             } else {
                 byID[item.id] = item
@@ -136,8 +138,13 @@ struct RemoteTranscriptProjector: Equatable {
     }
 
     private func item(from row: XMLRow, logIndex: String, sequenceIndex: Int) -> AgentChatItem {
+        // The wire timestamp is deliberately excluded from the deterministic ID seed so
+        // rows projected from legacy (timestampless) and upgraded hosts share identity
+        // and merge via `upserting` instead of duplicating.
         let id = deterministicUUID(seed: "remote-transcript-row-v1|\(remoteSessionID)|\(logIndex)|\(row.kind.rawValue)|\(row.toolName ?? "")")
-        let timestamp = Date(timeIntervalSince1970: TimeInterval(sequenceIndex))
+        // Fallback synthetic date keeps deterministic ordering for legacy hosts; display
+        // suppresses it (AgentSessionRecencySanity.isDisplayable).
+        let timestamp = row.timestamp ?? Date(timeIntervalSince1970: TimeInterval(sequenceIndex))
         switch row.kind {
         case .user:
             return AgentChatItem(id: id, timestamp: timestamp, kind: .user, text: row.text, sequenceIndex: sequenceIndex)
@@ -174,11 +181,15 @@ struct RemoteTranscriptProjector: Equatable {
         var text: String
         var toolName: String?
         var toolResultStatusWord: String?
+        /// Authoritative host row date parsed from the wire `ts` attribute; nil for legacy hosts.
+        var timestamp: Date?
     }
 
     private static func parseTranscriptXML(_ xml: String) -> [XMLRow] {
         guard !xml.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
-        let pattern = #"(?s)<(user|assistant|system|error)>(.*?)</\1>|<tool_call\b([^>]*)\s*/>|<tool_call\b([^>]*)>(.*?)</tool_call>|<tool_result\b([^>]*)\s*/>"#
+        // Groups: 1 tag, 2 tag attributes, 3 text, 4 self-closed tool_call attributes,
+        // 5 open tool_call attributes, 6 tool_call body, 7 tool_result attributes.
+        let pattern = #"(?s)<(user|assistant|system|error)((?:\s[^>]*)?)>(.*?)</\1>|<tool_call\b([^>]*)\s*/>|<tool_call\b([^>]*)>(.*?)</tool_call>|<tool_result\b([^>]*)\s*/>"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else { return [] }
         let range = NSRange(xml.startIndex ..< xml.endIndex, in: xml)
         let matches = regex.matches(in: xml, options: [], range: range)
@@ -186,7 +197,8 @@ struct RemoteTranscriptProjector: Equatable {
         rows.reserveCapacity(matches.count)
         for match in matches {
             if let tag = string(in: xml, match: match, at: 1) {
-                let text = decodeXMLEntities(string(in: xml, match: match, at: 2) ?? "")
+                let attributes = string(in: xml, match: match, at: 2) ?? ""
+                let text = decodeXMLEntities(string(in: xml, match: match, at: 3) ?? "")
                 let kind: AgentChatItemKind = switch tag {
                 case "user": .user
                 case "assistant": .assistant
@@ -194,20 +206,26 @@ struct RemoteTranscriptProjector: Equatable {
                 case "error": .error
                 default: .system
                 }
-                rows.append(XMLRow(kind: kind, text: text, toolName: nil))
-            } else if let attributes = string(in: xml, match: match, at: 3),
-                      let toolName = attribute("name", in: attributes)
-            {
-                rows.append(XMLRow(kind: .toolCall, text: "", toolName: decodeXMLEntities(toolName)))
+                rows.append(XMLRow(kind: kind, text: text, toolName: nil, timestamp: rowTimestamp(in: attributes)))
             } else if let attributes = string(in: xml, match: match, at: 4),
                       let toolName = attribute("name", in: attributes)
             {
                 rows.append(XMLRow(
                     kind: .toolCall,
-                    text: decodeXMLEntities(string(in: xml, match: match, at: 5) ?? ""),
-                    toolName: decodeXMLEntities(toolName)
+                    text: "",
+                    toolName: decodeXMLEntities(toolName),
+                    timestamp: rowTimestamp(in: attributes)
                 ))
-            } else if let attributes = string(in: xml, match: match, at: 6),
+            } else if let attributes = string(in: xml, match: match, at: 5),
+                      let toolName = attribute("name", in: attributes)
+            {
+                rows.append(XMLRow(
+                    kind: .toolCall,
+                    text: decodeXMLEntities(string(in: xml, match: match, at: 6) ?? ""),
+                    toolName: decodeXMLEntities(toolName),
+                    timestamp: rowTimestamp(in: attributes)
+                ))
+            } else if let attributes = string(in: xml, match: match, at: 7),
                       let toolName = attribute("name", in: attributes),
                       let statusWord = projectedToolResultStatusWord(attribute("status", in: attributes)),
                       rows.last?.kind == .toolCall,
@@ -228,6 +246,17 @@ struct RemoteTranscriptProjector: Equatable {
             return [XMLRow(kind: .system, text: fallback, toolName: nil)]
         }
         return rows
+    }
+
+    /// Parses the wire `ts` attribute (Unix epoch seconds, locale-independent) into a Date.
+    /// Non-finite values (`nan`/`inf` parse as valid TimeIntervals) fall back to nil so a
+    /// buggy host cannot poison max-merge or session persistence with a non-finite Date.
+    private static func rowTimestamp(in attributes: String) -> Date? {
+        guard let raw = attribute("ts", in: attributes),
+              let interval = TimeInterval(raw),
+              interval.isFinite
+        else { return nil }
+        return Date(timeIntervalSince1970: interval)
     }
 
     private static func attribute(_ name: String, in attributes: String) -> String? {

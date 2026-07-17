@@ -156,6 +156,61 @@ final class RemoteTranscriptProjectorTests: XCTestCase {
         XCTAssertEqual(ToolCallCardStateResolver.status(for: item), .running)
     }
 
+    func testRowTimestampAttributesParseAcrossRowKindsWithSyntheticFallback() {
+        let items = project(xml: """
+        <transcript>
+        <user ts="1752717279.250">Hello</user>
+        <assistant ts="1752717601.500">Hi there</assistant>
+        <system ts="1752717602.750">note</system>
+        <error ts="1752717603.125">boom</error>
+        <tool_call name="read_file" ts="1752717604.250"/>
+        <tool_call name="apply_edits" ts="1752717605.500">{"path":"a.swift"}</tool_call>
+        <assistant>legacy row without ts</assistant>
+        <assistant ts="nan">non-finite ts row</assistant>
+        <assistant ts="inf">infinite ts row</assistant>
+        </transcript>
+        """)
+
+        XCTAssertEqual(
+            items.map(\.kind),
+            [.user, .assistant, .system, .error, .toolCall, .toolCall, .assistant, .assistant, .assistant]
+        )
+        XCTAssertEqual(items[0].timestamp, Date(timeIntervalSince1970: 1_752_717_279.25))
+        XCTAssertEqual(items[1].timestamp, Date(timeIntervalSince1970: 1_752_717_601.5))
+        XCTAssertEqual(items[2].timestamp, Date(timeIntervalSince1970: 1_752_717_602.75))
+        XCTAssertEqual(items[3].timestamp, Date(timeIntervalSince1970: 1_752_717_603.125))
+        XCTAssertEqual(items[4].timestamp, Date(timeIntervalSince1970: 1_752_717_604.25))
+        XCTAssertEqual(items[4].toolName, "read_file")
+        XCTAssertEqual(items[5].timestamp, Date(timeIntervalSince1970: 1_752_717_605.5))
+        XCTAssertEqual(items[5].toolArgsJSON, #"{"path":"a.swift"}"#)
+        // Rows without a wire ts keep the legacy synthetic sequence-index date.
+        XCTAssertEqual(items[6].timestamp, Date(timeIntervalSince1970: TimeInterval(items[6].sequenceIndex)))
+        // Non-finite ts values ("nan"/"inf" parse as valid TimeIntervals) must not poison
+        // max-merge or persistence; they fall back to the synthetic date.
+        XCTAssertEqual(items[7].timestamp, Date(timeIntervalSince1970: TimeInterval(items[7].sequenceIndex)))
+        XCTAssertEqual(items[8].timestamp, Date(timeIntervalSince1970: TimeInterval(items[8].sequenceIndex)))
+    }
+
+    func testWireTimestampedRowsKeepLegacyDeterministicIDsAndUpsertHealsSyntheticDates() {
+        let legacy = project(xml: "<user>Hello</user>\n<assistant>Hi</assistant>")
+        let timestamped = project(
+            xml: "<user ts=\"1752717279.250\">Hello</user>\n<assistant ts=\"1752717601.500\">Hi</assistant>"
+        )
+
+        // The wire ts must not participate in row identity, so legacy and upgraded
+        // projections of the same row merge instead of duplicating.
+        XCTAssertEqual(legacy.map(\.id), timestamped.map(\.id))
+
+        let projector = RemoteTranscriptProjector(remoteSessionID: "remote-session-projector-test")
+        let healed = projector.upserting(timestamped, into: legacy)
+
+        XCTAssertEqual(healed.map(\.id), legacy.map(\.id))
+        XCTAssertEqual(healed.map(\.timestamp), [
+            Date(timeIntervalSince1970: 1_752_717_279.25),
+            Date(timeIntervalSince1970: 1_752_717_601.5)
+        ])
+    }
+
     func testProjectSnapshotParsesAgentReasoningEffort() {
         let projector = RemoteTranscriptProjector(remoteSessionID: "remote-session-projector-effort")
 

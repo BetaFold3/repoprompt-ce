@@ -425,21 +425,35 @@ enum ToolRawJSON {
     }
 
     static func string(_ object: [String: Any], key: String) -> String? {
-        if let value = object[key] as? String { return value }
-        if let number = object[key] as? NSNumber { return number.stringValue }
+        if let value = object[key] as? String {
+            return value
+        }
+        if let number = object[key] as? NSNumber {
+            return number.stringValue
+        }
         return nil
     }
 
     static func bool(_ object: [String: Any], key: String) -> Bool? {
-        if let value = object[key] as? Bool { return value }
-        if let number = object[key] as? NSNumber { return number.boolValue }
+        if let value = object[key] as? Bool {
+            return value
+        }
+        if let number = object[key] as? NSNumber {
+            return number.boolValue
+        }
         return nil
     }
 
     static func int(_ object: [String: Any], key: String) -> Int? {
-        if let value = object[key] as? Int { return value }
-        if let number = object[key] as? NSNumber { return number.intValue }
-        if let string = object[key] as? String { return Int(string.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        if let value = object[key] as? Int {
+            return value
+        }
+        if let number = object[key] as? NSNumber {
+            return number.intValue
+        }
+        if let string = object[key] as? String {
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
         return nil
     }
 }
@@ -767,17 +781,27 @@ enum BashToolResultParser {
         let isSummaryOnly = scanText.range(of: #""summary_only"\s*:\s*true"#, options: [.regularExpression, .caseInsensitive]) != nil
             || scanText.range(of: #""summaryOnly"\s*:\s*true"#, options: [.regularExpression, .caseInsensitive]) != nil
         let isRunning: Bool = {
-            if plainTextHint.isRunning { return true }
-            if AgentTranscriptToolStatusSemantics.isRunningStatusWord(statusWord) { return true }
-            if hasSuccessFlag || hasErrorText { return false }
-            if let exitCode, exitCode >= 0 { return false }
+            if plainTextHint.isRunning {
+                return true
+            }
+            if AgentTranscriptToolStatusSemantics.isRunningStatusWord(statusWord) {
+                return true
+            }
+            if hasSuccessFlag || hasErrorText {
+                return false
+            }
+            if let exitCode, exitCode >= 0 {
+                return false
+            }
             if let statusWord, AgentTranscriptToolStatusSemantics.isTerminalStatusWord(statusWord) {
                 if exitCode != nil, exitCode ?? 0 < 0, processID?.isEmpty == false, !hasDurationHint {
                     return true
                 }
                 return false
             }
-            if exitCode != nil { return false }
+            if exitCode != nil {
+                return false
+            }
             return processID?.isEmpty == false
         }()
         return Metadata(
@@ -1033,8 +1057,12 @@ enum BashToolResultParser {
         if let array = value as? [Any] {
             let parts = array
                 .compactMap { element -> String? in
-                    if let string = element as? String { return string }
-                    if let number = element as? NSNumber { return number.stringValue }
+                    if let string = element as? String {
+                        return string
+                    }
+                    if let number = element as? NSNumber {
+                        return number.stringValue
+                    }
                     return nil
                 }
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -1088,15 +1116,21 @@ enum BashToolResultParser {
         ] {
             if let value = stringValue(object, key: key) {
                 let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return value }
+                if !trimmed.isEmpty {
+                    return value
+                }
             }
         }
         return nil
     }
 
     private static func stringValue(_ object: [String: Any], key: String) -> String? {
-        if let value = object[key] as? String { return value }
-        if let number = object[key] as? NSNumber { return number.stringValue }
+        if let value = object[key] as? String {
+            return value
+        }
+        if let number = object[key] as? NSNumber {
+            return number.stringValue
+        }
         if let array = object[key] as? [Any] {
             let parts = array
                 .compactMap { $0 as? String }
@@ -1841,7 +1875,9 @@ enum AgentTranscriptSummaryTextFormatter {
         var seenTools = Set<String>()
         let uniqueTools = summary.toolNames.filter { toolName in
             let key = toolName.lowercased()
-            if seenTools.contains(key) { return false }
+            if seenTools.contains(key) {
+                return false
+            }
             seenTools.insert(key)
             return true
         }
@@ -1880,9 +1916,15 @@ enum AgentTranscriptSummaryTextFormatter {
 
     private static func collapsedStatus(for summary: AgentTranscriptClusterSummary?) -> AgentTranscriptCollapsedSummaryStatus {
         guard let summary else { return .neutral }
-        if summary.containsFailure { return .failure }
-        if summary.containsWarning { return .warning }
-        if summary.containsRunningWork { return .running }
+        if summary.containsFailure {
+            return .failure
+        }
+        if summary.containsWarning {
+            return .warning
+        }
+        if summary.containsRunningWork {
+            return .running
+        }
         return .neutral
     }
 
@@ -3498,6 +3540,7 @@ enum AgentTranscriptIO {
         var payload: Payload
         let dropPriority: ForkItemDropPriority
         let turnID: UUID?
+        var timestamp: Date?
     }
 
     static func buildForkTranscriptXML(
@@ -3505,7 +3548,8 @@ enum AgentTranscriptIO {
         upToRowID: UUID? = nil,
         maxTranscriptItems: Int = 200,
         maxToolArgsCharacters: Int = 2000,
-        preserveIntermediateAssistantNarration: Bool = false
+        preserveIntermediateAssistantNarration: Bool = false,
+        includeRowTimestamps: Bool = false
     ) -> String {
         let entries = handoffExportEntries(
             from: transcript,
@@ -3542,23 +3586,23 @@ enum AgentTranscriptIO {
                 defer { flatIndex += 1 }
                 switch row.kind {
                 case .user:
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "user", text: row.text), dropPriority: .essential, turnID: tid))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "user", text: row.text), dropPriority: .essential, turnID: tid, timestamp: row.timestamp))
                     pos += 1
                 case .assistant, .assistantInline:
                     guard row.hasDisplayableAssistantBody else { continue }
                     let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     let isConclusion = conclusionIndices.contains(flatIndex)
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "assistant", text: trimmed), dropPriority: isConclusion ? .essential : .supplemental, turnID: tid))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "assistant", text: trimmed), dropPriority: isConclusion ? .essential : .supplemental, turnID: tid, timestamp: row.timestamp))
                     pos += 1
                 case .system:
                     let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "system", text: trimmed), dropPriority: .context, turnID: tid))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "system", text: trimmed), dropPriority: .context, turnID: tid, timestamp: row.timestamp))
                     pos += 1
                 case .error:
                     let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "error", text: trimmed), dropPriority: .context, turnID: tid))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "error", text: trimmed), dropPriority: .context, turnID: tid, timestamp: row.timestamp))
                     pos += 1
                 case .toolCall:
                     guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
@@ -3569,7 +3613,8 @@ enum AgentTranscriptIO {
                         pos: pos,
                         payload: .toolCall(name: toolName, args: args, resultStatusWord: resultStatusWord),
                         dropPriority: .toolCall,
-                        turnID: tid
+                        turnID: tid,
+                        timestamp: row.timestamp
                     ))
                     if let execution = AgentTranscriptToolNormalizer.toolExecution(for: row) {
                         lastToolCallIndexByExecutionID[execution.stableExecutionID] = forkItems.count - 1
@@ -3640,7 +3685,9 @@ enum AgentTranscriptIO {
             for idx in nonEssentialSorted {
                 dropIndices.insert(idx)
                 currentRendered = renderedOutputCount(excluding: dropIndices)
-                if currentRendered <= maxTranscriptItems { break }
+                if currentRendered <= maxTranscriptItems {
+                    break
+                }
             }
 
             // Step 2: If still over budget, drop essential items in whole-turn groups
@@ -3651,7 +3698,9 @@ enum AgentTranscriptIO {
                 var essentialByTurn: [UUID: [Int]] = [:]
                 for idx in forkItems.indices where forkItems[idx].dropPriority == .essential {
                     guard let turnID = forkItems[idx].turnID else { continue }
-                    if essentialByTurn[turnID] == nil { turnOrder.append(turnID) }
+                    if essentialByTurn[turnID] == nil {
+                        turnOrder.append(turnID)
+                    }
                     essentialByTurn[turnID, default: []].append(idx)
                 }
                 for turnID in turnOrder {
@@ -3674,20 +3723,21 @@ enum AgentTranscriptIO {
 
         // --- Phase 3: Render survivors in chronological order ---
         enum ForkTranscriptOutput {
-            case tagged(tag: String, text: String)
+            case tagged(tag: String, text: String, ts: Date?)
             case rawXML(String)
         }
         var outputs: [ForkTranscriptOutput] = []
         func appendOutput(_ output: ForkTranscriptOutput) {
             switch output {
-            case let .tagged(tag, text):
+            case let .tagged(tag, text, ts):
                 if tag == "system",
-                   case let .tagged(lastTag, lastText)? = outputs.last,
+                   case let .tagged(lastTag, lastText, lastTS)? = outputs.last,
                    lastTag == "system"
                 {
-                    outputs[outputs.count - 1] = .tagged(tag: "system", text: lastText + "\n" + text)
+                    // Merged consecutive system rows keep the first row's timestamp.
+                    outputs[outputs.count - 1] = .tagged(tag: "system", text: lastText + "\n" + text, ts: lastTS)
                 } else {
-                    outputs.append(.tagged(tag: tag, text: text))
+                    outputs.append(.tagged(tag: tag, text: text, ts: ts))
                 }
             case .rawXML:
                 outputs.append(output)
@@ -3697,14 +3747,15 @@ enum AgentTranscriptIO {
         for item in surviving {
             switch item.payload {
             case let .tagged(tag, text):
-                appendOutput(.tagged(tag: tag, text: text))
+                appendOutput(.tagged(tag: tag, text: text, ts: item.timestamp))
             case let .rawXML(xml):
                 appendOutput(.rawXML(xml))
             case let .toolCall(name, args, resultStatusWord):
                 appendOutput(.rawXML(forkTranscriptToolCallXML(
                     name: name,
                     args: args,
-                    resultStatusWord: resultStatusWord
+                    resultStatusWord: resultStatusWord,
+                    timestamp: includeRowTimestamps ? item.timestamp : nil
                 )))
             }
         }
@@ -3712,8 +3763,8 @@ enum AgentTranscriptIO {
         var lines = ["<transcript>"]
         for output in outputs {
             switch output {
-            case let .tagged(tag, text):
-                lines.append("<\(tag)>\(text)</\(tag)>")
+            case let .tagged(tag, text, ts):
+                lines.append("<\(tag)\(rowTimestampAttribute(includeRowTimestamps ? ts : nil))>\(text)</\(tag)>")
             case let .rawXML(xml):
                 lines.append(xml)
             }
@@ -3728,14 +3779,24 @@ enum AgentTranscriptIO {
     private static func forkTranscriptToolCallXML(
         name: String,
         args: String,
-        resultStatusWord: String?
+        resultStatusWord: String?,
+        timestamp: Date? = nil
     ) -> String {
         let escapedName = forkTranscriptXMLAttributeEscaped(name)
+        let ts = rowTimestampAttribute(timestamp)
         let callXML = args.isEmpty
-            ? "<tool_call name=\"\(escapedName)\"/>"
-            : "<tool_call name=\"\(escapedName)\">\(args)</tool_call>"
+            ? "<tool_call name=\"\(escapedName)\"\(ts)/>"
+            : "<tool_call name=\"\(escapedName)\"\(ts)>\(args)</tool_call>"
         guard let resultStatusWord else { return callXML }
         return callXML + "\n<tool_result name=\"\(escapedName)\" status=\"\(resultStatusWord)\"/>"
+    }
+
+    /// Renders an optional per-row wire timestamp attribute as Unix epoch seconds with
+    /// millisecond precision. Epoch numbers are deliberately locale/timezone-free; the
+    /// `%.3f` format is POSIX (dot decimal separator) because no locale is supplied.
+    private static func rowTimestampAttribute(_ date: Date?) -> String {
+        guard let date else { return "" }
+        return String(format: " ts=\"%.3f\"", date.timeIntervalSince1970)
     }
 
     private static func forkTranscriptXMLAttributeEscaped(_ text: String) -> String {
@@ -3813,13 +3874,15 @@ enum AgentTranscriptIO {
     static func buildSpartanLogXML(
         from transcript: AgentTranscript,
         maxTranscriptItems: Int = 200,
-        maxToolArgsCharacters: Int = 2000
+        maxToolArgsCharacters: Int = 2000,
+        includeRowTimestamps: Bool = false
     ) -> String {
         buildForkTranscriptXML(
             from: transcript,
             maxTranscriptItems: maxTranscriptItems,
             maxToolArgsCharacters: maxToolArgsCharacters,
-            preserveIntermediateAssistantNarration: true
+            preserveIntermediateAssistantNarration: true,
+            includeRowTimestamps: includeRowTimestamps
         )
     }
 
@@ -4124,7 +4187,9 @@ enum AgentTranscriptIO {
                 let entry = entries[i]
                 if isDisplayableAssistantEntry(entry) {
                     assistantIndices.append(i)
-                    if toolBeforeSeen { hasToolBefore.insert(i) }
+                    if toolBeforeSeen {
+                        hasToolBefore.insert(i)
+                    }
                 } else if entry.isToolBoundary {
                     toolBeforeSeen = true
                 }
@@ -4136,7 +4201,9 @@ enum AgentTranscriptIO {
             for i in segment.reversed() {
                 let entry = entries[i]
                 if isDisplayableAssistantEntry(entry) {
-                    if toolAfterSeen { hasToolAfter.insert(i) }
+                    if toolAfterSeen {
+                        hasToolAfter.insert(i)
+                    }
                 } else if entry.isToolBoundary {
                     toolAfterSeen = true
                 }
@@ -4164,7 +4231,9 @@ enum AgentTranscriptIO {
 
         logHandoffDebug("filterIntermediateAssistant dropped=\(dropIndices.count) truncated=\(truncateIndices.count)")
         return entries.enumerated().compactMap { index, entry in
-            if dropIndices.contains(index) { return nil }
+            if dropIndices.contains(index) {
+                return nil
+            }
             if truncateIndices.contains(index) {
                 return truncateAssistantEntry(entry)
             }

@@ -207,7 +207,9 @@ struct RemoteCommandTranslator {
 
     private func enforceBinding(for operation: String, payload: [String: JSONValue], resolvedWindowID: Int?) throws {
         // open_workspace names its own workspace target and is intentionally binding-exempt.
-        if operation == "open_workspace" { return }
+        if operation == "open_workspace" {
+            return
+        }
 
         switch bindingState {
         case .bound:
@@ -216,16 +218,28 @@ struct RemoteCommandTranslator {
             // M6.6: an explicit start selector names its own target, so start may
             // proceed on an unbound multi-window connection. Observation and
             // session-addressed operations still require binding.
-            if operation == "start", hasExplicitStartTarget(payload) { return }
-            if resolvedWindowID != nil, Self.sessionAddressedOperations.contains(operation) { return }
-            if operation == "list_agents", resolvedWindowID != nil { return }
+            if operation == "start", hasExplicitStartTarget(payload) {
+                return
+            }
+            if resolvedWindowID != nil, Self.sessionAddressedOperations.contains(operation) {
+                return
+            }
+            if operation == "list_agents", resolvedWindowID != nil {
+                return
+            }
             throw RemoteCommandTranslatorError.bindingRequired(message)
         case .ambiguousStartTarget where operation == "start":
-            if hasExplicitStartTarget(payload) { return }
+            if hasExplicitStartTarget(payload) {
+                return
+            }
             throw RemoteCommandTranslatorError.ambiguousStartTarget
         case let .ambiguousStartTarget(message):
-            if resolvedWindowID != nil, Self.sessionAddressedOperations.contains(operation) { return }
-            if operation == "list_agents", resolvedWindowID != nil { return }
+            if resolvedWindowID != nil, Self.sessionAddressedOperations.contains(operation) {
+                return
+            }
+            if operation == "list_agents", resolvedWindowID != nil {
+                return
+            }
             throw RemoteCommandTranslatorError.bindingRequired(message)
         }
     }
@@ -473,7 +487,8 @@ struct RemoteCommandTranslator {
 
     private static let getLogPayloadKeys: Set<String> = [
         "offset",
-        "limit"
+        "limit",
+        "include_row_timestamps"
     ]
 
     private static let sessionAddressedOperations: Set<String> = [

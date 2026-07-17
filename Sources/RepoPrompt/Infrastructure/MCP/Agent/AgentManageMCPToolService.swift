@@ -338,8 +338,12 @@ struct AgentManageMCPToolService {
                     ?? object["agent"]?.stringValue
                     ?? ""
             ).lowercased()
-            if let agentFilter, agent != agentFilter { return false }
-            if let stateFilter, !sessionStateMatches(object: object, filter: stateFilter) { return false }
+            if let agentFilter, agent != agentFilter {
+                return false
+            }
+            if let stateFilter, !sessionStateMatches(object: object, filter: stateFilter) {
+                return false
+            }
             return true
         }
         .sorted {
@@ -365,6 +369,11 @@ struct AgentManageMCPToolService {
         }
         let offset = max(0, args["offset"]?.intValue ?? 0)
         let limit = max(1, args["limit"]?.intValue ?? 20)
+        let includeRowTimestamps = try parseBool(
+            args["include_row_timestamps"],
+            name: "include_row_timestamps",
+            defaultValue: false
+        )
 
         let agentModeVM = targetWindow.agentModeViewModel
         let transcriptInfo = try await resolveTranscript(
@@ -393,7 +402,10 @@ struct AgentManageMCPToolService {
             "total_turns": .int(totalTurns),
             "completed_turn_count": .int(completedTurnCount),
             "transcript_xml": .string(
-                AgentTranscriptIO.buildSpartanLogXML(from: slicedTranscript)
+                AgentTranscriptIO.buildSpartanLogXML(
+                    from: slicedTranscript,
+                    includeRowTimestamps: includeRowTimestamps
+                )
             )
         ]
         if let name = transcriptInfo.name, !name.isEmpty {

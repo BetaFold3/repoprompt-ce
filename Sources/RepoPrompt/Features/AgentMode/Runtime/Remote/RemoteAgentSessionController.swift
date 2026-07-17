@@ -7,11 +7,19 @@ protocol RemoteAgentSessionConnection: Sendable {
     func ensureConnected() async throws
     func subscribe(sessionIDs: [String]) async throws
     func unsubscribe(sessionIDs: [String]) async throws
+    /// Whether the connected host advertised an optional `hello_ack` feature
+    /// (see `RemoteWireFeatures`). Defaults to false so legacy fakes and hosts
+    /// degrade to legacy behavior.
+    func supportsHostFeature(_ feature: String) async -> Bool
 }
 
 extension RemoteAgentSessionConnection {
     func command(_ frame: RemoteClientFrame) async throws -> JSONValue {
         try await command(frame, timeout: RemoteHostConnection.commandTimeout)
+    }
+
+    func supportsHostFeature(_: String) async -> Bool {
+        false
     }
 }
 
@@ -125,6 +133,10 @@ actor RemoteAgentSessionController {
     private var didReportLogCatchUpFailure = false
     private var didYieldSessionExpired = false
     private var didTerminalSettleReRead = false
+    /// One-shot version-skew latch: set when a host that advertised
+    /// `get_log_row_timestamps` still rejected the payload key, so every later
+    /// fetch degrades to the legacy timestampless request.
+    private var hostRejectedGetLogRowTimestamps = false
     private var projectedRowIDsByPageOffset: [Int: Set<UUID>] = [:]
     private var lastCompletePageOffset: Int?
     private var lastLegacyAdvanceOffset: Int?
@@ -209,8 +221,12 @@ actor RemoteAgentSessionController {
         if let sessionName, !sessionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             payload["session_name"] = .string(sessionName)
         }
-        if let windowID { payload["window_id"] = .int(windowID) }
-        if let workspaceID, !workspaceID.isEmpty { payload["workspace_id"] = .string(workspaceID) }
+        if let windowID {
+            payload["window_id"] = .int(windowID)
+        }
+        if let workspaceID, !workspaceID.isEmpty {
+            payload["workspace_id"] = .string(workspaceID)
+        }
         if let workspaceName = workspaceName?.trimmingCharacters(in: .whitespacesAndNewlines), !workspaceName.isEmpty {
             payload["workspace_name"] = .string(workspaceName)
         }
@@ -906,22 +922,68 @@ actor RemoteAgentSessionController {
         lifecycleGeneration: UUID
     ) async throws -> RemoteProjectedLogPage {
         try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
-        Self.logger.log("remote get_log fetch session_id=\(sessionID, privacy: .public) offset=\(offset) limit=\(limit)")
-        let logFrame = RemoteClientFrame(
-            type: "get_log",
-            requestID: makeRequestID(prefix: "log"),
-            sessionID: sessionID,
-            payload: .object([
-                "offset": .int(offset),
-                "limit": .int(limit)
-            ])
-        )
-        let pagePayload = try await connection.command(logFrame)
+        // Establish the connection (and therefore the hello_ack feature set) before the
+        // feature read; command() auto-connects, so a cold-start fetch would otherwise
+        // read a stale-false feature and permanently project this page without dates.
+        try await connection.ensureConnected()
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+        let includeRowTimestamps = if hostRejectedGetLogRowTimestamps {
+            false
+        } else {
+            await connection.supportsHostFeature(RemoteWireFeatures.getLogRowTimestamps)
+        }
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+        Self.logger.log("remote get_log fetch session_id=\(sessionID, privacy: .public) offset=\(offset) limit=\(limit) row_ts=\(includeRowTimestamps)")
+        let pagePayload: JSONValue
+        do {
+            pagePayload = try await connection.command(makeGetLogFrame(
+                offset: offset,
+                limit: limit,
+                sessionID: sessionID,
+                includeRowTimestamps: includeRowTimestamps
+            ))
+        } catch let error as RemoteClientError where includeRowTimestamps
+            && error.commandError?.code == "unsupported_payload_key"
+        {
+            // Version-skew guard: a host (or stale gateway in between) may advertise the
+            // feature yet still reject the payload key. Latch legacy behavior for this
+            // controller's lifetime so transcript sync degrades instead of failing.
+            hostRejectedGetLogRowTimestamps = true
+            Self.logger.notice("remote get_log retrying without include_row_timestamps after unsupported_payload_key session_id=\(sessionID, privacy: .public)")
+            try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+            pagePayload = try await connection.command(makeGetLogFrame(
+                offset: offset,
+                limit: limit,
+                sessionID: sessionID,
+                includeRowTimestamps: false
+            ))
+        }
         try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
         guard let page = projector?.projectGetLogResponse(pagePayload) else {
             throw RemoteLogPagingError.missingProjector
         }
         return page
+    }
+
+    private func makeGetLogFrame(
+        offset: Int,
+        limit: Int,
+        sessionID: String,
+        includeRowTimestamps: Bool
+    ) -> RemoteClientFrame {
+        var payload: [String: JSONValue] = [
+            "offset": .int(offset),
+            "limit": .int(limit)
+        ]
+        if includeRowTimestamps {
+            payload["include_row_timestamps"] = .bool(true)
+        }
+        return RemoteClientFrame(
+            type: "get_log",
+            requestID: makeRequestID(prefix: "log"),
+            sessionID: sessionID,
+            payload: .object(payload)
+        )
     }
 
     private enum LogPageReconciliation {

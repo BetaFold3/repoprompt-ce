@@ -92,6 +92,7 @@ actor RemoteHostConnection {
     private var subscriptionReconciliationWaiters: [CheckedContinuation<Void, Never>] = []
     private var connectedHostName: String?
     private var connectedScopes: Set<String> = []
+    private var connectedFeatures: Set<String> = []
     private var reconnectBackoff: TimeInterval
     private var pendingCounterWrite: UInt64?
     private var counterWriteTask: Task<Void, Never>?
@@ -195,6 +196,13 @@ actor RemoteHostConnection {
         return connectedHostName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
+    /// Whether the currently connected host advertised an optional feature in its
+    /// `hello_ack` `features` array. Returns false when disconnected or for legacy
+    /// hosts that advertise nothing; callers degrade to legacy behavior in both cases.
+    func supportsHostFeature(_ feature: String) -> Bool {
+        connectedFeatures.contains(feature)
+    }
+
     func subscribe(sessionIDs: [String]) async throws {
         let normalized = Self.normalizedSessionIDs(sessionIDs)
         guard !normalized.isEmpty else { return }
@@ -263,6 +271,7 @@ actor RemoteHostConnection {
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        connectedFeatures = []
         acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.connectionClosed)
         transition(to: .idle)
@@ -456,6 +465,10 @@ actor RemoteHostConnection {
         signer = localSigner
         connectedScopes = scopes
         connectedHostName = payload["host_name"]?.stringValue
+        // Missing or non-array features (every legacy host) is the empty set; unknown
+        // strings are retained but only known constants are ever queried. Reassigned on
+        // every hello_ack so reconnects can observe an upgraded or downgraded host.
+        connectedFeatures = Set(payload["features"]?.arrayValue?.compactMap(\.stringValue) ?? [])
         reconnectBackoff = initialReconnectBackoff
         _ = try? registry.updateLastConnected(hostID: record.id, at: now())
         transition(to: .connected(scopes: scopes))
@@ -580,7 +593,9 @@ actor RemoteHostConnection {
                 acknowledgedSubscriptions.insert(sessionID)
                 retained.insert(sessionID)
             } catch {
-                if !Self.isCommandLevel(error) { throw error }
+                if !Self.isCommandLevel(error) {
+                    throw error
+                }
                 if requestedSessionIDs.contains(sessionID), requestedFailure == nil {
                     requestedFailure = error
                 }
@@ -796,6 +811,7 @@ actor RemoteHostConnection {
                 signer = nil
                 connectedScopes = []
                 connectedHostName = nil
+                connectedFeatures = []
                 acknowledgedSubscriptions.removeAll()
                 readTask?.cancel()
                 readTask = nil
@@ -832,12 +848,17 @@ actor RemoteHostConnection {
     }
 
     private func handleReadLoopTermination(_ error: Error) async {
-        if Task.isCancelled { return }
-        if case .revoked = state { return }
+        if Task.isCancelled {
+            return
+        }
+        if case .revoked = state {
+            return
+        }
         webSocketTask = nil
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        connectedFeatures = []
         acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.connectionClosed)
         guard hasTrackedSubscriptions else {
@@ -879,7 +900,9 @@ actor RemoteHostConnection {
         do {
             try await ensureConnected()
         } catch {
-            if case .revoked = state { return }
+            if case .revoked = state {
+                return
+            }
             let reason = (error as? RemoteClientError)?.commandError?.code ?? "reconnect_failed"
             scheduleReconnectIfNeeded(reason: reason)
         }
@@ -899,6 +922,7 @@ actor RemoteHostConnection {
         signer = nil
         connectedScopes = []
         connectedHostName = nil
+        connectedFeatures = []
         acknowledgedSubscriptions.removeAll()
         failAllPending(with: RemoteClientError.hostRevoked(hostID))
         transition(to: .revoked)
