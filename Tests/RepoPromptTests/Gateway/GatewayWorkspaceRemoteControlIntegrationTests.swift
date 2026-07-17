@@ -170,6 +170,60 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         )
     }
 
+    func testObservationRecoveryEmitsCurrentSnapshotFromRecoveredWindowWithoutClientRepoll() async throws {
+        let sessionID = windowTwoNewestID
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "running"
+            )))
+        ])
+        let root = try GatewayTestHelpers.temporaryRoot()
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let manager = SessionWatchManager(
+            appLink: appLink,
+            waitTimeoutSeconds: 0.05,
+            pollRefreshSeconds: 0.05
+        )
+        let runtime = try RemoteGatewayRuntime(
+            appLink: appLink,
+            ledger: CommandLedger(),
+            watchManager: manager,
+            auditLog: nil,
+            bindingState: .bound,
+            observationWindowDiscovery: { _, _ in 2 },
+            observationDiscoveryTimeoutSeconds: 0.1
+        )
+        await manager.setObservationRouting(
+            windowResolver: { deviceID, sessionID in
+                await runtime.cachedSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+            },
+            windowRecovery: { deviceID, sessionID, invalidate in
+                await runtime.recoverSessionWindowForObservation(
+                    deviceID: deviceID,
+                    sessionID: sessionID,
+                    invalidate: invalidate
+                )
+            }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        let frames = await waitForSessionUpdate(sink: sink, sessionID: sessionID)
+        await manager.shutdown()
+
+        XCTAssertTrue(frames.contains { $0.type == "session_update" && $0.sessionID == sessionID })
+        let calls = await connection.calls.filter { $0.arguments["op"] == .string("poll") }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.arguments["_windowID"], .int(2))
+    }
+
     func testRemoteOpenThenAutoRoutedStartSubscribeDidQueuePushesFromSecondWindow() async throws {
         let deviceID = "remote:1a2b3c4d"
         let sessionID = "99999999-9999-9999-9999-999999999999"
@@ -688,5 +742,19 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         XCTAssertEqual(calls[1].arguments["action"], .string("open"))
         XCTAssertEqual(calls[3].arguments["op"], .string("list_sessions"))
         XCTAssertEqual(calls[3].arguments["_windowID"], .int(7))
+    }
+
+    private func waitForSessionUpdate(
+        sink: RecordingFrameSink,
+        sessionID: String
+    ) async -> [RemoteServerFrame] {
+        for _ in 0 ..< 100 {
+            let frames = await sink.frames
+            if frames.contains(where: { $0.type == "session_update" && $0.sessionID == sessionID }) {
+                return frames
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await sink.frames
     }
 }

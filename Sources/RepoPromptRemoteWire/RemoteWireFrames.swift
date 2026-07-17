@@ -86,6 +86,13 @@ public struct RemoteClientFrame: Codable, Equatable, Sendable {
     }
 }
 
+public enum RemoteObservationFailureReason: String, CaseIterable, Codable, Hashable, Sendable {
+    case routingUnavailable = "routing_unavailable"
+    case linkUnavailable = "link_unavailable"
+    case toolFailure = "tool_failure"
+    case invalidSnapshot = "invalid_snapshot"
+}
+
 public struct RemoteServerFrame: Codable, Equatable, Sendable {
     public let v: Int
     public let type: String
@@ -123,6 +130,28 @@ public struct RemoteServerFrame: Codable, Equatable, Sendable {
         payload: JSONValue
     ) -> RemoteServerFrame {
         RemoteServerFrame(type: "command_result", requestID: requestID, sessionID: sessionID, payload: payload)
+    }
+
+    public static func observationFailure(
+        sessionID: String,
+        reason: RemoteObservationFailureReason,
+        attempt: Int,
+        attemptLimit: Int,
+        seq: UInt64,
+        seqEpoch: String
+    ) -> RemoteServerFrame {
+        RemoteServerFrame(
+            type: "observation_failure",
+            sessionID: sessionID,
+            seq: seq,
+            seqEpoch: seqEpoch,
+            payload: .object([
+                "session_id": .string(sessionID),
+                "reason": .string(reason.rawValue),
+                "attempt": .int(max(1, attempt)),
+                "attempt_limit": .int(max(1, attemptLimit))
+            ])
+        )
     }
 
     public static func commandError(

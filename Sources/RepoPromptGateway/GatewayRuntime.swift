@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Logging
 import MCP
@@ -10,6 +11,8 @@ protocol RemoteFrameSink: Sendable {
 }
 
 actor RemoteGatewayRuntime {
+    typealias ObservationWindowDiscovery = @Sendable (_ deviceID: String, _ sessionID: String) async -> Int?
+
     static let phase0DeviceID = "phase0:static-token"
 
     private struct SubscriptionValidationKey: Hashable {
@@ -82,6 +85,8 @@ actor RemoteGatewayRuntime {
     private let logger: Logger
     private let defaultBindingState: RemoteGatewayBindingState
     private let pushSubscriptionStore: WebPushSubscriptionStore?
+    private let observationWindowDiscovery: ObservationWindowDiscovery?
+    private let observationDiscoveryTimeoutSeconds: TimeInterval
     private let now: @Sendable () -> Date
     private var lastEligibleWindowDetailsByDevice: [String: JSONValue] = [:]
     private var autoRoutedStartWindowIDByCommandKey: [String: Int] = [:]
@@ -103,6 +108,8 @@ actor RemoteGatewayRuntime {
         appLinkPool: AppLinkPool? = nil,
         pushSubscriptionStore: WebPushSubscriptionStore? = nil,
         sessionWindowAffinity: GatewaySessionWindowAffinity = GatewaySessionWindowAffinity(),
+        observationWindowDiscovery: ObservationWindowDiscovery? = nil,
+        observationDiscoveryTimeoutSeconds: TimeInterval = 5,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.appLink = appLink
@@ -114,6 +121,8 @@ actor RemoteGatewayRuntime {
         self.logger = logger
         defaultBindingState = bindingState
         self.pushSubscriptionStore = pushSubscriptionStore
+        self.observationWindowDiscovery = observationWindowDiscovery
+        self.observationDiscoveryTimeoutSeconds = max(0.01, observationDiscoveryTimeoutSeconds)
         self.now = now
     }
 
@@ -1014,14 +1023,57 @@ actor RemoteGatewayRuntime {
         throw RemoteGatewayRuntimeError.deviceAppLinkUnavailable(deviceID: deviceID)
     }
 
-    func resolveSessionWindowForObservation(deviceID: String, sessionID: String) async -> Int? {
-        if let cachedWindowID = await sessionWindowAffinity.windowID(forSession: sessionID) {
-            logger.info("observation window resolution stage=warm_hit device_id=\(deviceID) session_id=\(sessionID.trimmingCharacters(in: .whitespacesAndNewlines)) window_id=\(cachedWindowID)")
+    func cachedSessionWindowForObservation(deviceID: String, sessionID: String) async -> Int? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return nil }
+        if let cachedWindowID = await sessionWindowAffinity.windowID(forSession: normalizedSessionID) {
+            logger.debug(
+                "observation event=affinity_lookup outcome=warm_hit device_id=\(Self.boundedLogIdentifier(deviceID)) session_id=\(Self.boundedLogIdentifier(normalizedSessionID)) window_id=\(cachedWindowID)"
+            )
             return cachedWindowID
         }
-        logger.info("observation window resolution stage=cold_path device_id=\(deviceID) session_id=\(sessionID.trimmingCharacters(in: .whitespacesAndNewlines))")
-        guard let (_, bindingState) = try? await resolveAppLink(deviceID: deviceID) else { return nil }
-        return await resolvedWindowID(forSession: sessionID, deviceID: deviceID, bindingState: bindingState)
+        logger.notice(
+            "observation event=affinity_lookup outcome=miss device_id=\(Self.boundedLogIdentifier(deviceID)) session_id=\(Self.boundedLogIdentifier(normalizedSessionID))"
+        )
+        return nil
+    }
+
+    func resolveSessionWindowForObservation(deviceID: String, sessionID: String) async -> Int? {
+        if let cached = await cachedSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID) {
+            return cached
+        }
+        return await recoverSessionWindowForObservation(
+            deviceID: deviceID,
+            sessionID: sessionID,
+            invalidate: false
+        )
+    }
+
+    func recoverSessionWindowForObservation(
+        deviceID: String,
+        sessionID: String,
+        invalidate: Bool
+    ) async -> Int? {
+        let normalizedSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedSessionID.isEmpty else { return nil }
+        if invalidate {
+            await sessionWindowAffinity.invalidate(sessionID: normalizedSessionID)
+        }
+        logger.notice(
+            "observation event=affinity_recovery outcome=issued device_id=\(Self.boundedLogIdentifier(deviceID)) session_id=\(Self.boundedLogIdentifier(normalizedSessionID))"
+        )
+        let result = await withBoundedObservationResolution(seconds: observationDiscoveryTimeoutSeconds) {
+            await self.sessionWindowAffinity.resolvingWindowID(forSession: normalizedSessionID) {
+                if let observationWindowDiscovery = await self.observationWindowDiscovery {
+                    return await observationWindowDiscovery(deviceID, normalizedSessionID)
+                }
+                return await self.discoverSessionWindow(sessionID: normalizedSessionID, deviceID: deviceID)
+            }
+        }
+        logger.notice(
+            "observation event=affinity_recovery outcome=\(result == nil ? "exhausted" : "recovered") device_id=\(Self.boundedLogIdentifier(deviceID)) session_id=\(Self.boundedLogIdentifier(normalizedSessionID)) window_id=\(result.map(String.init) ?? "none")"
+        )
+        return result
     }
 
     private func resolvedWindowID(
@@ -1509,6 +1561,11 @@ actor RemoteGatewayRuntime {
         return listAgentsRoutingDiagnosticsByCommandKey.removeValue(forKey: key)
     }
 
+    private nonisolated static func boundedLogIdentifier(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return "id_" + digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
     private func bindingStateCategory(_ state: RemoteGatewayBindingState) -> String {
         switch state {
         case .bound:
@@ -1621,6 +1678,52 @@ actor RemoteGatewayRuntime {
             recoveryRetried: listAgentsDiagnostics?.recoveryRetried
         ))
     }
+}
+
+private actor BoundedObservationResolutionGate {
+    private var resolved = false
+    private var result: Int?
+    private var waiters: [CheckedContinuation<Int?, Never>] = []
+
+    func resolve(_ result: Int?) {
+        guard !resolved else { return }
+        resolved = true
+        self.result = result
+        waiters.forEach { $0.resume(returning: result) }
+        waiters.removeAll()
+    }
+
+    func value() async -> Int? {
+        if resolved {
+            return result
+        }
+        return await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
+private func withBoundedObservationResolution(
+    seconds: TimeInterval,
+    operation: @escaping @Sendable () async -> Int?
+) async -> Int? {
+    let gate = BoundedObservationResolutionGate()
+    let discoveryTask = Task {
+        await gate.resolve(operation())
+    }
+    let timeoutTask = Task {
+        try? await Task.sleep(for: .milliseconds(Int64((max(0.01, seconds) * 1000).rounded(.up))))
+        guard !Task.isCancelled else { return }
+        await gate.resolve(nil)
+    }
+    let result = await withTaskCancellationHandler {
+        await gate.value()
+    } onCancel: {
+        Task { await gate.resolve(nil) }
+    }
+    timeoutTask.cancel()
+    discoveryTask.cancel()
+    return result
 }
 
 enum RemoteGatewayRuntimeError: Error, Equatable {

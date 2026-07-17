@@ -4,6 +4,17 @@ import RepoPromptRemoteWire
 import XCTest
 
 final class RemoteGatewayLifecycleTests: XCTestCase {
+    func testProductionDiagnosticsResolveAuthoritativeGatewayRuntimeRoot() {
+        let buildIdentity = RemoteControlBuildIdentity.forTesting(channel: .release)
+        let configuration = RemoteGatewayLaunchConfiguration.production(
+            bindHost: "100.64.0.8",
+            buildIdentity: buildIdentity
+        )
+
+        XCTAssertEqual(configuration.appSupportRoot, RemoteControlStorageNamespace.gatewayRuntimeRootURL().path)
+        XCTAssertEqual(configuration.port, buildIdentity.fixedPort)
+    }
+
     func testSerializedLifecycleCompletesRetirementBeforeReplacementAndIgnoresLateTermination() async throws {
         let fixture = try makeFixture()
         let recorder = LifecycleMutationRecorder()

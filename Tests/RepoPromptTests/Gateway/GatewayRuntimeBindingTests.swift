@@ -241,7 +241,8 @@ final class GatewayRuntimeBindingTests: XCTestCase {
     private func makeRuntime(
         connection: RecordingAppLinkConnection,
         bindingState: RemoteGatewayBindingState,
-        auditLog: RemoteAuditLog? = nil
+        auditLog: RemoteAuditLog? = nil,
+        configureObservationRouting: Bool = false
     ) async throws -> RemoteGatewayRuntime {
         let root = try GatewayTestHelpers.temporaryRoot()
         let config = try GatewayTestHelpers.configuration(root: root)
@@ -263,8 +264,19 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             auditLog: auditLog,
             bindingState: bindingState
         )
-        await watchManager.setWindowResolver { deviceID, sessionID in
-            await runtime.resolveSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+        if configureObservationRouting {
+            await watchManager.setObservationRouting(
+                windowResolver: { deviceID, sessionID in
+                    await runtime.cachedSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+                },
+                windowRecovery: { deviceID, sessionID, invalidate in
+                    await runtime.recoverSessionWindowForObservation(
+                        deviceID: deviceID,
+                        sessionID: sessionID,
+                        invalidate: invalidate
+                    )
+                }
+            )
         }
         return runtime
     }
@@ -299,6 +311,59 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         )
     }
 
+    private func makeObservationRuntime(
+        connection: RecordingAppLinkConnection,
+        affinity: GatewaySessionWindowAffinity = GatewaySessionWindowAffinity(),
+        discovery: @escaping RemoteGatewayRuntime.ObservationWindowDiscovery,
+        timeoutSeconds: TimeInterval = 0.2,
+        logger: Logger = Logger(label: "test.gateway.observation")
+    ) async throws -> (RemoteGatewayRuntime, SessionWatchManager) {
+        let root = try GatewayTestHelpers.temporaryRoot()
+        let config = try GatewayTestHelpers.configuration(root: root)
+        let appLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: connection),
+            sleep: { _ in }
+        )
+        try await appLink.connect()
+        let manager = SessionWatchManager(
+            appLink: appLink,
+            logger: logger,
+            waitTimeoutSeconds: 0.05,
+            pollRefreshSeconds: 0.05,
+            observationFailureBudgets: .init(
+                routingUnavailable: 2,
+                linkUnavailable: 2,
+                toolFailure: 2,
+                invalidSnapshot: 2
+            )
+        )
+        let runtime = try RemoteGatewayRuntime(
+            appLink: appLink,
+            ledger: CommandLedger(),
+            watchManager: manager,
+            auditLog: nil,
+            logger: logger,
+            bindingState: .bound,
+            sessionWindowAffinity: affinity,
+            observationWindowDiscovery: discovery,
+            observationDiscoveryTimeoutSeconds: timeoutSeconds
+        )
+        await manager.setObservationRouting(
+            windowResolver: { deviceID, sessionID in
+                await runtime.cachedSessionWindowForObservation(deviceID: deviceID, sessionID: sessionID)
+            },
+            windowRecovery: { deviceID, sessionID, invalidate in
+                await runtime.recoverSessionWindowForObservation(
+                    deviceID: deviceID,
+                    sessionID: sessionID,
+                    invalidate: invalidate
+                )
+            }
+        )
+        return (runtime, manager)
+    }
+
     private func assertListAgentsRoutingAuditIsRedacted(
         _ record: [String: Any],
         file: StaticString = #filePath,
@@ -330,6 +395,207 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         for forbiddenKey in ["payload", "arguments", "model", "token", "secret"] {
             XCTAssertNil(record[forbiddenKey], file: file, line: line)
         }
+    }
+
+    func testObservationNilAffinityDiscoversBeforeCallAndNeverCallsWithoutWindowID() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "running"
+            )))
+        ])
+        let (_, manager) = try await makeObservationRuntime(
+            connection: connection,
+            discovery: { _, _ in 7 }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForSessionUpdateCount(1, sink: sink)
+        await manager.shutdown()
+
+        let observationCalls = await connection.calls.filter { call in
+            call.name == "agent_run"
+                && (call.arguments["op"] == .string("poll") || call.arguments["op"] == .string("wait"))
+        }
+        XCTAssertFalse(observationCalls.isEmpty)
+        XCTAssertTrue(observationCalls.allSatisfy { $0.arguments["_windowID"] == .int(7) })
+    }
+
+    func testObservationStaleAffinityBindingErrorInvalidatesAndRetriesOnceWithRecoveredWindowID() async throws {
+        let affinity = GatewaySessionWindowAffinity()
+        await affinity.record(sessionID: sessionID, windowID: 1)
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: .object(["code": .string("binding_required")]),
+                isError: true
+            )),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "running"
+            )))
+        ])
+        let (_, manager) = try await makeObservationRuntime(
+            connection: connection,
+            affinity: affinity,
+            discovery: { _, _ in 2 }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForSessionUpdateCount(1, sink: sink)
+        await manager.shutdown()
+
+        let pollWindows = await connection.calls
+            .filter { $0.arguments["op"] == .string("poll") }
+            .compactMap { $0.arguments["_windowID"]?.intValue }
+        XCTAssertEqual(pollWindows, [1, 2])
+    }
+
+    func testObservationMultiWindowErrorRecoversOnceWithRecoveredWindowID() async throws {
+        let affinity = GatewaySessionWindowAffinity()
+        await affinity.record(sessionID: sessionID, windowID: 3)
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(
+                json: .object(["message": .string("multiple windows require binding_required")]),
+                isError: true
+            )),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "running"
+            )))
+        ])
+        let (_, manager) = try await makeObservationRuntime(
+            connection: connection,
+            affinity: affinity,
+            discovery: { _, _ in 4 }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForSessionUpdateCount(1, sink: sink)
+        await manager.shutdown()
+
+        let pollWindows = await connection.calls
+            .filter { $0.arguments["op"] == .string("poll") }
+            .compactMap { $0.arguments["_windowID"]?.intValue }
+        XCTAssertEqual(pollWindows, [3, 4])
+    }
+
+    func testObservationDiscoveryTimeoutReturnsBoundedFailureAndLateDiscoveryCannotRoute() async throws {
+        let gate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection()
+        let (runtime, manager) = try await makeObservationRuntime(
+            connection: connection,
+            discovery: { _, _ in
+                await gate.enterAndWaitForRelease()
+                return 9
+            },
+            timeoutSeconds: 0.01
+        )
+
+        let result = await runtime.recoverSessionWindowForObservation(
+            deviceID: "device",
+            sessionID: sessionID,
+            invalidate: false
+        )
+        XCTAssertNil(result)
+        await gate.release()
+        await Task.yield()
+        await manager.shutdown()
+
+        let calls = await connection.calls
+        XCTAssertFalse(calls.contains { $0.name == "agent_run" })
+    }
+
+    func testAffinityRecoveryOperationalEventsAreStructuredAndRedacted() async throws {
+        let recorder = BindingLogRecorder()
+        let logger = Logger(label: "test.gateway.observation") { _ in recorder.handler() }
+        let connection = RecordingAppLinkConnection()
+        let (runtime, manager) = try await makeObservationRuntime(
+            connection: connection,
+            discovery: { _, _ in 8 },
+            logger: logger
+        )
+
+        let result = await runtime.recoverSessionWindowForObservation(
+            deviceID: "device-secret\npayload",
+            sessionID: "session-secret\nprompt",
+            invalidate: false
+        )
+        await manager.shutdown()
+
+        XCTAssertEqual(result, 8)
+        let messages = recorder.messages.joined(separator: " ")
+        XCTAssertTrue(messages.contains("event=affinity_recovery"))
+        XCTAssertTrue(messages.contains("outcome=issued"))
+        XCTAssertTrue(messages.contains("outcome=recovered"))
+        XCTAssertFalse(messages.contains("\n"))
+        XCTAssertFalse(messages.contains("raw MCP"))
+    }
+
+    func testAffinityNoticeIdentifiersUseSafeEncodingAndRejectFieldInjection() async throws {
+        let recorder = BindingLogRecorder()
+        let logger = Logger(label: "test.gateway.observation.safe-identifiers") { _ in recorder.handler() }
+        let deviceID = "remote:secret-device\r\n outcome=forged\tapi_key=alpha"
+        let sessionID = "secret-session\r\n session_id=forged authorization=bearer"
+        let (runtime, manager) = try await makeObservationRuntime(
+            connection: RecordingAppLinkConnection(),
+            discovery: { _, _ in 8 },
+            logger: logger
+        )
+
+        let result = await runtime.recoverSessionWindowForObservation(
+            deviceID: deviceID,
+            sessionID: sessionID,
+            invalidate: false
+        )
+        await manager.shutdown()
+
+        XCTAssertEqual(result, 8)
+        let notices = recorder.noticeMessages
+        let joined = notices.joined(separator: " ")
+        XCTAssertFalse(joined.contains("secret-device"))
+        XCTAssertFalse(joined.contains("secret-session"))
+        XCTAssertFalse(joined.contains("outcome=forged"))
+        XCTAssertFalse(joined.contains("api_key=alpha"))
+        XCTAssertFalse(joined.contains("authorization=bearer"))
+        XCTAssertFalse(joined.contains("\r"))
+        XCTAssertFalse(joined.contains("\n"))
+        XCTAssertFalse(joined.contains("\t"))
+        for message in notices {
+            for key in ["device_id=", "session_id="] {
+                guard let range = message.range(of: key) else { continue }
+                let value = message[range.upperBound...].prefix { !$0.isWhitespace }
+                XCTAssertEqual(value.count, 27)
+                XCTAssertTrue(value.hasPrefix("id_"))
+                XCTAssertTrue(value.dropFirst(3).allSatisfy {
+                    $0.isNumber || "abcdef".contains($0)
+                })
+            }
+        }
+    }
+
+    func testAffinityOperationalEventsAvoidWarmHitNoticeAmplification() async throws {
+        let recorder = BindingLogRecorder()
+        let logger = Logger(label: "test.gateway.observation.warm-hit") { _ in recorder.handler() }
+        let affinity = GatewaySessionWindowAffinity()
+        await affinity.record(sessionID: sessionID, windowID: 7)
+        let (runtime, manager) = try await makeObservationRuntime(
+            connection: RecordingAppLinkConnection(),
+            affinity: affinity,
+            discovery: { _, _ in 9 },
+            logger: logger
+        )
+
+        let first = await runtime.cachedSessionWindowForObservation(deviceID: "device", sessionID: sessionID)
+        let second = await runtime.cachedSessionWindowForObservation(deviceID: "device", sessionID: sessionID)
+        XCTAssertEqual(first, 7)
+        XCTAssertEqual(second, 7)
+        await manager.shutdown()
+
+        XCTAssertEqual(recorder.noticeMessages.count(where: { $0.contains("outcome=warm_hit") }), 0)
+        XCTAssertEqual(recorder.messages.count(where: { $0.contains("outcome=warm_hit") }), 2)
     }
 
     func testWarmObservationAffinityBypassesAppLinkLookupBindingRefreshAndDiscovery() async throws {
@@ -649,7 +915,11 @@ final class GatewayRuntimeBindingTests: XCTestCase {
             .result(sessionListResponse([sessionID])),
             .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running")))
         ])
-        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .bindingRequired("bind first"),
+            configureObservationRouting: true
+        )
         let sink = RecordingFrameSink()
 
         let request = RemoteClientFrame(type: "subscribe", requestID: "r1", sessionID: sessionID)
@@ -2212,5 +2482,59 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         let frames = await sink.frames.filter { $0.type == "session_update" }
         XCTAssertGreaterThanOrEqual(frames.count, minimumCount, file: file, line: line)
         return frames
+    }
+}
+
+private final class BindingLogRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var records: [(level: Logger.Level, message: String)] = []
+
+    var messages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return records.map(\.message)
+    }
+
+    var noticeMessages: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return records.filter { $0.level >= .notice }.map(\.message)
+    }
+
+    func handler() -> BindingCaptureLogHandler {
+        BindingCaptureLogHandler(recorder: self)
+    }
+
+    func record(level: Logger.Level, message: String) {
+        lock.lock()
+        records.append((level, message))
+        lock.unlock()
+    }
+}
+
+private struct BindingCaptureLogHandler: LogHandler {
+    var metadata: Logger.Metadata = [:]
+    var logLevel: Logger.Level = .trace
+    private let recorder: BindingLogRecorder
+
+    init(recorder: BindingLogRecorder) {
+        self.recorder = recorder
+    }
+
+    subscript(metadataKey key: String) -> Logger.Metadata.Value? {
+        get { metadata[key] }
+        set { metadata[key] = newValue }
+    }
+
+    func log(
+        level: Logger.Level,
+        message: Logger.Message,
+        metadata _: Logger.Metadata?,
+        source _: String,
+        file _: String,
+        function _: String,
+        line _: UInt
+    ) {
+        recorder.record(level: level, message: message.description)
     }
 }

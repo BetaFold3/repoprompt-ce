@@ -32,6 +32,7 @@ public enum RemoteWireProtocol {
         "session_update",
         "session_terminal",
         "session_expired",
+        "observation_failure",
         // M6.2: emitted when a pending interaction is resolved (by this device,
         // another device, a CLI client, or the local user).
         "interaction_resolved",
@@ -91,14 +92,14 @@ public enum RemoteWireProtocol {
     }
 }
 
-extension RemoteWireProtocol {
+public extension RemoteWireProtocol {
     /// Context line for the canonical remote frame signing payload.
-    public static let frameSigningContext = "RemoteFrameV1"
+    static let frameSigningContext = "RemoteFrameV1"
 
     /// SHA-256 hex digest of the canonical JSON encoding of the raw frame object
     /// with the `sig` member removed. Computed from raw bytes so unknown fields the
     /// device signed over are preserved verbatim.
-    public static func canonicalFrameHashHex(fromRawFrameData data: Data) throws -> String {
+    static func canonicalFrameHashHex(fromRawFrameData data: Data) throws -> String {
         let value: JSONValue
         do {
             value = try JSONDecoder().decode(JSONValue.self, from: data)
@@ -114,7 +115,7 @@ extension RemoteWireProtocol {
 
     /// Canonical signing payload:
     /// `RemoteFrameV1\n<ticket_id>\n<device_id>\n<counter>\n<sha256(canonical_json_without_sig)>\n`
-    public static func frameSigningPayload(
+    static func frameSigningPayload(
         ticketID: UUID,
         deviceID: String,
         counter: UInt64,

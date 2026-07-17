@@ -491,10 +491,9 @@ final actor ServerController: ObservableObject {
             }
             let buildIdentity = RemoteControlBuildIdentity.current
             let origin = try RemoteGatewayOrigin(tailscaleIPv4: bindHost, channel: buildIdentity.channel)
-            let launchConfiguration = RemoteGatewayLaunchConfiguration(
+            let launchConfiguration = RemoteGatewayLaunchConfiguration.production(
                 bindHost: bindHost,
-                port: buildIdentity.fixedPort,
-                appSupportRoot: RemoteControlStorageNamespace.gatewayRuntimeRootURL().path
+                buildIdentity: buildIdentity
             )
             await publishRemoteGatewayStatus(.starting(origin))
             try await ensureRemoteGatewayGeneration(generation)
@@ -665,7 +664,16 @@ final actor ServerController: ObservableObject {
                 environment["REPOPROMPT_GATEWAY_PROCESS_LEASE_FILE"] = remoteGatewayProcessLeaseFileURL(for: configuration).path
                 environment["REPOPROMPT_GATEWAY_APP_LINK_MAX_RECONNECT_ATTEMPTS"] = "24"
                 process.environment = environment
+                let diagnostics = RemoteGatewayProcessDiagnosticsCapture(
+                    runtimeRootURL: URL(fileURLWithPath: configuration.appSupportRoot),
+                    generation: token
+                )
+                if let diagnostics {
+                    process.standardOutput = diagnostics.stdoutPipe
+                    process.standardError = diagnostics.stderrPipe
+                }
                 process.terminationHandler = { process in
+                    diagnostics?.finish()
                     didTerminate(.init(token: token, pid: process.processIdentifier))
                 }
                 try process.run()
