@@ -416,6 +416,240 @@ final class GatewayWorkspaceRemoteControlIntegrationTests: XCTestCase {
         XCTAssertFalse(observationCalls.contains { $0.arguments["_windowID"] == nil })
     }
 
+    func testOpenWorkspaceUnsubscribeResubscribeAdoptedSessionSteerCompletionDeliversAccountableFrame() async throws {
+        let deviceID = "remote:1a2b3c4d"
+        let oldSessionID = windowTwoNewestID
+        let adoptedSessionID = windowTwoOlderID
+        let validationGate = RecordingAppLinkResponseGate()
+        let completionGate = RecordingAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "status": .string("opened"),
+                "window_id": .int(2),
+                "workspace": .object([
+                    "id": .string(sharedWorkspaceID),
+                    "name": .string("Shared Workspace")
+                ])
+            ]))),
+            .result(twoWindowSharedWorkspaceListResponse()),
+            .result(workspaceSessionListResponse(windowOneSessions())),
+            .result(workspaceSessionListResponse(windowTwoSessions())),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: oldSessionID,
+                status: "running"
+            ))),
+            .gated(
+                GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                    sessionID: adoptedSessionID,
+                    status: "running"
+                )),
+                validationGate
+            ),
+            .gated(
+                GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                    sessionID: adoptedSessionID,
+                    status: "completed"
+                )),
+                completionGate
+            ),
+            .result(steerResult(sessionID: adoptedSessionID))
+        ])
+        let root = try GatewayTestHelpers.temporaryRoot()
+        let config = try GatewayTestHelpers.configuration(root: root, staticToken: nil)
+        let connector = WorkspaceRemoteDeviceConnector(connection: connection)
+        let pool = AppLinkPool(
+            configuration: config,
+            connector: connector,
+            bindingProbe: { _ in .ambiguousStartTarget("choose a window") },
+            refreshBindingProbe: { _ in .ambiguousStartTarget("choose a window") }
+        )
+        _ = try await pool.ensureLink(forDevice: deviceID)
+        let defaultConnection = RecordingAppLinkConnection()
+        let defaultAppLink = AppLinkSession(
+            config: config,
+            connector: StaticAppLinkConnector(connection: defaultConnection),
+            sleep: { _ in }
+        )
+        try await defaultAppLink.connect()
+        let watchManager = SessionWatchManager(
+            appLink: defaultAppLink,
+            appLinkPool: pool,
+            waitTimeoutSeconds: 2,
+            pollRefreshSeconds: 1,
+            terminalQuarantineSeconds: 0
+        )
+        let runtime = try RemoteGatewayRuntime(
+            appLink: defaultAppLink,
+            ledger: CommandLedger(),
+            watchManager: watchManager,
+            auditLog: nil,
+            appLinkPool: pool
+        )
+        await watchManager.setObservationRouting(
+            windowResolver: { resolvedDeviceID, resolvedSessionID in
+                await runtime.cachedSessionWindowForObservation(
+                    deviceID: resolvedDeviceID,
+                    sessionID: resolvedSessionID
+                )
+            },
+            windowRecovery: { resolvedDeviceID, resolvedSessionID, invalidate in
+                await runtime.recoverSessionWindowForObservation(
+                    deviceID: resolvedDeviceID,
+                    sessionID: resolvedSessionID,
+                    invalidate: invalidate
+                )
+            }
+        )
+        defer {
+            Task {
+                await watchManager.shutdown()
+                await pool.shutdownAll()
+                await defaultAppLink.shutdown()
+            }
+        }
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+        _ = await watchManager.registerSubscription(
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink,
+            sessionIDs: [oldSessionID]
+        )
+
+        let openRequest = RemoteClientFrame(
+            type: "open_workspace",
+            requestID: "accountable-open",
+            payload: .object(["workspace_name": .string("Shared Workspace")])
+        )
+        let handledOpenResponse = await runtime.handle(
+            openRequest,
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink
+        )
+        let openResponse = try XCTUnwrap(handledOpenResponse)
+        XCTAssertEqual(openResponse.type, "command_result")
+        XCTAssertEqual(openResponse.payload?.objectValue?["window_id"], .int(2))
+        await sink.send(openResponse)
+
+        let unsubscribeRequest = RemoteClientFrame(
+            type: "unsubscribe",
+            requestID: "accountable-unsubscribe",
+            sessionID: oldSessionID
+        )
+        let handledUnsubscribeResponse = await runtime.handle(
+            unsubscribeRequest,
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink
+        )
+        let unsubscribeResponse = try XCTUnwrap(handledUnsubscribeResponse)
+        XCTAssertEqual(unsubscribeResponse.type, "command_result")
+        await sink.send(unsubscribeResponse)
+
+        let subscribeRequest = RemoteClientFrame(
+            type: "subscribe",
+            requestID: "accountable-subscribe",
+            sessionID: adoptedSessionID
+        )
+        let handledSubscribeResponse = await runtime.handle(
+            subscribeRequest,
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink
+        )
+        let subscribeResponse = try XCTUnwrap(handledSubscribeResponse)
+        XCTAssertEqual(subscribeResponse.type, "command_result")
+        XCTAssertEqual(
+            subscribeResponse.payload?.objectValue?["subscribed_session_ids"]?.arrayValue,
+            [.string(adoptedSessionID)]
+        )
+        let enteredBeforeQueue = await validationGate.hasEntered()
+        XCTAssertFalse(enteredBeforeQueue)
+        await sink.send(subscribeResponse)
+        let enteredBeforeActivation = await validationGate.hasEntered()
+        XCTAssertFalse(enteredBeforeActivation)
+        let frameTypesBeforeActivation = await sink.frames.map(\.type)
+        XCTAssertEqual(frameTypesBeforeActivation, ["command_result", "command_result", "command_result"])
+
+        await runtime.didQueueResponse(
+            for: subscribeRequest,
+            response: subscribeResponse,
+            deviceID: deviceID,
+            sinkID: sinkID
+        )
+        await validationGate.waitUntilEntered()
+        let frameTypesWhileValidationHeld = await sink.frames.map(\.type)
+        XCTAssertEqual(frameTypesWhileValidationHeld, frameTypesBeforeActivation)
+        await validationGate.release()
+        await completionGate.waitUntilEntered()
+
+        let steerRequest = RemoteClientFrame(
+            type: "steer",
+            requestID: "accountable-steer",
+            sessionID: adoptedSessionID,
+            payload: .object(["message": .string("finish the adopted session")])
+        )
+        let handledSteerResponse = await runtime.handle(
+            steerRequest,
+            deviceID: deviceID,
+            sinkID: sinkID,
+            sink: sink
+        )
+        let steerResponse = try XCTUnwrap(handledSteerResponse)
+        XCTAssertEqual(steerResponse.type, "command_result")
+        await sink.send(steerResponse)
+        await completionGate.release()
+
+        var frames = await sink.frames
+        for _ in 0 ..< 100 {
+            if frames.contains(where: { $0.type == "session_terminal" && $0.sessionID == adoptedSessionID }) {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+            frames = await sink.frames
+        }
+        await watchManager.shutdown()
+        await pool.shutdownAll()
+        await defaultAppLink.shutdown()
+
+        let stateFrames = frames.filter { ["session_update", "session_terminal", "observation_failure"].contains($0.type) }
+        XCTAssertFalse(stateFrames.contains { $0.sessionID == oldSessionID })
+        XCTAssertFalse(stateFrames.contains { $0.sessionID != adoptedSessionID })
+        XCTAssertTrue(stateFrames.contains {
+            $0.type == "session_update"
+                && $0.sessionID == adoptedSessionID
+                && $0.payload?.objectValue?["status"]?.stringValue == "running"
+        })
+        let terminal = try XCTUnwrap(stateFrames.first {
+            $0.type == "session_terminal" && $0.sessionID == adoptedSessionID
+        })
+        XCTAssertNotNil(terminal.seq)
+        XCTAssertNotNil(terminal.seqEpoch)
+
+        let calls = await connection.calls
+        XCTAssertFalse(calls.contains { $0.arguments["op"] == .string("start") })
+        let discoveryCalls = calls.filter {
+            $0.name == "agent_manage" && $0.arguments["op"] == .string("list_sessions")
+        }
+        XCTAssertEqual(discoveryCalls.map { $0.arguments["_windowID"] }, [.int(1), .int(2)])
+        let routedCalls = calls.filter {
+            $0.name == "agent_run"
+                && ["poll", "wait", "steer"].contains($0.arguments["op"]?.stringValue ?? "")
+        }
+        XCTAssertFalse(routedCalls.isEmpty)
+        XCTAssertTrue(routedCalls.allSatisfy { $0.arguments["_windowID"] == .int(2) })
+        let adoptedCalls = routedCalls.filter {
+            $0.arguments["session_id"] == .string(adoptedSessionID)
+        }
+        XCTAssertTrue(adoptedCalls.contains { $0.arguments["op"] == .string("poll") })
+        XCTAssertTrue(adoptedCalls.contains { $0.arguments["op"] == .string("wait") })
+        XCTAssertTrue(adoptedCalls.contains { $0.arguments["op"] == .string("steer") })
+        XCTAssertEqual(connector.recordedClientNames, [deviceID])
+        let defaultCalls = await defaultConnection.calls
+        XCTAssertTrue(defaultCalls.isEmpty)
+    }
+
     func testWorkspaceCatalogUnionThenWarmAffinityWatchAndSteerWithoutRediscovery() async throws {
         let validationGate = RecordingAppLinkResponseGate()
         let connection = RecordingAppLinkConnection(responses: [

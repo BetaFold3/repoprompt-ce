@@ -10,6 +10,8 @@ private enum SessionWatchError: Error, Equatable {
 
 actor SessionWatchManager {
     typealias WindowResolver = @Sendable (_ deviceID: String, _ sessionID: String) async -> Int?
+    typealias WaitDeadlineSleep = @Sendable (_ seconds: TimeInterval) async throws -> Void
+    typealias WaitRetrySleep = @Sendable (_ seconds: TimeInterval) async throws -> Void
     typealias WindowRecovery = @Sendable (
         _ deviceID: String,
         _ sessionID: String,
@@ -82,6 +84,13 @@ actor SessionWatchManager {
         let task: Task<Void, Never>
     }
 
+    private struct WaitCycle {
+        let id: UUID
+        let owningTaskID: UUID
+        let sessionTokens: [String: UUID]
+        let watchdogTask: Task<Void, Never>
+    }
+
     private struct QuarantinedTerminal {
         let snapshot: RemoteSessionSnapshot
         let task: Task<Void, Never>
@@ -112,6 +121,9 @@ actor SessionWatchManager {
     private let logger: Logger
     private let sequenceEpoch: String
     private let waitTimeoutSeconds: TimeInterval
+    private let waitWatchdogMarginSeconds: TimeInterval
+    private let waitDeadlineSleep: WaitDeadlineSleep
+    private let waitRetrySleep: WaitRetrySleep
     private let pollRefreshSeconds: TimeInterval
     private let revalidationIntervalSeconds: TimeInterval
     private let terminalQuarantineSeconds: TimeInterval
@@ -132,6 +144,7 @@ actor SessionWatchManager {
     private var pendingTerminalQuarantineByDeviceSession: [String: QuarantinedTerminal] = [:]
     private var observationHealthByDeviceSession: [String: ObservationHealthState] = [:]
     private var routingRecoveryByDeviceSession: [String: RoutingRecoveryFlight] = [:]
+    private var waitCycleByDevice: [String: WaitCycle] = [:]
     private var appLinkStateTask: Task<Void, Never>?
 
     init(
@@ -142,6 +155,13 @@ actor SessionWatchManager {
         logger: Logger = Logger(label: "com.repoprompt.gateway.watch"),
         sequenceEpoch: String = UUID().uuidString.lowercased(),
         waitTimeoutSeconds: TimeInterval = 30,
+        waitWatchdogMarginSeconds: TimeInterval = 10,
+        waitDeadlineSleep: @escaping WaitDeadlineSleep = { seconds in
+            try await Task.sleep(for: .milliseconds(Int64((seconds * 1000).rounded(.up))))
+        },
+        waitRetrySleep: @escaping WaitRetrySleep = { seconds in
+            try await Task.sleep(for: .milliseconds(Int64((seconds * 1000).rounded(.up))))
+        },
         pollRefreshSeconds: TimeInterval = 5,
         revalidationIntervalSeconds: TimeInterval = 30,
         terminalQuarantineSeconds: TimeInterval = 5,
@@ -154,6 +174,11 @@ actor SessionWatchManager {
         self.logger = logger
         self.sequenceEpoch = sequenceEpoch
         self.waitTimeoutSeconds = waitTimeoutSeconds
+        // The app call allows its transport up to waitTimeoutSeconds + 5; keep the
+        // independent watchdog strictly outside that allowance so it cannot win early.
+        self.waitWatchdogMarginSeconds = max(5.001, waitWatchdogMarginSeconds)
+        self.waitDeadlineSleep = waitDeadlineSleep
+        self.waitRetrySleep = waitRetrySleep
         self.pollRefreshSeconds = pollRefreshSeconds
         self.revalidationIntervalSeconds = revalidationIntervalSeconds
         self.terminalQuarantineSeconds = terminalQuarantineSeconds
@@ -210,6 +235,10 @@ actor SessionWatchManager {
             recovery.task.cancel()
         }
         routingRecoveryByDeviceSession.removeAll()
+        for cycle in waitCycleByDevice.values {
+            cycle.watchdogTask.cancel()
+        }
+        waitCycleByDevice.removeAll()
         observationHealthByDeviceSession.removeAll()
         lastEmittedIsTerminalByDeviceSession.removeAll()
         lastEmittedTerminalFingerprintByDeviceSession.removeAll()
@@ -228,6 +257,7 @@ actor SessionWatchManager {
         if state.sinks.isEmpty, state.watchedSessionIDs.isEmpty {
             state.waitTask?.cancel()
             state.revalidationTask?.cancel()
+            cancelWaitCycle(deviceID: deviceID)
             devices.removeValue(forKey: deviceID)
             return
         }
@@ -325,6 +355,7 @@ actor SessionWatchManager {
         guard let state = devices.removeValue(forKey: deviceID) else { return }
         state.waitTask?.cancel()
         state.revalidationTask?.cancel()
+        cancelWaitCycle(deviceID: deviceID)
         for sessionID in state.watchedSessionIDs {
             let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
             lastPushKindByDeviceSession.removeValue(forKey: key)
@@ -350,10 +381,12 @@ actor SessionWatchManager {
     }
 
     func rearm(deviceID: String, sessionID: String?) {
-        logger.debug("watch rearm device=\(boundedLogIdentifier(deviceID)) session=\(sessionID.map(boundedLogIdentifier) ?? "-")")
         guard let sessionID, var state = devices[deviceID], state.watchedSessionIDs.contains(sessionID) else {
             return
         }
+        logger.debug(
+            "watch_accountability event=rearm outcome=rearm trigger=steer device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID))"
+        )
         state.parkedActionableSessionIDs.remove(sessionID)
         state.parkedTerminalSessionIDs.remove(sessionID)
         state.activeWaitSessionIDs.insert(sessionID)
@@ -361,7 +394,7 @@ actor SessionWatchManager {
         // The session left its wake-worthy state via respond/steer; the next
         // wake-worthy transition should push again for a disconnected device.
         lastPushKindByDeviceSession.removeValue(forKey: deviceSessionKey(deviceID: deviceID, sessionID: sessionID))
-        clearObservationHealth(deviceID: deviceID, sessionID: sessionID)
+        preserveObservationHealthForRearm(deviceID: deviceID, sessionID: sessionID)
         ensureWaitLoop(deviceID: deviceID)
         ensureRevalidationLoop(deviceID: deviceID)
     }
@@ -421,8 +454,9 @@ actor SessionWatchManager {
                 token: subscriptionToken
             ) else { return }
             let requestedSessionID = normalizedSessionID(sessionID)
+            let requestedMatchKey = canonicalSessionMatchKey(requestedSessionID)
             guard var snapshot = snapshots.first(where: {
-                normalizedSessionID($0.sessionID) == requestedSessionID
+                canonicalSessionMatchKey($0.sessionID) == requestedMatchKey
             }) else {
                 await pauseObservation(
                     deviceID: deviceID,
@@ -545,6 +579,10 @@ actor SessionWatchManager {
             health.failureEmitted = true
         }
         observationHealthByDeviceSession[key] = health
+        let accountingOutcome = shouldEmit ? "exhausted" : "transition"
+        logger.debug(
+            "watch_accountability event=failure_accounting outcome=\(accountingOutcome) reason=\(reason.rawValue) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) attempt=\(count) attempt_limit=\(limit)"
+        )
         if priorCount == 0 {
             logger.notice(
                 "observation event=issue outcome=\(reason.rawValue) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) attempt=\(count) attempt_limit=\(limit)"
@@ -566,6 +604,9 @@ actor SessionWatchManager {
             seqEpoch: sequenceEpoch
         )
         await broadcast(frame, deviceID: deviceID)
+        logger.notice(
+            "watch_accountability event=failure_accounting outcome=emitted reason=\(reason.rawValue) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) attempt=\(count) attempt_limit=\(limit) frame_type=observation_failure seq=\(frame.seq.map(String.init) ?? "-") seq_epoch=\(boundedLogIdentifier(sequenceEpoch))"
+        )
         logger.notice(
             "observation event=exhaustion outcome=emitted device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) reason=\(reason.rawValue)"
         )
@@ -608,6 +649,15 @@ actor SessionWatchManager {
         if let recovery = routingRecoveryByDeviceSession.removeValue(forKey: key) {
             recovery.task.cancel()
         }
+    }
+
+    private func preserveObservationHealthForRearm(deviceID: String, sessionID: String) {
+        let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
+        guard var health = observationHealthByDeviceSession[key],
+              currentSubscriptionToken(deviceID: deviceID, sessionID: sessionID, expected: health.token) != nil
+        else { return }
+        health.failureEmitted = false
+        observationHealthByDeviceSession[key] = health
     }
 
     private func scheduleRoutingRecovery(
@@ -698,6 +748,12 @@ actor SessionWatchManager {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private func canonicalSessionMatchKey(_ value: String) -> String {
+        let normalized = normalizedSessionID(value)
+        guard let uuid = UUID(uuidString: normalized) else { return normalized }
+        return uuid.uuidString.lowercased()
+    }
+
     private func boundedLogIdentifier(_ value: String) -> String {
         let digest = SHA256.hash(data: Data(value.utf8))
         return "id_" + digest.prefix(12).map { String(format: "%02x", $0) }.joined()
@@ -769,11 +825,77 @@ actor SessionWatchManager {
         }
     }
 
+    private func beginWaitCycle(
+        deviceID: String,
+        taskID: UUID,
+        sessionTokens: [String: UUID]
+    ) -> UUID {
+        cancelWaitCycle(deviceID: deviceID)
+        let cycleID = UUID()
+        let deadlineSeconds = waitTimeoutSeconds + waitWatchdogMarginSeconds
+        let deadlineSleep = waitDeadlineSleep
+        let watchdogTask = Task { [weak self] in
+            do {
+                try await deadlineSleep(deadlineSeconds)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await self?.expireWaitCycle(deviceID: deviceID, cycleID: cycleID)
+        }
+        waitCycleByDevice[deviceID] = WaitCycle(
+            id: cycleID,
+            owningTaskID: taskID,
+            sessionTokens: sessionTokens,
+            watchdogTask: watchdogTask
+        )
+        return cycleID
+    }
+
+    private func endWaitCycle(deviceID: String, cycleID: UUID) {
+        guard let cycle = waitCycleByDevice[deviceID], cycle.id == cycleID else { return }
+        cycle.watchdogTask.cancel()
+        waitCycleByDevice.removeValue(forKey: deviceID)
+    }
+
+    private func cancelWaitCycle(deviceID: String) {
+        guard let cycle = waitCycleByDevice.removeValue(forKey: deviceID) else { return }
+        cycle.watchdogTask.cancel()
+    }
+
+    private func expireWaitCycle(deviceID: String, cycleID: UUID) async {
+        guard let cycle = waitCycleByDevice[deviceID],
+              cycle.id == cycleID,
+              var state = devices[deviceID],
+              state.waitTaskID == cycle.owningTaskID
+        else { return }
+        waitCycleByDevice.removeValue(forKey: deviceID)
+        state.waitTask?.cancel()
+        state.waitTask = nil
+        state.waitTaskID = nil
+        devices[deviceID] = state
+        let durationMilliseconds = Int64(((waitTimeoutSeconds + waitWatchdogMarginSeconds) * 1000).rounded(.up))
+        logger.notice(
+            "watch_accountability event=wait_deadline outcome=deadline_exceeded duration_ms=\(durationMilliseconds) device_id=\(boundedLogIdentifier(deviceID)) correlation_id=\(boundedLogIdentifier(cycleID.uuidString))"
+        )
+        for sessionID in cycle.sessionTokens.keys.sorted() {
+            guard let token = cycle.sessionTokens[sessionID] else { continue }
+            await pauseObservation(
+                deviceID: deviceID,
+                sessionID: sessionID,
+                token: token,
+                reason: .toolFailure
+            )
+        }
+        ensureWaitLoop(deviceID: deviceID)
+    }
+
     private func ensureWaitLoop(deviceID: String) {
         guard var state = devices[deviceID] else { return }
         if state.waitTask?.isCancelled == true {
             state.waitTask = nil
             state.waitTaskID = nil
+            cancelWaitCycle(deviceID: deviceID)
         }
         // Wake-push semantics: a disconnected device with a push subscription keeps
         // its wait loop so wake-worthy transitions can trigger Web Push.
@@ -800,6 +922,7 @@ actor SessionWatchManager {
         devices[deviceID]?.waitTask?.cancel()
         devices[deviceID]?.waitTask = nil
         devices[deviceID]?.waitTaskID = nil
+        cancelWaitCycle(deviceID: deviceID)
     }
 
     private func ensureRevalidationLoop(deviceID: String) {
@@ -883,13 +1006,14 @@ actor SessionWatchManager {
                     taskID: taskID,
                     includeStatusUpdates: !state.sinks.isEmpty
                 )
-                if waitResult == .paused {
+                switch waitResult {
+                case .snapshots:
+                    break
+                case .retryScheduled:
+                    return
+                case .rearmImmediately:
                     shouldRearmAfterExit = true
                     return
-                }
-                if waitResult == .empty {
-                    try await Task.sleep(for: .milliseconds(Int64((pollRefreshSeconds * 1000).rounded(.up))))
-                    continue
                 }
             } catch is CancellationError {
                 return
@@ -906,6 +1030,7 @@ actor SessionWatchManager {
 
     private func clearWaitTask(deviceID: String, taskID: UUID, rearm: Bool) {
         guard var state = devices[deviceID], state.waitTaskID == taskID else { return }
+        cancelWaitCycle(deviceID: deviceID)
         state.waitTask = nil
         state.waitTaskID = nil
         devices[deviceID] = state
@@ -916,8 +1041,13 @@ actor SessionWatchManager {
 
     private func scheduleWaitLoopRetry(deviceID: String, delay: TimeInterval? = nil) {
         let retryDelay = max(0.05, delay ?? pollRefreshSeconds)
+        let retrySleep = waitRetrySleep
         Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(Int64((retryDelay * 1000).rounded(.up))))
+            do {
+                try await retrySleep(retryDelay)
+            } catch {
+                return
+            }
             await self?.retryWaitLoopIfStillWatched(deviceID: deviceID)
         }
     }
@@ -994,8 +1124,8 @@ actor SessionWatchManager {
 
     private enum WaitPartitionResult: Equatable {
         case snapshots
-        case empty
-        case paused
+        case retryScheduled
+        case rearmImmediately
     }
 
     private struct SessionWindowPartition {
@@ -1019,9 +1149,19 @@ actor SessionWatchManager {
         includeStatusUpdates: Bool
     ) async throws -> WaitPartitionResult {
         let partitions = await partitions(deviceID: deviceID, sessionIDs: sessionIDs)
-        guard !partitions.isEmpty else { return .paused }
-        var sawSnapshot = false
-        var paused = false
+        guard !partitions.isEmpty else { return .rearmImmediately }
+        let cycleSessionTokens = partitions.reduce(into: [String: UUID]()) { tokens, partition in
+            tokens.merge(partition.sessionTokens) { current, _ in current }
+        }
+        let cycleID = beginWaitCycle(
+            deviceID: deviceID,
+            taskID: taskID,
+            sessionTokens: cycleSessionTokens
+        )
+        defer { endWaitCycle(deviceID: deviceID, cycleID: cycleID) }
+        var sawMatchedSnapshot = false
+        var retryScheduled = false
+        var shouldRearmImmediately = false
 
         await withTaskGroup(of: WaitGroupOutcome.self) { group in
             for partition in partitions {
@@ -1051,26 +1191,66 @@ actor SessionWatchManager {
                 switch outcome {
                 case let .success(sessionTokens, payload):
                     let snapshots = RemoteSessionSnapshot.extractSnapshots(from: payload)
-                    if !snapshots.isEmpty {
-                        sawSnapshot = true
+                    let tokensByMatchKey = sessionTokens.keys.sorted().reduce(
+                        into: [String: [(sessionID: String, token: UUID)]]()
+                    ) { lookup, sessionID in
+                        guard let token = sessionTokens[sessionID] else { return }
+                        lookup[canonicalSessionMatchKey(sessionID), default: []].append((sessionID, token))
                     }
+                    var matchedCurrentCount = 0
                     for snapshot in snapshots {
-                        guard let token = sessionTokens[snapshot.sessionID],
-                              currentSubscriptionToken(
-                                  deviceID: deviceID,
-                                  sessionID: snapshot.sessionID,
-                                  expected: token
-                              ) != nil
-                        else { continue }
-                        clearObservationHealthAfterSuccess(
-                            deviceID: deviceID,
-                            sessionID: snapshot.sessionID,
-                            token: token
+                        let matchKey = canonicalSessionMatchKey(snapshot.sessionID)
+                        guard let matches = tokensByMatchKey[matchKey] else { continue }
+                        for match in matches {
+                            guard currentSubscriptionToken(
+                                deviceID: deviceID,
+                                sessionID: match.sessionID,
+                                expected: match.token
+                            ) != nil else { continue }
+                            var subscribedSnapshot = snapshot
+                            if subscribedSnapshot.sessionID != match.sessionID {
+                                var rewrittenPayload = subscribedSnapshot.payload.objectValue ?? [:]
+                                rewrittenPayload["session_id"] = .string(match.sessionID)
+                                subscribedSnapshot = RemoteSessionSnapshot(
+                                    sessionID: match.sessionID,
+                                    status: subscribedSnapshot.status,
+                                    payload: .object(rewrittenPayload)
+                                )
+                            }
+                            matchedCurrentCount += 1
+                            clearObservationHealthAfterSuccess(
+                                deviceID: deviceID,
+                                sessionID: match.sessionID,
+                                token: match.token
+                            )
+                            await handleWaitSnapshot(deviceID: deviceID, snapshot: subscribedSnapshot)
+                        }
+                    }
+                    if matchedCurrentCount > 0 {
+                        sawMatchedSnapshot = true
+                        logger.debug(
+                            "watch_accountability event=wait_disposition outcome=accepted device_id=\(boundedLogIdentifier(deviceID)) correlation_id=\(boundedLogIdentifier(cycleID.uuidString))"
                         )
-                        await handleWaitSnapshot(deviceID: deviceID, snapshot: snapshot)
+                    } else {
+                        retryScheduled = true
+                        let returnedRowCount = payload.objectValue?["snapshots"]?.arrayValue?.count
+                            ?? (payload.objectValue == nil ? 0 : 1)
+                        let disposition = returnedRowCount == 0 ? "empty" : "rejected"
+                        logger.notice(
+                            "watch_accountability event=wait_disposition outcome=\(disposition) reason=invalid_snapshot device_id=\(boundedLogIdentifier(deviceID)) correlation_id=\(boundedLogIdentifier(cycleID.uuidString))"
+                        )
+                        for sessionID in sessionTokens.keys.sorted() {
+                            guard let token = sessionTokens[sessionID] else { continue }
+                            await pauseObservation(
+                                deviceID: deviceID,
+                                sessionID: sessionID,
+                                token: token,
+                                reason: .invalidSnapshot
+                            )
+                        }
                     }
                 case let .failure(sessionTokens, reason):
-                    paused = true
+                    shouldRearmImmediately = true
                     for (sessionID, token) in sessionTokens {
                         await pauseObservation(
                             deviceID: deviceID,
@@ -1083,10 +1263,13 @@ actor SessionWatchManager {
             }
         }
 
-        if paused {
-            return .paused
+        if shouldRearmImmediately {
+            return .rearmImmediately
         }
-        return sawSnapshot ? .snapshots : .empty
+        if retryScheduled {
+            return .retryScheduled
+        }
+        return sawMatchedSnapshot ? .snapshots : .rearmImmediately
     }
 
     private func callAgentRunPoll(deviceID: String, sessionIDs: [String]) async throws -> JSONValue {
@@ -1545,12 +1728,15 @@ actor SessionWatchManager {
         deviceID: String,
         sessionID: String,
         trigger: EmissionTrigger,
-        status: String,
+        status _: String,
         type: String,
         seq: UInt64?,
-        suffix: String = ""
+        suffix _: String = ""
     ) {
-        logger.debug("watch emit device=\(boundedLogIdentifier(deviceID)) session=\(boundedLogIdentifier(sessionID)) trigger=\(trigger.rawValue) status=\(status) type=\(type) seq=\(seq.map(String.init) ?? "-")\(suffix)")
+        let outcome = ["held", "suppressed"].contains(type) ? type : "emitted"
+        logger.debug(
+            "watch_accountability event=snapshot_emission outcome=\(outcome) device_id=\(boundedLogIdentifier(deviceID)) session_id=\(boundedLogIdentifier(sessionID)) frame_type=\(type) seq=\(seq.map(String.init) ?? "-") seq_epoch=\(boundedLogIdentifier(sequenceEpoch)) trigger=\(trigger.rawValue)"
+        )
     }
 
     /// Wake-only push semantics (M5): push fires only when the device is

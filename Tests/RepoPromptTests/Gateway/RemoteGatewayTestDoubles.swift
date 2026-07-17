@@ -46,10 +46,64 @@ actor RecordingAppLinkResponseGate {
     }
 }
 
+actor CancellationObservableAppLinkResponseGate {
+    private var entered = false
+    private var cancelled = false
+    private var released = false
+    private var enterWaiters: [CheckedContinuation<Void, Never>] = []
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitUntilEntered() async {
+        if entered {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            enterWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilCancelled() async {
+        if cancelled {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            cancellationWaiters.append(continuation)
+        }
+    }
+
+    func enterAndWaitForRelease() async {
+        entered = true
+        enterWaiters.forEach { $0.resume() }
+        enterWaiters.removeAll()
+        guard !released else { return }
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        } onCancel: {
+            Task { await self.recordCancellation() }
+        }
+    }
+
+    func release() {
+        released = true
+        releaseWaiters.forEach { $0.resume() }
+        releaseWaiters.removeAll()
+    }
+
+    private func recordCancellation() {
+        cancelled = true
+        cancellationWaiters.forEach { $0.resume() }
+        cancellationWaiters.removeAll()
+    }
+}
+
 actor RecordingAppLinkConnection: AppLinkConnection {
     enum Response {
         case result(MCPToolResult)
         case gated(MCPToolResult, RecordingAppLinkResponseGate)
+        case cancellationObservedGated(MCPToolResult, CancellationObservableAppLinkResponseGate)
         case appLinkLost(String)
         case timeout(TimeInterval)
         case failure(String)
@@ -82,6 +136,9 @@ actor RecordingAppLinkConnection: AppLinkConnection {
         case let .result(result):
             return result
         case let .gated(result, gate):
+            await gate.enterAndWaitForRelease()
+            return result
+        case let .cancellationObservedGated(result, gate):
             await gate.enterAndWaitForRelease()
             return result
         case let .appLinkLost(reason):

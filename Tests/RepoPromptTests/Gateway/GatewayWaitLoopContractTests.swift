@@ -1037,6 +1037,477 @@ final class GatewayWaitLoopContractTests: XCTestCase {
         assertSafeIdentifierFields(in: notices)
     }
 
+    func testRepeatedEmptyWaitsChargeRequestedSessionAndEmitOneBoundedFailure() async throws {
+        let sessionID = "11111111-AAAA-BBBB-CCCC-111111111111"
+        let firstEmptyGate = RecordingAppLinkResponseGate()
+        let deadlineScheduler = ManualWatchDeadlineScheduler()
+        let retryScheduler = ManualWatchDeadlineScheduler()
+        let empty = GatewayTestHelpers.toolResult(json: .object(["snapshots": .array([])]))
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running"))),
+            .gated(empty, firstEmptyGate),
+            .result(empty),
+            .result(empty)
+        ])
+        let (manager, _) = try await makeManager(
+            connection: connection,
+            observationFailureBudgets: .init(invalidSnapshot: 2),
+            waitTimeoutSeconds: 2,
+            waitWatchdogMarginSeconds: 6,
+            waitDeadlineSleep: { try await deadlineScheduler.sleep(seconds: $0) },
+            waitRetrySleep: { try await retryScheduler.sleep(seconds: $0) },
+            pollRefreshSeconds: 0.02
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        await firstEmptyGate.waitUntilEntered()
+        await deadlineScheduler.waitUntilScheduled(count: 1)
+        let configuredDurations = await deadlineScheduler.recordedDurations
+        XCTAssertEqual(configuredDurations.first, 8)
+        await firstEmptyGate.release()
+
+        await retryScheduler.waitUntilScheduled(count: 1)
+        var calls = await connection.calls
+        XCTAssertEqual(calls.count { $0.arguments["op"] == .string("wait") }, 1, "first empty result must wait for its scheduled retry")
+        let framesBeforeRetry = await sink.frames
+        XCTAssertFalse(framesBeforeRetry.contains { $0.type == "observation_failure" })
+        var retryDurations = await retryScheduler.recordedDurations
+        XCTAssertEqual(retryDurations, [0.05])
+
+        let firstRetryFired = await retryScheduler.fireNext()
+        XCTAssertTrue(firstRetryFired)
+        await retryScheduler.waitUntilScheduled(count: 2)
+        calls = await connection.calls
+        XCTAssertEqual(calls.count { $0.arguments["op"] == .string("wait") }, 2, "second empty result must not immediately rearm")
+        let framesAtLimit = await waitForFrames(sink, containing: "observation_failure")
+        retryDurations = await retryScheduler.recordedDurations
+        XCTAssertEqual(retryDurations, [0.05, 0.05])
+
+        let secondRetryFired = await retryScheduler.fireNext()
+        XCTAssertTrue(secondRetryFired)
+        await retryScheduler.waitUntilScheduled(count: 3)
+        calls = await connection.calls
+        XCTAssertEqual(calls.count { $0.arguments["op"] == .string("wait") }, 3, "every instant-empty cycle must be paced by its retry")
+        let finalFrames = await sink.frames
+        await manager.shutdown()
+        _ = await retryScheduler.fireAll()
+
+        let failures = finalFrames.filter { $0.type == "observation_failure" }
+        XCTAssertEqual(failures.count, 1, "three paced empty waits must emit exactly one latched failure")
+        XCTAssertEqual(framesAtLimit.count { $0.type == "observation_failure" }, 1)
+        let failure = try XCTUnwrap(failures.first)
+        XCTAssertEqual(failure.sessionID, sessionID)
+        XCTAssertEqual(failure.payload?.objectValue?["reason"]?.stringValue, "invalid_snapshot")
+        XCTAssertEqual(failure.payload?.objectValue?["attempt"]?.intValue, 2)
+        XCTAssertEqual(failure.payload?.objectValue?["attempt_limit"]?.intValue, 2)
+        XCTAssertNotNil(failure.seq)
+        XCTAssertNotNil(failure.seqEpoch)
+    }
+
+    func testRejectedWaitSnapshotsChargeEveryCurrentRequestWithoutUnsolicitedFrames() async throws {
+        let first = "11111111-1111-1111-1111-111111111111"
+        let second = "22222222-2222-2222-2222-222222222222"
+        let unsolicited = "99999999-9999-9999-9999-999999999999"
+        let cases: [(name: String, payload: JSONValue)] = [
+            ("wrong_id", GatewayTestHelpers.snapshot(sessionID: unsolicited, status: "running")),
+            ("missing_id", .object(["status": .string("running")])),
+            ("missing_status", .object(["session_id": .string(unsolicited)])),
+            ("unusable_row", .object(["snapshots": .array([.string("not-a-snapshot")])]))
+        ]
+
+        for testCase in cases {
+            let connection = RecordingAppLinkConnection(responses: [
+                .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: first, status: "running"))),
+                .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: second, status: "running"))),
+                .result(GatewayTestHelpers.toolResult(json: testCase.payload))
+            ])
+            let (manager, _) = try await makeManager(
+                connection: connection,
+                observationFailureBudgets: .init(invalidSnapshot: 1),
+                pollRefreshSeconds: 1
+            )
+            let sink = RecordingFrameSink()
+
+            await manager.subscribe(
+                deviceID: "device",
+                sinkID: UUID(),
+                sink: sink,
+                sessionIDs: [first, second]
+            )
+            let frames = await waitForFrameCount(
+                sink,
+                type: "observation_failure",
+                minimum: 2
+            )
+            let unsolicitedState = await manager.debugTerminalState(
+                deviceID: "device",
+                sessionID: unsolicited
+            )
+            await manager.shutdown()
+
+            let failures = frames.filter { $0.type == "observation_failure" }
+            XCTAssertEqual(failures.count, 2, testCase.name)
+            XCTAssertEqual(Set(failures.compactMap(\.sessionID)), Set([first, second]), testCase.name)
+            XCTAssertTrue(failures.allSatisfy {
+                $0.payload?.objectValue?["reason"]?.stringValue == "invalid_snapshot"
+                    && $0.payload?.objectValue?["attempt"]?.intValue == 1
+                    && $0.payload?.objectValue?["attempt_limit"]?.intValue == 1
+            }, testCase.name)
+            XCTAssertFalse(frames.contains { $0.sessionID == unsolicited }, testCase.name)
+            XCTAssertFalse(unsolicitedState.watched, testCase.name)
+            XCTAssertFalse(unsolicitedState.parkedTerminal, testCase.name)
+            XCTAssertFalse(unsolicitedState.pendingQuarantine, testCase.name)
+        }
+    }
+
+    func testLateWaitFromObsoleteSubscriptionTokenCannotSatisfyReplacement() async throws {
+        let sessionID = "11111111-1111-1111-1111-111111111111"
+        let obsoleteWaitGate = CancellationObservableAppLinkResponseGate()
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running"))),
+            .cancellationObservedGated(
+                GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "completed")),
+                obsoleteWaitGate
+            ),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: .object(["snapshots": .array([])])))
+        ])
+        let (manager, _) = try await makeManager(
+            connection: connection,
+            observationFailureBudgets: .init(invalidSnapshot: 1),
+            pollRefreshSeconds: 1
+        )
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+
+        await manager.subscribe(deviceID: "device", sinkID: sinkID, sink: sink, sessionIDs: [sessionID])
+        await obsoleteWaitGate.waitUntilEntered()
+        await manager.unsubscribe(deviceID: "device", sessionIDs: [sessionID])
+        await obsoleteWaitGate.waitUntilCancelled()
+        await manager.subscribe(deviceID: "device", sinkID: sinkID, sink: sink, sessionIDs: [sessionID])
+        let replacementFrames = await waitForFrames(sink, containing: "observation_failure")
+        await obsoleteWaitGate.release()
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await manager.shutdown()
+
+        let failures = replacementFrames.filter { $0.type == "observation_failure" }
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(failures.first?.sessionID, sessionID)
+        XCTAssertEqual(failures.first?.payload?.objectValue?["reason"]?.stringValue, "invalid_snapshot")
+        let finalFrames = await sink.frames
+        XCTAssertFalse(finalFrames.contains { $0.type == "session_terminal" })
+        XCTAssertEqual(finalFrames.count { $0.type == "observation_failure" }, 1)
+    }
+
+    func testCaseOnlyUUIDSnapshotUsesSubscribedCanonicalIDWhileNonUUIDCaseRemainsDistinct() async throws {
+        let subscribedUUID = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        let subscribedUUIDVariant = subscribedUUID.lowercased()
+        let uuidConnection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: subscribedUUIDVariant, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: subscribedUUID, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: subscribedUUIDVariant, status: "waiting_for_input")))
+        ])
+        let (uuidManager, _) = try await makeManager(connection: uuidConnection)
+        let uuidSink = RecordingFrameSink()
+
+        await uuidManager.subscribe(
+            deviceID: "uuid-device",
+            sinkID: UUID(),
+            sink: uuidSink,
+            sessionIDs: ["  \(subscribedUUID)\n", subscribedUUIDVariant]
+        )
+        let uuidFrames = await waitForFrameCount(uuidSink, type: "session_update", minimum: 4)
+        await uuidManager.shutdown()
+
+        let accepted = uuidFrames.filter {
+            $0.type == "session_update"
+                && $0.payload?.objectValue?["status"]?.stringValue == "waiting_for_input"
+        }
+        XCTAssertEqual(accepted.count, 2, "one canonical UUID snapshot must satisfy every current subscribed spelling")
+        XCTAssertEqual(Set(accepted.compactMap(\.sessionID)), Set([subscribedUUID, subscribedUUIDVariant]))
+        XCTAssertTrue(accepted.allSatisfy {
+            $0.payload?.objectValue?["session_id"]?.stringValue == $0.sessionID
+        }, "each emitted frame and payload must preserve its exact subscribed ID")
+
+        let subscribedArbitrary = "Session-A"
+        let returnedArbitrary = "session-a"
+        let arbitraryConnection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: subscribedArbitrary, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: returnedArbitrary, status: "waiting_for_input")))
+        ])
+        let (arbitraryManager, _) = try await makeManager(
+            connection: arbitraryConnection,
+            observationFailureBudgets: .init(invalidSnapshot: 1),
+            pollRefreshSeconds: 1
+        )
+        let arbitrarySink = RecordingFrameSink()
+
+        await arbitraryManager.subscribe(
+            deviceID: "arbitrary-device",
+            sinkID: UUID(),
+            sink: arbitrarySink,
+            sessionIDs: [subscribedArbitrary]
+        )
+        let arbitraryFrames = await waitForFrames(arbitrarySink, containing: "observation_failure")
+        let returnedState = await arbitraryManager.debugTerminalState(
+            deviceID: "arbitrary-device",
+            sessionID: returnedArbitrary
+        )
+        await arbitraryManager.shutdown()
+
+        XCTAssertEqual(arbitraryFrames.count { $0.type == "observation_failure" && $0.sessionID == subscribedArbitrary }, 1)
+        XCTAssertFalse(arbitraryFrames.contains { $0.sessionID == returnedArbitrary })
+        XCTAssertFalse(returnedState.watched)
+    }
+
+    func testNeverReturningWaitDeadlineCancelsStaleOwnerAndStartsFreshWait() async throws {
+        let sessionID = "11111111-1111-1111-1111-111111111111"
+        let staleWaitGate = CancellationObservableAppLinkResponseGate()
+        let deadlineScheduler = ManualWatchDeadlineScheduler()
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running"))),
+            .cancellationObservedGated(
+                GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "completed")),
+                staleWaitGate
+            ),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input")))
+        ])
+        let (manager, _) = try await makeManager(
+            connection: connection,
+            observationFailureBudgets: .init(toolFailure: 1),
+            waitTimeoutSeconds: 2,
+            waitWatchdogMarginSeconds: 6,
+            waitDeadlineSleep: { try await deadlineScheduler.sleep(seconds: $0) },
+            pollRefreshSeconds: 1
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        await staleWaitGate.waitUntilEntered()
+        await deadlineScheduler.waitUntilScheduled(count: 1)
+        let durations = await deadlineScheduler.recordedDurations
+        XCTAssertEqual(durations.first, 8)
+        let firedCount = await deadlineScheduler.fireAll()
+        XCTAssertGreaterThanOrEqual(firedCount, 1)
+        await staleWaitGate.waitUntilCancelled()
+        let callsBeforeStaleRelease = await waitForCalls(connection, minimum: 3)
+        let framesBeforeStaleRelease = await waitForSessionStatus(sink, status: "waiting_for_input")
+
+        XCTAssertGreaterThanOrEqual(callsBeforeStaleRelease.count, 3)
+        XCTAssertTrue(framesBeforeStaleRelease.contains {
+            $0.type == "session_update"
+                && $0.sessionID == sessionID
+                && $0.payload?.objectValue?["status"]?.stringValue == "waiting_for_input"
+        })
+        XCTAssertEqual(framesBeforeStaleRelease.count {
+            $0.type == "observation_failure"
+                && $0.payload?.objectValue?["reason"]?.stringValue == "tool_failure"
+        }, 1)
+
+        await staleWaitGate.release()
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await manager.shutdown()
+        let finalFrames = await sink.frames
+        XCTAssertFalse(finalFrames.contains { $0.type == "session_terminal" })
+        XCTAssertEqual(finalFrames.count { $0.type == "observation_failure" }, 1)
+    }
+
+    func testRepeatedRearmCannotPostponeCurrentSubscriptionAccountability() async throws {
+        let sessionID = "11111111-1111-1111-1111-111111111111"
+        let firstWaitGate = CancellationObservableAppLinkResponseGate()
+        let secondWaitGate = CancellationObservableAppLinkResponseGate()
+        let deadlineScheduler = ManualWatchDeadlineScheduler()
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running"))),
+            .cancellationObservedGated(
+                GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "completed")),
+                firstWaitGate
+            ),
+            .cancellationObservedGated(
+                GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "completed")),
+                secondWaitGate
+            ),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input")))
+        ])
+        let (manager, _) = try await makeManager(
+            connection: connection,
+            observationFailureBudgets: .init(toolFailure: 2),
+            waitTimeoutSeconds: 2,
+            waitWatchdogMarginSeconds: 6,
+            waitDeadlineSleep: { try await deadlineScheduler.sleep(seconds: $0) },
+            pollRefreshSeconds: 1
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        await firstWaitGate.waitUntilEntered()
+        await deadlineScheduler.waitUntilScheduled(count: 1)
+        for _ in 0 ..< 3 {
+            await manager.rearm(deviceID: "device", sessionID: sessionID)
+        }
+        var calls = await connection.calls
+        XCTAssertEqual(calls.count { $0.arguments["op"] == .string("wait") }, 1, "rearm must not install a duplicate current owner")
+
+        let firstDeadlineFireCount = await deadlineScheduler.fireAll()
+        XCTAssertGreaterThanOrEqual(firstDeadlineFireCount, 1)
+        await firstWaitGate.waitUntilCancelled()
+        await secondWaitGate.waitUntilEntered()
+        await deadlineScheduler.waitUntilScheduled(count: 2)
+        for _ in 0 ..< 3 {
+            await manager.rearm(deviceID: "device", sessionID: sessionID)
+        }
+        calls = await connection.calls
+        XCTAssertEqual(calls.count { $0.arguments["op"] == .string("wait") }, 2, "six rearms must not move the active deadline or add an owner")
+
+        let secondDeadlineFireCount = await deadlineScheduler.fireAll()
+        XCTAssertGreaterThanOrEqual(secondDeadlineFireCount, 1)
+        await secondWaitGate.waitUntilCancelled()
+        let accountableFrames = await waitForSessionStatus(sink, status: "waiting_for_input")
+        let failures = accountableFrames.filter { $0.type == "observation_failure" }
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(failures.first?.payload?.objectValue?["reason"]?.stringValue, "tool_failure")
+        XCTAssertEqual(failures.first?.payload?.objectValue?["attempt"]?.intValue, 2)
+        XCTAssertEqual(failures.first?.payload?.objectValue?["attempt_limit"]?.intValue, 2)
+        XCTAssertTrue(accountableFrames.contains {
+            $0.type == "session_update"
+                && $0.sessionID == sessionID
+                && $0.payload?.objectValue?["status"]?.stringValue == "waiting_for_input"
+        })
+
+        let durations = await deadlineScheduler.recordedDurations
+        XCTAssertTrue(durations.prefix(2).allSatisfy { $0 == 8 })
+        await firstWaitGate.release()
+        await secondWaitGate.release()
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await manager.shutdown()
+        let finalFrames = await sink.frames
+        XCTAssertFalse(finalFrames.contains { $0.type == "session_terminal" })
+        XCTAssertEqual(finalFrames.count { $0.type == "observation_failure" }, 1)
+    }
+
+    func testWatchOperationalMarkersAreDistinctAllowlistedAndContentFree() async throws {
+        let recorder = WaitLoopLogRecorder()
+        let logger = Logger(label: "test.gateway.watch-accountability") { _ in recorder.handler() }
+        let deviceID = "raw-device-canary"
+        let sessionID = "raw-session-canary"
+        let unsolicitedID = "raw-unsolicited-canary"
+        let deadlineGate = CancellationObservableAppLinkResponseGate()
+        let deadlineScheduler = ManualWatchDeadlineScheduler()
+        let rejectedPayload: JSONValue = .object([
+            "session_id": .string(unsolicitedID),
+            "status": .string("status-canary"),
+            "prompt": .string("prompt-canary"),
+            "assistant_text": .string("assistant-canary"),
+            "transcript": .string("transcript-canary"),
+            "workspace_name": .string("workspace-canary"),
+            "path": .string("/private/path-canary"),
+            "credential": .string("credential-canary"),
+            "subscription_token": .string("subscription-token-canary"),
+            "raw_payload": .string("raw-payload-canary")
+        ])
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "running"))),
+            .result(GatewayTestHelpers.toolResult(json: .object(["snapshots": .array([])]))),
+            .result(GatewayTestHelpers.toolResult(json: rejectedPayload)),
+            .cancellationObservedGated(
+                GatewayTestHelpers.toolResult(json: rejectedPayload),
+                deadlineGate
+            ),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(sessionID: sessionID, status: "waiting_for_input")))
+        ])
+        let (manager, _) = try await makeManager(
+            connection: connection,
+            logger: logger,
+            observationFailureBudgets: .init(toolFailure: 1, invalidSnapshot: 2),
+            waitTimeoutSeconds: 2,
+            waitWatchdogMarginSeconds: 6,
+            waitDeadlineSleep: { try await deadlineScheduler.sleep(seconds: $0) },
+            pollRefreshSeconds: 0.02
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: deviceID, sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForFrames(sink, containing: "observation_failure")
+        await deadlineGate.waitUntilEntered()
+        await manager.rearm(deviceID: deviceID, sessionID: sessionID)
+        await deadlineScheduler.waitUntilScheduled(count: 3)
+        let deadlineFireCount = await deadlineScheduler.fireAll()
+        XCTAssertGreaterThanOrEqual(deadlineFireCount, 1)
+        await deadlineGate.waitUntilCancelled()
+        _ = await waitForSessionStatus(sink, status: "waiting_for_input")
+        await deadlineGate.release()
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+        await manager.shutdown()
+
+        func parsedFields(_ message: String) -> [String: String] {
+            message.split(separator: " ").dropFirst().reduce(into: [:]) { fields, component in
+                let parts = component.split(separator: "=", maxSplits: 1).map(String.init)
+                if parts.count == 2 {
+                    fields[parts[0]] = parts[1]
+                }
+            }
+        }
+
+        let records = recorder.records
+        let markerRecords = records.filter { $0.message.hasPrefix("watch_accountability ") }
+        let markerFields = markerRecords.map { parsedFields($0.message).merging($0.metadata) { _, metadata in metadata } }
+        let outcomes = Set(markerFields.compactMap { $0["outcome"] })
+        let requiredOutcomes: Set = [
+            "accepted", "empty", "rejected", "deadline_exceeded", "rearm",
+            "transition", "exhausted", "emitted"
+        ]
+        XCTAssertTrue(requiredOutcomes.isSubset(of: outcomes), "missing outcomes: \(requiredOutcomes.subtracting(outcomes).sorted())")
+
+        let allowedKeys: Set = [
+            "event", "outcome", "reason", "attempt", "attempt_limit", "duration_ms",
+            "window_id", "frame_type", "seq", "seq_epoch", "trigger", "device_id",
+            "session_id", "correlation_id"
+        ]
+        for fields in markerFields {
+            let extraKeys = Set(fields.keys).subtracting(allowedKeys)
+            XCTAssertTrue(extraKeys.isEmpty, "unexpected marker keys: \(extraKeys.sorted())")
+            for key in ["attempt", "attempt_limit", "duration_ms", "seq"] {
+                guard let value = fields[key], value != "-" else { continue }
+                let number = Int64(value)
+                XCTAssertNotNil(number, "non-numeric marker key: \(key)")
+                XCTAssertTrue((number ?? -1) >= 0 && (number ?? 1_000_001) <= 1_000_000, "out-of-range marker key: \(key)")
+            }
+            for key in ["device_id", "session_id", "correlation_id"] {
+                guard let value = fields[key] else { continue }
+                XCTAssertEqual(value.count, 27, "unsafe identifier key: \(key)")
+                XCTAssertTrue(value.hasPrefix("id_"), "unsafe identifier key: \(key)")
+            }
+        }
+
+        let serialized = records.map { record in
+            let metadata = record.metadata.keys.sorted().map { "\($0)=\(record.metadata[$0] ?? "")" }.joined(separator: " ")
+            return record.message + " " + metadata
+        }.joined(separator: "\n")
+        for forbiddenValue in [
+            deviceID, sessionID, unsolicitedID, "status-canary", "prompt-canary",
+            "assistant-canary", "transcript-canary", "workspace-canary", "/private/path-canary",
+            "credential-canary", "subscription-token-canary", "raw-payload-canary"
+        ] {
+            XCTAssertFalse(serialized.contains(forbiddenValue))
+        }
+        for forbiddenKey in [
+            "prompt", "assistant_text", "transcript", "status", "message_content", "workspace",
+            "workspace_name", "path", "credential", "token", "subscription_token", "payload",
+            "raw_payload"
+        ] {
+            XCTAssertFalse(serialized.contains("\(forbiddenKey)="), "forbidden diagnostic key: \(forbiddenKey)")
+        }
+    }
+
     func testAppGlobalClosingReachesDefaultAndPairedDevicesWhileReconnectStateRemainsScoped() async throws {
         let sessionID = "11111111-1111-1111-1111-111111111111"
         let remoteDeviceID = "remote:deadbeef"
@@ -1170,9 +1641,16 @@ final class GatewayWaitLoopContractTests: XCTestCase {
         logger: Logger = Logger(label: "test.gateway.wait"),
         observationFailureBudgets: SessionWatchManager.ObservationFailureBudgets = .init(),
         waitTimeoutSeconds: TimeInterval = 0.2,
+        waitWatchdogMarginSeconds: TimeInterval = 10,
+        waitDeadlineSleep: @escaping SessionWatchManager.WaitDeadlineSleep = { seconds in
+            try await Task.sleep(for: .milliseconds(Int64((seconds * 1000).rounded(.up))))
+        },
+        waitRetrySleep: @escaping SessionWatchManager.WaitRetrySleep = { seconds in
+            try await Task.sleep(for: .milliseconds(Int64((seconds * 1000).rounded(.up))))
+        },
         pollRefreshSeconds: TimeInterval = 0.2
     ) async throws -> (SessionWatchManager, AppLinkSession) {
-        let root = try GatewayTestHelpers.temporaryRoot()
+        let root = try GatewayTestHelpers.temporaryRoot("wait-manager")
         let config = try GatewayTestHelpers.configuration(root: root)
         let appLink = AppLinkSession(
             config: config,
@@ -1186,6 +1664,9 @@ final class GatewayWaitLoopContractTests: XCTestCase {
             windowResolver: windowResolver,
             logger: logger,
             waitTimeoutSeconds: waitTimeoutSeconds,
+            waitWatchdogMarginSeconds: waitWatchdogMarginSeconds,
+            waitDeadlineSleep: waitDeadlineSleep,
+            waitRetrySleep: waitRetrySleep,
             pollRefreshSeconds: pollRefreshSeconds,
             terminalQuarantineSeconds: 0,
             observationFailureBudgets: observationFailureBudgets
@@ -1274,6 +1755,75 @@ final class GatewayWaitLoopContractTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(20))
         }
         return await sink.frames
+    }
+}
+
+private actor ManualWatchDeadlineScheduler {
+    private struct Entry {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, any Error>
+    }
+
+    private var entries: [Entry] = []
+    private var durationHistory: [TimeInterval] = []
+    private var scheduleWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func sleep(seconds: TimeInterval) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                durationHistory.append(seconds)
+                entries.append(Entry(id: id, continuation: continuation))
+                resumeSatisfiedScheduleWaiters()
+            }
+        } onCancel: {
+            Task { await self.cancel(id: id) }
+        }
+    }
+
+    func waitUntilScheduled(count: Int) async {
+        if durationHistory.count >= count {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            scheduleWaiters.append((count, continuation))
+        }
+    }
+
+    @discardableResult
+    func fireNext() -> Bool {
+        guard !entries.isEmpty else { return false }
+        let entry = entries.removeFirst()
+        entry.continuation.resume()
+        return true
+    }
+
+    @discardableResult
+    func fireAll() -> Int {
+        let scheduled = entries
+        entries.removeAll()
+        scheduled.forEach { $0.continuation.resume() }
+        return scheduled.count
+    }
+
+    var recordedDurations: [TimeInterval] {
+        durationHistory
+    }
+
+    private func cancel(id: UUID) {
+        guard let index = entries.firstIndex(where: { $0.id == id }) else { return }
+        let entry = entries.remove(at: index)
+        entry.continuation.resume(throwing: CancellationError())
+    }
+
+    private func resumeSatisfiedScheduleWaiters() {
+        let satisfied = scheduleWaiters.filter { durationHistory.count >= $0.count }
+        scheduleWaiters.removeAll { durationHistory.count >= $0.count }
+        satisfied.forEach { $0.continuation.resume() }
     }
 }
 
@@ -1375,29 +1925,37 @@ private final class WaitLoopPairedConnector: AppLinkConnecting, @unchecked Senda
     }
 }
 
+private struct WaitLoopLogRecord {
+    let level: Logger.Level
+    let message: String
+    let metadata: [String: String]
+}
+
 private final class WaitLoopLogRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var records: [(level: Logger.Level, message: String)] = []
+    private var storedRecords: [WaitLoopLogRecord] = []
 
-    var messages: [String] {
+    var records: [WaitLoopLogRecord] {
         lock.lock()
         defer { lock.unlock() }
-        return records.map(\.message)
+        return storedRecords
+    }
+
+    var messages: [String] {
+        records.map(\.message)
     }
 
     var noticeMessages: [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return records.filter { $0.level >= .notice }.map(\.message)
+        records.filter { $0.level >= .notice }.map(\.message)
     }
 
     func handler() -> WaitLoopCaptureLogHandler {
         WaitLoopCaptureLogHandler(recorder: self)
     }
 
-    func record(level: Logger.Level, message: String) {
+    func record(level: Logger.Level, message: String, metadata: [String: String]) {
         lock.lock()
-        records.append((level, message))
+        storedRecords.append(WaitLoopLogRecord(level: level, message: message, metadata: metadata))
         lock.unlock()
     }
 }
@@ -1419,13 +1977,19 @@ private struct WaitLoopCaptureLogHandler: LogHandler {
     func log(
         level: Logger.Level,
         message: Logger.Message,
-        metadata _: Logger.Metadata?,
+        metadata additionalMetadata: Logger.Metadata?,
         source _: String,
         file _: String,
         function _: String,
         line _: UInt
     ) {
-        recorder.record(level: level, message: message.description)
+        var mergedMetadata = metadata
+        additionalMetadata?.forEach { mergedMetadata[$0.key] = $0.value }
+        recorder.record(
+            level: level,
+            message: message.description,
+            metadata: mergedMetadata.mapValues(\.description)
+        )
     }
 }
 
