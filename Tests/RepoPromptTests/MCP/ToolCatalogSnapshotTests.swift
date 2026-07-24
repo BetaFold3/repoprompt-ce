@@ -42,6 +42,136 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testCodingAgentPromptManifestMatchesRegisteredSchemas() async throws {
+        let prompt = SystemPromptService.agentModePrompt()
+        XCTAssertTrue(prompt.hasPrefix("# RepoPrompt Coding Agent — System Prompt (vNext-rc2.1)"))
+        XCTAssertFalse(prompt.contains("SHIP GATE"))
+        XCTAssertTrue(prompt.contains("review independence outweighs the continuity default"))
+        XCTAssertTrue(prompt.contains("never end your turn with an unattended session"))
+        XCTAssertTrue(prompt.contains("oracle_export_instruction"))
+        XCTAssertTrue(prompt.contains("via `ask_user`"))
+        XCTAssertTrue(prompt.contains("`RepoPrompt__read_file`"))
+        XCTAssertTrue(prompt.contains("Read the applicable instruction chain before acting"))
+        XCTAssertFalse(prompt.contains("Codex loads the applicable"))
+
+        let codeMapsDisabledPrompt = SystemPromptService.agentModePrompt(codeMapsDisabled: true)
+        XCTAssertTrue(codeMapsDisabledPrompt.contains("Code Maps are globally disabled"))
+        XCTAssertFalse(codeMapsDisabledPrompt.contains("when signatures and relationships suffice"))
+
+        let codexPrompt = SystemPromptService.agentModePrompt(agentKind: .codexExec)
+        let codexQualifiedToolNames = [
+            MCPWindowToolName.readFile,
+            MCPWindowToolName.getFileTree,
+            MCPWindowToolName.search,
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.applyEdits,
+            MCPWindowToolName.fileActions,
+            MCPWindowToolName.askOracle,
+            MCPWindowToolName.agentRun,
+            MCPWindowToolName.agentManage,
+            MCPWindowToolName.askUser,
+            MCPWindowToolName.workspaceContext,
+            MCPWindowToolName.oracleChatLog,
+            MCPWindowToolName.setStatus
+        ]
+        for toolName in codexQualifiedToolNames {
+            let qualified = "`mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__\(toolName)`"
+            XCTAssertTrue(codexPrompt.contains(qualified), "Codex prompt should qualify tool \(toolName)")
+            XCTAssertFalse(codexPrompt.contains("`\(toolName)`"), "Codex prompt should not retain canonical tool \(toolName)")
+        }
+        XCTAssertFalse(codexPrompt.contains("`RepoPrompt__read_file`"))
+        XCTAssertTrue(codexPrompt.contains("provider's native image or document reading tools"))
+        XCTAssertFalse(codexPrompt.contains("native Read tool"))
+        XCTAssertTrue(codexPrompt.contains("Codex loads the applicable"))
+        XCTAssertFalse(codexPrompt.contains("Read the applicable instruction chain before acting"))
+        XCTAssertTrue(codexPrompt.contains("Codex native `spawn_agent` children"))
+
+        for role in [AgentModelCatalog.TaskLabelKind.pair, .design] {
+            let rolePrompt = SystemPromptService.agentModePrompt(taskLabelKind: role)
+            XCTAssertTrue(rolePrompt.contains("`agent_explore`"), "\(role) prompt should advertise agent_explore")
+            XCTAssertFalse(rolePrompt.contains("`agent_run`"), "\(role) prompt should not advertise agent_run")
+            XCTAssertFalse(rolePrompt.contains("vNext-rc2.1"), "\(role) should retain its role-specific prompt")
+        }
+
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let registeredToolNames = Set(tools.map(\.name))
+        // Curated ship-gate inventory: update this list whenever the coding-agent prompt
+        // adds or removes a RepoPrompt tool contract.
+        let shipGateToolNames = [
+            MCPWindowToolName.askOracle,
+            MCPWindowToolName.oracleChatLog,
+            MCPWindowToolName.askUser,
+            MCPWindowToolName.setStatus,
+            MCPWindowToolName.readFile,
+            MCPWindowToolName.applyEdits,
+            MCPWindowToolName.fileActions,
+            MCPWindowToolName.getFileTree,
+            MCPWindowToolName.search,
+            MCPWindowToolName.getCodeStructure,
+            MCPWindowToolName.manageSelection,
+            MCPWindowToolName.prompt,
+            MCPWindowToolName.workspaceContext,
+            MCPWindowToolName.agentRun,
+            MCPWindowToolName.agentManage
+        ]
+        for toolName in shipGateToolNames {
+            XCTAssertTrue(registeredToolNames.contains(toolName), "Coding-agent ship-gate tool is not registered: \(toolName)")
+        }
+
+        let askOracle = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.askOracle })
+        let oracleSend = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.oracleSend })
+        let oracleChatLog = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.oracleChatLog })
+        let agentRun = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
+        let applyEdits = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.applyEdits })
+        let setStatus = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.setStatus })
+
+        let askOracleProperties = try Self.schemaProperties(for: askOracle)
+        for field in ["mode", "new_chat", "chat_id", "export_response"] {
+            XCTAssertNotNil(askOracleProperties[field], "ask_oracle schema should advertise property \(field)")
+        }
+        let oracleModes = askOracleProperties["mode"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        XCTAssertTrue(oracleModes.contains("plan"))
+        XCTAssertTrue(oracleModes.contains("review"))
+
+        for tool in [askOracle, oracleSend] {
+            let properties = try Self.schemaProperties(for: tool)
+            let newChatDescription = try XCTUnwrap(
+                properties["new_chat"]?.objectValue?["description"]?.stringValue
+            )
+            XCTAssertFalse(newChatDescription.contains("discouraged"))
+            XCTAssertTrue(newChatDescription.contains("continuity"))
+            XCTAssertTrue(newChatDescription.contains("independent review"))
+        }
+
+        let oracleChatLogProperties = try Self.schemaProperties(for: oracleChatLog)
+        XCTAssertNotNil(oracleChatLogProperties["limit"])
+
+        let agentRunProperties = try Self.schemaProperties(for: agentRun)
+        for field in [
+            "model_id",
+            "detach",
+            "session_id",
+            "session_ids",
+            "wait",
+            "interaction_id",
+            "response"
+        ] {
+            XCTAssertNotNil(agentRunProperties[field], "agent_run schema should advertise property \(field)")
+        }
+        let agentRunOperations = agentRunProperties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        for operation in ["wait", "steer", "respond"] {
+            XCTAssertTrue(agentRunOperations.contains(operation), "agent_run schema should advertise operation \(operation)")
+        }
+
+        let applyEditsProperties = try Self.schemaProperties(for: applyEdits)
+        XCTAssertNotNil(applyEditsProperties["rewrite"])
+        XCTAssertNotNil(applyEditsProperties["on_missing"])
+
+        let setStatusProperties = try Self.schemaProperties(for: setStatus)
+        XCTAssertNotNil(setStatusProperties["session_name"])
+    }
+
     func testLifecycleSchemasAdvertiseConfigurableDefaultsWithoutMaximumClamp() async throws {
         do {
             let caseLabel = "testAgentLifecycleSchemasAdvertiseTwoMinuteDefaultsWithoutMaximumClamp"
@@ -480,8 +610,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "7|prompt|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=e1377f12a6495829c0ade3e37b9325f7a07dc2065288b16bb810d01a4df9e55d|schema=8c8ea22a39bbb9e10c364ad483527faf109a52e1eb9c45c0c939f569ecf144d1",
         "8|apply_edits|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=d33efa75e3e29e1e4e1cfe90d0e9d621337c397e5329aee02f4a261726d790fa|schema=e1ad464843910182006a484b0545305f8d53821a795cd8e116c07a01eededed8",
         "9|oracle_utils|enabled=true|ann=title=nil,readOnly=nil,destructive=nil,idempotent=nil,openWorld=nil|desc=af161abbd2edf82b9cf502e1cf794bc48366b816b3ddc0ec2034b154ecc35c3a|schema=7d3c55c22f02f8825008521e4c20cd304a7c12f3679743b34f5a2bf315d19d7b",
-        "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=7a4771154006b3dcf158003d04b2b78da91fe4cc63d1acb5942f64f8a3e04e98|schema=03968f76ace268ccd7128c088ecc2544ca5ec77f47100d03e38a29a155cf81eb",
-        "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=4608413a45189586669c6cc3339af4d467939a2477036545ef5d879b676b51fb|schema=6f940dcd0a0d39789189120217abdb60cd0f520b85f862beb81349f98bc1b19c",
+        "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=7a4771154006b3dcf158003d04b2b78da91fe4cc63d1acb5942f64f8a3e04e98|schema=f3c14362911d5d1f748a5096c7d8453084f743325e468db3dff6393788a84d0a",
+        "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=4608413a45189586669c6cc3339af4d467939a2477036545ef5d879b676b51fb|schema=9c3a8dbe6c615550d7c8a500982d838000a0813923d8228cbd058a25460239c1",
         "12|oracle_chat_log|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=5acbb74a0fcf76bd3717faac8fc355f582f13523685d3bfebf11fda7241958b1|schema=50db94327abe785e20d3628135efa29cf184d18272d5af5b94a43d7246a4a201",
         "13|git|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=1a9ff83872cf8842146dd84563dd880f7d9b8f6190cc6e9204a0ea82fc8feca6|schema=51bd804997d6acfaa17d529867f6188b969282a4db95956e859a74ab07de626a",
         "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",

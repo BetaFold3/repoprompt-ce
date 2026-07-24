@@ -80,7 +80,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         description: "Continue a specific chat in the current agent tab"
                     ),
                     "new_chat": .boolean(
-                        description: "Start a new chat session (default: false; discouraged)"
+                        description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review."
                     ),
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
@@ -123,7 +123,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         description: "Continue a specific chat in the current tab or current context"
                     ),
                     "new_chat": .boolean(
-                        description: "Start a new chat session (default: false; discouraged)"
+                        description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review."
                     ),
                     "model": .string(
                         description: "Model preset ID or name override"
