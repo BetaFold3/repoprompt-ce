@@ -470,14 +470,6 @@ actor RemoteGatewayRuntime {
                 lastEligibleWindowDetailsByDevice.removeValue(forKey: deviceID)
                 _ = await appLinkPool?.refreshBindingState(forDevice: deviceID)
             }
-            let resultingSessionID = frame.type == "start"
-                ? payload.objectValue?["session_id"]?.stringValue
-                : frame.sessionID
-            await watchManager.recordTurnOrigin(
-                deviceID: deviceID,
-                frame: frame,
-                resultingSessionID: resultingSessionID
-            )
             audit(frame: frame, deviceID: deviceID, outcome: "success", responsePayload: payload)
             if frame.type == "steer" || frame.type == "respond" {
                 await watchManager.rearm(deviceID: deviceID, sessionID: frame.sessionID)

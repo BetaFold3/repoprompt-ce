@@ -838,8 +838,7 @@ final class RemoteAgentSessionTests: XCTestCase {
             binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
             connection: connection,
             recoveryScheduler: scheduler,
-            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10]),
-            flightRecorder: flightRecorder
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
         )
         let recorder = RemoteSessionEventRecorder()
         let eventTask = Task {

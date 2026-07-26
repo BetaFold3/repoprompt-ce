@@ -264,12 +264,15 @@ actor RemoteAgentSessionController {
             nextLogOffset = 0
             scheduledLogCatchUpDirty = false
             didReportLogCatchUpFailure = false
+            let hadHostRowIDMappings = !hostRowIDByClientItemID.isEmpty
             resetLogReconciliationState()
-            eventsContinuation.yield(.transcriptRows(
-                items: [],
-                removedIDs: [],
-                hostRowIDByClientItemID: [:]
-            ))
+            if hadHostRowIDMappings {
+                eventsContinuation.yield(.transcriptRows(
+                    items: [],
+                    removedIDs: [],
+                    hostRowIDByClientItemID: [:]
+                ))
+            }
         }
         didYieldSessionExpired = false
         lastKnownRunState = .running
@@ -1356,12 +1359,6 @@ actor RemoteAgentSessionController {
 
             let progressBeforeAttempt = staleProgressGeneration
             Self.logger.notice("remote stale recovery attempted session_id=\(sessionID, privacy: .public) attempt=\(attempt) max_attempts=\(attemptCount)")
-            recordStaleRecovery(
-                outcome: .started,
-                sessionID: sessionID,
-                attempt: attempt,
-                attemptLimit: attemptCount
-            )
             do {
                 try await catchUpFromHost()
             } catch {
@@ -1370,12 +1367,6 @@ actor RemoteAgentSessionController {
                     lifecycleGeneration: lifecycleGeneration,
                     sessionID: sessionID
                 ) else { return }
-                recordStaleRecovery(
-                    outcome: .failed,
-                    sessionID: sessionID,
-                    attempt: attempt,
-                    attemptLimit: attemptCount
-                )
             }
             guard isStaleRecoveryCurrent(
                 generation: generation,

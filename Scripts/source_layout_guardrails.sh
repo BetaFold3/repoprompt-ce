@@ -367,6 +367,7 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-07-13-workspace-run-target-snapshot-invalidation.md"
   "docs/technical_implementation_reports/2026-07-15-remote-pairing-trust-refresh-and-revocation.md"
   "docs/technical_implementation_reports/2026-07-16-remote-command-tail-stale-recovery.md"
+  "docs/technical_implementation_reports/2026-07-26-remote-handoff-fork.md"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"

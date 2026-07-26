@@ -382,8 +382,7 @@ final class RemoteAgentModeCoordinator {
         let connection = try connectionManager.connection(for: binding.hostID)
         let controller = RemoteAgentSessionController(
             binding: binding,
-            connection: connection,
-            flightRecorder: flightRecorderProvider()
+            connection: connection
         )
         controllersByTabID[session.tabID] = controller
         hostIDByTabID[session.tabID] = binding.hostID
@@ -462,7 +461,6 @@ final class RemoteAgentModeCoordinator {
         }
         guard !controllers.isEmpty else {
             Self.logger.notice("remote inbound frame dropped host_id=\(hostID, privacy: .public) type=\(frame.type, privacy: .public) session_id=\(frame.sessionID ?? "", privacy: .public) seq=\(frame.seq ?? 0) has_seq=\(frame.seq != nil) reason=no_matching_controller")
-            recordFrameDrop(frame, reason: "no_matching_controller")
             return
         }
         for controller in controllers {
