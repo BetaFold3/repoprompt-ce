@@ -522,8 +522,16 @@ final actor ClaudeNativeProcessSessionController {
 
         failPendingControlRequests(with: ControllerError.processNotRunning)
         pendingPermissionRequests.removeAll()
-        clearTurnIDQueue()
+        // Flush observed deferred completions before clearing the queue. The flush inside
+        // cancelAuthoritativeLifecycleState() is gated on `hasPendingTurnIDs`, so clearing
+        // first made it dead code and silently dropped turns whose result had already been
+        // observed but whose authoritative `idle` had not yet arrived.
         cancelAuthoritativeLifecycleState()
+        clearTurnIDQueue()
+        // Never carry an interrupt marker into the next session on this reusable controller:
+        // determineTurnStatus() is what consumes it, and a trailing result that misses the
+        // pending-turn-ID guard never reaches that consumption point.
+        turnWasInterrupted = false
 
         closeOutputChannelsAndInput()
 
@@ -616,6 +624,7 @@ final actor ClaudeNativeProcessSessionController {
         // don't inherit the previous process's capability negotiation.
         observedSessionStateChangedEvents = false
         cancelAuthoritativeLifecycleState()
+        turnWasInterrupted = false
         // Reset runtime init aggregation state so stale metadata doesn't leak across runs.
         initializeResponseSnapshot = nil
         latestRuntimeInitTools = []
@@ -1369,7 +1378,7 @@ final actor ClaudeNativeProcessSessionController {
             emit(.stream(result))
             if isResultPayload, result.type == "message_stop" {
                 guard hasPendingTurnIDs else {
-                    assertionFailure("[ClaudeController] result message_stop with no pending turn IDs — possible protocol drift")
+                    noteMissingPendingTurnID(context: "result message_stop")
                     continue
                 }
                 let status = determineTurnStatus(from: payload, stopReasonHint: result.stopReason)
@@ -1398,7 +1407,7 @@ final actor ClaudeNativeProcessSessionController {
         authoritativeIdleFallbackTask?.cancel()
         authoritativeIdleFallbackTask = nil
         guard hasPendingTurnIDs else {
-            assertionFailure("[ClaudeController] deferred idle completion with no pending turn IDs — possible protocol drift")
+            noteMissingPendingTurnID(context: "deferred idle completion")
             return
         }
         let turnID = dequeueTurnID()
@@ -1436,7 +1445,7 @@ final actor ClaudeNativeProcessSessionController {
         guard !pendingAuthoritativeTurnStatuses.isEmpty else { return }
         let status = pendingAuthoritativeTurnStatuses.removeFirst()
         guard hasPendingTurnIDs else {
-            assertionFailure("[ClaudeController] idle fallback with no pending turn IDs — possible protocol drift")
+            noteMissingPendingTurnID(context: "idle fallback")
             return
         }
         let turnID = dequeueTurnID()
@@ -1462,6 +1471,28 @@ final actor ClaudeNativeProcessSessionController {
             emit(.turnCompleted(turnID: turnID, status: status))
         }
         pendingAuthoritativeTurnStatuses.removeAll()
+    }
+
+    /// Records a turn-completion signal that arrived with no pending turn ID.
+    ///
+    /// During teardown this is expected rather than a defect: `shutdown()` and
+    /// `failProtocolAndShutdown()` clear the turn-ID queue synchronously, while the stdout
+    /// consumer can already hold a framed line. Cancellation is cooperative and the consume
+    /// path performs no cancellation check, so the subprocess's trailing `result` (a normal
+    /// interrupt side effect) is still delivered after the queue was cleared. Trapping there
+    /// killed DEBUG builds on ordinary interrupt-then-teardown sequences.
+    ///
+    /// Outside teardown the invariant still holds, so the DEBUG tripwire for genuine protocol
+    /// drift is preserved. Callers keep their existing recovery path either way.
+    private func noteMissingPendingTurnID(context: String) {
+        writeRawEventLogRecord(kind: "turn.pendingIDMissing", payload: [
+            "context": context,
+            "isShuttingDown": isShuttingDown,
+            "turnWasInterrupted": turnWasInterrupted,
+            "pendingAuthoritativeStatusCount": pendingAuthoritativeTurnStatuses.count
+        ] as [String: Any])
+        guard !isShuttingDown else { return }
+        assertionFailure("[ClaudeController] \(context) with no pending turn IDs — possible protocol drift")
     }
 
     static func shouldSuppressUserFacingStreamResult(_ result: AIStreamResult) -> Bool {
@@ -1659,6 +1690,10 @@ final actor ClaudeNativeProcessSessionController {
 
         func test_setTurnWasInterrupted(_ value: Bool) {
             turnWasInterrupted = value
+        }
+
+        func test_handleStreamPayload(_ payload: [String: Any]) {
+            handleStreamPayload(payload)
         }
 
         func test_effectiveLaunchEnvironment(
