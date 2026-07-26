@@ -58,6 +58,59 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertTrue(codeMapsDisabledPrompt.contains("Code Maps are globally disabled"))
         XCTAssertFalse(codeMapsDisabledPrompt.contains("when signatures and relationships suffice"))
 
+        let claudeBinaryGuidance = "Use the native Read tool for images, screenshots, PDFs, and other binary assets — always, including @path references in the user's message."
+        let codexBinaryGuidance = "Use the provider's native image or document reading tools for binary assets — always, including @path references in the user's message."
+        let openCodeBinaryGuidance = "Binary and media files (images, screenshots, PDFs) cannot be read in this session; when the task depends on one — including an @path reference in the user's message — tell the user that limitation and ask for the content in a text form."
+        let providerNeutralBinaryGuidance = "If the provider exposes a native image or document reading capability, use it for binary assets — including @path references in the user's message; if it does not, tell the user the file cannot be read and ask for the content in another form."
+        let claudeProviderKinds: Set<AgentProviderKind> = [
+            .claudeCode,
+            .claudeCodeGLM,
+            .kimiCode,
+            .customClaudeCompatible
+        ]
+        XCTAssertEqual(
+            Set(AgentProviderKind.allCases.filter(\.usesClaudeNativeRuntime)),
+            claudeProviderKinds
+        )
+
+        let expectedBinaryGuidance: [AgentProviderKind: String] = [
+            .claudeCode: claudeBinaryGuidance,
+            .claudeCodeGLM: claudeBinaryGuidance,
+            .kimiCode: claudeBinaryGuidance,
+            .customClaudeCompatible: claudeBinaryGuidance,
+            .codexExec: codexBinaryGuidance,
+            .openCode: openCodeBinaryGuidance,
+            .cursor: providerNeutralBinaryGuidance
+        ]
+        let allBinaryGuidance = [
+            claudeBinaryGuidance,
+            codexBinaryGuidance,
+            openCodeBinaryGuidance,
+            providerNeutralBinaryGuidance
+        ]
+        XCTAssertEqual(Set(expectedBinaryGuidance.keys), Set(AgentProviderKind.allCases))
+        for (agentKind, expectedGuidance) in expectedBinaryGuidance {
+            let providerPrompt = SystemPromptService.agentModePrompt(agentKind: agentKind)
+            XCTAssertTrue(providerPrompt.contains(expectedGuidance), "Unexpected binary guidance for \(agentKind)")
+            XCTAssertEqual(
+                allBinaryGuidance.count(where: { providerPrompt.contains($0) }),
+                1,
+                "\(agentKind) prompt must contain exactly one binary guidance sentence"
+            )
+            if !claudeProviderKinds.contains(agentKind) {
+                XCTAssertFalse(providerPrompt.contains(claudeBinaryGuidance), "\(agentKind) must not claim native Read")
+            }
+        }
+
+        let providerNeutralPrompt = SystemPromptService.agentModePrompt(agentKind: nil)
+        XCTAssertTrue(providerNeutralPrompt.contains(providerNeutralBinaryGuidance))
+        XCTAssertEqual(
+            allBinaryGuidance.count(where: { providerNeutralPrompt.contains($0) }),
+            1,
+            "nil provider prompt must contain exactly one binary guidance sentence"
+        )
+        XCTAssertFalse(providerNeutralPrompt.contains(claudeBinaryGuidance))
+
         let codexPrompt = SystemPromptService.agentModePrompt(agentKind: .codexExec)
         let codexQualifiedToolNames = [
             MCPWindowToolName.readFile,

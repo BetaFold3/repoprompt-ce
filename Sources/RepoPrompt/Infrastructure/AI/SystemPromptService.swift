@@ -680,9 +680,16 @@ class SystemPromptService {
         let structureReadingGuidance = codeMapsDisabled
             ? "Use `get_file_tree` (mode:\"auto\") to orient and `file_search` to locate; Code Maps are globally disabled, so use targeted text reads instead of `get_code_structure`."
             : "Use `get_file_tree` (mode:\"auto\") to orient, `file_search` to locate, and `get_code_structure` when signatures and relationships suffice."
-        let binaryAssetReadingGuidance = agentKind == .codexExec
-            ? "Use the provider's native image or document reading tools for binary assets — always, including @path references in the user's message."
-            : "Use the native Read tool for images, screenshots, PDFs, and other binary assets — always, including @path references in the user's message."
+        let binaryAssetReadingGuidance = switch agentKind {
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            "Use the native Read tool for images, screenshots, PDFs, and other binary assets — always, including @path references in the user's message."
+        case .codexExec:
+            "Use the provider's native image or document reading tools for binary assets — always, including @path references in the user's message."
+        case .openCode:
+            "Binary and media files (images, screenshots, PDFs) cannot be read in this session; when the task depends on one — including an @path reference in the user's message — tell the user that limitation and ask for the content in a text form."
+        case .cursor, nil:
+            "If the provider exposes a native image or document reading capability, use it for binary assets — including @path references in the user's message; if it does not, tell the user the file cannot be read and ask for the content in another form."
+        }
 
         // RepoPrompt starts Codex app-server threads with the workspace cwd and does not
         // disable Codex project-doc discovery, so its AGENTS chain is already in context.
