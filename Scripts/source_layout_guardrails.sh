@@ -345,6 +345,7 @@ print_matches \
 # 8. Agent-authored reports and working notes stay local unless explicitly
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
+  "docs/architecture/mcp-instructions-and-provider-guidance.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
@@ -367,12 +368,14 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-07-13-workspace-run-target-snapshot-invalidation.md"
   "docs/technical_implementation_reports/2026-07-15-remote-pairing-trust-refresh-and-revocation.md"
   "docs/technical_implementation_reports/2026-07-16-remote-command-tail-stale-recovery.md"
+  "docs/technical_implementation_reports/2026-07-25-mcp-instructions-rewrite-provider-guidance.md"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"
   "docs/spec/native-direct-tailnet-pairing.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
+  "docs/investigations/r1-r4-contract-validity-2026-07-25.md"
   "docs/investigations/remote-agent-transcript-delivery-regression-2026-07-13.md"
   "docs/investigations/remote-control-ticket-endpoint-404-2026-07-14.md"
   "docs/investigations/remote-pairing-device-revoked-after-pairing-2026-07-15.md"

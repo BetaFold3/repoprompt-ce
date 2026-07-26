@@ -27,76 +27,78 @@ enum RepoPromptMCPInstructions {
 
     // MARK: - Per-purpose instructions
 
+    private static let routingAndBoundaries = """
+    ROUTING AND BOUNDARIES:
+    - `file_search` locates paths or content across workspace roots with literal or regex matching.
+    - `get_file_tree` maps directories with configurable depth and detail.
+    - `read_file` returns full files or precise line ranges.
+    - `apply_edits` applies targeted replacements, transaction groups, or complete-file rewrites, and creates new files.
+    """
+
+    private static let contextWorkflow = "CONTEXT WORKFLOW: `manage_selection` curates the files and slices used by Oracle; update it before Oracle calls. `workspace_context` renders that selection. Add or remove incrementally; reserve set mode=full for complete replacement and set mode=slices for file-scoped slice replacement."
+
+    private static func additionalCapabilities(codeMapsDisabled: Bool) -> String {
+        codeMapsDisabled
+            ? "Additional capabilities: `file_actions` creates, deletes, or moves files, and `git` reports status, diffs, history, and blame. Code Maps are globally disabled; use `file_search` and targeted `read_file` for structure."
+            : "Additional capabilities: `get_code_structure` returns function and type signatures, `file_actions` creates, deletes, or moves files, and `git` reports status, diffs, history, and blame."
+    }
+
     /// Full toolset with `ask_oracle`, no bind_context.
     private static func agentModeText(codeMapsDisabled: Bool) -> String {
-        let alsoAvailable = codeMapsDisabled
-            ? "Also available: file_actions (create/delete/move), git (status/diff/log/blame). Code Maps are globally disabled; use file_search and read_file for structure instead."
-            : "Also available: get_code_structure (function/type signatures), file_actions (create/delete/move), git (status/diff/log/blame)."
-        return """
-        RepoPrompt is a context workspace with battle-tested agent tools optimized for reliability and token efficiency.
+        """
+        RepoPrompt provides workspace-aware tools for reliable, token-efficient repository work.
 
-        RECOMMENDED over built-in equivalents:
-        - file_search instead of Grep/Glob — combines content, path, and regex search in one call across all workspace roots
-        - get_file_tree instead of ls/find — returns structured overview with depth/mode control
-        - read_file instead of cat/head — supports line-range slicing (start_line + limit)
-        - apply_edits instead of Edit — search/replace for targeted changes, rewrite mode for new/full-file rewrites, multi-edit transactions in one call
+        \(routingAndBoundaries)
 
-        \(alsoAvailable)
+        \(additionalCapabilities(codeMapsDisabled: codeMapsDisabled))
 
-        CONTEXT BUILDING: context_builder is a heavy sub-agent that autonomously explores the codebase to build deep, curated context for a task. Ideal for going from task description to full implementation plan (response_type="plan"), code review ("review"), or deep Q&A ("question"). Its context is stateful — optionally continue with oracle calls using the returned chat_id.
+        \(contextWorkflow)
 
-        CONTEXT WORKFLOW: manage_selection curates the file context used by oracle and workspace_context tools — update it before oracle calls. Use add/remove for incremental changes; use set mode=full only for complete replacement; set mode=slices only replaces slices for specified files. Continue chats by passing the returned chat_id to ask_oracle.
+        CONTEXT BUILDING: `context_builder` explores the repository and prepares curated context for a plan, review, or question. Continue its stateful result with `ask_oracle` using the returned chat_id.
 
-        AGENT DELEGATION: Your system prompt lists the delegation tool available to you and how to use it. Use that tool to spawn or drive separate Agent Mode sessions when the task needs work in a fresh session or read-only exploration probes; do not assume any specific delegation tool is in scope for this connection.
+        DELEGATION: Follow the system prompt's named control tool when a fresh Agent Mode session or read-only probe is useful.
 
-        SHARING AN ORACLE / CONTEXT_BUILDER EXPORT: Pass `export_response: true` on `context_builder`, `ask_oracle`, or `oracle_send` to capture the response as a shareable file. The call returns `oracle_export_path` (the file path) and `oracle_export_instruction` (a ready-made "Read the Oracle export at `<path>` with `read_file` …" sentence). To hand the export to a delegated child agent, include `oracle_export_path` inside the `message` you send on your next delegation call — your system prompt names the specific delegation tool you should use. The child agent already has `read_file` and will open the export itself.
+        EXPORT SHARING: Set `export_response: true` on `context_builder` or `ask_oracle`. The result includes `oracle_export_path` and `oracle_export_instruction`. Pass the exported path or instruction in the delegated child's `message`; the child can open it with `read_file`.
         """
     }
 
     /// Full toolset with `oracle_send` and bind_context for external MCP clients.
     private static func externalMCPText(codeMapsDisabled: Bool) -> String {
-        let alsoAvailable = codeMapsDisabled
-            ? "Also available: file_actions (create/delete/move), git (status/diff/log/blame). Code Maps are globally disabled; use file_search and read_file for structure instead."
-            : "Also available: get_code_structure (function/type signatures), file_actions (create/delete/move), git (status/diff/log/blame)."
-        return """
-        RepoPrompt is a context workspace with battle-tested agent tools optimized for reliability and token efficiency.
+        """
+        RepoPrompt provides workspace-aware tools for reliable, token-efficient repository work. These tools are the primary interface to this workspace: they span all bound roots and feed the shared Oracle selection.
 
-        RECOMMENDED over built-in equivalents:
-        - file_search instead of Grep/Glob — combines content, path, and regex search in one call across all workspace roots
-        - get_file_tree instead of ls/find — returns structured overview with depth/mode control
-        - read_file instead of cat/head — supports line-range slicing (start_line + limit)
-        - apply_edits instead of Edit — search/replace for targeted changes, rewrite mode for new/full-file rewrites, multi-edit transactions in one call
+        \(routingAndBoundaries)
 
-        \(alsoAvailable)
+        \(additionalCapabilities(codeMapsDisabled: codeMapsDisabled))
 
-        CONTEXT BUILDING: context_builder is a heavy sub-agent that autonomously explores the codebase to build deep, curated context for a task. Ideal for going from task description to full implementation plan (response_type="plan"), code review ("review"), or deep Q&A ("question"). Its context is stateful — optionally continue with oracle calls using the returned chat_id.
+        \(contextWorkflow)
 
-        CONTEXT WORKFLOW: manage_selection curates the file context used by oracle and workspace_context tools — update it before oracle calls. Use add/remove for incremental changes; use set mode=full only for complete replacement; set mode=slices only replaces slices for specified files. Continue chats by passing the returned chat_id to oracle_send.
+        CONTEXT BUILDING: `context_builder` explores the repository and prepares curated context for a plan, review, or question. Continue its stateful result with `oracle_send` using the returned chat_id.
 
-        AGENT DELEGATION: Use agent_run to spawn separate Agent Mode sessions. Omit model_id to use the pair role, or pass model_id with a role label (explore, engineer, pair, design) or a specific model from agent_manage.list_agents. Explore agents are lightweight — use them proactively when codebase investigation would ground your work. Heavier roles (engineer, pair, design) should be launched when the user requests delegation. Design agents produce a markdown review document (saved under docs/reviews/, docs/designs/, or docs/analysis/) as their primary deliverable for review/analysis tasks — expect a report path in their summary, not just an inline response.
+        DELEGATION: `agent_run` starts or drives a separate Agent Mode session when a fresh workstream is appropriate; pass model_id with a role: explore (lightweight, read-only), engineer, pair, or design.
 
-        SHARING AN ORACLE / CONTEXT_BUILDER EXPORT: Pass `export_response: true` on `context_builder` or `oracle_send` to capture the response as a shareable file. The call returns `oracle_export_path` (the file path) and `oracle_export_instruction` (a ready-made "Read the Oracle export at `<path>` with `read_file` …" sentence). To hand the export to a delegated child agent, include `oracle_export_path` inside the `message` you send on your next `agent_run` `start` or `steer` call. You may emit `oracle_export_instruction` verbatim at the head of that `message`; the child already has `read_file` and will open the export itself.
+        EXPORT SHARING: Set `export_response: true` on `context_builder` or `oracle_send`. The result includes `oracle_export_path` and `oracle_export_instruction`. Pass the exported path or instruction in the delegated child's `message` for the next `agent_run`; the child can open it with `read_file`.
 
-        Workspace tabs isolate tab contexts for parallel tasks. Use bind_context with context_id to bind this connection to the intended tab context for multi-window/tab routing.
+        TAB ROUTING: Workspace tabs isolate tab contexts. Use `bind_context` with `context_id` to bind this connection to the intended tab and workspace context.
         """
     }
 
-    /// Read-only tools — no editing, oracle, context_builder, or delegation.
+    /// Read-only tools - no editing, oracle, context_builder, or delegation.
     private static func discoverText(codeMapsDisabled: Bool) -> String {
         let codeStructureLine = codeMapsDisabled
-            ? "- Code Maps are globally disabled; use file_search and read_file for structure instead"
-            : "- get_code_structure — function/type signatures without full file content"
+            ? "- Code Maps are globally disabled; use `file_search` and targeted `read_file` for structure."
+            : "- `get_code_structure` returns function and type signatures without loading full files."
         return """
-        RepoPrompt is a context workspace with battle-tested agent tools optimized for reliability and token efficiency.
+        RepoPrompt provides a reduced read-only workspace surface for repository discovery.
 
-        Available tools:
-        - file_search — combines content, path, and regex search in one call across all workspace roots
-        - get_file_tree — structured directory overview with depth/mode control
-        - read_file — file contents with line-range slicing (start_line + limit)
+        AVAILABLE CAPABILITIES:
+        - `file_search` locates paths or content across workspace roots with literal or regex matching.
+        - `get_file_tree` maps directories with configurable depth and detail.
+        - `read_file` returns full files or precise line ranges.
         \(codeStructureLine)
-        - manage_selection — curate file context for the response
-        - workspace_context — render the current selection as a snapshot
-        - git — read-only git operations (status/diff/log/blame)
+        - `manage_selection` curates files and slices for the response.
+        - `workspace_context` renders the current selection as a snapshot.
+        - `git` reports status, diffs, history, and blame without repository mutation.
         """
     }
 }
