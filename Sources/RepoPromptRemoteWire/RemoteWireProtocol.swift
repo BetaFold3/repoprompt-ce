@@ -18,6 +18,8 @@ public enum RemoteWireProtocol {
         "list_sessions",
         "open_workspace",
         "get_log",
+        "fork_session",
+        "extract_handoff",
         "ping",
         // M5: gateway-owned Web Push subscription registration for the connected
         // (authenticated) device; never translated to an app tool call.
@@ -40,7 +42,14 @@ public enum RemoteWireProtocol {
         "pong"
     ]
 
-    public static let mutatingClientFrameTypes: Set<String> = ["start", "steer", "respond", "cancel", "open_workspace"]
+    public static let mutatingClientFrameTypes: Set<String> = [
+        "start",
+        "steer",
+        "respond",
+        "cancel",
+        "open_workspace",
+        "fork_session"
+    ]
 
     public static func decodeClientFrame(from data: Data) throws -> RemoteClientFrame {
         let frame: RemoteClientFrame

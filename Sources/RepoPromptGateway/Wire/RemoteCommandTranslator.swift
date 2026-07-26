@@ -200,6 +200,24 @@ struct RemoteCommandTranslator {
                 requiresSessionID: true,
                 resolvedWindowID: resolvedWindowID
             )
+        case "fork_session":
+            return try translateAgentManage(
+                frame: frame,
+                op: "fork_session",
+                payload: payload,
+                allowedPayloadKeys: Self.forkSessionPayloadKeys,
+                requiresSessionID: true,
+                resolvedWindowID: resolvedWindowID
+            )
+        case "extract_handoff":
+            return try translateAgentManage(
+                frame: frame,
+                op: "extract_handoff",
+                payload: payload,
+                allowedPayloadKeys: Self.extractHandoffPayloadKeys,
+                requiresSessionID: true,
+                resolvedWindowID: resolvedWindowID
+            )
         default:
             throw RemoteCommandTranslatorError.unsupportedFrameType(frame.type)
         }
@@ -488,7 +506,21 @@ struct RemoteCommandTranslator {
     private static let getLogPayloadKeys: Set<String> = [
         "offset",
         "limit",
-        "include_row_timestamps"
+        "include_row_timestamps",
+        "include_host_row_ids"
+    ]
+
+    private static let forkSessionPayloadKeys: Set<String> = [
+        "up_to_item_id",
+        "destination_agent",
+        "destination_model_id",
+        "destination_effort"
+    ]
+
+    private static let extractHandoffPayloadKeys: Set<String> = [
+        "up_to_item_id",
+        "max_transcript_items",
+        "max_tool_args_characters"
     ]
 
     private static let sessionAddressedOperations: Set<String> = [
@@ -499,6 +531,8 @@ struct RemoteCommandTranslator {
         "subscribe",
         "unsubscribe",
         "get_log",
+        "fork_session",
+        "extract_handoff",
         "list_sessions"
     ]
 
@@ -511,6 +545,8 @@ struct RemoteCommandTranslator {
 
     private static let sessionAddressedAgentManageOps: Set<String> = [
         "get_log",
+        "fork_session",
+        "extract_handoff",
         "list_sessions"
     ]
 }

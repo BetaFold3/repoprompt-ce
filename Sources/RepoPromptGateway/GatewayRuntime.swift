@@ -470,6 +470,14 @@ actor RemoteGatewayRuntime {
                 lastEligibleWindowDetailsByDevice.removeValue(forKey: deviceID)
                 _ = await appLinkPool?.refreshBindingState(forDevice: deviceID)
             }
+            let resultingSessionID = frame.type == "start"
+                ? payload.objectValue?["session_id"]?.stringValue
+                : frame.sessionID
+            await watchManager.recordTurnOrigin(
+                deviceID: deviceID,
+                frame: frame,
+                resultingSessionID: resultingSessionID
+            )
             audit(frame: frame, deviceID: deviceID, outcome: "success", responsePayload: payload)
             if frame.type == "steer" || frame.type == "respond" {
                 await watchManager.rearm(deviceID: deviceID, sessionID: frame.sessionID)
@@ -1386,7 +1394,9 @@ actor RemoteGatewayRuntime {
         if frame.type == "list_sessions" {
             return parentSessionID(from: frame)
         }
-        guard ["steer", "respond", "cancel", "get_log", "poll"].contains(frame.type) else { return nil }
+        guard ["steer", "respond", "cancel", "get_log", "fork_session", "extract_handoff", "poll"].contains(frame.type) else {
+            return nil
+        }
         guard let ids = try? sessionIDs(from: frame), ids.count == 1 else { return nil }
         return ids[0]
     }

@@ -1174,7 +1174,7 @@ private actor EventRecorder {
 
     func record(_ event: RemoteSessionEvent) {
         switch event {
-        case let .transcriptRows(items, removedIDs):
+        case let .transcriptRows(items, removedIDs, _):
             transcriptBatches.append((items, removedIDs))
         case .runState:
             runStates.append(event)

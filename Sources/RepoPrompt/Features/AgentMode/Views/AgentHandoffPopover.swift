@@ -10,6 +10,7 @@ struct AgentHandoffPopover: View {
     @State private var selectedAgent: AgentProviderKind
     @State private var selectedModelRaw: String
     @State private var selectedReasoningEffortRaw: String?
+    @State private var remoteDestinationState: AgentHandoffRemoteDestinationState
     @State private var isLoading = false
     @State private var isCopying = false
     @State private var showCopied = false
@@ -30,6 +31,17 @@ struct AgentHandoffPopover: View {
         _selectedAgent = State(initialValue: initialSelection.agent)
         _selectedModelRaw = State(initialValue: initialSelection.modelRaw)
         _selectedReasoningEffortRaw = State(initialValue: initialSelection.reasoningEffortRaw)
+        _remoteDestinationState = State(initialValue: AgentHandoffRemoteDestinationState(
+            catalog: config.remoteCatalogSnapshot,
+            preferredModelID: config.defaultModelRaw
+        ))
+    }
+
+    private var isRemoteDestination: Bool {
+        if case .remoteCatalog = config.destinationSource {
+            return true
+        }
+        return false
     }
 
     private var availableAgents: [AgentProviderKind] {
@@ -60,8 +72,27 @@ struct AgentHandoffPopover: View {
         selectedModelOption?.displayName ?? selectedModelRaw
     }
 
+    private var canCopyPayload: Bool {
+        !isRemoteDestination || remoteDestinationState.canCopyPayload
+    }
+
     private var canPerformHandoff: Bool {
-        availableAgents.contains(selectedAgent) && !allCurrentOptions.isEmpty
+        if isRemoteDestination {
+            return remoteDestinationState.canPerformHandoff
+        }
+        return availableAgents.contains(selectedAgent) && !allCurrentOptions.isEmpty
+    }
+
+    private var handoffDestination: AgentHandoffDestination? {
+        if isRemoteDestination {
+            return remoteDestinationState.destination
+        }
+        guard canPerformHandoff else { return nil }
+        return .local(AgentHandoffSelection(
+            agent: selectedAgent,
+            modelRaw: selectedModelRaw,
+            reasoningEffortRaw: showReasoningEffort ? selectedReasoningEffortRaw : nil
+        ))
     }
 
     private var providerChipTitle: String {
@@ -85,6 +116,13 @@ struct AgentHandoffPopover: View {
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            if isRemoteDestination {
+                Text("File contents come from the host tab's last stored selection.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Divider()
 
             VStack(alignment: .leading, spacing: 6) {
@@ -92,88 +130,14 @@ struct AgentHandoffPopover: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                     .foregroundColor(.secondary)
 
-                HStack(spacing: 6) {
-                    Menu {
-                        if availableAgents.isEmpty {
-                            Button("No connected CLI providers") {}
-                                .disabled(true)
-                        } else {
-                            ForEach(availableAgents, id: \.self) { agent in
-                                Menu(agent.displayName) {
-                                    handoffModelMenuContent(for: agent)
-                                }
-                            }
-                        }
-                        AgentProviderSettingsMenuSection(availableAgents: availableAgents, windowID: config.windowID)
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: selectedAgent.iconName)
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                            if isSelectedCodexFastModel {
-                                Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
-                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
-                                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
-                            }
-                            Text(providerChipTitle)
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Image(systemName: "chevron.down")
-                                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
-                                .foregroundColor(.secondary)
-                        }
-                        .foregroundColor(isSelectedCodexFastModel ? .orange : .secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(chipColor)
-                        .cornerRadius(4)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                    if showReasoningEffort {
-                        Menu {
-                            ForEach(reasoningEffortOptions, id: \.rawValue) { effort in
-                                Button {
-                                    selectedReasoningEffortRaw = effort.rawValue
-                                } label: {
-                                    HStack {
-                                        Text(effort.rawValue.capitalized)
-                                        if selectedReasoningEffortRaw == effort.rawValue {
-                                            Spacer()
-                                            Image(systemName: "checkmark")
-                                        }
-                                    }
-                                }
-                            }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Text(selectedReasoningEffortRaw?.capitalized ?? "Default")
-                                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                            }
-                            .foregroundColor(.secondary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(chipColor)
-                            .cornerRadius(4)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .fixedSize()
-                    }
-                }
-
-                if availableAgents.isEmpty {
-                    Text("Connect a CLI provider in Settings before handing off to a new agent.")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                        .foregroundColor(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                destinationPicker
             }
 
             if let errorMessage {
                 Text(errorMessage)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                     .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()
@@ -182,14 +146,19 @@ struct AgentHandoffPopover: View {
                 Button {
                     Task {
                         isCopying = true
-                        let payload = await config.buildPayloadForClipboard()
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(payload, forType: .string)
-                        isCopying = false
-                        showCopied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                            showCopied = false
+                        errorMessage = nil
+                        switch await Self.clipboardPayloadResult(config: config) {
+                        case let .success(payload):
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(payload, forType: .string)
+                            showCopied = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                showCopied = false
+                            }
+                        case let .failure(message):
+                            errorMessage = message
                         }
+                        isCopying = false
                     }
                 } label: {
                     HStack(spacing: 4) {
@@ -207,7 +176,7 @@ struct AgentHandoffPopover: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundColor(showCopied ? .green : .accentColor)
-                .disabled(isLoading || isCopying)
+                .disabled(isLoading || isCopying || !canCopyPayload)
 
                 Spacer()
 
@@ -221,18 +190,14 @@ struct AgentHandoffPopover: View {
 
                 Button {
                     Task {
+                        guard let destination = handoffDestination else { return }
                         isLoading = true
                         errorMessage = nil
-                        let selection = AgentHandoffSelection(
-                            agent: selectedAgent,
-                            modelRaw: selectedModelRaw,
-                            reasoningEffortRaw: showReasoningEffort ? selectedReasoningEffortRaw : nil
-                        )
                         do {
-                            try await config.performHandoff(selection)
+                            try await config.performHandoff(destination)
                             dismiss()
                         } catch {
-                            errorMessage = "Handoff failed: \(error.localizedDescription)"
+                            errorMessage = Self.errorMessage(for: .handoff, error: error)
                             isLoading = false
                         }
                     }
@@ -259,11 +224,214 @@ struct AgentHandoffPopover: View {
         .padding(16)
         .frame(width: popoverWidth)
         .onAppear {
-            reconcileSelectionWithAvailability()
+            if !isRemoteDestination {
+                reconcileSelectionWithAvailability()
+            }
         }
         .onChange(of: availableAgents) { _, _ in
-            reconcileSelectionWithAvailability()
+            if !isRemoteDestination {
+                reconcileSelectionWithAvailability()
+            }
         }
+    }
+
+    @ViewBuilder
+    private var destinationPicker: some View {
+        if isRemoteDestination {
+            remoteDestinationPicker
+        } else {
+            localDestinationPicker
+        }
+    }
+
+    private var localDestinationPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Menu {
+                    if availableAgents.isEmpty {
+                        Button("No connected CLI providers") {}
+                            .disabled(true)
+                    } else {
+                        ForEach(availableAgents, id: \.self) { agent in
+                            Menu(agent.displayName) {
+                                handoffModelMenuContent(for: agent)
+                            }
+                        }
+                    }
+                    AgentProviderSettingsMenuSection(availableAgents: availableAgents, windowID: config.windowID)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: selectedAgent.iconName)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        if isSelectedCodexFastModel {
+                            Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                                .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                        }
+                        Text(providerChipTitle)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Image(systemName: "chevron.down")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
+                            .foregroundColor(.secondary)
+                    }
+                    .foregroundColor(isSelectedCodexFastModel ? .orange : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(chipColor)
+                    .cornerRadius(4)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize(horizontal: false, vertical: true)
+
+                if showReasoningEffort {
+                    Menu {
+                        ForEach(reasoningEffortOptions, id: \.rawValue) { effort in
+                            Button {
+                                selectedReasoningEffortRaw = effort.rawValue
+                            } label: {
+                                HStack {
+                                    Text(effort.rawValue.capitalized)
+                                    if selectedReasoningEffortRaw == effort.rawValue {
+                                        Spacer()
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(selectedReasoningEffortRaw?.capitalized ?? "Default")
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        }
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(chipColor)
+                        .cornerRadius(4)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+            }
+
+            if availableAgents.isEmpty {
+                Text("Connect a CLI provider in Settings before handing off to a new agent.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var remoteDestinationPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Menu {
+                    if remoteDestinationState.structuredAgentGroups.isEmpty {
+                        Button("No remote destinations available") {}
+                            .disabled(true)
+                    } else {
+                        ForEach(remoteDestinationState.structuredAgentGroups) { agent in
+                            Menu(agent.name) {
+                                ForEach(agent.models) { model in
+                                    Button {
+                                        remoteDestinationState.selectModel(
+                                            agentGroupID: agent.id,
+                                            modelGroupID: model.id
+                                        )
+                                    } label: {
+                                        HStack {
+                                            Text(model.displayName)
+                                            if remoteDestinationState.selectedModelGroupID == model.id {
+                                                Spacer()
+                                                Image(systemName: "checkmark")
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: remoteDestinationState.selectedAgentGroup?.agentKind?.iconName ?? "network")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        Text(remoteProviderChipTitle)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Image(systemName: "chevron.down")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
+                            .foregroundColor(.secondary)
+                    }
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(chipColor)
+                    .cornerRadius(4)
+                }
+                .menuStyle(.borderlessButton)
+                .disabled(remoteDestinationState.structuredAgentGroups.isEmpty)
+                .fixedSize(horizontal: false, vertical: true)
+
+                if !remoteDestinationState.effortOptions.isEmpty {
+                    Menu {
+                        ForEach(remoteDestinationState.effortOptions) { option in
+                            Button {
+                                remoteDestinationState.selectEffort(modelID: option.modelID)
+                            } label: {
+                                HStack {
+                                    Text(option.displayName)
+                                    if remoteDestinationState.selectedModelID == option.modelID {
+                                        Spacer()
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Text(remoteDestinationState.selectedEffortOption?.displayName ?? "Effort")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(chipColor)
+                            .cornerRadius(4)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
+            }
+
+            if let message = remoteCatalogAvailabilityMessage {
+                Text(message)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var remoteProviderChipTitle: String {
+        guard let agent = remoteDestinationState.selectedAgentGroup,
+              let model = remoteDestinationState.selectedModelGroup
+        else { return "No remote destinations" }
+        return "\(agent.name) \u{00B7} \(model.displayName)"
+    }
+
+    private var remoteCatalogAvailabilityMessage: String? {
+        guard let catalog = remoteDestinationState.catalog else {
+            return "The host model catalog is unavailable. You can still copy the payload."
+        }
+        if catalog.isDegraded {
+            return "The host model catalog is unavailable. You can still copy the payload."
+        }
+        if remoteDestinationState.structuredAgentGroups.isEmpty {
+            return "This host did not expose structured handoff destinations. You can still copy the payload."
+        }
+        return nil
     }
 
     @ViewBuilder
@@ -319,6 +487,43 @@ struct AgentHandoffPopover: View {
             preferredReasoningEffortRaw: agent == config.defaultDestinationAgent ? config.defaultReasoningEffortRaw : nil,
             config: config
         )
+    }
+
+    enum Action: Equatable {
+        case copyPayload
+        case handoff
+    }
+
+    enum ClipboardPayloadResult: Equatable {
+        case success(String)
+        case failure(String)
+    }
+
+    @MainActor
+    static func clipboardPayloadResult(config: AgentHandoffConfig) async -> ClipboardPayloadResult {
+        do {
+            return try await .success(config.buildPayloadForClipboard())
+        } catch {
+            return .failure(errorMessage(for: .copyPayload, error: error))
+        }
+    }
+
+    static func errorMessage(for action: Action, error: Error) -> String {
+        if let remoteError = error as? RemoteClientError,
+           case let .inDoubt(commandError) = remoteError
+        {
+            let detail = commandError.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            if action == .copyPayload {
+                let suffix = detail.isEmpty
+                    ? "The host did not confirm whether payload extraction completed."
+                    : detail
+                return "Copy Payload outcome is uncertain (in doubt). \(suffix)"
+            }
+            let suffix = detail.isEmpty ? "The host may already have created the fork." : detail
+            return "Handoff outcome is uncertain (in doubt). \(suffix) Check remote sessions before retrying."
+        }
+        let prefix = action == .copyPayload ? "Copy Payload failed" : "Handoff failed"
+        return "\(prefix): \(error.localizedDescription)"
     }
 
     private static func initialSelection(for config: AgentHandoffConfig) -> AgentHandoffSelection {

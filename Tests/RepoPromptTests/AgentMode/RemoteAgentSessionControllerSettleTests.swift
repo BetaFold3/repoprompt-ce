@@ -427,6 +427,305 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
         XCTAssertTrue(flags.dropFirst().allSatisfy { $0 == nil }, String(describing: flags))
     }
 
+    func testFetchLogPageSendsIncludeHostRowIDsOnlyWhenHostAdvertisesFeature() async throws {
+        let legacyConnection = ScriptedRemoteAgentSessionConnection(responses: [
+            "poll": [Self.snapshotPayload(status: "completed")],
+            "get_log": [
+                Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1)
+            ]
+        ])
+        let legacyController = RemoteAgentSessionController(
+            binding: Self.makeBinding(nextLogOffset: 0),
+            connection: legacyConnection
+        )
+        defer { Task { await legacyController.shutdown() } }
+        try await legacyController.attachAndCatchUp()
+        let legacyFlags = await legacyConnection.getLogIncludeHostRowIDsFlags()
+        XCTAssertFalse(legacyFlags.isEmpty)
+        XCTAssertTrue(legacyFlags.allSatisfy { $0 == nil }, String(describing: legacyFlags))
+
+        let upgradedConnection = ScriptedRemoteAgentSessionConnection(
+            responses: [
+                "poll": [Self.snapshotPayload(status: "completed")],
+                "get_log": [
+                    Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1)
+                ]
+            ],
+            advertisedFeatures: [RemoteWireFeatures.getLogHostRowIDs]
+        )
+        let upgradedController = RemoteAgentSessionController(
+            binding: Self.makeBinding(nextLogOffset: 0),
+            connection: upgradedConnection
+        )
+        defer { Task { await upgradedController.shutdown() } }
+        try await upgradedController.attachAndCatchUp()
+        let upgradedFlags = await upgradedConnection.getLogIncludeHostRowIDsFlags()
+        XCTAssertFalse(upgradedFlags.isEmpty)
+        XCTAssertTrue(upgradedFlags.allSatisfy { $0 == true }, String(describing: upgradedFlags))
+    }
+
+    func testFetchLogPageRetriesWithoutHostRowIDsAfterUnsupportedPayloadKeyAndLatches() async throws {
+        let connection = ScriptedRemoteAgentSessionConnection(
+            scriptedResponses: [
+                "poll": [.payload(Self.snapshotPayload(status: "completed"))],
+                "get_log": [
+                    .commandFailure(
+                        code: "unsupported_payload_key",
+                        message: "Remote operation 'get_log' does not support payload key 'include_host_row_ids'."
+                    ),
+                    .payload(Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1)),
+                    .payload(Self.logPayload(offset: 0, returned: 1, total: 1, xml: "<user>Prompt</user>", completed: 1))
+                ]
+            ],
+            advertisedFeatures: [RemoteWireFeatures.getLogHostRowIDs]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: Self.makeBinding(nextLogOffset: 0),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+
+        try await controller.attachAndCatchUp()
+
+        let requests = await connection.getLogRequests()
+        let flags = await connection.getLogIncludeHostRowIDsFlags()
+        XCTAssertGreaterThanOrEqual(requests.count, 2, String(describing: requests))
+        XCTAssertEqual(flags.first, true, String(describing: flags))
+        XCTAssertEqual(requests[0].offset, requests[1].offset)
+        XCTAssertTrue(flags.dropFirst().allSatisfy { $0 == nil }, String(describing: flags))
+    }
+
+    func testHostRowIDLookupPopulatesFromLogAndResetsForNewSession() async throws {
+        let originalSessionID = "remote-session-abc"
+        let newSessionID = "remote-session-new"
+        let hostRowID = UUID()
+        let xml = "<user id=\"\(hostRowID.uuidString)\">Prompt</user>"
+        let connection = ScriptedRemoteAgentSessionConnection(
+            responses: [
+                "start": [Self.snapshotPayload(status: "completed", sessionID: newSessionID)],
+                "poll": [
+                    Self.snapshotPayload(status: "completed", sessionID: originalSessionID),
+                    Self.snapshotPayload(status: "completed", sessionID: newSessionID)
+                ],
+                "get_log": [
+                    Self.logPayload(offset: 0, returned: 1, total: 1, xml: xml, completed: 1),
+                    Self.logPayload(offset: 0, returned: 1, total: 1, xml: xml, completed: 1),
+                    Self.logPayload(offset: 0, returned: 0, total: 0, xml: "<transcript/>", completed: 0)
+                ]
+            ],
+            advertisedFeatures: [RemoteWireFeatures.getLogHostRowIDs]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: Self.makeBinding(remoteSessionID: originalSessionID, nextLogOffset: 0),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+        let clientItemID = try XCTUnwrap(
+            RemoteTranscriptProjector(remoteSessionID: originalSessionID)
+                .projectGetLogResponse(Self.logPayload(offset: 0, returned: 1, total: 1, xml: xml, completed: 1))
+                .items.first?.id
+        )
+
+        try await controller.attachAndCatchUp()
+        let mappedHostRowID = await controller.hostRowID(forClientItemID: clientItemID)
+        XCTAssertEqual(mappedHostRowID, hostRowID)
+
+        let startedSessionID = try await controller.start(
+            message: "New prompt",
+            modelSelectionRaw: nil,
+            sessionName: nil,
+            windowID: nil,
+            workspaceID: nil,
+            workspaceName: nil
+        )
+        XCTAssertEqual(startedSessionID, newSessionID)
+        let resetHostRowID = await controller.hostRowID(forClientItemID: clientItemID)
+        XCTAssertNil(resetHostRowID)
+    }
+
+    func testForkSendsMappedHostRowIDAndParsesSharedSessionDescriptor() async throws {
+        let clientItemID = UUID()
+        let hostRowID = UUID()
+        let destinationSessionID = UUID().uuidString
+        let connection = ScriptedRemoteAgentSessionConnection(
+            responses: [
+                "fork_session": [
+                    .object(["status": .string("in_flight")]),
+                    .object([
+                        "status": .string("forked"),
+                        "session": .object([
+                            "session_id": .string(destinationSessionID),
+                            "name": .string("Forked on host"),
+                            "raw_state": .string("completed"),
+                            "agent": .object([
+                                "id": .string(AgentProviderKind.codexExec.rawValue),
+                                "model": .string("gpt-5.4")
+                            ]),
+                            "parent_session_id": .string("parent-session"),
+                            "last_modified": .string("2026-07-26T12:34:56.000Z"),
+                            "item_count": .int(7),
+                            "origin": .string("user"),
+                            "is_live": .bool(true)
+                        ])
+                    ])
+                ]
+            ],
+            advertisedFeatures: [RemoteWireFeatures.forkSession]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: Self.makeBinding(),
+            connection: connection,
+            recoveryScheduler: ImmediateRemoteAgentSessionRecoveryScheduler()
+        )
+        defer { Task { await controller.shutdown() } }
+        await controller.test_setHostRowID(hostRowID, forClientItemID: clientItemID)
+
+        let descriptor = try await controller.fork(
+            upToClientItemID: clientItemID,
+            destinationAgent: AgentProviderKind.codexExec.rawValue,
+            destinationModelID: "gpt-5.4",
+            destinationEffort: "high"
+        )
+
+        XCTAssertEqual(descriptor.sessionID, destinationSessionID)
+        XCTAssertEqual(descriptor.name, "Forked on host")
+        XCTAssertEqual(descriptor.stateRaw, "completed")
+        XCTAssertEqual(descriptor.agentKindRaw, AgentProviderKind.codexExec.rawValue)
+        XCTAssertEqual(descriptor.agentModelRaw, "gpt-5.4")
+        XCTAssertEqual(descriptor.parentSessionID, "parent-session")
+        XCTAssertEqual(descriptor.itemCount, 7)
+        XCTAssertEqual(descriptor.originSummary, "user")
+        XCTAssertEqual(descriptor.isLive, true)
+        XCTAssertNotNil(descriptor.lastModified)
+
+        let forkFrames = await connection.frames(type: "fork_session")
+        XCTAssertEqual(forkFrames.count, 2)
+        XCTAssertEqual(forkFrames[0].requestID, forkFrames[1].requestID)
+        let frame = try XCTUnwrap(forkFrames.first)
+        XCTAssertEqual(frame.sessionID, "remote-session-abc")
+        XCTAssertTrue(frame.requestID?.hasPrefix("rpce-n5-fork-") == true)
+        XCTAssertEqual(frame.payload?.objectValue, [
+            "up_to_item_id": .string(hostRowID.uuidString),
+            "destination_agent": .string(AgentProviderKind.codexExec.rawValue),
+            "destination_model_id": .string("gpt-5.4"),
+            "destination_effort": .string("high")
+        ])
+        XCTAssertNotEqual(frame.payload?.objectValue?["up_to_item_id"], .string(clientItemID.uuidString))
+    }
+
+    func testExtractHandoffSendsMappedHostRowIDAndReturnsInlineXML() async throws {
+        let clientItemID = UUID()
+        let hostRowID = UUID()
+        let expectedXML = "<forked_session><transcript/></forked_session>"
+        let connection = ScriptedRemoteAgentSessionConnection(
+            responses: [
+                "extract_handoff": [
+                    .object([
+                        "status": .string("ok"),
+                        "handoff_xml": .string(expectedXML)
+                    ])
+                ]
+            ],
+            advertisedFeatures: [RemoteWireFeatures.extractHandoff]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: Self.makeBinding(),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+        await controller.test_setHostRowID(hostRowID, forClientItemID: clientItemID)
+
+        let payload = try await controller.extractHandoff(
+            upToClientItemID: clientItemID,
+            maxTranscriptItems: 123,
+            maxToolArgsCharacters: 456
+        )
+
+        XCTAssertEqual(payload, expectedXML)
+        let extractFrames = await connection.frames(type: "extract_handoff")
+        XCTAssertEqual(extractFrames.count, 1)
+        let frame = try XCTUnwrap(extractFrames.first)
+        XCTAssertEqual(frame.sessionID, "remote-session-abc")
+        XCTAssertTrue(frame.requestID?.hasPrefix("rpce-n5-extract-") == true)
+        XCTAssertEqual(frame.payload?.objectValue, [
+            "up_to_item_id": .string(hostRowID.uuidString),
+            "max_transcript_items": .int(123),
+            "max_tool_args_characters": .int(456)
+        ])
+        XCTAssertNotEqual(frame.payload?.objectValue?["up_to_item_id"], .string(clientItemID.uuidString))
+    }
+
+    func testForkAndExtractRejectHostsWithoutTheirAdvertisedFeatures() async throws {
+        let connection = ScriptedRemoteAgentSessionConnection(responses: [:])
+        let controller = RemoteAgentSessionController(
+            binding: Self.makeBinding(),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+
+        do {
+            _ = try await controller.fork(
+                upToClientItemID: UUID(),
+                destinationAgent: AgentProviderKind.codexExec.rawValue,
+                destinationModelID: "gpt-5.4",
+                destinationEffort: nil
+            )
+            XCTFail("Expected unsupported fork feature error")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "unsupported_host_feature")
+            XCTAssertTrue(error.localizedDescription.contains("does not support remote session forking"))
+        }
+
+        do {
+            _ = try await controller.extractHandoff(upToClientItemID: UUID())
+            XCTFail("Expected unsupported extract feature error")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "unsupported_host_feature")
+            XCTAssertTrue(error.localizedDescription.contains("does not support remote handoff payload extraction"))
+        }
+        let forkFrames = await connection.frames(type: "fork_session")
+        let extractFrames = await connection.frames(type: "extract_handoff")
+        XCTAssertTrue(forkFrames.isEmpty)
+        XCTAssertTrue(extractFrames.isEmpty)
+    }
+
+    func testForkAndExtractRejectUnmappedClientCutoffsBeforeSending() async throws {
+        let connection = ScriptedRemoteAgentSessionConnection(
+            responses: [:],
+            advertisedFeatures: [RemoteWireFeatures.forkSession, RemoteWireFeatures.extractHandoff]
+        )
+        let controller = RemoteAgentSessionController(
+            binding: Self.makeBinding(),
+            connection: connection
+        )
+        defer { Task { await controller.shutdown() } }
+
+        do {
+            _ = try await controller.fork(
+                upToClientItemID: UUID(),
+                destinationAgent: AgentProviderKind.codexExec.rawValue,
+                destinationModelID: "gpt-5.4",
+                destinationEffort: nil
+            )
+            XCTFail("Expected unmapped fork cutoff error")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "host_row_id_unavailable")
+            XCTAssertTrue(error.localizedDescription.contains("not yet mapped"))
+        }
+
+        do {
+            _ = try await controller.extractHandoff(upToClientItemID: UUID())
+            XCTFail("Expected unmapped extract cutoff error")
+        } catch let error as RemoteClientError {
+            XCTAssertEqual(error.commandError?.code, "host_row_id_unavailable")
+            XCTAssertTrue(error.localizedDescription.contains("not yet mapped"))
+        }
+        let forkFrames = await connection.frames(type: "fork_session")
+        let extractFrames = await connection.frames(type: "extract_handoff")
+        XCTAssertTrue(forkFrames.isEmpty)
+        XCTAssertTrue(extractFrames.isEmpty)
+    }
+
     private static func makeBinding(
         hostID: String = "host-abc",
         remoteSessionID: String = "remote-session-abc",
@@ -510,6 +809,10 @@ final class RemoteAgentSessionControllerSettleTests: XCTestCase {
     }
 }
 
+private struct ImmediateRemoteAgentSessionRecoveryScheduler: RemoteAgentSessionRecoveryScheduling {
+    func sleep(seconds _: TimeInterval) async throws {}
+}
+
 private enum ScriptedRemoteResponse {
     case payload(JSONValue)
     case transportFailure(String)
@@ -522,7 +825,7 @@ private actor RemoteSessionEventRecorder {
     private var transcriptBatchWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
     func record(_ event: RemoteSessionEvent) {
-        if case let .transcriptRows(rows, removed) = event {
+        if case let .transcriptRows(rows, removed, _) = event {
             transcriptRows.append(rows)
             removedIDs.append(removed)
             resumeSatisfiedWaiters()
@@ -617,6 +920,10 @@ private actor ScriptedRemoteAgentSessionConnection: RemoteAgentSessionConnection
         frames.count { $0.type == type }
     }
 
+    func frames(type: String) -> [RemoteClientFrame] {
+        frames.filter { $0.type == type }
+    }
+
     func getLogRequests() -> [(offset: Int, limit: Int)] {
         frames.compactMap { frame in
             guard frame.type == "get_log" else { return nil }
@@ -633,6 +940,14 @@ private actor ScriptedRemoteAgentSessionConnection: RemoteAgentSessionConnection
     func getLogIncludeRowTimestampsFlags() -> [Bool?] {
         frames.filter { $0.type == "get_log" }.map { frame in
             frame.payload?.objectValue?["include_row_timestamps"]?.boolValue
+        }
+    }
+
+    /// One entry per get_log request: the raw `include_host_row_ids` payload value
+    /// (nil when the key was omitted).
+    func getLogIncludeHostRowIDsFlags() -> [Bool?] {
+        frames.filter { $0.type == "get_log" }.map { frame in
+            frame.payload?.objectValue?["include_host_row_ids"]?.boolValue
         }
     }
 

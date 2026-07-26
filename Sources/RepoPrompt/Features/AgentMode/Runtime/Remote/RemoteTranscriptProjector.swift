@@ -11,6 +11,7 @@ struct RemoteProjectedLogPage: Equatable {
     var completedTurnCount: Int?
     var transcriptXML: String
     var items: [AgentChatItem]
+    var hostRowIDByClientItemID: [UUID: UUID]
 
     var nextLogOffset: Int {
         turnOffset + returnedTurnCount
@@ -51,6 +52,12 @@ struct RemoteTranscriptProjector: Equatable {
         let items = rows.enumerated().map { index, row in
             item(from: row, logIndex: "\(turnOffset):\(index)", sequenceIndex: turnOffset * 1_000_000 + index)
         }
+        var hostRowIDByClientItemID: [UUID: UUID] = [:]
+        for (item, row) in zip(items, rows) {
+            if let hostRowID = row.hostRowID {
+                hostRowIDByClientItemID[item.id] = hostRowID
+            }
+        }
         return RemoteProjectedLogPage(
             sessionID: sessionID,
             turnOffset: turnOffset,
@@ -59,7 +66,8 @@ struct RemoteTranscriptProjector: Equatable {
             totalTurns: totalTurns,
             completedTurnCount: completedTurnCount,
             transcriptXML: transcriptXML,
-            items: items
+            items: items,
+            hostRowIDByClientItemID: hostRowIDByClientItemID
         )
     }
 
@@ -183,6 +191,8 @@ struct RemoteTranscriptProjector: Equatable {
         var toolResultStatusWord: String?
         /// Authoritative host row date parsed from the wire `ts` attribute; nil for legacy hosts.
         var timestamp: Date?
+        /// Host transcript row identity parsed from the opt-in wire `id` attribute.
+        var hostRowID: UUID?
     }
 
     private static func parseTranscriptXML(_ xml: String) -> [XMLRow] {
@@ -206,7 +216,13 @@ struct RemoteTranscriptProjector: Equatable {
                 case "error": .error
                 default: .system
                 }
-                rows.append(XMLRow(kind: kind, text: text, toolName: nil, timestamp: rowTimestamp(in: attributes)))
+                rows.append(XMLRow(
+                    kind: kind,
+                    text: text,
+                    toolName: nil,
+                    timestamp: rowTimestamp(in: attributes),
+                    hostRowID: rowHostID(in: attributes)
+                ))
             } else if let attributes = string(in: xml, match: match, at: 4),
                       let toolName = attribute("name", in: attributes)
             {
@@ -214,7 +230,8 @@ struct RemoteTranscriptProjector: Equatable {
                     kind: .toolCall,
                     text: "",
                     toolName: decodeXMLEntities(toolName),
-                    timestamp: rowTimestamp(in: attributes)
+                    timestamp: rowTimestamp(in: attributes),
+                    hostRowID: rowHostID(in: attributes)
                 ))
             } else if let attributes = string(in: xml, match: match, at: 5),
                       let toolName = attribute("name", in: attributes)
@@ -223,7 +240,8 @@ struct RemoteTranscriptProjector: Equatable {
                     kind: .toolCall,
                     text: decodeXMLEntities(string(in: xml, match: match, at: 6) ?? ""),
                     toolName: decodeXMLEntities(toolName),
-                    timestamp: rowTimestamp(in: attributes)
+                    timestamp: rowTimestamp(in: attributes),
+                    hostRowID: rowHostID(in: attributes)
                 ))
             } else if let attributes = string(in: xml, match: match, at: 7),
                       let toolName = attribute("name", in: attributes),
@@ -246,6 +264,11 @@ struct RemoteTranscriptProjector: Equatable {
             return [XMLRow(kind: .system, text: fallback, toolName: nil)]
         }
         return rows
+    }
+
+    private static func rowHostID(in attributes: String) -> UUID? {
+        guard let raw = attribute("id", in: attributes) else { return nil }
+        return UUID(uuidString: raw)
     }
 
     /// Parses the wire `ts` attribute (Unix epoch seconds, locale-independent) into a Date.

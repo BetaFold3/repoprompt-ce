@@ -838,7 +838,8 @@ final class RemoteAgentSessionTests: XCTestCase {
             binding: makeBinding(remoteSessionID: "", lastAppliedSeq: 0, nextLogOffset: 0),
             connection: connection,
             recoveryScheduler: scheduler,
-            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10])
+            recoveryPolicy: .init(staleIntervalSeconds: 10, retryDelaySeconds: [5, 10]),
+            flightRecorder: flightRecorder
         )
         let recorder = RemoteSessionEventRecorder()
         let eventTask = Task {
@@ -2576,7 +2577,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
 
         let toolCall = Self.remoteToolCall(name: "read_file")
-        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: []), tabID: fixture.tabID)
+        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: [], hostRowIDByClientItemID: [:]), tabID: fixture.tabID)
 
         let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
         XCTAssertNotNil(settledTool.toolResultJSON)
@@ -2613,7 +2614,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(session.runState, .cancelled)
 
         let toolCall = Self.remoteToolCall(name: "read_file")
-        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: []), tabID: fixture.tabID)
+        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: [], hostRowIDByClientItemID: [:]), tabID: fixture.tabID)
 
         let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
         XCTAssertEqual(settledTool.toolIsError, true)
@@ -3359,7 +3360,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func record(_ event: RemoteSessionEvent) {
             switch event {
-            case let .transcriptRows(rows, _):
+            case let .transcriptRows(rows, _, _):
                 transcriptRows.append(rows)
             case let .systemMessage(message):
                 systemMessages.append(message)

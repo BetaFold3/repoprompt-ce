@@ -52,11 +52,15 @@ final class RemoteAgentModeCoordinator {
     private weak var viewModel: AgentModeViewModel?
     private let connectionManagerProvider: @MainActor () -> RemoteHostConnectionManager
     private let catalogProvider: @MainActor (String) -> RemoteHostAgentCatalog?
+    private let hostRecordProvider: @MainActor (String) -> PairedHostRecord?
     private let workspaceSessionCatalogStore: any RemoteWorkspaceSessionCatalogStoring
     private let workspaceOpenConnectionProvider: @MainActor (String) throws -> any RemoteWorkspaceSessionCatalogConnection
     private var controllersByTabID: [UUID: RemoteAgentSessionController] = [:]
     private var eventTasksByTabID: [UUID: Task<Void, Never>] = [:]
     private var hostIDByTabID: [UUID: String] = [:]
+    private var forkCapabilityByHostID: [String: Bool] = [:]
+    private var forkCapabilityProbeTasksByHostID: [String: Task<Void, Never>] = [:]
+    private var hostRowIDByClientItemIDByTabID: [UUID: [UUID: UUID]] = [:]
     private var connectionTasksByHostID: [String: HostConnectionTasks] = [:]
     private var surfacedChannelReasonsByTabID: [UUID: Set<String>] = [:]
     /// Tabs whose current running label came from host status_text (not a client placeholder).
@@ -86,13 +90,15 @@ final class RemoteAgentModeCoordinator {
 
     init(
         connectionManagerProvider: @escaping @MainActor () -> RemoteHostConnectionManager = { RemoteHostConnectionManager.shared },
-        catalogProvider: @escaping @MainActor (String) -> RemoteHostAgentCatalog? = { RemoteHostCatalog.shared.cachedNonDegradedCatalog(for: $0) },
+        catalogProvider: @escaping @MainActor (String) -> RemoteHostAgentCatalog? = { RemoteHostCatalog.shared.cachedCatalog(for: $0) },
+        hostRecordProvider: @escaping @MainActor (String) -> PairedHostRecord? = { try? RemoteHostRegistry.shared.host(id: $0) },
         workspaceSessionCatalogStore: (any RemoteWorkspaceSessionCatalogStoring)? = nil,
         workspaceOpenConnectionProvider: (@MainActor (String) throws -> any RemoteWorkspaceSessionCatalogConnection)? = nil,
         childDiscoveryDebounceInterval: TimeInterval = 3
     ) {
         self.connectionManagerProvider = connectionManagerProvider
         self.catalogProvider = catalogProvider
+        self.hostRecordProvider = hostRecordProvider
         self.workspaceSessionCatalogStore = workspaceSessionCatalogStore ?? RemoteWorkspaceSessionCatalogStore.shared
         self.workspaceOpenConnectionProvider = workspaceOpenConnectionProvider ?? {
             try RemoteHostConnectionManager.shared.connection(for: $0)
@@ -106,6 +112,9 @@ final class RemoteAgentModeCoordinator {
             tasks.state.cancel()
         }
         for task in eventTasksByTabID.values {
+            task.cancel()
+        }
+        for task in forkCapabilityProbeTasksByHostID.values {
             task.cancel()
         }
         for task in childDiscoveryTasksByKey.values {
@@ -177,6 +186,81 @@ final class RemoteAgentModeCoordinator {
         try await controller.steer(text)
     }
 
+    func fork(
+        session: AgentModeViewModel.TabSession,
+        upToClientItemID clientItemID: UUID,
+        destinationAgent: String,
+        destinationModelID: String,
+        destinationEffort: String?
+    ) async throws {
+        guard let binding = session.remoteHost else {
+            throw RemoteClientError.protocolViolation("Session is not bound to a remote host.")
+        }
+        guard let hostRecord = hostRecordProvider(binding.hostID) else {
+            throw RemoteClientError.hostNotFound(binding.hostID)
+        }
+        guard let viewModel else {
+            throw RemoteClientError.protocolViolation("Remote Agent Mode coordinator is not attached.")
+        }
+        let controller = try controller(for: session)
+        let descriptor = try await controller.fork(
+            upToClientItemID: clientItemID,
+            destinationAgent: destinationAgent,
+            destinationModelID: destinationModelID,
+            destinationEffort: destinationEffort
+        )
+        let alreadyExists = localSessionExists(
+            hostID: binding.hostID,
+            remoteSessionID: descriptor.sessionID
+        )
+        let materializedSession: AgentModeViewModel.TabSession? = if alreadyExists {
+            nil
+        } else {
+            await viewModel.materializeRemoteWorkspaceSession(
+                descriptor: descriptor,
+                hostRecord: hostRecord
+            )
+        }
+        await refreshWorkspaceSessionCatalogAfterSuccessfulStart(hostID: binding.hostID)
+        guard alreadyExists || materializedSession != nil else {
+            throw RemoteClientError.protocolViolation(
+                "The host fork succeeded, but the returned session could not be opened on this client. Refresh the remote workspace sessions and open it manually."
+            )
+        }
+    }
+
+    func extractHandoff(
+        session: AgentModeViewModel.TabSession,
+        upToClientItemID clientItemID: UUID,
+        maxTranscriptItems: Int? = nil,
+        maxToolArgsCharacters: Int? = nil
+    ) async throws -> String {
+        let controller = try controller(for: session)
+        return try await controller.extractHandoff(
+            upToClientItemID: clientItemID,
+            maxTranscriptItems: maxTranscriptItems,
+            maxToolArgsCharacters: maxToolArgsCharacters
+        )
+    }
+
+    func canForkRemoteSession(session: AgentModeViewModel.TabSession) -> Bool {
+        guard let hostID = session.remoteHost?.hostID,
+              catalogProvider(hostID) != nil
+        else { return false }
+        guard let supported = forkCapabilityByHostID[hostID] else {
+            scheduleForkCapabilityProbe(for: session)
+            return false
+        }
+        return supported
+    }
+
+    func hostRowID(
+        for session: AgentModeViewModel.TabSession,
+        clientItemID: UUID
+    ) -> UUID? {
+        hostRowIDByClientItemIDByTabID[session.tabID]?[clientItemID]
+    }
+
     func cancel(session: AgentModeViewModel.TabSession) async throws {
         let controller = try controller(for: session)
         try await controller.cancel()
@@ -235,6 +319,9 @@ final class RemoteAgentModeCoordinator {
         tabsWithSyntheticSettlements.remove(tabID)
         lastAdoptedHostNameByTabID.removeValue(forKey: tabID)
         startSessionNameByTabID.removeValue(forKey: tabID)
+        if hostRowIDByClientItemIDByTabID.removeValue(forKey: tabID)?.isEmpty == false {
+            viewModel?.syncRunInteractionUIState()
+        }
         let controller = controllersByTabID.removeValue(forKey: tabID)
         if let hostID = hostIDByTabID.removeValue(forKey: tabID) {
             stopConnectionFanoutIfUnused(hostID: hostID)
@@ -291,8 +378,13 @@ final class RemoteAgentModeCoordinator {
         guard let binding = session.remoteHost else {
             throw RemoteClientError.protocolViolation("Session is not bound to a remote host.")
         }
-        let connection = try connectionManagerProvider().connection(for: binding.hostID)
-        let controller = RemoteAgentSessionController(binding: binding, connection: connection)
+        let connectionManager = connectionManagerProvider()
+        let connection = try connectionManager.connection(for: binding.hostID)
+        let controller = RemoteAgentSessionController(
+            binding: binding,
+            connection: connection,
+            flightRecorder: flightRecorderProvider()
+        )
         controllersByTabID[session.tabID] = controller
         hostIDByTabID[session.tabID] = binding.hostID
         startEventTask(for: session.tabID, controller: controller)
@@ -306,6 +398,32 @@ final class RemoteAgentModeCoordinator {
             for await event in controller.events {
                 await self?.handle(event, tabID: tabID)
             }
+        }
+    }
+
+    private func scheduleForkCapabilityProbe(for session: AgentModeViewModel.TabSession) {
+        guard let hostID = session.remoteHost?.hostID,
+              forkCapabilityProbeTasksByHostID[hostID] == nil
+        else { return }
+        let controller: RemoteAgentSessionController
+        do {
+            controller = try self.controller(for: session)
+        } catch {
+            updateForkCapability(false, hostID: hostID)
+            return
+        }
+        forkCapabilityProbeTasksByHostID[hostID] = Task { @MainActor [weak self] in
+            let supported = await controller.supportsForkSessionFeature()
+            guard !Task.isCancelled else { return }
+            self?.forkCapabilityProbeTasksByHostID.removeValue(forKey: hostID)
+            self?.updateForkCapability(supported, hostID: hostID)
+        }
+    }
+
+    private func updateForkCapability(_ supported: Bool, hostID: String) {
+        let previous = forkCapabilityByHostID.updateValue(supported, forKey: hostID)
+        if previous != supported {
+            viewModel?.syncRunInteractionUIState()
         }
     }
 
@@ -334,6 +452,8 @@ final class RemoteAgentModeCoordinator {
         let tasks = connectionTasksByHostID.removeValue(forKey: hostID)
         tasks?.inbound.cancel()
         tasks?.state.cancel()
+        forkCapabilityProbeTasksByHostID.removeValue(forKey: hostID)?.cancel()
+        forkCapabilityByHostID.removeValue(forKey: hostID)
     }
 
     private func deliver(_ frame: RemoteServerFrame, hostID: String) async {
@@ -342,6 +462,7 @@ final class RemoteAgentModeCoordinator {
         }
         guard !controllers.isEmpty else {
             Self.logger.notice("remote inbound frame dropped host_id=\(hostID, privacy: .public) type=\(frame.type, privacy: .public) session_id=\(frame.sessionID ?? "", privacy: .public) seq=\(frame.seq ?? 0) has_seq=\(frame.seq != nil) reason=no_matching_controller")
+            recordFrameDrop(frame, reason: "no_matching_controller")
             return
         }
         for controller in controllers {
@@ -360,6 +481,14 @@ final class RemoteAgentModeCoordinator {
                 workspaceOpenEpisodes = workspaceOpenEpisodes.filter { $0.key.hostID != hostID }
             }
             viewModel?.refreshRemoteHostCatalogAfterConnect(hostID: hostID)
+            if let session = viewModel?.sessions.values.first(where: { $0.remoteHost?.hostID == hostID }) {
+                forkCapabilityByHostID.removeValue(forKey: hostID)
+                forkCapabilityProbeTasksByHostID.removeValue(forKey: hostID)?.cancel()
+                scheduleForkCapabilityProbe(for: session)
+            }
+        } else {
+            forkCapabilityProbeTasksByHostID.removeValue(forKey: hostID)?.cancel()
+            updateForkCapability(false, hostID: hostID)
         }
         let controllers = controllersByTabID.compactMap { tabID, controller in
             hostIDByTabID[tabID] == hostID ? controller : nil
@@ -376,7 +505,8 @@ final class RemoteAgentModeCoordinator {
             session.lastActivityAt = Date()
         }
         switch event {
-        case let .transcriptRows(rows, removedIDs):
+        case let .transcriptRows(rows, removedIDs, hostRowIDByClientItemID):
+            mirrorHostRowIDs(hostRowIDByClientItemID, tabID: tabID)
             let containsSpawnTool = Self.containsSpawnToolCall(rows)
             applyTranscriptRows(rows, removedIDs: removedIDs, to: session)
             if containsSpawnTool {
@@ -427,6 +557,17 @@ final class RemoteAgentModeCoordinator {
         viewModel?.updateBindingsFromSession(session)
         viewModel?.requestUIRefresh(tabID: tabID, urgent: true)
         viewModel?.scheduleSave(for: tabID)
+    }
+
+    private func mirrorHostRowIDs(_ mappings: [UUID: UUID], tabID: UUID) {
+        let previous = hostRowIDByClientItemIDByTabID[tabID] ?? [:]
+        guard previous != mappings else { return }
+        if mappings.isEmpty {
+            hostRowIDByClientItemIDByTabID.removeValue(forKey: tabID)
+        } else {
+            hostRowIDByClientItemIDByTabID[tabID] = mappings
+        }
+        viewModel?.syncRunInteractionUIState()
     }
 
     private func applyTranscriptRows(
@@ -1519,7 +1660,9 @@ final class RemoteAgentModeCoordinator {
 
     private static func shouldRefreshActivity(for event: RemoteSessionEvent) -> Bool {
         switch event {
-        case .transcriptRows, .runState, .terminal, .metadata:
+        case let .transcriptRows(items, removedIDs, _):
+            !items.isEmpty || !removedIDs.isEmpty
+        case .runState, .terminal, .metadata:
             true
         case .interactionResolved, .sessionExpired, .channel, .systemMessage, .binding:
             false
@@ -1555,6 +1698,14 @@ final class RemoteAgentModeCoordinator {
     }
 
     #if DEBUG
+        func test_controller(for session: AgentModeViewModel.TabSession) throws -> RemoteAgentSessionController {
+            try controller(for: session)
+        }
+
+        func test_deliverFrame(_ frame: RemoteServerFrame, hostID: String) async {
+            await deliver(frame, hostID: hostID)
+        }
+
         func test_deliverConnectionState(_ state: RemoteHostConnection.State, hostID: String) async {
             await deliver(state, hostID: hostID)
         }

@@ -88,6 +88,50 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         )
     }
 
+    func testGetLogHostRowIDAttributesAreFeatureGatedAndLegacyOutputIsByteIdentical() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let userRowID = UUID()
+        let assistantRowID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.runState = .completed
+        session.transcript = AgentTranscriptIO.buildTranscript(
+            from: [
+                AgentChatItem(id: userRowID, kind: .user, text: "Prompt", sequenceIndex: 0),
+                AgentChatItem(id: assistantRowID, kind: .assistant, text: "Reply", sequenceIndex: 1)
+            ],
+            terminalState: .completed,
+            compact: false
+        )
+        let service = makeService(window: window, connectionID: UUID())
+        let baseArgs: [String: Value] = [
+            "op": .string("get_log"),
+            "session_id": .string(sessionID.uuidString)
+        ]
+
+        let legacyResult = try await service.execute(args: baseArgs)
+        let explicitFalseResult = try await service.execute(args: baseArgs.merging([
+            "include_host_row_ids": .bool(false)
+        ]) { _, incoming in incoming })
+        let optedInResult = try await service.execute(args: baseArgs.merging([
+            "include_host_row_ids": .bool(true)
+        ]) { _, incoming in incoming })
+        let legacyXML = try XCTUnwrap(legacyResult.objectValue?["transcript_xml"]?.stringValue)
+        let explicitFalseXML = try XCTUnwrap(explicitFalseResult.objectValue?["transcript_xml"]?.stringValue)
+        let optedInXML = try XCTUnwrap(optedInResult.objectValue?["transcript_xml"]?.stringValue)
+
+        XCTAssertEqual(legacyXML, "<transcript>\n<user>Prompt</user>\n<assistant>Reply</assistant>\n</transcript>")
+        XCTAssertEqual(explicitFalseXML, legacyXML)
+        XCTAssertEqual(
+            optedInXML,
+            "<transcript>\n<user id=\"\(userRowID.uuidString)\">Prompt</user>\n<assistant id=\"\(assistantRowID.uuidString)\">Reply</assistant>\n</transcript>"
+        )
+    }
+
     func testGetLogReportsOnlyLeadingCompletedTurns() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }

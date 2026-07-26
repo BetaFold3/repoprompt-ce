@@ -66,6 +66,8 @@ struct AgentManageMCPToolService {
             return try await executeGetLog(args: args)
         case "extract_handoff", "handoff":
             return try await executeExtractHandoff(args: args)
+        case "fork_session":
+            return try await executeForkSession(args: args)
         case "create_session":
             return try await executeCreateSession(args: args)
         case "resume_session":
@@ -77,7 +79,7 @@ struct AgentManageMCPToolService {
         case "cleanup_sessions":
             return try await executeCleanupSessions(args: args)
         default:
-            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cleanup_sessions, or list_workflows.")
+            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, fork_session, create_session, resume_session, stop_session, cleanup_sessions, or list_workflows.")
         }
     }
 
@@ -374,6 +376,11 @@ struct AgentManageMCPToolService {
             name: "include_row_timestamps",
             defaultValue: false
         )
+        let includeHostRowIDs = try parseBool(
+            args["include_host_row_ids"],
+            name: "include_host_row_ids",
+            defaultValue: false
+        )
 
         let agentModeVM = targetWindow.agentModeViewModel
         let transcriptInfo = try await resolveTranscript(
@@ -404,7 +411,8 @@ struct AgentManageMCPToolService {
             "transcript_xml": .string(
                 AgentTranscriptIO.buildSpartanLogXML(
                     from: slicedTranscript,
-                    includeRowTimestamps: includeRowTimestamps
+                    includeRowTimestamps: includeRowTimestamps,
+                    includeHostRowIDs: includeHostRowIDs
                 )
             )
         ]
@@ -542,6 +550,120 @@ struct AgentManageMCPToolService {
             result["bytes_written"] = .int(writeResult.bytes)
         }
         return .object(result)
+    }
+
+    private func executeForkSession(args: [String: Value]) async throws -> Value {
+        let sessionReference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        guard UUID(uuidString: sessionReference) != nil else {
+            throw MCPError.invalidParams("session_id must be a valid UUID.")
+        }
+
+        let targetWindow = try requireTargetWindow()
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.fork_session.")
+        }
+        let destination = try resolveForkDestination(args: args, targetWindow: targetWindow)
+
+        let upToItemID: UUID?
+        if let rawCutoff = normalizedString(args["up_to_item_id"]) {
+            guard let parsed = UUID(uuidString: rawCutoff) else {
+                throw MCPError.invalidParams("up_to_item_id must be a valid UUID.")
+            }
+            upToItemID = parsed
+        } else {
+            upToItemID = nil
+        }
+
+        let agentModeVM = targetWindow.agentModeViewModel
+        let sessionInfo = try await resolveHandoffSession(
+            reference: sessionReference,
+            workspace: workspace,
+            targetWindow: targetWindow,
+            agentModeVM: agentModeVM
+        )
+        guard sessionInfo.isLive, let sourceTabID = sessionInfo.sourceTabID else {
+            throw MCPError.invalidParams("Session '\(sessionReference)' is persisted-only; fork_session requires a live source session.")
+        }
+        if let upToItemID,
+           !AgentTranscriptIO.isValidHandoffExportCutoffRowID(upToItemID, in: sessionInfo.transcript)
+        {
+            throw MCPError.invalidParams("up_to_item_id was not found in the session transcript.")
+        }
+
+        let destinationTabID = try await agentModeVM.prepareHandoffHeadless(
+            sourceTabID: sourceTabID,
+            upToItemID: upToItemID,
+            destinationAgent: destination.agent,
+            destinationModelRaw: destination.modelRaw,
+            destinationReasoningEffortRaw: destination.reasoningEffortRaw
+        )
+        guard let destinationSession = agentModeVM.session(for: destinationTabID, createIfNeeded: false),
+              let destinationSessionID = destinationSession.activeAgentSessionID
+        else {
+            throw MCPError.internalError("Forked destination session could not be resolved.")
+        }
+        let destinationName = targetWindow.workspaceManager.composeTab(with: destinationTabID)?.name ?? "Agent Session"
+        let descriptor = sessionSummaryObject(
+            sessionID: destinationSessionID,
+            name: destinationName,
+            lastModified: destinationSession.lastActivityAt,
+            itemCount: destinationSession.transcriptProjectionCounts.canonicalVisibleRowCount,
+            agentRaw: destinationSession.selectedAgent.rawValue,
+            modelRaw: destinationSession.selectedModelRaw,
+            stateRaw: destinationSession.runState.rawValue,
+            isLive: true,
+            parentSessionID: destinationSession.parentSessionID,
+            isMCPOriginated: destinationSession.isMCPOriginated,
+            origin: destinationSession.origin
+        )
+        return .object([
+            "status": .string("forked"),
+            "session": .object(descriptor)
+        ])
+    }
+
+    private func resolveForkDestination(
+        args: [String: Value],
+        targetWindow: WindowState
+    ) throws -> (agent: AgentProviderKind, modelRaw: String, reasoningEffortRaw: String?) {
+        let rawAgent = try requireNonEmptyString(args["destination_agent"], name: "destination_agent")
+        guard let agent = AgentProviderKind(rawValue: rawAgent) else {
+            throw MCPError.invalidParams("destination_agent is not a recognized host agent provider.")
+        }
+        let modelID = try requireNonEmptyString(args["destination_model_id"], name: "destination_model_id")
+        let availability = targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
+        guard let discoveryAgent = AgentModelCatalog.discoveryAgents(availability: availability).first(where: { $0.agent == agent }),
+              discoveryAgent.available
+        else {
+            throw MCPError.invalidParams("destination_agent '\(rawAgent)' is not available on this host.")
+        }
+        guard let parsedModelID = AgentModelSelectionID.parse(modelID),
+              parsedModelID.agentRaw == agent.rawValue,
+              let target = discoveryAgent.models
+              .flatMap(\.startTargets)
+              .first(where: { $0.selectionID.rawValue == modelID })
+        else {
+            throw MCPError.invalidParams("destination_model_id is not an available model for destination_agent '\(rawAgent)'.")
+        }
+
+        // list_agents emits a distinct compound model_id for each exact model/effort
+        // start target. destination_effort is therefore a consistency check for that
+        // target, not an independent family-level effort selector.
+        let catalogEffort = listAgentsEffortRaw(
+            agent: agent,
+            modelRaw: target.modelRaw,
+            fallback: target.reasoningEffort
+        )
+        let explicitEffort = normalizedString(args["destination_effort"])
+        if let explicitEffort {
+            guard let catalogEffort,
+                  catalogEffort.caseInsensitiveCompare(explicitEffort) == .orderedSame
+            else {
+                throw MCPError.invalidParams("destination_effort is not accepted for destination_model_id.")
+            }
+        }
+        let reasoningEffortRaw = agent == .codexExec ? (explicitEffort ?? catalogEffort) : nil
+        return (agent, target.modelRaw, reasoningEffortRaw)
     }
 
     private func executeCreateSession(args: [String: Value]) async throws -> Value {

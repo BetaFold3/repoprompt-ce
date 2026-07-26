@@ -211,6 +211,44 @@ final class RemoteTranscriptProjectorTests: XCTestCase {
         ])
     }
 
+    func testHostRowIDAttributesMapToClientItemsWithoutChangingLegacyProjection() {
+        let userHostRowID = UUID()
+        let toolHostRowID = UUID()
+        let projector = RemoteTranscriptProjector(remoteSessionID: "remote-session-host-row-ids")
+        let legacyXML = """
+        <user>Hello</user>
+        <tool_call name="read_file"/>
+        <assistant>Done</assistant>
+        <error>Failed</error>
+        """
+        let upgradedXML = """
+        <user id="\(userHostRowID.uuidString)">Hello</user>
+        <tool_call name="read_file" id="\(toolHostRowID.uuidString)"/>
+        <assistant>Done</assistant>
+        <error id="not-a-uuid">Failed</error>
+        """
+        func payload(xml: String) -> JSONValue {
+            .object([
+                "turn_offset": .int(0),
+                "returned_turn_count": .int(1),
+                "total_turns": .int(1),
+                "transcript_xml": .string(xml)
+            ])
+        }
+
+        let legacy = projector.projectGetLogResponse(payload(xml: legacyXML))
+        let upgraded = projector.projectGetLogResponse(payload(xml: upgradedXML))
+
+        XCTAssertEqual(upgraded.items, legacy.items)
+        XCTAssertTrue(legacy.hostRowIDByClientItemID.isEmpty)
+        XCTAssertEqual(upgraded.hostRowIDByClientItemID, [
+            upgraded.items[0].id: userHostRowID,
+            upgraded.items[1].id: toolHostRowID
+        ])
+        XCTAssertNil(upgraded.hostRowIDByClientItemID[upgraded.items[2].id])
+        XCTAssertNil(upgraded.hostRowIDByClientItemID[upgraded.items[3].id])
+    }
+
     func testProjectSnapshotParsesAgentReasoningEffort() {
         let projector = RemoteTranscriptProjector(remoteSessionID: "remote-session-projector-effort")
 

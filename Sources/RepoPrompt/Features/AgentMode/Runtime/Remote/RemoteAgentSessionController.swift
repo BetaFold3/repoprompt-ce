@@ -36,7 +36,7 @@ struct RemoteAgentSessionTaskRecoveryScheduler: RemoteAgentSessionRecoverySchedu
     }
 }
 
-struct RemoteAgentSessionRecoveryPolicy: Sendable {
+struct RemoteAgentSessionRecoveryPolicy {
     var staleIntervalSeconds: TimeInterval
     var retryDelaySeconds: [TimeInterval]
 
@@ -84,7 +84,11 @@ private enum RemoteLogPagingError: Error, CustomStringConvertible {
 }
 
 enum RemoteSessionEvent: Equatable {
-    case transcriptRows(items: [AgentChatItem], removedIDs: [UUID])
+    case transcriptRows(
+        items: [AgentChatItem],
+        removedIDs: [UUID],
+        hostRowIDByClientItemID: [UUID: UUID]
+    )
     case runState(AgentSessionRunState, pendingInteraction: RemotePendingInteraction?, statusText: String?)
     case interactionResolved(interactionID: String, resolvedBy: String?)
     case sessionExpired
@@ -137,6 +141,10 @@ actor RemoteAgentSessionController {
     /// `get_log_row_timestamps` still rejected the payload key, so every later
     /// fetch degrades to the legacy timestampless request.
     private var hostRejectedGetLogRowTimestamps = false
+    /// One-shot version-skew latch matching the timestamp fallback for hosts that
+    /// advertise `get_log_host_row_ids` but reject `include_host_row_ids`.
+    private var hostRejectedGetLogHostRowIDs = false
+    private var hostRowIDByClientItemID: [UUID: UUID] = [:]
     private var projectedRowIDsByPageOffset: [Int: Set<UUID>] = [:]
     private var lastCompletePageOffset: Int?
     private var lastLegacyAdvanceOffset: Int?
@@ -257,6 +265,11 @@ actor RemoteAgentSessionController {
             scheduledLogCatchUpDirty = false
             didReportLogCatchUpFailure = false
             resetLogReconciliationState()
+            eventsContinuation.yield(.transcriptRows(
+                items: [],
+                removedIDs: [],
+                hostRowIDByClientItemID: [:]
+            ))
         }
         didYieldSessionExpired = false
         lastKnownRunState = .running
@@ -299,6 +312,101 @@ actor RemoteAgentSessionController {
         didTerminalSettleReRead = false
         applySnapshot(response, frameType: "session_update")
         try await catchUpFromHost()
+    }
+
+    func fork(
+        upToClientItemID clientItemID: UUID,
+        destinationAgent: String,
+        destinationModelID: String,
+        destinationEffort: String?
+    ) async throws -> RemoteAgentSessionDescriptor {
+        try ensureNotShutdown()
+        guard let sessionID = remoteSessionID else { throw missingSessionError() }
+        try await requireHostFeature(
+            RemoteWireFeatures.forkSession,
+            operationDescription: "remote session forking"
+        )
+        try ensureCurrentSession(sessionID, operation: "fork_session")
+        let hostRowID = try requireHostRowID(forClientItemID: clientItemID)
+        var payload: [String: JSONValue] = [
+            "up_to_item_id": .string(hostRowID.uuidString),
+            "destination_agent": .string(destinationAgent),
+            "destination_model_id": .string(destinationModelID)
+        ]
+        if let destinationEffort {
+            payload["destination_effort"] = .string(destinationEffort)
+        }
+        let frame = RemoteClientFrame(
+            type: "fork_session",
+            requestID: makeRequestID(prefix: "fork"),
+            sessionID: sessionID,
+            payload: .object(payload)
+        )
+        let response = try await commandWithLedgerCompletionRetry(
+            frame,
+            operation: "fork_session"
+        )
+        guard let sessionValue = response.objectValue?["session"],
+              let descriptor = Self.sessionDescriptor(from: sessionValue)
+        else {
+            throw RemoteClientError.protocolViolation(
+                "fork_session response did not include a valid list_sessions session descriptor."
+            )
+        }
+        return descriptor
+    }
+
+    func extractHandoff(
+        upToClientItemID clientItemID: UUID,
+        maxTranscriptItems: Int? = nil,
+        maxToolArgsCharacters: Int? = nil
+    ) async throws -> String {
+        try ensureNotShutdown()
+        guard let sessionID = remoteSessionID else { throw missingSessionError() }
+        try await requireHostFeature(
+            RemoteWireFeatures.extractHandoff,
+            operationDescription: "remote handoff payload extraction"
+        )
+        try ensureCurrentSession(sessionID, operation: "extract_handoff")
+        let hostRowID = try requireHostRowID(forClientItemID: clientItemID)
+        var payload: [String: JSONValue] = [
+            "up_to_item_id": .string(hostRowID.uuidString)
+        ]
+        if let maxTranscriptItems {
+            payload["max_transcript_items"] = .int(maxTranscriptItems)
+        }
+        if let maxToolArgsCharacters {
+            payload["max_tool_args_characters"] = .int(maxToolArgsCharacters)
+        }
+        let frame = RemoteClientFrame(
+            type: "extract_handoff",
+            requestID: makeRequestID(prefix: "extract"),
+            sessionID: sessionID,
+            payload: .object(payload)
+        )
+        let response = try await commandWithTransportRetry(
+            frame,
+            operation: "extract_handoff",
+            mayRetryTransportLoss: true
+        )
+        guard let handoffXML = response.objectValue?["handoff_xml"]?.stringValue,
+              !handoffXML.isEmpty
+        else {
+            throw RemoteClientError.protocolViolation(
+                "extract_handoff response did not include the inline handoff XML payload."
+            )
+        }
+        return handoffXML
+    }
+
+    func supportsForkSessionFeature() async -> Bool {
+        guard !isShutdown else { return false }
+        do {
+            try await connection.ensureConnected()
+        } catch {
+            return false
+        }
+        return await connection.supportsHostFeature(RemoteWireFeatures.forkSession)
     }
 
     func respond(interactionID: String, payload: RemoteInteractionResponsePayload) async throws {
@@ -390,6 +498,16 @@ actor RemoteAgentSessionController {
             nextLogOffset: nextLogOffset
         )
     }
+
+    func hostRowID(forClientItemID clientItemID: UUID) -> UUID? {
+        hostRowIDByClientItemID[clientItemID]
+    }
+
+    #if DEBUG
+        func test_setHostRowID(_ hostRowID: UUID, forClientItemID clientItemID: UUID) {
+            hostRowIDByClientItemID[clientItemID] = hostRowID
+        }
+    #endif
 
     func unsubscribe() async {
         observationEnabled = false
@@ -674,6 +792,40 @@ actor RemoteAgentSessionController {
         }
     }
 
+    private func commandWithLedgerCompletionRetry(
+        _ frame: RemoteClientFrame,
+        operation: String
+    ) async throws -> JSONValue {
+        let retryDelaySeconds: TimeInterval = 0.25
+        let maximumWaitSeconds: TimeInterval = 30
+        var waitedSeconds: TimeInterval = 0
+        var response = try await commandWithTransportRetry(
+            frame,
+            operation: operation,
+            mayRetryTransportLoss: true
+        )
+        while Self.isLedgerInFlightResponse(response) {
+            guard waitedSeconds < maximumWaitSeconds else {
+                throw RemoteClientError.timeout(
+                    operation: "\(operation) ledger completion",
+                    seconds: maximumWaitSeconds
+                )
+            }
+            try await recoveryScheduler.sleep(seconds: retryDelaySeconds)
+            waitedSeconds += retryDelaySeconds
+            try ensureNotShutdown()
+            if let sessionID = frame.sessionID {
+                try ensureCurrentSession(sessionID, operation: operation)
+            }
+            response = try await commandWithTransportRetry(
+                frame,
+                operation: operation,
+                mayRetryTransportLoss: true
+            )
+        }
+        return response
+    }
+
     private func commandWithTransportRetry(
         _ frame: RemoteClientFrame,
         operation _: String,
@@ -927,39 +1079,53 @@ actor RemoteAgentSessionController {
         // read a stale-false feature and permanently project this page without dates.
         try await connection.ensureConnected()
         try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
-        let includeRowTimestamps = if hostRejectedGetLogRowTimestamps {
+        var includeRowTimestamps = if hostRejectedGetLogRowTimestamps {
             false
         } else {
             await connection.supportsHostFeature(RemoteWireFeatures.getLogRowTimestamps)
         }
         try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
-        Self.logger.log("remote get_log fetch session_id=\(sessionID, privacy: .public) offset=\(offset) limit=\(limit) row_ts=\(includeRowTimestamps)")
-        let pagePayload: JSONValue
-        do {
-            pagePayload = try await connection.command(makeGetLogFrame(
-                offset: offset,
-                limit: limit,
-                sessionID: sessionID,
-                includeRowTimestamps: includeRowTimestamps
-            ))
-        } catch let error as RemoteClientError where includeRowTimestamps
-            && error.commandError?.code == "unsupported_payload_key"
-        {
-            // Version-skew guard: a host (or stale gateway in between) may advertise the
-            // feature yet still reject the payload key. Latch legacy behavior for this
-            // controller's lifetime so transcript sync degrades instead of failing.
-            hostRejectedGetLogRowTimestamps = true
-            Self.logger.notice("remote get_log retrying without include_row_timestamps after unsupported_payload_key session_id=\(sessionID, privacy: .public)")
-            try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
-            pagePayload = try await connection.command(makeGetLogFrame(
-                offset: offset,
-                limit: limit,
-                sessionID: sessionID,
-                includeRowTimestamps: false
-            ))
+        var includeHostRowIDs = if hostRejectedGetLogHostRowIDs {
+            false
+        } else {
+            await connection.supportsHostFeature(RemoteWireFeatures.getLogHostRowIDs)
         }
         try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
-        guard let page = projector?.projectGetLogResponse(pagePayload) else {
+        Self.logger.log("remote get_log fetch session_id=\(sessionID, privacy: .public) offset=\(offset) limit=\(limit) row_ts=\(includeRowTimestamps) host_row_ids=\(includeHostRowIDs)")
+        var resolvedPagePayload: JSONValue?
+        while resolvedPagePayload == nil {
+            do {
+                resolvedPagePayload = try await connection.command(makeGetLogFrame(
+                    offset: offset,
+                    limit: limit,
+                    sessionID: sessionID,
+                    includeRowTimestamps: includeRowTimestamps,
+                    includeHostRowIDs: includeHostRowIDs
+                ))
+            } catch let error as RemoteClientError {
+                guard error.commandError?.code == "unsupported_payload_key" else {
+                    throw error
+                }
+                // Prefer dropping the newest additive key first. If an older skewed host
+                // rejects timestamps instead, a second retry applies the existing latch.
+                if includeHostRowIDs {
+                    hostRejectedGetLogHostRowIDs = true
+                    includeHostRowIDs = false
+                    Self.logger.notice("remote get_log retrying without include_host_row_ids after unsupported_payload_key session_id=\(sessionID, privacy: .public)")
+                } else if includeRowTimestamps {
+                    hostRejectedGetLogRowTimestamps = true
+                    includeRowTimestamps = false
+                    Self.logger.notice("remote get_log retrying without include_row_timestamps after unsupported_payload_key session_id=\(sessionID, privacy: .public)")
+                } else {
+                    throw error
+                }
+                try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+            }
+        }
+        try ensureObservationCurrent(generation: lifecycleGeneration, sessionID: sessionID)
+        guard let pagePayload = resolvedPagePayload,
+              let page = projector?.projectGetLogResponse(pagePayload)
+        else {
             throw RemoteLogPagingError.missingProjector
         }
         return page
@@ -969,7 +1135,8 @@ actor RemoteAgentSessionController {
         offset: Int,
         limit: Int,
         sessionID: String,
-        includeRowTimestamps: Bool
+        includeRowTimestamps: Bool,
+        includeHostRowIDs: Bool
     ) -> RemoteClientFrame {
         var payload: [String: JSONValue] = [
             "offset": .int(offset),
@@ -977,6 +1144,9 @@ actor RemoteAgentSessionController {
         ]
         if includeRowTimestamps {
             payload["include_row_timestamps"] = .bool(true)
+        }
+        if includeHostRowIDs {
+            payload["include_host_row_ids"] = .bool(true)
         }
         return RemoteClientFrame(
             type: "get_log",
@@ -992,9 +1162,17 @@ actor RemoteAgentSessionController {
     }
 
     private func emitLogPage(_ page: RemoteProjectedLogPage, reconciliation: LogPageReconciliation) {
+        hostRowIDByClientItemID.merge(page.hostRowIDByClientItemID) { _, incoming in incoming }
         let removedIDs = reconcileProjectedRows(for: page, reconciliation: reconciliation)
-        if !page.items.isEmpty || !removedIDs.isEmpty {
-            eventsContinuation.yield(.transcriptRows(items: page.items, removedIDs: removedIDs))
+        for removedID in removedIDs {
+            hostRowIDByClientItemID.removeValue(forKey: removedID)
+        }
+        if !page.items.isEmpty || !removedIDs.isEmpty || !page.hostRowIDByClientItemID.isEmpty {
+            eventsContinuation.yield(.transcriptRows(
+                items: page.items,
+                removedIDs: removedIDs,
+                hostRowIDByClientItemID: hostRowIDByClientItemID
+            ))
         }
     }
 
@@ -1022,6 +1200,7 @@ actor RemoteAgentSessionController {
     }
 
     private func resetLogReconciliationState() {
+        hostRowIDByClientItemID.removeAll()
         projectedRowIDsByPageOffset.removeAll()
         lastCompletePageOffset = nil
         lastLegacyAdvanceOffset = nil
@@ -1177,6 +1356,12 @@ actor RemoteAgentSessionController {
 
             let progressBeforeAttempt = staleProgressGeneration
             Self.logger.notice("remote stale recovery attempted session_id=\(sessionID, privacy: .public) attempt=\(attempt) max_attempts=\(attemptCount)")
+            recordStaleRecovery(
+                outcome: .started,
+                sessionID: sessionID,
+                attempt: attempt,
+                attemptLimit: attemptCount
+            )
             do {
                 try await catchUpFromHost()
             } catch {
@@ -1185,6 +1370,12 @@ actor RemoteAgentSessionController {
                     lifecycleGeneration: lifecycleGeneration,
                     sessionID: sessionID
                 ) else { return }
+                recordStaleRecovery(
+                    outcome: .failed,
+                    sessionID: sessionID,
+                    attempt: attempt,
+                    attemptLimit: attemptCount
+                )
             }
             guard isStaleRecoveryCurrent(
                 generation: generation,
@@ -1322,8 +1513,44 @@ actor RemoteAgentSessionController {
         else { throw CancellationError() }
     }
 
+    private func ensureCurrentSession(_ expectedSessionID: String, operation: String) throws {
+        try ensureNotShutdown()
+        guard remoteSessionID == expectedSessionID else {
+            throw RemoteClientError.protocolViolation(
+                "Remote session changed while preparing \(operation); choose the cutoff again."
+            )
+        }
+    }
+
     private func missingSessionError() -> RemoteClientError {
         .sessionExpired(.init(code: "missing_session", message: "Remote session is not attached."))
+    }
+
+    private func requireHostFeature(
+        _ feature: String,
+        operationDescription: String
+    ) async throws {
+        try await connection.ensureConnected()
+        guard await connection.supportsHostFeature(feature) else {
+            throw RemoteClientError.command(.init(
+                code: "unsupported_host_feature",
+                message: "\(hostDisplayName) does not support \(operationDescription). Update RepoPrompt CE on the host and try again."
+            ))
+        }
+    }
+
+    private func requireHostRowID(forClientItemID clientItemID: UUID) throws -> UUID {
+        guard let hostRowID = hostRowIDByClientItemID[clientItemID] else {
+            throw RemoteClientError.command(.init(
+                code: "host_row_id_unavailable",
+                message: "This transcript row is not yet mapped to its host cutoff ID. Wait for remote transcript sync and try again."
+            ))
+        }
+        return hostRowID
+    }
+
+    private static func isLedgerInFlightResponse(_ response: JSONValue) -> Bool {
+        response.objectValue?["status"]?.stringValue == "in_flight"
     }
 
     private static func errorLogMetadata(_ error: Error) -> (type: String, code: String, description: String) {
@@ -1361,24 +1588,26 @@ actor RemoteAgentSessionController {
 
     static func sessionDescriptors(from payload: JSONValue) -> [RemoteAgentSessionDescriptor] {
         let sessions = payload.objectValue?["sessions"]?.arrayValue ?? []
-        return sessions.compactMap { value in
-            guard let object = value.objectValue,
-                  let sessionID = normalizedDescriptorString(object["session_id"]?.stringValue)
-            else { return nil }
-            let agentObject = object["agent"]?.objectValue
-            return RemoteAgentSessionDescriptor(
-                sessionID: sessionID,
-                name: normalizedDescriptorString(object["name"]?.stringValue),
-                stateRaw: object["raw_state"]?.stringValue ?? object["state"]?.stringValue,
-                agentKindRaw: agentObject?["id"]?.stringValue ?? object["agent"]?.stringValue,
-                agentModelRaw: agentObject?["model"]?.stringValue,
-                parentSessionID: normalizedDescriptorString(object["parent_session_id"]?.stringValue),
-                lastModified: descriptorDate(from: object["last_modified"]?.stringValue),
-                itemCount: object["item_count"]?.intValue,
-                originSummary: normalizedDescriptorString(object["origin"]?.stringValue),
-                isLive: object["is_live"]?.boolValue
-            )
-        }
+        return sessions.compactMap(sessionDescriptor(from:))
+    }
+
+    static func sessionDescriptor(from value: JSONValue) -> RemoteAgentSessionDescriptor? {
+        guard let object = value.objectValue,
+              let sessionID = normalizedDescriptorString(object["session_id"]?.stringValue)
+        else { return nil }
+        let agentObject = object["agent"]?.objectValue
+        return RemoteAgentSessionDescriptor(
+            sessionID: sessionID,
+            name: normalizedDescriptorString(object["name"]?.stringValue),
+            stateRaw: object["raw_state"]?.stringValue ?? object["state"]?.stringValue,
+            agentKindRaw: agentObject?["id"]?.stringValue ?? object["agent"]?.stringValue,
+            agentModelRaw: agentObject?["model"]?.stringValue,
+            parentSessionID: normalizedDescriptorString(object["parent_session_id"]?.stringValue),
+            lastModified: descriptorDate(from: object["last_modified"]?.stringValue),
+            itemCount: object["item_count"]?.intValue,
+            originSummary: normalizedDescriptorString(object["origin"]?.stringValue),
+            isLive: object["is_live"]?.boolValue
+        )
     }
 
     private static func normalizedDescriptorString(_ value: String?) -> String? {
