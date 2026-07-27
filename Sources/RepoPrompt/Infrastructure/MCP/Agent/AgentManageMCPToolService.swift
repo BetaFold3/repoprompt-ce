@@ -616,6 +616,10 @@ struct AgentManageMCPToolService {
             isMCPOriginated: destinationSession.isMCPOriginated,
             origin: destinationSession.origin
         )
+        // Envelope stability: the remote gateway extracts `session.session_id`
+        // from this exact shape to record session→window routing affinity
+        // (GatewayRuntime.recordForkSessionAffinityIfNeeded). Keep the
+        // `session` key and descriptor `session_id` field stable.
         return .object([
             "status": .string("forked"),
             "session": .object(descriptor)

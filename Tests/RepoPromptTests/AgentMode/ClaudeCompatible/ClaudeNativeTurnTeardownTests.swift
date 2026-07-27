@@ -41,6 +41,26 @@ final class ClaudeNativeTurnTeardownTests: XCTestCase {
         XCTAssertFalse(inFlight, "A post-shutdown trailing result must not resurrect turn tracking.")
     }
 
+    func testReplayedResultWithoutShutdownIsRecoveredWithoutTrapping() async {
+        let controller = makeController()
+
+        // Mirrors the 2026-07-27 19:28 host crash: reattaching an existing CLI
+        // session replayed the final `result`/`message_stop` of an
+        // already-completed turn while the controller was fully live
+        // (isShuttingDown == false) with no pending turn ID. The former
+        // assertionFailure killed the debug host; the signal must be recorded
+        // and recovered instead.
+        await controller.test_handleStreamPayload([
+            "type": "result",
+            "subtype": "success",
+            "stop_reason": "end_turn",
+            "result": "replayed final message"
+        ])
+
+        let inFlight = await controller.hasTurnInFlight
+        XCTAssertFalse(inFlight, "A replayed live-path result must not resurrect turn tracking.")
+    }
+
     func testShutdownClearsInterruptMarkerSoALaterResultIsNotMisreportedAsCancelled() async {
         let controller = makeController()
         await controller.test_setTurnWasInterrupted(true)

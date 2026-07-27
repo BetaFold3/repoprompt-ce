@@ -2639,6 +2639,159 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(calls.count(where: { $0.name == "bind_context" }), 2)
     }
 
+    /// Incident 2026-07-27 integrated lock (both root causes together): on an
+    /// unbound multi-window connection, the full fork → subscribe → catch-up
+    /// poll → get_log → first steer sequence for the forked session routes on
+    /// recorded affinity with no binding_required error and no session_expired
+    /// push.
+    func testUnboundMultiWindowForkAttachObserveAndSteerRoutesWithoutBindingOrExpiry() async throws {
+        let forkedSessionID = "99999999-9999-9999-9999-999999999999"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([sessionID])),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "status": .string("forked"),
+                "session": .object([
+                    "session_id": .string(forkedSessionID),
+                    "name": .string("Forked Session"),
+                    "state": .string("idle"),
+                    "is_live": .bool(true)
+                ])
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: forkedSessionID,
+                status: "completed"
+            ))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: forkedSessionID,
+                status: "completed"
+            ))),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "session_id": .string(forkedSessionID),
+                "turn_offset": .int(0),
+                "turn_limit": .int(20),
+                "returned_turn_count": .int(0),
+                "total_turns": .int(0),
+                "completed_turn_count": .int(0),
+                "transcript_xml": .string("<log/>")
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: forkedSessionID,
+                status: "running"
+            )))
+        ])
+        let runtime = try await makeRuntime(
+            connection: connection,
+            bindingState: .bindingRequired("bind first"),
+            configureObservationRouting: true
+        )
+        let sink = RecordingFrameSink()
+        let sinkID = UUID()
+
+        let forkResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "fork_session",
+                requestID: "r-e2e-fork",
+                sessionID: sessionID,
+                payload: .object([
+                    "destination_agent": .string("claudeCode"),
+                    "destination_model_id": .string("claudeCode__opus")
+                ])
+            ),
+            deviceID: "device",
+            sinkID: sinkID,
+            sink: sink
+        )
+        XCTAssertEqual(forkResponse?.type, "command_result")
+
+        let subscribeRequest = RemoteClientFrame(
+            type: "subscribe",
+            requestID: "r-e2e-sub",
+            sessionID: forkedSessionID
+        )
+        let subscribeResponse = await runtime.handle(
+            subscribeRequest,
+            deviceID: "device",
+            sinkID: sinkID,
+            sink: sink
+        )
+        XCTAssertEqual(subscribeResponse?.type, "command_result")
+        let queuedSubscribeResponse = try XCTUnwrap(subscribeResponse)
+        await sink.send(queuedSubscribeResponse)
+        await runtime.didQueueResponse(
+            for: subscribeRequest,
+            response: queuedSubscribeResponse,
+            deviceID: "device",
+            sinkID: sinkID
+        )
+        // Serialize: wait for the deferred watch validation poll before issuing
+        // the client's catch-up commands so scripted responses stay aligned.
+        var calls = await connection.calls
+        for _ in 0 ..< 100 where !calls.contains(where: {
+            $0.name == "agent_run" && $0.arguments["op"] == .string("poll")
+        }) {
+            try? await Task.sleep(for: .milliseconds(20))
+            calls = await connection.calls
+        }
+
+        let pollResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "poll",
+                requestID: "r-e2e-poll",
+                sessionID: forkedSessionID,
+                payload: .object(["timeout": .int(0)])
+            ),
+            deviceID: "device",
+            sinkID: sinkID,
+            sink: sink
+        )
+        XCTAssertEqual(pollResponse?.type, "command_result")
+
+        let getLogResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "get_log",
+                requestID: "r-e2e-log",
+                sessionID: forkedSessionID,
+                payload: .object(["limit": .int(20)])
+            ),
+            deviceID: "device",
+            sinkID: sinkID,
+            sink: sink
+        )
+        XCTAssertEqual(getLogResponse?.type, "command_result")
+
+        let steerResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "steer",
+                requestID: "r-e2e-steer",
+                sessionID: forkedSessionID,
+                payload: .object(["message": .string("continue")])
+            ),
+            deviceID: "device",
+            sinkID: sinkID,
+            sink: sink
+        )
+        XCTAssertEqual(steerResponse?.type, "command_result")
+
+        calls = await connection.calls
+        // One discovery sweep total (to route the fork to its source window);
+        // every forked-session command rode the recorded affinity.
+        XCTAssertEqual(calls.count(where: { $0.name == "bind_context" }), 1)
+        let forkedSessionCalls = calls.filter { call in
+            call.arguments["session_id"] == .string(forkedSessionID)
+        }
+        XCTAssertFalse(forkedSessionCalls.isEmpty)
+        XCTAssertTrue(forkedSessionCalls.allSatisfy { $0.arguments["_windowID"] == .int(2) })
+        let steerCall = try XCTUnwrap(calls.last { $0.arguments["op"] == .string("steer") })
+        XCTAssertEqual(steerCall.arguments["session_id"], .string(forkedSessionID))
+        XCTAssertEqual(steerCall.arguments["_windowID"], .int(2))
+
+        let frames = await sink.frames
+        XCTAssertTrue(frames.filter { $0.type == "session_expired" }.isEmpty)
+        XCTAssertTrue(frames.filter { $0.payload?.objectValue?["code"]?.stringValue == "binding_required" }.isEmpty)
+    }
+
     /// Incident 2026-07-27 companion lock: subscribe validation of a session
     /// whose app snapshot is terminal-but-real (e.g. a fork-staged session
     /// reported as completed) must not emit `session_expired`.

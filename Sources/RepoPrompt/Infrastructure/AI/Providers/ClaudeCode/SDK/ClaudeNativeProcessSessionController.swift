@@ -1475,15 +1475,21 @@ final actor ClaudeNativeProcessSessionController {
 
     /// Records a turn-completion signal that arrived with no pending turn ID.
     ///
-    /// During teardown this is expected rather than a defect: `shutdown()` and
-    /// `failProtocolAndShutdown()` clear the turn-ID queue synchronously, while the stdout
-    /// consumer can already hold a framed line. Cancellation is cooperative and the consume
-    /// path performs no cancellation check, so the subprocess's trailing `result` (a normal
-    /// interrupt side effect) is still delivered after the queue was cleared. Trapping there
-    /// killed DEBUG builds on ordinary interrupt-then-teardown sequences.
-    ///
-    /// Outside teardown the invariant still holds, so the DEBUG tripwire for genuine protocol
-    /// drift is preserved. Callers keep their existing recovery path either way.
+    /// This is an observed-benign signal on at least three routes, so it is a logged
+    /// diagnostic rather than a DEBUG trap:
+    /// - Teardown: `shutdown()`/`failProtocolAndShutdown()` clear the turn-ID queue
+    ///   synchronously while the stdout consumer already holds a framed line, so the
+    ///   subprocess's trailing `result` (a normal interrupt side effect) lands after
+    ///   the queue was cleared.
+    /// - Straggler lines: cancellation is cooperative and the consume path performs no
+    ///   cancellation check, so a line from an old process can be processed after
+    ///   `startOrResume` reset `isShuttingDown`.
+    /// - Resume replay (crash 2026-07-27 19:28, `isShuttingDown == false`): reattaching
+    ///   an existing CLI session can replay the final `result`/`message_stop` of a turn
+    ///   this process instance never started, killing the debug host mid-session when
+    ///   this was an `assertionFailure`.
+    /// Callers keep their existing recovery path; the raw-event record preserves the
+    /// diagnostic trail for genuine protocol drift.
     private func noteMissingPendingTurnID(context: String) {
         writeRawEventLogRecord(kind: "turn.pendingIDMissing", payload: [
             "context": context,
@@ -1491,8 +1497,9 @@ final actor ClaudeNativeProcessSessionController {
             "turnWasInterrupted": turnWasInterrupted,
             "pendingAuthoritativeStatusCount": pendingAuthoritativeTurnStatuses.count
         ] as [String: Any])
-        guard !isShuttingDown else { return }
-        assertionFailure("[ClaudeController] \(context) with no pending turn IDs — possible protocol drift")
+        if config.enableDebugLogging {
+            print("[ClaudeNativeSession] \(context) with no pending turn IDs — recovered (shutting_down=\(isShuttingDown))")
+        }
     }
 
     static func shouldSuppressUserFacingStreamResult(_ result: AIStreamResult) -> Bool {
