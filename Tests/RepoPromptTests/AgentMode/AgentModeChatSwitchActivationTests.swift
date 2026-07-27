@@ -74,6 +74,37 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     }
 
+    func testPrepareHandoffHeadlessKeepsForegroundTabAndStagesFullTranscriptPayload() async throws {
+        try await withFixture { fixture in
+            await fixture.window.promptManager.switchComposeTab(fixture.tabBID)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: nil,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+
+            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, fixture.tabBID)
+            XCTAssertEqual(fixture.viewModel.currentTabID, fixture.tabBID)
+            XCTAssertNotEqual(destinationTabID, fixture.tabBID)
+
+            let destinationSession = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            XCTAssertEqual(destinationSession.items.map(\.text), fixture.tabATexts)
+            XCTAssertNil(destinationSession.pendingHandoff.sourceItemID)
+            let pendingPayload = try XCTUnwrap(destinationSession.pendingHandoff.payload)
+            XCTAssertTrue(pendingPayload.hasPrefix("<forked_session"))
+
+            let composed = fixture.viewModel.prependPendingHandoffIfNeeded(
+                "continue from the fork",
+                session: destinationSession
+            )
+            XCTAssertEqual(composed, pendingPayload + "\n\ncontinue from the fork")
+        }
+    }
+
     func testWarmSwitchPublishesDestinationTranscriptBeforeSwitchReturns() async throws {
         try await withFixture { fixture in
             assertPresentation(

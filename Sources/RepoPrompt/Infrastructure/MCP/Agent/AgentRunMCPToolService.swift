@@ -979,7 +979,7 @@ struct AgentRunMCPToolService {
     private func executePollMany(args: [String: Value]) async throws -> Value {
         let references = try parseSessionIDArray(args)
         let targetWindow = try requireTargetWindow()
-        let agentModeVM = targetWindow.agentModeViewModel
+        let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
         return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots)
@@ -987,7 +987,7 @@ struct AgentRunMCPToolService {
 
     private func executeCancel(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
-        let agentModeVM = targetWindow.agentModeViewModel
+        let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
         if initialSnapshot.status == .expired {
@@ -2519,6 +2519,9 @@ struct AgentRunMCPToolService {
             if let indexedSnapshot = indexedSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
                 return indexedSnapshot
             }
+            if let liveSnapshot = liveUnregisteredSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+                return liveSnapshot
+            }
             return Self.agentRunExpiredSnapshot(sessionID: sessionID)
         }
         if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
@@ -2530,7 +2533,50 @@ struct AgentRunMCPToolService {
         if let indexedSnapshot = indexedSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
             return indexedSnapshot
         }
+        if let liveSnapshot = liveUnregisteredSessionSnapshot(sessionID: sessionID, agentModeVM: agentModeVM) {
+            return liveSnapshot
+        }
         return Self.agentRunExpiredSnapshot(sessionID: sessionID)
+    }
+
+    /// Last-resort fallback before synthesizing an expired snapshot: a session
+    /// that is live in the window (bound to an open tab) but has no MCP control
+    /// registration, no stored snapshot, and no session-index entry yet — for
+    /// example a fork-staged destination session that has never run. Reporting
+    /// such a session as expired is a lie the remote gateway watch relays
+    /// verbatim as `session_expired`, failing freshly forked tabs on paired
+    /// clients (incident 2026-07-27). Mirrors the indexed projection's
+    /// conservative status collapse so both unregistered paths share one
+    /// vocabulary. Truly unknown/deleted sessions still synthesize expired.
+    private func liveUnregisteredSessionSnapshot(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel
+    ) -> AgentRunMCPSnapshot? {
+        guard let live = (try? agentModeVM.authoritativeLiveSession(for: sessionID)) ?? nil,
+              live.activeAgentSessionID == sessionID
+        else { return nil }
+        let rawState = live.runState.rawValue
+        let status = indexedSessionStatus(from: rawState)
+        let statusText = indexedSessionStatusText(rawState: rawState, status: status)
+        return AgentRunMCPSnapshot(
+            sessionID: sessionID,
+            tabID: live.tabID,
+            sessionName: agentModeVM.sessionIndex[sessionID]?.name,
+            agentRaw: live.selectedAgent.rawValue,
+            agentDisplayName: live.selectedAgent.displayName,
+            modelRaw: live.selectedModelRaw,
+            reasoningEffortRaw: live.selectedReasoningEffortRaw,
+            status: status,
+            statusText: statusText,
+            latestAssistantPreview: nil,
+            interaction: nil,
+            transcriptItemCount: live.transcriptProjectionCounts.canonicalVisibleRowCount,
+            updatedAt: live.lastActivityAt,
+            parentSessionID: live.parentSessionID,
+            failureReason: AgentRunMCPSnapshot.FailureReason.classify(status: status, statusText: statusText),
+            worktreeBindings: [],
+            activeWorktreeMerges: live.worktreeMergeOperations.activeWorktreeMergeSummaries
+        )
     }
 
     private func indexedSessionSnapshot(

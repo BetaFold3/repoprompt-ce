@@ -17279,7 +17279,9 @@ final class AgentModeViewModel: ObservableObject {
     var canForkCurrentSession: Bool {
         guard let tabID = currentTabID,
               let session = sessions[tabID] else { return false }
-        guard session.remoteHost == nil else { return false }
+        if session.remoteHost != nil {
+            return remoteCoordinator.canForkRemoteSession(session: session)
+        }
         if session.transcript.turns.contains(where: { $0.request != nil }) {
             return true
         }
@@ -17405,12 +17407,12 @@ final class AgentModeViewModel: ObservableObject {
         return session.transcript
     }
 
-    /// Build transcript items prefix for the destination session (copies items up through upToItemID,
-    /// forces streaming off, drops thinking items).
+    /// Build transcript items for the destination session (copies through `upToItemID`,
+    /// or the full transcript when no cutoff is supplied; forces streaming off and drops thinking items).
     @MainActor
     func buildHandoffTranscriptItems(
         sourceTranscript: AgentTranscript,
-        upToItemID: UUID
+        upToItemID: UUID?
     ) -> [AgentChatItem] {
         AgentTranscriptIO.buildHandoffTranscriptItems(from: sourceTranscript, upToRowID: upToItemID)
     }
@@ -17427,25 +17429,27 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
-    /// Handoff the current session to a new tab with transcript migration and deferred payload injection.
-    /// Creates a duplicate tab, migrates transcript items up to the cutoff, sets the pending handoff
-    /// payload (delivered on the destination tab's first user send), and switches to the new tab.
+    /// Prepare a handoff fork without changing the foreground compose tab or active bindings.
+    /// The source is explicitly addressed so MCP callers can fork any live session in the window.
+    /// A nil cutoff migrates and exports the full transcript.
     ///
-    /// - Returns: The destination tab ID on success.
+    /// - Returns: The background destination tab ID on success.
     @MainActor
     @discardableResult
-    func prepareHandoffToNewTab(
-        upToItemID: UUID,
+    func prepareHandoffHeadless(
+        sourceTabID: UUID,
+        upToItemID: UUID?,
         destinationAgent: AgentProviderKind,
         destinationModelRaw: String,
         destinationReasoningEffortRaw: String?
     ) async throws -> UUID {
         guard let promptManager,
-              let workspaceManager,
-              let sourceTabID = currentTabID,
-              let sourceSession = sessions[sourceTabID]
+              let workspaceManager
         else {
             throw AgentSessionError.noActiveWorkspace
+        }
+        guard let sourceSession = sessions[sourceTabID] else {
+            throw AgentSessionError.emptySession
         }
 
         if let remoteReason = localSessionMutationDisabledReason(for: sourceSession) {
@@ -17468,7 +17472,7 @@ final class AgentModeViewModel: ObservableObject {
         )
         let sourceTabName = workspaceManager.composeTabName(with: sourceTabID) ?? "Session"
 
-        // 2) Build migrated transcript items (prefix copy up to cutoff, no thinking, no streaming)
+        // 2) Build migrated transcript items (prefix or full copy, no thinking, no streaming).
         let migratedItems = buildHandoffTranscriptItems(
             sourceTranscript: sourceTranscript,
             upToItemID: upToItemID
@@ -17484,24 +17488,23 @@ final class AgentModeViewModel: ObservableObject {
         }
         let destTabID = destTab.id
 
-        // 4) Clone Oracle/chat sessions before switching tabs
-        var clonedActiveChatSessionID: UUID?
+        // 4) Clone Oracle/chat sessions without focusing the destination.
         if let oracleViewModel {
             do {
                 _ = try await oracleViewModel.cloneChatSessions(fromTabID: sourceTabID, toTabID: destTabID)
-                clonedActiveChatSessionID = workspaceManager.activeChatSessionID(forTabID: destTabID)
             } catch {
                 print("[AgentVM] Warning: failed to clone chat sessions for handoff: \(error)")
             }
         }
 
-        // 5) Create destination agent session with migrated transcript + pending payload
+        // 5) Create destination agent session with migrated transcript + pending payload.
         let destSession = session(for: destTabID)
         destSession.selectedAgent = destinationAgent
         destSession.selectedModelRaw = destinationModelRaw
         destSession.selectedReasoningEffortRaw = destinationReasoningEffortRaw
         destSession.autoEditEnabled = sourceSession.autoEditEnabled
         destSession.replaceItems(migratedItems)
+        refreshDerivedTranscriptState(for: destSession)
         destSession.hasSentFirstMessage = migratedItems.contains { $0.kind == .user }
         destSession.pendingHandoff = PendingHandoffState(
             payload: payload,
@@ -17511,14 +17514,43 @@ final class AgentModeViewModel: ObservableObject {
             isStagedForSend: false
         )
         guard ensureSessionBoundToTab(destSession) != nil else {
+            await promptManager.closeComposeTab(destTabID)
             throw PersistentBindingMutationError.staleTransition
         }
 
-        // 6) Persist destination session/tab mapping
+        // 6) Persist destination session/tab mapping.
         scheduleSave(for: destTabID)
+        return destTabID
+    }
 
-        // 7) Switch to the destination tab, focus the cloned active Oracle chat if one
-        //    exists, then update active bindings for the handoff session.
+    /// Handoff the current session to a new tab, then foreground the prepared destination.
+    @MainActor
+    @discardableResult
+    func prepareHandoffToNewTab(
+        upToItemID: UUID,
+        destinationAgent: AgentProviderKind,
+        destinationModelRaw: String,
+        destinationReasoningEffortRaw: String?
+    ) async throws -> UUID {
+        guard let promptManager,
+              let workspaceManager,
+              let sourceTabID = currentTabID
+        else {
+            throw AgentSessionError.noActiveWorkspace
+        }
+
+        let destTabID = try await prepareHandoffHeadless(
+            sourceTabID: sourceTabID,
+            upToItemID: upToItemID,
+            destinationAgent: destinationAgent,
+            destinationModelRaw: destinationModelRaw,
+            destinationReasoningEffortRaw: destinationReasoningEffortRaw
+        )
+        let clonedActiveChatSessionID = workspaceManager.activeChatSessionID(forTabID: destTabID)
+        guard let destSession = sessions[destTabID] else {
+            throw AgentSessionError.emptySession
+        }
+
         await promptManager.switchComposeTab(destTabID)
         if let oracleViewModel,
            let clonedActiveChatSessionID
@@ -17526,7 +17558,6 @@ final class AgentModeViewModel: ObservableObject {
             await oracleViewModel.focusSession(clonedActiveChatSessionID, forTab: destTabID)
         }
         updateBindingsFromSession(destSession)
-
         return destTabID
     }
 

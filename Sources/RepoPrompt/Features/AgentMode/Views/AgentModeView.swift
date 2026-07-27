@@ -2777,7 +2777,7 @@ struct AgentModeChatDetailView: View {
                 isRemoteSession: isRemoteSession
             ),
             promptManager: promptManager,
-            handoffConfig: runInteractionSnapshot.canForkCurrentSession ? handoffConfig(for: item.id) : nil,
+            handoffConfig: handoffConfig(for: item.id),
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
             rawToolResultPayloadRenderRevision: transcriptSnapshot.presentation
                 .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
@@ -3247,9 +3247,24 @@ struct AgentModeChatDetailView: View {
 
     // MARK: - Handoff
 
-    private func handoffConfig(for itemID: UUID) -> AgentHandoffConfig {
-        AgentHandoffConfig(
+    private func handoffConfig(for itemID: UUID) -> AgentHandoffConfig? {
+        guard runInteractionSnapshot.canForkCurrentSession,
+              let tabID = currentTabID,
+              let session = agentModeVM.sessions[tabID]
+        else { return nil }
+
+        let remoteHostID = session.remoteHost?.hostID
+        let resolvedHostRowID = remoteHostID.map { _ in
+            agentModeVM.remoteCoordinator.hostRowID(for: session, clientItemID: itemID)
+        } ?? nil
+        guard let destinationSource = AgentHandoffConfig.destinationSource(
+            remoteHostID: remoteHostID,
+            resolvedHostRowID: resolvedHostRowID
+        ) else { return nil }
+
+        return AgentHandoffConfig(
             itemID: itemID,
+            destinationSource: destinationSource,
             defaultDestinationAgent: runInteractionSnapshot.selectedAgent,
             defaultModelRaw: runInteractionSnapshot.selectedModelRaw,
             defaultReasoningEffortRaw: runInteractionSnapshot.selectedReasoningEffortRaw,
@@ -3259,18 +3274,43 @@ struct AgentModeChatDetailView: View {
             modelOptionsProvider: { [weak agentModeVM] agent in
                 agentModeVM?.modelOptions(for: agent) ?? []
             },
+            remoteCatalogSnapshot: remoteHostID == nil ? nil : agentModeVM.remoteHostCatalogSnapshot(for: session),
             windowID: windowID,
             buildPayloadForClipboard: { [weak agentModeVM] in
-                await agentModeVM?.buildHandoffPayload(upToItemID: itemID) ?? ""
+                guard let vm = agentModeVM else {
+                    throw AgentHandoffConfigurationError.sourceUnavailable
+                }
+                if remoteHostID != nil {
+                    return try await vm.remoteCoordinator.extractHandoff(
+                        session: session,
+                        upToClientItemID: itemID
+                    )
+                }
+                return await vm.buildHandoffPayload(upToItemID: itemID)
             },
-            performHandoff: { [weak agentModeVM] selection in
-                guard let vm = agentModeVM else { return }
-                try await vm.prepareHandoffToNewTab(
-                    upToItemID: itemID,
-                    destinationAgent: selection.agent,
-                    destinationModelRaw: selection.modelRaw,
-                    destinationReasoningEffortRaw: selection.reasoningEffortRaw
-                )
+            performHandoff: { [weak agentModeVM] destination in
+                guard let vm = agentModeVM else {
+                    throw AgentHandoffConfigurationError.sourceUnavailable
+                }
+                switch (destinationSource, destination) {
+                case let (.localProviders, .local(selection)):
+                    try await vm.prepareHandoffToNewTab(
+                        upToItemID: itemID,
+                        destinationAgent: selection.agent,
+                        destinationModelRaw: selection.modelRaw,
+                        destinationReasoningEffortRaw: selection.reasoningEffortRaw
+                    )
+                case let (.remoteCatalog, .remote(agentID, modelID, effort)):
+                    try await vm.remoteCoordinator.fork(
+                        session: session,
+                        upToClientItemID: itemID,
+                        destinationAgent: agentID,
+                        destinationModelID: modelID,
+                        destinationEffort: effort
+                    )
+                default:
+                    throw AgentHandoffConfigurationError.invalidDestination
+                }
             }
         )
     }

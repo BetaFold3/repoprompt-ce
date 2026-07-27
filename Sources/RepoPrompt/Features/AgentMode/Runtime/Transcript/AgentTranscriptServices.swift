@@ -3541,6 +3541,7 @@ enum AgentTranscriptIO {
         var payload: Payload
         let dropPriority: ForkItemDropPriority
         let turnID: UUID?
+        let hostRowID: UUID
         var timestamp: Date?
     }
 
@@ -3550,7 +3551,8 @@ enum AgentTranscriptIO {
         maxTranscriptItems: Int = 200,
         maxToolArgsCharacters: Int = 2000,
         preserveIntermediateAssistantNarration: Bool = false,
-        includeRowTimestamps: Bool = false
+        includeRowTimestamps: Bool = false,
+        includeHostRowIDs: Bool = false
     ) -> String {
         let entries = handoffExportEntries(
             from: transcript,
@@ -3587,23 +3589,23 @@ enum AgentTranscriptIO {
                 defer { flatIndex += 1 }
                 switch row.kind {
                 case .user:
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "user", text: row.text), dropPriority: .essential, turnID: tid, timestamp: row.timestamp))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "user", text: row.text), dropPriority: .essential, turnID: tid, hostRowID: row.id, timestamp: row.timestamp))
                     pos += 1
                 case .assistant, .assistantInline:
                     guard row.hasDisplayableAssistantBody else { continue }
                     let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     let isConclusion = conclusionIndices.contains(flatIndex)
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "assistant", text: trimmed), dropPriority: isConclusion ? .essential : .supplemental, turnID: tid, timestamp: row.timestamp))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "assistant", text: trimmed), dropPriority: isConclusion ? .essential : .supplemental, turnID: tid, hostRowID: row.id, timestamp: row.timestamp))
                     pos += 1
                 case .system:
                     let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "system", text: trimmed), dropPriority: .context, turnID: tid, timestamp: row.timestamp))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "system", text: trimmed), dropPriority: .context, turnID: tid, hostRowID: row.id, timestamp: row.timestamp))
                     pos += 1
                 case .error:
                     let trimmed = row.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
-                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "error", text: trimmed), dropPriority: .context, turnID: tid, timestamp: row.timestamp))
+                    forkItems.append(ForkItem(pos: pos, payload: .tagged(tag: "error", text: trimmed), dropPriority: .context, turnID: tid, hostRowID: row.id, timestamp: row.timestamp))
                     pos += 1
                 case .toolCall:
                     guard !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(row),
@@ -3615,6 +3617,7 @@ enum AgentTranscriptIO {
                         payload: .toolCall(name: toolName, args: args, resultStatusWord: resultStatusWord),
                         dropPriority: .toolCall,
                         turnID: tid,
+                        hostRowID: row.id,
                         timestamp: row.timestamp
                     ))
                     if let execution = AgentTranscriptToolNormalizer.toolExecution(for: row) {
@@ -3724,21 +3727,26 @@ enum AgentTranscriptIO {
 
         // --- Phase 3: Render survivors in chronological order ---
         enum ForkTranscriptOutput {
-            case tagged(tag: String, text: String, ts: Date?)
+            case tagged(tag: String, text: String, ts: Date?, hostRowID: UUID)
             case rawXML(String)
         }
         var outputs: [ForkTranscriptOutput] = []
         func appendOutput(_ output: ForkTranscriptOutput) {
             switch output {
-            case let .tagged(tag, text, ts):
+            case let .tagged(tag, text, ts, hostRowID):
                 if tag == "system",
-                   case let .tagged(lastTag, lastText, lastTS)? = outputs.last,
+                   case let .tagged(lastTag, lastText, lastTS, lastHostRowID)? = outputs.last,
                    lastTag == "system"
                 {
-                    // Merged consecutive system rows keep the first row's timestamp.
-                    outputs[outputs.count - 1] = .tagged(tag: "system", text: lastText + "\n" + text, ts: lastTS)
+                    // Merged consecutive system rows keep the first row's timestamp and identity.
+                    outputs[outputs.count - 1] = .tagged(
+                        tag: "system",
+                        text: lastText + "\n" + text,
+                        ts: lastTS,
+                        hostRowID: lastHostRowID
+                    )
                 } else {
-                    outputs.append(.tagged(tag: tag, text: text, ts: ts))
+                    outputs.append(.tagged(tag: tag, text: text, ts: ts, hostRowID: hostRowID))
                 }
             case .rawXML:
                 outputs.append(output)
@@ -3748,7 +3756,7 @@ enum AgentTranscriptIO {
         for item in surviving {
             switch item.payload {
             case let .tagged(tag, text):
-                appendOutput(.tagged(tag: tag, text: text, ts: item.timestamp))
+                appendOutput(.tagged(tag: tag, text: text, ts: item.timestamp, hostRowID: item.hostRowID))
             case let .rawXML(xml):
                 appendOutput(.rawXML(xml))
             case let .toolCall(name, args, resultStatusWord):
@@ -3756,7 +3764,8 @@ enum AgentTranscriptIO {
                     name: name,
                     args: args,
                     resultStatusWord: resultStatusWord,
-                    timestamp: includeRowTimestamps ? item.timestamp : nil
+                    timestamp: includeRowTimestamps ? item.timestamp : nil,
+                    hostRowID: includeHostRowIDs ? item.hostRowID : nil
                 )))
             }
         }
@@ -3764,8 +3773,8 @@ enum AgentTranscriptIO {
         var lines = ["<transcript>"]
         for output in outputs {
             switch output {
-            case let .tagged(tag, text, ts):
-                lines.append("<\(tag)\(rowTimestampAttribute(includeRowTimestamps ? ts : nil))>\(text)</\(tag)>")
+            case let .tagged(tag, text, ts, hostRowID):
+                lines.append("<\(tag)\(rowHostIDAttribute(includeHostRowIDs ? hostRowID : nil))\(rowTimestampAttribute(includeRowTimestamps ? ts : nil))>\(text)</\(tag)>")
             case let .rawXML(xml):
                 lines.append(xml)
             }
@@ -3781,15 +3790,22 @@ enum AgentTranscriptIO {
         name: String,
         args: String,
         resultStatusWord: String?,
-        timestamp: Date? = nil
+        timestamp: Date? = nil,
+        hostRowID: UUID? = nil
     ) -> String {
         let escapedName = forkTranscriptXMLAttributeEscaped(name)
+        let id = rowHostIDAttribute(hostRowID)
         let ts = rowTimestampAttribute(timestamp)
         let callXML = args.isEmpty
-            ? "<tool_call name=\"\(escapedName)\"\(ts)/>"
-            : "<tool_call name=\"\(escapedName)\"\(ts)>\(args)</tool_call>"
+            ? "<tool_call name=\"\(escapedName)\"\(id)\(ts)/>"
+            : "<tool_call name=\"\(escapedName)\"\(id)\(ts)>\(args)</tool_call>"
         guard let resultStatusWord else { return callXML }
         return callXML + "\n<tool_result name=\"\(escapedName)\" status=\"\(resultStatusWord)\"/>"
+    }
+
+    private static func rowHostIDAttribute(_ id: UUID?) -> String {
+        guard let id else { return "" }
+        return " id=\"\(id.uuidString)\""
     }
 
     /// Renders an optional per-row wire timestamp attribute as Unix epoch seconds with
@@ -3876,18 +3892,20 @@ enum AgentTranscriptIO {
         from transcript: AgentTranscript,
         maxTranscriptItems: Int = 200,
         maxToolArgsCharacters: Int = 2000,
-        includeRowTimestamps: Bool = false
+        includeRowTimestamps: Bool = false,
+        includeHostRowIDs: Bool = false
     ) -> String {
         buildForkTranscriptXML(
             from: transcript,
             maxTranscriptItems: maxTranscriptItems,
             maxToolArgsCharacters: maxToolArgsCharacters,
             preserveIntermediateAssistantNarration: true,
-            includeRowTimestamps: includeRowTimestamps
+            includeRowTimestamps: includeRowTimestamps,
+            includeHostRowIDs: includeHostRowIDs
         )
     }
 
-    static func buildHandoffTranscriptItems(from transcript: AgentTranscript, upToRowID: UUID) -> [AgentChatItem] {
+    static func buildHandoffTranscriptItems(from transcript: AgentTranscript, upToRowID: UUID?) -> [AgentChatItem] {
         handoffExportEntries(from: transcript, upToRowID: upToRowID).compactMap(\.migratedItem).enumerated().map { index, item in
             var copy = item
             copy.isStreaming = false

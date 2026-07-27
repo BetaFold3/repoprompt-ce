@@ -337,6 +337,232 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     }
 
     @MainActor
+    func testRemoteForkMaterializesAndOpensOnceThenForceRefreshesForDuplicateDescriptor() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .loaded(.init(
+            hostWorkspaceID: nil,
+            hostWorkspaceName: nil,
+            sessions: [],
+            fetchedAt: Date()
+        )))
+        let fixture = try await makeFixture(store: store)
+        let sourceRemoteSessionID = UUID().uuidString
+        let destinationRemoteSessionID = UUID().uuidString
+        let hostRowID = UUID()
+        let connection = HandoffRecordingConnection(
+            sourceSessionID: sourceRemoteSessionID,
+            hostRowID: hostRowID,
+            destinationSessionID: destinationRemoteSessionID,
+            advertisedFeatures: [RemoteWireFeatures.forkSession, RemoteWireFeatures.getLogHostRowIDs]
+        )
+        let sourceSession = fixture.viewModel.session(for: fixture.initialTabID)
+        sourceSession.remoteHost = binding(host: fixture.host, remoteSessionID: sourceRemoteSessionID)
+        let controller = try RemoteAgentSessionController(
+            binding: XCTUnwrap(sourceSession.remoteHost),
+            connection: connection
+        )
+        fixture.coordinator.test_installController(controller, for: sourceSession, hostID: fixture.host.id)
+        defer { fixture.coordinator.stop(tabID: sourceSession.tabID) }
+
+        try await controller.attachAndCatchUp()
+        let clientItemID = try XCTUnwrap(
+            RemoteTranscriptProjector(remoteSessionID: sourceRemoteSessionID)
+                .projectGetLogResponse(HandoffRecordingConnection.logPayload(
+                    sourceSessionID: sourceRemoteSessionID,
+                    hostRowID: hostRowID
+                ))
+                .items.first?.id
+        )
+        await waitUntil {
+            fixture.coordinator.hostRowID(for: sourceSession, clientItemID: clientItemID) == hostRowID
+        }
+        var attachedTabIDs: [UUID] = []
+        fixture.coordinator.test_setMaterializedRemoteWorkspaceAttachHandler { [coordinator = fixture.coordinator, host = fixture.host] session in
+            attachedTabIDs.append(session.tabID)
+            // Run the real controller attach against the recording stub so the test
+            // pins the wire contract (subscribe for the destination session), not just
+            // the coordinator wiring.
+            let destinationController = try RemoteAgentSessionController(
+                binding: XCTUnwrap(session.remoteHost),
+                connection: connection
+            )
+            coordinator.test_installController(destinationController, for: session, hostID: host.id)
+            try await destinationController.attachAndCatchUp()
+        }
+
+        try await fixture.coordinator.fork(
+            session: sourceSession,
+            upToClientItemID: clientItemID,
+            destinationAgent: AgentProviderKind.codexExec.rawValue,
+            destinationModelID: "gpt-5.4",
+            destinationEffort: "high"
+        )
+        let materialized = try XCTUnwrap(fixture.viewModel.sessions.values.first {
+            $0.remoteHost?.remoteSessionID == destinationRemoteSessionID
+        })
+        XCTAssertEqual(materialized.remoteHost?.hostID, fixture.host.id)
+        XCTAssertEqual(fixture.workspaceManager.activeWorkspace?.activeComposeTabID, materialized.tabID)
+        XCTAssertEqual(store.fetchForceRefreshValues, [true])
+        // Fork must attach the materialized session so the client subscribes to the
+        // forked session's host push events before any steer.
+        XCTAssertEqual(attachedTabIDs, [materialized.tabID])
+        let destinationSubscribes = await connection.subscribeBatches()
+            .filter { $0 == [destinationRemoteSessionID] }
+        XCTAssertEqual(destinationSubscribes.count, 1)
+
+        try await fixture.coordinator.fork(
+            session: sourceSession,
+            upToClientItemID: clientItemID,
+            destinationAgent: AgentProviderKind.codexExec.rawValue,
+            destinationModelID: "gpt-5.4",
+            destinationEffort: "high"
+        )
+        XCTAssertEqual(
+            fixture.viewModel.sessions.values.count { $0.remoteHost?.remoteSessionID == destinationRemoteSessionID },
+            1
+        )
+        XCTAssertEqual(store.fetchForceRefreshValues, [true, true])
+        // Duplicate descriptor: no new materialization, so no additional attach.
+        XCTAssertEqual(attachedTabIDs, [materialized.tabID])
+        let destinationSubscribesAfterDuplicate = await connection.subscribeBatches()
+            .filter { $0 == [destinationRemoteSessionID] }
+        XCTAssertEqual(destinationSubscribesAfterDuplicate.count, 1)
+        let forkFrames = await connection.frames(type: "fork_session")
+        XCTAssertEqual(forkFrames.count, 2)
+        fixture.coordinator.stop(tabID: materialized.tabID)
+    }
+
+    @MainActor
+    func testRemoteForkCapabilityAndHostRowMirrorInvalidateRunInteractionUIState() async throws {
+        let store = StubWorkspaceSessionCatalogStore(state: .loaded(.init(
+            hostWorkspaceID: nil,
+            hostWorkspaceName: nil,
+            sessions: [],
+            fetchedAt: Date()
+        )))
+        let catalog = RemoteHostAgentCatalog(agents: [.hostDefault])
+        let fixture = try await makeFixture(store: store, catalogProvider: { _ in catalog })
+        let sourceRemoteSessionID = UUID().uuidString
+        let hostRowID = UUID()
+        let connection = HandoffRecordingConnection(
+            sourceSessionID: sourceRemoteSessionID,
+            hostRowID: hostRowID,
+            destinationSessionID: UUID().uuidString,
+            advertisedFeatures: [RemoteWireFeatures.forkSession, RemoteWireFeatures.getLogHostRowIDs]
+        )
+        let sourceSession = fixture.viewModel.session(for: fixture.initialTabID)
+        sourceSession.remoteHost = binding(host: fixture.host, remoteSessionID: sourceRemoteSessionID)
+        let controller = try RemoteAgentSessionController(
+            binding: XCTUnwrap(sourceSession.remoteHost),
+            connection: connection
+        )
+        fixture.coordinator.test_installController(controller, for: sourceSession, hostID: fixture.host.id)
+        defer { fixture.coordinator.stop(tabID: sourceSession.tabID) }
+        let clientItemID = try XCTUnwrap(
+            RemoteTranscriptProjector(remoteSessionID: sourceRemoteSessionID)
+                .projectGetLogResponse(HandoffRecordingConnection.logPayload(
+                    sourceSessionID: sourceRemoteSessionID,
+                    hostRowID: hostRowID
+                ))
+                .items.first?.id
+        )
+
+        let beforeRowMirror = fixture.viewModel.test_syncRunInteractionCallCount
+        try await controller.attachAndCatchUp()
+        await waitUntil {
+            fixture.coordinator.hostRowID(for: sourceSession, clientItemID: clientItemID) == hostRowID
+        }
+        XCTAssertGreaterThan(fixture.viewModel.test_syncRunInteractionCallCount, beforeRowMirror)
+
+        await waitUntil {
+            fixture.coordinator.canForkRemoteSession(session: sourceSession)
+        }
+        XCTAssertTrue(fixture.coordinator.canForkRemoteSession(session: sourceSession))
+    }
+
+    @MainActor
+    func testCanForkCurrentSessionReflectsCapableAndLegacyHostsWithoutChangingLocalGate() async throws {
+        let catalog = RemoteHostAgentCatalog.degraded
+        let capableStore = StubWorkspaceSessionCatalogStore(state: .loaded(.init(
+            hostWorkspaceID: nil,
+            hostWorkspaceName: nil,
+            sessions: [],
+            fetchedAt: Date()
+        )))
+        let capable = try await makeFixture(store: capableStore, catalogProvider: { _ in catalog })
+        let capableSession = capable.viewModel.session(for: capable.initialTabID)
+        let capableConnection = HandoffRecordingConnection(
+            sourceSessionID: UUID().uuidString,
+            hostRowID: UUID(),
+            destinationSessionID: UUID().uuidString,
+            advertisedFeatures: [RemoteWireFeatures.forkSession]
+        )
+        capableSession.remoteHost = binding(
+            host: capable.host,
+            remoteSessionID: UUID().uuidString
+        )
+        let capableController = try RemoteAgentSessionController(
+            binding: XCTUnwrap(capableSession.remoteHost),
+            connection: capableConnection
+        )
+        capable.coordinator.test_installController(
+            capableController,
+            for: capableSession,
+            hostID: capable.host.id
+        )
+        defer { capable.coordinator.stop(tabID: capableSession.tabID) }
+
+        let beforeCapableProbe = capable.viewModel.test_syncRunInteractionCallCount
+        XCTAssertFalse(capable.viewModel.canForkCurrentSession)
+        await waitUntil {
+            capable.viewModel.canForkCurrentSession
+        }
+        XCTAssertTrue(capable.viewModel.canForkCurrentSession)
+        XCTAssertGreaterThan(capable.viewModel.test_syncRunInteractionCallCount, beforeCapableProbe)
+
+        capableSession.remoteHost = nil
+        capableSession.replaceItems([])
+        XCTAssertFalse(capable.viewModel.canForkCurrentSession)
+        capableSession.replaceItems([.user("local turn", sequenceIndex: 0)])
+        XCTAssertTrue(capable.viewModel.canForkCurrentSession)
+
+        let legacyStore = StubWorkspaceSessionCatalogStore(state: .loaded(.init(
+            hostWorkspaceID: nil,
+            hostWorkspaceName: nil,
+            sessions: [],
+            fetchedAt: Date()
+        )))
+        let legacy = try await makeFixture(store: legacyStore, catalogProvider: { _ in catalog })
+        let legacySession = legacy.viewModel.session(for: legacy.initialTabID)
+        let legacyConnection = HandoffRecordingConnection(
+            sourceSessionID: UUID().uuidString,
+            hostRowID: UUID(),
+            destinationSessionID: UUID().uuidString,
+            advertisedFeatures: []
+        )
+        legacySession.remoteHost = binding(
+            host: legacy.host,
+            remoteSessionID: UUID().uuidString
+        )
+        let legacyController = try RemoteAgentSessionController(
+            binding: XCTUnwrap(legacySession.remoteHost),
+            connection: legacyConnection
+        )
+        legacy.coordinator.test_installController(
+            legacyController,
+            for: legacySession,
+            hostID: legacy.host.id
+        )
+        defer { legacy.coordinator.stop(tabID: legacySession.tabID) }
+
+        let beforeLegacyProbe = legacy.viewModel.test_syncRunInteractionCallCount
+        XCTAssertFalse(legacy.viewModel.canForkCurrentSession)
+        await waitUntil {
+            legacy.viewModel.test_syncRunInteractionCallCount > beforeLegacyProbe
+        }
+        XCTAssertFalse(legacy.viewModel.canForkCurrentSession)
+    }
+
+    @MainActor
     func testWorkspacePickupAttachFailureKeepsTabAndAppendsSystemMessage() async throws {
         let store = StubWorkspaceSessionCatalogStore(state: .loaded(.init(
             hostWorkspaceID: nil,
@@ -1095,6 +1321,10 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         let connection = BlockingFailingResendConnection()
         let remoteHost = try XCTUnwrap(session.remoteHost)
         let controller = RemoteAgentSessionController(binding: remoteHost, connection: connection)
+        // Model a previously attached session (the production resend reality) so the
+        // steer observation preflight no-ops instead of attaching via the blocking
+        // stub, preserving this test's original command choreography.
+        await controller.test_markObservationAttached()
         fixture.coordinator.test_installController(controller, for: session, hostID: fixture.host.id)
 
         fixture.viewModel.resendUndeliveredRemoteUserTurn(tabID: session.tabID, itemID: userItem.id)
@@ -1134,6 +1364,10 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         let connection = BlockingFailingResendConnection()
         let remoteHost = try XCTUnwrap(session.remoteHost)
         let controller = RemoteAgentSessionController(binding: remoteHost, connection: connection)
+        // Model a previously attached session (the production resend reality) so the
+        // steer observation preflight no-ops instead of attaching via the blocking
+        // stub, preserving this test's original command choreography.
+        await controller.test_markObservationAttached()
         fixture.coordinator.test_installController(controller, for: session, hostID: fixture.host.id)
 
         fixture.viewModel.resendUndeliveredRemoteUserTurn(tabID: session.tabID, itemID: userItem.id)
@@ -2130,7 +2364,8 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     private func makeFixture(
         store: StubWorkspaceSessionCatalogStore,
         workspaceOpenConnection: (any RemoteWorkspaceSessionCatalogConnection)? = nil,
-        grantedScopes: Set<String>? = nil
+        grantedScopes: Set<String>? = nil,
+        catalogProvider: (@MainActor (String) -> RemoteHostAgentCatalog?)? = nil
     ) async throws -> Fixture {
         let directory = try RemoteHostTestSupport.temporaryDirectory(testCase: self)
         let registry = RemoteHostRegistry(url: RemoteHostTestSupport.registryURL(in: directory))
@@ -2176,6 +2411,12 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         prompt.loadComposeTabsFromWorkspace(workspace)
 
         let coordinator = RemoteAgentModeCoordinator(
+            catalogProvider: { hostID in
+                catalogProvider?(hostID) ?? RemoteHostCatalog.shared.cachedNonDegradedCatalog(for: hostID)
+            },
+            hostRecordProvider: { hostID in
+                hostID == host.id ? host : nil
+            },
             workspaceSessionCatalogStore: store,
             workspaceOpenConnectionProvider: workspaceOpenConnection.map { connection in
                 { _ in connection }
@@ -2396,6 +2637,94 @@ private actor WorkspaceOpenRecordingConnection: RemoteWorkspaceSessionCatalogCon
 
     func frames() -> [RemoteClientFrame] {
         recordedFrames
+    }
+}
+
+private actor HandoffRecordingConnection: RemoteAgentSessionConnection {
+    private let sourceSessionID: String
+    private let hostRowID: UUID
+    private let destinationSessionID: String
+    private let advertisedFeatures: Set<String>
+    private var recordedFrames: [RemoteClientFrame] = []
+    private var subscribedSessionIDBatches: [[String]] = []
+
+    init(
+        sourceSessionID: String,
+        hostRowID: UUID,
+        destinationSessionID: String,
+        advertisedFeatures: Set<String>
+    ) {
+        self.sourceSessionID = sourceSessionID
+        self.hostRowID = hostRowID
+        self.destinationSessionID = destinationSessionID
+        self.advertisedFeatures = advertisedFeatures
+    }
+
+    func command(_ frame: RemoteClientFrame, timeout _: TimeInterval) async throws -> JSONValue {
+        recordedFrames.append(frame)
+        switch frame.type {
+        case "poll":
+            return .object([
+                "status": .string("completed"),
+                "session_id": .string(frame.sessionID ?? sourceSessionID)
+            ])
+        case "get_log":
+            return Self.logPayload(sourceSessionID: sourceSessionID, hostRowID: hostRowID)
+        case "fork_session":
+            return .object([
+                "status": .string("forked"),
+                "session": .object([
+                    "session_id": .string(destinationSessionID),
+                    "name": .string("Forked on host"),
+                    "raw_state": .string("completed"),
+                    "agent": .object([
+                        "id": .string(AgentProviderKind.codexExec.rawValue),
+                        "model": .string("gpt-5.4")
+                    ]),
+                    "item_count": .int(0),
+                    "origin": .string("user"),
+                    "is_live": .bool(true)
+                ])
+            ])
+        case "extract_handoff":
+            return .object([
+                "status": .string("ok"),
+                "handoff_xml": .string("<forked_session/>")
+            ])
+        default:
+            return .object([:])
+        }
+    }
+
+    func ensureConnected() async throws {}
+
+    func subscribe(sessionIDs: [String]) async throws {
+        subscribedSessionIDBatches.append(sessionIDs)
+    }
+
+    func unsubscribe(sessionIDs _: [String]) async throws {}
+
+    func supportsHostFeature(_ feature: String) -> Bool {
+        advertisedFeatures.contains(feature)
+    }
+
+    func subscribeBatches() -> [[String]] {
+        subscribedSessionIDBatches
+    }
+
+    func frames(type: String) -> [RemoteClientFrame] {
+        recordedFrames.filter { $0.type == type }
+    }
+
+    nonisolated static func logPayload(sourceSessionID _: String, hostRowID: UUID) -> JSONValue {
+        .object([
+            "turn_offset": .int(0),
+            "turn_limit": .int(20),
+            "returned_turn_count": .int(1),
+            "total_turns": .int(1),
+            "completed_turn_count": .int(1),
+            "transcript_xml": .string("<user id=\"\(hostRowID.uuidString)\">Prompt</user>")
+        ])
     }
 }
 

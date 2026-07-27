@@ -2447,6 +2447,89 @@ final class RemoteAgentSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testSteerAttachesObservationForNeverAttachedSessionBeforeSending() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Terminal Child Steer")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        let sessionID = "remote-child-terminal-steer"
+        session.remoteHost = makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 0)
+        session.parentSessionID = UUID()
+        session.runState = .completed
+
+        // Restore deliberately skips attaching terminal child sessions.
+        fixture.coordinator.attachPersistedSessionIfNeeded(session)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(fixture.coordinator.test_lifecycleCounts().controllers, 0)
+
+        let connection = RecordingRemoteAgentSessionConnection(responses: [
+            "poll": [
+                Self.snapshotPayload(status: "completed", sessionID: sessionID),
+                Self.snapshotPayload(status: "completed", sessionID: sessionID)
+            ],
+            "steer": [Self.snapshotPayload(status: "running", sessionID: sessionID)]
+        ])
+        let controller = try RemoteAgentSessionController(
+            binding: XCTUnwrap(session.remoteHost),
+            connection: connection
+        )
+        let fanoutConnection = RemoteHostConnection(hostID: session.remoteHost?.hostID ?? "host-abc")
+        fixture.coordinator.test_attachController(
+            tabID: fixture.tabID,
+            hostID: session.remoteHost?.hostID ?? "host-abc",
+            controller: controller,
+            connection: fanoutConnection
+        )
+
+        // The first steer must self-heal observation: subscribe + catch-up, then send.
+        try await fixture.coordinator.steer(session: session, text: "Continue")
+
+        let subscribeCount = await connection.subscribeCallCount()
+        let steerCount = await connection.commandCount(type: "steer")
+        let attached = await controller.hasAttachedObservation()
+        XCTAssertEqual(subscribeCount, 1)
+        XCTAssertEqual(steerCount, 1)
+        XCTAssertTrue(attached)
+        fixture.coordinator.stop(tabID: fixture.tabID)
+    }
+
+    @MainActor
+    func testSteerWithheldWhenObservationAttachFailsHard() async throws {
+        let fixture = try await makeRemoteNamingFixture(tabTitle: "Attach Fail Steer")
+        let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
+        let sessionID = "remote-attach-fail-steer"
+        session.remoteHost = makeBinding(remoteSessionID: sessionID, lastAppliedSeq: 0, nextLogOffset: 0)
+
+        let connection = RecordingRemoteAgentSessionConnection(
+            subscribeErrors: [RemoteClientError.protocolViolation("subscribe rejected")]
+        )
+        let controller = try RemoteAgentSessionController(
+            binding: XCTUnwrap(session.remoteHost),
+            connection: connection
+        )
+        let fanoutConnection = RemoteHostConnection(hostID: session.remoteHost?.hostID ?? "host-abc")
+        fixture.coordinator.test_attachController(
+            tabID: fixture.tabID,
+            hostID: session.remoteHost?.hostID ?? "host-abc",
+            controller: controller,
+            connection: fanoutConnection
+        )
+
+        do {
+            try await fixture.coordinator.steer(session: session, text: "Continue")
+            XCTFail("Expected steer to be withheld when observation attach fails hard")
+        } catch {
+            // Hard (non-transient) attach failure must surface as a send failure.
+        }
+
+        let subscribeCount = await connection.subscribeCallCount()
+        let steerCount = await connection.commandCount(type: "steer")
+        let attached = await controller.hasAttachedObservation()
+        XCTAssertEqual(subscribeCount, 1)
+        XCTAssertEqual(steerCount, 0)
+        XCTAssertFalse(attached)
+        fixture.coordinator.stop(tabID: fixture.tabID)
+    }
+
+    @MainActor
     func testInboundRunStateEventBumpsParentLastActivityAndIndexSavedAt() async throws {
         let fixture = try await makeRemoteNamingFixture(tabTitle: "Remote Parent")
         let session = try XCTUnwrap(fixture.viewModel.sessions[fixture.tabID])
@@ -2576,7 +2659,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
 
         let toolCall = Self.remoteToolCall(name: "read_file")
-        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: []), tabID: fixture.tabID)
+        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: [], hostRowIDByClientItemID: [:]), tabID: fixture.tabID)
 
         let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
         XCTAssertNotNil(settledTool.toolResultJSON)
@@ -2613,7 +2696,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         XCTAssertEqual(session.runState, .cancelled)
 
         let toolCall = Self.remoteToolCall(name: "read_file")
-        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: []), tabID: fixture.tabID)
+        fixture.coordinator.test_handleEvent(.transcriptRows(items: [toolCall], removedIDs: [], hostRowIDByClientItemID: [:]), tabID: fixture.tabID)
 
         let settledTool = try XCTUnwrap(session.items.first { $0.kind == .toolCall })
         XCTAssertEqual(settledTool.toolIsError, true)
@@ -3359,7 +3442,7 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         func record(_ event: RemoteSessionEvent) {
             switch event {
-            case let .transcriptRows(rows, _):
+            case let .transcriptRows(rows, _, _):
                 transcriptRows.append(rows)
             case let .systemMessage(message):
                 systemMessages.append(message)

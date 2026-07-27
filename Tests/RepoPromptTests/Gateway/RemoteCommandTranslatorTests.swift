@@ -78,7 +78,7 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         }
     }
 
-    func testGetLogForwardsIncludeRowTimestampsAndStillRejectsUnknownKeys() throws {
+    func testGetLogForwardsOptionalRowMetadataAndStillRejectsUnknownKeys() throws {
         let sid = "11111111-1111-1111-1111-111111111111"
         let call = try RemoteCommandTranslator().translate(RemoteClientFrame(
             type: "get_log",
@@ -86,12 +86,14 @@ final class RemoteCommandTranslatorTests: XCTestCase {
             payload: .object([
                 "offset": .int(0),
                 "limit": .int(20),
-                "include_row_timestamps": .bool(true)
+                "include_row_timestamps": .bool(true),
+                "include_host_row_ids": .bool(true)
             ])
         ))
         XCTAssertEqual(call.toolName, "agent_manage")
         XCTAssertEqual(call.arguments["op"], .string("get_log"))
         XCTAssertEqual(call.arguments["include_row_timestamps"], .bool(true))
+        XCTAssertEqual(call.arguments["include_host_row_ids"], .bool(true))
 
         // The whitelist still rejects any other unknown key.
         XCTAssertThrowsError(try RemoteCommandTranslator().translate(RemoteClientFrame(
@@ -103,6 +105,108 @@ final class RemoteCommandTranslatorTests: XCTestCase {
                 error as? RemoteCommandTranslatorError,
                 .unsupportedPayloadKey(operation: "get_log", key: "verbose")
             )
+        }
+    }
+
+    func testHandoffFramesMapAllowedPayloadsWithoutForwardingRequestID() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let cases: [(frame: RemoteClientFrame, op: String, expected: [String: Value])] = [
+            (
+                RemoteClientFrame(
+                    type: "fork_session",
+                    requestID: "fork-request-1",
+                    sessionID: sid,
+                    payload: .object([
+                        "up_to_item_id": .string("22222222-2222-2222-2222-222222222222"),
+                        "destination_agent": .string("pair"),
+                        "destination_model_id": .string("gpt-5.4"),
+                        "destination_effort": .string("high")
+                    ])
+                ),
+                "fork_session",
+                [
+                    "up_to_item_id": .string("22222222-2222-2222-2222-222222222222"),
+                    "destination_agent": .string("pair"),
+                    "destination_model_id": .string("gpt-5.4"),
+                    "destination_effort": .string("high")
+                ]
+            ),
+            (
+                RemoteClientFrame(
+                    type: "extract_handoff",
+                    sessionID: sid,
+                    payload: .object([
+                        "up_to_item_id": .string("22222222-2222-2222-2222-222222222222"),
+                        "max_transcript_items": .int(40),
+                        "max_tool_args_characters": .int(2000)
+                    ])
+                ),
+                "extract_handoff",
+                [
+                    "up_to_item_id": .string("22222222-2222-2222-2222-222222222222"),
+                    "max_transcript_items": .int(40),
+                    "max_tool_args_characters": .int(2000)
+                ]
+            )
+        ]
+
+        for (frame, op, expected) in cases {
+            let call = try RemoteCommandTranslator().translate(frame)
+            XCTAssertEqual(call.toolName, "agent_manage", frame.type)
+            XCTAssertEqual(call.arguments["op"], .string(op), frame.type)
+            XCTAssertEqual(call.arguments["session_id"], .string(sid), frame.type)
+            XCTAssertEqual(call.arguments["_rawJSON"], .bool(true), frame.type)
+            XCTAssertNil(call.arguments["request_id"], frame.type)
+            XCTAssertEqual(call.timeout, 60, frame.type)
+            for (key, value) in expected {
+                XCTAssertEqual(call.arguments[key], value, "\(frame.type).\(key)")
+            }
+        }
+    }
+
+    func testHandoffFramesRejectUnknownKeysAndMissingSessionID() throws {
+        for type in ["fork_session", "extract_handoff"] {
+            XCTAssertThrowsError(try RemoteCommandTranslator().translate(RemoteClientFrame(
+                type: type,
+                requestID: type == "fork_session" ? "fork-request-1" : nil,
+                sessionID: "11111111-1111-1111-1111-111111111111",
+                payload: .object(["unsupported": .bool(true)])
+            )), type) { error in
+                XCTAssertEqual(
+                    error as? RemoteCommandTranslatorError,
+                    .unsupportedPayloadKey(operation: type, key: "unsupported")
+                )
+            }
+
+            XCTAssertThrowsError(try RemoteCommandTranslator().translate(RemoteClientFrame(
+                type: type,
+                requestID: type == "fork_session" ? "fork-request-2" : nil,
+                payload: .object([:])
+            )), type) { error in
+                XCTAssertEqual(error as? RemoteCommandTranslatorError, .missingSessionID(type))
+            }
+        }
+    }
+
+    func testHandoffFramesUseResolvedWindowToBypassBinding() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let frames = [
+            RemoteClientFrame(type: "fork_session", requestID: "fork-request-1", sessionID: sid),
+            RemoteClientFrame(type: "extract_handoff", sessionID: sid)
+        ]
+
+        for bindingState in [
+            RemoteGatewayBindingState.bindingRequired("bind first"),
+            .ambiguousStartTarget("multiple windows")
+        ] {
+            let translator = RemoteCommandTranslator(bindingState: bindingState)
+            for frame in frames {
+                let call = try translator.translate(frame, resolvedWindowID: 9)
+                XCTAssertEqual(call.toolName, "agent_manage", frame.type)
+                XCTAssertEqual(call.arguments["op"], .string(frame.type), frame.type)
+                XCTAssertEqual(call.arguments["session_id"], .string(sid), frame.type)
+                XCTAssertEqual(call.arguments["_windowID"], .int(9), frame.type)
+            }
         }
     }
 

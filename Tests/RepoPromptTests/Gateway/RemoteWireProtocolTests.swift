@@ -34,7 +34,7 @@ final class RemoteWireProtocolTests: XCTestCase {
     }
 
     func testMutatingOperationsRequireRequestID() throws {
-        for type in ["start", "steer", "respond", "cancel", "open_workspace"] {
+        for type in ["start", "steer", "respond", "cancel", "open_workspace", "fork_session"] {
             let data = "{\"v\":1,\"type\":\"\(type)\",\"payload\":{},\"sig\":null}".data(using: .utf8)!
             XCTAssertThrowsError(try RemoteWireProtocol.decodeClientFrame(from: data), type) { error in
                 XCTAssertEqual(error as? RemoteWireProtocolError, .missingRequestID(type))
@@ -47,6 +47,30 @@ final class RemoteWireProtocolTests: XCTestCase {
         XCTAssertTrue(RemoteWireProtocol.mutatingClientFrameTypes.contains("open_workspace"))
         let data = #"{"v":1,"type":"open_workspace","request_id":"open-1","payload":{"workspace_name":"Project"},"sig":null}"#.data(using: .utf8)!
         XCTAssertEqual(try RemoteWireProtocol.decodeClientFrame(from: data).type, "open_workspace")
+    }
+
+    func testHandoffFramesHaveExpectedMutationAndFeatureMembership() throws {
+        XCTAssertTrue(RemoteWireProtocol.clientFrameTypes.contains("fork_session"))
+        XCTAssertTrue(RemoteWireProtocol.mutatingClientFrameTypes.contains("fork_session"))
+        XCTAssertTrue(RemoteWireProtocol.clientFrameTypes.contains("extract_handoff"))
+        XCTAssertFalse(RemoteWireProtocol.mutatingClientFrameTypes.contains("extract_handoff"))
+
+        let forkData = #"{"v":1,"type":"fork_session","request_id":"fork-1","session_id":"session-1","payload":{},"sig":null}"#.data(using: .utf8)!
+        XCTAssertEqual(try RemoteWireProtocol.decodeClientFrame(from: forkData).type, "fork_session")
+
+        let extractData = #"{"v":1,"type":"extract_handoff","session_id":"session-1","payload":{},"sig":null}"#.data(using: .utf8)!
+        let extractFrame = try RemoteWireProtocol.decodeClientFrame(from: extractData)
+        XCTAssertEqual(extractFrame.type, "extract_handoff")
+        XCTAssertNil(extractFrame.requestID)
+
+        XCTAssertEqual(
+            Set([
+                RemoteWireFeatures.forkSession,
+                RemoteWireFeatures.extractHandoff,
+                RemoteWireFeatures.getLogHostRowIDs
+            ]).subtracting(RemoteWireFeatures.all),
+            []
+        )
     }
 
     func testListAgentsFrameIsAcceptedWithoutRequestID() throws {

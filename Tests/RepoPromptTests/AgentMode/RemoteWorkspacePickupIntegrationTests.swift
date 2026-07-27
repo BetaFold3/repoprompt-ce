@@ -37,7 +37,8 @@ final class RemoteWorkspacePickupIntegrationTests: XCTestCase {
                         AgentChatItem.user("Summarize the host-side changes", sequenceIndex: 0),
                         AgentChatItem.assistant("The host session refactored the gateway runtime.", sequenceIndex: 1)
                     ],
-                    removedIDs: []
+                    removedIDs: [],
+                    hostRowIDByClientItemID: [:]
                 ),
                 tabID: session.tabID
             )
