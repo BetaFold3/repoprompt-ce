@@ -376,8 +376,17 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             fixture.coordinator.hostRowID(for: sourceSession, clientItemID: clientItemID) == hostRowID
         }
         var attachedTabIDs: [UUID] = []
-        fixture.coordinator.test_setMaterializedRemoteWorkspaceAttachHandler { session in
+        fixture.coordinator.test_setMaterializedRemoteWorkspaceAttachHandler { [coordinator = fixture.coordinator, host = fixture.host] session in
             attachedTabIDs.append(session.tabID)
+            // Run the real controller attach against the recording stub so the test
+            // pins the wire contract (subscribe for the destination session), not just
+            // the coordinator wiring.
+            let destinationController = try RemoteAgentSessionController(
+                binding: XCTUnwrap(session.remoteHost),
+                connection: connection
+            )
+            coordinator.test_installController(destinationController, for: session, hostID: host.id)
+            try await destinationController.attachAndCatchUp()
         }
 
         try await fixture.coordinator.fork(
@@ -396,6 +405,9 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         // Fork must attach the materialized session so the client subscribes to the
         // forked session's host push events before any steer.
         XCTAssertEqual(attachedTabIDs, [materialized.tabID])
+        let destinationSubscribes = await connection.subscribeBatches()
+            .filter { $0 == [destinationRemoteSessionID] }
+        XCTAssertEqual(destinationSubscribes.count, 1)
 
         try await fixture.coordinator.fork(
             session: sourceSession,
@@ -411,8 +423,12 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         XCTAssertEqual(store.fetchForceRefreshValues, [true, true])
         // Duplicate descriptor: no new materialization, so no additional attach.
         XCTAssertEqual(attachedTabIDs, [materialized.tabID])
+        let destinationSubscribesAfterDuplicate = await connection.subscribeBatches()
+            .filter { $0 == [destinationRemoteSessionID] }
+        XCTAssertEqual(destinationSubscribesAfterDuplicate.count, 1)
         let forkFrames = await connection.frames(type: "fork_session")
         XCTAssertEqual(forkFrames.count, 2)
+        fixture.coordinator.stop(tabID: materialized.tabID)
     }
 
     @MainActor
@@ -2622,6 +2638,7 @@ private actor HandoffRecordingConnection: RemoteAgentSessionConnection {
     private let destinationSessionID: String
     private let advertisedFeatures: Set<String>
     private var recordedFrames: [RemoteClientFrame] = []
+    private var subscribedSessionIDBatches: [[String]] = []
 
     init(
         sourceSessionID: String,
@@ -2641,7 +2658,7 @@ private actor HandoffRecordingConnection: RemoteAgentSessionConnection {
         case "poll":
             return .object([
                 "status": .string("completed"),
-                "session_id": .string(sourceSessionID)
+                "session_id": .string(frame.sessionID ?? sourceSessionID)
             ])
         case "get_log":
             return Self.logPayload(sourceSessionID: sourceSessionID, hostRowID: hostRowID)
@@ -2672,11 +2689,19 @@ private actor HandoffRecordingConnection: RemoteAgentSessionConnection {
     }
 
     func ensureConnected() async throws {}
-    func subscribe(sessionIDs _: [String]) async throws {}
+
+    func subscribe(sessionIDs: [String]) async throws {
+        subscribedSessionIDBatches.append(sessionIDs)
+    }
+
     func unsubscribe(sessionIDs _: [String]) async throws {}
 
     func supportsHostFeature(_ feature: String) -> Bool {
         advertisedFeatures.contains(feature)
+    }
+
+    func subscribeBatches() -> [[String]] {
+        subscribedSessionIDBatches
     }
 
     func frames(type: String) -> [RemoteClientFrame] {

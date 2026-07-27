@@ -209,19 +209,35 @@ final class RemoteAgentModeCoordinator {
             destinationModelID: destinationModelID,
             destinationEffort: destinationEffort
         )
-        let alreadyExists = localSessionExists(
+        let pickupKey = WorkspacePickupKey(
             hostID: binding.hostID,
-            remoteSessionID: descriptor.sessionID
+            remoteSessionID: descriptor.sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         )
-        let materializedSession: AgentModeViewModel.TabSession? = if alreadyExists {
-            nil
-        } else {
-            await viewModel.materializeRemoteWorkspaceSession(
+        // Treat an in-flight sidebar pickup of the same descriptor as "already exists":
+        // the pickup path materializes and attaches it, and racing a second
+        // materialization would double-create the local proxy tab.
+        let alreadyExists = workspacePickupInFlightKeys.contains(pickupKey)
+            || localSessionExists(
+                hostID: binding.hostID,
+                remoteSessionID: descriptor.sessionID
+            )
+        var materializedSession: AgentModeViewModel.TabSession?
+        if !alreadyExists {
+            workspacePickupInFlightKeys.insert(pickupKey)
+            defer { workspacePickupInFlightKeys.remove(pickupKey) }
+            materializedSession = await viewModel.materializeRemoteWorkspaceSession(
                 descriptor: descriptor,
                 hostRecord: hostRecord
             )
         }
         if let materializedSession {
+            // Mirror pickUpWorkspaceSession's host-name adoption so later host renames
+            // of the forked session propagate to this client proxy.
+            if let adoptedName = descriptor.name?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !adoptedName.isEmpty
+            {
+                lastAdoptedHostNameByTabID[materializedSession.tabID] = AgentSession.validatedName(adoptedName)
+            }
             // Attach immediately (mirrors pickUpWorkspaceSession): this is the only path
             // that subscribes the client to the forked session's host push events and arms
             // stale-recovery polling. Without it, a subsequent steer runs on the host while
