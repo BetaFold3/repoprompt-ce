@@ -375,6 +375,10 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         await waitUntil {
             fixture.coordinator.hostRowID(for: sourceSession, clientItemID: clientItemID) == hostRowID
         }
+        var attachedTabIDs: [UUID] = []
+        fixture.coordinator.test_setMaterializedRemoteWorkspaceAttachHandler { session in
+            attachedTabIDs.append(session.tabID)
+        }
 
         try await fixture.coordinator.fork(
             session: sourceSession,
@@ -389,6 +393,9 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         XCTAssertEqual(materialized.remoteHost?.hostID, fixture.host.id)
         XCTAssertEqual(fixture.workspaceManager.activeWorkspace?.activeComposeTabID, materialized.tabID)
         XCTAssertEqual(store.fetchForceRefreshValues, [true])
+        // Fork must attach the materialized session so the client subscribes to the
+        // forked session's host push events before any steer.
+        XCTAssertEqual(attachedTabIDs, [materialized.tabID])
 
         try await fixture.coordinator.fork(
             session: sourceSession,
@@ -402,6 +409,8 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             1
         )
         XCTAssertEqual(store.fetchForceRefreshValues, [true, true])
+        // Duplicate descriptor: no new materialization, so no additional attach.
+        XCTAssertEqual(attachedTabIDs, [materialized.tabID])
         let forkFrames = await connection.frames(type: "fork_session")
         XCTAssertEqual(forkFrames.count, 2)
     }

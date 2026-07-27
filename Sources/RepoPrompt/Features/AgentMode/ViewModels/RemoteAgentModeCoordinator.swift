@@ -221,6 +221,25 @@ final class RemoteAgentModeCoordinator {
                 hostRecord: hostRecord
             )
         }
+        if let materializedSession {
+            // Attach immediately (mirrors pickUpWorkspaceSession): this is the only path
+            // that subscribes the client to the forked session's host push events and arms
+            // stale-recovery polling. Without it, a subsequent steer runs on the host while
+            // the client never receives the response and stays frozen on the initial status.
+            do {
+                try await attachMaterializedRemoteWorkspaceSession(materializedSession)
+            } catch {
+                let description = Self.describe(
+                    error,
+                    workspaceName: viewModel.remoteWorkspaceCatalogContext(hostID: binding.hostID)?.workspaceName,
+                    hostName: hostRecord.displayName
+                )
+                appendSystemMessage(
+                    "Remote workspace session attach failed: \(description)",
+                    tabID: materializedSession.tabID
+                )
+            }
+        }
         await refreshWorkspaceSessionCatalogAfterSuccessfulStart(hostID: binding.hostID)
         guard alreadyExists || materializedSession != nil else {
             throw RemoteClientError.protocolViolation(
