@@ -2466,6 +2466,227 @@ final class GatewayRuntimeBindingTests: XCTestCase {
         XCTAssertEqual(calls.first?.arguments["op"], .string("respond"))
     }
 
+    /// Incident 2026-07-27: a fork_session success must record the forked
+    /// session's window affinity so the client's immediate attach catch-up
+    /// poll routes deterministically instead of racing per-window discovery
+    /// (which returned binding_required 90ms after the fork in production).
+    func testForkSessionRecordsDestinationAffinityAndImmediatePollRoutesWithoutRediscovery() async throws {
+        let forkedSessionID = "99999999-9999-9999-9999-999999999999"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([sessionID])),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "status": .string("forked"),
+                "session": .object([
+                    "session_id": .string(forkedSessionID),
+                    "name": .string("Forked Session"),
+                    "state": .string("idle"),
+                    "is_live": .bool(true)
+                ])
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: forkedSessionID,
+                status: "completed"
+            )))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+
+        let forkResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "fork_session",
+                requestID: "r-fork",
+                sessionID: sessionID,
+                payload: .object([
+                    "destination_agent": .string("claudeCode"),
+                    "destination_model_id": .string("claudeCode__opus")
+                ])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(forkResponse?.type, "command_result")
+
+        let pollResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "poll",
+                requestID: "r-fork-poll",
+                sessionID: forkedSessionID,
+                payload: .object(["timeout": .int(0)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(pollResponse?.type, "command_result")
+
+        let calls = await connection.calls
+        // Discovery ran exactly once, to route the fork to its source window —
+        // never again for the forked session.
+        XCTAssertEqual(calls.count(where: { $0.name == "bind_context" }), 1)
+        XCTAssertEqual(
+            calls.count(where: { $0.name == "agent_manage" && $0.arguments["op"] == .string("list_sessions") }),
+            2
+        )
+        let forkCall = try XCTUnwrap(calls.first { $0.arguments["op"] == .string("fork_session") })
+        XCTAssertEqual(forkCall.arguments["_windowID"], .int(2))
+        let pollCall = try XCTUnwrap(calls.last { $0.name == "agent_run" && $0.arguments["op"] == .string("poll") })
+        XCTAssertEqual(pollCall.arguments["_windowID"], .int(2))
+    }
+
+    func testForkSessionOnLegacyBoundConnectionSkipsAffinityRecording() async throws {
+        let forkedSessionID = "99999999-9999-9999-9999-999999999999"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "status": .string("forked"),
+                "session": .object(["session_id": .string(forkedSessionID)])
+            ]))),
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: forkedSessionID,
+                status: "completed"
+            )))
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bound)
+
+        let forkResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "fork_session",
+                requestID: "r-fork-bound",
+                sessionID: sessionID,
+                payload: .object([
+                    "destination_agent": .string("claudeCode"),
+                    "destination_model_id": .string("claudeCode__opus")
+                ])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(forkResponse?.type, "command_result")
+
+        let pollResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "poll",
+                requestID: "r-fork-bound-poll",
+                sessionID: forkedSessionID,
+                payload: .object(["timeout": .int(0)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(pollResponse?.type, "command_result")
+
+        let calls = await connection.calls
+        XCTAssertTrue(calls.filter { $0.name == "bind_context" }.isEmpty)
+        // Bound/legacy routing never injects a window and the nil-window
+        // affinity write is a silent no-op.
+        XCTAssertTrue(calls.allSatisfy { $0.arguments["_windowID"] == nil })
+    }
+
+    func testForkSessionMalformedResultPayloadPassesThroughWithoutAffinityWrite() async throws {
+        let forkedSessionID = "99999999-9999-9999-9999-999999999999"
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([sessionID])),
+            .result(GatewayTestHelpers.toolResult(json: .object([
+                "status": .string("forked")
+            ]))),
+            .result(windowListResponse()),
+            .result(sessionListResponse([])),
+            .result(sessionListResponse([])),
+            .result(windowListResponse())
+        ])
+        let runtime = try await makeRuntime(connection: connection, bindingState: .bindingRequired("bind first"))
+
+        let forkResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "fork_session",
+                requestID: "r-fork-malformed",
+                sessionID: sessionID,
+                payload: .object([
+                    "destination_agent": .string("claudeCode"),
+                    "destination_model_id": .string("claudeCode__opus")
+                ])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(forkResponse?.type, "command_result")
+
+        // Without a session envelope nothing was recorded: the follow-up poll
+        // rediscovers (and, with the session in no window, fails routing).
+        let pollResponse = await runtime.handle(
+            RemoteClientFrame(
+                type: "poll",
+                requestID: "r-fork-malformed-poll",
+                sessionID: forkedSessionID,
+                payload: .object(["timeout": .int(0)])
+            ),
+            deviceID: "device",
+            sinkID: UUID(),
+            sink: RecordingFrameSink()
+        )
+        XCTAssertEqual(pollResponse?.type, "command_error")
+        XCTAssertEqual(pollResponse?.payload?.objectValue?["code"]?.stringValue, "binding_required")
+        let calls = await connection.calls
+        // The poll went back to discovery (second bind_context sweep) instead of
+        // hitting a cached affinity; error-details enrichment may add another
+        // bind_context call after the failed sweep.
+        XCTAssertGreaterThanOrEqual(calls.count(where: { $0.name == "bind_context" }), 2)
+    }
+
+    /// Incident 2026-07-27 companion lock: subscribe validation of a session
+    /// whose app snapshot is terminal-but-real (e.g. a fork-staged session
+    /// reported as completed) must not emit `session_expired`.
+    func testSubscribeValidationCompletedSnapshotDoesNotEmitSessionExpired() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "completed"
+            )))
+        ])
+        let (_, manager) = try await makeObservationRuntime(
+            connection: connection,
+            discovery: { _, _ in 2 }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        try await Task.sleep(for: .milliseconds(300))
+        await manager.shutdown()
+
+        let expiredFrames = await sink.frames.filter { $0.type == "session_expired" }
+        XCTAssertTrue(expiredFrames.isEmpty)
+    }
+
+    func testSubscribeValidationExpiredSnapshotStillEmitsSessionExpired() async throws {
+        let connection = RecordingAppLinkConnection(responses: [
+            .result(GatewayTestHelpers.toolResult(json: GatewayTestHelpers.snapshot(
+                sessionID: sessionID,
+                status: "expired"
+            )))
+        ])
+        let (_, manager) = try await makeObservationRuntime(
+            connection: connection,
+            discovery: { _, _ in 2 }
+        )
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: "device", sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        var expiredFrames: [RemoteServerFrame] = []
+        for _ in 0 ..< 100 {
+            expiredFrames = await sink.frames.filter { $0.type == "session_expired" }
+            if !expiredFrames.isEmpty { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        await manager.shutdown()
+        XCTAssertFalse(expiredFrames.isEmpty)
+    }
+
     private func waitForSessionUpdateCount(
         _ minimumCount: Int,
         sink: RecordingFrameSink,

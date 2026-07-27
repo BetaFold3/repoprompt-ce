@@ -92,6 +92,7 @@ actor SessionWatchManager {
     }
 
     private struct QuarantinedTerminal {
+        let id: UUID
         let snapshot: RemoteSessionSnapshot
         let task: Task<Void, Never>
     }
@@ -395,6 +396,13 @@ actor SessionWatchManager {
         // wake-worthy transition should push again for a disconnected device.
         lastPushKindByDeviceSession.removeValue(forKey: deviceSessionKey(deviceID: deviceID, sessionID: sessionID))
         preserveObservationHealthForRearm(deviceID: deviceID, sessionID: sessionID)
+        // A steer/respond opens a new observation epoch for this session: cancel
+        // any pending completed-terminal quarantine and drop terminal-emission
+        // dedupe state so a stale pre-mutation `completed` snapshot can never be
+        // emitted (or suppress a fresh truthful terminal) after the mutation's
+        // run starts. Fork-staged sessions hit the quarantine deterministically
+        // via the unregistered-live-session `completed` projection.
+        clearTerminalObservationState(deviceID: deviceID, sessionID: sessionID)
         ensureWaitLoop(deviceID: deviceID)
         ensureRevalidationLoop(deviceID: deviceID)
     }
@@ -1675,20 +1683,37 @@ actor SessionWatchManager {
 
         let key = deviceSessionKey(deviceID: deviceID, sessionID: snapshot.sessionID)
         let milliseconds = Int64((terminalQuarantineSeconds * 1000).rounded(.up))
+        let quarantineID = UUID()
         let task = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(milliseconds))
             guard !Task.isCancelled else { return }
-            await self?.resolveTerminalQuarantine(deviceID: deviceID, sessionID: snapshot.sessionID)
+            await self?.resolveTerminalQuarantine(
+                deviceID: deviceID,
+                sessionID: snapshot.sessionID,
+                quarantineID: quarantineID
+            )
         }
-        pendingTerminalQuarantineByDeviceSession[key] = QuarantinedTerminal(snapshot: snapshot, task: task)
+        pendingTerminalQuarantineByDeviceSession[key] = QuarantinedTerminal(id: quarantineID, snapshot: snapshot, task: task)
         logEmission(deviceID: deviceID, sessionID: snapshot.sessionID, trigger: trigger, status: snapshot.status, type: "held", seq: nil)
         return true
     }
 
-    private func resolveTerminalQuarantine(deviceID: String, sessionID: String) async {
+    /// Confirms or supersedes a quarantined completed terminal after the hold
+    /// window. The map entry intentionally stays present across the
+    /// confirm-poll suspension and every emission is fenced on the quarantine
+    /// identity: a steer/respond `rearm` (or any supersession) that clears or
+    /// replaces the entry mid-await suppresses the stale pre-mutation
+    /// `completed` snapshot instead of emitting it after the new run has
+    /// started. Fork-staged sessions reach this path deterministically now
+    /// that unregistered live sessions project as `completed` instead of
+    /// expired, so a first steer inside the hold window must invalidate here.
+    private func resolveTerminalQuarantine(deviceID: String, sessionID: String, quarantineID: UUID) async {
         let key = deviceSessionKey(deviceID: deviceID, sessionID: sessionID)
-        guard let quarantine = pendingTerminalQuarantineByDeviceSession.removeValue(forKey: key) else { return }
+        guard let quarantine = pendingTerminalQuarantineByDeviceSession[key],
+              quarantine.id == quarantineID
+        else { return }
         guard devices[deviceID]?.watchedSessionIDs.contains(sessionID) == true else {
+            pendingTerminalQuarantineByDeviceSession.removeValue(forKey: key)
             logEmission(deviceID: deviceID, sessionID: sessionID, trigger: .quarantine, status: quarantine.snapshot.status, type: "suppressed", seq: nil, suffix: " reason=unwatched")
             return
         }
@@ -1696,18 +1721,25 @@ actor SessionWatchManager {
             ensureWaitLoop(deviceID: deviceID)
             ensureRevalidationLoop(deviceID: deviceID)
         }
+        var confirmed: RemoteSessionSnapshot?
+        var confirmFailed = false
         do {
-            let snapshots = try await poll(deviceID: deviceID, sessionIDs: [sessionID])
-            guard let snapshot = snapshots.first else {
-                logEmission(deviceID: deviceID, sessionID: sessionID, trigger: .quarantine, status: quarantine.snapshot.status, type: "held", seq: nil, suffix: " reason=confirm_poll_missing")
-                await emitSnapshot(deviceID: deviceID, snapshot: quarantine.snapshot, trigger: .quarantine)
-                return
-            }
-            await emitSnapshot(deviceID: deviceID, snapshot: snapshot, trigger: .quarantine)
+            confirmed = try await poll(deviceID: deviceID, sessionIDs: [sessionID]).first
         } catch {
-            logEmission(deviceID: deviceID, sessionID: sessionID, trigger: .quarantine, status: quarantine.snapshot.status, type: "held", seq: nil, suffix: " reason=confirm_poll_failed")
-            await emitSnapshot(deviceID: deviceID, snapshot: quarantine.snapshot, trigger: .quarantine)
+            confirmFailed = true
         }
+        guard pendingTerminalQuarantineByDeviceSession[key]?.id == quarantineID else {
+            logEmission(deviceID: deviceID, sessionID: sessionID, trigger: .quarantine, status: quarantine.snapshot.status, type: "suppressed", seq: nil, suffix: " reason=quarantine_superseded")
+            return
+        }
+        pendingTerminalQuarantineByDeviceSession.removeValue(forKey: key)
+        guard let confirmed else {
+            let reason = confirmFailed ? "confirm_poll_failed" : "confirm_poll_missing"
+            logEmission(deviceID: deviceID, sessionID: sessionID, trigger: .quarantine, status: quarantine.snapshot.status, type: "held", seq: nil, suffix: " reason=\(reason)")
+            await emitSnapshot(deviceID: deviceID, snapshot: quarantine.snapshot, trigger: .quarantine)
+            return
+        }
+        await emitSnapshot(deviceID: deviceID, snapshot: confirmed, trigger: .quarantine)
     }
 
     private func cancelPendingTerminalQuarantine(deviceID: String, sessionID: String) {

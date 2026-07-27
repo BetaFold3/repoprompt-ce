@@ -918,6 +918,7 @@ actor RemoteGatewayRuntime {
             }
             throw runtimeError
         }
+        await recordForkSessionAffinityIfNeeded(frame: frame, payload: payload, windowID: resolvedWindowID)
         return payload
     }
 
@@ -1430,6 +1431,32 @@ actor RemoteGatewayRuntime {
         guard frame.type == "start",
               let windowID = explicitStartWindowID(frame),
               let sessionID = payload.objectValue?["session_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sessionID.isEmpty
+        else { return }
+        await sessionWindowAffinity.record(sessionID: sessionID, windowID: windowID)
+    }
+
+    /// A successful `fork_session` creates a brand-new session in the window
+    /// the call was routed to (the app forks under `requireTargetWindow()`).
+    /// Record that session→window affinity immediately so the client's
+    /// follow-up attach (subscribe validation + catch-up poll, observed ~90ms
+    /// after the fork in the 2026-07-27 incident) routes deterministically
+    /// instead of racing per-window discovery against the app's async
+    /// registration of the staged destination tab. Recorded per successful
+    /// attempt in `executeTranslatedTool` so corrective retries persist the
+    /// window that actually served the call. Best-effort cache write: nil
+    /// window (legacy/bound routing) and malformed payloads are silent no-ops.
+    /// Depends on `executeForkSession`'s stable `{"session":{"session_id":…}}`
+    /// response envelope.
+    private func recordForkSessionAffinityIfNeeded(
+        frame: RemoteClientFrame,
+        payload: JSONValue,
+        windowID: Int?
+    ) async {
+        guard frame.type == "fork_session",
+              let windowID,
+              let sessionID = payload.objectValue?["session"]?.objectValue?["session_id"]?.stringValue?
+              .trimmingCharacters(in: .whitespacesAndNewlines),
               !sessionID.isEmpty
         else { return }
         await sessionWindowAffinity.record(sessionID: sessionID, windowID: windowID)

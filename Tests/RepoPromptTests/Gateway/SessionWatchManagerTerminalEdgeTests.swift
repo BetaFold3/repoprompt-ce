@@ -127,6 +127,83 @@ final class SessionWatchManagerTerminalEdgeTests: XCTestCase {
         XCTAssertEqual(frames.count(where: { $0.type == "session_terminal" }), 1)
     }
 
+    func testRearmCancelsPendingCompletedQuarantineBeforeItResolves() async throws {
+        let connection = ScriptedAppLinkConnection(poll: [
+            .result(snapshot(status: "completed"))
+        ])
+        let (manager, _) = try await makeManager(connection: connection, terminalQuarantineSeconds: 0.15)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: deviceID, sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        try await Task.sleep(for: .milliseconds(50))
+        var frames = await sink.frames
+        XCTAssertEqual(frames.count(where: { $0.type == "session_terminal" }), 0)
+
+        // A steer/respond rearm inside the hold window must invalidate the
+        // staged quarantine: the pre-mutation completed snapshot may not be
+        // emitted after the mutation's run starts (fork-staged sessions enter
+        // this quarantine deterministically via the live-session projection).
+        await manager.rearm(deviceID: deviceID, sessionID: sessionID)
+        try await Task.sleep(for: .milliseconds(300))
+        await manager.shutdown()
+
+        frames = await sink.frames
+        XCTAssertEqual(frames.count(where: { $0.type == "session_terminal" }), 0)
+        XCTAssertEqual(frames.count(where: { $0.type == "session_expired" }), 0)
+    }
+
+    func testRearmDuringSuspendedConfirmPollSuppressesStaleCompletedTerminal() async throws {
+        let connection = ScriptedAppLinkConnection(poll: [
+            .result(snapshot(status: "completed")),
+            .gated(snapshot(status: "completed"))
+        ])
+        let (manager, _) = try await makeManager(connection: connection, terminalQuarantineSeconds: 0.05)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: deviceID, sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        // Wait until the quarantine confirm poll has started (it suspends on the
+        // gate), then rearm while it is in flight. The identity fence must
+        // suppress the stale completed snapshot even though the confirm poll
+        // was already past cancellation.
+        var pollCalls = 0
+        for _ in 0 ..< 200 {
+            pollCalls = await connection.calls.count(where: { $0.arguments["op"] == .string("poll") })
+            if pollCalls >= 2 { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertGreaterThanOrEqual(pollCalls, 2)
+
+        await manager.rearm(deviceID: deviceID, sessionID: sessionID)
+        await connection.releaseGate()
+        try await Task.sleep(for: .milliseconds(100))
+        await manager.shutdown()
+
+        let frames = await sink.frames
+        XCTAssertEqual(frames.count(where: { $0.type == "session_terminal" }), 0)
+    }
+
+    func testRearmClearsTerminalDedupeSoIdenticalTerminalReemitsAfterMutation() async throws {
+        let connection = ScriptedAppLinkConnection(poll: [
+            .result(snapshot(status: "completed")),
+            .result(snapshot(status: "completed"))
+        ])
+        let (manager, _) = try await makeManager(connection: connection, terminalQuarantineSeconds: 0)
+        let sink = RecordingFrameSink()
+
+        await manager.subscribe(deviceID: deviceID, sinkID: UUID(), sink: sink, sessionIDs: [sessionID])
+        _ = await waitForFrames(sink, type: "session_terminal", minimum: 1, timeoutMilliseconds: 1000)
+
+        // rearm starts a new observation epoch: an identical terminal observed
+        // after a steer/respond must re-emit (duplicate truth beats a client
+        // stranded on a possibly stale mutation outcome).
+        await manager.rearm(deviceID: deviceID, sessionID: sessionID)
+        await manager.pollCatchUp(deviceID: deviceID)
+        await manager.shutdown()
+
+        let frames = await sink.frames
+        XCTAssertEqual(frames.count(where: { $0.type == "session_terminal" }), 2)
+    }
+
     func testFailedTerminalBypassesCompletedQuarantine() async throws {
         let connection = ScriptedAppLinkConnection(poll: [
             .result(snapshot(status: "running")),
@@ -480,10 +557,25 @@ private actor ScriptedAppLinkConnection: AppLinkConnection {
     enum Response {
         case result(JSONValue)
         case failure(String)
+        /// Suspends the call on an actor-held gate until `releaseGate()`, then
+        /// returns the payload. Used to hold a quarantine confirm poll in
+        /// flight while the test rearms the session.
+        case gated(JSONValue)
     }
 
     private var responsesByOp: [String: [Response]]
     private(set) var calls: [RecordedGatewayToolCall] = []
+    private var gateReleased = false
+    private var gateWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func releaseGate() {
+        gateReleased = true
+        let waiters = gateWaiters
+        gateWaiters = []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
 
     init(poll: [Response] = [], wait: [Response] = []) {
         responsesByOp = [
@@ -507,6 +599,11 @@ private actor ScriptedAppLinkConnection: AppLinkConnection {
             return GatewayTestHelpers.toolResult(json: json)
         case let .failure(message):
             throw GatewayTestError(message: message)
+        case let .gated(json):
+            if !gateReleased {
+                await withCheckedContinuation { gateWaiters.append($0) }
+            }
+            return GatewayTestHelpers.toolResult(json: json)
         case nil:
             return GatewayTestHelpers.toolResult(json: .object(["snapshots": .array([])]))
         }
