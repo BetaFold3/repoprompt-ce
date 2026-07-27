@@ -1321,6 +1321,10 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         let connection = BlockingFailingResendConnection()
         let remoteHost = try XCTUnwrap(session.remoteHost)
         let controller = RemoteAgentSessionController(binding: remoteHost, connection: connection)
+        // Model a previously attached session (the production resend reality) so the
+        // steer observation preflight no-ops instead of attaching via the blocking
+        // stub, preserving this test's original command choreography.
+        await controller.test_markObservationAttached()
         fixture.coordinator.test_installController(controller, for: session, hostID: fixture.host.id)
 
         fixture.viewModel.resendUndeliveredRemoteUserTurn(tabID: session.tabID, itemID: userItem.id)
@@ -1360,6 +1364,10 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         let connection = BlockingFailingResendConnection()
         let remoteHost = try XCTUnwrap(session.remoteHost)
         let controller = RemoteAgentSessionController(binding: remoteHost, connection: connection)
+        // Model a previously attached session (the production resend reality) so the
+        // steer observation preflight no-ops instead of attaching via the blocking
+        // stub, preserving this test's original command choreography.
+        await controller.test_markObservationAttached()
         fixture.coordinator.test_installController(controller, for: session, hostID: fixture.host.id)
 
         fixture.viewModel.resendUndeliveredRemoteUserTurn(tabID: session.tabID, itemID: userItem.id)

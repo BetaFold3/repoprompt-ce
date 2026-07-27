@@ -447,6 +447,15 @@ actor RemoteAgentSessionController {
         try await catchUpFromHost()
     }
 
+    /// Whether observation (subscribe + initial catch-up) has completed for the
+    /// current remote session. False for controllers created lazily on a send path
+    /// (e.g. restored terminal child sessions skipped by attachPersistedSessionIfNeeded)
+    /// where no attach ever ran, and after a failed attach.
+    func hasAttachedObservation() -> Bool {
+        guard let remoteSessionID else { return false }
+        return attachedObservationSessionID == remoteSessionID
+    }
+
     func attachAndCatchUp() async throws {
         try ensureNotShutdown()
         guard let sessionID = remoteSessionID else { return }
@@ -509,6 +518,12 @@ actor RemoteAgentSessionController {
     #if DEBUG
         func test_setHostRowID(_ hostRowID: UUID, forClientItemID clientItemID: UUID) {
             hostRowIDByClientItemID[clientItemID] = hostRowID
+        }
+
+        /// Marks observation as already attached so tests can model a session that
+        /// completed subscribe + catch-up before the scenario under test begins.
+        func test_markObservationAttached() {
+            attachedObservationSessionID = remoteSessionID
         }
     #endif
 

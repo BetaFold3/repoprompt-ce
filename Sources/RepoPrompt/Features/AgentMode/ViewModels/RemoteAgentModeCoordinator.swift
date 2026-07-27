@@ -183,6 +183,17 @@ final class RemoteAgentModeCoordinator {
 
     func steer(session: AgentModeViewModel.TabSession, text: String) async throws {
         let controller = try controller(for: session)
+        // Self-heal: a session can reach steer without observation ever attaching —
+        // e.g. a restored terminal child session that attachPersistedSessionIfNeeded
+        // deliberately skipped, or a proxy whose earlier attach failed non-transiently.
+        // Steering without the subscribe would run the turn on the host while this
+        // client never receives the response, so a hard attach failure withholds the
+        // steer and surfaces as a send failure (resending retries the attach).
+        // Transient failures are absorbed inside attachAndCatchUp, which schedules
+        // automatic observation recovery; the steer then proceeds.
+        if await !controller.hasAttachedObservation() {
+            try await controller.attachAndCatchUp()
+        }
         try await controller.steer(text)
     }
 
@@ -392,6 +403,12 @@ final class RemoteAgentModeCoordinator {
             let controller = try controller(for: session)
             Task { [weak self] in
                 do {
+                    // Same observation preflight as steer(): responding can resume a
+                    // long-running turn, so a hard attach failure withholds the response
+                    // and flows into the restorable-interaction recovery below.
+                    if await !controller.hasAttachedObservation() {
+                        try await controller.attachAndCatchUp()
+                    }
                     try await controller.respond(interactionID: interactionID, payload: payload)
                 } catch RemoteClientError.interactionAlreadyResolved {
                     self?.clearResolvedInteraction(tabID: session.tabID, interactionID: interactionID, resolvedBy: nil)
