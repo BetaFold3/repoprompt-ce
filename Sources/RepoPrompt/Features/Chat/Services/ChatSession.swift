@@ -42,6 +42,11 @@ struct ChatSession: Codable, Identifiable {
     /// NEW: The selected Chat Preset for this session
     var selectedChatPresetID: UUID?
 
+    /// Durable attribution for the model used by the most recent send.
+    /// This is denormalized so lightweight session stubs can render it without loading messages.
+    var lastSendModelID: String?
+    var lastSendModelDisplayName: String?
+
     /// Human-readable short identifier combining name slug and UUID prefix
     var shortID: String
 
@@ -67,6 +72,8 @@ struct ChatSession: Codable, Identifiable {
         // NEW:
         preferredAIModel: String? = nil,
         selectedChatPresetID: UUID? = nil,
+        lastSendModelID: String? = nil,
+        lastSendModelDisplayName: String? = nil,
         messageCount: Int? = nil,
         shortID: String? = nil
     ) {
@@ -84,6 +91,8 @@ struct ChatSession: Codable, Identifiable {
         self.selectedPromptIDs = selectedPromptIDs
         self.preferredAIModel = preferredAIModel
         self.selectedChatPresetID = selectedChatPresetID
+        self.lastSendModelID = lastSendModelID
+        self.lastSendModelDisplayName = lastSendModelDisplayName
         self.shortID = shortID ?? Self.makeShortID(name: name, uuid: id)
     }
 
@@ -102,6 +111,8 @@ struct ChatSession: Codable, Identifiable {
         case selectedPromptIDs
         case preferredAIModel // NEW
         case selectedChatPresetID // NEW
+        case lastSendModelID
+        case lastSendModelDisplayName
         case shortID
     }
 
@@ -122,6 +133,8 @@ struct ChatSession: Codable, Identifiable {
         selectedPromptIDs = try container.decodeIfPresent([UUID].self, forKey: .selectedPromptIDs) ?? []
         preferredAIModel = try container.decodeIfPresent(String.self, forKey: .preferredAIModel)
         selectedChatPresetID = try container.decodeIfPresent(UUID.self, forKey: .selectedChatPresetID)
+        lastSendModelID = try container.decodeIfPresent(String.self, forKey: .lastSendModelID)
+        lastSendModelDisplayName = try container.decodeIfPresent(String.self, forKey: .lastSendModelDisplayName)
 
         // Handle backward compatibility for shortID
         if let decodedShortID = try container.decodeIfPresent(String.self, forKey: .shortID) {
@@ -168,5 +181,11 @@ extension ChatSession {
         copy.messageCount = effectiveMessageCount
         copy.messages = []
         return copy
+    }
+
+    /// Model attribution for session-list UI. Fully loaded sessions prefer the
+    /// per-message value because it identifies the actual latest assistant response.
+    var lastResponseModelDisplayName: String? {
+        messages.last(where: { !$0.isUser })?.modelName ?? lastSendModelDisplayName
     }
 }

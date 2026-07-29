@@ -35,9 +35,17 @@ Continue your current workflow using \(toolDesc) instead of built-in alternative
 | `workspace_context` | Snapshot current prompt + selection + token budget; also exports. |
 | `prompt` | Read/set the shared prompt; list or select copy presets. |
 | `context_builder` | Heavy discovery sub-agent — describe the task, it curates files + rewrites the prompt. `response_type`: `clarify` / `plan` / `question` / `review`. Pass `export_response:true` to hand the result to a child agent. |
-| \(variant == .cli ? "`chat` (`ask_oracle`)" : "`ask_oracle`") | Chat-mode reasoning over the current selection. Continue existing chats (`new_chat:false`) rather than opening new ones. Modes: `chat` / `plan` / `review`. |
-| `oracle_chat_log` | Recover recent Oracle messages after compaction. |
+| \(variant == .cli ? "`chat` (`ask_oracle`)" : "`ask_oracle`") | Chat-mode reasoning over the current selection. Continue one lane by its exact `chat_id`. For independent parallel opinions, start up to two calls with `new_chat:true` and exact model-preset IDs or names from `oracle_utils op=models`. Modes: `chat` / `plan` / `review`. |
+| `oracle_chat_log` | Recover recent Oracle messages after compaction. When multiple Oracle lanes exist, always pass the exact `chat_id`. |
 | `ask_user` | Ask the user when ambiguity is load-bearing — don't guess at requirements. |
+
+### Named Oracle requests
+
+When the user asks for one or more named Oracles, treat each name as a model-preset selector:
+
+1. Call `oracle_utils op=models` and resolve every requested name against the authoritative list. Prefer the returned exact preset UUID; do not guess when a name is missing or ambiguous.
+2. For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and an explicit `model`. `chat_name` is display-only and never selects a model.
+3. Before comparing or synthesizing, verify every result's returned `model_preset_id` and `model_preset_name` match the requested preset. If identity is missing, mismatched, or a lane fails, report the failure and do not synthesize.
 
 ## Agent Delegation — `agent_run` / `agent_manage`
 
@@ -74,7 +82,10 @@ Dispatch a sub-agent when a side investigation or delegated chunk of work would 
 // Selection · Builder · Oracle
 {"tool":"manage_selection","args":{"op":"add","paths":["Root/path/file.swift"]}}
 {"tool":"context_builder","args":{"instructions":"<task>","response_type":"plan"}}
-{"tool":"ask_oracle","args":{"message":"...","mode":"plan","new_chat":false}}
+{"tool":"ask_oracle","args":{"message":"...","mode":"plan","chat_id":"<existing-chat-id>"}}
+// Independent parallel opinions: issue both calls together, each with new_chat:true.
+{"tool":"ask_oracle","args":{"message":"Review independently.","mode":"review","model":"<exact-preset-uuid-a>","chat_name":"Oracle A","new_chat":true}}
+{"tool":"ask_oracle","args":{"message":"Review independently.","mode":"review","model":"<exact-preset-uuid-b>","chat_name":"Oracle B","new_chat":true}}
 
 // Delegate · Fan-out · Steer · Cleanup
 {"tool":"agent_run","args":{"op":"start","model_id":"explore","session_name":"Probe: X","message":"<question>","detach":true}}

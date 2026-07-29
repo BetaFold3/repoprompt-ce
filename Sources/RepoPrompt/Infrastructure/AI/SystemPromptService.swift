@@ -956,6 +956,7 @@ class SystemPromptService {
         - `workspace_context` - Get a combined workspace snapshot (prompt + selection + tokens)
         - `ask_oracle` - Consult a second AI for planning, review, or questions. File reads are tracked so the Oracle knows what you see. Prefer one long-running chat (`new_chat:false`).
         - `oracle_chat_log` - Read recent Oracle conversation messages to recover context after compaction
+        \(AgentModePrompts.Fragments.namedOracleConsultationGuidance)
 
         \(agentDelegationSection)
 

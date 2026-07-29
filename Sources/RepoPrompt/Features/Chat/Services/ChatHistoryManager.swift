@@ -18,6 +18,8 @@ struct ChatSessionMeta {
     let lastModified: Date
     let selectedFilePaths: [String]
     let messageCount: Int
+    let lastSendModelID: String?
+    let lastSendModelDisplayName: String?
 }
 
 /// Failure information for a chat session stub load in a batch.
@@ -101,6 +103,8 @@ actor ChatDataService {
         let selectedPromptIDs: [UUID]?
         let preferredAIModel: String?
         let selectedChatPresetID: UUID?
+        let lastSendModelID: String?
+        let lastSendModelDisplayName: String?
         let messageCount: Int?
         let messages: [StoredMessageHeader]?
     }
@@ -272,6 +276,8 @@ actor ChatDataService {
                 selectedPromptIDs: header.selectedPromptIDs ?? [],
                 preferredAIModel: header.preferredAIModel,
                 selectedChatPresetID: header.selectedChatPresetID,
+                lastSendModelID: header.lastSendModelID,
+                lastSendModelDisplayName: header.lastSendModelDisplayName,
                 messageCount: count,
                 shortID: shortID
             )
@@ -343,7 +349,9 @@ actor ChatDataService {
                     name: session.name,
                     lastModified: lastModified,
                     selectedFilePaths: session.selectedFilePaths,
-                    messageCount: session.effectiveMessageCount
+                    messageCount: session.effectiveMessageCount,
+                    lastSendModelID: session.lastSendModelID,
+                    lastSendModelDisplayName: session.lastSendModelDisplayName
                 )
                 metadataList.append(meta)
 

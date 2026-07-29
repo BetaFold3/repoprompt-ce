@@ -180,7 +180,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let setStatus = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.setStatus })
 
         let askOracleProperties = try Self.schemaProperties(for: askOracle)
-        for field in ["mode", "new_chat", "chat_id", "export_response"] {
+        for field in ["mode", "new_chat", "chat_id", "model", "chat_name", "export_response"] {
             XCTAssertNotNil(askOracleProperties[field], "ask_oracle schema should advertise property \(field)")
         }
         let oracleModes = askOracleProperties["mode"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -223,6 +223,24 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
         let setStatusProperties = try Self.schemaProperties(for: setStatus)
         XCTAssertNotNil(setStatusProperties["session_name"])
+    }
+
+    func testAskOracleCatalogDocumentsNamedPresetIdentityContract() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let askOracle = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.askOracle })
+        let properties = try Self.schemaProperties(for: askOracle)
+        let modelDescription = try XCTUnwrap(properties["model"]?.objectValue?["description"]?.stringValue)
+        let chatNameDescription = try XCTUnwrap(properties["chat_name"]?.objectValue?["description"]?.stringValue)
+
+        XCTAssertTrue(askOracle.description.contains("model-preset selectors"))
+        XCTAssertTrue(askOracle.description.contains("oracle_utils op=models"))
+        XCTAssertTrue(askOracle.description.contains("one tool-call batch"))
+        XCTAssertTrue(askOracle.description.contains("do not synthesize"))
+        XCTAssertTrue(modelDescription.contains("Exact model preset UUID (preferred)"))
+        XCTAssertTrue(modelDescription.contains("Required when the user requests a named Oracle"))
+        XCTAssertTrue(chatNameDescription.contains("display-only"))
+        XCTAssertTrue(chatNameDescription.contains("never selects the model"))
     }
 
     func testLifecycleSchemasAdvertiseConfigurableDefaultsWithoutMaximumClamp() async throws {

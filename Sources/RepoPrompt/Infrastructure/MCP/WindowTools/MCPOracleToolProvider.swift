@@ -35,6 +35,8 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
             - `op="models"`   → list model choices relevant to oracle sends
             - `op="sessions"` → list oracle/chat sessions for the current workspace. Pass context_id to filter to a specific context's sessions.
 
+            Model discovery lists only selectable models under Available models. If configured presets are disabled or temporarily hidden, it reports them separately as NOT selectable with exact remediation. Do not pass those presets to ask_oracle until they are enabled.
+
             Use `ask_oracle` for all send/continue turns.
             """,
             inputSchema: .object(
@@ -60,6 +62,10 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab.
 
+            To run two independent consultations concurrently, issue two calls with `new_chat:true`, a distinct exact model preset ID/name from `oracle_utils op=models`, and optionally distinct `chat_name` values. Continue each lane with its returned `chat_id`. Reusing a streaming chat returns `oracle_session_busy`; a third simultaneous MCP Oracle stream in the tab returns `oracle_concurrency_limit`. Under parallel use, always pass an explicit `chat_id` to `oracle_chat_log`.
+
+            When the user names one or more Oracles, treat those names as model-preset selectors. First resolve them with `oracle_utils op=models`, prefer each returned exact preset UUID, and pass an explicit `model` on every new-chat lane. Issue independent lanes together in one tool-call batch. `chat_name` is display-only and never selects a model. Before synthesizing, verify each result's returned preset ID/name matches the requested preset; if identity is missing or mismatched, do not synthesize.
+
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
             Use `oracle_chat_log` after compaction to recover recent oracle messages.
@@ -80,7 +86,13 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         description: "Continue a specific chat in the current agent tab"
                     ),
                     "new_chat": .boolean(
-                        description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review."
+                        description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review or each independent parallel lane. When multiple compatible presets exist, new chats require an explicit model."
+                    ),
+                    "model": .string(
+                        description: "Exact model preset UUID (preferred) or exact preset name from oracle_utils op=models. Required when the user requests a named Oracle."
+                    ),
+                    "chat_name": .string(
+                        description: "Optional display-only session name; valid only with new_chat:true. This never selects the model."
                     ),
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
@@ -101,7 +113,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
             Consult a second AI for planning, review, or questions.
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode.
-            Use `oracle_utils` for passive helpers like models and sessions.
+            Use `oracle_utils` for passive helpers like models and sessions. Pass either `chat_id` to continue or `new_chat:true` to start fresh; the two arguments cannot be combined.
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
@@ -123,7 +135,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         description: "Continue a specific chat in the current tab or current context"
                     ),
                     "new_chat": .boolean(
-                        description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review."
+                        description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review. Cannot be combined with chat_id."
                     ),
                     "model": .string(
                         description: "Model preset ID or name override"

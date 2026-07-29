@@ -807,7 +807,7 @@ private enum AppSettingsMCPRegistry {
         boolSetting(
             key: "mcp.show_model_presets",
             group: "mcp",
-            description: "Whether MCP model preset recommendations are shown.",
+            description: "Whether configured Oracle model presets are selectable by MCP tools such as ask_oracle and oracle_utils.",
             read: { .bool($0.mcpShowModelPresets()) },
             write: { try $0.setMCPShowModelPresets(requiredBool(from: $1)) },
             afterWrite: postRecommendationsDidApply

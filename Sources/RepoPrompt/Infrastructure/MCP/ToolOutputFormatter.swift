@@ -528,11 +528,31 @@ enum ToolOutputFormatter {
 
     // MARK: - Chat Send
 
-    static func chatSend(chatId: String?, mode: String?, response: String?, diffs: [(path: String, patch: String)]) -> String {
+    static func chatSend(
+        chatId: String?,
+        mode: String?,
+        modelName: String? = nil,
+        modelID: String? = nil,
+        modelSelection: String? = nil,
+        modelSource: String? = nil,
+        modelPresetID: String? = nil,
+        modelPresetName: String? = nil,
+        response: String?,
+        diffs: [(path: String, patch: String)]
+    ) -> String {
         var out: [String] = []
-        out.reserveCapacity(6 + diffs.count * 2)
+        out.reserveCapacity(7 + diffs.count * 2)
         out.append("## Chat Send \(statusIcon(success: true))")
         if let id = chatId, let m = mode { out.append("- **Chat**: `\(id)` | **Mode**: \(m)") }
+        appendOracleModelIdentity(
+            modelName: modelName,
+            modelID: modelID,
+            modelSelection: modelSelection,
+            modelSource: modelSource,
+            modelPresetID: modelPresetID,
+            modelPresetName: modelPresetName,
+            to: &out
+        )
         if let resp = response, !resp.isEmpty {
             out.append("")
             out.append("### Response")
@@ -553,11 +573,31 @@ enum ToolOutputFormatter {
 
     // MARK: - Ask Oracle
 
-    static func askOracle(chatId: String?, mode: String?, response: String?, diffs: [(path: String, patch: String)]) -> String {
+    static func askOracle(
+        chatId: String?,
+        mode: String?,
+        modelName: String? = nil,
+        modelID: String? = nil,
+        modelSelection: String? = nil,
+        modelSource: String? = nil,
+        modelPresetID: String? = nil,
+        modelPresetName: String? = nil,
+        response: String?,
+        diffs: [(path: String, patch: String)]
+    ) -> String {
         var out: [String] = []
-        out.reserveCapacity(6 + diffs.count * 2)
+        out.reserveCapacity(7 + diffs.count * 2)
         out.append("## Ask Oracle \(statusIcon(success: true))")
         if let id = chatId, let m = mode { out.append("- **Chat**: `\(id)` | **Mode**: \(m)") }
+        appendOracleModelIdentity(
+            modelName: modelName,
+            modelID: modelID,
+            modelSelection: modelSelection,
+            modelSource: modelSource,
+            modelPresetID: modelPresetID,
+            modelPresetName: modelPresetName,
+            to: &out
+        )
         if let resp = response, !resp.isEmpty {
             out.append("")
             out.append("### Response")
@@ -574,6 +614,48 @@ enum ToolOutputFormatter {
             }
         }
         return out.joined(separator: "\n")
+    }
+
+    private static func appendOracleModelIdentity(
+        modelName: String?,
+        modelID: String?,
+        modelSelection: String?,
+        modelSource: String?,
+        modelPresetID: String?,
+        modelPresetName: String?,
+        to output: inout [String]
+    ) {
+        let hasAuthoritativeIdentity = modelID != nil || modelSelection != nil || modelSource != nil ||
+            modelPresetID != nil || modelPresetName != nil
+        guard hasAuthoritativeIdentity else {
+            if let modelName, !modelName.isEmpty { output.append("- **Model**: \(modelName)") }
+            return
+        }
+
+        if let modelSelection, !modelSelection.isEmpty {
+            output.append("- **Model selection**: \(modelSelection)")
+        }
+        if let modelPresetName, !modelPresetName.isEmpty {
+            if let modelPresetID, !modelPresetID.isEmpty {
+                output.append("- **Model preset**: `\(modelPresetName)` (`\(modelPresetID)`)")
+            } else {
+                output.append("- **Model preset**: `\(modelPresetName)`")
+            }
+        } else if let modelPresetID, !modelPresetID.isEmpty {
+            output.append("- **Model preset ID**: `\(modelPresetID)`")
+        }
+        if let modelName, !modelName.isEmpty {
+            if let modelID, !modelID.isEmpty {
+                output.append("- **Resolved model**: \(modelName) (`\(modelID)`)")
+            } else {
+                output.append("- **Resolved model**: \(modelName)")
+            }
+        } else if let modelID, !modelID.isEmpty {
+            output.append("- **Resolved model ID**: `\(modelID)`")
+        }
+        if let modelSource, !modelSource.isEmpty {
+            output.append("- **Model source**: `\(modelSource)`")
+        }
     }
 
     // MARK: - Selected Files Content
@@ -2353,6 +2435,12 @@ extension ToolOutputFormatter {
         var errors: [String] = []
         var oracleExportPath: String?
         var oracleExportInstruction: String?
+        var resolvedModelID: String?
+        var resolvedModelName: String?
+        var modelSelection: String?
+        var modelSource: String?
+        var modelPresetID: String?
+        var modelPresetName: String?
 
         switch value {
         case let .string(s):
@@ -2370,6 +2458,12 @@ extension ToolOutputFormatter {
             }
             oracleExportPath = obj["oracle_export_path"]?.stringValue
             oracleExportInstruction = obj["oracle_export_instruction"]?.stringValue
+            resolvedModelID = obj["model_id"]?.stringValue
+            resolvedModelName = obj["model_name"]?.stringValue
+            modelSelection = obj["model_selection"]?.stringValue
+            modelSource = obj["model_source"]?.stringValue
+            modelPresetID = obj["model_preset_id"]?.stringValue
+            modelPresetName = obj["model_preset_name"]?.stringValue
             // Nested result support
             if response == nil, let res = obj["result"] {
                 if let s = res.stringValue { response = s }
@@ -2383,7 +2477,18 @@ extension ToolOutputFormatter {
         }
 
         // Build main section using our existing helper
-        let text = chatSend(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = chatSend(
+            chatId: shortId,
+            mode: mode,
+            modelName: resolvedModelName,
+            modelID: resolvedModelID,
+            modelSelection: modelSelection,
+            modelSource: modelSource,
+            modelPresetID: modelPresetID,
+            modelPresetName: modelPresetName,
+            response: response,
+            diffs: diffs
+        )
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
@@ -2441,6 +2546,12 @@ extension ToolOutputFormatter {
         var errors: [String] = []
         var oracleExportPath: String?
         var oracleExportInstruction: String?
+        var resolvedModelID: String?
+        var resolvedModelName: String?
+        var modelSelection: String?
+        var modelSource: String?
+        var modelPresetID: String?
+        var modelPresetName: String?
 
         switch value {
         case let .string(s):
@@ -2457,6 +2568,12 @@ extension ToolOutputFormatter {
             }
             oracleExportPath = obj["oracle_export_path"]?.stringValue
             oracleExportInstruction = obj["oracle_export_instruction"]?.stringValue
+            resolvedModelID = obj["model_id"]?.stringValue
+            resolvedModelName = obj["model_name"]?.stringValue
+            modelSelection = obj["model_selection"]?.stringValue
+            modelSource = obj["model_source"]?.stringValue
+            modelPresetID = obj["model_preset_id"]?.stringValue
+            modelPresetName = obj["model_preset_name"]?.stringValue
             if response == nil, let res = obj["result"] {
                 if let s = res.stringValue { response = s }
                 else if let arr = res.objectValue?["diffs"]?.arrayValue { diffs = parseDiffArray(arr) }
@@ -2467,7 +2584,18 @@ extension ToolOutputFormatter {
             break
         }
 
-        let text = askOracle(chatId: shortId, mode: mode, response: response, diffs: diffs)
+        let text = askOracle(
+            chatId: shortId,
+            mode: mode,
+            modelName: resolvedModelName,
+            modelID: resolvedModelID,
+            modelSelection: modelSelection,
+            modelSource: modelSource,
+            modelPresetID: modelPresetID,
+            modelPresetName: modelPresetName,
+            response: response,
+            diffs: diffs
+        )
         var blocks: [MCP.Tool.Content] = [.text(text)]
         if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))

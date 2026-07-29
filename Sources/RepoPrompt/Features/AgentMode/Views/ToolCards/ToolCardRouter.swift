@@ -388,8 +388,11 @@ private enum ToolCardSubtitleBuilder {
             }
         case "ask_oracle":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.AskOracleArgs.self, from: argsJSON) {
-                if let mode = args.mode, !mode.isEmpty {
-                    return mode
+                let mode = args.mode?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let model = args.model?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let labels = [mode, model].compactMap(\.self).filter { !$0.isEmpty }
+                if !labels.isEmpty {
+                    return labels.joined(separator: " • ")
                 }
                 if let message = args.message, !message.isEmpty {
                     return "\"\(message)\""

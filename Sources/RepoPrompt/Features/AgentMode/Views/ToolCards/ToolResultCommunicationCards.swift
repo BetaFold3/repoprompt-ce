@@ -12,6 +12,21 @@ func oracleToolResultPopoverUserInfo(
     )
 }
 
+func chatSendResultSummary(_ dto: ToolResultDTOs.ChatSendDTO) -> String {
+    var parts: [String] = []
+    if let mode = dto.mode { parts.append(mode) }
+    if let modelName = dto.modelPresetName ?? dto.modelName, !modelName.isEmpty {
+        parts.append(modelName)
+    }
+    if let chatID = dto.chatID, !chatID.isEmpty, parts.isEmpty || dto.diffs?.isEmpty != false {
+        parts.append(chatID)
+    }
+    if let diffs = dto.diffs, !diffs.isEmpty {
+        parts.append("\(diffs.count) diffs")
+    }
+    return parts.joined(separator: " • ")
+}
+
 struct ChatSendResultCard: View {
     let item: AgentChatItem
     let oracleOpenContext: AgentOracleOpenContext?
@@ -27,16 +42,7 @@ struct ChatSendResultCard: View {
 
     /// Compact summary showing mode and a small amount of result context
     private var summary: String {
-        guard let dto else { return "" }
-        var parts: [String] = []
-        if let mode = dto.mode { parts.append(mode) }
-        if let chatID = dto.chatID, !chatID.isEmpty, parts.isEmpty || dto.diffs?.isEmpty != false {
-            parts.append(chatID)
-        }
-        if let diffs = dto.diffs, !diffs.isEmpty {
-            parts.append("\(diffs.count) diffs")
-        }
-        return parts.joined(separator: " • ")
+        dto.map(chatSendResultSummary) ?? ""
     }
 
     private var status: ToolCardStatus {

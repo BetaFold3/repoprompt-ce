@@ -12,12 +12,38 @@ extension OracleViewModel {
 
     // MARK: - Model Selection
 
-    /// Encapsulates the result of model selection
+    /// Encapsulates the result of model selection.
     private struct ModelSelectionResult {
         let model: AIModel
         let mcpControlInfo: String?
         let isAutoSelected: Bool
         let chatPresetID: UUID? // The chat preset to use for this mode (always resolved now)
+        let modelSource: String
+        let modelPresetID: UUID?
+        let modelPresetName: String?
+
+        init(
+            model: AIModel,
+            mcpControlInfo: String?,
+            isAutoSelected: Bool,
+            chatPresetID: UUID?,
+            modelSource: String = "planning_model",
+            modelPresetID: UUID? = nil,
+            modelPresetName: String? = nil
+        ) {
+            self.model = model
+            self.mcpControlInfo = mcpControlInfo
+            self.isAutoSelected = isAutoSelected
+            self.chatPresetID = chatPresetID
+            self.modelSource = modelSource
+            self.modelPresetID = modelPresetID
+            self.modelPresetName = modelPresetName
+        }
+    }
+
+    private enum ModelPresetMatchPolicy {
+        case fuzzyAllowed
+        case exactOnly
     }
 
     enum OracleSendPackagingProvenance: Equatable {
@@ -166,7 +192,8 @@ extension OracleViewModel {
         mode rawMode: String,
         allPresets: [ModelPreset],
         promptVM: PromptViewModel,
-        planningModelRawOverride: String? = nil
+        planningModelRawOverride: String? = nil,
+        presetMatchPolicy: ModelPresetMatchPolicy = .fuzzyAllowed
     ) async throws -> ModelSelectionResult {
         /// Resolve a chat preset for the MCP mode even when the selected model preset
         /// does not map one explicitly. Ensures UI display and prompt building stay in sync.
@@ -214,10 +241,15 @@ extension OracleViewModel {
         let settingsStore = GlobalSettingsStore.shared
         let useModelPresets = settingsStore.mcpShowModelPresets()
         let temporarilyDisabled = settingsStore.mcpTemporarilyDisablePresets()
+        let presetUsageState = MCPModelPresetUsageState(
+            showModelPresets: useModelPresets,
+            temporarilyDisabled: temporarilyDisabled,
+            configuredPresetCount: allPresets.count
+        )
 
         // When presets are temporarily hidden by wizard, treat as empty
         // This ensures hiding presets behaves identically to having no presets
-        let effectivePresets: [ModelPreset] = (useModelPresets && temporarilyDisabled) ? [] : allPresets
+        let effectivePresets: [ModelPreset] = presetUsageState.allowsConfiguredPresets ? allPresets : []
         let hasAnyModelPresets = !effectivePresets.isEmpty
 
         /// Helpers for consistent info labels
@@ -231,6 +263,12 @@ extension OracleViewModel {
         // This ensures consistent MCP behavior regardless of preset toggle state.
         // ─────────────────────────────────────────────────────────────────
         if !useModelPresets {
+            if let mp = modelParam,
+               let preset = try await findPreset(named: mp, in: allPresets, allowFuzzy: false),
+               let message = presetUsageState.blockedPresetMessage(for: preset)
+            {
+                throw ChatToolError.invalidParams(message)
+            }
             // MCP always uses the explicitly configured Oracle planning model when presets are off.
             let planningModel = try strictPlanningModel()
             let resolvedPreset = resolveChatPreset(for: mode, from: nil)
@@ -271,6 +309,12 @@ extension OracleViewModel {
 
         // B.1: No model presets exist at all → use default MCP model (error if unavailable)
         if !hasAnyModelPresets {
+            if let mp = modelParam,
+               let preset = try await findPreset(named: mp, in: allPresets, allowFuzzy: false),
+               let message = presetUsageState.blockedPresetMessage(for: preset)
+            {
+                throw ChatToolError.invalidParams(message)
+            }
             // Default MCP model must be explicitly configured and available when presets are enabled but none are defined.
             let planningModel = try strictPlanningModel()
             let resolvedPreset = resolveChatPreset(for: mode, from: nil)
@@ -311,8 +355,13 @@ extension OracleViewModel {
 
         // Explicit model request via param
         if let mp = modelParam {
-            // Try to resolve a user-defined preset by id/name/fuzzy
-            if let preset = try await findPreset(named: mp, in: effectivePresets) {
+            // ask_oracle uses exact preset identity; oracle_send keeps its
+            // compatibility fuzzy match behavior.
+            if let preset = try await findPreset(
+                named: mp,
+                in: effectivePresets,
+                allowFuzzy: presetMatchPolicy == .fuzzyAllowed
+            ) {
                 try validateModeCompatibility(preset: preset, mode: mode, allPresets: effectivePresets)
 
                 // Check if the preset's model is available (model presets are sacred)
@@ -328,7 +377,15 @@ extension OracleViewModel {
 
                 let info = resolvedPreset.name ?? "\(modeLabel) mode • \(preset.name) (\(modelName))"
 
-                return .init(model: preset.model, mcpControlInfo: info, isAutoSelected: false, chatPresetID: resolvedPreset.id)
+                return .init(
+                    model: preset.model,
+                    mcpControlInfo: info,
+                    isAutoSelected: false,
+                    chatPresetID: resolvedPreset.id,
+                    modelSource: "preset",
+                    modelPresetID: preset.id,
+                    modelPresetName: preset.name
+                )
             }
 
             // No preset match: do not allow sentinel fallback here since presets exist.
@@ -346,7 +403,15 @@ extension OracleViewModel {
             let resolvedPreset = resolveChatPreset(for: mode, from: first.chatPresetMappings)
             let info = resolvedPreset.name ?? "\(modeLabel) mode • Auto: \(first.name) (\(modelName))"
 
-            return .init(model: first.model, mcpControlInfo: info, isAutoSelected: true, chatPresetID: resolvedPreset.id)
+            return .init(
+                model: first.model,
+                mcpControlInfo: info,
+                isAutoSelected: true,
+                chatPresetID: resolvedPreset.id,
+                modelSource: "preset",
+                modelPresetID: first.id,
+                modelPresetName: first.name
+            )
         }
 
         // Hard line: user disabled this mode across presets
@@ -411,27 +476,47 @@ extension OracleViewModel {
 
     /// Finds a preset by name using various matching strategies
     @MainActor
-    private func findPreset(named name: String, in presets: [ModelPreset]) async throws -> ModelPreset? {
+    private func findPreset(
+        named name: String,
+        in presets: [ModelPreset],
+        allowFuzzy: Bool
+    ) async throws -> ModelPreset? {
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+
         // Try by ID first
-        if let presetId = UUID(uuidString: name),
+        if let presetId = UUID(uuidString: normalizedName),
            let preset = presets.first(where: { $0.id == presetId })
         {
             return preset
         }
 
-        // Try exact name match (case-insensitive)
-        if let preset = presets.first(where: { $0.name.lowercased() == name.lowercased() }) {
-            return preset
+        // Try exact name match (case-insensitive). Strict ask_oracle calls
+        // must fail closed when duplicate display names exist; UUIDs remain unique.
+        let exactNameMatches = presets.filter {
+            $0.name.caseInsensitiveCompare(normalizedName) == .orderedSame
         }
+        if exactNameMatches.count == 1 {
+            return exactNameMatches[0]
+        }
+        if exactNameMatches.count > 1, !allowFuzzy {
+            throw ChatToolError.invalidParams(
+                "Multiple model presets are named '\(normalizedName)'. Pass the exact preset UUID from oracle_utils op=models."
+            )
+        }
+        if let firstExactMatch = exactNameMatches.first {
+            return firstExactMatch
+        }
+
+        guard allowFuzzy else { return nil }
 
         // Try fuzzy matching
         let availableNames = presets.map(\.name)
         let closestName = await Task.detached(priority: .userInitiated) {
-            ModelPreset.findBestMatch(name, among: availableNames)
+            ModelPreset.findBestMatch(normalizedName, among: availableNames)
         }.value
 
         if let closestName {
-            print("[MCP] Fuzzy matched model '\(name)' to preset '\(closestName)'")
+            print("[MCP] Fuzzy matched model '\(normalizedName)' to preset '\(closestName)'")
             return presets.first { $0.name == closestName }
         }
 
@@ -729,7 +814,8 @@ extension OracleViewModel {
         activateInUI: Bool = true,
         setActiveForTab: Bool = true,
         agentModeSessionID: UUID? = nil,
-        agentModeRunID: UUID? = nil
+        agentModeRunID: UUID? = nil,
+        reuseBlankSession: Bool = true
     ) async throws -> ChatSession {
         let safeName = ChatSession.validatedName(name ?? "")
         let createdID = await startNewChatSession(
@@ -738,7 +824,8 @@ extension OracleViewModel {
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
             activateInUI: activateInUI,
-            setActiveForTab: setActiveForTab
+            setActiveForTab: setActiveForTab,
+            reuseBlankSession: reuseBlankSession
         )
 
         guard let id = createdID ?? currentSessionID,
@@ -881,11 +968,7 @@ extension OracleViewModel {
         }
         guard changed else { return }
 
-        let sessionToSave = sessions[index]
-        Task { [weak self] in
-            guard let self else { return }
-            _ = try? await autosaveSession(sessionToSave)
-        }
+        scheduleSessionSave(sessions[index])
     }
 
     @MainActor
@@ -931,7 +1014,8 @@ extension OracleViewModel {
                 activateInUI: activateInUI,
                 setActiveForTab: true,
                 agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID
+                agentModeRunID: agentModeRunID,
+                reuseBlankSession: false
             )
             return new.id
         }
@@ -1093,6 +1177,12 @@ extension OracleViewModel {
         let chatIdIn = args["chat_id"]?.stringValue
         let newChat = args["new_chat"]?.boolValue ?? false
         let modelParam = args["model"]?.stringValue
+        if newChat,
+           let chatIdIn,
+           !chatIdIn.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            throw ChatToolError.invalidParams("chat_id and new_chat:true cannot be used together")
+        }
         // Deprecated compatibility parameter: Oracle replies are text-only and no longer emit diffs.
         _ = args["include_diffs"]?.boolValue
         let selectionOverride = tabContext?.packaging.selection
@@ -1107,7 +1197,8 @@ extension OracleViewModel {
             modelParam: modelParam,
             mode: mode,
             allPresets: allPresets,
-            promptVM: promptVM
+            promptVM: promptVM,
+            presetMatchPolicy: tabContext?.origin == .askOracle ? .exactOnly : .fuzzyAllowed
         )
 
         let selectedModel = modelSelection.model
@@ -1140,6 +1231,9 @@ extension OracleViewModel {
         } else {
             shouldActivate = true
         }
+        let previousActiveChatSessionID = tabID.flatMap {
+            workspaceManager.activeChatSessionID(forTabID: $0)
+        }
         let chatID = try await locateOrCreateChat(
             chatIdIn,
             desiredName: chatName,
@@ -1151,20 +1245,6 @@ extension OracleViewModel {
         )
         pinSession(chatID)
         defer { unpinSession(chatID) }
-
-        // Set MCP control info for the MCP-triggered session only
-        if let mcpControlledModel {
-            setMCPSessionUIState(
-                MCPSessionUIState(
-                    modelInfo: mcpControlledModel,
-                    overrideModelName: overrideModelName,
-                    overrideChatPresetName: overrideChatPresetName
-                ),
-                for: chatID
-            )
-        } else {
-            clearMCPSessionUIState(for: chatID)
-        }
 
         // ────────── 4. Determine mode ──────────
         let effectiveMode = PromptViewModel.PlanActMode(rawValue: mode.capitalized) ?? .chat
@@ -1182,29 +1262,79 @@ extension OracleViewModel {
                 gitBaseOverride: nil,
                 selectionOverride: selectionOverride,
                 lookupContextOverride: lookupContextOverride,
-                reviewGitContextOverride: reviewGitContextOverride
+                reviewGitContextOverride: reviewGitContextOverride,
+                overlapPolicy: .rejectIfBusy,
+                origin: .mcp
             )
         }
+        let sendStart: SendStart
         #if DEBUG
             let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
                 tabContext: tabContext,
                 observer: oracleReviewPackagingTraceObserverForTesting
             )
-            await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
+            sendStart = await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
         #else
-            await send()
+            sendStart = await send()
         #endif
-        let queryId = activeQueryId(for: chatID) ?? currentQueryId
 
-        if let q = queryId {
-            try await waitUntilMessageFinalised(q)
+        let queryId: UUID
+        switch sendStart {
+        case let .started(startedQueryID):
+            queryId = startedQueryID
+        case .rejectedSessionBusy:
+            throw ChatToolError.oracleSessionBusy(
+                "This chat is still streaming. Pass new_chat:true or a different chat_id, or wait. In Agent Mode, use oracle_chat_log with the explicit chat_id to inspect the lane."
+            )
+        case .rejectedTabConcurrencyLimit:
+            // A force-new request creates its target before the atomic reservation.
+            // Remove that still-blank target so a rejected third lane does not leave
+            // an invisible orphan or steal the tab's active-chat pointer.
+            #if DEBUG
+                if let observer = oracleRejectedNewSessionCleanupObserverForTesting {
+                    await observer(chatID, tabID)
+                }
+            #endif
+            if newChat,
+               let rejectedSession = sessions.first(where: { $0.id == chatID }),
+               rejectedSession.effectiveMessageCount == 0
+            {
+                // Restore only while the rejected session still owns the tab pointer.
+                // This check-and-set is synchronous on MainActor; doing it before
+                // deletion prevents cleanup awaits from overwriting a newer lane.
+                if let tabID,
+                   workspaceManager.activeChatSessionID(forTabID: tabID) == chatID
+                {
+                    workspaceManager.setActiveChatSessionID(previousActiveChatSessionID, forTabID: tabID)
+                }
+                await deleteSession(rejectedSession)
+            }
+            throw ChatToolError.oracleConcurrencyLimit(
+                "2 Oracle streams are already running in this tab. Wait for one to finish, then retry. In Agent Mode, use oracle_chat_log with each explicit chat_id to inspect the active lanes."
+            )
+        case let .failed(reason):
+            throw ChatToolError.invalidParams(reason)
         }
+
+        // Publish ephemeral UI state only after this send owns the session.
+        if let mcpControlledModel {
+            setMCPSessionUIState(
+                MCPSessionUIState(
+                    modelInfo: mcpControlledModel,
+                    overrideModelName: overrideModelName,
+                    overrideChatPresetName: overrideChatPresetName
+                ),
+                for: chatID
+            )
+        } else {
+            clearMCPSessionUIState(for: chatID)
+        }
+
+        try await waitUntilMessageFinalised(queryId)
 
         // ────────── 6. Build typed reply ──────────
         let errors: [String] = []
-        let aiMsg = queryId.flatMap { id in
-            getChatMessage(withId: id)
-        }.flatMap { $0.isUser ? nil : $0 }
+        let aiMsg = getChatMessage(withId: queryId).flatMap { $0.isUser ? nil : $0 }
 
         let replyObj = ChatSendReply(
             chatId: chatID,
@@ -1226,6 +1356,16 @@ extension OracleViewModel {
         }
         if let agentModeRunID = tabContext?.agentModeRunID {
             dict["agent_run_id"] = .string(agentModeRunID.uuidString)
+        }
+        dict["model_id"] = .string(selectedModel.rawValue)
+        dict["model_name"] = .string(selectedModel.displayName)
+        dict["model_selection"] = .string(modelSelection.isAutoSelected ? "automatic" : "explicit")
+        dict["model_source"] = .string(modelSelection.modelSource)
+        if let modelPresetID = modelSelection.modelPresetID {
+            dict["model_preset_id"] = .string(modelPresetID.uuidString)
+        }
+        if let modelPresetName = modelSelection.modelPresetName {
+            dict["model_preset_name"] = .string(modelPresetName)
         }
         return dict
     }
@@ -1441,23 +1581,71 @@ extension OracleViewModel {
 
         let formatter = Self.iso8601Formatter
 
-        // Convert to Value array - only expose short IDs
-        let chatsArray = metadataList.map { meta -> Value in
+        // Always expose every active stream first, even if its initial autosave
+        // has not reached disk yet. Completed persisted sessions fill the rest.
+        let liveStreamingSessions = sessions
+            .filter { session in
+                session.workspaceID == workspace.id &&
+                    streamingSessions.contains(session.id) &&
+                    (resolvedTabID == nil || session.composeTabID == resolvedTabID)
+            }
+            .sorted { $0.savedAt > $1.savedAt }
+        let liveStreamingIDs = Set(liveStreamingSessions.map(\.id))
+
+        func liveSessionValue(_ session: ChatSession) -> Value {
+            let activeForTab = session.composeTabID.flatMap { workspaceManager.activeChatSessionID(forTabID: $0) } == session.id
+            var chatDict: [String: Value] = [
+                "id": .string(session.shortID),
+                "name": .string(session.name),
+                "last_modified": .string(formatter.string(from: session.savedAt)),
+                "message_count": .int(session.effectiveMessageCount),
+                "selected_files": .array(session.selectedFilePaths.map(Value.string)),
+                "is_current": .bool(session.id == currentSessionID),
+                "is_active_for_tab": .bool(activeForTab),
+                "is_streaming": .bool(true)
+            ]
+            if let tabID = session.composeTabID {
+                chatDict["context_id"] = .string(tabID.uuidString)
+            }
+            if let modelID = session.lastSendModelID {
+                chatDict["model_id"] = .string(modelID)
+            }
+            if let modelName = session.lastSendModelDisplayName ?? session.lastResponseModelDisplayName {
+                chatDict["model_name"] = .string(modelName)
+            }
+            return .object(chatDict)
+        }
+
+        func persistedSessionValue(_ meta: ChatSessionMeta) -> Value {
             let activeForTab = meta.composeTabID.flatMap { workspaceManager.activeChatSessionID(forTabID: $0) } == meta.id
             var chatDict: [String: Value] = [
-                "id": .string(meta.shortID), // Only expose short ID
+                "id": .string(meta.shortID),
                 "name": .string(meta.name),
                 "last_modified": .string(formatter.string(from: meta.lastModified)),
                 "message_count": .int(meta.messageCount),
-                "selected_files": .array(meta.selectedFilePaths.map { path in Value.string(path) }),
+                "selected_files": .array(meta.selectedFilePaths.map(Value.string)),
                 "is_current": .bool(meta.id == currentSessionID),
-                "is_active_for_tab": .bool(activeForTab)
+                "is_active_for_tab": .bool(activeForTab),
+                "is_streaming": .bool(streamingSessions.contains(meta.id))
             ]
             if let tabID = meta.composeTabID {
                 chatDict["context_id"] = .string(tabID.uuidString)
             }
+            if let modelID = meta.lastSendModelID {
+                chatDict["model_id"] = .string(modelID)
+            }
+            if let modelName = meta.lastSendModelDisplayName {
+                chatDict["model_name"] = .string(modelName)
+            }
             return .object(chatDict)
         }
+
+        let completedLimit = max(0, limit - liveStreamingSessions.count)
+        let persistedCompleted = metadataList
+            .filter { !liveStreamingIDs.contains($0.id) }
+            .prefix(completedLimit)
+        let chatsArray = liveStreamingSessions.map(liveSessionValue)
+            + persistedCompleted.map(persistedSessionValue)
 
         var result: [String: Value] = [
             "chats": .array(chatsArray),
@@ -1773,7 +1961,7 @@ extension OracleViewModel {
             promptTokens: tokenInfo.promptTokens,
             completionTokens: tokenInfo.completionTokens,
             cost: tokenInfo.cost,
-            modelName: model.rawValue
+            modelName: model.displayName
         )
 
         // 2) Create a ChatSession object (in-memory)
@@ -1793,7 +1981,9 @@ extension OracleViewModel {
                 ? Array(promptViewModel.selectedPromptIDsForChat)
                 : [],
             preferredAIModel: model.rawValue,
-            selectedChatPresetID: chatPresetID
+            selectedChatPresetID: chatPresetID,
+            lastSendModelID: model.rawValue,
+            lastSendModelDisplayName: model.displayName
         )
 
         if setActiveForTab {

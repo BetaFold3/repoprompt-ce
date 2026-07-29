@@ -144,12 +144,16 @@ enum ToolArgsDTOs {
         let mode: String?
         let chatID: String?
         let newChat: Bool?
+        let model: String?
+        let chatName: String?
 
         enum CodingKeys: String, CodingKey {
             case message
             case mode
             case chatID = "chat_id"
             case newChat = "new_chat"
+            case model
+            case chatName = "chat_name"
         }
     }
 

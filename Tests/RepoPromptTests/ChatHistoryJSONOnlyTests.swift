@@ -9,7 +9,12 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
             sequenceIndex: 0
         )
         let workspace = WorkspaceModel(name: "Chat JSON Only", repoPaths: ["/tmp/root"])
-        let session = ChatSession(name: "Current Session", messages: [message])
+        let session = ChatSession(
+            name: "Current Session",
+            messages: [message],
+            lastSendModelID: "custom:oracle-model",
+            lastSendModelDisplayName: "Oracle Model"
+        )
         let service = ChatDataService()
 
         let fileURL = try await service.saveChatSession(session, for: workspace)
@@ -22,6 +27,14 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertEqual(loaded.name, "Current Session")
         XCTAssertEqual(loaded.messages.count, 1)
         XCTAssertEqual(loaded.messages[0].rawText, "assistant reply")
+        XCTAssertEqual(loaded.lastSendModelID, "custom:oracle-model")
+        XCTAssertEqual(loaded.lastSendModelDisplayName, "Oracle Model")
+        XCTAssertEqual(loaded.listStub().lastSendModelID, "custom:oracle-model")
+        XCTAssertEqual(loaded.listStub().lastSendModelDisplayName, "Oracle Model")
+
+        let metadata = try await service.recentSessions(for: workspace, limit: 1)
+        XCTAssertEqual(metadata.first?.lastSendModelID, "custom:oracle-model")
+        XCTAssertEqual(metadata.first?.lastSendModelDisplayName, "Oracle Model")
     }
 
     func testStoredMessageOmitsLegacyDelegateAndCombinedTextFields() throws {
@@ -95,6 +108,8 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
 
         let decoded = try JSONDecoder().decode(ChatSession.self, from: Data(payload.utf8))
         XCTAssertEqual(decoded.messages.first?.rawText, "assistant text")
+        XCTAssertNil(decoded.lastSendModelID)
+        XCTAssertNil(decoded.lastSendModelDisplayName)
 
         let encoded = try JSONEncoder().encode(decoded)
         let encodedString = String(data: encoded, encoding: .utf8) ?? ""

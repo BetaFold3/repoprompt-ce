@@ -3,6 +3,12 @@ import SwiftUI
 // MARK: - Oracle Pill
 
 enum AgentOraclePillLogic {
+    enum PresentationSource: Equatable {
+        case latest
+        case explicit
+        case pinned
+    }
+
     struct ExplicitOpenRequest: Equatable {
         let generation: UInt64
         let workspaceID: UUID
@@ -59,6 +65,8 @@ enum AgentOraclePillLogic {
             hasRenderableMessages(session: session, liveMessageCount: liveMessageCount(session.id))
                 || streamingSessionIDs.contains(session.id)
         }
+        let streaming = renderable.filter { streamingSessionIDs.contains($0.id) }
+        let completed = renderable.filter { !streamingSessionIDs.contains($0.id) }
         guard activeAgentSessionID != nil || activeRunID != nil else { return renderable }
 
         func isUnownedLegacy(_ session: ChatSession) -> Bool {
@@ -68,28 +76,35 @@ enum AgentOraclePillLogic {
             guard let activeAgentSessionID else { return true }
             return session.agentModeSessionID == activeAgentSessionID
         }
+        func includingEveryStream(_ completedSessions: [ChatSession]) -> [ChatSession] {
+            streaming + completedSessions
+        }
 
+        // Cap accounting and user observability are tab-scoped, so every active
+        // stream remains visible even when completed history is owner-filtered.
         if let activeRunID {
-            let exactRunMatches = renderable.filter { matchesAgent($0) && $0.agentModeRunID == activeRunID }
-            if !exactRunMatches.isEmpty { return exactRunMatches }
+            let exactRunMatches = completed.filter { matchesAgent($0) && $0.agentModeRunID == activeRunID }
+            if !exactRunMatches.isEmpty { return includingEveryStream(exactRunMatches) }
 
-            let sameAgentLegacyRunMatches = renderable.filter { matchesAgent($0) && $0.agentModeSessionID != nil && $0.agentModeRunID == nil }
-            if !sameAgentLegacyRunMatches.isEmpty { return sameAgentLegacyRunMatches }
+            let sameAgentLegacyRunMatches = completed.filter {
+                matchesAgent($0) && $0.agentModeSessionID != nil && $0.agentModeRunID == nil
+            }
+            if !sameAgentLegacyRunMatches.isEmpty { return includingEveryStream(sameAgentLegacyRunMatches) }
 
             if let activeAgentSessionID,
-               renderable.contains(where: { $0.agentModeSessionID == activeAgentSessionID })
+               completed.contains(where: { $0.agentModeSessionID == activeAgentSessionID })
             {
-                return []
+                return streaming
             }
-            return renderable.filter(isUnownedLegacy)
+            return includingEveryStream(completed.filter(isUnownedLegacy))
         }
 
         if let activeAgentSessionID {
-            let sameAgentMatches = renderable.filter { $0.agentModeSessionID == activeAgentSessionID }
-            if !sameAgentMatches.isEmpty { return sameAgentMatches }
+            let sameAgentMatches = completed.filter { $0.agentModeSessionID == activeAgentSessionID }
+            if !sameAgentMatches.isEmpty { return includingEveryStream(sameAgentMatches) }
         }
 
-        return renderable.filter(isUnownedLegacy)
+        return includingEveryStream(completed.filter(isUnownedLegacy))
     }
 
     static func latestSession(
@@ -109,6 +124,23 @@ enum AgentOraclePillLogic {
             .max(by: { $0.savedAt < $1.savedAt })
     }
 
+    static func orderedSessions(
+        _ sessions: [ChatSession],
+        streamingSessionIDs: Set<UUID>,
+        completedLimit: Int? = nil
+    ) -> [ChatSession] {
+        let streaming = sessions
+            .filter { streamingSessionIDs.contains($0.id) }
+            .sorted { $0.savedAt > $1.savedAt }
+        let completed = sessions
+            .filter { !streamingSessionIDs.contains($0.id) }
+            .sorted { $0.savedAt > $1.savedAt }
+        if let completedLimit {
+            return streaming + Array(completed.prefix(max(0, completedLimit)))
+        }
+        return streaming + completed
+    }
+
     static func selectedSessionID(
         currentSelectionID: UUID?,
         in sessions: [ChatSession],
@@ -124,7 +156,7 @@ enum AgentOraclePillLogic {
 
     static func reconciledPresentedSessionID(
         currentSessionID: UUID?,
-        isExplicit: Bool,
+        source: PresentationSource,
         currentWorkspaceID: UUID?,
         sameTabSessions: [ChatSession],
         eligibleSessions: [ChatSession],
@@ -132,7 +164,7 @@ enum AgentOraclePillLogic {
     ) -> UUID? {
         let sameWorkspaceSessions = sameTabSessions.filter { $0.workspaceID == currentWorkspaceID }
         let sameWorkspaceEligibleSessions = eligibleSessions.filter { $0.workspaceID == currentWorkspaceID }
-        if isExplicit {
+        if source == .explicit {
             guard let currentSessionID,
                   sameWorkspaceSessions.contains(where: { $0.id == currentSessionID })
             else {
@@ -147,6 +179,50 @@ enum AgentOraclePillLogic {
             return currentSessionID
         }
         return latestSession(in: sameWorkspaceEligibleSessions, streamingSessionIDs: streamingSessionIDs)?.id
+    }
+
+    static func reconciledPresentedSessionID(
+        currentSessionID: UUID?,
+        isExplicit: Bool,
+        currentWorkspaceID: UUID?,
+        sameTabSessions: [ChatSession],
+        eligibleSessions: [ChatSession],
+        streamingSessionIDs: Set<UUID>
+    ) -> UUID? {
+        reconciledPresentedSessionID(
+            currentSessionID: currentSessionID,
+            source: isExplicit ? .explicit : .latest,
+            currentWorkspaceID: currentWorkspaceID,
+            sameTabSessions: sameTabSessions,
+            eligibleSessions: eligibleSessions,
+            streamingSessionIDs: streamingSessionIDs
+        )
+    }
+
+    static func modelDisplayName(
+        for session: ChatSession,
+        streamingSessionIDs: Set<UUID>
+    ) -> String? {
+        if streamingSessionIDs.contains(session.id) {
+            return session.lastSendModelDisplayName ?? session.lastResponseModelDisplayName
+        }
+        return session.lastResponseModelDisplayName
+    }
+
+    static func displayTitle(
+        for session: ChatSession,
+        modelDisplayName: String? = nil
+    ) -> String {
+        let resolvedModelName = modelDisplayName ?? session.lastResponseModelDisplayName
+        let genericNames: Set = ["new chat", "untitled", "untitled chat"]
+        let trimmedName = session.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if genericNames.contains(trimmedName.lowercased()),
+           let resolvedModelName,
+           !resolvedModelName.isEmpty
+        {
+            return resolvedModelName
+        }
+        return trimmedName.isEmpty ? (resolvedModelName ?? session.shortID) : trimmedName
     }
 
     static func session(matchingChatID raw: String, in sessions: [ChatSession]) -> ChatSession? {
@@ -173,15 +249,10 @@ struct AgentOraclePill: View {
     let activeAgentSessionID: UUID?
     let activeRunID: UUID?
 
-    private enum PresentedSessionSource {
-        case latest
-        case explicit
-    }
-
     @State private var showPopover = false
     @State private var autoScrollEnabled = false
     @State private var presentedSessionID: UUID?
-    @State private var presentedSessionSource: PresentedSessionSource = .latest
+    @State private var presentedSessionSource: AgentOraclePillLogic.PresentationSource = .latest
     @State private var openRequestGeneration: UInt64 = 0
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
@@ -199,6 +270,21 @@ struct AgentOraclePill: View {
         )
     }
 
+    private var orderedEligibleTabSessions: [ChatSession] {
+        var ordered = AgentOraclePillLogic.orderedSessions(
+            eligibleTabSessions,
+            streamingSessionIDs: oracleViewModel.streamingSessions,
+            completedLimit: 3
+        )
+        if let presentedSession,
+           eligibleTabSessions.contains(where: { $0.id == presentedSession.id }),
+           !ordered.contains(where: { $0.id == presentedSession.id })
+        {
+            ordered.append(presentedSession)
+        }
+        return ordered
+    }
+
     private var latestTabSession: ChatSession? {
         AgentOraclePillLogic.latestSession(
             in: eligibleTabSessions,
@@ -206,9 +292,16 @@ struct AgentOraclePill: View {
         )
     }
 
+    private var streamingSessionCount: Int {
+        eligibleTabSessions.reduce(into: 0) { count, session in
+            if oracleViewModel.streamingSessions.contains(session.id) {
+                count += 1
+            }
+        }
+    }
+
     private var isStreaming: Bool {
-        guard let latestTabSession else { return false }
-        return oracleViewModel.streamingSessions.contains(latestTabSession.id)
+        streamingSessionCount > 0
     }
 
     private var presentedSession: ChatSession? {
@@ -224,10 +317,33 @@ struct AgentOraclePill: View {
 
     private var popoverSubtitle: String {
         guard let presentedSession else { return "Latest tab chat" }
-        if presentedSession.id == latestTabSession?.id {
-            return "Latest tab chat"
+        let modelName = AgentOraclePillLogic.modelDisplayName(
+            for: presentedSession,
+            streamingSessionIDs: oracleViewModel.streamingSessions
+        )
+        var parts = [AgentOraclePillLogic.displayTitle(
+            for: presentedSession,
+            modelDisplayName: modelName
+        )]
+        if let modelName, !parts.contains(modelName) {
+            parts.append(modelName)
         }
-        return presentedSession.name
+        parts.append(presentedSession.shortID)
+        return parts.joined(separator: " • ")
+    }
+
+    private var pillLabel: String {
+        streamingSessionCount > 1 ? "Oracle · \(streamingSessionCount)" : "Oracle"
+    }
+
+    private var pillTooltip: String {
+        if streamingSessionCount > 1 {
+            return "\(streamingSessionCount) Oracle chats are running — click to view"
+        }
+        if isStreaming {
+            return "Oracle is thinking — click to view the live chat"
+        }
+        return "Open the latest Oracle chat for this tab"
     }
 
     private var hasAnySessions: Bool {
@@ -254,7 +370,7 @@ struct AgentOraclePill: View {
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                                 .foregroundStyle(.secondary)
                         }
-                        Text("Oracle")
+                        Text(pillLabel)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: isStreaming ? .semibold : .medium))
                             .foregroundStyle(isStreaming ? .primary : .secondary)
                     }
@@ -269,8 +385,11 @@ struct AgentOraclePill: View {
                     .shadow(color: isStreaming ? Color.purple.opacity(0.15) : .clear, radius: 4, y: 1)
                 }
                 .buttonStyle(.plain)
-                .hoverTooltip(isStreaming ? "Oracle is thinking — click to view the live chat" : "Open the latest Oracle chat for this tab", .top)
+                .hoverTooltip(pillTooltip, .top)
+                .accessibilityLabel("Oracle")
+                .accessibilityValue(isStreaming ? "\(streamingSessionCount) chat\(streamingSessionCount == 1 ? "" : "s") running" : "No chats running")
                 .animation(.easeInOut(duration: 0.2), value: isStreaming)
+                .animation(.easeInOut(duration: 0.2), value: streamingSessionCount)
             } else {
                 Color.clear.frame(width: 0, height: 0)
             }
@@ -313,6 +432,9 @@ struct AgentOraclePill: View {
         .onChange(of: activeRunID) { _, _ in
             reconcilePresentedSession()
         }
+        .onChange(of: eligibleTabSessions.map(\.id)) { _, _ in
+            reconcilePresentedSession()
+        }
     }
 
     @ViewBuilder
@@ -341,6 +463,18 @@ struct AgentOraclePill: View {
                     .lineLimit(1)
             }
 
+            if orderedEligibleTabSessions.count > 1 {
+                ScrollView(.horizontal) {
+                    HStack(spacing: 8) {
+                        ForEach(orderedEligibleTabSessions) { session in
+                            oracleSessionChip(session)
+                        }
+                    }
+                    .padding(.vertical, 1)
+                }
+                .scrollIndicators(.hidden)
+            }
+
             ChatMessagesView(
                 viewModel: oracleViewModel,
                 autoScrollEnabled: $autoScrollEnabled,
@@ -361,7 +495,7 @@ struct AgentOraclePill: View {
         let sameTabSessions = currentTabID.map { oracleViewModel.sessions(forTabID: $0) } ?? []
         let resolvedID = AgentOraclePillLogic.reconciledPresentedSessionID(
             currentSessionID: presentedSessionID,
-            isExplicit: presentedSessionSource == .explicit,
+            source: presentedSessionSource,
             currentWorkspaceID: oracleViewModel.workspaceManager.activeWorkspaceID,
             sameTabSessions: sameTabSessions,
             eligibleSessions: eligibleTabSessions,
@@ -373,6 +507,62 @@ struct AgentOraclePill: View {
             return
         }
         presentedSessionID = resolvedID
+    }
+
+    private func oracleSessionChip(_ session: ChatSession) -> some View {
+        let isSelected = session.id == presentedSessionID
+        let isSessionStreaming = oracleViewModel.streamingSessions.contains(session.id)
+        let modelName = AgentOraclePillLogic.modelDisplayName(
+            for: session,
+            streamingSessionIDs: oracleViewModel.streamingSessions
+        )
+        let title = AgentOraclePillLogic.displayTitle(for: session, modelDisplayName: modelName)
+        let detail = [modelName == title ? nil : modelName, session.shortID]
+            .compactMap(\.self)
+            .joined(separator: " • ")
+
+        return Button {
+            presentedSessionID = session.id
+            presentedSessionSource = .pinned
+        } label: {
+            HStack(spacing: 7) {
+                if isSessionStreaming {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .scaleEffect(0.65)
+                } else {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                        .foregroundStyle(.green)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
+                        .lineLimit(1)
+                    Text(detail)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 9))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.secondary.opacity(0.07))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(
+                        isSessionStreaming ? Color.purple.opacity(0.35) : Color.secondary.opacity(0.12),
+                        lineWidth: 0.75
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(title), \(detail)")
+        .accessibilityValue("\(isSessionStreaming ? "running" : "completed")\(isSelected ? ", selected" : "")")
     }
 
     private func openLatestStreamingPopover() {
