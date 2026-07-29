@@ -165,6 +165,7 @@ enum AgentModePrompts {
         - `prompt` - Get or modify the shared prompt
         - `ask_oracle` - Consult a second AI for planning or review
         - `oracle_chat_log` - Recover Oracle context after compaction
+        \(Fragments.namedOracleConsultationGuidance)
 
         *Read-only Sub-agent Probes:*
         - `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)
@@ -210,6 +211,20 @@ enum AgentModePrompts {
 
     /// Reusable prompt fragments shared across role-specific prompts.
     enum Fragments {
+        // MARK: - Oracle model identity
+
+        /// Fail-closed guidance for natural-language requests that name
+        /// one or more Oracle model presets. Kept in one fragment so the
+        /// standard and engineer Agent Mode prompts cannot drift apart.
+        static let namedOracleConsultationGuidance = """
+
+        **Named Oracle consultations**
+        - When the user asks for an opinion from a named Oracle (for example, "ask Knowledge Duel A and Knowledge Duel B Oracles"), treat each name as a model-preset selector, not merely as a chat title.
+        - First call `oracle_utils` with `op:"models"` and resolve each requested name against the authoritative preset list. Prefer the returned exact preset UUID in every `ask_oracle` call; do not guess when a name is missing or ambiguous.
+        - For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and its own explicit `model`; `chat_name` is optional display text only and never selects a model.
+        - Before comparing or synthesizing answers, verify every result's returned `model_preset_id` and `model_preset_name` match the requested preset. If identity is missing, mismatched, or any lane fails, report that failure and do not synthesize the answers.
+        """
+
         // MARK: - Export delegation guidance
 
         //

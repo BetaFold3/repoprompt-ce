@@ -56,6 +56,13 @@ struct MCPOracleToolService {
         case "models":
             return try await executeOracleModelsUtility()
         case "sessions":
+            if let connectionID = ServerNetworkManager.currentConnectionID,
+               await ServerNetworkManager.shared.runPurpose(for: connectionID) == .agentModeRun
+            {
+                throw MCPError.invalidParams(
+                    "oracle_utils op=sessions is unavailable in Agent Mode because workspace-wide session metadata is not scoped to the current run. Use oracle_chat_log with an explicit chat_id returned by ask_oracle."
+                )
+            }
             return try await executeLiveOracleSessions(args: forwarded)
         default:
             throw MCPError.invalidParams("Unsupported oracle_utils op '\(op)'. Use models or sessions.")
@@ -83,10 +90,13 @@ struct MCPOracleToolService {
         if let includeUserValue = args["include_user"], includeUserValue.boolValue == nil {
             throw MCPError.invalidParams("include_user must be a boolean")
         }
-        if let chatIDRaw = args["chat_id"]?.stringValue,
-           chatIDRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            throw MCPError.invalidParams("chat_id cannot be empty when provided")
+        if let chatIDValue = args["chat_id"] {
+            guard let chatIDRaw = chatIDValue.stringValue else {
+                throw MCPError.invalidParams("chat_id must be a string")
+            }
+            guard !chatIDRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw MCPError.invalidParams("chat_id cannot be empty when provided")
+            }
         }
 
         let hasExplicitTabID = rawExplicitTabID(args) != nil
@@ -116,13 +126,13 @@ struct MCPOracleToolService {
     // MARK: - ask_oracle (agent-mode only)
 
     func executeAskOracle(args: [String: Value]) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "export_response"]
+        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "chat_name", "export_response"]
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "ask_oracle only accepts: message, mode, chat_id, new_chat, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
+                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, chat_name, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
             )
         }
 
@@ -138,6 +148,13 @@ struct MCPOracleToolService {
         let newChat = args["new_chat"]?.boolValue ?? false
         let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
+        let model = args["model"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let chatName = args["chat_name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        try validateNewChatModelSelection(
+            newChat: newChat,
+            model: model,
+            mode: modeRaw
+        )
         let targetWindow = try requireTargetWindow()
 
         let tabID = try await resolveTabIDForAgentMode(args, connectionID)
@@ -233,6 +250,12 @@ struct MCPOracleToolService {
         ]
         if let normalizedChatID {
             chatArgs["chat_id"] = .string(normalizedChatID)
+        }
+        if let model {
+            chatArgs["model"] = .string(model)
+        }
+        if let chatName {
+            chatArgs["chat_name"] = .string(chatName)
         }
 
         await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
@@ -392,14 +415,88 @@ struct MCPOracleToolService {
             throw MCPError.invalidParams("Invalid mode: \(modeRaw). Valid modes: chat, plan, review")
         }
 
-        if let chatIDRaw = args["chat_id"]?.stringValue,
-           chatIDRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        {
-            throw MCPError.invalidParams("chat_id cannot be empty when provided")
+        if let chatIDValue = args["chat_id"] {
+            guard let chatIDRaw = chatIDValue.stringValue else {
+                throw MCPError.invalidParams("chat_id must be a string")
+            }
+            guard !chatIDRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw MCPError.invalidParams("chat_id cannot be empty when provided")
+            }
         }
         if let newChatValue = args["new_chat"], newChatValue.boolValue == nil {
             throw MCPError.invalidParams("new_chat must be a boolean")
         }
+        let newChat = args["new_chat"]?.boolValue ?? false
+        if newChat, args["chat_id"] != nil {
+            throw MCPError.invalidParams("chat_id and new_chat:true cannot be used together")
+        }
+
+        for key in ["model", "chat_name"] where args[key] != nil {
+            guard let value = args[key]?.stringValue else {
+                throw MCPError.invalidParams("\(key) must be a string")
+            }
+            guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw MCPError.invalidParams("\(key) cannot be empty when provided")
+            }
+        }
+        if args["chat_name"] != nil, !newChat {
+            throw MCPError.invalidParams("chat_name is only valid with new_chat:true")
+        }
+    }
+
+    private func validateNewChatModelSelection(
+        newChat: Bool,
+        model: String?,
+        mode: String
+    ) throws {
+        guard newChat else { return }
+
+        let settings = GlobalSettingsStore.shared
+        let configuredPresets = ModelPresetsManager.shared.allPresets()
+        let usageState = MCPModelPresetUsageState(
+            showModelPresets: settings.mcpShowModelPresets(),
+            temporarilyDisabled: settings.mcpTemporarilyDisablePresets(),
+            configuredPresetCount: configuredPresets.count
+        )
+
+        if let model,
+           let preset = Self.exactModelPresetMatch(model, in: configuredPresets),
+           let message = usageState.blockedPresetMessage(for: preset)
+        {
+            throw MCPError.invalidParams(message)
+        }
+
+        guard model == nil, usageState.allowsConfiguredPresets else { return }
+
+        let compatiblePresets = configuredPresets
+            .filteredForMode(mode)
+            .sorted {
+                let order = $0.name.localizedCaseInsensitiveCompare($1.name)
+                if order == .orderedSame { return $0.id.uuidString < $1.id.uuidString }
+                return order == .orderedAscending
+            }
+        guard compatiblePresets.count > 1 else { return }
+
+        let choices = compatiblePresets
+            .map { "'\($0.name)' (\($0.id.uuidString))" }
+            .joined(separator: ", ")
+        throw MCPError.invalidParams(
+            "new_chat:true requires an explicit model when multiple model presets support '\(mode)' mode: \(choices). Retry with model set to one exact preset name or UUID from oracle_utils op=models. chat_name only labels the Oracle session and never selects a model."
+        )
+    }
+
+    private static func exactModelPresetMatch(
+        _ selector: String,
+        in presets: [ModelPreset]
+    ) -> ModelPreset? {
+        let normalized = selector.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let id = UUID(uuidString: normalized) {
+            return presets.first { $0.id == id }
+        }
+        let matches = presets.filter {
+            $0.name.caseInsensitiveCompare(normalized) == .orderedSame
+        }
+        return matches.count == 1 ? matches[0] : nil
     }
 
     private func oracleModelAvailabilityGuidance(for model: AIModel) -> String {
@@ -419,32 +516,34 @@ struct MCPOracleToolService {
             let store = GlobalSettingsStore.shared
             return (store.mcpShowModelPresets(), store.mcpTemporarilyDisablePresets())
         }
+        let configuredPresets = ModelPresetsManager.shared.allPresets()
+        let usageState = MCPModelPresetUsageState(
+            showModelPresets: showModelPresets,
+            temporarilyDisabled: temporarilyDisabled,
+            configuredPresetCount: configuredPresets.count
+        )
 
         var models: [ToolResultDTOs.ModelInfo] = []
 
-        if showModelPresets {
-            let presets = temporarilyDisabled ? [] : await ModelPresetsManager.shared.allPresets()
-            if !presets.isEmpty {
-                for preset in presets {
-                    let supportedModes: ToolResultDTOs.SupportedModesInfo = {
-                        if let modes = preset.supportedModes {
-                            return ToolResultDTOs.SupportedModesInfo(
-                                chat: modes.chat,
-                                plan: modes.plan,
-                                review: modes.review
-                            )
-                        }
-                        return ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
-                    }()
-                    models.append(ToolResultDTOs.ModelInfo(
-                        id: preset.id.uuidString,
-                        name: preset.name,
-                        description: preset.description,
-                        supportedModes: supportedModes
-                    ))
-                }
-            } else {
-                try models.append(defaultCurrentChatModelInfo())
+        func supportedModes(for preset: ModelPreset) -> ToolResultDTOs.SupportedModesInfo {
+            if let modes = preset.supportedModes {
+                return ToolResultDTOs.SupportedModesInfo(
+                    chat: modes.chat,
+                    plan: modes.plan,
+                    review: modes.review
+                )
+            }
+            return ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
+        }
+
+        if usageState.allowsConfiguredPresets {
+            for preset in configuredPresets {
+                models.append(ToolResultDTOs.ModelInfo(
+                    id: preset.id.uuidString,
+                    name: preset.name,
+                    description: preset.description,
+                    supportedModes: supportedModes(for: preset)
+                ))
             }
         } else {
             try models.append(defaultCurrentChatModelInfo())
@@ -465,7 +564,51 @@ struct MCPOracleToolService {
             let descText = (model.description?.isEmpty == false) ? " — \(model.description!)" : ""
             lines.append("- \(model.id): \(model.name) — modes: \(modesText)\(descText)")
         }
+
+        lines.append(contentsOf: Self.modelPresetDiagnosticLines(
+            usageState: usageState,
+            configuredPresets: configuredPresets
+        ))
         return .string(lines.joined(separator: "\n"))
+    }
+
+    static func modelPresetDiagnosticLines(
+        usageState: MCPModelPresetUsageState,
+        configuredPresets: [ModelPreset]
+    ) -> [String] {
+        guard usageState == .disabledByToggle || usageState == .temporarilyHidden else {
+            return []
+        }
+
+        func modes(for preset: ModelPreset) -> String {
+            let supported = preset.supportedModes ?? SupportedModes()
+            var items: [String] = []
+            if supported.chat { items.append("Chat") }
+            if supported.plan { items.append("Plan") }
+            if supported.review { items.append("Review") }
+            return "[\(items.joined(separator: ", "))]"
+        }
+
+        var lines = [""]
+        if usageState == .disabledByToggle {
+            lines.append("Model preset state: disabled for MCP")
+        } else {
+            lines.append("Model preset state: temporarily hidden by Setup Wizard")
+        }
+        lines.append("Configured presets — NOT selectable in this state:")
+        for preset in configuredPresets {
+            lines.append("- \(preset.id.uuidString): \(preset.name) — modes: \(modes(for: preset))")
+        }
+        if usageState == .disabledByToggle {
+            lines.append(
+                "Enable \"Use Oracle Model Presets for MCP\" in Settings → MCP, then call oracle_utils op=models again. Do not pass these presets to ask_oracle until enabled."
+            )
+        } else {
+            lines.append(
+                "Choose \"Show presets\" in Settings → MCP, then call oracle_utils op=models again. Do not pass these presets to ask_oracle until they are shown."
+            )
+        }
+        return lines
     }
 
     private func defaultCurrentChatModelInfo() throws -> ToolResultDTOs.ModelInfo {

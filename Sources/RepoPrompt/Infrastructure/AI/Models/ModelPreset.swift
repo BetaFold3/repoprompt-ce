@@ -215,6 +215,48 @@ struct ModelPreset: Codable, Identifiable, Equatable {
     }
 }
 
+// MARK: - MCP Model Preset Usage
+
+/// Describes whether configured model presets are currently selectable by MCP
+/// Oracle tools. Tool availability is a separate permission boundary.
+enum MCPModelPresetUsageState: Equatable {
+    case enabled
+    case noneDefined
+    case disabledByToggle
+    case temporarilyHidden
+
+    init(
+        showModelPresets: Bool,
+        temporarilyDisabled: Bool,
+        configuredPresetCount: Int
+    ) {
+        if configuredPresetCount == 0 {
+            self = .noneDefined
+        } else if !showModelPresets {
+            self = .disabledByToggle
+        } else if temporarilyDisabled {
+            self = .temporarilyHidden
+        } else {
+            self = .enabled
+        }
+    }
+
+    var allowsConfiguredPresets: Bool {
+        self == .enabled
+    }
+
+    func blockedPresetMessage(for preset: ModelPreset) -> String? {
+        switch self {
+        case .disabledByToggle:
+            "Model preset '\(preset.name)' (\(preset.id.uuidString)) exists but is not selectable because \"Use Oracle Model Presets for MCP\" is disabled. It was not used. Enable that setting under Settings → MCP, call oracle_utils op=models again, then retry."
+        case .temporarilyHidden:
+            "Model preset '\(preset.name)' (\(preset.id.uuidString)) exists but is temporarily hidden by Setup Wizard. It was not used. Choose \"Show presets\" under Settings → MCP, call oracle_utils op=models again, then retry."
+        case .enabled, .noneDefined:
+            nil
+        }
+    }
+}
+
 // MARK: - SupportedModes
 
 /// Defines which modes a model preset supports

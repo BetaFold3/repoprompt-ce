@@ -8,6 +8,8 @@ enum ChatToolErrorCode: String, Codable {
     case internalError = "internal_error"
     case fileNotFound = "file_not_found"
     case permissionDenied = "permission_denied"
+    case oracleSessionBusy = "oracle_session_busy"
+    case oracleConcurrencyLimit = "oracle_concurrency_limit"
 }
 
 struct ChatToolError: LocalizedError, Codable {
@@ -33,6 +35,14 @@ struct ChatToolError: LocalizedError, Codable {
 
     static func internalError(_ msg: String) -> Self {
         .init(code: .internalError, message: msg, details: nil)
+    }
+
+    static func oracleSessionBusy(_ msg: String) -> Self {
+        .init(code: .oracleSessionBusy, message: "oracle_session_busy: \(msg)", details: nil)
+    }
+
+    static func oracleConcurrencyLimit(_ msg: String) -> Self {
+        .init(code: .oracleConcurrencyLimit, message: "oracle_concurrency_limit: \(msg)", details: nil)
     }
 
     /// Serialise into the canonical MCP Value wrapper

@@ -1744,10 +1744,28 @@ enum AgentToolResultPersistencePolicy {
         if let title = smallStringValue(rawObject, keys: ["title"]) {
             object["title"] = title
         }
-        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send",
-           let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"])
-        {
-            object["chat_id"] = chatID
+        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send" {
+            if let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"]) {
+                object["chat_id"] = chatID
+            }
+            if let modelName = smallStringValue(rawObject, keys: ["model_name", "modelName"]) {
+                object["model_name"] = modelName
+            }
+            if let modelPresetName = smallStringValue(rawObject, keys: ["model_preset_name", "modelPresetName"]) {
+                object["model_preset_name"] = modelPresetName
+            }
+            if let modelSelection = smallStringValue(rawObject, keys: ["model_selection", "modelSelection"]) {
+                object["model_selection"] = modelSelection
+            }
+            if let modelSource = smallStringValue(rawObject, keys: ["model_source", "modelSource"]) {
+                object["model_source"] = modelSource
+            }
+            if let modelPresetID = smallStringValue(rawObject, keys: ["model_preset_id", "modelPresetID"]) {
+                object["model_preset_id"] = modelPresetID
+            }
+            if let modelID = smallStringValue(rawObject, keys: ["model_id", "modelID"]) {
+                object["model_id"] = modelID
+            }
         }
         return object
     }
@@ -2205,6 +2223,24 @@ enum AgentToolResultPersistencePolicy {
         if let mode = smallStringValue(rawObject, keys: ["mode"]) {
             object["mode"] = mode
         }
+        if let modelName = smallStringValue(rawObject, keys: ["model_name", "modelName"]) {
+            object["model_name"] = modelName
+        }
+        if let modelPresetName = smallStringValue(rawObject, keys: ["model_preset_name", "modelPresetName"]) {
+            object["model_preset_name"] = modelPresetName
+        }
+        if let modelSelection = smallStringValue(rawObject, keys: ["model_selection", "modelSelection"]) {
+            object["model_selection"] = modelSelection
+        }
+        if let modelSource = smallStringValue(rawObject, keys: ["model_source", "modelSource"]) {
+            object["model_source"] = modelSource
+        }
+        if let modelPresetID = smallStringValue(rawObject, keys: ["model_preset_id", "modelPresetID"]) {
+            object["model_preset_id"] = modelPresetID
+        }
+        if let modelID = smallStringValue(rawObject, keys: ["model_id", "modelID"]) {
+            object["model_id"] = modelID
+        }
         let diffCount = intValue(rawObject, keys: ["diff_count", "diffCount"])
             ?? (rawObject["diffs"] as? [Any])?.count
             ?? (rawObject["patches"] as? [Any])?.count
@@ -2241,6 +2277,9 @@ enum AgentToolResultPersistencePolicy {
         var parts: [String] = []
         if let mode = stringValue(object, keys: ["mode"]), !mode.isEmpty {
             parts.append(mode)
+        }
+        if let model = stringValue(object, keys: ["model_preset_name", "model_name"]), !model.isEmpty {
+            parts.append(model)
         }
         let diffCount = intValue(object, keys: ["diff_count", "diffCount"])
         if let chatID = stringValue(object, keys: ["chat_id", "chatID"]),

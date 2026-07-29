@@ -1,3 +1,4 @@
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
@@ -266,6 +267,58 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             item: toolResultItem(toolName: "oracle_send", payload: ["chat_id": "   "]),
             openContext: openContext
         ))
+
+        XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString(["message": "review", "mode": "review", "model": "GPT_5_6_Sol_xhigh"])
+            ),
+            "review • GPT_5_6_Sol_xhigh"
+        )
+        let resolvedDTO = try XCTUnwrap(ToolJSON.decode(
+            ToolResultDTOs.ChatSendDTO.self,
+            from: jsonString([
+                "chat_id": "resolved-chat",
+                "mode": "review",
+                "model_id": "codex_custom_gpt-5.6-sol-xhigh",
+                "model_name": "CLI·GPT-5.6 Sol XHigh",
+                "model_selection": "explicit",
+                "model_source": "preset",
+                "model_preset_id": "DA2C9FCE-1D37-453F-8E15-DAD11E5EBD46",
+                "model_preset_name": "GPT_5_6_Sol_xhigh",
+                "response": "done"
+            ])
+        ))
+        XCTAssertEqual(resolvedDTO.modelSelection, "explicit")
+        XCTAssertEqual(resolvedDTO.modelSource, "preset")
+        XCTAssertEqual(resolvedDTO.modelPresetID, "DA2C9FCE-1D37-453F-8E15-DAD11E5EBD46")
+        XCTAssertEqual(resolvedDTO.modelPresetName, "GPT_5_6_Sol_xhigh")
+        XCTAssertEqual(resolvedDTO.modelID, "codex_custom_gpt-5.6-sol-xhigh")
+        XCTAssertEqual(resolvedDTO.modelName, "CLI·GPT-5.6 Sol XHigh")
+        XCTAssertEqual(
+            chatSendResultSummary(resolvedDTO),
+            "review • GPT_5_6_Sol_xhigh • resolved-chat"
+        )
+
+        let formatted = try onlyText(ToolOutputFormatter.formatAskOracle(
+            args: [:],
+            value: .object([
+                "chat_id": .string("resolved-chat"),
+                "mode": .string("review"),
+                "model_id": .string("codex_custom_gpt-5.6-sol-xhigh"),
+                "model_name": .string("CLI·GPT-5.6 Sol XHigh"),
+                "model_selection": .string("explicit"),
+                "model_source": .string("preset"),
+                "model_preset_id": .string("DA2C9FCE-1D37-453F-8E15-DAD11E5EBD46"),
+                "model_preset_name": .string("GPT_5_6_Sol_xhigh"),
+                "response": .string("done")
+            ]),
+            emitResources: false
+        ))
+        XCTAssertTrue(formatted.contains("**Model selection**: explicit"), formatted)
+        XCTAssertTrue(formatted.contains("`GPT_5_6_Sol_xhigh` (`DA2C9FCE-1D37-453F-8E15-DAD11E5EBD46`)"), formatted)
+        XCTAssertTrue(formatted.contains("CLI·GPT-5.6 Sol XHigh (`codex_custom_gpt-5.6-sol-xhigh`)"), formatted)
+        XCTAssertTrue(formatted.contains("**Model source**: `preset`"), formatted)
     }
 
     func testOracleToolCallRoutingRequiresExactArgumentChatID() throws {
@@ -516,6 +569,15 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             toolName: toolName,
             toolResultJSON: raw
         )
+    }
+
+    private func onlyText(_ blocks: [MCP.Tool.Content]) throws -> String {
+        let first = try XCTUnwrap(blocks.first)
+        guard case let .text(text, _, _) = first else {
+            XCTFail("Expected text content")
+            return ""
+        }
+        return text
     }
 
     private func jsonString(

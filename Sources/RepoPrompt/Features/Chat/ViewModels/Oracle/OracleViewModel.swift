@@ -323,6 +323,7 @@ actor MessageFinalisationHub {
 private struct SessionRunState {
     var activeQueryId: UUID?
     var activeStreamId: ChatStreamID?
+    var origin: OracleViewModel.SendOrigin?
     var isStreaming: Bool {
         activeQueryId != nil && activeStreamId != nil
     }
@@ -351,6 +352,25 @@ enum ChatSessionScope: String, CaseIterable, Identifiable {
 
 @MainActor
 class OracleViewModel: ObservableObject {
+    enum SendOverlapPolicy {
+        case cancelExisting
+        case rejectIfBusy
+    }
+
+    enum SendOrigin {
+        case ui
+        case mcp
+    }
+
+    enum SendStart: Equatable {
+        case started(queryID: UUID)
+        case rejectedSessionBusy
+        case rejectedTabConcurrencyLimit
+        case failed(reason: String)
+    }
+
+    private static let maxConcurrentMCPOracleStreamsPerTab = 2
+
     @Published var messages: [AIChatMessage] = []
     @Published private(set) var streamingSessions: Set<UUID> = []
     @Published private(set) var messageStoreRevision: Int = 0
@@ -364,6 +384,23 @@ class OracleViewModel: ObservableObject {
 
     /// Per-session messages
     private var messageStore: [UUID: [AIChatMessage]] = [:]
+
+    private struct SessionSaveTicket {
+        let generation: UInt64
+        let task: Task<URL, Error>
+    }
+
+    /// Serial save tails and monotonically increasing generations keep disk and
+    /// in-memory session snapshots ordered independently for each chat.
+    private var sessionSaveTails: [UUID: Task<URL, Error>] = [:]
+    private var sessionSaveGenerations: [UUID: UInt64] = [:]
+    /// Updated immediately after each successful disk write, independently of
+    /// whether that save is still the newest generation allowed to publish into
+    /// `sessions`. Deletion uses it to remove files created by an older queued save.
+    private var sessionLastPersistedFileURLs: [UUID: URL] = [:]
+    /// Permanent per-identity tombstones prevent a late finalizer or captured
+    /// metadata save from recreating a chat after the user deletes it.
+    private var deletedSessionIDs: Set<UUID> = []
 
     /// Per-session sequence numbering
     private var nextSequenceIndexBySession: [UUID: Int] = [:]
@@ -929,10 +966,18 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    private func setSessionStreaming(_ sessionID: UUID, queryId: UUID, streamId: ChatStreamID?) {
+    private func setSessionStreaming(
+        _ sessionID: UUID,
+        queryId: UUID,
+        streamId: ChatStreamID?,
+        origin: SendOrigin? = nil
+    ) {
         ensureSessionStorage(sessionID)
         runStateBySession[sessionID]?.activeQueryId = queryId
         runStateBySession[sessionID]?.activeStreamId = streamId
+        if let origin {
+            runStateBySession[sessionID]?.origin = origin
+        }
         streamingSessions.insert(sessionID)
 
         if currentSessionID == sessionID {
@@ -942,15 +987,47 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
-    private func clearSessionStreaming(_ sessionID: UUID) {
+    @discardableResult
+    private func clearSessionStreaming(_ sessionID: UUID, matching queryID: UUID? = nil) -> Bool {
+        if let queryID, runStateBySession[sessionID]?.activeQueryId != queryID {
+            return false
+        }
         runStateBySession[sessionID]?.activeQueryId = nil
         runStateBySession[sessionID]?.activeStreamId = nil
+        runStateBySession[sessionID]?.origin = nil
         streamingSessions.remove(sessionID)
 
         if currentSessionID == sessionID {
             currentQueryId = nil
         }
         recomputeWorkspaceBusyAndFontFreeze()
+        return true
+    }
+
+    @MainActor
+    private func attachStreamID(
+        _ streamID: ChatStreamID,
+        to sessionID: UUID,
+        matching queryID: UUID
+    ) -> Bool {
+        guard runStateBySession[sessionID]?.activeQueryId == queryID,
+              streamingSessions.contains(sessionID)
+        else { return false }
+        streamIDsByQueryId[queryID] = streamID
+        setSessionStreaming(sessionID, queryId: queryID, streamId: streamID)
+        return true
+    }
+
+    @MainActor
+    private func activeMCPOracleStreamCount(forTabID tabID: UUID?) -> Int {
+        guard let tabID else { return 0 }
+        return sessions.reduce(into: 0) { count, session in
+            guard session.composeTabID == tabID,
+                  runStateBySession[session.id]?.activeQueryId != nil,
+                  runStateBySession[session.id]?.origin == .mcp
+            else { return }
+            count += 1
+        }
     }
 
     @MainActor
@@ -978,10 +1055,35 @@ class OracleViewModel: ObservableObject {
             stream: AsyncThrowingStream<ChatStreamOutput, Error>
         )
 
+        typealias OracleSessionSaveWillPersistObserver = @MainActor @Sendable (
+            _ sessionID: UUID,
+            _ generation: UInt64
+        ) async -> Void
+        typealias OracleFinalizationBeforeOwnershipCommitObserver = @MainActor @Sendable (
+            _ queryID: UUID,
+            _ sessionID: UUID
+        ) async -> Void
+        typealias OracleCancellationAfterOwnershipClearObserver = @MainActor @Sendable (
+            _ queryID: UUID,
+            _ sessionID: UUID
+        ) async -> Void
+        typealias OracleRejectedNewSessionCleanupObserver = @MainActor @Sendable (
+            _ rejectedSessionID: UUID,
+            _ tabID: UUID?
+        ) async -> Void
+
         var oracleReviewPackagingTraceObserverForTesting:
             OracleReviewPackagingTraceContext.Observer?
         private var oraclePostPackagingTransportOverrideForTesting:
             OraclePostPackagingTransportOverride?
+        private var oracleSessionSaveWillPersistObserverForTesting:
+            OracleSessionSaveWillPersistObserver?
+        private var oracleFinalizationBeforeOwnershipCommitObserverForTesting:
+            OracleFinalizationBeforeOwnershipCommitObserver?
+        private var oracleCancellationAfterOwnershipClearObserverForTesting:
+            OracleCancellationAfterOwnershipClearObserver?
+        var oracleRejectedNewSessionCleanupObserverForTesting:
+            OracleRejectedNewSessionCleanupObserver?
 
         func setOracleReviewPackagingTraceObserverForTesting(
             _ observer: OracleReviewPackagingTraceContext.Observer?
@@ -994,10 +1096,40 @@ class OracleViewModel: ObservableObject {
         ) {
             oraclePostPackagingTransportOverrideForTesting = override
         }
-    #endif
 
-    /// Track the active retry task so it can be properly cancelled
-    private var activeRetryTask: Task<Void, Error>?
+        func setOracleSessionSaveWillPersistObserverForTesting(
+            _ observer: OracleSessionSaveWillPersistObserver?
+        ) {
+            oracleSessionSaveWillPersistObserverForTesting = observer
+        }
+
+        func setOracleFinalizationBeforeOwnershipCommitObserverForTesting(
+            _ observer: OracleFinalizationBeforeOwnershipCommitObserver?
+        ) {
+            oracleFinalizationBeforeOwnershipCommitObserverForTesting = observer
+        }
+
+        func setOracleCancellationAfterOwnershipClearObserverForTesting(
+            _ observer: OracleCancellationAfterOwnershipClearObserver?
+        ) {
+            oracleCancellationAfterOwnershipClearObserverForTesting = observer
+        }
+
+        func setOracleRejectedNewSessionCleanupObserverForTesting(
+            _ observer: OracleRejectedNewSessionCleanupObserver?
+        ) {
+            oracleRejectedNewSessionCleanupObserverForTesting = observer
+        }
+
+        func waitForSessionSavesForTesting(_ sessionID: UUID) async {
+            guard let tail = sessionSaveTails[sessionID] else { return }
+            _ = try? await tail.value
+        }
+
+        func isSessionTombstonedForTesting(_ sessionID: UUID) -> Bool {
+            deletedSessionIDs.contains(sessionID)
+        }
+    #endif
 
     private var finalizationWatchdogs: [UUID: Task<Void, Never>] = [:]
     private var finalizationWatchdogTokens: [UUID: UUID] = [:]
@@ -1115,9 +1247,6 @@ class OracleViewModel: ObservableObject {
         // Cancel background token calculation tasks
         latestTokenCountsTask?.cancel()
         upcomingTokenEstimateTask?.cancel()
-
-        // Cancel active retry task
-        activeRetryTask?.cancel()
 
         // Cancel any active headless and chat streams
         let headlessStreamIDs = Array(headlessStreamsByTabID.values)
@@ -1479,12 +1608,16 @@ class OracleViewModel: ObservableObject {
     @MainActor
     func deleteSession(_ session: ChatSession) async {
         sessionSwitchGeneration += 1
+        deletedSessionIDs.insert(session.id)
         if isSessionStreaming(session.id) {
             await cancelAIResponse(in: session.id, skipPartialParseAndSave: true)
         }
         clearMCPSessionUIState(for: session.id)
-        // 1) Attempt to delete file from disk (if it exists).
-        if let fileURL = session.fileURL {
+        let pendingFileURL = await drainSessionSaves(session.id)
+        let registeredFileURL = sessions.first(where: { $0.id == session.id })?.fileURL
+        // 1) Delete only after every pre-tombstone write has completed, so no
+        // pending save can recreate the file after this point.
+        if let fileURL = pendingFileURL ?? registeredFileURL ?? session.fileURL {
             do {
                 // Ensure we do it on background or in an actor
                 try await chatData.deleteChatSessionFile(fileURL)
@@ -1522,11 +1655,19 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func clearAllChats() async {
-        await cancelAllActiveSessionStreams()
         // 1) Identify the currently active workspace
         guard let activeWS = workspaceManager.activeWorkspace else {
             print("No active workspace found; nothing to clear.")
             return
+        }
+
+        let clearingSessionIDs = sessions
+            .filter { $0.workspaceID == activeWS.id }
+            .map(\.id)
+        deletedSessionIDs.formUnion(clearingSessionIDs)
+        await cancelAllActiveSessionStreams()
+        for sessionID in clearingSessionIDs {
+            _ = await drainSessionSaves(sessionID)
         }
 
         // 2) Delete chat JSON files only for this workspace
@@ -1640,10 +1781,7 @@ class OracleViewModel: ObservableObject {
         if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
             sessions[idx].composeTabID = updatedTab.id
             refreshSessionLists()
-            Task { [weak self] in
-                guard let self else { return }
-                _ = try? await autosaveSession(sessions[idx])
-            }
+            scheduleSessionSave(sessions[idx])
         }
 
         return updatedTab.id
@@ -1888,18 +2026,22 @@ class OracleViewModel: ObservableObject {
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
         activateInUI: Bool = true,
-        setActiveForTab: Bool = true
+        setActiveForTab: Bool = true,
+        reuseBlankSession: Bool = true
     ) async -> UUID? {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
-        // If there's already a blank session with that name, just switch to it
-        if let existingIndex = sessions.firstIndex(where: {
-            $0.name == name &&
-                $0.effectiveMessageCount == 0 &&
-                $0.composeTabID == resolvedTabID &&
-                $0.agentModeSessionID == agentModeSessionID &&
-                $0.agentModeRunID == agentModeRunID
-        }) {
+        // If there's already a blank session with that name, just switch to it.
+        // MCP force-new sends disable this reuse so parallel lanes cannot collide.
+        if reuseBlankSession,
+           let existingIndex = sessions.firstIndex(where: {
+               $0.name == name &&
+                   $0.effectiveMessageCount == 0 &&
+                   $0.composeTabID == resolvedTabID &&
+                   $0.agentModeSessionID == agentModeSessionID &&
+                   $0.agentModeRunID == agentModeRunID
+           })
+        {
             let existingID = sessions[existingIndex].id
             if setActiveForTab, let resolvedTabID {
                 workspaceManager.setActiveChatSessionID(existingID, forTabID: resolvedTabID)
@@ -2022,7 +2164,9 @@ class OracleViewModel: ObservableObject {
                 selectedFilePaths: fullSession.selectedFilePaths,
                 selectedPromptIDs: fullSession.selectedPromptIDs,
                 preferredAIModel: fullSession.preferredAIModel,
-                selectedChatPresetID: fullSession.selectedChatPresetID
+                selectedChatPresetID: fullSession.selectedChatPresetID,
+                lastSendModelID: fullSession.lastSendModelID,
+                lastSendModelDisplayName: fullSession.lastSendModelDisplayName
             )
 
             // Persist the clone and capture the file URL so the stub can resolve it later
@@ -2128,6 +2272,15 @@ class OracleViewModel: ObservableObject {
         let nextForkCount = maxForkCount + 1
         let newName = nextForkCount == 1 ? "\(baseName) (Forked)" : "\(baseName) (Forked \(nextForkCount))"
 
+        let originalLatestAssistantID = liveMessages.last(where: { !$0.isUser })?.id
+        let forkLatestAssistant = messagesToCopy.last(where: { !$0.isUser })
+        let includesOriginalLatestAssistant = forkLatestAssistant?.id == originalLatestAssistantID
+        let forkLastSendModelID = includesOriginalLatestAssistant
+            ? originalSession.lastSendModelID
+            : nil
+        let forkLastSendModelDisplayName = forkLatestAssistant?.modelName
+            ?? (includesOriginalLatestAssistant ? originalSession.lastSendModelDisplayName : nil)
+
         // Create the new forked session
         let newSession = ChatSession(
             id: UUID(), // New unique ID
@@ -2140,7 +2293,9 @@ class OracleViewModel: ObservableObject {
             selectedFilePaths: originalSession.selectedFilePaths, // Or maybe capture current selection? Decide based on desired UX
             selectedPromptIDs: originalSession.selectedPromptIDs, // Same as above
             preferredAIModel: originalSession.preferredAIModel,
-            selectedChatPresetID: originalSession.selectedChatPresetID
+            selectedChatPresetID: originalSession.selectedChatPresetID,
+            lastSendModelID: forkLastSendModelID,
+            lastSendModelDisplayName: forkLastSendModelDisplayName
         )
 
         // Add the new session to the list and switch to it
@@ -2439,13 +2594,104 @@ class OracleViewModel: ObservableObject {
      }
      */
 
+    private func enqueueSessionSave(_ session: ChatSession) -> SessionSaveTicket {
+        let sessionID = session.id
+        let generation = sessionSaveGenerations[sessionID, default: 0] &+ 1
+        sessionSaveGenerations[sessionID] = generation
+        let predecessor = sessionSaveTails[sessionID]
+        let task = Task { @MainActor [weak self] () throws -> URL in
+            if let predecessor {
+                _ = try? await predecessor.value
+            }
+            guard let self else { throw CancellationError() }
+            guard !deletedSessionIDs.contains(sessionID) else { throw CancellationError() }
+            #if DEBUG
+                if let observer = oracleSessionSaveWillPersistObserverForTesting {
+                    await observer(sessionID, generation)
+                }
+            #endif
+            let fileURL = try await persistSessionSnapshot(session)
+            // Publish successful persistence independently of save-generation
+            // ownership. A later queued save can be tombstoned while waiting for
+            // this predecessor, and deletion must still discover this file.
+            sessionLastPersistedFileURLs[sessionID] = fileURL
+            return fileURL
+        }
+        sessionSaveTails[sessionID] = task
+        return SessionSaveTicket(generation: generation, task: task)
+    }
+
+    private func finishSessionSave(_ ticket: SessionSaveTicket, sessionID: UUID) {
+        guard sessionSaveGenerations[sessionID] == ticket.generation else { return }
+        sessionSaveTails.removeValue(forKey: sessionID)
+    }
+
+    /// Drains every save already scheduled for a session. New tombstoned saves
+    /// fail without touching disk, so deletion can safely remove the final URL.
+    private func drainSessionSaves(_ sessionID: UUID) async -> URL? {
+        var latestFileURL = sessionLastPersistedFileURLs[sessionID]
+        while let tail = sessionSaveTails[sessionID] {
+            let generation = sessionSaveGenerations[sessionID]
+            if let fileURL = try? await tail.value {
+                latestFileURL = fileURL
+            }
+            // The awaited tail may have failed after a successful predecessor.
+            // That predecessor records its URL independently of generation so a
+            // tombstoned successor cannot hide a file from deletion.
+            if let persistedFileURL = sessionLastPersistedFileURLs[sessionID] {
+                latestFileURL = persistedFileURL
+            }
+            guard sessionSaveGenerations[sessionID] != generation else { break }
+        }
+        sessionSaveTails.removeValue(forKey: sessionID)
+        sessionSaveGenerations.removeValue(forKey: sessionID)
+        sessionLastPersistedFileURLs.removeValue(forKey: sessionID)
+        return latestFileURL
+    }
+
+    /// Queues a metadata/session snapshot immediately, avoiding delayed Tasks
+    /// that capture an older value and enqueue it after newer state.
+    func scheduleSessionSave(_ session: ChatSession) {
+        guard !deletedSessionIDs.contains(session.id) else { return }
+        let ticket = enqueueSessionSave(session)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { finishSessionSave(ticket, sessionID: session.id) }
+            do {
+                let fileURL = try await ticket.task.value
+                guard sessionSaveGenerations[session.id] == ticket.generation,
+                      let index = sessions.firstIndex(where: { $0.id == session.id })
+                else { return }
+                sessions[index].fileURL = fileURL
+                if sessions[index].savedAt < session.savedAt {
+                    sessions[index].savedAt = session.savedAt
+                }
+            } catch is CancellationError {
+                // Expected for a tombstoned/deleted session.
+            } catch {
+                print("Session save failed: \(error)")
+            }
+        }
+    }
+
     /// Returns the newly saved file URL for a given session, if successful.
-    /// If the session has no workspace assigned, fails.
-    /// If the session is a stub (messages unloaded), loads the full session first
-    /// to avoid overwriting disk content with empty messages.
+    /// All writes for the same session are serialized in scheduling order.
     @discardableResult
     func autosaveSession(_ session: ChatSession) async throws -> URL {
-        // Must have a workspace
+        let ticket = enqueueSessionSave(session)
+        do {
+            let fileURL = try await ticket.task.value
+            finishSessionSave(ticket, sessionID: session.id)
+            return fileURL
+        } catch {
+            finishSessionSave(ticket, sessionID: session.id)
+            throw error
+        }
+    }
+
+    /// Low-level persistence body. Callers must enter through enqueueSessionSave
+    /// or autosaveSession so an older snapshot cannot finish after a newer one.
+    private func persistSessionSnapshot(_ session: ChatSession) async throws -> URL {
         guard let wsId = session.workspaceID,
               let ws = workspaceManager.workspaces.first(where: { $0.id == wsId })
         else {
@@ -2454,12 +2700,11 @@ class OracleViewModel: ObservableObject {
 
         var sessionToSave = session
 
-        // Stub-safe: if the session is a stub (messages unloaded), we need to
-        // load the full session from disk first to avoid wiping messages.
+        // Stub-safe: if the session is a stub (messages unloaded), load the full
+        // session first so metadata-only changes never wipe message history.
         if session.isListStub, let fileURL = session.fileURL {
             do {
                 let fullSession = try await chatData.loadChatSession(from: fileURL)
-                // Merge any updated metadata from the stub into the full session
                 sessionToSave = fullSession
                 sessionToSave.name = session.name
                 sessionToSave.composeTabID = session.composeTabID
@@ -2469,6 +2714,8 @@ class OracleViewModel: ObservableObject {
                 sessionToSave.selectedPromptIDs = session.selectedPromptIDs
                 sessionToSave.preferredAIModel = session.preferredAIModel
                 sessionToSave.selectedChatPresetID = session.selectedChatPresetID
+                sessionToSave.lastSendModelID = session.lastSendModelID
+                sessionToSave.lastSendModelDisplayName = session.lastSendModelDisplayName
             } catch {
                 print("Warning: Failed to load full session for stub-safe save, skipping save: \(error)")
                 throw error
@@ -2498,6 +2745,7 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func autosaveChatHistory(for sessionID: UUID, force: Bool = false) {
+        guard !deletedSessionIDs.contains(sessionID) else { return }
         // ------------------------------------------------------------------
         // 0️⃣  Preconditions
         // ------------------------------------------------------------------
@@ -2617,29 +2865,43 @@ class OracleViewModel: ObservableObject {
         sessionCopy.selectedChatPresetID = selectedChatPresetId
 
         // ------------------------------------------------------------------
-        // 7️⃣  Persist to disk
+        // 7️⃣  Publish the snapshot synchronously, then persist it in order
         // ------------------------------------------------------------------
-        Task {
-            do {
-                let fileURL = try await autosaveSession(sessionCopy)
-                await MainActor.run {
-                    if let idx = sessions.firstIndex(where: { $0.id == sessionCopy.id }) {
-                        var updated = sessionCopy
-                        updated.fileURL = fileURL
-                        updated.savedAt = sessionCopy.savedAt
+        // The live registry must advance before this function yields. Otherwise an
+        // older save completion can replace model attribution or messages installed
+        // by a successor send before that successor queues its own final save.
+        if let sessionIndex = sessions.firstIndex(where: { $0.id == sessionCopy.id }) {
+            sessions[sessionIndex] = sessionCopy
+        }
 
-                        // Keep only the active session loaded; list entries should be lightweight.
-                        // Skip stubbing if a caller has pinned the session.
-                        if sessionCopy.id != currentSessionID, !isSessionPinned(sessionCopy.id) {
-                            updated = updated.listStub()
-                            updated.fileURL = fileURL
-                            updated.savedAt = sessionCopy.savedAt
-                        }
-                        sessions[idx] = updated
+        let saveTicket = enqueueSessionSave(sessionCopy)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { finishSessionSave(saveTicket, sessionID: sessionCopy.id) }
+            do {
+                let fileURL = try await saveTicket.task.value
+                // A newer snapshot may already be queued. Disk writes are ordered,
+                // and only the newest completion may publish persistence metadata.
+                guard sessionSaveGenerations[sessionCopy.id] == saveTicket.generation else { return }
+                if let idx = sessions.firstIndex(where: { $0.id == sessionCopy.id }) {
+                    // Merge persistence metadata into the current live value instead
+                    // of reinstalling the captured snapshot: the session may have
+                    // acquired a successor query while this disk write was awaiting.
+                    var updated = sessions[idx]
+                    updated.fileURL = fileURL
+                    if updated.savedAt < sessionCopy.savedAt {
+                        updated.savedAt = sessionCopy.savedAt
                     }
-                    unloadNonCurrentSessions()
-                    workspaceManager.pollAndSaveState()
+
+                    // Keep only the active session loaded; list entries should be lightweight.
+                    // Skip stubbing if a caller has pinned the session.
+                    if sessionCopy.id != currentSessionID, !isSessionPinned(sessionCopy.id) {
+                        updated = updated.listStub()
+                    }
+                    sessions[idx] = updated
                 }
+                unloadNonCurrentSessions()
+                workspaceManager.pollAndSaveState()
             } catch {
                 print("Autosave failed: \(error)")
             }
@@ -2766,6 +3028,7 @@ class OracleViewModel: ObservableObject {
     // MARK: - Main Send/Receive Flow
 
     @MainActor
+    @discardableResult
     func sendMessage(
         _ newUserMessage: String,
         sessionID: UUID? = nil,
@@ -2778,10 +3041,11 @@ class OracleViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
+        overlapPolicy: SendOverlapPolicy = .cancelExisting,
+        origin: SendOrigin = .ui,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
-    ) async {
-        guard !newUserMessage.isEmpty else { return }
-        _ = true
+    ) async -> SendStart {
+        guard !newUserMessage.isEmpty else { return .failed(reason: "message cannot be empty") }
 
         let targetSessionID: UUID
         if let sessionID {
@@ -2790,7 +3054,9 @@ class OracleViewModel: ObservableObject {
             targetSessionID = currentSessionID
         } else {
             await startNewChatSession()
-            guard let currentSessionID else { return }
+            guard let currentSessionID else {
+                return .failed(reason: "failed to create a chat session")
+            }
             targetSessionID = currentSessionID
         }
 
@@ -2799,12 +3065,96 @@ class OracleViewModel: ObservableObject {
         }
 
         if isSessionStreaming(targetSessionID) {
-            await cancelAIResponse(in: targetSessionID, skipPartialParseAndSave: false)
+            switch overlapPolicy {
+            case .rejectIfBusy:
+                return .rejectedSessionBusy
+            case .cancelExisting:
+                // `cancelAIResponse` captures the active query before its first
+                // suspension and only clears that query's ownership. A successor
+                // may reserve the session while partial finalization is awaiting;
+                // never issue a second session-wide cancellation here. The atomic
+                // reservation check below retains the UI message with a retry error.
+                await cancelAIResponse(in: targetSessionID, skipPartialParseAndSave: false)
+            }
         }
 
         ensureSessionStorage(targetSessionID)
 
-        // Create the user message
+        // Gather currently selected file paths and resolve the model before
+        // reserving a stream slot so startup failures never consume the cap.
+        let selectedPaths = selectionOverride?.selectedPaths ?? promptViewModel.fileManager.selectedFiles.map(\.fullPath)
+        let presetModel = promptViewModel.modelFromCurrentChatPreset()
+        let model = overrideModel ?? presetModel ?? promptViewModel.preferredAIModel
+        let modelDisplayName = model.displayName
+
+        // Check if the selected model is actually available (provider configured).
+        if !promptViewModel.isModelAvailable(model) {
+            let reason = "The model '\(modelDisplayName)' is not available. Please check that the \(model.providerType.displayName) API key is configured in Settings."
+            let userId = UUID()
+            let userMessage = AIChatMessage(
+                id: userId,
+                content: newUserMessage,
+                isUser: true,
+                sequenceIndex: nextSequenceIndex(for: targetSessionID)
+            )
+            let errorMessage = AIChatMessage(
+                content: "Error: \(reason)",
+                isUser: false,
+                isFinalized: true,
+                sequenceIndex: nextSequenceIndex(for: targetSessionID),
+                modelName: modelDisplayName
+            )
+            withSessionMessages(targetSessionID) { msgs in
+                msgs.append(userMessage)
+                msgs.append(errorMessage)
+            }
+            registerMessage(userId, sessionID: targetSessionID)
+            registerMessage(errorMessage.id, sessionID: targetSessionID)
+            autosaveChatHistory(for: targetSessionID)
+            return .failed(reason: reason)
+        }
+
+        // Normal UI sends should remember the chat controls immediately. Final
+        // autosave can happen after the user switches compose tabs; by then
+        // promptViewModel may already reflect the destination tab.
+        if overrideModel == nil, selectionOverride == nil {
+            refreshSessionChatControlsFromLivePromptState(for: targetSessionID)
+        }
+
+        // Atomic MainActor reservation. There are no suspension points from the
+        // authoritative busy/cap checks through placeholder registration.
+        guard !isSessionStreaming(targetSessionID) else {
+            let reason = "This chat started another Oracle response while your previous response was being cancelled. Please retry this message."
+            let userId = UUID()
+            let userMessage = AIChatMessage(
+                id: userId,
+                content: newUserMessage,
+                isUser: true,
+                sequenceIndex: nextSequenceIndex(for: targetSessionID)
+            )
+            let errorMessage = AIChatMessage(
+                content: "Error: \(reason)",
+                isUser: false,
+                isFinalized: true,
+                sequenceIndex: nextSequenceIndex(for: targetSessionID),
+                modelName: modelDisplayName
+            )
+            withSessionMessages(targetSessionID) { msgs in
+                msgs.append(userMessage)
+                msgs.append(errorMessage)
+            }
+            registerMessage(userId, sessionID: targetSessionID)
+            registerMessage(errorMessage.id, sessionID: targetSessionID)
+            autosaveChatHistory(for: targetSessionID)
+            return .rejectedSessionBusy
+        }
+        let targetTabID = sessions.first(where: { $0.id == targetSessionID })?.composeTabID
+        if origin == .mcp,
+           activeMCPOracleStreamCount(forTabID: targetTabID) >= Self.maxConcurrentMCPOracleStreamsPerTab
+        {
+            return .rejectedTabConcurrencyLimit
+        }
+
         let userId = UUID()
         let userMessage = AIChatMessage(
             id: userId,
@@ -2818,40 +3168,6 @@ class OracleViewModel: ObservableObject {
         registerMessage(userId, sessionID: targetSessionID)
 
         let conversation = buildConversationEntries(for: targetSessionID)
-
-        // Gather currently selected file paths
-        let selectedPaths = selectionOverride?.selectedPaths ?? promptViewModel.fileManager.selectedFiles.map(\.fullPath)
-
-        let presetModel = promptViewModel.modelFromCurrentChatPreset()
-        let model = overrideModel ?? presetModel ?? promptViewModel.preferredAIModel
-
-        // Check if the selected model is actually available (provider configured)
-        if !promptViewModel.isModelAvailable(model) {
-            // Show error in chat instead of silently falling back
-            let errorMessage = AIChatMessage(
-                content: "Error: The model '\(model.displayName)' is not available. Please check that the \(model.providerType.displayName) API key is configured in Settings.",
-                isUser: false,
-                isFinalized: true
-            )
-            withSessionMessages(targetSessionID) { msgs in
-                msgs.append(errorMessage)
-            }
-            registerMessage(errorMessage.id, sessionID: targetSessionID)
-            autosaveChatHistory(for: targetSessionID)
-            return
-        }
-
-        // Derive a string representation for storage / UI
-        let modelDisplayName = model.displayName
-
-        // Normal UI sends should remember the chat controls immediately.  Final
-        // autosave can happen after the user switches compose tabs; by then
-        // promptViewModel may already reflect the destination tab.
-        if overrideModel == nil, selectionOverride == nil {
-            refreshSessionChatControlsFromLivePromptState(for: targetSessionID)
-        }
-
-        // Create a placeholder AI response
         let aiResponseId = UUID()
         let aiPlaceholder = AIChatMessage(
             id: aiResponseId,
@@ -2865,7 +3181,16 @@ class OracleViewModel: ObservableObject {
             msgs.append(aiPlaceholder)
         }
         registerMessage(aiResponseId, sessionID: targetSessionID)
-        setSessionStreaming(targetSessionID, queryId: aiResponseId, streamId: nil)
+        setSessionStreaming(
+            targetSessionID,
+            queryId: aiResponseId,
+            streamId: nil,
+            origin: origin
+        )
+        if let sessionIndex = sessions.firstIndex(where: { $0.id == targetSessionID }) {
+            sessions[sessionIndex].lastSendModelID = model.rawValue
+            sessions[sessionIndex].lastSendModelDisplayName = modelDisplayName
+        }
 
         if currentSessionID == targetSessionID {
             updateLatestTokenCounts()
@@ -2941,9 +3266,12 @@ class OracleViewModel: ObservableObject {
                     throw CancellationError()
                 }
 
-                await MainActor.run {
-                    self.streamIDsByQueryId[aiResponseId] = streamID
-                    self.setSessionStreaming(targetSessionID, queryId: aiResponseId, streamId: streamID)
+                let attached = await MainActor.run {
+                    self.attachStreamID(streamID, to: targetSessionID, matching: aiResponseId)
+                }
+                guard attached else {
+                    await aiQueriesService.cancelStream(id: streamID)
+                    throw CancellationError()
                 }
 
                 var partialBuffer = ""
@@ -3028,14 +3356,13 @@ class OracleViewModel: ObservableObject {
                 #if DEBUG
                     OracleReviewPackagingDiagnostics.recordFailure(error)
                 #endif
-                await MainActor.run {
-                    self.clearSessionStreaming(targetSessionID)
-                }
                 Task {
                     await handleSendMessageError(error, aiResponseId: aiResponseId, sessionID: targetSessionID)
                 }
             }
         }
+
+        return .started(queryID: aiResponseId)
     }
 
     // MARK: - Finalise an AI response
@@ -3070,34 +3397,44 @@ class OracleViewModel: ObservableObject {
                 .content ?? partialBuffer
         }
 
-        // 2️⃣ Process final display content before toggling the finished flags that external tools poll for.
+        #if DEBUG
+            if let observer = oracleFinalizationBeforeOwnershipCommitObserverForTesting {
+                await observer(aiResponseId, sessionID)
+            }
+        #endif
+
+        // 2️⃣ Normalize query-scoped display content. Session-scoped side effects
+        // inside this operation re-check ownership atomically on MainActor.
         await processAIResponse(finalContent, forQueryId: aiResponseId, sessionID: sessionID)
 
         // 3️⃣ Now – and only now – mark the message / chat turn as complete.
-        await MainActor.run {
+        let clearedActiveRun = await MainActor.run { () -> Bool in
             self.withSessionMessages(sessionID) { msgs in
                 if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
                     msgs[idx].setIsFinalized(true)
                 }
             }
-            clearSessionStreaming(sessionID)
+            let cleared = clearSessionStreaming(sessionID, matching: aiResponseId)
 
-            // Clear MCP model info after response completes
-            clearMCPSessionUIState(for: sessionID)
-
-            // Trigger notification when AI response is complete
-            let sessionName = sessions.first(where: { $0.id == sessionID })?.name
-            NotificationService.shared.notifyChatComplete(
-                chatName: sessionName,
-                fallbackToDockBounce: true
-            )
+            // A finalizer that lost ownership must not publish completion side
+            // effects for a newer run in the same session.
+            if cleared {
+                clearMCPSessionUIState(for: sessionID)
+                let sessionName = sessions.first(where: { $0.id == sessionID })?.name
+                NotificationService.shared.notifyChatComplete(
+                    chatName: sessionName,
+                    fallbackToDockBounce: true
+                )
+            }
+            return cleared
         }
 
-        // 4️⃣ Persist the fully‑processed session state
-        // When finalizing after a delegate‑edit retry, force autosave so XML results persist
-        // even if the assistant message text hasn't changed (avoids "no meaningful changes" skip).
-        let shouldForceAutosave = (activeRetryTask != nil)
-        autosaveChatHistory(for: sessionID, force: shouldForceAutosave)
+        // 4️⃣ Persist only while this response still owns the session. A user
+        // cancellation already persisted the partial state before any successor
+        // could reserve the session.
+        if clearedActiveRun {
+            autosaveChatHistory(for: sessionID)
+        }
 
         // 5️⃣ Notify observers and any waiters that this message is finalised
         emitMessageLifecycleActivity(.finalizationCompleted, for: aiResponseId)
@@ -3108,25 +3445,38 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     private func handleSendMessageError(_ error: Error, aiResponseId: UUID, sessionID: UUID) async {
-        // Clear MCP model info on error
-        clearMCPSessionUIState(for: sessionID)
+        func clearStreamingIfOwned() {
+            if clearSessionStreaming(sessionID, matching: aiResponseId) {
+                clearMCPSessionUIState(for: sessionID)
+            }
+        }
 
         // Cancel any watchdog for this response and clear activity/stream tracking
         cancelFinalizationWatchdog(for: aiResponseId)
         clearStreamActivityTracking(for: aiResponseId)
         streamIDsByQueryId.removeValue(forKey: aiResponseId)
 
+        let stillOwnsSession = runStateBySession[sessionID]?.activeQueryId == aiResponseId
+        guard stillOwnsSession else {
+            emitMessageLifecycleActivity(
+                error is CancellationError ? .streamCancelled : .streamFailed,
+                for: aiResponseId
+            )
+            Task { await finalisationHub.fulfil(aiResponseId) }
+            return
+        }
+
         if error is CancellationError {
             emitMessageLifecycleActivity(.streamCancelled, for: aiResponseId)
             print("AI response was cancelled.")
             guard let index = messageStore[sessionID]?.firstIndex(where: { $0.id == aiResponseId }) else {
-                clearSessionStreaming(sessionID)
+                clearStreamingIfOwned()
                 Task { await finalisationHub.fulfil(aiResponseId) }
                 return
             }
 
             if messageStore[sessionID]?[index].isFinalized == true {
-                clearSessionStreaming(sessionID)
+                clearStreamingIfOwned()
                 Task { await finalisationHub.fulfil(aiResponseId) }
                 return
             }
@@ -3139,7 +3489,7 @@ class OracleViewModel: ObservableObject {
                     }
                 }
                 purgeMessageCaches(for: aiResponseId)
-                clearSessionStreaming(sessionID)
+                clearStreamingIfOwned()
                 autosaveChatHistory(for: sessionID)
                 Task { await finalisationHub.fulfil(aiResponseId) }
                 return
@@ -3178,7 +3528,7 @@ class OracleViewModel: ObservableObject {
             autosaveChatHistory(for: sessionID)
         }
 
-        clearSessionStreaming(sessionID)
+        clearStreamingIfOwned()
         Task { await finalisationHub.fulfil(aiResponseId) }
     }
 
@@ -3333,10 +3683,6 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     func cancelAIResponse(in sessionID: UUID, skipPartialParseAndSave: Bool = false) async {
-        // Cancel the active retry task if it exists
-        activeRetryTask?.cancel()
-        activeRetryTask = nil
-
         // Targeted cancel for the current chat stream only (not headless/context-builder streams)
         let qid = runStateBySession[sessionID]?.activeQueryId
         let streamId = runStateBySession[sessionID]?.activeStreamId ?? (qid.flatMap { streamIDsByQueryId[$0] })
@@ -3347,8 +3693,16 @@ class OracleViewModel: ObservableObject {
             streamIDsByQueryId.removeValue(forKey: qid)
         }
 
-        clearSessionStreaming(sessionID)
-        clearMCPSessionUIState(for: sessionID)
+        let clearedActiveRun = clearSessionStreaming(sessionID, matching: qid)
+        if clearedActiveRun {
+            clearMCPSessionUIState(for: sessionID)
+        }
+
+        #if DEBUG
+            if let qid, let observer = oracleCancellationAfterOwnershipClearObserverForTesting {
+                await observer(qid, sessionID)
+            }
+        #endif
 
         // Cancel any active watchdog for the current query
         if let qid {
@@ -3448,36 +3802,31 @@ class OracleViewModel: ObservableObject {
         sessionID: UUID
     ) async {
         var mutableContent = finalContent
-
-        // 1️⃣ Optional <chatName …/> extraction.
-        if let extractedName = ChatNameExtractor
+        let extractedName = ChatNameExtractor
             .extractAndRemove(from: &mutableContent)?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !extractedName.isEmpty
-        {
-            await MainActor.run {
-                if let idx = sessions.firstIndex(where: { $0.id == sessionID }) {
-                    if sessions[idx].name == "New Chat" {
-                        sessions[idx].name = extractedName
-                        print("Chat session renamed to: \(extractedName)")
-                    }
-                    if let tabID = sessions[idx].composeTabID {
-                        renameComposeTabIfDefault(tabID: tabID, sessionName: sessions[idx].name)
-                    }
-                }
-            }
-        } else {
-            await MainActor.run {
-                guard let idx = sessions.firstIndex(where: { $0.id == sessionID }),
-                      let tabID = sessions[idx].composeTabID else { return }
-                renameComposeTabIfDefault(tabID: tabID, sessionName: sessions[idx].name)
-            }
-        }
+            .trimmingCharacters(in: .whitespacesAndNewlines)
 
         await MainActor.run {
+            // Message normalization is query-scoped and remains valid even after
+            // cancellation. Session/tab renames are session-scoped, so only the
+            // query that still owns the session may publish them.
+            if runStateBySession[sessionID]?.activeQueryId == queryId,
+               let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID })
+            {
+                if let extractedName, !extractedName.isEmpty,
+                   sessions[sessionIndex].name == "New Chat"
+                {
+                    sessions[sessionIndex].name = extractedName
+                    print("Chat session renamed to: \(extractedName)")
+                }
+                if let tabID = sessions[sessionIndex].composeTabID {
+                    renameComposeTabIfDefault(tabID: tabID, sessionName: sessions[sessionIndex].name)
+                }
+            }
+
             self.withSessionMessages(sessionID) { msgs in
-                if let msgIdx = msgs.firstIndex(where: { $0.id == queryId }) {
-                    msgs[msgIdx].updateContent(mutableContent)
+                if let messageIndex = msgs.firstIndex(where: { $0.id == queryId }) {
+                    msgs[messageIndex].updateContent(mutableContent)
                 }
             }
         }
@@ -3514,20 +3863,9 @@ class OracleViewModel: ObservableObject {
             // Current session: autosaveChatHistory updates from live messages
             autosaveChatHistory(force: true)
         } else {
-            // Non-current session: explicitly save it (stub-safe via autosaveSession)
-            let sessionToSave = sessions[index]
-            Task {
-                do {
-                    let savedURL = try await autosaveSession(sessionToSave)
-                    // Update the sessions array with the saved fileURL
-                    if let idx = sessions.firstIndex(where: { $0.id == id }) {
-                        sessions[idx].fileURL = savedURL
-                        sessions[idx].savedAt = Date()
-                    }
-                } catch {
-                    print("Error saving renamed session: \(error)")
-                }
-            }
+            // Non-current session: enqueue immediately so a captured older
+            // snapshot cannot be scheduled after a newer mutation.
+            scheduleSessionSave(sessions[index])
         }
     }
 

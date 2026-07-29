@@ -4329,7 +4329,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
 
             await progressReporter?(.messageSend)
-            await oracleViewModel.sendMessage(
+            let sendStart = await oracleViewModel.sendMessage(
                 prompt,
                 sessionID: createdSession.id,
                 overrideModel: model,
@@ -4339,6 +4339,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 selectionOverride: selection,
                 lookupContextOverride: lookupContext,
                 overrideAIMessage: aiMessage,
+                overlapPolicy: .rejectIfBusy,
                 onProgress: { [weak self] text, reasoning in
                     guard let self,
                           let session = sessions[tabID],
@@ -4355,8 +4356,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 throw CancellationError()
             }
             await progressReporter?(.activeQueryAcquisition)
-            guard let queryId = oracleViewModel.activeQueryId(for: createdSession.id) else {
-                throw ChatToolError.internalError("Failed to start follow-up stream")
+            let queryId: UUID
+            switch sendStart {
+            case let .started(startedQueryID):
+                queryId = startedQueryID
+            case .rejectedSessionBusy:
+                throw ChatToolError.oracleSessionBusy("Context Builder follow-up chat is already streaming.")
+            case .rejectedTabConcurrencyLimit:
+                throw ChatToolError.oracleConcurrencyLimit("Context Builder follow-up unexpectedly reached the MCP Oracle concurrency limit.")
+            case let .failed(reason):
+                throw ChatToolError.internalError("Failed to start follow-up stream: \(reason)")
             }
             await progressReporter?(.streaming)
             try await waitForFollowUpFinalization(

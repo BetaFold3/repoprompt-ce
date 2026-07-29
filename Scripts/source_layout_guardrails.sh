@@ -344,6 +344,7 @@ allowed_tracked_docs=(
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
   "docs/plans/test-coverage-value-audit-2026-05-29.md"
+  "docs/technical_implementation_reports/2026-07-29-parallel-dual-oracle-sessions.md"
 )
 while IFS= read -r path; do
   allowed_tracked_docs+=("$path")

@@ -46,16 +46,37 @@ final class WorkflowPromptCatalogTests: XCTestCase {
     }
 
     func testRenderedManagedPromptFrontmatterCompatibility() {
-        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 61)
+        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 63)
 
         for descriptor in WorkflowPromptCatalog.installDescriptors {
             let rendered = RepoPromptWorkflowPrompts.render(id: descriptor.id, variant: .mcp)
             XCTAssertTrue(rendered.hasPrefix("---\n"), descriptor.name)
             XCTAssertTrue(rendered.contains("name: \"\(descriptor.name)\""), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_managed: true"), descriptor.name)
-            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 61"), descriptor.name)
+            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 63"), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_variant: mcp"), descriptor.name)
             XCTAssertFalse(RepoPromptWorkflowPrompts.stripYAMLFrontmatter(rendered).hasPrefix("---"), descriptor.name)
+        }
+    }
+
+    func testNamedOracleGuidanceStaysFailClosedAcrossAgentAndReminderPrompts() {
+        let reminder = RepoPromptWorkflowPrompts.render(id: .reminder, variant: .mcp)
+        let standardAgent = SystemPromptService.agentModePrompt()
+        let engineerAgent = SystemPromptService.agentModePrompt(taskLabelKind: .engineer)
+
+        for (label, prompt) in [
+            ("rp-reminder", reminder),
+            ("standard agent", standardAgent),
+            ("engineer agent", engineerAgent)
+        ] {
+            XCTAssertTrue(prompt.contains("model-preset selector"), label)
+            XCTAssertTrue(prompt.contains("oracle_utils"), label)
+            XCTAssertTrue(prompt.contains("exact preset UUID"), label)
+            XCTAssertTrue(prompt.contains("same tool-call batch"), label)
+            XCTAssertTrue(prompt.contains("`chat_name` is"), label)
+            XCTAssertTrue(prompt.contains("never selects a model"), label)
+            XCTAssertTrue(prompt.contains("`model_preset_id`"), label)
+            XCTAssertTrue(prompt.contains("do not synthesize"), label)
         }
     }
 

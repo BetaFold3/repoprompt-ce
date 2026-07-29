@@ -42,6 +42,24 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
+    func testAskOracleCatalogDocumentsNamedPresetIdentityContract() async throws {
+        let window = Self.makeWindowWithoutAutoStart()
+        let tools = await window.mcpServer.windowMCPTools
+        let askOracle = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.askOracle })
+        let properties = try Self.schemaProperties(for: askOracle)
+        let modelDescription = try XCTUnwrap(properties["model"]?.objectValue?["description"]?.stringValue)
+        let chatNameDescription = try XCTUnwrap(properties["chat_name"]?.objectValue?["description"]?.stringValue)
+
+        XCTAssertTrue(askOracle.description.contains("model-preset selectors"))
+        XCTAssertTrue(askOracle.description.contains("oracle_utils op=models"))
+        XCTAssertTrue(askOracle.description.contains("one tool-call batch"))
+        XCTAssertTrue(askOracle.description.contains("do not synthesize"))
+        XCTAssertTrue(modelDescription.contains("Exact model preset UUID (preferred)"))
+        XCTAssertTrue(modelDescription.contains("Required when the user requests a named Oracle"))
+        XCTAssertTrue(chatNameDescription.contains("display-only"))
+        XCTAssertTrue(chatNameDescription.contains("never selects the model"))
+    }
+
     func testLifecycleSchemasAdvertiseConfigurableDefaultsWithoutMaximumClamp() async throws {
         do {
             let caseLabel = "testAgentLifecycleSchemasAdvertiseTwoMinuteDefaultsWithoutMaximumClamp"
@@ -479,9 +497,9 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "6|workspace_context|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=fb968e72d430d354b03a0dfdb5251d95bbdea2a38cddcd58fe402f6bcb4f1035|schema=d41b9e8db1ccb1ce385d2d20619485a211bda4a8474270ef0c08fc77647e8376",
         "7|prompt|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=e1377f12a6495829c0ade3e37b9325f7a07dc2065288b16bb810d01a4df9e55d|schema=8c8ea22a39bbb9e10c364ad483527faf109a52e1eb9c45c0c939f569ecf144d1",
         "8|apply_edits|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=d33efa75e3e29e1e4e1cfe90d0e9d621337c397e5329aee02f4a261726d790fa|schema=e1ad464843910182006a484b0545305f8d53821a795cd8e116c07a01eededed8",
-        "9|oracle_utils|enabled=true|ann=title=nil,readOnly=nil,destructive=nil,idempotent=nil,openWorld=nil|desc=af161abbd2edf82b9cf502e1cf794bc48366b816b3ddc0ec2034b154ecc35c3a|schema=7d3c55c22f02f8825008521e4c20cd304a7c12f3679743b34f5a2bf315d19d7b",
-        "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=7a4771154006b3dcf158003d04b2b78da91fe4cc63d1acb5942f64f8a3e04e98|schema=03968f76ace268ccd7128c088ecc2544ca5ec77f47100d03e38a29a155cf81eb",
-        "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=4608413a45189586669c6cc3339af4d467939a2477036545ef5d879b676b51fb|schema=6f940dcd0a0d39789189120217abdb60cd0f520b85f862beb81349f98bc1b19c",
+        "9|oracle_utils|enabled=true|ann=title=nil,readOnly=nil,destructive=nil,idempotent=nil,openWorld=nil|desc=27f95db5e0be6c58c0ce9ee266dd398fd3c40218b1cd575cb6770c81a8fc63e7|schema=7d3c55c22f02f8825008521e4c20cd304a7c12f3679743b34f5a2bf315d19d7b",
+        "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=506b19bfecb554d8c60ee2238bfa195cd61223221e7b354ee3d9907044ea2639|schema=96bb27926af20e3ed93182c28653fc192de26250738f1d2f19d31ce08ec8fdb3",
+        "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=8620bbc618d4c411efea574d2fbc53d304ee2ecc98612d9139e5ea3b045ad118|schema=bc03241738fbb82449f52dd74a71fdc2d3920a9b825f803162001e69fca19410",
         "12|oracle_chat_log|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=5acbb74a0fcf76bd3717faac8fc355f582f13523685d3bfebf11fda7241958b1|schema=50db94327abe785e20d3628135efa29cf184d18272d5af5b94a43d7246a4a201",
         "13|git|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=1a9ff83872cf8842146dd84563dd880f7d9b8f6190cc6e9204a0ea82fc8feca6|schema=51bd804997d6acfaa17d529867f6188b969282a4db95956e859a74ab07de626a",
         "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",

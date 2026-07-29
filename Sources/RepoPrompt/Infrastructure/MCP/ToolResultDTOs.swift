@@ -988,6 +988,12 @@ enum ToolResultDTOs {
         let response: String?
         let diffs: [Diff]?
         let errors: [String]?
+        let modelID: String?
+        let modelName: String?
+        let modelSelection: String?
+        let modelSource: String?
+        let modelPresetID: String?
+        let modelPresetName: String?
 
         private enum CodingKeys: String, CodingKey {
             case chatID = "chat_id"
@@ -996,14 +1002,38 @@ enum ToolResultDTOs {
             case diffs
             case patches
             case errors
+            case modelID = "model_id"
+            case modelName = "model_name"
+            case modelSelection = "model_selection"
+            case modelSource = "model_source"
+            case modelPresetID = "model_preset_id"
+            case modelPresetName = "model_preset_name"
         }
 
-        init(chatID: String?, mode: String?, response: String?, diffs: [Diff]?, errors: [String]?) {
+        init(
+            chatID: String?,
+            mode: String?,
+            response: String?,
+            diffs: [Diff]?,
+            errors: [String]?,
+            modelID: String? = nil,
+            modelName: String? = nil,
+            modelSelection: String? = nil,
+            modelSource: String? = nil,
+            modelPresetID: String? = nil,
+            modelPresetName: String? = nil
+        ) {
             self.chatID = chatID
             self.mode = mode
             self.response = response
             self.diffs = diffs
             self.errors = errors
+            self.modelID = modelID
+            self.modelName = modelName
+            self.modelSelection = modelSelection
+            self.modelSource = modelSource
+            self.modelPresetID = modelPresetID
+            self.modelPresetName = modelPresetName
         }
 
         init(from decoder: Decoder) throws {
@@ -1017,6 +1047,12 @@ enum ToolResultDTOs {
                 diffs = try container.decodeIfPresent([Diff].self, forKey: .patches)
             }
             errors = try container.decodeIfPresent([String].self, forKey: .errors)
+            modelID = try container.decodeIfPresent(String.self, forKey: .modelID)
+            modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
+            modelSelection = try container.decodeIfPresent(String.self, forKey: .modelSelection)
+            modelSource = try container.decodeIfPresent(String.self, forKey: .modelSource)
+            modelPresetID = try container.decodeIfPresent(String.self, forKey: .modelPresetID)
+            modelPresetName = try container.decodeIfPresent(String.self, forKey: .modelPresetName)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -1026,6 +1062,12 @@ enum ToolResultDTOs {
             try container.encodeIfPresent(response, forKey: .response)
             try container.encodeIfPresent(diffs, forKey: .diffs)
             try container.encodeIfPresent(errors, forKey: .errors)
+            try container.encodeIfPresent(modelID, forKey: .modelID)
+            try container.encodeIfPresent(modelName, forKey: .modelName)
+            try container.encodeIfPresent(modelSelection, forKey: .modelSelection)
+            try container.encodeIfPresent(modelSource, forKey: .modelSource)
+            try container.encodeIfPresent(modelPresetID, forKey: .modelPresetID)
+            try container.encodeIfPresent(modelPresetName, forKey: .modelPresetName)
         }
     }
 

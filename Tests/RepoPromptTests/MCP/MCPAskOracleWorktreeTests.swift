@@ -2665,6 +2665,203 @@ import XCTest
             }
         }
 
+        func testAskOracleValidatesAndForwardsParallelSessionArgumentsAtServiceBoundary() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let capture = OracleArgsCapture()
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+                }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(codemapAutoEnabled: false),
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting { args, _, _ in
+                        capture.record(args)
+                        return [
+                            "chat_id": .string(UUID().uuidString),
+                            "short_id": .string("argument-capture"),
+                            "mode": .string("review"),
+                            "response": .string("captured")
+                        ]
+                    }
+
+                    let connectionID = endpoint.connectionID
+                    _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                        try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                            "message": .string("Review independently"),
+                            "mode": .string("review"),
+                            "model": .string("GPT_5_6_Sol_xhigh"),
+                            "chat_name": .string("Sol review lane"),
+                            "new_chat": .bool(true)
+                        ])
+                    }
+                    XCTAssertEqual(capture.args?["model"]?.stringValue, "GPT_5_6_Sol_xhigh")
+                    XCTAssertEqual(capture.args?["chat_name"]?.stringValue, "Sol review lane")
+                    XCTAssertEqual(capture.args?["new_chat"]?.boolValue, true)
+                    XCTAssertEqual(capture.callCount, 1)
+
+                    let firstPreset = ModelPreset(
+                        name: "KnowledgeDuelA",
+                        model: .customProviderUser(name: "knowledge-duel-a"),
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    let secondPreset = ModelPreset(
+                        name: "KnowledgeDuelB",
+                        model: .customProviderUser(name: "knowledge-duel-b"),
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    presetsManager.presets = [firstPreset, secondPreset]
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+
+                    let modelsResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.oracleUtils,
+                        arguments: ["op": "models"],
+                        timeoutSeconds: 20
+                    )
+                    XCTAssertFalse(modelsResponse.rawJSON.contains("\"isError\":true"), modelsResponse.rawJSON)
+                    XCTAssertTrue(modelsResponse.rawJSON.contains(firstPreset.name), modelsResponse.rawJSON)
+                    XCTAssertTrue(modelsResponse.rawJSON.contains(secondPreset.name), modelsResponse.rawJSON)
+
+                    let disabledModelsResponse = MCPOracleToolService.modelPresetDiagnosticLines(
+                        usageState: .disabledByToggle,
+                        configuredPresets: [firstPreset, secondPreset]
+                    ).joined(separator: "\n")
+                    XCTAssertTrue(
+                        disabledModelsResponse.contains("Model preset state: disabled for MCP"),
+                        disabledModelsResponse
+                    )
+                    XCTAssertTrue(
+                        disabledModelsResponse.contains("NOT selectable"),
+                        disabledModelsResponse
+                    )
+                    XCTAssertTrue(disabledModelsResponse.contains(firstPreset.name))
+                    XCTAssertTrue(disabledModelsResponse.contains(firstPreset.id.uuidString))
+                    XCTAssertTrue(disabledModelsResponse.contains(secondPreset.name))
+                    XCTAssertTrue(disabledModelsResponse.contains(secondPreset.id.uuidString))
+                    XCTAssertTrue(
+                        disabledModelsResponse.contains("Use Oracle Model Presets for MCP"),
+                        disabledModelsResponse
+                    )
+
+                    settings.setMCPShowModelPresets(false, commit: false)
+                    do {
+                        _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                                "message": .string("Use the exact disabled preset"),
+                                "mode": .string("review"),
+                                "model": .string(firstPreset.id.uuidString),
+                                "new_chat": .bool(true)
+                            ])
+                        }
+                        XCTFail("Expected an explicitly requested disabled preset to fail closed")
+                    } catch {
+                        let message = error.localizedDescription
+                        XCTAssertTrue(message.contains(firstPreset.name), message)
+                        XCTAssertTrue(message.contains("exists but is not selectable"), message)
+                        XCTAssertTrue(message.contains("Use Oracle Model Presets for MCP"), message)
+                        XCTAssertTrue(message.contains("It was not used"), message)
+                    }
+
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(true, commit: false)
+                    let hiddenModelsResponse = MCPOracleToolService.modelPresetDiagnosticLines(
+                        usageState: .temporarilyHidden,
+                        configuredPresets: [firstPreset, secondPreset]
+                    ).joined(separator: "\n")
+                    XCTAssertTrue(
+                        hiddenModelsResponse.contains("temporarily hidden by Setup Wizard"),
+                        hiddenModelsResponse
+                    )
+                    XCTAssertTrue(hiddenModelsResponse.contains(firstPreset.name))
+                    XCTAssertTrue(hiddenModelsResponse.contains(secondPreset.name))
+                    XCTAssertTrue(hiddenModelsResponse.contains("Show presets"))
+
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+
+                    let sessionsResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.oracleUtils,
+                        arguments: ["op": "sessions"],
+                        timeoutSeconds: 20
+                    )
+                    XCTAssertTrue(sessionsResponse.rawJSON.contains("\"isError\":true"), sessionsResponse.rawJSON)
+                    XCTAssertTrue(sessionsResponse.rawJSON.contains("unavailable in Agent Mode"), sessionsResponse.rawJSON)
+
+                    for chatName in [String?.none, "Knowledge Duel A"] {
+                        var ambiguousArgs: [String: Value] = [
+                            "message": .string("Ask both named Oracles"),
+                            "mode": .string("review"),
+                            "new_chat": .bool(true)
+                        ]
+                        if let chatName {
+                            ambiguousArgs["chat_name"] = .string(chatName)
+                        }
+                        do {
+                            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                                try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(
+                                    args: ambiguousArgs
+                                )
+                            }
+                            XCTFail("Expected a new Oracle lane without model to fail closed")
+                        } catch {
+                            let message = error.localizedDescription
+                            XCTAssertTrue(message.contains("requires an explicit model"), message)
+                            XCTAssertTrue(message.contains("chat_name only labels"), message)
+                            XCTAssertTrue(message.contains(firstPreset.name), message)
+                            XCTAssertTrue(message.contains(firstPreset.id.uuidString), message)
+                            XCTAssertTrue(message.contains(secondPreset.name), message)
+                            XCTAssertTrue(message.contains(secondPreset.id.uuidString), message)
+                        }
+                    }
+                    XCTAssertEqual(capture.callCount, 1, "Ambiguous named lanes must fail before sendChat")
+
+                    let invalidCases: [([String: Value], String)] = [
+                        (["message": .string("x"), "chat_id": .int(7)], "chat_id must be a string"),
+                        (["message": .string("x"), "model": .string("  ")], "model cannot be empty"),
+                        (["message": .string("x"), "chat_name": .string("Lane")], "chat_name is only valid"),
+                        ([
+                            "message": .string("x"),
+                            "chat_id": .string("abc123"),
+                            "new_chat": .bool(true)
+                        ], "cannot be used together")
+                    ]
+                    for (args, expectedMessage) in invalidCases {
+                        do {
+                            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                                try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: args)
+                            }
+                            XCTFail("Expected invalid ask_oracle arguments: \(args)")
+                        } catch {
+                            XCTAssertTrue(error.localizedDescription.contains(expectedMessage), error.localizedDescription)
+                        }
+                    }
+
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                } catch {
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         private func installOracleCapture(
             _ capture: OracleWorktreeCapture,
             on window: WindowState,
@@ -3143,6 +3340,17 @@ import XCTest
 
         func snapshot() -> [MCPExplicitWindowRoutingHint?] {
             hints
+        }
+    }
+
+    @MainActor
+    private final class OracleArgsCapture {
+        private(set) var args: [String: Value]?
+        private(set) var callCount = 0
+
+        func record(_ args: [String: Value]) {
+            self.args = args
+            callCount += 1
         }
     }
 

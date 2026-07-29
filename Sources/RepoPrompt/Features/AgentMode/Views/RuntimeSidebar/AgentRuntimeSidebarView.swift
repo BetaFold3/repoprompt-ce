@@ -41,6 +41,14 @@ struct AgentRuntimeSidebarView: View {
         )
     }
 
+    private var displayedOracleSessions: [ChatSession] {
+        AgentOraclePillLogic.orderedSessions(
+            tabChatSessions,
+            streamingSessionIDs: oracleViewModel.streamingSessions,
+            completedLimit: 5
+        )
+    }
+
     private var selectedOracleSession: ChatSession? {
         guard let selectedID = AgentOraclePillLogic.selectedSessionID(
             currentSelectionID: selectedOracleSessionID,
@@ -194,7 +202,7 @@ struct AgentRuntimeSidebarView: View {
             // Session list for switching
             if tabChatSessions.count > 1 {
                 VStack(spacing: 2) {
-                    ForEach(tabChatSessions.suffix(5)) { session in
+                    ForEach(displayedOracleSessions) { session in
                         oracleSessionRow(session)
                     }
                 }
@@ -221,15 +229,26 @@ struct AgentRuntimeSidebarView: View {
         Button {
             selectedOracleSessionID = session.id
         } label: {
-            HStack(spacing: 6) {
+            HStack(spacing: 7) {
                 Image(systemName: "bubble.left.and.text.bubble.right")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
-                Text(session.name)
-                    .font(.system(size: 11))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer()
+                VStack(alignment: .leading, spacing: 1) {
+                    let modelName = AgentOraclePillLogic.modelDisplayName(
+                        for: session,
+                        streamingSessionIDs: oracleViewModel.streamingSessions
+                    )
+                    Text(AgentOraclePillLogic.displayTitle(for: session, modelDisplayName: modelName))
+                        .font(.system(size: 11))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Text(session.oracleSessionDetailLabel(modelDisplayName: modelName))
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer(minLength: 4)
                 if oracleViewModel.streamingSessions.contains(session.id) {
                     ProgressView()
                         .controlSize(.mini)
@@ -253,6 +272,12 @@ struct AgentRuntimeSidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(
+            "\(AgentOraclePillLogic.displayTitle(for: session, modelDisplayName: AgentOraclePillLogic.modelDisplayName(for: session, streamingSessionIDs: oracleViewModel.streamingSessions))), \(session.oracleSessionDetailLabel(modelDisplayName: AgentOraclePillLogic.modelDisplayName(for: session, streamingSessionIDs: oracleViewModel.streamingSessions)))"
+        )
+        .accessibilityValue(
+            oracleViewModel.streamingSessions.contains(session.id) ? "running" : "completed"
+        )
     }
 
     // MARK: - File Context
@@ -435,6 +460,12 @@ private extension View {
 }
 
 private extension ChatSession {
+    func oracleSessionDetailLabel(modelDisplayName: String?) -> String {
+        [modelDisplayName, shortID]
+            .compactMap(\.self)
+            .joined(separator: " • ")
+    }
+
     var messageCountLabel: String {
         let count = effectiveMessageCount
         return "\(count) msg\(count == 1 ? "" : "s")"

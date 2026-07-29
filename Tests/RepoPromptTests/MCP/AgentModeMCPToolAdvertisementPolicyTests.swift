@@ -3,6 +3,11 @@ import XCTest
 
 final class AgentModeMCPToolAdvertisementPolicyTests: XCTestCase {
     func testDelegationAdvertisementRequiresTopLevelNonExploreControl() {
+        XCTAssertFalse(
+            AgentModeMCPToolPolicy.restrictedTools.contains(MCPWindowToolName.oracleUtils),
+            "Agent Mode execution policy must allow the Oracle service to handle safe model discovery"
+        )
+
         let roleCases: [(AgentModelCatalog.TaskLabelKind, String)] = [
             (.pair, "Pair"),
             (.engineer, "Engineer"),
@@ -10,6 +15,13 @@ final class AgentModeMCPToolAdvertisementPolicyTests: XCTestCase {
         ]
 
         for (role, label) in roleCases {
+            XCTAssertTrue(
+                AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                    toolName: MCPWindowToolName.oracleUtils,
+                    taskLabelKind: role
+                ),
+                "\(label) oracle_utils"
+            )
             XCTAssertTrue(
                 AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
                     toolName: MCPWindowToolName.agentRun,
@@ -61,6 +73,14 @@ final class AgentModeMCPToolAdvertisementPolicyTests: XCTestCase {
             )
         }
 
+        XCTAssertFalse(
+            AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                toolName: MCPWindowToolName.oracleUtils,
+                taskLabelKind: .explore
+            ),
+            "Explore should not discover oracle_utils"
+        )
+
         for allowsExternalControl in [false, true] {
             XCTAssertFalse(
                 AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
@@ -87,6 +107,14 @@ final class AgentModeMCPToolAdvertisementPolicyTests: XCTestCase {
     }
 
     func testDirectConnectionDoesNotAdvertiseExploreControl() {
+        XCTAssertTrue(
+            AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
+                toolName: MCPWindowToolName.oracleUtils,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false
+            ),
+            "Generic Agent Mode runs should discover oracle_utils"
+        )
         XCTAssertTrue(
             AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
                 toolName: MCPWindowToolName.agentRun,

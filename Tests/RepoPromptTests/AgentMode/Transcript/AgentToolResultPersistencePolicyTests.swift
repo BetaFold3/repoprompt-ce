@@ -17,6 +17,12 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                 "status": "success",
                 "chat_id": "chat-123",
                 "mode": "review",
+                "model_id": "provider-model-id",
+                "model_name": "Fable",
+                "model_selection": "explicit",
+                "model_source": "preset",
+                "model_preset_id": "11111111-2222-3333-4444-555555555555",
+                "model_preset_name": "Claude_Fable_xhigh",
                 "response": rawResponse,
                 "diffs": [["path": "File.swift", "diff": rawDiff]],
                 "errors": [rawError]
@@ -31,13 +37,33 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             if row.receivesOracleMetadata {
                 XCTAssertEqual(object["chat_id"] as? String, "chat-123", row.toolName)
                 XCTAssertEqual(object["mode"] as? String, "review", row.toolName)
+                XCTAssertEqual(object["model_id"] as? String, "provider-model-id", row.toolName)
+                XCTAssertEqual(object["model_name"] as? String, "Fable", row.toolName)
+                XCTAssertEqual(object["model_selection"] as? String, "explicit", row.toolName)
+                XCTAssertEqual(object["model_source"] as? String, "preset", row.toolName)
+                XCTAssertEqual(
+                    object["model_preset_id"] as? String,
+                    "11111111-2222-3333-4444-555555555555",
+                    row.toolName
+                )
+                XCTAssertEqual(object["model_preset_name"] as? String, "Claude_Fable_xhigh", row.toolName)
                 XCTAssertEqual(object["has_response"] as? Bool, true, row.toolName)
                 XCTAssertEqual(object["diff_count"] as? Int, 1, row.toolName)
                 XCTAssertEqual(object["error_count"] as? Int, 1, row.toolName)
-                XCTAssertEqual(object["summary_text"] as? String, "review • 1 diff", row.toolName)
+                XCTAssertEqual(
+                    object["summary_text"] as? String,
+                    "review • Claude_Fable_xhigh • 1 diff",
+                    row.toolName
+                )
             } else {
                 XCTAssertNil(object["chat_id"], row.toolName)
                 XCTAssertNil(object["mode"], row.toolName)
+                XCTAssertNil(object["model_id"], row.toolName)
+                XCTAssertNil(object["model_name"], row.toolName)
+                XCTAssertNil(object["model_selection"], row.toolName)
+                XCTAssertNil(object["model_source"], row.toolName)
+                XCTAssertNil(object["model_preset_id"], row.toolName)
+                XCTAssertNil(object["model_preset_name"], row.toolName)
                 XCTAssertNil(object["has_response"], row.toolName)
                 XCTAssertNil(object["diff_count"], row.toolName)
                 XCTAssertNil(object["error_count"], row.toolName)
