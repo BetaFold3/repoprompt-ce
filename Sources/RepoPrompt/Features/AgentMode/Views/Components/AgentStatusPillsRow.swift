@@ -19,33 +19,43 @@ struct AgentStatusPillsRow: View {
         #endif
         HStack(spacing: 12) {
             HStack(spacing: 6) {
-                if let executionLocation = snapshot.executionLocation {
-                    AgentExecutionLocationPill(
-                        props: executionLocation,
-                        loadExistingWorktrees: { try await agentModeVM.availableExecutionWorktrees(for: executionLocation.tabID) },
-                        selectLocation: { choice, confirmation in
-                            await agentModeVM.selectExecutionLocation(
-                                choice,
-                                for: executionLocation.tabID,
-                                confirmedChange: confirmation
-                            )
-                        }
+                if snapshot.profile == .knowledge {
+                    Label("Knowledge", systemImage: "brain")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 4)
+                        .background(.quaternary, in: Capsule())
+                        .accessibilityLabel("Knowledge session")
+                } else {
+                    if let executionLocation = snapshot.executionLocation {
+                        AgentExecutionLocationPill(
+                            props: executionLocation,
+                            loadExistingWorktrees: { try await agentModeVM.availableExecutionWorktrees(for: executionLocation.tabID) },
+                            selectLocation: { choice, confirmation in
+                                await agentModeVM.selectExecutionLocation(
+                                    choice,
+                                    for: executionLocation.tabID,
+                                    confirmedChange: confirmation
+                                )
+                            }
+                        )
+                    }
+
+                    AgentWorkflowPill(
+                        statusPillsUI: statusPillsUI,
+                        windowID: windowID,
+                        selectWorkflow: { agentModeVM.selectWorkflow($0) }
                     )
-                }
 
-                AgentWorkflowPill(
-                    statusPillsUI: statusPillsUI,
-                    windowID: windowID,
-                    selectWorkflow: { agentModeVM.selectWorkflow($0) }
-                )
+                    AgentInterviewPill(
+                        isOn: snapshot.interviewFirst,
+                        onToggle: { agentModeVM.toggleInterviewFirst() }
+                    )
 
-                AgentInterviewPill(
-                    isOn: snapshot.interviewFirst,
-                    onToggle: { agentModeVM.toggleInterviewFirst() }
-                )
-
-                if let stagedSlashCommand = snapshot.stagedSlashCommand {
-                    AgentStagedSlashCommandPill(staged: stagedSlashCommand)
+                    if let stagedSlashCommand = snapshot.stagedSlashCommand {
+                        AgentStagedSlashCommandPill(staged: stagedSlashCommand)
+                    }
                 }
             }
 

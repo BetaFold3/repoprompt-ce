@@ -67,6 +67,38 @@ enum ClaudeCodeIntegrationConfiguration {
         "PushNotification"
     ]
 
+    /// Claude Code tools to disallow during Knowledge sessions.
+    /// Native Read remains available for images and PDFs; RepoPrompt owns text reads.
+    /// WebSearch/WebFetch are intentionally absent so provider web preferences remain authoritative.
+    private static let knowledgeDisallowedTools: [String] = [
+        "Bash",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "Task",
+        "SlashCommand",
+        "BashOutput",
+        "KillShell",
+        "Monitor",
+        "NotebookEdit",
+        "TodoWrite",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "EnterWorktree",
+        "ExitWorktree",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "RemoteTrigger",
+        "Skill",
+        "TaskOutput",
+        "TaskStop",
+        "AskUserQuestion",
+        "ScheduleWakeup",
+        "PushNotification"
+    ]
+
     /// Claude Code tools to disallow during discovery runs.
     /// All native file/shell tools blocked — MCP tools drive exploration.
     /// WebSearch + WebFetch are kept enabled so the agent can look up docs/context.
@@ -119,19 +151,24 @@ enum ClaudeCodeIntegrationConfiguration {
     /// Pass `allowNativeBashTool: true` to keep Bash/BashOutput/KillShell enabled.
     static func disallowedTools(
         for context: AgentCLIToolContext,
-        allowNativeBashTool: Bool = false
+        allowNativeBashTool: Bool = false,
+        sessionProfile: AgentSessionProfile = .standard
     ) -> [String] {
-        let base: [String] = switch context {
-        case .agentRun:
-            agentDisallowedTools
-        case .discoverRun:
-            discoverDisallowedTools
-        case .promptOnly:
-            agentDisallowedTools
-        case .terminal:
-            terminalDisallowedTools
+        let base: [String] = if sessionProfile == .knowledge, context == .agentRun || context == .promptOnly {
+            knowledgeDisallowedTools
+        } else {
+            switch context {
+            case .agentRun:
+                agentDisallowedTools
+            case .discoverRun:
+                discoverDisallowedTools
+            case .promptOnly:
+                agentDisallowedTools
+            case .terminal:
+                terminalDisallowedTools
+            }
         }
-        guard allowNativeBashTool else { return base }
+        guard allowNativeBashTool, sessionProfile == .standard else { return base }
         let bashToolNames: Set = ["Bash", "BashOutput", "KillShell"]
         return base.filter { !bashToolNames.contains($0) }
     }

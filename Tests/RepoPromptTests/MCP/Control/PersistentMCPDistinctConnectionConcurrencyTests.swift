@@ -1933,6 +1933,15 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             }
         }
 
+        func listToolNames(timeoutSeconds: Int = 10) async throws -> [String] {
+            let response = try await client.request(
+                method: "tools/list",
+                params: [:],
+                timeoutSeconds: timeoutSeconds
+            )
+            return try Self.toolNames(from: response)
+        }
+
         func callTool(
             name: String,
             arguments: [String: Any],

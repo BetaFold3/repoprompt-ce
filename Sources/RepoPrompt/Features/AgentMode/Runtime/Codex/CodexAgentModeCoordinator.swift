@@ -12,6 +12,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ windowID: Int,
         _ workspacePath: String?,
         _ permissionProfile: AgentModeViewModel.AgentPermissionProfile,
+        _ sessionProfile: AgentSessionProfile,
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         _ computerUseEnabled: Bool
     ) -> any CodexSessionControlling
@@ -26,6 +27,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ tabID: UUID?,
         _ runID: UUID?,
         _ additionalTools: Set<String>?,
+        _ allowedToolsOverride: Set<String>?,
+        _ sessionProfile: AgentSessionProfile,
         _ purpose: MCPRunPurpose,
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         _ allowsAgentExternalControlTools: Bool,
@@ -1315,6 +1318,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard session.selectedAgent == .codexExec else {
             return "Native Codex slash commands are only available in Codex agent sessions."
         }
+        if session.profile == .knowledge, command != .compact {
+            return "Only /compact is available in a Knowledge session. Open a standard Agent Mode session for /\(command.rawValue)."
+        }
         switch command {
         case .compact:
             guard !runState.isActive else {
@@ -2551,7 +2557,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ command: NativeSlashCommand,
         session: AgentModeViewModel.TabSession
     ) -> Bool {
-        switch command {
+        if session.profile == .knowledge, command != .compact {
+            return false
+        }
+        return switch command {
         case .compact:
             !session.runState.isActive && hasKnownCodexThread(session)
         case .goal:
@@ -2656,6 +2665,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             session.codexController = nil
             session.codexControllerPermissionProfile = nil
+            session.codexControllerSessionProfile = nil
             session.codexControllerTaskLabelKind = nil
             session.codexControllerWorkspacePath = nil
             session.pendingCodexComputerUseActivation = nil
@@ -2885,6 +2895,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func makeCodexRunLease(
         tabID: UUID,
         runID: UUID,
+        sessionProfile: AgentSessionProfile = .standard,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false
     ) -> MCPBootstrapLease? {
@@ -2896,6 +2907,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             gateID: UUID(),
             windowID: windowID,
             agent: .codexExec,
+            sessionProfile: sessionProfile,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools
         )
@@ -3519,6 +3531,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         session.codexController = nil
         session.codexControllerPermissionProfile = nil
+        session.codexControllerSessionProfile = nil
         session.codexControllerTaskLabelKind = nil
         session.codexControllerWorkspacePath = nil
         session.codexControllerFeatureState = nil
@@ -3676,13 +3689,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             await failCodexStartupForWorkspaceResolution(session: session, error: error)
             return
         }
-        let wantsGoalSupport = CodexGoalSupport.isEnabled
+        let wantsGoalSupport = session.profile == .standard && CodexGoalSupport.isEnabled
         let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
         let codexComputerUseFeatureEnabled = CodexComputerUseWorkflow.isEnabled
-        if !codexComputerUseFeatureEnabled {
+        if !codexComputerUseFeatureEnabled || session.profile == .knowledge {
             session.pendingCodexComputerUseActivation = nil
         }
-        let wantsComputerUse = session.wantsCodexComputerUseForNextTurn && codexComputerUseFeatureEnabled
+        let wantsComputerUse = session.profile == .standard
+            && session.wantsCodexComputerUseForNextTurn
+            && codexComputerUseFeatureEnabled
         let desiredFeatureState = AgentModeViewModel.TabSession.CodexControllerFeatureState(
             computerUseEnabled: wantsComputerUse,
             goalSupportEnabled: wantsGoalSupport,
@@ -3711,11 +3726,17 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if let existingController = session.codexController,
            let existingProfile = session.codexControllerPermissionProfile,
-           existingProfile != session.permissionProfile || session.codexControllerTaskLabelKind != currentTaskLabelKind
+           existingProfile != session.permissionProfile
+           || session.codexControllerSessionProfile != session.profile
+           || session.codexControllerTaskLabelKind != currentTaskLabelKind
         {
-            let source = existingProfile != session.permissionProfile
-                ? "permission-profile-change"
-                : "task-label-kind-change"
+            let source = if existingProfile != session.permissionProfile {
+                "permission-profile-change"
+            } else if session.codexControllerSessionProfile != session.profile {
+                "session-profile-change"
+            } else {
+                "task-label-kind-change"
+            }
             _ = invalidateCodexControllerForReconnect(
                 session: session,
                 expectedController: existingController,
@@ -3746,11 +3767,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     windowID,
                     runtimeWorkspacePath,
                     session.permissionProfile,
+                    session.profile,
                     currentTaskLabelKind,
                     wantsComputerUse
                 )
                 session.codexController = controller
                 session.codexControllerPermissionProfile = session.permissionProfile
+                session.codexControllerSessionProfile = session.profile
                 session.codexControllerTaskLabelKind = currentTaskLabelKind
                 session.codexControllerWorkspacePath = runtimeWorkspacePath
                 session.codexControllerFeatureState = desiredFeatureState
@@ -3882,6 +3905,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             guard let lease = makeCodexRunLease(
                 tabID: session.tabID,
                 runID: runID,
+                sessionProfile: session.profile,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools
             ) else { return }
@@ -3930,7 +3954,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let basePrompt = SystemPromptService.agentModePrompt(
             agentKind: .codexExec,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
+            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled(),
+            sessionProfile: session.profile
         )
         let resumeCandidate: CodexNativeSessionController.SessionRef? = {
             guard session.codexNeedsReconnect else { return nil }
@@ -8027,6 +8052,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         session.codexController = nil
         session.codexControllerPermissionProfile = nil
+        session.codexControllerSessionProfile = nil
         session.codexControllerTaskLabelKind = nil
         session.codexControllerWorkspacePath = nil
         session.codexControllerFeatureState = nil
@@ -8106,6 +8132,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         stopBashLivenessTask(for: session.tabID)
         session.codexController = nil
         session.codexControllerPermissionProfile = nil
+        session.codexControllerSessionProfile = nil
         session.codexControllerTaskLabelKind = nil
         session.codexControllerWorkspacePath = nil
         session.codexControllerFeatureState = nil
@@ -8189,6 +8216,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         session.codexController = nil
         session.codexControllerPermissionProfile = nil
+        session.codexControllerSessionProfile = nil
         session.codexControllerTaskLabelKind = nil
         session.codexControllerWorkspacePath = nil
         session.codexControllerFeatureState = nil

@@ -5,6 +5,26 @@ import XCTest
 
 @MainActor
 final class AgentChatTitlebarSafetyTests: XCTestCase {
+    func testNewSessionAccessoryKeepsPrimaryAndKnowledgeActionsDistinctAcrossUpdate() {
+        var events: [String] = []
+        let controller = AgentModeTitlebarAccessoryViewController(
+            onNewSession: { events.append("standard-1") },
+            onNewKnowledgeSession: { events.append("knowledge-1") }
+        )
+
+        controller.testInvokeNewSession()
+        controller.testInvokeNewKnowledgeSession()
+        controller.update(
+            onNewSession: { events.append("standard-2") },
+            onNewKnowledgeSession: { events.append("knowledge-2") },
+            isKnowledgeSessionAvailable: false
+        )
+        controller.testInvokeNewSession()
+        controller.testInvokeNewKnowledgeSession()
+
+        XCTAssertEqual(events, ["standard-1", "knowledge-1", "standard-2"])
+    }
+
     func testButtonPointerStandardAndAccessibilityActivationUseTargetAction() throws {
         let probe = ButtonActionProbe()
         let button = AgentChatOptionsButton()

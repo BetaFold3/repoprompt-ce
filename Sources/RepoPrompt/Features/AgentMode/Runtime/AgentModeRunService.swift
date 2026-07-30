@@ -168,6 +168,13 @@ final class AgentModeRunService {
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         let selectedAgent = session.selectedAgent
+        if session.profile == .knowledge,
+           !KnowledgeSessionPolicy.supportedProviders.contains(selectedAgent)
+        {
+            let message = "Knowledge sessions currently support Claude Code and Codex only."
+            await failBeforeProviderStartup(session: session, message: message)
+            return selectedAgent == .codexExec ? .failed(message: message) : nil
+        }
         let selectedModelString = session.selectedModelRaw == AgentModel.defaultModel.rawValue
             ? nil
             : session.selectedModelRaw
@@ -220,6 +227,7 @@ final class AgentModeRunService {
                 gateID: UUID(),
                 windowID: windowID,
                 agent: selectedAgent,
+                sessionProfile: session.profile,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools
             )

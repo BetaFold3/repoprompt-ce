@@ -5,6 +5,9 @@ extension AgentModeViewModel {
         let tabID = explicitTabID ?? currentTabID
         let session = tabID.flatMap { sessions[$0] }
         let isMCPControlled = isMCPControlled(tabID: tabID)
+        let availableAgentsForTab = selectableAgents(forTabID: tabID)
+        let selectedAgentForTab = session?.selectedAgent ?? selectedAgent
+        let canSendWithProviderForTab = availableAgentsForTab.contains(selectedAgentForTab)
         let isCodexRunActive: Bool = {
             guard selectedAgent == .codexExec, let tabID else { return false }
             return isTabRunning(tabID)
@@ -36,15 +39,17 @@ extension AgentModeViewModel {
             areModelControlsDisabled: isMCPControlled,
             providerControls: activeProviderControlsBinding,
             isCodexRunActive: isCodexRunActive,
-            hasAvailableAgentProviders: hasAvailableAgentProviders,
-            canSendWithCurrentProvider: canSendWithCurrentProvider,
-            unavailableSelectedAgentMessage: unavailableSelectedAgentMessage,
+            hasAvailableAgentProviders: !availableAgentsForTab.isEmpty,
+            canSendWithCurrentProvider: canSendWithProviderForTab,
+            unavailableSelectedAgentMessage: canSendWithProviderForTab
+                ? nil
+                : unavailableSelectedAgentMessage,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
             selectedModelDisplayName: selectedModelDisplayName,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
-            availableAgents: availableAgents,
+            availableAgents: availableAgentsForTab,
             isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
             lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
             autoEditEnabled: autoEditEnabled,

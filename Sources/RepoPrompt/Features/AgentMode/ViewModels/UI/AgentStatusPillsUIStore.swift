@@ -17,6 +17,7 @@ struct AgentStatusPillsSnapshot: Equatable {
     let selectedWorkflow: AgentWorkflowDefinition?
     let stagedSlashCommand: AgentStagedSlashCommandProps?
     let selectedAgent: AgentProviderKind
+    let profile: AgentSessionProfile
     let autoEditPermissionGuidance: AgentModeViewModel.AutoEditPermissionGuidance?
     let runState: AgentSessionRunState
     let autoEditEnabled: Bool
@@ -30,6 +31,7 @@ struct AgentStatusPillsSnapshot: Equatable {
         selectedWorkflow: nil,
         stagedSlashCommand: nil,
         selectedAgent: .claudeCode,
+        profile: .standard,
         autoEditPermissionGuidance: nil,
         runState: .idle,
         autoEditEnabled: ApplyEditsApprovalStore.globalDefaultAutoEditEnabled(),

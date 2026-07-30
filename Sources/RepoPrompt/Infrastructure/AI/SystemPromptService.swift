@@ -677,11 +677,17 @@ class SystemPromptService {
     /// - Parameters:
     ///   - agentKind: Optional active agent kind to specialize provider-specific guidance
     ///   - taskLabelKind: Optional task label to select role-specific prompt variants
+    ///   - sessionProfile: Stable top-level session profile selected before provider startup
     static func agentModePrompt(
         agentKind: AgentProviderKind? = nil,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
-        codeMapsDisabled: Bool = false
+        codeMapsDisabled: Bool = false,
+        sessionProfile: AgentSessionProfile = .standard
     ) -> String {
+        if sessionProfile == .knowledge {
+            return AgentModePrompts.knowledgePrompt(agentKind: agentKind)
+        }
+
         // Role-specific prompts: dedicated lean prompts instead of conditional blocks
         switch taskLabelKind {
         case .explore:

@@ -73,6 +73,7 @@
             session.codexNeedsReconnect = false
             session.codexController = nil
             session.codexControllerPermissionProfile = nil
+            session.codexControllerSessionProfile = nil
             session.codexControllerTaskLabelKind = nil
             claudeCoordinator.test_discardRuntimeState(for: session)
             session.codexEventTask?.cancel()

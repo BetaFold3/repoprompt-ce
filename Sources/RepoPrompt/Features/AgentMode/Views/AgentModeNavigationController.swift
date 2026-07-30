@@ -43,15 +43,24 @@ final class AgentModeNavigationController: ObservableObject {
             return
         }
 
-        windowState.setAgentTitlebarAccessoryVisible(true) { [weak agentModeVM] in
-            Task {
-                guard let agentModeVM else { return }
-                let activeTabID = await MainActor.run { agentModeVM.currentTabID }
-                if await MainActor.run(body: { agentModeVM.shouldSwallowNewSessionClick(for: activeTabID) }) {
-                    return
+        windowState.setAgentTitlebarAccessoryVisible(
+            true,
+            onNewSession: { [weak agentModeVM] in
+                Task {
+                    guard let agentModeVM else { return }
+                    let activeTabID = await MainActor.run { agentModeVM.currentTabID }
+                    if await MainActor.run(body: { agentModeVM.shouldSwallowNewSessionClick(for: activeTabID) }) {
+                        return
+                    }
+                    await agentModeVM.createAndActivateSessionTab()
                 }
-                await agentModeVM.createAndActivateSessionTab()
-            }
-        }
+            },
+            onNewKnowledgeSession: { [weak agentModeVM] in
+                Task {
+                    await agentModeVM?.createAndActivateSessionTab(profile: .knowledge)
+                }
+            },
+            isKnowledgeSessionAvailable: agentModeVM.canCreateKnowledgeSession
+        )
     }
 }

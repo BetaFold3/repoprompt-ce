@@ -1,7 +1,7 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 5
+    static let currentSchemaVersion = 6
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -52,6 +52,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var itemCount: Int
     var transcriptProjectionCounts: AgentTranscriptProjectionCounts?
     var hasUnknownConversationContent: Bool
+    var profileRaw: String?
     var agentKindRaw: String?
     var agentModelRaw: String?
     var agentReasoningEffortRaw: String?
@@ -77,6 +78,10 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
 
     var activityDate: Date {
         AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
+    }
+
+    var profile: AgentSessionProfile {
+        profileRaw.flatMap(AgentSessionProfile.init(rawValue:)) ?? .standard
     }
 
     /// Active duration at the default idle threshold, derived from the stored primitives.
@@ -119,6 +124,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         itemCount: Int,
         transcriptProjectionCounts: AgentTranscriptProjectionCounts?,
         hasUnknownConversationContent: Bool,
+        profileRaw: String? = nil,
         agentKindRaw: String?,
         agentModelRaw: String?,
         agentReasoningEffortRaw: String?,
@@ -149,6 +155,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.itemCount = itemCount
         self.transcriptProjectionCounts = transcriptProjectionCounts
         self.hasUnknownConversationContent = hasUnknownConversationContent
+        self.profileRaw = profileRaw
         self.agentKindRaw = agentKindRaw
         self.agentModelRaw = agentModelRaw
         self.agentReasoningEffortRaw = agentReasoningEffortRaw
@@ -181,6 +188,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case itemCount
         case transcriptProjectionCounts
         case hasUnknownConversationContent
+        case profileRaw
         case agentKindRaw
         case agentModelRaw
         case agentReasoningEffortRaw
@@ -214,6 +222,27 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         itemCount = try container.decode(Int.self, forKey: .itemCount)
         transcriptProjectionCounts = try container.decodeIfPresent(AgentTranscriptProjectionCounts.self, forKey: .transcriptProjectionCounts)
         hasUnknownConversationContent = try container.decodeIfPresent(Bool.self, forKey: .hasUnknownConversationContent) ?? false
+        if container.contains(.profileRaw) {
+            guard try !container.decodeNil(forKey: .profileRaw) else {
+                throw DecodingError.valueNotFound(
+                    String.self,
+                    .init(
+                        codingPath: container.codingPath + [CodingKeys.profileRaw],
+                        debugDescription: "Agent session profile cannot be null"
+                    )
+                )
+            }
+            profileRaw = try container.decode(String.self, forKey: .profileRaw)
+        } else {
+            profileRaw = nil
+        }
+        if let profileRaw, AgentSessionProfile(rawValue: profileRaw) == nil {
+            throw DecodingError.dataCorruptedError(
+                forKey: .profileRaw,
+                in: container,
+                debugDescription: "Unknown agent session profile '\(profileRaw)'"
+            )
+        }
         agentKindRaw = try container.decodeIfPresent(String.self, forKey: .agentKindRaw)
         agentModelRaw = try container.decodeIfPresent(String.self, forKey: .agentModelRaw)
         agentReasoningEffortRaw = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffortRaw)
@@ -252,6 +281,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             isMCPOriginated: isMCPOriginated,
+            profile: profile,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
         )
@@ -285,6 +315,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && itemCount == other.itemCount
             && transcriptProjectionCounts == other.transcriptProjectionCounts
             && hasUnknownConversationContent == other.hasUnknownConversationContent
+            && profileRaw == other.profileRaw
             && agentKindRaw == other.agentKindRaw
             && agentModelRaw == other.agentModelRaw
             && agentReasoningEffortRaw == other.agentReasoningEffortRaw
@@ -329,6 +360,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             itemCount: session.effectiveItemCount,
             transcriptProjectionCounts: session.transcriptProjectionCounts,
             hasUnknownConversationContent: AgentSessionRestoreSupport.hasUnknownConversationContent(in: session),
+            profileRaw: session.profile.rawValue,
             agentKindRaw: session.agentKind,
             agentModelRaw: session.agentModel,
             agentReasoningEffortRaw: session.agentReasoningEffort,

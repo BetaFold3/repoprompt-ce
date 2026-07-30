@@ -15,6 +15,7 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var parentSessionID: UUID?
     var hasUnknownConversationContent: Bool
     var isMCPOriginated: Bool
+    var profile: AgentSessionProfile = .standard
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
 }

@@ -313,7 +313,21 @@ import XCTest
                         bindings: [binding]
                     )
                     let endpoint = try fixture.endpointA()
-                    try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: context,
+                        fixture: fixture,
+                        sessionProfile: .knowledge
+                    )
+                    let deniedResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.manageSelection,
+                        arguments: ["op": "get"]
+                    )
+                    XCTAssertTrue(
+                        deniedResponse.rawJSON.contains("not available in this Knowledge session"),
+                        deniedResponse.rawJSON
+                    )
+
                     installOracleCapture(capture, on: fixture.contextA.window)
                     fixture.contextA.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
                         await gate.markStartedAndWaitForRelease()
@@ -2936,23 +2950,57 @@ import XCTest
         private func configureAgentModeEndpoint(
             _ endpoint: PersistentMCPTestEndpoint,
             context: MCPServerViewModel.TabContextSnapshot,
-            fixture: PersistentMCPTestFixture
+            fixture: PersistentMCPTestFixture,
+            sessionProfile: AgentSessionProfile = .standard
         ) async throws {
             _ = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: ["op": "bind", "context_id": context.tabID.uuidString]
             )
             await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
+            let runID = try XCTUnwrap(context.runID)
             try await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,
-                runID: XCTUnwrap(context.runID),
+                runID: runID,
                 purpose: .agentModeRun,
                 windowID: context.windowID
             )
-            await fixture.networkManager.debugSetAdditionalTools(
-                for: endpoint.connectionID,
-                additionalTools: [MCPWindowToolName.askOracle]
-            )
+            if sessionProfile == .knowledge {
+                await fixture.networkManager.installClientConnectionPolicy(
+                    for: endpoint.clientName,
+                    windowID: context.windowID,
+                    restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                    oneShot: true,
+                    reason: "knowledge read-to-oracle integration",
+                    ttl: 10,
+                    tabID: context.tabID,
+                    runID: runID,
+                    additionalTools: AgentModeMCPPolicyInstaller.additionalTools(
+                        for: .codexExec,
+                        sessionProfile: .knowledge
+                    ),
+                    allowedToolsOverride: AgentModeMCPToolPolicy.knowledgeAllowedTools,
+                    sessionProfile: .knowledge,
+                    purpose: .agentModeRun
+                )
+                let admission = await fixture.networkManager.debugApplyPendingPolicy(
+                    clientName: endpoint.clientName,
+                    connectionID: endpoint.connectionID,
+                    requireRunRouting: false
+                )
+                XCTAssertEqual(admission.outcome, "applied")
+                XCTAssertEqual(admission.sessionProfile, .knowledge)
+                let advertisedToolNames = try await endpoint.listToolNames()
+                XCTAssertEqual(
+                    Set(advertisedToolNames),
+                    AgentModeMCPToolPolicy.knowledgeAllowedTools
+                )
+            } else {
+                await fixture.networkManager.debugSetAdditionalTools(
+                    for: endpoint.connectionID,
+                    additionalTools: [MCPWindowToolName.askOracle]
+                )
+            }
             var canonicalTab = try XCTUnwrap(
                 fixture.contextA.window.workspaceManager.composeTab(with: context.tabID)
             )

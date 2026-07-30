@@ -125,7 +125,7 @@ struct AgentTokenUsagePersist: Codable, Equatable {
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
-    static let currentSerializationVersion = 6
+    static let currentSerializationVersion = 7
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID
@@ -192,6 +192,9 @@ struct AgentSession: Codable, Identifiable {
     /// Used to scope cleanup operations to MCP-originated sessions only.
     var isMCPOriginated: Bool
 
+    /// Stable top-level behavior profile selected for this session.
+    var profile: AgentSessionProfile
+
     /// Persisted per-session logical-root to worktree bindings.
     /// Runtime cwd/path projection is resolved by downstream worktree-system layers.
     var worktreeBindings: [AgentSessionWorktreeBinding]
@@ -241,6 +244,7 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffSourceItemID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
         isMCPOriginated: Bool = false,
+        profile: AgentSessionProfile = .standard,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
         worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
     ) {
@@ -277,6 +281,7 @@ struct AgentSession: Codable, Identifiable {
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
         self.isMCPOriginated = isMCPOriginated
+        self.profile = profile
         self.worktreeBindings = worktreeBindings
         self.worktreeMergeOperations = worktreeMergeOperations
     }
@@ -315,6 +320,7 @@ struct AgentSession: Codable, Identifiable {
         case pendingHandoffSourceItemID
         case pendingHandoffDefersProviderLockUntilSend
         case isMCPOriginated
+        case profile
         case worktreeBindings
         case worktreeMergeOperations
     }
@@ -356,6 +362,20 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
         isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
+        if container.contains(.profile) {
+            guard try !container.decodeNil(forKey: .profile) else {
+                throw DecodingError.valueNotFound(
+                    AgentSessionProfile.self,
+                    .init(
+                        codingPath: container.codingPath + [CodingKeys.profile],
+                        debugDescription: "Agent session profile cannot be null"
+                    )
+                )
+            }
+            profile = try container.decode(AgentSessionProfile.self, forKey: .profile)
+        } else {
+            profile = .standard
+        }
         worktreeBindings = try container.decodeIfPresent([AgentSessionWorktreeBinding].self, forKey: .worktreeBindings) ?? []
         worktreeMergeOperations = try container.decodeIfPresent([AgentSessionWorktreeMergeOperation].self, forKey: .worktreeMergeOperations) ?? []
     }

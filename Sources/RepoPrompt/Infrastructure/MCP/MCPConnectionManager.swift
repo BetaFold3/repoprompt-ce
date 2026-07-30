@@ -400,6 +400,27 @@ actor ServerNetworkManager {
         toolNameAliases[name] ?? name
     }
 
+    nonisolated static func isAllowedByPositiveToolCeiling(
+        canonicalToolName: String,
+        allowedToolsOverride: Set<String>?
+    ) -> Bool {
+        allowedToolsOverride?.contains(canonicalToolName) ?? true
+    }
+
+    nonisolated static func positiveToolCeilingDenialMessage(
+        forCanonicalToolName toolName: String,
+        allowedToolsOverride: Set<String>?
+    ) -> String? {
+        guard !isAllowedByPositiveToolCeiling(
+            canonicalToolName: toolName,
+            allowedToolsOverride: allowedToolsOverride
+        ), let allowedToolsOverride
+        else {
+            return nil
+        }
+        return "Tool '\(toolName)' is not available in this Knowledge session. Available: \(allowedToolsOverride.sorted().joined(separator: ", "))."
+    }
+
     nonisolated static func admissionClass(forCanonicalToolName toolName: String) -> MCPToolAdmissionClass? {
         MCPToolAdmissionPolicy.classification(forCanonicalToolName: toolName)
     }
@@ -1005,6 +1026,8 @@ actor ServerNetworkManager {
     // Per-connection restriction + routing state
     private var restrictedToolsByConnection: [UUID: Set<String>] = [:]
     private var additionalToolsByConnection: [UUID: Set<String>] = [:]
+    private var allowedToolsOverrideByConnection: [UUID: Set<String>] = [:]
+    private var sessionProfileByConnection: [UUID: AgentSessionProfile] = [:]
     private var runPurposeByConnection: [UUID: MCPRunPurpose] = [:]
     private var windowAssignmentByConnection: [UUID: Int] = [:]
     private var preassignedConnections: Set<UUID> = []
@@ -1034,6 +1057,10 @@ actor ServerNetworkManager {
         let runID: UUID?
         /// Additional tools to expose for this connection (policy-gated tools like ask_user)
         let additionalTools: Set<String>?
+        /// Positive tool ceiling for the routed run. Nil preserves standard behavior.
+        let allowedToolsOverride: Set<String>?
+        /// Stable session profile used for model-visible tool projections.
+        let sessionProfile: AgentSessionProfile
         /// Purpose of this run (for UI routing)
         let purpose: MCPRunPurpose
         /// Task label kind for role-aware tool advertisement filtering
@@ -1055,6 +1082,8 @@ actor ServerNetworkManager {
         let tabID: UUID?
         let restrictedTools: Set<String>
         let additionalTools: Set<String>?
+        let allowedToolsOverride: Set<String>?
+        let sessionProfile: AgentSessionProfile
         let purpose: MCPRunPurpose
         let taskLabelKind: AgentModelCatalog.TaskLabelKind?
         let allowsAgentExternalControlTools: Bool
@@ -1087,6 +1116,8 @@ actor ServerNetworkManager {
     private struct PendingPolicyRestorePoint {
         let restrictedTools: Set<String>?
         let additionalTools: Set<String>?
+        let allowedToolsOverride: Set<String>?
+        let sessionProfile: AgentSessionProfile?
         let runPurpose: MCPRunPurpose?
         let windowID: Int?
         let windowAssignment: Int?
@@ -2455,7 +2486,7 @@ actor ServerNetworkManager {
         saveRoutingState()
     }
 
-    private func effectivePolicyState(for connectionID: UUID) -> (restricted: Set<String>, additional: Set<String>, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool) {
+    private func effectivePolicyState(for connectionID: UUID) -> (restricted: Set<String>, additional: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool) {
         let restricted = restrictedToolsByConnection[connectionID] ?? []
         let additional = additionalToolsByConnection[connectionID] ?? []
         let preassigned = preassignedConnections.contains(connectionID)
@@ -2464,15 +2495,26 @@ actor ServerNetworkManager {
             guard let runID = runIDByConnectionID[connectionID] else { return nil }
             return runPolicyStateByRunID[runID]
         }()
+        let allowedToolsOverride = allowedToolsOverrideByConnection[connectionID] ?? runState?.allowedToolsOverride
+        let sessionProfile = sessionProfileByConnection[connectionID] ?? runState?.sessionProfile ?? .standard
         let taskLabelKind = runState?.taskLabelKind
         let allowsAgentExternalControlTools = runState?.allowsAgentExternalControlTools ?? false
-        return (restricted, additional, preassigned, purpose, taskLabelKind, allowsAgentExternalControlTools)
+        return (
+            restricted,
+            additional,
+            allowedToolsOverride,
+            sessionProfile,
+            preassigned,
+            purpose,
+            taskLabelKind,
+            allowsAgentExternalControlTools
+        )
     }
 
     #if DEBUG
         private func debugPolicyDiagnosticFields(
             connectionID: UUID,
-            policy: (restricted: Set<String>, additional: Set<String>, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool)? = nil,
+            policy: (restricted: Set<String>, additional: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool)? = nil,
             extra: [String: String] = [:]
         ) -> [String: String] {
             let effective = policy ?? effectivePolicyState(for: connectionID)
@@ -2486,6 +2528,8 @@ actor ServerNetworkManager {
             fields["purpose"] = effective.purpose.rawValue
             fields["taskLabel"] = effective.taskLabelKind?.rawValue ?? "nil"
             fields["additionalTools"] = Self.debugDescribeToolSet(effective.additional)
+            fields["allowedToolsOverride"] = effective.allowedToolsOverride.map(Self.debugDescribeToolSet) ?? "nil"
+            fields["sessionProfile"] = effective.sessionProfile.rawValue
             fields["restrictedTools"] = Self.debugDescribeToolSet(effective.restricted)
             fields["preassigned"] = String(effective.preassigned)
             fields["allowsAgentExternalControlTools"] = String(effective.allowsAgentExternalControlTools)
@@ -2498,7 +2542,7 @@ actor ServerNetworkManager {
             return "[" + tools.sorted().joined(separator: ",") + "]"
         }
 
-        private func debugPolicyDiagnostic(_ name: String, connectionID: UUID, policy: (restricted: Set<String>, additional: Set<String>, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool)? = nil, extra: [String: String] = [:]) {
+        private func debugPolicyDiagnostic(_ name: String, connectionID: UUID, policy: (restricted: Set<String>, additional: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, preassigned: Bool, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?, allowsAgentExternalControlTools: Bool)? = nil, extra: [String: String] = [:]) {
             AgentModePerfDiagnostics.event(
                 "mcp.policy.\(name)",
                 fields: debugPolicyDiagnosticFields(connectionID: connectionID, policy: policy, extra: extra)
@@ -2942,6 +2986,8 @@ actor ServerNetworkManager {
         tabID: UUID?,
         restrictedTools: Set<String>,
         additionalTools: Set<String>?,
+        allowedToolsOverride: Set<String>? = nil,
+        sessionProfile: AgentSessionProfile = .standard,
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
@@ -2956,6 +3002,8 @@ actor ServerNetworkManager {
             tabID: tabID,
             restrictedTools: restrictedTools,
             additionalTools: additionalTools,
+            allowedToolsOverride: allowedToolsOverride,
+            sessionProfile: sessionProfile,
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
@@ -2973,6 +3021,8 @@ actor ServerNetworkManager {
             tabID: policy.tabID,
             restrictedTools: policy.restrictedTools,
             additionalTools: policy.additionalTools,
+            allowedToolsOverride: policy.allowedToolsOverride,
+            sessionProfile: policy.sessionProfile,
             purpose: policy.purpose,
             taskLabelKind: policy.taskLabelKind,
             allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools,
@@ -3199,6 +3249,12 @@ actor ServerNetworkManager {
         } else {
             additionalToolsByConnection.removeValue(forKey: connectionID)
         }
+        if let allowedToolsOverride = cached.allowedToolsOverride {
+            allowedToolsOverrideByConnection[connectionID] = allowedToolsOverride
+        } else {
+            allowedToolsOverrideByConnection.removeValue(forKey: connectionID)
+        }
+        sessionProfileByConnection[connectionID] = cached.sessionProfile
         runPurposeByConnection[connectionID] = cached.purpose
         preassignedConnections.insert(connectionID)
         if persistWindowBinding {
@@ -5309,6 +5365,8 @@ actor ServerNetworkManager {
         windowAssignmentByConnection.removeAll()
         restrictedToolsByConnection.removeAll()
         additionalToolsByConnection.removeAll()
+        allowedToolsOverrideByConnection.removeAll()
+        sessionProfileByConnection.removeAll()
         runPurposeByConnection.removeAll()
         windowCountAtConnectionTime.removeAll()
         preassignedConnections.removeAll()
@@ -6059,6 +6117,8 @@ actor ServerNetworkManager {
 
         restrictedToolsByConnection.removeValue(forKey: id)
         additionalToolsByConnection.removeValue(forKey: id)
+        allowedToolsOverrideByConnection.removeValue(forKey: id)
+        sessionProfileByConnection.removeValue(forKey: id)
         runPurposeByConnection.removeValue(forKey: id)
         runIDByConnectionID.removeValue(forKey: id)
         pendingPolicyApplicationIDByConnectionID.removeValue(forKey: id)
@@ -6331,9 +6391,15 @@ actor ServerNetworkManager {
     private nonisolated func advertisedToolDescription(
         for name: String,
         baseDescription: String,
-        purpose: MCPRunPurpose
+        purpose: MCPRunPurpose,
+        sessionProfile: AgentSessionProfile
     ) -> String {
-        baseDescription
+        guard sessionProfile == .knowledge,
+              name == MCPWindowToolName.askOracle
+        else {
+            return baseDescription
+        }
+        return AgentModeMCPToolPolicy.knowledgeAskOracleDescription
     }
 
     /// Checks if a tool's schema declares a `window_id` parameter.
@@ -6705,6 +6771,8 @@ actor ServerNetworkManager {
         tabID: UUID? = nil,
         runID: UUID? = nil,
         additionalTools: Set<String>? = nil,
+        allowedToolsOverride: Set<String>? = nil,
+        sessionProfile: AgentSessionProfile = .standard,
         purpose: MCPRunPurpose = .unknown,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
@@ -6713,6 +6781,9 @@ actor ServerNetworkManager {
         let storageKey = Self.clientStorageKey(clientName)
         pruneExpiredPolicies(for: clientName)
         let sanitizedRestricted = Self.sanitizedRoutingRestrictedTools(restrictedTools)
+        let sanitizedAllowedToolsOverride = sessionProfile == .knowledge
+            ? AgentModeMCPToolPolicy.knowledgeAllowedTools
+            : allowedToolsOverride.map { Set($0.map(Self.canonicalToolName)) }
         let policy = ClientConnectionPolicy(
             id: UUID(),
             windowID: windowID,
@@ -6724,6 +6795,8 @@ actor ServerNetworkManager {
             tabID: tabID,
             runID: runID,
             additionalTools: additionalTools,
+            allowedToolsOverride: sanitizedAllowedToolsOverride,
+            sessionProfile: sessionProfile,
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
@@ -6733,7 +6806,7 @@ actor ServerNetworkManager {
         let grantDescription = Self.describeGrantedTools(restricted: sanitizedRestricted)
         let restrictedDescription = Self.describeToolList(sanitizedRestricted)
         connectionLog(
-            "Installing connection policy for client \(clientName) window=\(windowID) grants=\(grantDescription) restricted=\(restrictedDescription) oneShot=\(oneShot) ttl=\(ttl) reason=\(reason ?? "-") role=\(taskLabelKind?.rawValue ?? "-")"
+            "Installing connection policy for client \(clientName) window=\(windowID) grants=\(grantDescription) restricted=\(restrictedDescription) allowed=\(sanitizedAllowedToolsOverride.map(Self.describeToolList) ?? "-") profile=\(sessionProfile.rawValue) oneShot=\(oneShot) ttl=\(ttl) reason=\(reason ?? "-") role=\(taskLabelKind?.rawValue ?? "-")"
         )
         if let runID {
             seedRunPolicyState(
@@ -6743,6 +6816,8 @@ actor ServerNetworkManager {
                 tabID: tabID,
                 restrictedTools: sanitizedRestricted,
                 additionalTools: additionalTools,
+                allowedToolsOverride: sanitizedAllowedToolsOverride,
+                sessionProfile: sessionProfile,
                 purpose: purpose,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
@@ -6970,7 +7045,7 @@ actor ServerNetworkManager {
             pidGateTimeout: TimeInterval = 0.25,
             requireRunRouting: Bool = true,
             expectedLifecycleGeneration: UInt64? = nil
-        ) async -> (restrictedTools: Set<String>, additionalTools: Set<String>, purpose: MCPRunPurpose, windowID: Int?, outcome: String, runID: UUID?) {
+        ) async -> (restrictedTools: Set<String>, additionalTools: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, purpose: MCPRunPurpose, windowID: Int?, outcome: String, runID: UUID?) {
             pendingConnections[connectionID] = clientName
             if let sessionKey {
                 capabilityTokenByConnection[connectionID] = sessionKey
@@ -7001,6 +7076,8 @@ actor ServerNetworkManager {
             return (
                 restrictedTools: state.restrictedTools,
                 additionalTools: state.additionalTools,
+                allowedToolsOverride: state.allowedToolsOverride,
+                sessionProfile: state.sessionProfile,
                 purpose: state.purpose,
                 windowID: state.windowID,
                 outcome: outcomeDescription,
@@ -7060,13 +7137,15 @@ actor ServerNetworkManager {
             }
         }
 
-        func debugRunPolicyState(for runID: UUID) -> (windowID: Int, workspaceID: UUID?, restrictedTools: Set<String>, additionalTools: Set<String>?, purpose: MCPRunPurpose)? {
+        func debugRunPolicyState(for runID: UUID) -> (windowID: Int, workspaceID: UUID?, restrictedTools: Set<String>, additionalTools: Set<String>?, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, purpose: MCPRunPurpose)? {
             guard let cached = runPolicyStateByRunID[runID] else { return nil }
             return (
                 windowID: cached.windowID,
                 workspaceID: cached.workspaceID,
                 restrictedTools: cached.restrictedTools,
                 additionalTools: cached.additionalTools,
+                allowedToolsOverride: cached.allowedToolsOverride,
+                sessionProfile: cached.sessionProfile,
                 purpose: cached.purpose
             )
         }
@@ -7078,6 +7157,8 @@ actor ServerNetworkManager {
             tabID: UUID? = nil,
             restrictedTools: Set<String>,
             additionalTools: Set<String>?,
+            allowedToolsOverride: Set<String>? = nil,
+            sessionProfile: AgentSessionProfile = .standard,
             purpose: MCPRunPurpose,
             updatedAt: Date = Date()
         ) {
@@ -7088,15 +7169,19 @@ actor ServerNetworkManager {
                 tabID: tabID,
                 restrictedTools: restrictedTools,
                 additionalTools: additionalTools,
+                allowedToolsOverride: allowedToolsOverride,
+                sessionProfile: sessionProfile,
                 purpose: purpose,
                 updatedAt: updatedAt
             )
         }
 
-        func debugConnectionPolicyState(for connectionID: UUID) -> (restrictedTools: Set<String>, additionalTools: Set<String>, purpose: MCPRunPurpose, windowID: Int?) {
+        func debugConnectionPolicyState(for connectionID: UUID) -> (restrictedTools: Set<String>, additionalTools: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, purpose: MCPRunPurpose, windowID: Int?) {
             (
                 restrictedTools: restrictedToolsByConnection[connectionID] ?? [],
                 additionalTools: additionalToolsByConnection[connectionID] ?? [],
+                allowedToolsOverride: allowedToolsOverrideByConnection[connectionID],
+                sessionProfile: sessionProfileByConnection[connectionID] ?? .standard,
                 purpose: runPurposeByConnection[connectionID] ?? .unknown,
                 windowID: connectionWindowMap[connectionID]
             )
@@ -7157,13 +7242,39 @@ actor ServerNetworkManager {
             )
         }
 
-        func debugEffectivePolicyState(for connectionID: UUID) -> (restrictedTools: Set<String>, additionalTools: Set<String>, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?) {
+        func debugEffectivePolicyState(for connectionID: UUID) -> (restrictedTools: Set<String>, additionalTools: Set<String>, allowedToolsOverride: Set<String>?, sessionProfile: AgentSessionProfile, purpose: MCPRunPurpose, taskLabelKind: AgentModelCatalog.TaskLabelKind?) {
             let policy = effectivePolicyState(for: connectionID)
             return (
                 restrictedTools: policy.restricted,
                 additionalTools: policy.additional,
+                allowedToolsOverride: policy.allowedToolsOverride,
+                sessionProfile: policy.sessionProfile,
                 purpose: policy.purpose,
                 taskLabelKind: policy.taskLabelKind
+            )
+        }
+
+        func debugApplyRunPolicyState(
+            runID: UUID,
+            connectionID: UUID
+        ) async {
+            await applyRunPolicyStateIfAvailable(
+                runID: runID,
+                connectionID: connectionID
+            )
+        }
+
+        func debugAdvertisedToolDescription(
+            for name: String,
+            baseDescription: String,
+            purpose: MCPRunPurpose,
+            sessionProfile: AgentSessionProfile
+        ) -> String {
+            advertisedToolDescription(
+                for: name,
+                baseDescription: baseDescription,
+                purpose: purpose,
+                sessionProfile: sessionProfile
             )
         }
 
@@ -8978,6 +9089,13 @@ actor ServerNetworkManager {
                             allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
                         ) { continue }
 
+                        if !Self.isAllowedByPositiveToolCeiling(
+                            canonicalToolName: tool.name,
+                            allowedToolsOverride: policy.allowedToolsOverride
+                        ) {
+                            continue
+                        }
+
                         guard seenNames.insert(tool.name).inserted else { continue }
                         names.append(tool.name)
                     }
@@ -9615,6 +9733,8 @@ actor ServerNetworkManager {
         let restorePoint = PendingPolicyRestorePoint(
             restrictedTools: restrictedToolsByConnection[connectionID],
             additionalTools: additionalToolsByConnection[connectionID],
+            allowedToolsOverride: allowedToolsOverrideByConnection[connectionID],
+            sessionProfile: sessionProfileByConnection[connectionID],
             runPurpose: runPurposeByConnection[connectionID],
             windowID: connectionWindowMap[connectionID],
             windowAssignment: windowAssignmentByConnection[connectionID],
@@ -9634,6 +9754,12 @@ actor ServerNetworkManager {
         // signals MCPRoutingWaiter, so restrictions and run identity must already be
         // visible before the bootstrap gate can be released.
         restrictedToolsByConnection[connectionID] = policy.restrictedTools
+        if let allowedToolsOverride = policy.allowedToolsOverride {
+            allowedToolsOverrideByConnection[connectionID] = allowedToolsOverride
+        } else {
+            allowedToolsOverrideByConnection.removeValue(forKey: connectionID)
+        }
+        sessionProfileByConnection[connectionID] = policy.sessionProfile
         preassignedConnections.insert(connectionID)
         runPurposeByConnection[connectionID] = policy.purpose
         cacheRunPolicyStateIfNeeded(policy)
@@ -9990,6 +10116,16 @@ actor ServerNetworkManager {
             } else {
                 additionalToolsByConnection.removeValue(forKey: connectionID)
             }
+            if let allowedToolsOverride = restorePoint.allowedToolsOverride {
+                allowedToolsOverrideByConnection[connectionID] = allowedToolsOverride
+            } else {
+                allowedToolsOverrideByConnection.removeValue(forKey: connectionID)
+            }
+            if let sessionProfile = restorePoint.sessionProfile {
+                sessionProfileByConnection[connectionID] = sessionProfile
+            } else {
+                sessionProfileByConnection.removeValue(forKey: connectionID)
+            }
             if let runPurpose = restorePoint.runPurpose {
                 runPurposeByConnection[connectionID] = runPurpose
             } else {
@@ -10087,6 +10223,8 @@ actor ServerNetworkManager {
                 tabID: resolved.snapshot.id,
                 restrictedTools: cached.restrictedTools,
                 additionalTools: cached.additionalTools,
+                allowedToolsOverride: cached.allowedToolsOverride,
+                sessionProfile: cached.sessionProfile,
                 purpose: cached.purpose,
                 taskLabelKind: cached.taskLabelKind,
                 allowsAgentExternalControlTools: cached.allowsAgentExternalControlTools,
@@ -10145,6 +10283,8 @@ actor ServerNetworkManager {
                     tabID: cached.tabID,
                     restrictedTools: cached.restrictedTools,
                     additionalTools: cached.additionalTools,
+                    allowedToolsOverride: cached.allowedToolsOverride,
+                    sessionProfile: cached.sessionProfile,
                     purpose: cached.purpose,
                     taskLabelKind: cached.taskLabelKind,
                     allowsAgentExternalControlTools: cached.allowsAgentExternalControlTools,
@@ -10340,6 +10480,16 @@ actor ServerNetworkManager {
                             continue
                         }
 
+                        if !Self.isAllowedByPositiveToolCeiling(
+                            canonicalToolName: tool.name,
+                            allowedToolsOverride: policy.allowedToolsOverride
+                        ) {
+                            #if DEBUG
+                                recordHiddenTool(tool.name, reason: "profile_allowlist")
+                            #endif
+                            continue
+                        }
+
                         // • skip duplicates coming from other windows
                         guard seenNames.insert(tool.name).inserted else { continue }
 
@@ -10352,7 +10502,8 @@ actor ServerNetworkManager {
                         let description = advertisedToolDescription(
                             for: tool.name,
                             baseDescription: tool.description,
-                            purpose: policy.purpose
+                            purpose: policy.purpose,
+                            sessionProfile: policy.sessionProfile
                         )
 
                         tools.append(
@@ -10395,6 +10546,32 @@ actor ServerNetworkManager {
             let originalName = params.name
             let toolName = Self.canonicalToolName(for: originalName)
             connectionLog("tools/call received original=\(originalName) canonical=\(toolName) connection=\(connectionID)")
+
+            // Match tools/list: a resumed agent session can restore its run-scoped
+            // Knowledge ceiling before its first request, even when that request is
+            // tools/call rather than tools/list.
+            _ = await hydratePersistedAgentModePolicyForConnectionIfNeeded(
+                connectionID: connectionID,
+                reason: "tools/call"
+            )
+            let earlyPolicy = await effectivePolicyState(for: connectionID)
+            if let denialMessage = Self.positiveToolCeilingDenialMessage(
+                forCanonicalToolName: toolName,
+                allowedToolsOverride: earlyPolicy.allowedToolsOverride
+            ) {
+                return CallTool.Result.err(denialMessage)
+            }
+            if earlyPolicy.allowedToolsOverride != nil {
+                let disabledTools = await MainActor.run {
+                    ToolAvailabilityStore.shared.effectiveDisabledTools
+                }
+                guard !disabledTools.contains(toolName) else {
+                    return CallTool.Result.err(
+                        "Tool '\(toolName)' is disabled in global MCP settings."
+                    )
+                }
+            }
+
             #if DEBUG
                 await debugPolicyDiagnostic("toolsCallReceived", connectionID: connectionID, extra: [
                     "toolName": toolName,

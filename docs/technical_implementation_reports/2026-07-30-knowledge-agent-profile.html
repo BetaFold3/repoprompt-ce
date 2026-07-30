@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Knowledge Agent Profile — Technical Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --surface: #ffffff;
+      --surface-2: #eef3f9;
+      --ink: #182230;
+      --muted: #5e6d7e;
+      --line: #d8e1ec;
+      --accent: #3158c9;
+      --accent-2: #6b47c8;
+      --good: #117a55;
+      --warn: #9a5b00;
+      --bad: #a33b3b;
+      --code-bg: #182230;
+      --code-ink: #edf4ff;
+      --shadow: 0 14px 38px rgba(32, 54, 86, .09);
+      --radius: 18px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10151d;
+        --surface: #171e28;
+        --surface-2: #202a36;
+        --ink: #edf3fa;
+        --muted: #aebacc;
+        --line: #334052;
+        --accent: #87a4ff;
+        --accent-2: #b39aff;
+        --good: #5fd2a4;
+        --warn: #f0b96a;
+        --bad: #ff9a9a;
+        --code-bg: #0b0f15;
+        --code-ink: #eef5ff;
+        --shadow: 0 14px 38px rgba(0, 0, 0, .28);
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code {
+      padding: .12rem .34rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-2);
+      font-size: .9em;
+    }
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+    header {
+      position: relative;
+      overflow: hidden;
+      padding: 64px 0 48px;
+      color: #fff;
+      background: linear-gradient(128deg, #1d3b88 0%, #3158c9 48%, #6746bd 100%);
+    }
+    header::after {
+      content: "";
+      position: absolute;
+      width: 420px;
+      height: 420px;
+      right: -120px;
+      top: -230px;
+      border-radius: 50%;
+      background: rgba(255,255,255,.12);
+    }
+    .eyebrow { margin: 0 0 10px; font-size: .78rem; font-weight: 750; letter-spacing: .13em; text-transform: uppercase; opacity: .86; }
+    h1 { max-width: 880px; margin: 0; font-size: clamp(2.15rem, 5vw, 4.2rem); line-height: 1.04; letter-spacing: -.045em; }
+    .lede { max-width: 820px; margin: 22px 0 0; font-size: clamp(1.02rem, 2.2vw, 1.28rem); opacity: .94; }
+    .meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+    .meta span { padding: 7px 11px; border: 1px solid rgba(255,255,255,.35); border-radius: 999px; background: rgba(255,255,255,.1); font-size: .84rem; }
+    .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 28px; padding: 34px 0 72px; align-items: start; }
+    nav {
+      position: sticky;
+      top: 18px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    nav strong { display: block; margin-bottom: 9px; font-size: .82rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+    nav a { display: block; padding: 7px 8px; border-radius: 8px; color: var(--ink); text-decoration: none; font-size: .91rem; }
+    nav a:hover { background: var(--surface-2); color: var(--accent); }
+    main { min-width: 0; }
+    section {
+      margin-bottom: 24px;
+      padding: clamp(22px, 4vw, 38px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      scroll-margin-top: 20px;
+    }
+    h2 { margin: 0 0 18px; font-size: clamp(1.45rem, 3vw, 2.05rem); letter-spacing: -.025em; }
+    h3 { margin: 26px 0 10px; font-size: 1.12rem; }
+    p { margin: 10px 0; }
+    ul, ol { padding-left: 1.3rem; }
+    li + li { margin-top: .42rem; }
+    .summary-grid, .cards, .steps, .decision-grid { display: grid; gap: 14px; }
+    .summary-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .decision-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .stat, .card, .step {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-2);
+    }
+    .stat { padding: 16px; }
+    .stat b { display: block; font-size: 1.65rem; line-height: 1.1; color: var(--accent); }
+    .stat span { display: block; margin-top: 6px; color: var(--muted); font-size: .85rem; }
+    .card { padding: 18px; }
+    .card h3 { margin-top: 0; }
+    .card.good { border-left: 5px solid var(--good); }
+    .card.warn { border-left: 5px solid var(--warn); }
+    .card.bad { border-left: 5px solid var(--bad); }
+    .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 999px; font-size: .72rem; font-weight: 750; letter-spacing: .03em; text-transform: uppercase; }
+    .observed { color: var(--good); background: color-mix(in srgb, var(--good) 13%, transparent); }
+    .session { color: var(--accent-2); background: color-mix(in srgb, var(--accent-2) 13%, transparent); }
+    .tests { color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, transparent); }
+    .inferred { color: var(--warn); background: color-mix(in srgb, var(--warn) 13%, transparent); }
+    .callout { margin: 18px 0; padding: 16px 18px; border-left: 5px solid var(--accent); border-radius: 10px; background: color-mix(in srgb, var(--accent) 8%, var(--surface)); }
+    .callout strong { color: var(--accent); }
+    .flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 10px; align-items: stretch; margin: 20px 0; }
+    .flow-box { display: grid; place-items: center; min-height: 104px; padding: 15px; text-align: center; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-2); }
+    .arrow { align-self: center; color: var(--accent); font-size: 1.5rem; font-weight: 800; }
+    .table-wrap { overflow-x: auto; margin: 18px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: .91rem; }
+    th, td { padding: 11px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-2); font-size: .78rem; text-transform: uppercase; letter-spacing: .055em; }
+    td code { white-space: nowrap; }
+    .steps { counter-reset: step; }
+    .step { position: relative; padding: 18px 18px 18px 62px; background: var(--surface); }
+    .step::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute;
+      left: 17px;
+      top: 17px;
+      width: 30px;
+      height: 30px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--accent);
+      font-weight: 800;
+    }
+    .step h3 { margin: 0 0 5px; }
+    pre { overflow-x: auto; padding: 16px; border-radius: 12px; color: var(--code-ink); background: var(--code-bg); line-height: 1.52; font-size: .86rem; }
+    details { margin: 12px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); }
+    summary { cursor: pointer; padding: 13px 15px; font-weight: 700; }
+    details > div { padding: 0 15px 15px; }
+    .checklist { list-style: none; padding: 0; }
+    .checklist li { position: relative; padding-left: 30px; }
+    .checklist li::before { content: "□"; position: absolute; left: 3px; top: -2px; color: var(--accent); font-size: 1.25rem; }
+    .small { color: var(--muted); font-size: .88rem; }
+    footer { padding: 0 0 54px; color: var(--muted); text-align: center; font-size: .85rem; }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { position: static; }
+      nav .links { columns: 2; }
+      .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); justify-self: center; }
+    }
+    @media (max-width: 620px) {
+      .shell { width: min(100% - 20px, 1180px); }
+      header { padding: 45px 0 38px; }
+      .layout { padding-top: 20px; }
+      section { padding: 20px; }
+      nav .links { columns: 1; }
+      .summary-grid, .cards, .decision-grid { grid-template-columns: 1fr; }
+    }
+    @media print {
+      :root { --bg: #fff; --surface: #fff; --surface-2: #f5f7fa; --ink: #111; --muted: #444; --line: #bbb; }
+      header { color: #111; background: #fff; border-bottom: 2px solid #111; padding: 24px 0; }
+      header::after, nav { display: none; }
+      .layout { display: block; padding: 18px 0; }
+      section { break-inside: avoid; box-shadow: none; }
+      a { color: #111; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="shell">
+      <p class="eyebrow">RepoPrompt CE · Technical Implementation Report</p>
+      <h1>Knowledge Agent Profile</h1>
+      <p class="lede">A fresh, focused Agent Mode session for research, document reasoning, optional dual-Oracle consultation, web evidence, media reading, and durable workspace notes—without turning everyday coding sessions into a knowledge-work interface.</p>
+      <div class="meta">
+        <span>Report date: 30 July 2026</span>
+        <span>Branch: feat/duo-duel-oracles</span>
+        <span>Baseline: e6b6802d</span>
+        <span>Implementation status: uncommitted</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="shell layout">
+    <nav aria-label="Report sections">
+      <strong>Contents</strong>
+      <div class="links">
+        <a href="#executive-summary">1. Executive summary</a>
+        <a href="#expect">2. What to expect</a>
+        <a href="#experience">3. Product experience</a>
+        <a href="#architecture">4. How it works</a>
+        <a href="#decisions">5. Major decisions</a>
+        <a href="#implementation">6. Implementation inventory</a>
+        <a href="#validation">7. Validation</a>
+        <a href="#test-guide">8. Test it step by step</a>
+        <a href="#risks">9. Risks and limitations</a>
+        <a href="#actions">10. Your action items</a>
+        <a href="#evidence">11. Evidence and metrics</a>
+      </div>
+    </nav>
+
+    <main>
+      <section id="executive-summary">
+        <span class="badge observed">Observed in code</span>
+        <h2>Executive summary</h2>
+        <p>RepoPrompt CE now has a second, deliberately fresh Agent Mode profile named <strong>Knowledge</strong>. It is designed for questions such as “help me understand these documents,” “compare two expert opinions,” “research the latest evidence,” or “turn this investigation into a durable note.”</p>
+        <p>The ordinary New Session action remains the coding-oriented Agent Mode experience. Knowledge mode is available through a small secondary menu, so it is discoverable when needed without adding coding workflows, research presets, or debate controls to every new session.</p>
+        <div class="summary-grid" aria-label="Implementation metrics">
+          <div class="stat"><b>7</b><span>RepoPrompt tools in the Knowledge ceiling</span></div>
+          <div class="stat"><b>2</b><span>V1 providers: Claude Code and Codex</span></div>
+          <div class="stat"><b>41</b><span>Implementation files changed before this report</span></div>
+          <div class="stat"><b>2</b><span>Independent post-implementation Oracle approvals</span></div>
+        </div>
+        <div class="callout"><strong>Most important invariant:</strong> Knowledge is chosen when a fresh session is created and remains fixed for that session. The implementation does not rewrite the parent Agent’s system prompt halfway through an existing conversation.</div>
+      </section>
+
+      <section id="expect">
+        <span class="badge session">Observed in session</span>
+        <h2>What can we expect from this change?</h2>
+        <div class="cards">
+          <article class="card good">
+            <h3>A quieter research agent</h3>
+            <p>The agent sees workspace reading, search, note editing, Oracle consultation, and recovery tools—not the broad coding, shell, Git, delegation, settings, and worktree surface.</p>
+          </article>
+          <article class="card good">
+            <h3>Current information when useful</h3>
+            <p>Provider-native web search remains available when the selected provider supports it and the existing user preference enables it. The prompt asks for primary sources, dates, links, and explicit uncertainty.</p>
+          </article>
+          <article class="card good">
+            <h3>Images and PDFs remain useful</h3>
+            <p>Claude keeps native <code>Read</code> for images, screenshots, PDFs, and other non-text media. Codex keeps <code>view_image</code> for images and screenshots; the UI and prompt do not overstate Codex PDF support.</p>
+          </article>
+          <article class="card good">
+            <h3>Dual opinions without a debate machine</h3>
+            <p>The agent may consult OracleA and OracleB independently and concurrently, synthesize directly by default, and use one or rarely two anonymized critique rounds only when disagreement warrants it.</p>
+          </article>
+          <article class="card">
+            <h3>Durable output follows the workspace</h3>
+            <p>When useful, the agent writes a note with <code>apply_edits</code> into the active workspace. A project workspace yields a project-local note; an iCloud or Obsidian-rooted workspace yields a note there.</p>
+          </article>
+          <article class="card">
+            <h3>Normal coding work should not move</h3>
+            <p>The primary button, global standard-session shortcut, ordinary system prompt, broad coding tool policy, and standard provider behavior remain on the existing path.</p>
+          </article>
+        </div>
+        <p class="small"><strong>Inferred product benefit:</strong> a smaller, purpose-specific surface should reduce irrelevant tool choice and keep the model’s attention on evidence and synthesis. This report does not claim a measured quality or token improvement; behavioral evaluation still requires real usage.</p>
+      </section>
+
+      <section id="experience">
+        <span class="badge observed">Observed in code</span>
+        <h2>The user experience</h2>
+        <div class="flow" aria-label="Knowledge session flow">
+          <div class="flow-box"><strong>Click the chevron</strong><br><span class="small">Primary New Session stays standard</span></div>
+          <div class="arrow">→</div>
+          <div class="flow-box"><strong>New Knowledge Session</strong><br><span class="small">Fresh immutable profile</span></div>
+          <div class="arrow">→</div>
+          <div class="flow-box"><strong>Research and write</strong><br><span class="small">Local text, media, web, Oracles, notes</span></div>
+        </div>
+        <h3>Visible differences</h3>
+        <ul>
+          <li>A brain-labelled <strong>New Knowledge Session</strong> action appears in the titlebar chevron menu.</li>
+          <li>A small immutable <strong>Knowledge</strong> pill identifies the session.</li>
+          <li>The empty state asks <strong>“What are we exploring?”</strong></li>
+          <li>Coding workflows and coding-oriented empty-state tips are hidden.</li>
+          <li>Only supported providers are selectable in V1: Claude Code and Codex.</li>
+          <li>Provider-specific media guidance is truthful: Claude can read PDFs; Codex is presented as image-capable, not PDF-capable.</li>
+        </ul>
+        <h3>Fresh-session behavior</h3>
+        <p>An untouched placeholder may be discarded and replaced through normal fresh-session construction. Once provider work, transcript activity, or MCP work exists, the profile cannot change. A standard shortcut invoked while viewing an untouched Knowledge placeholder still creates a standard session rather than inheriting Knowledge accidentally.</p>
+      </section>
+
+      <section id="architecture">
+        <span class="badge observed">Observed in code</span>
+        <h2>How it works</h2>
+        <h3>1. Persisted session identity</h3>
+        <p><code>AgentSessionProfile</code> has two values: <code>standard</code> and <code>knowledge</code>. The profile is threaded through full persistence, lightweight restore headers, sidebar metadata, run leases, headless leases, provider-controller identity, handoff behavior, and MCP connection policy.</p>
+        <p>Session serialization is now version 7 and the metadata index schema is version 6. Older sessions with no profile decode as standard. Explicit <code>null</code> and unknown present values fail closed so corrupted or future data cannot silently become a different profile.</p>
+
+        <h3>2. Exact RepoPrompt tool ceiling</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Tool</th><th>Knowledge purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code>get_file_tree</code></td><td>Orient within the active document or repository workspace.</td></tr>
+              <tr><td><code>file_search</code></td><td>Find paths and text across workspace roots.</td></tr>
+              <tr><td><code>read_file</code></td><td>Read source, Markdown, configuration, logs, and other text with RepoPrompt context tracking.</td></tr>
+              <tr><td><code>apply_edits</code></td><td>Create or update durable notes and other user-requested text artifacts.</td></tr>
+              <tr><td><code>oracle_utils</code></td><td>Resolve named Oracle presets exactly.</td></tr>
+              <tr><td><code>ask_oracle</code></td><td>Start or continue independent expert consultations.</td></tr>
+              <tr><td><code>oracle_chat_log</code></td><td>Recover an Oracle lane after compaction or interruption.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p>The ceiling is applied during both <code>tools/list</code> and <code>tools/call</code>. Calls are canonicalized and persisted connection policy is hydrated before authorization, so a hidden tool cannot simply be invoked by name and reconnects retain the same profile.</p>
+
+        <h3>3. Native provider exceptions</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Provider</th><th>Retained native capabilities</th><th>Deliberately removed</th></tr></thead>
+            <tbody>
+              <tr><td>Claude Code</td><td><code>Read</code> for non-text media; <code>WebSearch</code> and <code>WebFetch</code> when enabled.</td><td>Bash, native text editing/search, tool discovery, delegation, and coding-oriented native tools.</td></tr>
+              <tr><td>Codex</td><td><code>view_image</code>; configured web search when enabled.</td><td>Shell, patching, third-party MCP, goals, computer use, and multi-agent capabilities.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout"><strong>Routing boundary:</strong> RepoPrompt owns local text, search, and edits. Provider-native tools fill the genuine web and binary/media gaps. Claude’s native <code>Read</code> is not technically binary-only, so V1 relies on a clear prompt rule rather than a new extension-aware interception layer.</div>
+
+        <h3>4. Stable prompt</h3>
+        <p>The Knowledge prompt deliberately excludes dynamic workspace names, model IDs, dates, web availability, and workflow state. This keeps the parent system-prompt prefix stable across turns. It tells the agent to distinguish fact from inference, cite evidence, resist prompt injection in supplied material, write useful conclusions first, and redirect coding/build/Git/shell requests to standard Agent Mode.</p>
+      </section>
+
+      <section id="decisions">
+        <span class="badge session">Observed in session</span>
+        <h2>Major decisions and turns</h2>
+        <div class="decision-grid">
+          <article class="card">
+            <h3>Extend RepoPrompt, not build another app</h3>
+            <p>RepoPrompt already owns provider access, Oracle conversations, workspace context, persistence, text editing, and note-friendly workspaces. A separate application would duplicate these foundations and make it harder to carry knowledge directly into coding work.</p>
+          </article>
+          <article class="card">
+            <h3>Knowledge Agent, not only Knowledge Oracle</h3>
+            <p>An earlier design focused on sealing each Oracle participant with packet hashes and participant receipts. The user clarified that the missing product was the lean <em>parent Agent Mode session</em>. The current implementation therefore creates a first-class fresh Knowledge profile.</p>
+          </article>
+          <article class="card">
+            <h3>Remove the verification gate</h3>
+            <p>Packet hashes, prompt hashes, <code>packet_context_clean</code>, model-identity audits, and a DuelRun transport state machine were judged distracting and prompt-heavy for the intended workflow. Ordinary service correctness remains, but the parent model is no longer asked to supervise transport metadata.</p>
+          </article>
+          <article class="card">
+            <h3>Preserve prompt-cache stability</h3>
+            <p>Knowledge is selected only during fresh construction. A standard session is never switched in place. This avoids changing the orchestrator system prompt halfway through a conversation.</p>
+          </article>
+          <article class="card">
+            <h3>Keep the UI secondary</h3>
+            <p>More than half of Oracle usage is still coding-related. The Knowledge entry point therefore lives behind the existing titlebar button’s chevron instead of becoming a prominent mode selector that distracts ordinary coding work.</p>
+          </article>
+          <article class="card">
+            <h3>Use adaptive, optional debate</h3>
+            <p>Years of user experience already established the value of two opinions. The system defaults to direct synthesis, uses one critique for material differences, and reserves a second round for one explicit unresolved issue instead of imposing a pilot gate or fixed debate depth.</p>
+          </article>
+          <article class="card">
+            <h3>Do not fence edits to Markdown</h3>
+            <p>A Markdown-only runtime restriction was rejected because useful knowledge work may target <code>.txt</code>, <code>.org</code>, or existing project documents. Existing workspace/edit validation and prompt guidance remain authoritative.</p>
+          </article>
+          <article class="card">
+            <h3>Restore native media support</h3>
+            <p>The first rewritten plan removed native image/PDF browsing. The user explicitly corrected that decision. V1 now retains Claude media/PDF reading and Codex image viewing while preserving RepoPrompt ownership of text.</p>
+          </article>
+        </div>
+        <details>
+          <summary>What happened to the earlier implementation?</summary>
+          <div><p>It was not restored or mixed into the current tree. It remains safely preserved as <code>stash@{0}: wip: knowledge harness implementation before plan rethink</code>. The current 41-file implementation was built from the revised profile-oriented plan.</p></div>
+        </details>
+      </section>
+
+      <section id="implementation">
+        <span class="badge observed">Observed in code</span>
+        <h2>Implementation inventory</h2>
+        <p>The inventory groups related files so every observable implementation change is represented without turning the report into a 41-row file dump.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Git state</th><th>Area and files</th><th>What changed</th></tr></thead>
+            <tbody>
+              <tr><td>Untracked source</td><td><code>Runtime/AgentSessionProfile.swift</code></td><td>Defines profile identity, exact V1 providers, and the seven-tool ceiling.</td></tr>
+              <tr><td>Modified source</td><td><code>AgentSession.swift</code>, <code>AgentSessionDataService.swift</code>, metadata index and restore models/support</td><td>Persists and restores profile identity through full and lightweight paths; adds strict missing/null/unknown behavior and a one-pass header decoder.</td></tr>
+              <tr><td>Modified source</td><td>Run service, run lease, headless lease, MCP policy installer, bootstrap lease</td><td>Carries the immutable profile and exact ceiling from fresh session creation into provider and MCP runtime state.</td></tr>
+              <tr><td>Modified source</td><td>Claude and Codex coordinators; Claude integration configuration</td><td>Projects profile-specific native capabilities and blocks unsupported Knowledge providers.</td></tr>
+              <tr><td>Modified source</td><td><code>AgentModeMCPToolPolicy.swift</code>, <code>MCPConnectionManager.swift</code></td><td>Enforces the exact ceiling during listing and execution, including persisted reconnect policy, and projects concise Knowledge-specific Oracle guidance.</td></tr>
+              <tr><td>Modified source</td><td><code>AgentModePrompts.swift</code>, <code>SystemPromptService.swift</code></td><td>Adds the stable evidence-oriented parent prompt and provider-truthful media routing.</td></tr>
+              <tr><td>Modified source</td><td><code>AgentModeViewModel.swift</code> and related composer, pills, tab-session, and UI-store extensions</td><td>Owns profile-aware creation, provider filtering/repair, immutability, handoff, placeholder replacement, availability, and UI state.</td></tr>
+              <tr><td>Modified source</td><td><code>WindowState.swift</code>, navigation/view/status/titlebar components, stress harness</td><td>Adds the split fresh-session entry point, Knowledge identity/empty state, hides coding affordances, and preserves standard shortcuts.</td></tr>
+              <tr><td>Untracked tests</td><td>Provider policy, profile persistence, MCP ceiling, and Knowledge prompt test files</td><td>Adds 22 focused contracts covering the profile’s core policy and persistence boundaries.</td></tr>
+              <tr><td>Modified tests</td><td>Run-service lifecycle, Claude lifecycle, worktree persistence, titlebar safety, persistent MCP concurrency, Oracle/worktree integration</td><td>Extends existing integration seams and protects standard-session behavior.</td></tr>
+              <tr><td>Modified fixture</td><td><code>Scripts/Fixtures/test-suite-contract-ledger.tsv</code></td><td>Adds 25 surgical ledger entries/updates for the affected executable tests.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="validation">
+        <span class="badge tests">Observed in tests</span>
+        <h2>Validation and review evidence</h2>
+        <div class="cards">
+          <article class="card good"><h3>OracleA</h3><p>Independent final review: approved, with no P0 or P1 findings after fixes.</p></article>
+          <article class="card good"><h3>OracleB</h3><p>Independent final review: approved, with no P0 or P1 findings after fixes.</p></article>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Check</th><th>Result</th><th>Evidence</th></tr></thead>
+            <tbody>
+              <tr><td>Knowledge-filtered tests</td><td><strong>Pass</strong> — 19/19</td><td>Conductor ticket <code>f528982f…</code></td></tr>
+              <tr><td>Agent Mode run-service lifecycle</td><td><strong>Pass</strong> — 34/34</td><td>Ticket <code>b744a1be…</code></td></tr>
+              <tr><td>Profile persistence</td><td><strong>Pass</strong> — 7/7</td><td>Ticket <code>cb64d829…</code></td></tr>
+              <tr><td>Knowledge MCP policy</td><td><strong>Pass</strong> — 4/4</td><td>Ticket <code>562f16ae…</code></td></tr>
+              <tr><td>Titlebar safety</td><td><strong>Pass</strong> — 6/6</td><td>Ticket <code>af885ca0…</code></td></tr>
+              <tr><td>Real Knowledge MCP boundary</td><td><strong>Pass</strong> — 1 integration test</td><td>Real connection lists exactly seven tools, denies <code>manage_selection</code>, accretes <code>read_file</code>, and packages the result for Oracle; ticket <code>008a3975…</code>.</td></tr>
+              <tr><td><code>RepoPrompt</code> build</td><td><strong>Pass</strong></td><td>Ticket <code>00b4eab7…</code></td></tr>
+              <tr><td><code>repoprompt-mcp</code> build</td><td><strong>Pass</strong></td><td>Ticket <code>6f8e0ef5…</code></td></tr>
+              <tr><td>SwiftFormat and strict SwiftLint</td><td><strong>Pass</strong></td><td>Tickets <code>95425118…</code> and <code>22059c0f…</code></td></tr>
+              <tr><td>Guardrails and diff whitespace</td><td><strong>Pass</strong></td><td><code>make guardrails</code> and <code>git diff --check</code></td></tr>
+              <tr><td>Authoritative test list</td><td><strong>Pass</strong></td><td>Ticket <code>3c4ed60a…</code>; new IDs present.</td></tr>
+              <tr><td>Full root suite</td><td><strong>Red outside this feature</strong></td><td>3,297 tests, 10 skipped, 10 failures in unmodified Git/VCS suites; ticket <code>65e2e8a3…</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout"><strong>Full-suite interpretation:</strong> two failures were the already-known <code>GitBlobIdentityServiceTests</code> baseline. Eight <code>GitLoadedRootAuthorityEvidenceTests</code> failed with Git error code 128 after roughly 60 seconds each. No Git/VCS source or test file is part of this implementation diff. These failures were recorded, not “fixed” by weakening or skipping tests.</div>
+        <h3>Important review-driven fixes</h3>
+        <ul>
+          <li>Direct <code>tools/call</code> now hydrates and enforces the persisted ceiling instead of relying on a previous <code>tools/list</code>.</li>
+          <li>Explicit-null profile values fail in full sessions, metadata, and lightweight headers.</li>
+          <li>Supported provider disconnection no longer triggers an inappropriate cross-provider repair.</li>
+          <li>Codex UI/prompt copy no longer claims PDF support that was not proven.</li>
+          <li>A potential full-session JSON reparse was replaced with a single-pass custom header decoder.</li>
+          <li>An Oracle concern that standard Claude Bash had been disabled was rejected after cross-review and source inspection; the standard deny list contains no Bash entries, and standard regression tests pass.</li>
+        </ul>
+      </section>
+
+      <section id="test-guide">
+        <span class="badge session">Recommended next validation</span>
+        <h2>How to test and see the effect</h2>
+        <h3>A. Automated checks without launching the app</h3>
+        <div class="steps">
+          <article class="step"><h3>Inspect the scope</h3><p>Run <code>git status --short</code> and <code>git diff --stat</code>. Confirm the Knowledge work remains isolated to Agent Mode, MCP policy, prompts, UI, persistence, and tests.</p></article>
+          <article class="step"><h3>Run the focused profile tests</h3><pre>make dev-test FILTER=Knowledge
+make dev-test FILTER=AgentSessionProfilePersistenceTests
+make dev-test FILTER=AgentKnowledgeProviderPolicyTests
+make dev-test FILTER=KnowledgeSessionMCPPolicyTests
+make dev-test FILTER=KnowledgeAgentPromptTests</pre><p>Expected: all selected tests pass.</p></article>
+          <article class="step"><h3>Protect ordinary Agent Mode</h3><pre>make dev-test FILTER=AgentModeRunServiceLifecycleTests
+make dev-test FILTER=AgentChatTitlebarSafetyTests</pre><p>Expected: the standard lifecycle and primary New Session path remain green.</p></article>
+          <article class="step"><h3>Build and lint</h3><pre>make dev-swift-build PRODUCT=RepoPrompt
+make dev-swift-build PRODUCT=repoprompt-mcp
+make dev-lint
+make guardrails</pre><p>Expected: both products compile and style/guardrail checks pass.</p></article>
+        </div>
+
+        <h3>B. Visible application smoke test</h3>
+        <div class="callout"><strong>Approval boundary:</strong> the implementation session did not launch or relaunch the visible app. Repository policy requires explicit user approval immediately before that action. Run the following only when it is safe to replace the current debug app.</div>
+        <div class="steps">
+          <article class="step"><h3>Build and launch</h3><pre>make dev-run</pre><p>Confirm the debug app launches normally.</p></article>
+          <article class="step"><h3>Verify the standard path first</h3><p>Click the main New Session icon. It should create an ordinary coding session with existing workflows and coding behavior. This is the regression-control case.</p></article>
+          <article class="step"><h3>Create Knowledge mode</h3><p>Open the chevron next to New Session and choose <strong>New Knowledge Session</strong>. Confirm the <strong>Knowledge</strong> pill and <strong>“What are we exploring?”</strong> empty state appear.</p></article>
+          <article class="step"><h3>Check provider scope</h3><p>Confirm only available Claude Code and Codex choices can be selected. Unsupported provider handoff or selection should be blocked with a clear explanation.</p></article>
+          <article class="step"><h3>Exercise local text</h3><p>Ask: “Find the project’s testing guidance, summarize it, and cite the relevant paths and line ranges.” Expected: RepoPrompt search/read tools are used; no shell or Git is needed.</p></article>
+          <article class="step"><h3>Exercise media</h3><p>With Claude, attach or reference a workspace image and PDF and ask for a grounded summary. With Codex, test an image and verify the agent does not claim it can natively inspect an arbitrary workspace PDF.</p></article>
+          <article class="step"><h3>Exercise web evidence</h3><p>Ask a current-fact question where freshness matters. Expected: when web is enabled, the answer cites authoritative URLs and separates sourced facts from inference. When web is disabled, the session remains useful and states the limitation.</p></article>
+          <article class="step"><h3>Exercise the boundary</h3><p>Ask it to run a build, use Git, or execute shell commands. Expected: it explains that the task belongs in a standard Agent Mode session rather than attempting unavailable tools.</p></article>
+          <article class="step"><h3>Exercise dual Oracles</h3><p>Ask: “Consult OracleA and OracleB independently in parallel, then synthesize. Use a critique round only if they materially disagree.” Confirm two independent consultations appear and the parent agent produces one evidence-led synthesis.</p></article>
+          <article class="step"><h3>Create and restore a note</h3><p>Ask the agent to write the result into the current workspace, close/reopen the session, and confirm the Knowledge pill/profile persists. In an Obsidian/iCloud-rooted workspace, verify the note lands there.</p></article>
+        </div>
+      </section>
+
+      <section id="risks">
+        <span class="badge inferred">Risks and limits</span>
+        <h2>Risks, limitations, and technical debt</h2>
+        <div class="cards">
+          <article class="card warn"><h3>No behavioral quality metric yet</h3><p>Compiler and contract coverage are strong, but the session did not measure answer quality, tool-use reduction, cache hit rate, cost, or elapsed time across real Knowledge questions.</p></article>
+          <article class="card warn"><h3>Claude media routing is prompt-enforced</h3><p>Claude’s native <code>Read</code> can also read text. V1 tells the model to reserve it for non-text media; there is no extension-aware native-tool guard.</p></article>
+          <article class="card warn"><h3>Codex PDF parity is intentionally absent</h3><p>Codex retains image viewing. Workspace PDF support should not be claimed until a concrete, tested path exists.</p></article>
+          <article class="card warn"><h3>Provider rollout is intentionally narrow</h3><p>OpenCode, Cursor, GLM, Kimi, and other compatible providers remain standard-only until their effective native inventories can be verified.</p></article>
+          <article class="card warn"><h3>Full repository suite is not green</h3><p>The changed feature suites pass, but the broad run currently has ten Git/VCS failures. A PR-ready handoff should preserve that distinction and avoid claiming a globally green baseline.</p></article>
+          <article class="card warn"><h3>Three useful test hardening ideas remain</h3><p>Future coverage could derive production Codex options directly, test full cross-profile placeholder cleanup end-to-end, and exercise a reconnect’s first direct call without a prior tool-list request.</p></article>
+        </div>
+        <p>The curated test ledger also retains the known unrelated baseline drift: three missing and two stale <code>WorkspaceProjectedPathSearchTests</code> entries.</p>
+      </section>
+
+      <section id="actions">
+        <span class="badge session">Action items</span>
+        <h2>What you need to do</h2>
+        <ol>
+          <li><strong>Review the 41-file implementation diff.</strong> Pay particular attention to the seven-tool ceiling, provider-native exceptions, fresh-session immutability, and the titlebar secondary action.</li>
+          <li><strong>Approve and perform the visible smoke test</strong> when it is safe to relaunch the debug app. The exact sequence is in the previous section.</li>
+          <li><strong>Use Knowledge mode for several real questions.</strong> Observe whether it stays focused, uses web research only when helpful, cites evidence well, and puts notes in the right workspace.</li>
+          <li><strong>Keep <code>stash@{0}</code> only as historical reference.</strong> Do not restore the old packet/verification-heavy prototype wholesale.</li>
+          <li><strong>Before committing,</strong> stage only intended files and run the repository-local contribution preflight. The full-suite VCS failures and ledger drift should be recorded honestly in the commit/PR handoff.</li>
+        </ol>
+        <pre>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</pre>
+        <p>No dependency installation, database migration, credential change, production mutation, visible app launch, commit, or push was performed during the implementation.</p>
+      </section>
+
+      <section id="evidence">
+        <span class="badge observed">Evidence and limitations</span>
+        <h2>Evidence, provenance, and metrics</h2>
+        <div class="table-wrap">
+          <table>
+            <tbody>
+              <tr><th>Session context</th><td>Available. The report includes the original knowledge-harness ask, user corrections, plan revisions, implementation outcomes, dual-Oracle reviews, and validation output.</td></tr>
+              <tr><th>Reliable baseline</th><td><code>e6b6802d</code>, the landed parallel preset-consultation commit. No implementation commit was created afterward; this report describes the uncommitted working tree above that baseline.</td></tr>
+              <tr><th>Implementation diff</th><td>41 files before this report: 36 modified and 5 untracked, approximately +1,903/−183 lines including untracked files.</td></tr>
+              <tr><th>Current report</th><td>This HTML file is an additional untracked documentation artifact and is not included in the 41-file implementation metric above.</td></tr>
+              <tr><th>Validation evidence</th><td>Available from conductor tickets, test logs, current Git state, focused test source, build/lint output, and the completed full-root run.</td></tr>
+              <tr><th>Duration</th><td>Not reported. Available timestamps cover individual jobs but do not establish the full implementation-session duration reliably.</td></tr>
+              <tr><th>Dependencies/configuration</th><td>No dependency or lockfile changes, new environment variables, database migrations, release settings, or feature flags were observed.</td></tr>
+              <tr><th>Backward compatibility</th><td>Legacy missing-profile sessions default to standard; standard UI/tool/provider paths are covered by focused regression tests. Unknown or explicit-null present profile data fails closed.</td></tr>
+              <tr><th>Manual UI evidence</th><td>Not available. The visible debug app was not launched because doing so requires explicit approval.</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3>Evidence labels used in this report</h3>
+        <ul>
+          <li><span class="badge observed">Observed in code</span> directly visible in current files or Git diff.</li>
+          <li><span class="badge tests">Observed in tests</span> supported by conductor/test output.</li>
+          <li><span class="badge session">Observed in session</span> supported by user direction or recorded implementation/review events.</li>
+          <li><span class="badge inferred">Inferred</span> a reasonable expected effect that has not yet been behaviorally measured.</li>
+        </ul>
+      </section>
+    </main>
+  </div>
+
+  <footer class="shell">
+    Generated from repository state and AI-agent coding-session evidence on 30 July 2026. No secrets, credentials, or private Oracle transcript contents are included.
+  </footer>
+</body>
+</html>

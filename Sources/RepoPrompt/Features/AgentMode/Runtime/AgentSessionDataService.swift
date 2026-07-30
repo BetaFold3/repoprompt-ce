@@ -165,6 +165,103 @@ actor AgentSessionDataService {
         let pendingHandoffSourceItemID: UUID?
         let pendingHandoffDefersProviderLockUntilSend: Bool?
         let isMCPOriginated: Bool?
+        let profile: AgentSessionProfile?
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case serializationVersion
+            case workspaceID
+            case composeTabID
+            case name
+            case savedAt
+            case itemCount
+            case transcriptProjectionCounts
+            case lastUserMessageAt
+            case agentKind
+            case agentModel
+            case agentReasoningEffort
+            case lastRunState
+            case providerSessionID
+            case autoEditEnabled
+            case codexConversationID
+            case codexRolloutPath
+            case codexModel
+            case codexReasoningEffort
+            case codexContextWindow
+            case codexLastTotalTokens
+            case codexTotalTotalTokens
+            case codexMcpSessionKey
+            case parentSessionID
+            case worktreeBindings
+            case worktreeMergeOperations
+            case pendingHandoffPayload
+            case pendingHandoffCreatedAt
+            case pendingHandoffSourceItemID
+            case pendingHandoffDefersProviderLockUntilSend
+            case isMCPOriginated
+            case profile
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(UUID.self, forKey: .id)
+            serializationVersion = try container.decodeIfPresent(Int.self, forKey: .serializationVersion)
+            workspaceID = try container.decodeIfPresent(UUID.self, forKey: .workspaceID)
+            composeTabID = try container.decodeIfPresent(UUID.self, forKey: .composeTabID)
+            name = try container.decode(String.self, forKey: .name)
+            savedAt = try container.decode(Date.self, forKey: .savedAt)
+            itemCount = try container.decodeIfPresent(Int.self, forKey: .itemCount)
+            transcriptProjectionCounts = try container.decodeIfPresent(
+                AgentTranscriptProjectionCounts.self,
+                forKey: .transcriptProjectionCounts
+            )
+            lastUserMessageAt = try container.decodeIfPresent(Date.self, forKey: .lastUserMessageAt)
+            agentKind = try container.decodeIfPresent(String.self, forKey: .agentKind)
+            agentModel = try container.decodeIfPresent(String.self, forKey: .agentModel)
+            agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
+            lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
+            providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
+            autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
+            codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
+            codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)
+            codexModel = try container.decodeIfPresent(String.self, forKey: .codexModel)
+            codexReasoningEffort = try container.decodeIfPresent(String.self, forKey: .codexReasoningEffort)
+            codexContextWindow = try container.decodeIfPresent(Int.self, forKey: .codexContextWindow)
+            codexLastTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexLastTotalTokens)
+            codexTotalTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexTotalTotalTokens)
+            codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
+            parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
+            worktreeBindings = try container.decodeIfPresent(
+                [AgentSessionWorktreeBinding].self,
+                forKey: .worktreeBindings
+            )
+            worktreeMergeOperations = try container.decodeIfPresent(
+                [AgentSessionWorktreeMergeOperation].self,
+                forKey: .worktreeMergeOperations
+            )
+            pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
+            pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
+            pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
+            pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(
+                Bool.self,
+                forKey: .pendingHandoffDefersProviderLockUntilSend
+            )
+            isMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated)
+            if container.contains(.profile) {
+                guard try !container.decodeNil(forKey: .profile) else {
+                    throw DecodingError.valueNotFound(
+                        AgentSessionProfile.self,
+                        .init(
+                            codingPath: container.codingPath + [CodingKeys.profile],
+                            debugDescription: "Agent session profile cannot be null"
+                        )
+                    )
+                }
+                profile = try container.decode(AgentSessionProfile.self, forKey: .profile)
+            } else {
+                profile = nil
+            }
+        }
     }
 
     private func computeLastUserMessageAt(in items: [AgentChatItemPersist]) -> Date? {
@@ -1090,6 +1187,7 @@ actor AgentSessionDataService {
                 pendingHandoffSourceItemID: header.pendingHandoffSourceItemID,
                 pendingHandoffDefersProviderLockUntilSend: header.pendingHandoffDefersProviderLockUntilSend ?? false,
                 isMCPOriginated: header.isMCPOriginated ?? false,
+                profile: header.profile ?? .standard,
                 worktreeBindings: header.worktreeBindings ?? [],
                 worktreeMergeOperations: header.worktreeMergeOperations ?? []
             )

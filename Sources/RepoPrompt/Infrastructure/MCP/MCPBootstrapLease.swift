@@ -17,6 +17,10 @@ struct MCPBootstrapLeaseSpec {
 
     let restrictedTools: Set<String>
     let additionalTools: Set<String>?
+    /// Positive tool ceiling for this run. Nil preserves standard behavior.
+    let allowedToolsOverride: Set<String>?
+    /// Stable top-level Agent session profile used for model-visible projections.
+    let sessionProfile: AgentSessionProfile
     let oneShot: Bool
     let reason: String?
     let ttl: TimeInterval
@@ -29,6 +33,42 @@ struct MCPBootstrapLeaseSpec {
     /// When true, the queued policy is reserved until the MCP peer PID is a descendant
     /// of an explicitly registered expected agent process.
     let requiresExpectedAgentPID: Bool
+
+    init(
+        runID: UUID,
+        gateID: UUID,
+        windowID: Int,
+        tabID: UUID?,
+        clientName: String?,
+        restrictedTools: Set<String>,
+        additionalTools: Set<String>?,
+        allowedToolsOverride: Set<String>? = nil,
+        sessionProfile: AgentSessionProfile = .standard,
+        oneShot: Bool,
+        reason: String?,
+        ttl: TimeInterval,
+        purpose: MCPRunPurpose,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        allowsAgentExternalControlTools: Bool,
+        requiresExpectedAgentPID: Bool
+    ) {
+        self.runID = runID
+        self.gateID = gateID
+        self.windowID = windowID
+        self.tabID = tabID
+        self.clientName = clientName
+        self.restrictedTools = restrictedTools
+        self.additionalTools = additionalTools
+        self.allowedToolsOverride = allowedToolsOverride
+        self.sessionProfile = sessionProfile
+        self.oneShot = oneShot
+        self.reason = reason
+        self.ttl = ttl
+        self.purpose = purpose
+        self.taskLabelKind = taskLabelKind
+        self.allowsAgentExternalControlTools = allowsAgentExternalControlTools
+        self.requiresExpectedAgentPID = requiresExpectedAgentPID
+    }
 }
 
 /// Unified lease actor for the MCP bootstrap policy and routing lifecycle.
@@ -554,6 +594,8 @@ actor MCPBootstrapLease {
             tabID: spec.tabID,
             runID: spec.runID,
             additionalTools: spec.additionalTools,
+            allowedToolsOverride: spec.allowedToolsOverride,
+            sessionProfile: spec.sessionProfile,
             purpose: spec.purpose,
             taskLabelKind: spec.taskLabelKind,
             allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
