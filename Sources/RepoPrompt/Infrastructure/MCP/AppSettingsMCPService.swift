@@ -7,18 +7,25 @@ import MCP
 /// This service intentionally does not expose the raw global settings document. Only
 /// keys present in `AppSettingsMCPRegistry.definitions` are visible to MCP clients.
 final class AppSettingsMCPService: Service {
+    typealias RemoteGatewayReconciliationScheduler = @MainActor () -> Void
+
     static let toolName = MCPGlobalToolName.appSettings
 
     private let store: GlobalSettingsStore
     private let notificationCenter: NotificationCenter
+    private let scheduleRemoteGatewayReconciliation: RemoteGatewayReconciliationScheduler
 
     @MainActor
     init(
         store: GlobalSettingsStore? = nil,
-        notificationCenter: NotificationCenter = .default
+        notificationCenter: NotificationCenter = .default,
+        scheduleRemoteGatewayReconciliation: @escaping RemoteGatewayReconciliationScheduler = {
+            Task { await ServerController.shared.applyRemoteGatewaySettings() }
+        }
     ) {
         self.store = store ?? GlobalSettingsStore.shared
         self.notificationCenter = notificationCenter
+        self.scheduleRemoteGatewayReconciliation = scheduleRemoteGatewayReconciliation
     }
 
     var tools: [Tool] {
@@ -184,7 +191,13 @@ final class AppSettingsMCPService: Service {
                 definition.afterWrite?(store, normalizedValue, notificationCenter)
             }
             let newValue = definition.read(store)
-            definition.afterSet?(store, newValue, changed, notificationCenter)
+            definition.afterSet?(
+                store,
+                newValue,
+                changed,
+                notificationCenter,
+                scheduleRemoteGatewayReconciliation
+            )
             return (oldValue, newValue, changed, changed, store.persistenceBlockReason)
         }
 
@@ -482,7 +495,13 @@ private struct AppSettingDefinition: @unchecked Sendable {
     let validate: (Value) throws -> Value
     let write: @MainActor (GlobalSettingsStore, Value) throws -> Void
     let afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)?
-    let afterSet: (@MainActor (GlobalSettingsStore, Value, Bool, NotificationCenter) -> Void)?
+    let afterSet: (@MainActor (
+        GlobalSettingsStore,
+        Value,
+        Bool,
+        NotificationCenter,
+        AppSettingsMCPService.RemoteGatewayReconciliationScheduler
+    ) -> Void)?
     let candidateProvider: (@MainActor (AppSettingCandidateRequest) throws -> AppSettingCandidatesResult)?
     /// Optional resolver used by `op=options` to pick a default agent filter when the
     /// caller omits `agent=`. Only settings that opt in (currently `context_builder.model`)
@@ -503,7 +522,13 @@ private struct AppSettingDefinition: @unchecked Sendable {
         validate: @escaping (Value) throws -> Value,
         write: @escaping @MainActor (GlobalSettingsStore, Value) throws -> Void,
         afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)?,
-        afterSet: (@MainActor (GlobalSettingsStore, Value, Bool, NotificationCenter) -> Void)? = nil,
+        afterSet: (@MainActor (
+            GlobalSettingsStore,
+            Value,
+            Bool,
+            NotificationCenter,
+            AppSettingsMCPService.RemoteGatewayReconciliationScheduler
+        ) -> Void)? = nil,
         candidateProvider: (@MainActor (AppSettingCandidateRequest) throws -> AppSettingCandidatesResult)? = nil,
         defaultOptionsAgent: (@MainActor (GlobalSettingsStore) -> AgentProviderKind?)? = nil
     ) {
@@ -796,8 +821,9 @@ private enum AppSettingsMCPRegistry {
             }
         ),
 
-        // General MCP preferences (not MCP tool ACLs or server lifecycle
-        // controls). The internal recommendation-dismissal flag
+        // General MCP preferences plus the explicitly supported Remote Control
+        // lifecycle toggle. MCP tool ACLs and all other internal lifecycle controls
+        // remain intentionally omitted. The internal recommendation-dismissal flag
         // `mcpTemporarilyDisablePresets` is intentionally omitted because it
         // is not a durable user preference.
         boolSetting(
@@ -807,6 +833,17 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.mcpShowModelPresets()) },
             write: { try $0.setMCPShowModelPresets(requiredBool(from: $1)) },
             afterWrite: postRecommendationsDidApply
+        ),
+        boolSetting(
+            key: "mcp.remote_gateway_enabled",
+            group: "mcp",
+            label: "Remote Control",
+            description: "Whether this Mac advertises the Remote Control gateway on its Tailscale IPv4 address.",
+            read: { .bool($0.mcpRemoteGatewayEnabled()) },
+            write: { try $0.setMCPRemoteGatewayEnabled(requiredBool(from: $1)) },
+            afterSet: { _, _, _, _, scheduleReconciliation in
+                scheduleReconciliation()
+            }
         ),
 
         // Global Code Maps toggle.
@@ -978,7 +1015,14 @@ private enum AppSettingsMCPRegistry {
         description: String,
         read: @escaping @MainActor (GlobalSettingsStore) -> Value,
         write: @escaping @MainActor (GlobalSettingsStore, Value) throws -> Void,
-        afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)? = nil
+        afterWrite: (@MainActor (GlobalSettingsStore, Value, NotificationCenter) -> Void)? = nil,
+        afterSet: (@MainActor (
+            GlobalSettingsStore,
+            Value,
+            Bool,
+            NotificationCenter,
+            AppSettingsMCPService.RemoteGatewayReconciliationScheduler
+        ) -> Void)? = nil
     ) -> AppSettingDefinition {
         AppSettingDefinition(
             key: key,
@@ -990,7 +1034,8 @@ private enum AppSettingsMCPRegistry {
             read: read,
             validate: { value in try validateBool(value, key: key) },
             write: write,
-            afterWrite: afterWrite
+            afterWrite: afterWrite,
+            afterSet: afterSet
         )
     }
 
@@ -1196,10 +1241,12 @@ private enum AppSettingsMCPRegistry {
         _ store: GlobalSettingsStore,
         _ value: Value,
         _ changed: Bool,
-        _ notificationCenter: NotificationCenter
+        _ notificationCenter: NotificationCenter,
+        _ scheduleRemoteGatewayReconciliation: AppSettingsMCPService.RemoteGatewayReconciliationScheduler
     ) {
         _ = changed
         _ = notificationCenter
+        _ = scheduleRemoteGatewayReconciliation
         guard let rawValue = value.doubleValue ?? value.intValue.map(Double.init) else { return }
         FontScaleManager.shared.applyAppSettingsRawValue(
             rawValue,

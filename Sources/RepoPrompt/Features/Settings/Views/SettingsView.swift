@@ -904,7 +904,13 @@ enum SettingsTab: String, CaseIterable {
                 "mcp status",
                 "connect mcp",
                 "mcp settings",
-                "mcp configuration"
+                "mcp configuration",
+                "Remote Control",
+                "remote-control",
+                "gateway",
+                "pairing",
+                "remote host",
+                "Tailscale"
             ]
         case .mcpTools:
             [
