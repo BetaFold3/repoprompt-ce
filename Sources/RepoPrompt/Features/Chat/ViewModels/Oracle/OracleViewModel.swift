@@ -1006,7 +1006,7 @@ class OracleViewModel: ObservableObject {
         _ event: OracleMessageLifecycleActivityEvent
     ) -> Void
     private var messageLifecycleActivityObservers: [UUID: [UUID: MessageLifecycleActivityObserver]] = [:]
-    /// Prevents duplicate concurrent finalisers for the same assistant message.
+    /// Owns terminal processing across normal completion, failure, and cancellation.
     private var finalizingAIResponses: Set<UUID> = []
     private var lastAnyStreamActivityAt: [UUID: Date] = [:]
     private var lastTextStreamActivityAt: [UUID: Date] = [:]
@@ -2080,20 +2080,7 @@ class OracleViewModel: ObservableObject {
         }
 
         // Create the list of messages for the new session (up to and including the fork point)
-        let messagesToCopy = Array(liveMessages.prefix(through: forkMessageIndex)).map { msg in
-            StoredMessage(
-                id: msg.id,
-                isUser: msg.isUser,
-                rawText: msg.content,
-                timestamp: Date(),
-                sequenceIndex: msg.sequenceIndex,
-                allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
-                promptTokens: msg.promptTokens,
-                completionTokens: msg.completionTokens,
-                cost: msg.cost,
-                modelName: msg.modelName
-            )
-        }
+        let messagesToCopy = Array(liveMessages.prefix(through: forkMessageIndex)).map(StoredMessage.init(from:))
 
         // Determine a unique name for the forked session
         // First, extract the base name by removing any existing fork indicators
@@ -2530,7 +2517,8 @@ class OracleViewModel: ObservableObject {
                   let live = lastLive
             else { return true } // no messages → treat as unchanged
             return stored.id == live.id &&
-                stored.rawText == live.content
+                stored.rawText == live.content &&
+                stored.timestamp == live.timestamp
         }()
 
         // NEW ▶︎ catch changes to the session‑level preferred model
@@ -2582,20 +2570,7 @@ class OracleViewModel: ObservableObject {
         // ------------------------------------------------------------------
         // 2️⃣  Build StoredMessage array from live messages
         // ------------------------------------------------------------------
-        let storedMessages: [StoredMessage] = liveMessages.map { msg in
-            StoredMessage(
-                id: msg.id,
-                isUser: msg.isUser,
-                rawText: msg.content,
-                timestamp: Date(),
-                sequenceIndex: msg.sequenceIndex,
-                allowedFilePaths: msg.allowedFilePaths.isEmpty ? nil : msg.allowedFilePaths,
-                promptTokens: msg.promptTokens,
-                completionTokens: msg.completionTokens,
-                cost: msg.cost,
-                modelName: msg.modelName
-            )
-        }
+        let storedMessages = liveMessages.map(StoredMessage.init(from:))
 
         // ------------------------------------------------------------------
         // 5️⃣  Capture current selections & preferred model
@@ -2804,12 +2779,15 @@ class OracleViewModel: ObservableObject {
 
         ensureSessionStorage(targetSessionID)
 
-        // Create the user message
+        // Capture when the application accepts the send so the displayed user time
+        // remains stable even if prompt packaging takes time.
+        let userTimestamp = Date()
         let userId = UUID()
         let userMessage = AIChatMessage(
             id: userId,
             content: newUserMessage,
             isUser: true,
+            timestamp: userTimestamp,
             sequenceIndex: nextSequenceIndex(for: targetSessionID)
         )
         withSessionMessages(targetSessionID) { msgs in
@@ -3040,21 +3018,26 @@ class OracleViewModel: ObservableObject {
 
     // MARK: - Finalise an AI response
 
+    /// Claims exclusive ownership of terminal processing for one assistant response.
+    /// Normal completion, failure, and cancellation must all acquire this claim before
+    /// processing or publishing terminal state.
+    @MainActor
+    private func claimAIResponseFinalization(_ aiResponseId: UUID, sessionID: UUID) -> Bool {
+        guard !finalizingAIResponses.contains(aiResponseId) else { return false }
+        guard messageStore[sessionID]?.first(where: { $0.id == aiResponseId })?.isFinalized != true else {
+            return false
+        }
+        finalizingAIResponses.insert(aiResponseId)
+        emitMessageLifecycleActivity(.finalizationStarted, for: aiResponseId)
+        return true
+    }
+
     private func finalizeAIResponse(
         aiResponseId: UUID,
         sessionID: UUID,
         partialBuffer: String
     ) async {
-        // Single-flight finalisation: provider stop, watchdogs, and cancellation can
-        // all race to finalize the same message.
-        if finalizingAIResponses.contains(aiResponseId) {
-            return
-        }
-        if messageStore[sessionID]?.first(where: { $0.id == aiResponseId })?.isFinalized == true {
-            return
-        }
-        finalizingAIResponses.insert(aiResponseId)
-        emitMessageLifecycleActivity(.finalizationStarted, for: aiResponseId)
+        guard claimAIResponseFinalization(aiResponseId, sessionID: sessionID) else { return }
         defer { finalizingAIResponses.remove(aiResponseId) }
 
         // Cancel any watchdog to prevent duplicate finalization
@@ -3074,10 +3057,11 @@ class OracleViewModel: ObservableObject {
         await processAIResponse(finalContent, forQueryId: aiResponseId, sessionID: sessionID)
 
         // 3️⃣ Now – and only now – mark the message / chat turn as complete.
-        await MainActor.run {
+        let didFinalizeMessage = await MainActor.run { () -> Bool in
+            var didFinalize = false
             self.withSessionMessages(sessionID) { msgs in
                 if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
-                    msgs[idx].setIsFinalized(true)
+                    didFinalize = msgs[idx].markFinalized(at: Date())
                 }
             }
             clearSessionStreaming(sessionID)
@@ -3085,19 +3069,24 @@ class OracleViewModel: ObservableObject {
             // Clear MCP model info after response completes
             clearMCPSessionUIState(for: sessionID)
 
-            // Trigger notification when AI response is complete
-            let sessionName = sessions.first(where: { $0.id == sessionID })?.name
-            NotificationService.shared.notifyChatComplete(
-                chatName: sessionName,
-                fallbackToDockBounce: true
-            )
+            if didFinalize {
+                // Trigger notification only for the terminal path that won the race.
+                let sessionName = sessions.first(where: { $0.id == sessionID })?.name
+                NotificationService.shared.notifyChatComplete(
+                    chatName: sessionName,
+                    fallbackToDockBounce: true
+                )
+            }
+            return didFinalize
         }
 
-        // 4️⃣ Persist the fully‑processed session state
-        // When finalizing after a delegate‑edit retry, force autosave so XML results persist
-        // even if the assistant message text hasn't changed (avoids "no meaningful changes" skip).
-        let shouldForceAutosave = (activeRetryTask != nil)
-        autosaveChatHistory(for: sessionID, force: shouldForceAutosave)
+        // 4️⃣ Persist only when this path established the terminal timestamp.
+        if didFinalizeMessage {
+            // When finalizing after a delegate-edit retry, force autosave so XML results persist
+            // even if the assistant message text hasn't changed (avoids "no meaningful changes" skip).
+            let shouldForceAutosave = (activeRetryTask != nil)
+            autosaveChatHistory(for: sessionID, force: shouldForceAutosave)
+        }
 
         // 5️⃣ Notify observers and any waiters that this message is finalised
         emitMessageLifecycleActivity(.finalizationCompleted, for: aiResponseId)
@@ -3152,19 +3141,26 @@ class OracleViewModel: ObservableObject {
         }
 
         emitMessageLifecycleActivity(.streamFailed, for: aiResponseId)
+        guard claimAIResponseFinalization(aiResponseId, sessionID: sessionID) else { return }
+        defer { finalizingAIResponses.remove(aiResponseId) }
 
         // Pass token count to error message handler for non-cancellation errors
         let tokenCount = promptViewModel.totalTokenCount
         let errorMessage = userFriendlyErrorMessage(for: error, tokenCount: tokenCount)
         if messageStore[sessionID]?.contains(where: { $0.id == aiResponseId }) == true {
             let appendedErrorBlock = "\n\n--\nError:\n\(errorMessage)"
+            var didFinalizeMessage = false
             withSessionMessages(sessionID) { msgs in
-                if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }) {
+                if let idx = msgs.firstIndex(where: { $0.id == aiResponseId }),
+                   !msgs[idx].isFinalized
+                {
                     msgs[idx].appendContent(appendedErrorBlock)
-                    msgs[idx].setIsFinalized(true)
+                    didFinalizeMessage = msgs[idx].markFinalized(at: Date())
                 }
             }
-            autosaveChatHistory(for: sessionID)
+            if didFinalizeMessage {
+                autosaveChatHistory(for: sessionID)
+            }
         } else {
             let errorMessageModel = AIChatMessage(
                 content: errorMessage,
@@ -3347,21 +3343,33 @@ class OracleViewModel: ObservableObject {
             streamIDsByQueryId.removeValue(forKey: qid)
         }
 
-        clearSessionStreaming(sessionID)
-        clearMCPSessionUIState(for: sessionID)
-
         // Cancel any active watchdog for the current query
         if let qid {
             cancelFinalizationWatchdog(for: qid)
             clearStreamActivityTracking(for: qid)
         }
 
-        guard !skipPartialParseAndSave, let queryId = qid else {
-            if let qid {
-                Task { await finalisationHub.fulfil(qid) }
-            }
+        guard let queryId = qid else {
+            clearSessionStreaming(sessionID)
+            clearMCPSessionUIState(for: sessionID)
             return
         }
+        guard !skipPartialParseAndSave else {
+            clearSessionStreaming(sessionID)
+            clearMCPSessionUIState(for: sessionID)
+            Task { await finalisationHub.fulfil(queryId) }
+            return
+        }
+        guard claimAIResponseFinalization(queryId, sessionID: sessionID) else {
+            // Another terminal path owns this response. Wait for it before allowing a
+            // replacement send to start, so the old owner cannot clear the new stream.
+            try? await waitUntilMessageFinalised(queryId)
+            return
+        }
+        defer { finalizingAIResponses.remove(queryId) }
+
+        clearSessionStreaming(sessionID)
+        clearMCPSessionUIState(for: sessionID)
 
         guard let idx = messageStore[sessionID]?.firstIndex(where: { $0.id == queryId && !$0.isUser }) else {
             Task { await finalisationHub.fulfil(queryId) }
@@ -3381,13 +3389,16 @@ class OracleViewModel: ObservableObject {
             return
         }
 
+        await processAIResponse(finalContent, forQueryId: queryId, sessionID: sessionID)
+        var didFinalizeMessage = false
         withSessionMessages(sessionID) { msgs in
             if let index = msgs.firstIndex(where: { $0.id == queryId && !$0.isUser }) {
-                msgs[index].setIsFinalized(true)
+                didFinalizeMessage = msgs[index].markFinalized(at: Date())
             }
         }
-        await processAIResponse(finalContent, forQueryId: queryId, sessionID: sessionID)
-        autosaveChatHistory(for: sessionID)
+        if didFinalizeMessage {
+            autosaveChatHistory(for: sessionID)
+        }
 
         // Notify any waiters that this message is finalised (cancelled)
         Task { await finalisationHub.fulfil(queryId) }
@@ -3406,6 +3417,7 @@ class OracleViewModel: ObservableObject {
             id: stored.id,
             content: stored.rawText,
             isUser: stored.isUser,
+            timestamp: stored.timestamp,
             isFinalized: true,
             sequenceIndex: stored.sequenceIndex,
             allowedFilePaths: stored.allowedFilePaths ?? [],

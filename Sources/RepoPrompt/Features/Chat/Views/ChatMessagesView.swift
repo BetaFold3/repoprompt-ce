@@ -18,6 +18,9 @@ struct ChatMessagesView: View {
     /// Optional transcript session to render without changing global chat focus.
     let sessionIDOverride: UUID?
 
+    /// Whether message event times are shown in the transcript footer.
+    let showsMessageTimestamps: Bool
+
     private let contentAnimationDuration: Double = 0.2
 
     /// Tracks if we're near the bottom of the scrollable area.
@@ -48,7 +51,8 @@ struct ChatMessagesView: View {
         bottomOcclusion: CGFloat,
         showsScrollControls: Bool = true,
         autoScrollOnAppear: Bool = true,
-        sessionIDOverride: UUID? = nil
+        sessionIDOverride: UUID? = nil,
+        showsMessageTimestamps: Bool = false
     ) {
         self.viewModel = viewModel
         _autoScrollEnabled = autoScrollEnabled
@@ -56,6 +60,7 @@ struct ChatMessagesView: View {
         self.showsScrollControls = showsScrollControls
         self.autoScrollOnAppear = autoScrollOnAppear
         self.sessionIDOverride = sessionIDOverride
+        self.showsMessageTimestamps = showsMessageTimestamps
     }
 
     private var renderedSessionID: UUID? {
@@ -209,7 +214,8 @@ struct ChatMessagesView: View {
                 MessageBubble(
                     message: message,
                     viewModel: viewModel,
-                    isLatestMessage: message.id == renderedMessages.last?.id
+                    isLatestMessage: message.id == renderedMessages.last?.id,
+                    showsTimestamp: showsMessageTimestamps
                 )
                 .id(message.id)
                 .animation(.default, value: message.revisionCount)

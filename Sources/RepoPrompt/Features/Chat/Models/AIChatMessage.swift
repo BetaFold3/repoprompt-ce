@@ -14,6 +14,9 @@ struct AIChatMessage: Identifiable, Equatable {
     private(set) var content: String
     let isUser: Bool
 
+    /// Event time shown in chat: user dispatch time or assistant terminal time.
+    private(set) var timestamp: Date
+
     /// The sequence index determining message order.
     let sequenceIndex: Int
     private(set) var isFinalized: Bool = false
@@ -42,6 +45,7 @@ struct AIChatMessage: Identifiable, Equatable {
         id: UUID = UUID(),
         content: String,
         isUser: Bool,
+        timestamp: Date = Date(),
         isFinalized: Bool = false,
         sequenceIndex: Int = 0,
         allowedFilePaths: [String] = [],
@@ -51,6 +55,7 @@ struct AIChatMessage: Identifiable, Equatable {
         self.id = id
         self.content = content
         self.isUser = isUser
+        self.timestamp = timestamp
         self.sequenceIndex = sequenceIndex
         self.allowedFilePaths = allowedFilePaths
         self.isFinalized = isFinalized
@@ -82,6 +87,17 @@ struct AIChatMessage: Identifiable, Equatable {
     mutating func setIsFinalized(_ finalized: Bool) {
         isFinalized = finalized
         revisionCount += 1
+    }
+
+    /// Marks a live assistant response terminal and publishes its completion time atomically.
+    /// Hydrated messages initialize or restore finalization without calling this method, so loading never rewrites persisted timestamps.
+    @discardableResult
+    mutating func markFinalized(at timestamp: Date) -> Bool {
+        guard !isFinalized else { return false }
+        self.timestamp = timestamp
+        isFinalized = true
+        revisionCount += 1
+        return true
     }
 
     mutating func updateTokenInfo(_ info: ChatTokenInfo?) {

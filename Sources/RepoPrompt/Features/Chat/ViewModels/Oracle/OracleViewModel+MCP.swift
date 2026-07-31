@@ -1580,6 +1580,7 @@ extension OracleViewModel {
         guard !trimmedPrompt.isEmpty else {
             throw ChatToolError.invalidParams("Prompt cannot be empty")
         }
+        let userTimestamp = Date()
 
         // 1) Resolve model
         let model: AIModel
@@ -1694,6 +1695,7 @@ extension OracleViewModel {
         guard !trimmedResponse.isEmpty else {
             throw ChatToolError.internalError("Request produced no content.")
         }
+        let assistantTimestamp = Date()
 
         // 5) Create persisted ChatSession
         let (session, shortID) = try await createSessionFromHeadlessRun(
@@ -1707,7 +1709,9 @@ extension OracleViewModel {
             tabID: tabID,
             workspaceID: workspaceID,
             agentModeSessionID: agentModeSessionID,
-            agentModeRunID: agentModeRunID
+            agentModeRunID: agentModeRunID,
+            userTimestamp: userTimestamp,
+            assistantTimestamp: assistantTimestamp
         )
 
         // 6) Return ChatSendReply
@@ -1718,6 +1722,36 @@ extension OracleViewModel {
             response: trimmedResponse,
             errors: nil
         )
+    }
+
+    static func headlessStoredMessages(
+        prompt: String,
+        response: String,
+        modelName: String,
+        tokenInfo: ChatTokenInfo,
+        allowedPaths: [String],
+        userTimestamp: Date,
+        assistantTimestamp: Date
+    ) -> [StoredMessage] {
+        let userMessage = StoredMessage(
+            isUser: true,
+            rawText: prompt,
+            timestamp: userTimestamp,
+            sequenceIndex: 0,
+            allowedFilePaths: allowedPaths
+        )
+        let assistantMessage = StoredMessage(
+            isUser: false,
+            rawText: response,
+            timestamp: assistantTimestamp,
+            sequenceIndex: 1,
+            allowedFilePaths: allowedPaths,
+            promptTokens: tokenInfo.promptTokens,
+            completionTokens: tokenInfo.completionTokens,
+            cost: tokenInfo.cost,
+            modelName: modelName
+        )
+        return [userMessage, assistantMessage]
     }
 
     /// Helper: persist a new ChatSession from a headless run without
@@ -1735,6 +1769,8 @@ extension OracleViewModel {
         workspaceID: UUID? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
+        userTimestamp: Date = Date(),
+        assistantTimestamp: Date = Date(),
         setActiveForTab: Bool = false
     ) async throws -> (session: ChatSession, shortID: String) {
         let workspace: WorkspaceModel? = if let workspaceID {
@@ -1747,33 +1783,15 @@ extension OracleViewModel {
         }
 
         // 1) Build StoredMessage entries
-        let now = Date()
         let allowedPaths = selection.selectedPaths
-
-        let userMsg = StoredMessage(
-            id: UUID(),
-            isUser: true,
-            rawText: prompt,
-            timestamp: now,
-            sequenceIndex: 0,
-            allowedFilePaths: allowedPaths,
-            promptTokens: nil,
-            completionTokens: nil,
-            cost: nil,
-            modelName: nil
-        )
-
-        let aiMsg = StoredMessage(
-            id: UUID(),
-            isUser: false,
-            rawText: response,
-            timestamp: now,
-            sequenceIndex: 1,
-            allowedFilePaths: allowedPaths,
-            promptTokens: tokenInfo.promptTokens,
-            completionTokens: tokenInfo.completionTokens,
-            cost: tokenInfo.cost,
-            modelName: model.rawValue
+        let storedMessages = Self.headlessStoredMessages(
+            prompt: prompt,
+            response: response,
+            modelName: model.rawValue,
+            tokenInfo: tokenInfo,
+            allowedPaths: allowedPaths,
+            userTimestamp: userTimestamp,
+            assistantTimestamp: assistantTimestamp
         )
 
         // 2) Create a ChatSession object (in-memory)
@@ -1787,7 +1805,7 @@ extension OracleViewModel {
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
             name: resolvedName,
-            messages: [userMsg, aiMsg],
+            messages: storedMessages,
             selectedFilePaths: allowedPaths,
             selectedPromptIDs: workspace.id == workspaceManager.activeWorkspaceID
                 ? Array(promptViewModel.selectedPromptIDsForChat)

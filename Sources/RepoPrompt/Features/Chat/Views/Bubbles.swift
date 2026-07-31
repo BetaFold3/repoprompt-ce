@@ -282,6 +282,7 @@ struct MessageBubble: View {
     let message: AIChatMessage
     @ObservedObject var viewModel: OracleViewModel
     let isLatestMessage: Bool
+    let showsTimestamp: Bool
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     // Flags for hover states
@@ -404,6 +405,12 @@ struct MessageBubble: View {
                         }
                     }
 
+                    if showsTimestamp {
+                        MessageTimestampText(date: message.timestamp)
+                            .font(fontPreset.captionFont)
+                            .foregroundColor(.secondary.opacity(0.6))
+                    }
+
                     // Always show copy for user messages
                     CopyButtonOverlay(
                         message: message,
@@ -494,6 +501,12 @@ struct MessageBubble: View {
 
                     if message.selectedFileCount > 0 {
                         FileSelectionIndicator(message: message, viewModel: viewModel)
+                    }
+
+                    if showsTimestamp {
+                        MessageTimestampText(date: message.timestamp)
+                            .font(fontPreset.captionFont)
+                            .foregroundColor(.secondary.opacity(0.6))
                     }
 
                     if let inTok = message.promptTokens,

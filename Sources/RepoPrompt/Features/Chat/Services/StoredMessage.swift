@@ -62,6 +62,21 @@ struct StoredMessage: Codable {
         try container.encode(modelName, forKey: .modelName)
     }
 
+    init(from message: AIChatMessage) {
+        self.init(
+            id: message.id,
+            isUser: message.isUser,
+            rawText: message.content,
+            timestamp: message.timestamp,
+            sequenceIndex: message.sequenceIndex,
+            allowedFilePaths: message.allowedFilePaths.isEmpty ? nil : message.allowedFilePaths,
+            promptTokens: message.promptTokens,
+            completionTokens: message.completionTokens,
+            cost: message.cost,
+            modelName: message.modelName
+        )
+    }
+
     init(
         id: UUID = UUID(),
         isUser: Bool,
