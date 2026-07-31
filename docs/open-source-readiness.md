@@ -114,8 +114,8 @@ make guardrails
 When changes touch dependencies or provider-package code, add:
 
 ```bash
-swift package resolve
-cd Packages/RepoPromptAgentProviders && swift test
+make resolve
+make dev-provider-test
 ```
 
-When changes touch packaging, MCP runtime, debug CLI behavior, Agent Mode runtime behavior, or a running-app feature, run the live CE MCP smoke flow documented in the root [`README.md`](../README.md) after the smallest relevant build/test command.
+When changes touch packaging, MCP runtime, debug CLI behavior, Agent Mode runtime behavior, or a running-app feature, run the non-disruptive `make dev-smoke` against an already-running CE debug app as documented in the [development workflow](context/workflows/development.md#use-the-ce-debug-cli) after the smallest relevant build/test command.

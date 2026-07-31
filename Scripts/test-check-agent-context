@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+"""Synthetic repository tests for check-agent-context."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+CHECKER = Path(__file__).resolve().with_name("check-agent-context")
+
+
+def write(root: Path, relative: str, contents: str) -> Path:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(contents, encoding="utf-8")
+    return path
+
+
+def document(
+    root: Path,
+    relative: str,
+    *,
+    authority: str = "Reference",
+    last_verified: str | None = "2026-01-01",
+    body: str = "",
+) -> None:
+    lines = [
+        "# Context",
+        "",
+        "Scope: read when the task touches synthetic checker coverage.",
+        f"Authority: {authority}",
+    ]
+    if last_verified is not None:
+        lines.append(f"Last-verified: {last_verified}")
+    if body:
+        lines.extend(["", body])
+    write(root, relative, "\n".join(lines) + "\n")
+
+
+def agents(root: Path, routes: list[str] | None = None, extra_lines: list[str] | None = None) -> None:
+    lines = ["# Agent Notes"]
+    lines.extend(routes or [])
+    lines.extend(extra_lines or [])
+    write(root, "AGENTS.md", "\n".join(lines) + "\n")
+    write(root, "CLAUDE.md", "@AGENTS.md\n")
+
+
+def archive_manifest(root: Path, payloads: list[str]) -> Path:
+    rows = [
+        "# Agent-context archive manifest",
+        "",
+        "| Original path | Archive date | Archived copy | Reason | Integrity note |",
+        "|---|---|---|---|---|",
+    ]
+    for relative in payloads:
+        payload = root / "docs/context/archive" / relative
+        digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+        rows.append(
+            f"| `{relative}` | 2026-01-01 | [{relative}]({relative}) | synthetic migration | "
+            f"body preserved verbatim; SHA-256 `{digest}` |"
+        )
+    return write(root, "docs/context/archive/MANIFEST.md", "\n".join(rows) + "\n")
+
+
+def invoke(root: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [str(CHECKER), "--root", str(root)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+
+
+def require_failure(root: Path, category: str) -> None:
+    result = invoke(root)
+    output = result.stdout + result.stderr
+    if result.returncode == 0 or f"ERROR [{category}]" not in output or "Fix:" not in output:
+        raise AssertionError(
+            f"expected remediated {category!r} failure, got exit {result.returncode}:\n{output}"
+        )
+
+
+def require_warning_only(root: Path, category: str) -> None:
+    result = invoke(root)
+    output = result.stdout + result.stderr
+    if result.returncode != 0 or f"WARNING [{category}]" not in output or "Fix:" not in output:
+        raise AssertionError(
+            f"expected zero-exit remediated {category!r} warning, got exit {result.returncode}:\n{output}"
+        )
+
+
+def require_clean(root: Path) -> None:
+    first = invoke(root)
+    second = invoke(root)
+    output = first.stdout + first.stderr
+    if first.returncode != 0 or "ERROR [" in output or "WARNING [" in output:
+        raise AssertionError(f"expected clean result, got exit {first.returncode}:\n{output}")
+    if (first.returncode, first.stdout, first.stderr) != (second.returncode, second.stdout, second.stderr):
+        raise AssertionError("checker output is not deterministic across identical runs")
+
+
+def in_temporary_repository(test) -> None:
+    with tempfile.TemporaryDirectory(prefix="check-agent-context-") as directory:
+        test(Path(directory))
+
+
+def test_missing_agents(root: Path) -> None:
+    require_failure(root, "agents")
+
+
+def test_agents_line_limit(root: Path) -> None:
+    write(root, "AGENTS.md", "\n".join(f"line {number}" for number in range(100)) + "\n")
+    require_failure(root, "agents")
+
+
+def test_broken_local_link(root: Path) -> None:
+    agents(root, ["[Topic](docs/context/topic.md)"])
+    document(
+        root,
+        "docs/context/topic.md",
+        body="See the [missing local document](missing.md).",
+    )
+    require_failure(root, "link")
+
+
+def test_orphan_document(root: Path) -> None:
+    agents(root)
+    document(root, "docs/context/orphan.md")
+    require_failure(root, "reachability")
+
+
+def test_generic_filename(root: Path) -> None:
+    agents(root, ["[Notes](docs/context/NoTeS.md)"])
+    document(root, "docs/context/NoTeS.md")
+    require_failure(root, "filename")
+
+
+def test_invalid_claude_adapter(root: Path) -> None:
+    agents(root)
+    write(root, "CLAUDE.md", "@README.md\n")
+    require_failure(root, "adapter")
+
+
+def test_missing_claude_adapter(root: Path) -> None:
+    agents(root)
+    (root / "CLAUDE.md").unlink()
+    require_failure(root, "adapter")
+
+
+def test_symlinked_claude_adapter(root: Path) -> None:
+    agents(root)
+    (root / "CLAUDE.md").unlink()
+    write(root, "adapter-target.md", "@AGENTS.md\n")
+    (root / "CLAUDE.md").symlink_to("adapter-target.md")
+    require_failure(root, "adapter")
+
+
+def test_claude_adapter_whitespace_drift(root: Path) -> None:
+    agents(root)
+    for contents in (
+        "@AGENTS.md",
+        " @AGENTS.md\n",
+        "@AGENTS.md \n",
+        "\n@AGENTS.md\n",
+        "@AGENTS.md\n\n",
+    ):
+        write(root, "CLAUDE.md", contents)
+        require_failure(root, "adapter")
+
+
+def test_generic_filename_in_excluded_tree(root: Path) -> None:
+    agents(root)
+    write(root, "docs/context/archive/notes.md", "Archived verbatim content.\n")
+    require_failure(root, "filename")
+
+
+def test_missing_header(root: Path) -> None:
+    agents(root, ["[Topic](docs/context/topic.md)"])
+    write(root, "docs/context/topic.md", "# Context\n\nNo contract here.\n")
+    require_failure(root, "header")
+
+
+def test_invalid_last_verified(root: Path) -> None:
+    agents(root, ["[Topic](docs/context/topic.md)"])
+    document(root, "docs/context/topic.md", last_verified="2026-02-30")
+    require_failure(root, "header")
+
+
+def test_agents_size_warning(root: Path) -> None:
+    document(root, "docs/context/topic.md")
+    lines = ["# Agent Notes", "[Topic](docs/context/topic.md)"]
+    lines.extend(f"routing guidance {number}" for number in range(84))
+    write(root, "AGENTS.md", "\n".join(lines) + "\n")
+    write(root, "CLAUDE.md", "@AGENTS.md\n")
+    require_warning_only(root, "agents-size")
+
+
+def test_direct_route_warning(root: Path) -> None:
+    routes: list[str] = []
+    for number in range(16):
+        relative = f"docs/context/topic-{number:02d}.md"
+        document(root, relative)
+        routes.append(f"[Topic {number}]({relative})")
+    agents(root, routes)
+    require_warning_only(root, "route-count")
+
+
+def test_index_route_warning(root: Path) -> None:
+    document(root, "docs/context/index.md")
+    document(root, "docs/context/topic.md")
+    agents(
+        root,
+        [
+            "[Index](docs/context/index.md)",
+            "[Topic](docs/context/topic.md)",
+        ],
+    )
+    require_warning_only(root, "index-routing")
+
+
+def test_route_depth_warning(root: Path) -> None:
+    document(root, "docs/context/a.md", body="[B](b.md)")
+    document(root, "docs/context/b.md", body="[C](c.md)")
+    document(root, "docs/context/c.md", body="[D](d.md)")
+    document(root, "docs/context/d.md")
+    agents(root, ["[A](docs/context/a.md)"])
+    require_warning_only(root, "route-depth")
+
+
+def test_freshness_warning(root: Path) -> None:
+    if shutil.which("git") is None:
+        raise unittest.SkipTest("git is unavailable")
+    document(
+        root,
+        "docs/context/authority.md",
+        authority="Authoritative",
+        last_verified=None,
+    )
+    agents(root, ["[Authority](docs/context/authority.md)"])
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, timeout=10)
+    subprocess.run(["git", "add", "AGENTS.md", "docs/context/authority.md"], cwd=root, check=True, timeout=10)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000",
+            "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000",
+        }
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Agent Context Test",
+            "-c",
+            "user.email=agent-context@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "-m",
+            "old context",
+        ],
+        cwd=root,
+        env=environment,
+        check=True,
+        timeout=10,
+    )
+    require_warning_only(root, "freshness")
+
+
+def test_deleted_archive_payload(root: Path) -> None:
+    agents(root)
+    payload = write(root, "docs/context/archive/2026-01-01-AGENTS.md", "Legacy guidance.\n")
+    archive_manifest(root, ["2026-01-01-AGENTS.md"])
+    payload.unlink()
+    require_failure(root, "archive")
+
+
+def test_missing_archive_manifest(root: Path) -> None:
+    agents(root)
+    write(root, "docs/context/archive/2026-01-01-AGENTS.md", "Legacy guidance.\n")
+    require_failure(root, "archive")
+
+
+def test_tampered_archive_payload(root: Path) -> None:
+    agents(root)
+    write(root, "docs/context/archive/2026-01-01-AGENTS.md", "Legacy guidance.\n")
+    archive_manifest(root, ["2026-01-01-AGENTS.md"])
+    write(root, "docs/context/archive/2026-01-01-AGENTS.md", "Tampered guidance.\n")
+    require_failure(root, "archive")
+
+
+def test_duplicate_archive_manifest_entry(root: Path) -> None:
+    agents(root)
+    write(root, "docs/context/archive/2026-01-01-AGENTS.md", "Legacy guidance.\n")
+    manifest = archive_manifest(root, ["2026-01-01-AGENTS.md"])
+    row = manifest.read_text(encoding="utf-8").splitlines()[-1]
+    manifest.write_text(manifest.read_text(encoding="utf-8") + row + "\n", encoding="utf-8")
+    require_failure(root, "archive")
+
+
+def test_unlisted_archive_payload(root: Path) -> None:
+    agents(root)
+    write(root, "docs/context/archive/2026-01-01-AGENTS.md", "Legacy guidance.\n")
+    archive_manifest(root, [])
+    require_failure(root, "archive")
+
+
+def test_clean_and_excluded_archives(root: Path) -> None:
+    document(root, "docs/context/topic.md")
+    agents(root, ["[Topic](docs/context/topic.md)"])
+    write(root, "CLAUDE.md", "@AGENTS.md\n")
+    for relative in (
+        "docs/context/plans/completed/completed-agent-plan.md",
+        "docs/context/generated/generated-routing-reference.md",
+        "docs/context/archive/historical-agent-guidance.md",
+    ):
+        write(root, relative, "No header and a [broken link](missing.md).\n")
+    archive_manifest(root, ["historical-agent-guidance.md"])
+    require_clean(root)
+
+
+def main() -> int:
+    if not CHECKER.is_file():
+        print(f"FAIL: checker not found at {CHECKER}", file=sys.stderr)
+        return 1
+    tests = [
+        test_missing_agents,
+        test_agents_line_limit,
+        test_broken_local_link,
+        test_orphan_document,
+        test_generic_filename,
+        test_invalid_claude_adapter,
+        test_missing_claude_adapter,
+        test_symlinked_claude_adapter,
+        test_claude_adapter_whitespace_drift,
+        test_generic_filename_in_excluded_tree,
+        test_missing_header,
+        test_invalid_last_verified,
+        test_agents_size_warning,
+        test_direct_route_warning,
+        test_index_route_warning,
+        test_route_depth_warning,
+        test_freshness_warning,
+        test_deleted_archive_payload,
+        test_missing_archive_manifest,
+        test_tampered_archive_payload,
+        test_duplicate_archive_manifest_entry,
+        test_unlisted_archive_payload,
+        test_clean_and_excluded_archives,
+    ]
+    failures: list[str] = []
+    passed = 0
+    skipped = 0
+    for test in tests:
+        try:
+            in_temporary_repository(test)
+        except unittest.SkipTest as error:
+            skipped += 1
+            print(f"SKIP {test.__name__}: {error}")
+        except Exception as error:  # Keep the harness running to report every failed contract.
+            failures.append(test.__name__)
+            print(f"FAIL {test.__name__}: {error}", file=sys.stderr)
+        else:
+            passed += 1
+            print(f"PASS {test.__name__}")
+    print(
+        f"Agent-context checker tests: {passed} passed, {skipped} skipped, "
+        f"{len(failures)} failed."
+    )
+    if failures:
+        print(f"Failed tests: {', '.join(failures)}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

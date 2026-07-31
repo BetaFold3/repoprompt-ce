@@ -330,18 +330,27 @@ print_matches \
 # 8. Agent-authored reports and working notes stay local unless explicitly
 # promoted into the contributor-facing documentation set.
 allowed_tracked_docs=(
+  "docs/architecture/mcp-instructions-and-provider-guidance.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
+  "docs/context/archive/2026-07-30-AGENTS.md"
+  "docs/context/archive/2026-07-30-CLAUDE.md"
+  "docs/context/archive/MANIFEST.md"
+  "docs/context/workflows/development.md"
+  "docs/context/workflows/doc-gardening.md"
+  "docs/context/workflows/validation.md"
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
   "docs/open-source-readiness.md"
   "docs/privacy/telemetry.md"
   "docs/releasing.md"
+  "docs/technical_implementation_reports/2026-07-25-mcp-instructions-rewrite-provider-guidance.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"
   "docs/worktrees.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
+  "docs/investigations/r1-r4-contract-validity-2026-07-25.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
   "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )

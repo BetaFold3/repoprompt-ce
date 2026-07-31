@@ -190,4 +190,4 @@ make dev-build
 make dev-test
 ```
 
-Use `make run` only when it is safe to stop any existing RepoPrompt instance and launch the debug app.
+For validation that needs the visible debug app, follow the [development workflow](../context/workflows/development.md) and the just-in-time approval invariant in [`AGENTS.md`](../../AGENTS.md); use `make dev-run` instead of the uncoordinated fallback.
