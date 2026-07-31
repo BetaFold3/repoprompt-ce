@@ -103,6 +103,24 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(xhighSelection.effortLevel, .xhigh)
     }
 
+    func testClaudeCodePickerExposesPinnedOpus5AndResolvesItForCLI() throws {
+        let models = AIModel.modelsForProvider(.claudeCode)
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-opus-5")))
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-opus-5:xhigh")))
+
+        let menu = AIModel.claudeCodeMenu(for: models)
+        let opus5Group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-opus-5" })
+        XCTAssertEqual(opus5Group.displayName, "Opus 5")
+        XCTAssertEqual(opus5Group.options.map(\.displayName), ["Low", "Medium", "High", "Max", "XHigh"])
+        XCTAssertEqual(AgentModel.claudeOpus5.contextWindowTokens, 1_000_000)
+
+        let selection = try ClaudeCodeProvider.resolveCLIModelSelection(
+            for: .claudeCodeModel(specifier: "claude-opus-5:xhigh")
+        )
+        XCTAssertEqual(selection.modelArgument, "claude-opus-5")
+        XCTAssertEqual(selection.effortLevel, .xhigh)
+    }
+
     func testCodexReasoningEffortParsesExtendedEffortsWithoutChangingRecommendations() {
         XCTAssertEqual(CodexReasoningEffort.parse("max"), .max)
         XCTAssertEqual(CodexReasoningEffort.parse("maximum"), .max)

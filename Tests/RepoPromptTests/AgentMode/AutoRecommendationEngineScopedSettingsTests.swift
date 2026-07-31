@@ -3,6 +3,14 @@ import XCTest
 
 @MainActor
 final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
+    private var recommendedOpenAIModelRaw: String {
+        OpenAIConfiguredModelSelection(
+            modelID: AIModel.gpt56Sol.modelName,
+            reasoningMode: .pro,
+            reasoningEffort: .high
+        )!.rawValue
+    }
+
     func testOperationIdentityRejectsWorkspaceAndInheritanceChanges() {
         let workspaceID = UUID()
         let identity = AgentModelsOperationIdentity(
@@ -30,7 +38,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
     func testRecommendationSatisfactionUsesTargetEditingScope() throws {
         let fixture = try makeFixture()
         let workspaceID = UUID()
-        let recommended = AIModel.gpt54Pro.rawValue
+        let recommended = recommendedOpenAIModelRaw
         let nonRecommended = AIModel.claude4Sonnet.rawValue
 
         fixture.store.setGlobalAgentModelsProfile(
@@ -96,8 +104,8 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         )
 
         let workspaceProfile = try XCTUnwrap(fixture.store.workspaceAgentModelsProfile(for: workspaceID))
-        XCTAssertEqual(workspaceProfile.planningModelRaw, AIModel.gpt54Pro.rawValue)
-        XCTAssertEqual(workspaceProfile.preferredComposeModelRaw, AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(workspaceProfile.planningModelRaw, recommendedOpenAIModelRaw)
+        XCTAssertEqual(workspaceProfile.preferredComposeModelRaw, recommendedOpenAIModelRaw)
         XCTAssertEqual(fixture.store.globalAgentModelsProfile(), globalProfile)
     }
 

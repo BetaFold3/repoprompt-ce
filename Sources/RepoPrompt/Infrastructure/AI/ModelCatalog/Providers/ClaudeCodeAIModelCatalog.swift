@@ -26,6 +26,7 @@ enum ClaudeCodeAIModelCatalog {
         ModelDefinition(runtimeModelRaw: "claude-fable-5", displayName: "Fable 5", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "opus[1m]", displayName: "Opus Latest (1M)", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "opus", displayName: "Opus Latest", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
+        ModelDefinition(runtimeModelRaw: "claude-opus-5", displayName: "Opus 5", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-7", displayName: "Opus 4.7", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-6", displayName: "Opus 4.6", supportedEfforts: [.low, .medium, .high, .max, .xhigh]),
         ModelDefinition(runtimeModelRaw: "claude-opus-4-5-20251101", displayName: "Opus 4.5", supportedEfforts: []),

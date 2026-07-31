@@ -72,6 +72,8 @@ public enum AIModel: Equatable, Hashable {
     case gpt54MiniHigh
     case gpt54MiniXHigh
     case gpt54Nano
+    case gpt56Sol
+    case openAIConfigured(selection: OpenAIConfiguredModelSelection)
 
     case gpt5CodexLow
     case gpt5CodexMed
@@ -127,6 +129,7 @@ public enum AIModel: Equatable, Hashable {
 
     // Anthropic Models
     case claude45Haiku
+    case claude5Opus
     case claude4Sonnet
     case claude4SonnetThinking
     case claude4SonnetThinkingMax
@@ -292,6 +295,7 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .gpt54MiniHigh, rawValue: "gpt-5.4-mini-high", actualName: "gpt-5.4-mini", displayName: "GPT-5.4 Mini High", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt54MiniXHigh, rawValue: "gpt-5.4-mini-xhigh", actualName: "gpt-5.4-mini", displayName: "GPT-5.4 Mini XHigh", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt54Nano, rawValue: "gpt-5.4-nano", actualName: nil, displayName: "GPT-5.4 Nano", provider: ProviderIndex.openAI),
+        ModelInfo(model: .gpt56Sol, rawValue: "gpt-5.6-sol", actualName: nil, displayName: "GPT-5.6 Sol", provider: ProviderIndex.openAI),
 
         ModelInfo(model: .gpt5CodexLow, rawValue: "gpt-5.1-codex-max-low", actualName: "gpt-5.1-codex-max", displayName: "GPT-5.1 Codex Max Low", provider: ProviderIndex.openAI),
         ModelInfo(model: .gpt5CodexMed, rawValue: "gpt-5.1-codex-max", actualName: nil, displayName: "GPT-5.1 Codex Max Med", provider: ProviderIndex.openAI),
@@ -347,6 +351,7 @@ public enum AIModel: Equatable, Hashable {
 
         // Anthropic Models
         ModelInfo(model: .claude45Haiku, rawValue: "claude-haiku-4-5", actualName: nil, displayName: "Claude Haiku 4.5", provider: ProviderIndex.anthropic),
+        ModelInfo(model: .claude5Opus, rawValue: "claude-opus-5", actualName: nil, displayName: "Claude Opus 5", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claude4Sonnet, rawValue: "claude-sonnet-4-5-20250929", actualName: nil, displayName: "Claude Sonnet 4.5", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claude4SonnetThinking, rawValue: "claude-sonnet-4-5-20250929-thinking", actualName: nil, displayName: "Claude Sonnet 4.5 Thinking", provider: ProviderIndex.anthropic),
         ModelInfo(model: .claude4SonnetThinkingMax, rawValue: "claude-sonnet-4-5-20250929-thinking-max", actualName: nil, displayName: "Claude Sonnet 4.5 Thinking Max", provider: ProviderIndex.anthropic),
@@ -511,6 +516,8 @@ public enum AIModel: Equatable, Hashable {
             return "openai_custom_responses_\(n)"
         case let .openaiCustomReasoning(n, effort):
             return "openai_custom_reasoning_\(effort.rawValue)__\(n)"
+        case let .openAIConfigured(selection):
+            return selection.rawValue
         case let .claudeCodeModel(specifier):
             return "\(ClaudeCodeAIModelCatalog.rawPrefix)\(ClaudeCodeAIModelCatalog.normalizedSpecifier(specifier))"
         case let .anthropicCustom(n):
@@ -557,6 +564,12 @@ public enum AIModel: Equatable, Hashable {
         if case let .openaiCustom(n) = self { return "\(n)" }
         if case let .openaiCustomResponses(n) = self { return "\(n)" }
         if case let .openaiCustomReasoning(n, effort) = self { return "\(n) \(effort.displayName)" }
+        if case let .openAIConfigured(selection) = self {
+            let name = selection.modelID == AIModel.gpt56Sol.modelName
+                ? "GPT-5.6 Sol"
+                : selection.modelID
+            return "\(name) · \(selection.reasoningMode.displayName) · \(selection.reasoningEffort.displayName)"
+        }
         if case let .claudeCodeModel(specifier) = self { return ClaudeCodeAIModelCatalog.displayName(for: specifier) }
         if case let .anthropicCustom(n) = self { return "\(n)" }
         if case let .geminiCustom(n) = self { return "\(n)" }
@@ -644,7 +657,7 @@ public enum AIModel: Equatable, Hashable {
             return .customProvider
         case .ollama:
             return .ollama
-        case .openaiCustom, .openaiCustomResponses, .openaiCustomReasoning:
+        case .openaiCustom, .openaiCustomResponses, .openaiCustomReasoning, .openAIConfigured:
             return .openAI
         case .anthropicCustom: return .anthropic
         case .geminiCustom: return .gemini
@@ -697,6 +710,8 @@ public enum AIModel: Equatable, Hashable {
             return n
         case let .openaiCustomReasoning(n, _):
             return n
+        case let .openAIConfigured(selection):
+            return selection.modelID
         case let .claudeCodeModel(specifier):
             return ClaudeModelSpecifier(raw: specifier).runtimeModelParam ?? ""
         case let .anthropicCustom(n),
@@ -936,6 +951,7 @@ public enum AIModel: Equatable, Hashable {
             .gpt54MiniHigh,
             .gpt54MiniXHigh,
             .gpt54Nano,
+            .gpt56Sol,
             .gpt5CodexLow,
             .gpt5CodexMed,
             .gpt5CodexHigh,
@@ -947,6 +963,10 @@ public enum AIModel: Equatable, Hashable {
         }
 
         if case .openaiCustomReasoning = self {
+            return true
+        }
+
+        if case .openAIConfigured = self {
             return true
         }
 
@@ -1008,6 +1028,7 @@ public enum AIModel: Equatable, Hashable {
              .openaiCustom(_),
              .openaiCustomResponses(_),
              .openaiCustomReasoning(_, _),
+             .openAIConfigured(_),
              .anthropicCustom(_),
              .geminiCustom(_),
              .deepseekCustom(_),
@@ -1038,6 +1059,7 @@ public enum AIModel: Equatable, Hashable {
         if case let .openAIServiceTierVariant(base, _) = self {
             return base.isOpenAIModel
         }
+        if case .openAIConfigured = self { return true }
         return Self.modelGroups[ProviderIndex.openAI].contains(self)
     }
 
@@ -1090,6 +1112,12 @@ public enum AIModel: Equatable, Hashable {
         if self == .gpt5Pro || self == .gpt5ProXHigh || self == .gpt54Pro || self == .gpt54ProXHigh {
             return false
         }
+        if case let .openAIConfigured(selection) = self, selection.reasoningMode == .pro {
+            return false
+        }
+        if case let .openAIConfigured(selection) = self, selection.supportsStreaming == false {
+            return false
+        }
         return true
     }
 
@@ -1122,6 +1150,8 @@ public enum AIModel: Equatable, Hashable {
             return ClaudeModelSpecifier(raw: specifier).explicitEffortLevel?.rawValue
         case let .openaiCustomReasoning(_, effort):
             return effort.rawValue
+        case let .openAIConfigured(selection):
+            return selection.reasoningEffort.rawValue
         default: return nil
         }
     }
@@ -1243,6 +1273,13 @@ public enum AIModel: Equatable, Hashable {
         }
         if normalizedRawValue.starts(with: "cursor_custom_") {
             return .cursorCustom(name: String(normalizedRawValue.dropFirst("cursor_custom_".count)))
+        }
+
+        if normalizedRawValue.hasPrefix(OpenAIConfiguredModelSelection.rawPrefix)
+            || normalizedRawValue.hasPrefix(OpenAIConfiguredModelSelection.capabilityRawPrefix)
+        {
+            guard let selection = OpenAIConfiguredModelSelection(rawValue: normalizedRawValue) else { return nil }
+            return .openAIConfigured(selection: selection)
         }
 
         if normalizedRawValue.starts(with: "openai_custom_reasoning_") {
@@ -1951,6 +1988,7 @@ public enum AIModel: Equatable, Hashable {
         case openaiCustom(name: String)
         case openaiCustomResponses(name: String)
         case openaiCustomReasoning(name: String, effort: CodexReasoningEffort)
+        case openAIConfigured(selection: OpenAIConfiguredModelSelection)
         case anthropicCustom(name: String)
         case geminiCustom(name: String)
         case deepseekCustom(name: String)
@@ -1983,6 +2021,7 @@ public enum AIModel: Equatable, Hashable {
         case gpt54MiniHigh
         case gpt54MiniXHigh
         case gpt54Nano
+        case gpt56Sol
         case gpt5CodexLow
         case gpt5CodexMed
         case gpt5CodexHigh
@@ -2029,6 +2068,7 @@ public enum AIModel: Equatable, Hashable {
         case o3Low
         case o3High
         case claude45Haiku
+        case claude5Opus
         case claude4Sonnet
         case claude4SonnetThinking
         case claude4SonnetThinkingMax
@@ -2094,6 +2134,8 @@ public enum AIModel: Equatable, Hashable {
             .openaiCustomResponses(name: name)
         case let .openaiCustomReasoning(name, effort):
             .openaiCustomReasoning(name: name, effort: effort)
+        case let .openAIConfigured(selection):
+            .openAIConfigured(selection: selection)
         case let .anthropicCustom(name):
             .anthropicCustom(name: name)
         case let .geminiCustom(name):
@@ -2150,6 +2192,8 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.gpt54MiniXHigh)
         case .gpt54Nano:
             .staticCase(.gpt54Nano)
+        case .gpt56Sol:
+            .staticCase(.gpt56Sol)
         case .gpt5CodexLow:
             .staticCase(.gpt5CodexLow)
         case .gpt5CodexMed:
@@ -2242,6 +2286,8 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.o3High)
         case .claude45Haiku:
             .staticCase(.claude45Haiku)
+        case .claude5Opus:
+            .staticCase(.claude5Opus)
         case .claude4Sonnet:
             .staticCase(.claude4Sonnet)
         case .claude4SonnetThinking:

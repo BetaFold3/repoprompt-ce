@@ -308,12 +308,12 @@ enum BestPracticeProfiles {
         id: "bestPlanning",
         title: "Best Planning",
         modelLabel: "GPT-5.6 Sol",
-        accessLabel: "ChatGPT Pro export",
+        accessLabel: "OpenAI API Pro / ChatGPT Pro",
         modelString: "gpt-5.6-sol",
         agentKind: nil,
         agentModel: nil,
         strengths: [
-            "Use ChatGPT Pro's current GPT-5.6 Sol export/planning mode without forcing a RepoPrompt effort suffix",
+            "Use GPT-5.6 Sol Pro through the OpenAI API provider or ChatGPT Pro",
             "Can reason about entire codebases at once",
             "Produces clear, actionable architectural specifications",
             "Catches edge cases and implications other models miss"
@@ -380,7 +380,8 @@ enum BestPracticeProfiles {
     // MARK: Explanatory Text
 
     static let codexVsOpenAIExplanation = """
-    GPT-5.6 Sol is available to RepoPrompt through Codex CLI; do not configure it as an OpenAI API/OpenRouter model.
+    GPT-5.6 Sol is available through both Codex CLI and the direct OpenAI API provider. \
+    The API provider exposes Standard/Pro reasoning mode independently from effort; OpenRouter compatibility is not implied.
 
     Use GPT‑5.6 Sol Low via Codex CLI for Context Builder discovery and explore, \
     GPT‑5.6 Sol Medium for Engineer/default implementation, and GPT‑5.6 Sol High for Oracle, review, and pair-agent work. Use effort-neutral GPT‑5.6 Sol for ChatGPT Pro export/planning.

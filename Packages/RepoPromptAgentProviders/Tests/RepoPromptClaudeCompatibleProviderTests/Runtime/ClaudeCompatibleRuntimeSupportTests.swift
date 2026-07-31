@@ -167,11 +167,15 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(claude.options.first?.isPlaceholderDefault, true)
         XCTAssertTrue(claude.options.contains { $0.rawValue == "claude-fable-5" && $0.supportedEffortLevels.contains("xhigh") })
         XCTAssertTrue(claude.options.contains { $0.rawValue == "opus[1m]" && $0.supportedEffortLevels.contains("xhigh") })
+        let opus5 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-opus-5" })
+        XCTAssertEqual(opus5.displayName, "Opus 5")
+        XCTAssertEqual(opus5.supportedEffortLevels, ["low", "medium", "high", "max", "xhigh"])
         let sonnet5 = try XCTUnwrap(claude.options.first { $0.rawValue == "claude-sonnet-5" })
         XCTAssertEqual(sonnet5.displayName, "Sonnet 5")
         XCTAssertEqual(sonnet5.supportedEffortLevels, ["low", "medium", "high", "max", "xhigh"])
 
         let expandedClaude = ClaudeCompatibleModelCatalog.snapshot(pluginID: .claudeCode)
+        XCTAssertTrue(expandedClaude.options.contains { $0.rawValue == "claude-opus-5:xhigh" })
         XCTAssertTrue(expandedClaude.options.contains { $0.rawValue == "claude-sonnet-5:max" })
         XCTAssertTrue(expandedClaude.options.contains { $0.rawValue == "claude-sonnet-5:xhigh" })
 

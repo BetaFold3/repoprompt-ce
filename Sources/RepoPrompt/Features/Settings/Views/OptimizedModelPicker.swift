@@ -162,6 +162,14 @@ struct OptimizedModelPicker: View {
                     modelButton(option.model, title: option.displayName)
                 }
             }
+        } else if provider == .openAI {
+            ForEach(models, id: \.rawValue) { model in
+                if model.openAIServiceTierBase == .gpt56Sol {
+                    openAIGPT56SolMenu(model)
+                } else {
+                    modelButton(model)
+                }
+            }
         } else if provider == .openCode {
             ForEach(AIModel.openCodeMenu(for: models).providerGroups) { providerGroup in
                 if providerGroup.rendersAsSubmenu {
@@ -175,6 +183,28 @@ struct OptimizedModelPicker: View {
         } else {
             ForEach(models, id: \.rawValue) { model in
                 modelButton(model)
+            }
+        }
+    }
+
+    private func openAIGPT56SolMenu(_ model: AIModel) -> some View {
+        Menu(model.displayName) {
+            ForEach(OpenAIReasoningMode.allCases, id: \.rawValue) { mode in
+                Menu(mode.displayName) {
+                    ForEach(OpenAIConfiguredModelSelection.supportedEfforts, id: \.rawValue) { effort in
+                        if let selection = OpenAIConfiguredModelSelection(
+                            modelID: AIModel.gpt56Sol.modelName,
+                            reasoningMode: mode,
+                            reasoningEffort: effort
+                        ) {
+                            let configured = AIModel.openAIConfigured(selection: selection)
+                            let selectedModel = model.openAIServiceTierOverride.map {
+                                AIModel.openAIServiceTierVariant(base: configured, tier: $0)
+                            } ?? configured
+                            modelButton(selectedModel, title: effort.displayName)
+                        }
+                    }
+                }
             }
         }
     }

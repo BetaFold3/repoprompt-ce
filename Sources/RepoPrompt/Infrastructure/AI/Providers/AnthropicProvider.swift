@@ -3,15 +3,20 @@ import SwiftAnthropic
 
 class AnthropicProvider: AIProvider {
     private let service: AnthropicService
+    private let requestEncoder: AnthropicRequestEncoder
 
     init(apiKey: String, betaHeaders: [String] = ["messages-2023-12-15", "prompt-caching-2024-07-31", "output-128k-2025-02-19"]) {
         service = AnthropicServiceFactory.service(apiKey: apiKey, betaHeaders: betaHeaders)
+        requestEncoder = AnthropicRequestEncoder(
+            apiKey: apiKey,
+            betaHeaders: betaHeaders
+        )
     }
 
-    private func createMessages(for aiMessage: AIMessage) -> [MessageParameter.Message] {
+    private func createMessages(for aiMessage: AIMessage) -> [AnthropicRequestMessage] {
         let tail = aiMessage.buildTail(embedSystemPrompt: false)
         let lastUserIndex = aiMessage.conversationMessages.lastIndex { $0.role == .user }
-        var messages: [MessageParameter.Message] = []
+        var messages: [AnthropicRequestMessage] = []
 
         for (idx, entry) in aiMessage.conversationMessages.enumerated() {
             let contentText: String = if let lastIdx = lastUserIndex,
@@ -24,11 +29,11 @@ class AnthropicProvider: AIProvider {
                 entry.content
             }
 
-            let role: MessageParameter.Message.Role = (entry.role == .user) ? .user : .assistant
+            let role: AnthropicRequestMessage.Role = (entry.role == .user) ? .user : .assistant
             messages.append(
-                MessageParameter.Message(
+                AnthropicRequestMessage(
                     role: role,
-                    content: .text(contentText)
+                    content: contentText
                 )
             )
         }
@@ -36,14 +41,23 @@ class AnthropicProvider: AIProvider {
         return messages
     }
 
-    private func createSystemParameter(systemPrompt: String) -> MessageParameter.System {
-        .list([
-            MessageParameter.Cache(
-                type: .text,
-                text: systemPrompt,
-                cacheControl: MessageParameter.CacheControl(type: .ephemeral)
-            )
-        ])
+    private func createSystemBlocks(systemPrompt: String) -> [AnthropicSystemBlock] {
+        [AnthropicSystemBlock(text: systemPrompt)]
+    }
+
+    private func createRequestPlan(
+        for aiMessage: AIMessage,
+        model: AIModel,
+        maxTokens: Int?,
+        fallbackMaxTokens: Int,
+        defaultTemperature: Double?
+    ) throws -> AnthropicRequestPlan {
+        try AnthropicRequestPlan.resolve(
+            modelID: model.modelName,
+            requestedMaxTokens: maxTokens,
+            fallbackMaxTokens: fallbackMaxTokens,
+            temperature: aiMessage.effectiveTemperature(for: model) ?? defaultTemperature
+        )
     }
 
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
@@ -60,67 +74,31 @@ class AnthropicProvider: AIProvider {
             throw AIProviderError.invalidSystemPrompt
         }
 
-        // Get the model name and strip thinking suffix if present
-        let modelName = model.modelName
-        let baseModelName: String
-        let isThinkingMode: Bool
-        let thinkingBudget: Int
-        var overrideMaxTokens = 8192
-
-        if modelName.hasSuffix("-thinking-max") {
-            baseModelName = String(modelName.dropLast("-thinking-max".count))
-            isThinkingMode = true
-            thinkingBudget = 32000
-            overrideMaxTokens = 64000
-        } else if modelName.hasSuffix("-thinking") {
-            baseModelName = String(modelName.dropLast("-thinking".count))
-            isThinkingMode = true
-            // Check if it's Opus thinking (different budget)
-            if modelName.contains("opus") {
-                thinkingBudget = 16000
-                overrideMaxTokens = 32000
-            } else {
-                // Sonnet thinking
-                thinkingBudget = 16000
-                overrideMaxTokens = 64000
-            }
-        } else {
-            baseModelName = modelName
-            isThinkingMode = false
-            thinkingBudget = 0
-        }
-
-        let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
-
-        // Use your existing helper functions
-        let systemParameter = createSystemParameter(systemPrompt: aiMessage.systemPrompt)
+        let plan = try createRequestPlan(
+            for: aiMessage,
+            model: model,
+            maxTokens: maxTokens,
+            fallbackMaxTokens: 8192,
+            defaultTemperature: 0
+        )
+        let system = createSystemBlocks(systemPrompt: aiMessage.systemPrompt)
         let messages = createMessages(for: aiMessage)
-
-        var temperature: Double? = 0
-        // Skip temperature setting for thinking models
-        if isThinkingMode {
-            temperature = nil
-        }
-        // Apply user-defined temperature if override is enabled (for non-thinking models)
-        else if let messageTemperature = aiMessage.effectiveTemperature(for: model) {
-            temperature = messageTemperature
-        }
-
-        // Create parameters with thinking mode if needed
-        let parameters = MessageParameter(
-            model: anthropicModel,
+        let payload = AnthropicMessageRequest(
+            plan: plan,
             messages: messages,
-            maxTokens: overrideMaxTokens,
-            system: systemParameter,
-            stream: true,
-            temperature: temperature,
-            thinking: isThinkingMode ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
+            system: system,
+            stream: true
+        )
+        let request = try requestEncoder.makeRequest(payload)
+
+        let stream = try await service.fetchStream(
+            type: MessageStreamResponse.self,
+            with: request,
+            debugEnabled: false
         )
 
-        let stream = try await service.streamMessage(parameters)
-
         return AsyncThrowingStream { continuation in
-            Task {
+            let bridgeTask = Task {
                 do {
                     // Track current thinking content
                     var currentThinking = ""
@@ -197,62 +175,37 @@ class AnthropicProvider: AIProvider {
                     continuation.finish(throwing: error)
                 }
             }
+            continuation.onTermination = { _ in bridgeTask.cancel() }
         }
     }
 
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int? = nil) async throws -> AICompletionResult {
-        // Get the model name and strip thinking suffix if present
-        let modelName = model.modelName
-        let baseModelName: String
-        let isThinkingMode: Bool
-        let thinkingBudget: Int
-        var overrideMaxTokens = maxTokens ?? 4096
-
-        if modelName.hasSuffix("-thinking-max") {
-            baseModelName = String(modelName.dropLast("-thinking-max".count))
-            isThinkingMode = true
-            thinkingBudget = 32000
-            if maxTokens == nil { overrideMaxTokens = 64000 }
-        } else if modelName.hasSuffix("-thinking") {
-            baseModelName = String(modelName.dropLast("-thinking".count))
-            isThinkingMode = true
-            // Check if it's Opus thinking (different budget)
-            if modelName.contains("opus") {
-                thinkingBudget = 16000
-                if maxTokens == nil { overrideMaxTokens = 32000 }
-            } else {
-                // Sonnet thinking
-                thinkingBudget = 16000
-                if maxTokens == nil { overrideMaxTokens = 64000 }
-            }
-        } else {
-            baseModelName = modelName
-            isThinkingMode = false
-            thinkingBudget = 0
-        }
-
-        let anthropicModel = SwiftAnthropic.Model.other(baseModelName)
-        return try await completeMessage(aiMessage, model: anthropicModel, maxTokens: overrideMaxTokens, isThinkingMode: isThinkingMode, thinkingBudget: thinkingBudget)
-    }
-
-    private func completeMessage(_ aiMessage: AIMessage, model: SwiftAnthropic.Model, maxTokens: Int? = nil, isThinkingMode: Bool = false, thinkingBudget: Int = 0) async throws -> AICompletionResult {
         guard !aiMessage.systemPrompt.isEmpty else {
             throw AIProviderError.invalidSystemPrompt
         }
 
-        let systemParameter = createSystemParameter(systemPrompt: aiMessage.systemPrompt)
-        let messages = createMessages(for: aiMessage)
-
-        let parameters = MessageParameter(
+        let plan = try createRequestPlan(
+            for: aiMessage,
             model: model,
-            messages: messages,
-            maxTokens: maxTokens ?? 4096,
-            system: systemParameter,
-            stream: false,
-            thinking: isThinkingMode ? MessageParameter.Thinking(budgetTokens: thinkingBudget) : nil
+            maxTokens: maxTokens,
+            fallbackMaxTokens: 4096,
+            defaultTemperature: nil
         )
+        let system = createSystemBlocks(systemPrompt: aiMessage.systemPrompt)
+        let messages = createMessages(for: aiMessage)
+        let payload = AnthropicMessageRequest(
+            plan: plan,
+            messages: messages,
+            system: system,
+            stream: false
+        )
+        let request = try requestEncoder.makeRequest(payload)
 
-        let response = try await service.createMessage(parameters)
+        let response = try await service.fetch(
+            type: MessageResponse.self,
+            with: request,
+            debugEnabled: false
+        )
 
         let text = response.content.compactMap { contentItem in
             switch contentItem {
@@ -289,7 +242,7 @@ class AnthropicProvider: AIProvider {
 
     func testAPIKey() async throws -> Bool {
         let testMessage = AIMessage(systemPrompt: "You are a helpful assistant.", userMessage: "Say hello")
-        let result = try await completeMessage(testMessage, model: .claude3Haiku)
+        let result = try await completeMessage(testMessage, model: .claude45Haiku)
         return result.text.lowercased().contains("hello")
     }
 }
