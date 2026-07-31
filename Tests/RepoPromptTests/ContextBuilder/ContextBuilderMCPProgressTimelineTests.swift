@@ -232,6 +232,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                                 model: "unconfigured-test-model"
                             ),
                             chatPresetID: nil,
+                            modelPresetID: nil,
                             mcpControlInfo: nil
                         )
                     }

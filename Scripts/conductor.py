@@ -4123,6 +4123,65 @@ def activate_staged_debug_bundle(staged_bundle: Path, live_bundle: Optional[Path
     print(f"Activated staged debug app bundle: {live}", flush=True)
 
 
+def repair_debug_app_compatibility_link(repo_root: Path, live_bundle: Path) -> Path:
+    compatibility_bundle = repo_root / ".build" / "debug" / "RepoPrompt.app"
+    if compatibility_bundle == live_bundle:
+        return compatibility_bundle
+
+    executable = live_bundle / "Contents" / "MacOS" / "RepoPrompt"
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise ConductorError(f"activated debug app bundle is not launchable: {live_bundle}")
+
+    compatibility_bundle.parent.mkdir(parents=True, exist_ok=True)
+    temporary_link = compatibility_bundle.parent / f".{compatibility_bundle.name}.link.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    try:
+        temporary_link.symlink_to(live_bundle)
+        if compatibility_bundle.is_dir() and not compatibility_bundle.is_symlink():
+            shutil.rmtree(compatibility_bundle)
+        os.replace(temporary_link, compatibility_bundle)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_link.unlink()
+    print(f"Compatibility app bundle link: {compatibility_bundle} -> {live_bundle}", flush=True)
+    return compatibility_bundle
+
+
+def launch_services_cannot_resolve_executable(stderr: str) -> bool:
+    return any(
+        marker in stderr
+        for marker in (
+            "kLSNoExecutableErr",
+            "Code=-10827",
+            "kLSServerCommunicationErr",
+            "Code=-10822",
+        )
+    )
+
+
+def launch_debug_app_executable_directly(executable: Path, app_args: Sequence[str], repo_root: Path) -> bool:
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        print(f"ERROR: direct-launch executable is missing or not executable: {executable}", flush=True)
+        return False
+    argv = [str(executable), *app_args]
+    print("LaunchServices could not resolve the verified app bundle; launching its executable directly.", flush=True)
+    print(f"$ {format_argv(argv)}", flush=True)
+    try:
+        process = subprocess.Popen(
+            argv,
+            cwd=str(repo_root),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as exc:
+        print(f"ERROR: direct debug app launch failed: {exc}", flush=True)
+        return False
+    print(f"Started direct debug app process PID {process.pid}", flush=True)
+    return True
+
+
 def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
     bundle = debug_app_bundle_path()
     staged_value = args.get("stagedBundle")
@@ -4153,13 +4212,28 @@ def operation_app_launch_existing(repo_root: Path, args: Dict[str, Any]) -> int:
                 activate_staged_debug_bundle(staged_bundle, bundle)
                 activated = True
                 report_launch_bundle_details(repo_root, bundle)
+            executable = bundle / "Contents" / "MacOS" / "RepoPrompt"
+            if not executable.is_file() or not os.access(executable, os.X_OK):
+                print(f"ERROR: activated debug app bundle is not launchable: {bundle}", flush=True)
+                return 1
+            repair_debug_app_compatibility_link(repo_root, bundle)
             app_args = [str(arg) for arg in args.get("appArgs") or []]
             argv = ["open", "-n", str(bundle)]
             if app_args:
                 argv.extend(["--args", *app_args])
-            code, _stdout, _stderr = run_operation_command("launch existing debug app", argv, repo_root)
+            code, _stdout, stderr = run_operation_command(
+                "launch existing debug app",
+                argv,
+                repo_root,
+                allow_exit_codes={0, 1},
+            )
             if code != 0:
-                return code
+                if code == 1 and launch_services_cannot_resolve_executable(stderr):
+                    if not launch_debug_app_executable_directly(executable, app_args, repo_root):
+                        return 1
+                else:
+                    print(f"FAILED stage 'launch existing debug app' with status {code}", flush=True)
+                    return code
             try:
                 launched_pids = wait_for_debug_app_process()
             except ProcessIdentityError as exc:

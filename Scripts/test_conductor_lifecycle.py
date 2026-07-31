@@ -2393,6 +2393,9 @@ class RunScriptTransitionTests(unittest.TestCase):
             result = subprocess.run(["bash", str(run_script), "--demo"], env=env, text=True, capture_output=True, timeout=20)
             events = event_log.read_text(encoding="utf-8").splitlines()
             activated_executable_exists = app_executable.exists()
+            compatibility_bundle = root / ".build" / "debug" / "RepoPrompt.app"
+            compatibility_target = compatibility_bundle.resolve(strict=True)
+            app_bundle_target = app_bundle.resolve(strict=True)
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         expected_suffix = f":{app_executable}"
@@ -2406,6 +2409,7 @@ class RunScriptTransitionTests(unittest.TestCase):
         self.assertTrue(all(event.endswith(expected_suffix) for event in events if event.startswith(("list:", "terminate:"))))
         source = (SCRIPT_DIR / "run.sh").read_text(encoding="utf-8")
         self.assertTrue(activated_executable_exists)
+        self.assertEqual(compatibility_target, app_bundle_target)
         self.assertIn("Activated staged debug app bundle", result.stdout)
         self.assertIn("Observed launched RepoPrompt CE debug PID(s): 4242", result.stdout)
         self.assertNotIn("pgrep", source)
@@ -2432,6 +2436,69 @@ class AppStatusIdentityTests(unittest.TestCase):
             self.assertEqual((live / "Contents" / "MacOS" / "RepoPrompt").read_text(encoding="utf-8"), "new")
             self.assertFalse(staged.parent.exists())
             self.assertFalse(any(live.parent.glob(".RepoPrompt.app.previous.*")))
+
+    def test_repair_compatibility_link_replaces_removed_staging_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            removed_staging = root / "DebugApps" / ".staging" / "removed" / "RepoPrompt.app"
+            self.make_bundle(live, "current")
+            compatibility_bundle = root / ".build" / "debug" / "RepoPrompt.app"
+            compatibility_bundle.parent.mkdir(parents=True)
+            compatibility_bundle.symlink_to(removed_staging)
+
+            repaired = conductor.repair_debug_app_compatibility_link(root, live)
+
+            self.assertEqual(repaired, compatibility_bundle)
+            self.assertTrue(compatibility_bundle.is_symlink())
+            self.assertEqual(compatibility_bundle.resolve(strict=True), live.resolve(strict=True))
+
+    def test_launch_existing_falls_back_when_launch_services_cannot_resolve_verified_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            self.make_bundle(live, "current")
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                conductor, "machine_exclusive_lock", return_value=contextlib.nullcontext()
+            ), mock.patch.object(conductor, "report_launch_bundle_details"), mock.patch.object(
+                conductor, "_operation_app_stop_unlocked", return_value=0
+            ), mock.patch.object(
+                conductor,
+                "run_operation_command",
+                return_value=(1, "", 'Code=-10827 "kLSNoExecutableErr: The executable is missing"'),
+            ) as launch_services, mock.patch.object(
+                conductor, "launch_debug_app_executable_directly", return_value=True
+            ) as direct_launch, mock.patch.object(
+                conductor, "wait_for_debug_app_process", return_value=["4242"]
+            ), contextlib.redirect_stdout(output):
+                code = conductor.operation_app_launch_existing(root, {"appArgs": ["--demo"]})
+
+            compatibility_bundle = root / ".build" / "debug" / "RepoPrompt.app"
+            self.assertEqual(code, 0)
+            self.assertEqual(compatibility_bundle.resolve(strict=True), live.resolve(strict=True))
+            launch_services.assert_called_once()
+            direct_launch.assert_called_once_with(live / "Contents" / "MacOS" / "RepoPrompt", ["--demo"], root)
+            self.assertIn("Observed launched RepoPrompt CE debug PID(s): 4242", output.getvalue())
+
+    def test_launch_existing_does_not_fallback_for_unrelated_open_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            live = root / "DebugApps" / "RepoPrompt.app"
+            self.make_bundle(live, "current")
+            with mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": str(live)}), mock.patch.object(
+                conductor, "machine_exclusive_lock", return_value=contextlib.nullcontext()
+            ), mock.patch.object(conductor, "report_launch_bundle_details"), mock.patch.object(
+                conductor, "_operation_app_stop_unlocked", return_value=0
+            ), mock.patch.object(
+                conductor, "run_operation_command", return_value=(1, "", "unrelated open failure")
+            ), mock.patch.object(conductor, "launch_debug_app_executable_directly") as direct_launch, contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                code = conductor.operation_app_launch_existing(root, {"appArgs": []})
+
+            self.assertEqual(code, 1)
+            direct_launch.assert_not_called()
 
     def test_staged_launch_stop_failure_preserves_live_and_cleans_staging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -916,7 +916,7 @@ class SystemPromptService {
         **Important Notes**
         - Always explore before editing unfamiliar code
         - For multi-file changes, work methodically file by file
-        - Prefer continuing Oracle chats (`ask_oracle` with `new_chat:false`) unless a fresh thread is necessary
+        - Prefer continuing Oracle chats (`ask_oracle` with `new_chat:false` and the chat's `chat_id`) unless a fresh thread is necessary; a continued chat keeps its own model preset
         \(agentDelegationFinalNote)
         - If something goes wrong, explain what happened and offer to fix it\(askForHelpNote)
         """
@@ -976,7 +976,7 @@ class SystemPromptService {
         	"model":"model-id-from-oracle_utils"
         }}
         ```
-        After that first message, continue with `new_chat:false`.
+        After that first message, continue with `new_chat:false` and the returned `chat_id`. The chat keeps the model preset it last used, so you do not need to repeat `model`; passing a different one switches that chat.
 
         ### 2) Curate context for the current step
         ```json

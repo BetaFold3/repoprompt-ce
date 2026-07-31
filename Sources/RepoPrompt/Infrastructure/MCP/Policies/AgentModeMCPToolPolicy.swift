@@ -18,7 +18,7 @@ enum AgentModeMCPToolPolicy {
     static let knowledgeAllowedTools = KnowledgeSessionPolicy.allowedMCPToolNames
 
     static let knowledgeAskOracleDescription = """
-    Consult an Oracle model using the current repository evidence. Resolve exact selectable preset names or UUIDs with oracle_utils op=models. For independent opinions, issue calls together in one tool-call batch, each with new_chat:true and an explicit model. Continue each lane with its returned chat_id and new_chat:false. Before synthesis, verify each response's model_preset_id and model_preset_name. No packet, hash, manifest, or verification-gate ritual is required.
+    Consult an Oracle model using the current repository evidence. Resolve exact selectable preset names or UUIDs with oracle_utils op=models. For independent opinions, issue calls together in one tool-call batch, each with new_chat:true and an explicit model. Continue each lane with its returned chat_id and new_chat:false; the lane keeps its own model preset, so model can be omitted, and the call fails rather than switching models if that preset is no longer usable. No packet, hash, manifest, or verification-gate ritual is required.
     """
 
     /// Tools granted to legacy/generic agent mode runs (from MCPPolicyGatedTools).

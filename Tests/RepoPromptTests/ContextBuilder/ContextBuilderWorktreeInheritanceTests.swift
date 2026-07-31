@@ -2138,15 +2138,32 @@ import XCTest
                                 && $0.agentModeSessionID == agentModeSessionID
                                 && $0.agentModeRunID == agentModeRunID
                         }))
+                        // Same-session continuation under a rotated run (app relaunch or
+                        // controller recreation) stays owned and advances the ephemeral
+                        // run stamp instead of orphaning the lane.
+                        let rotatedRunID = UUID()
+                        let rotatedID = try await window.oracleViewModel.locateOrCreateChat(
+                            persisted.shortID,
+                            tabID: fixture.contextB.tabID,
+                            activateInUI: false,
+                            agentModeSessionID: agentModeSessionID,
+                            agentModeRunID: rotatedRunID
+                        )
+                        XCTAssertEqual(rotatedID, persisted.session.id)
+                        XCTAssertTrue(window.oracleViewModel.sessions.contains(where: {
+                            $0.id == persisted.session.id
+                                && $0.agentModeSessionID == agentModeSessionID
+                                && $0.agentModeRunID == rotatedRunID
+                        }))
                         do {
                             _ = try await window.oracleViewModel.locateOrCreateChat(
                                 persisted.shortID,
                                 tabID: fixture.contextB.tabID,
                                 activateInUI: false,
-                                agentModeSessionID: agentModeSessionID,
-                                agentModeRunID: UUID()
+                                agentModeSessionID: UUID(),
+                                agentModeRunID: rotatedRunID
                             )
-                            XCTFail("Expected strict continuation ownership mismatch to fail closed")
+                            XCTFail("Expected cross-session continuation ownership mismatch to fail closed")
                         } catch {
                             XCTAssertTrue(error.localizedDescription.contains("different Agent Mode owner"))
                         }

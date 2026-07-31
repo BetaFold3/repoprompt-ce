@@ -342,6 +342,147 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         XCTAssertEqual(collisionResult?.composeTabID, fixture.tabID)
     }
 
+    func testOracleLaneSurvivesRunRotationAndRejectsCrossSession() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+
+        let oracle = fixture.oracleViewModel
+        let sessionID = UUID()
+        let originalRunID = UUID()
+        let rotatedRunID = UUID()
+
+        let lane = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            agentModeSessionID: sessionID,
+            agentModeRunID: originalRunID,
+            name: "Rotated Lane",
+            savedAt: Date(timeIntervalSince1970: 100),
+            messages: [StoredMessage(isUser: false, rawText: "lane history", sequenceIndex: 0)]
+        )
+        oracle.sessions = [lane]
+
+        // Explicit continuation from the same Agent Mode session under a rotated run
+        // (app relaunch / controller recreation) resumes the lane and advances the
+        // ephemeral run stamp.
+        let continuedID = try await oracle.locateOrCreateChat(
+            lane.id.uuidString,
+            tabID: fixture.tabID,
+            activateInUI: false,
+            agentModeSessionID: sessionID,
+            agentModeRunID: rotatedRunID
+        )
+        XCTAssertEqual(continuedID, lane.id)
+        XCTAssertEqual(
+            oracle.sessions.first(where: { $0.id == lane.id })?.agentModeRunID,
+            rotatedRunID
+        )
+
+        // A different Agent Mode session still fails closed with a discriminating message.
+        do {
+            _ = try await oracle.locateOrCreateChat(
+                lane.id.uuidString,
+                tabID: fixture.tabID,
+                activateInUI: false,
+                agentModeSessionID: UUID(),
+                agentModeRunID: rotatedRunID
+            )
+            XCTFail("Expected cross-session continuation to fail closed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("different Agent Mode owner"))
+            XCTAssertTrue(error.localizedDescription.contains("different Agent Mode session"))
+        }
+
+        // Read-only log recovery works across rotation and never advances the stamp.
+        oracle.sessions = [lane]
+        let log = try await oracle.tool_oracleChatLog(
+            args: ["chat_id": .string(lane.id.uuidString)],
+            tabID: fixture.tabID,
+            agentModeSessionID: sessionID,
+            agentModeRunID: rotatedRunID
+        )
+        XCTAssertNotNil(log["messages"])
+        XCTAssertEqual(
+            oracle.sessions.first(where: { $0.id == lane.id })?.agentModeRunID,
+            originalRunID
+        )
+
+        // Implicit sends (no chat_id) never silently adopt a stale-run lane: after a
+        // rotation the send starts a fresh lane. Lane recovery is deliberate —
+        // oracle_chat_log (which echoes the chat_id) then explicit continuation.
+        let implicitID = try await oracle.locateOrCreateChat(
+            nil,
+            tabID: fixture.tabID,
+            activateInUI: false,
+            agentModeSessionID: sessionID,
+            agentModeRunID: rotatedRunID
+        )
+        XCTAssertNotEqual(implicitID, lane.id)
+        XCTAssertEqual(
+            oracle.sessions.first(where: { $0.id == implicitID })?.agentModeSessionID,
+            sessionID
+        )
+
+        // An exact-run lane outranks a stale-run lane even when the stale lane is newer.
+        let exactLane = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            agentModeSessionID: sessionID,
+            agentModeRunID: rotatedRunID,
+            name: "Exact Lane",
+            savedAt: Date(timeIntervalSince1970: 50),
+            messages: [StoredMessage(isUser: false, rawText: "exact history", sequenceIndex: 0)]
+        )
+        let staleNewerLane = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            agentModeSessionID: sessionID,
+            agentModeRunID: originalRunID,
+            name: "Stale Newer Lane",
+            savedAt: Date(timeIntervalSince1970: 200),
+            messages: [StoredMessage(isUser: false, rawText: "stale history", sequenceIndex: 0)]
+        )
+        oracle.sessions = [staleNewerLane, exactLane]
+        let dominantID = try await oracle.locateOrCreateChat(
+            nil,
+            tabID: fixture.tabID,
+            activateInUI: false,
+            agentModeSessionID: sessionID,
+            agentModeRunID: rotatedRunID
+        )
+        XCTAssertEqual(dominantID, exactLane.id)
+
+        // Post-restart shape: the lane is a persisted list stub. Continuation must load
+        // it from disk first, then stamp the canonical loaded entry (activate-then-stamp
+        // ordering) — keeping messages intact while advancing the run stamp.
+        let stubRunID = UUID()
+        var persistedLane = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            agentModeSessionID: sessionID,
+            agentModeRunID: originalRunID,
+            name: "Persisted Stub Lane",
+            savedAt: Date(timeIntervalSince1970: 300),
+            messages: [StoredMessage(isUser: false, rawText: "stub history", sequenceIndex: 0)]
+        )
+        persistedLane.fileURL = try await oracle.chatData.saveChatSession(
+            persistedLane,
+            for: fixture.workspace
+        )
+        oracle.sessions = [persistedLane.listStub()]
+        let stubContinuedID = try await oracle.locateOrCreateChat(
+            persistedLane.id.uuidString,
+            tabID: fixture.tabID,
+            activateInUI: false,
+            agentModeSessionID: sessionID,
+            agentModeRunID: stubRunID
+        )
+        XCTAssertEqual(stubContinuedID, persistedLane.id)
+        let canonical = try XCTUnwrap(oracle.sessions.first(where: { $0.id == persistedLane.id }))
+        XCTAssertEqual(canonical.agentModeRunID, stubRunID)
+        XCTAssertEqual(canonical.messages.count, 1)
+    }
+
     func testExactPersistedResolutionRejectsWrongTabAndUnknownWithoutLatestFallback() async throws {
         let fixture = try await makeFixture()
         defer { fixture.cleanup() }
@@ -1385,6 +1526,567 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let stub = persisted.listStub()
         XCTAssertEqual(stub.lastSendModelID, model.rawValue)
         XCTAssertEqual(stub.lastResponseModelDisplayName, model.displayName)
+    }
+
+    func testChatIDContinuationInheritsLanePresetAndSupportsExplicitMigration() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let settings = GlobalSettingsStore.shared
+        let presetsManager = ModelPresetsManager.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let harness = ParallelOracleTransportHarness()
+
+        defer {
+            harness.finishAll()
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            fixture.cleanup()
+        }
+
+        let fableModel = AIModel.customProviderUser(name: "inheritance-fable")
+        let solModel = AIModel.customProviderUser(name: "inheritance-sol")
+        let fablePreset = ModelPreset(
+            name: "Inheritance Fable",
+            model: fableModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        let solPreset = ModelPreset(
+            name: "Inheritance Sol",
+            model: solModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [fablePreset, solPreset]
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, model in
+            harness.makeStream(message: message, for: model)
+        }
+
+        let packaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: fixture.tabID,
+            sourceWorkspaceID: fixture.workspace.id,
+            sourceSelectionRevision: 0,
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            promptText: "",
+            selection: StoredSelection(selectedPaths: [], codemapAutoEnabled: false),
+            lookupContext: nil,
+            reviewGitContext: FrozenPromptGitReviewContext(
+                artifactCapability: nil,
+                compareIntent: .uncommittedHEAD,
+                displayContext: ReviewGitDisplayContext(roots: [])
+            ),
+            provenance: .direct
+        )
+        let tabContext = OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspace.id,
+            origin: .askOracle,
+            packaging: packaging
+        )
+
+        let openFableTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Open Fable lane"),
+                    "mode": .string("chat"),
+                    "model": .string(fablePreset.id.uuidString),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 1)
+        harness.finish(model: fableModel, text: "Fable opened")
+        let openFableResult = try await openFableTask.value
+        let fableChatID = try XCTUnwrap(openFableResult["chat_id"]?.stringValue)
+
+        let openSolTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Open Sol lane"),
+                    "mode": .string("chat"),
+                    "model": .string(solPreset.id.uuidString),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 2)
+        harness.finish(model: solModel, text: "Sol opened")
+        let openSolResult = try await openSolTask.value
+        let solChatID = try XCTUnwrap(openSolResult["chat_id"]?.stringValue)
+
+        let inheritSolTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Continue Sol lane"),
+                    "mode": .string("chat"),
+                    "chat_id": .string(solChatID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 3)
+        harness.finish(model: solModel, text: "Sol continued")
+        let inheritSolResult = try await inheritSolTask.value
+        XCTAssertEqual(
+            inheritSolResult["model_preset_id"]?.stringValue,
+            solPreset.id.uuidString,
+            "Resolving Fable here would reproduce the pre-fix wrong-lane available.first defect"
+        )
+        XCTAssertEqual(inheritSolResult["model_id"]?.stringValue, solModel.rawValue)
+        XCTAssertEqual(inheritSolResult["model_selection"]?.stringValue, "inherited")
+
+        presetsManager.presets = [solPreset, fablePreset]
+        let inheritFableTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Continue Fable lane"),
+                    "mode": .string("chat"),
+                    "chat_id": .string(fableChatID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 4)
+        harness.finish(model: fableModel, text: "Fable continued")
+        let inheritFableResult = try await inheritFableTask.value
+        XCTAssertEqual(inheritFableResult["model_preset_id"]?.stringValue, fablePreset.id.uuidString)
+        XCTAssertEqual(inheritFableResult["model_id"]?.stringValue, fableModel.rawValue)
+        XCTAssertEqual(inheritFableResult["model_selection"]?.stringValue, "inherited")
+
+        let migrateSolTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Migrate Sol lane to Fable"),
+                    "mode": .string("chat"),
+                    "model": .string(fablePreset.id.uuidString),
+                    "chat_id": .string(solChatID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 5)
+        harness.finish(model: fableModel, text: "Sol lane migrated")
+        let migrateSolResult = try await migrateSolTask.value
+        XCTAssertEqual(migrateSolResult["model_selection"]?.stringValue, "explicit")
+        XCTAssertEqual(migrateSolResult["model_preset_id"]?.stringValue, fablePreset.id.uuidString)
+        let migratedSolSession = try XCTUnwrap(oracle.sessions.first(where: { $0.shortID == solChatID }))
+        XCTAssertEqual(migratedSolSession.lastSendModelPresetID, fablePreset.id)
+    }
+
+    func testChatIDContinuationFailsClosedInsteadOfSubstitutingAPreset() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let settings = GlobalSettingsStore.shared
+        let presetsManager = ModelPresetsManager.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let harness = ParallelOracleTransportHarness()
+
+        defer {
+            harness.finishAll()
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            fixture.cleanup()
+        }
+
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, model in
+            harness.makeStream(message: message, for: model)
+        }
+
+        let packaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: fixture.tabID,
+            sourceWorkspaceID: fixture.workspace.id,
+            sourceSelectionRevision: 0,
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            promptText: "",
+            selection: StoredSelection(selectedPaths: [], codemapAutoEnabled: false),
+            lookupContext: nil,
+            reviewGitContext: FrozenPromptGitReviewContext(
+                artifactCapability: nil,
+                compareIntent: .uncommittedHEAD,
+                displayContext: ReviewGitDisplayContext(roots: [])
+            ),
+            provenance: .direct
+        )
+        let tabContext = OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspace.id,
+            origin: .askOracle,
+            packaging: packaging
+        )
+
+        let deletedModel = AIModel.customProviderUser(name: "fail-closed-deleted")
+        let survivingModel = AIModel.customProviderUser(name: "fail-closed-surviving")
+        let deletedPreset = ModelPreset(
+            name: "Deleted Bound Preset",
+            model: deletedModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        let survivingPreset = ModelPreset(
+            name: "Surviving Preset",
+            model: survivingModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [deletedPreset, survivingPreset]
+
+        let openDeletedTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Open soon-to-be-deleted lane"),
+                    "mode": .string("chat"),
+                    "model": .string(deletedPreset.id.uuidString),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 1)
+        harness.finish(model: deletedModel, text: "Deleted preset lane opened")
+        let openDeletedResult = try await openDeletedTask.value
+        let deletedChatID = try XCTUnwrap(openDeletedResult["chat_id"]?.stringValue)
+        presetsManager.presets = [survivingPreset]
+
+        do {
+            _ = try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Must not substitute surviving preset"),
+                    "mode": .string("chat"),
+                    "chat_id": .string(deletedChatID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+            XCTFail("Expected deleted bound preset continuation to fail closed")
+        } catch let error as ChatToolError {
+            XCTAssertTrue(error.localizedDescription.contains("no longer exists"), error.localizedDescription)
+        } catch {
+            XCTFail("Expected ChatToolError, got \(error)")
+        }
+        XCTAssertTrue(oracle.streamingSessions.isEmpty, "Preset resolution failure must not start a send")
+        XCTAssertFalse(
+            oracle.sessions.contains(where: { $0.lastSendModelID == survivingModel.rawValue }),
+            "The surviving preset must not be substituted for a deleted lane binding"
+        )
+
+        let modeModel = AIModel.customProviderUser(name: "fail-closed-mode")
+        let modePreset = ModelPreset(
+            name: "Mode Bound Preset",
+            model: modeModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [modePreset, survivingPreset]
+        let openModeTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Open mode-bound lane"),
+                    "mode": .string("chat"),
+                    "model": .string(modePreset.id.uuidString),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 2)
+        harness.finish(model: modeModel, text: "Mode-bound lane opened")
+        let openModeResult = try await openModeTask.value
+        let modeChatID = try XCTUnwrap(openModeResult["chat_id"]?.stringValue)
+        let incompatibleModePreset = ModelPreset(
+            id: modePreset.id,
+            name: modePreset.name,
+            model: modeModel,
+            supportedModes: SupportedModes(chat: true, plan: false, review: true)
+        )
+        presetsManager.presets = [incompatibleModePreset, survivingPreset]
+
+        do {
+            _ = try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Plan with incompatible bound preset"),
+                    "mode": .string("plan"),
+                    "chat_id": .string(modeChatID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+            XCTFail("Expected mode-incompatible bound preset continuation to fail closed")
+        } catch let error as ChatToolError {
+            XCTAssertTrue(error.localizedDescription.contains("'plan' mode"), error.localizedDescription)
+        } catch {
+            XCTFail("Expected ChatToolError, got \(error)")
+        }
+        XCTAssertTrue(oracle.streamingSessions.isEmpty, "Mode incompatibility must not start a send")
+
+        let sharedModel = AIModel.customProviderUser(name: "fail-closed-shared-model")
+        let sharedPresetOne = ModelPreset(
+            name: "Shared Model One",
+            model: sharedModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        let sharedPresetTwo = ModelPreset(
+            name: "Shared Model Two",
+            model: sharedModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        let legacySession = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Legacy model-attributed lane",
+            messages: [StoredMessage(isUser: false, rawText: "Earlier response", sequenceIndex: 0)],
+            lastSendModelID: sharedModel.rawValue,
+            lastSendModelDisplayName: sharedModel.displayName,
+            lastSendModelPresetID: nil
+        )
+        oracle.sessions.append(legacySession)
+        presetsManager.presets = [sharedPresetOne, sharedPresetTwo]
+
+        do {
+            _ = try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Ambiguous legacy continuation"),
+                    "mode": .string("chat"),
+                    "chat_id": .string(legacySession.shortID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+            XCTFail("Expected ambiguous legacy model attribution to fail closed")
+        } catch let error as ChatToolError {
+            XCTAssertTrue(error.localizedDescription.contains("ambiguous"), error.localizedDescription)
+        } catch {
+            XCTFail("Expected ChatToolError, got \(error)")
+        }
+        XCTAssertTrue(oracle.streamingSessions.isEmpty, "Ambiguous preset inheritance must not start a send")
+
+        presetsManager.presets = [sharedPresetOne]
+        let uniqueLegacyTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Unique legacy continuation"),
+                    "mode": .string("chat"),
+                    "chat_id": .string(legacySession.shortID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 3)
+        harness.finish(model: sharedModel, text: "Unique legacy preset inherited")
+        let uniqueLegacyResult = try await uniqueLegacyTask.value
+        XCTAssertEqual(uniqueLegacyResult["model_selection"]?.stringValue, "inherited")
+        XCTAssertEqual(uniqueLegacyResult["model_preset_id"]?.stringValue, sharedPresetOne.id.uuidString)
+    }
+
+    /// Pins the two contested policy edges of continuation inheritance:
+    /// a UI send resets the lane binding, and a chat with no recorded attribution at all is
+    /// treated by message count rather than blanket-automatic.
+    func testUnattributedContinuationPolicyAndUISendResetsLaneBinding() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let settings = GlobalSettingsStore.shared
+        let presetsManager = ModelPresetsManager.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let harness = ParallelOracleTransportHarness()
+
+        defer {
+            harness.finishAll()
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            fixture.cleanup()
+        }
+
+        let firstModel = AIModel.customProviderUser(name: "policy-first")
+        let boundModel = AIModel.customProviderUser(name: "policy-bound")
+        let uiModel = AIModel.customProviderUser(name: "policy-ui")
+        let firstPreset = ModelPreset(
+            name: "Policy_First",
+            model: firstModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        let boundPreset = ModelPreset(
+            name: "Policy_Bound",
+            model: boundModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [firstPreset, boundPreset]
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, model in
+            harness.makeStream(message: message, for: model)
+        }
+
+        let packaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: fixture.tabID,
+            sourceWorkspaceID: fixture.workspace.id,
+            sourceSelectionRevision: 0,
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            promptText: "",
+            selection: StoredSelection(selectedPaths: [], codemapAutoEnabled: false),
+            lookupContext: nil,
+            reviewGitContext: FrozenPromptGitReviewContext(
+                artifactCapability: nil,
+                compareIntent: .uncommittedHEAD,
+                displayContext: ReviewGitDisplayContext(roots: [])
+            ),
+            provenance: .direct
+        )
+        let tabContext = OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspace.id,
+            origin: .askOracle,
+            packaging: packaging
+        )
+
+        // Bind a lane to the preset that is NOT first in the available list.
+        let openTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Open bound lane"),
+                    "mode": .string("chat"),
+                    "model": .string(boundPreset.id.uuidString),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 1)
+        harness.finish(model: boundModel, text: "Bound lane opened")
+        let openResult = try await openTask.value
+        let boundChatID = try XCTUnwrap(openResult["chat_id"]?.stringValue)
+        let boundSession = try XCTUnwrap(oracle.sessions.first(where: { $0.shortID == boundChatID }))
+        XCTAssertEqual(boundSession.lastSendModelPresetID, boundPreset.id)
+
+        // A UI send has no ModelPreset identity, so it must clear the binding rather than leave a
+        // stale preset paired with a newer model. Attribution is recorded at send reservation.
+        let uiSendStart = await oracle.sendMessage(
+            "User typed directly into this lane",
+            sessionID: boundSession.id,
+            overrideModel: uiModel,
+            overrideModelPresetID: nil,
+            overlapPolicy: .rejectIfBusy,
+            origin: .ui
+        )
+        guard case .started = uiSendStart else {
+            XCTFail("Expected the UI send to start, got \(uiSendStart)")
+            return
+        }
+        let afterUISend = try XCTUnwrap(oracle.sessions.first(where: { $0.id == boundSession.id }))
+        XCTAssertNil(
+            afterUISend.lastSendModelPresetID,
+            "A UI send must reset the lane binding instead of leaving a stale preset/model pair"
+        )
+        XCTAssertEqual(afterUISend.lastSendModelID, uiModel.rawValue)
+        try await harness.waitUntilOpen(count: 2)
+        harness.finish(model: uiModel, text: "UI reply")
+
+        // Non-empty chat with no recorded attribution at all: its historical model is unrecoverable
+        // (per-message model names are display strings), so an ambiguous guess must fail loudly.
+        let unattributedSession = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Unattributed history",
+            messages: [StoredMessage(isUser: false, rawText: "Earlier response", sequenceIndex: 0)],
+            lastSendModelID: nil,
+            lastSendModelDisplayName: nil,
+            lastSendModelPresetID: nil
+        )
+        oracle.sessions.append(unattributedSession)
+        do {
+            _ = try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Continue unattributed history"),
+                    "mode": .string("chat"),
+                    "chat_id": .string(unattributedSession.shortID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+            XCTFail("Expected unattributed non-empty history to fail closed while ambiguous")
+        } catch let error as ChatToolError {
+            XCTAssertTrue(
+                error.localizedDescription.contains("no recorded model attribution"),
+                error.localizedDescription
+            )
+        } catch {
+            XCTFail("Expected ChatToolError, got \(error)")
+        }
+        // Scoped to this chat on purpose: the earlier UI send may still be settling, so global
+        // stream emptiness is not the invariant under test.
+        XCTAssertFalse(
+            oracle.streamingSessions.contains(unattributedSession.id),
+            "An ambiguity failure must not start a send for the chat it rejected"
+        )
+        XCTAssertNil(
+            oracle.sessions.first(where: { $0.id == unattributedSession.id })?.lastSendModelID,
+            "A rejected continuation must not record attribution"
+        )
+
+        // A never-sent chat has no binding to preserve, so automatic selection stays available and
+        // is reported honestly as automatic rather than inherited.
+        let neverSentSession = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            name: "Never sent",
+            messages: []
+        )
+        oracle.sessions.append(neverSentSession)
+        let neverSentTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Continue never-sent chat"),
+                    "mode": .string("chat"),
+                    "chat_id": .string(neverSentSession.shortID)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 3)
+        harness.finish(model: firstModel, text: "Automatic selection for an empty chat")
+        let neverSentResult = try await neverSentTask.value
+        XCTAssertEqual(neverSentResult["model_selection"]?.stringValue, "automatic")
+        XCTAssertEqual(neverSentResult["model_preset_id"]?.stringValue, firstPreset.id.uuidString)
     }
 
     private static var nextFixtureWindowID = -1200

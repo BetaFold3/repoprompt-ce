@@ -47,6 +47,15 @@ struct ChatSession: Codable, Identifiable {
     var lastSendModelID: String?
     var lastSendModelDisplayName: String?
 
+    /// Exact `ModelPreset` identity behind the most recent send, when that send was preset-backed.
+    ///
+    /// This is the durable lane binding that lets an MCP `chat_id` continuation stay on the
+    /// preset the conversation was opened with instead of re-running automatic selection.
+    /// It is `nil` whenever preset identity is genuinely unknown (UI sends, planning-model
+    /// sends, legacy sessions) and is always written as a unit with `lastSendModelID` so the
+    /// pair can never disagree.
+    var lastSendModelPresetID: UUID?
+
     /// Human-readable short identifier combining name slug and UUID prefix
     var shortID: String
 
@@ -74,6 +83,7 @@ struct ChatSession: Codable, Identifiable {
         selectedChatPresetID: UUID? = nil,
         lastSendModelID: String? = nil,
         lastSendModelDisplayName: String? = nil,
+        lastSendModelPresetID: UUID? = nil,
         messageCount: Int? = nil,
         shortID: String? = nil
     ) {
@@ -93,6 +103,7 @@ struct ChatSession: Codable, Identifiable {
         self.selectedChatPresetID = selectedChatPresetID
         self.lastSendModelID = lastSendModelID
         self.lastSendModelDisplayName = lastSendModelDisplayName
+        self.lastSendModelPresetID = lastSendModelPresetID
         self.shortID = shortID ?? Self.makeShortID(name: name, uuid: id)
     }
 
@@ -113,6 +124,7 @@ struct ChatSession: Codable, Identifiable {
         case selectedChatPresetID // NEW
         case lastSendModelID
         case lastSendModelDisplayName
+        case lastSendModelPresetID
         case shortID
     }
 
@@ -135,6 +147,7 @@ struct ChatSession: Codable, Identifiable {
         selectedChatPresetID = try container.decodeIfPresent(UUID.self, forKey: .selectedChatPresetID)
         lastSendModelID = try container.decodeIfPresent(String.self, forKey: .lastSendModelID)
         lastSendModelDisplayName = try container.decodeIfPresent(String.self, forKey: .lastSendModelDisplayName)
+        lastSendModelPresetID = try container.decodeIfPresent(UUID.self, forKey: .lastSendModelPresetID)
 
         // Handle backward compatibility for shortID
         if let decodedShortID = try container.decodeIfPresent(String.self, forKey: .shortID) {

@@ -37,6 +37,85 @@ final class ChatHistoryJSONOnlyTests: XCTestCase {
         XCTAssertEqual(metadata.first?.lastSendModelDisplayName, "Oracle Model")
     }
 
+    /// The lane binding an MCP `chat_id` continuation inherits must survive every load path.
+    ///
+    /// The lightweight header decoder is a separate `Decodable` with no compiler coupling to
+    /// `ChatSession.CodingKeys`, so omitting the field there compiles cleanly and only shows up
+    /// later: a hydrated stub would carry `nil` and the stub-safe save merge would then copy that
+    /// `nil` over the correct on-disk value, silently destroying the binding.
+    func testLastSendModelPresetIDSurvivesFullAndStubLoadPaths() async throws {
+        let presetID = UUID()
+        let message = StoredMessage(
+            isUser: false,
+            rawText: "assistant reply",
+            sequenceIndex: 0
+        )
+        let workspace = WorkspaceModel(name: "Chat Lane Binding", repoPaths: ["/tmp/root"])
+        let session = ChatSession(
+            name: "Bound Lane",
+            messages: [message],
+            lastSendModelID: "custom:oracle-model",
+            lastSendModelDisplayName: "Oracle Model",
+            lastSendModelPresetID: presetID
+        )
+        let service = ChatDataService()
+
+        let fileURL = try await service.saveChatSession(session, for: workspace)
+        defer { try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent().deletingLastPathComponent()) }
+
+        // Full Codable path.
+        let loaded = try await service.loadChatSession(from: fileURL)
+        XCTAssertEqual(loaded.lastSendModelPresetID, presetID)
+
+        // Lightweight header path used for session lists.
+        let stub = try await service.loadChatSessionStub(from: fileURL)
+        XCTAssertTrue(stub.isListStub, "Expected a lightweight stub so the header decoder is what is under test")
+        XCTAssertEqual(
+            stub.lastSendModelPresetID,
+            presetID,
+            "The lightweight header decoder dropped the lane binding; a stub-safe save would then erase it on disk"
+        )
+
+        // Attribution is one unit: a partial carry would manufacture a stale model/preset pair.
+        XCTAssertEqual(stub.lastSendModelID, "custom:oracle-model")
+        XCTAssertEqual(stub.lastSendModelDisplayName, "Oracle Model")
+        XCTAssertEqual(stub.listStub().lastSendModelPresetID, presetID)
+    }
+
+    func testChatSessionLaneBindingIsEncodedAndAbsentLegacyKeyDecodesAsNil() throws {
+        let presetID = UUID()
+        let session = ChatSession(
+            name: "Bound Lane",
+            messages: [StoredMessage(isUser: false, rawText: "reply", sequenceIndex: 0)],
+            lastSendModelID: "custom:oracle-model",
+            lastSendModelDisplayName: "Oracle Model",
+            lastSendModelPresetID: presetID
+        )
+
+        let encoded = try JSONEncoder().encode(session)
+        let encodedString = String(data: encoded, encoding: .utf8) ?? ""
+        XCTAssertTrue(
+            encodedString.contains("lastSendModelPresetID"),
+            "A missing CodingKeys case would silently drop the lane binding on save"
+        )
+        XCTAssertEqual(try JSONDecoder().decode(ChatSession.self, from: encoded).lastSendModelPresetID, presetID)
+
+        // Sessions saved before the field existed must still load, with no binding to inherit.
+        let legacyPayload = """
+        {
+          "id": "\(UUID().uuidString)",
+          "name": "Legacy Session",
+          "savedAt": 0,
+          "messages": [],
+          "lastSendModelID": "custom:oracle-model",
+          "lastSendModelDisplayName": "Oracle Model"
+        }
+        """
+        let legacy = try JSONDecoder().decode(ChatSession.self, from: Data(legacyPayload.utf8))
+        XCTAssertNil(legacy.lastSendModelPresetID)
+        XCTAssertEqual(legacy.lastSendModelID, "custom:oracle-model")
+    }
+
     func testStoredMessageOmitsLegacyDelegateAndCombinedTextFields() throws {
         let original = StoredMessage(
             isUser: false,
