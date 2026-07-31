@@ -5,6 +5,9 @@ extension AgentModeViewModel {
         let tabID = explicitTabID ?? currentTabID
         let session = tabID.flatMap { sessions[$0] }
         let isMCPControlled = isMCPControlled(tabID: tabID)
+        let availableAgentsForTab = selectableAgents(forTabID: tabID)
+        let selectedAgentForTab = session?.selectedAgent ?? selectedAgent
+        let canSendWithProviderForTab = availableAgentsForTab.contains(selectedAgentForTab)
         let isCodexRunActive: Bool = {
             guard selectedAgent == .codexExec, let tabID else { return false }
             return isTabRunning(tabID)
@@ -41,9 +44,11 @@ extension AgentModeViewModel {
             areModelControlsDisabled: isMCPControlled,
             providerControls: activeProviderControlsBinding,
             isCodexRunActive: isCodexRunActive,
-            hasAvailableAgentProviders: isRemoteSession ? true : hasAvailableAgentProviders,
-            canSendWithCurrentProvider: isRemoteSession ? true : canSendWithCurrentProvider,
-            unavailableSelectedAgentMessage: isRemoteSession ? nil : unavailableSelectedAgentMessage,
+            hasAvailableAgentProviders: isRemoteSession ? true : !availableAgentsForTab.isEmpty,
+            canSendWithCurrentProvider: isRemoteSession ? true : canSendWithProviderForTab,
+            unavailableSelectedAgentMessage: isRemoteSession
+                ? nil
+                : (canSendWithProviderForTab ? nil : unavailableSelectedAgentMessage),
             runLocation: runLocationSelection(for: session),
             runLocationHostDisplayName: session?.remoteHost?.hostDisplayName,
             remoteHostCatalog: remoteCatalog,
@@ -52,7 +57,7 @@ extension AgentModeViewModel {
             selectedModelDisplayName: selectedModelDisplayNameForProps,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
-            availableAgents: availableAgents,
+            availableAgents: availableAgentsForTab,
             isProviderPickerLockedForCurrentTab: isProviderPickerLocked(tabID: tabID),
             lockedAgentSelectionMessage: lockedAgentSelectionMessage(tabID: tabID),
             autoEditEnabled: autoEditEnabled,

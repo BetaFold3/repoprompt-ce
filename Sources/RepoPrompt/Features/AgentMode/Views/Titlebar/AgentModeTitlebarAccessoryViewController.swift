@@ -14,30 +14,46 @@ import SwiftUI
 /// Compact "New Session" button designed for the titlebar area
 private struct AgentModeTitlebarNewSessionView: View {
     let onNewSession: () -> Void
+    let onNewKnowledgeSession: () -> Void
+    let isKnowledgeSessionAvailable: Bool
     @State private var isHovering = false
 
     var body: some View {
-        Button(action: onNewSession) {
-            Image(systemName: "square.and.pencil")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundColor(.primary.opacity(isHovering ? 1.0 : 0.7))
-                // SEARCH-HELPER: Titlebar, Alignment, Compose icon offset
-                // The `square.and.pencil` glyph's pencil shaft extends up-and-right
-                // beyond the square, so the geometric center of its bounding box sits
-                // higher than the visible mass (the square). Centering the bounding
-                // box therefore renders the square visibly *low* relative to the
-                // traffic lights — nudge the icon up slightly to correct the optical
-                // center.
-                .offset(y: -1.5)
-        }
-        .buttonStyle(TitlebarAccessoryButtonStyle(isHovering: isHovering))
-        .onHover { hovering in
-            withAnimation(.easeInOut(duration: 0.15)) {
-                isHovering = hovering
+        HStack(spacing: 0) {
+            Button(action: onNewSession) {
+                Image(systemName: "square.and.pencil")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(.primary.opacity(isHovering ? 1.0 : 0.7))
+                    // SEARCH-HELPER: Titlebar, Alignment, Compose icon offset
+                    // The `square.and.pencil` glyph's pencil shaft extends up-and-right
+                    // beyond the square, so nudge the visible mass up slightly.
+                    .offset(y: -1.5)
             }
+            .buttonStyle(TitlebarAccessoryButtonStyle(isHovering: isHovering))
+            .onHover { hovering in
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isHovering = hovering
+                }
+            }
+            .hoverTooltip("New Session", .bottom)
+            .accessibilityLabel("New Session")
+
+            Menu {
+                Button("New Knowledge Session", systemImage: "brain", action: onNewKnowledgeSession)
+                    .disabled(!isKnowledgeSessionAvailable)
+            } label: {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(.secondary)
+                    .frame(width: 18, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .hoverTooltip("More session types", .bottom)
+            .accessibilityLabel("More session types")
         }
-        .hoverTooltip("New Session", .bottom)
-        .accessibilityLabel("New Session")
     }
 }
 
@@ -78,9 +94,17 @@ struct TitlebarAccessoryButtonStyle: ButtonStyle {
 final class AgentModeTitlebarAccessoryViewController: NSTitlebarAccessoryViewController {
     private var hostingView: NSHostingView<AgentModeTitlebarNewSessionView>?
     private var onNewSession: () -> Void
+    private var onNewKnowledgeSession: () -> Void
+    private var isKnowledgeSessionAvailable: Bool
 
-    init(onNewSession: @escaping () -> Void) {
+    init(
+        onNewSession: @escaping () -> Void,
+        onNewKnowledgeSession: @escaping () -> Void = {},
+        isKnowledgeSessionAvailable: Bool = true
+    ) {
         self.onNewSession = onNewSession
+        self.onNewKnowledgeSession = onNewKnowledgeSession
+        self.isKnowledgeSessionAvailable = isKnowledgeSessionAvailable
         super.init(nibName: nil, bundle: nil)
         layoutAttribute = .leading
     }
@@ -91,16 +115,41 @@ final class AgentModeTitlebarAccessoryViewController: NSTitlebarAccessoryViewCon
     }
 
     override func loadView() {
-        let swiftUIView = AgentModeTitlebarNewSessionView(onNewSession: onNewSession)
+        let swiftUIView = AgentModeTitlebarNewSessionView(
+            onNewSession: onNewSession,
+            onNewKnowledgeSession: onNewKnowledgeSession,
+            isKnowledgeSessionAvailable: isKnowledgeSessionAvailable
+        )
         let hosting = NSHostingView(rootView: swiftUIView)
         hosting.frame.size = hosting.fittingSize
         hostingView = hosting
         view = hosting
     }
 
-    /// Updates the action closure without recreating the controller
-    func update(onNewSession: @escaping () -> Void) {
+    // Updates the action closure without recreating the controller
+    #if DEBUG
+        func testInvokeNewSession() {
+            onNewSession()
+        }
+
+        func testInvokeNewKnowledgeSession() {
+            guard isKnowledgeSessionAvailable else { return }
+            onNewKnowledgeSession()
+        }
+    #endif
+
+    func update(
+        onNewSession: @escaping () -> Void,
+        onNewKnowledgeSession: @escaping () -> Void = {},
+        isKnowledgeSessionAvailable: Bool = true
+    ) {
         self.onNewSession = onNewSession
-        hostingView?.rootView = AgentModeTitlebarNewSessionView(onNewSession: onNewSession)
+        self.onNewKnowledgeSession = onNewKnowledgeSession
+        self.isKnowledgeSessionAvailable = isKnowledgeSessionAvailable
+        hostingView?.rootView = AgentModeTitlebarNewSessionView(
+            onNewSession: onNewSession,
+            onNewKnowledgeSession: onNewKnowledgeSession,
+            isKnowledgeSessionAvailable: isKnowledgeSessionAvailable
+        )
     }
 }

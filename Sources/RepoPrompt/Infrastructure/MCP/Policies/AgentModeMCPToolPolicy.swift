@@ -13,6 +13,14 @@ enum AgentModeMCPToolPolicy {
 
     static let restrictedTools: Set<String> = MCPToolCapabilities.toolNames(for: restrictedCapabilities)
 
+    /// Positive ceiling for a Knowledge session. Global availability, ordinary
+    /// restrictions, and policy-gated grants are still intersected with this set.
+    static let knowledgeAllowedTools = KnowledgeSessionPolicy.allowedMCPToolNames
+
+    static let knowledgeAskOracleDescription = """
+    Consult an Oracle model using the current repository evidence. Resolve exact selectable preset names or UUIDs with oracle_utils op=models. For independent opinions, issue calls together in one tool-call batch, each with new_chat:true and an explicit model. Continue each lane with its returned chat_id and new_chat:false; the lane keeps its own model preset, so model can be omitted, and the call fails rather than switching models if that preset is no longer usable. No packet, hash, manifest, or verification-gate ritual is required.
+    """
+
     /// Tools granted to legacy/generic agent mode runs (from MCPPolicyGatedTools).
     /// These enable user interaction, agent workflow control, and agent-only oracle recovery.
     static let grantedCapabilities: Set<MCPToolCapability> = [
@@ -70,8 +78,11 @@ enum AgentModeMCPToolPolicy {
 
     static let cursorGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
 
-    static func grantedTools(forAgent agent: AgentProviderKind) -> Set<String> {
-        switch agent {
+    static func grantedTools(
+        forAgent agent: AgentProviderKind,
+        sessionProfile: AgentSessionProfile = .standard
+    ) -> Set<String> {
+        let tools = switch agent {
         case .codexExec:
             codexNativeGrantedTools
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
@@ -81,5 +92,8 @@ enum AgentModeMCPToolPolicy {
         case .cursor:
             cursorGrantedTools
         }
+        return sessionProfile == .knowledge
+            ? tools.intersection(knowledgeAllowedTools)
+            : tools
     }
 }

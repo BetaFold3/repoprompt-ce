@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Oracle Continuation Preset Inheritance — Technical Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f4f7fb; --surface: #fff; --surface-2: #edf3f9; --ink: #182230;
+      --muted: #607084; --line: #d6e0eb; --accent: #3158c9; --accent-2: #7447bd;
+      --good: #117a55; --warn: #9a5b00; --bad: #a33b3b; --code-bg: #17212d;
+      --code-ink: #eef5ff; --shadow: 0 14px 38px rgba(32,54,86,.09); --radius: 18px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10151d; --surface: #171e28; --surface-2: #202a36; --ink: #edf3fa;
+        --muted: #afbbcc; --line: #334052; --accent: #8aa7ff; --accent-2: #c0a2ff;
+        --good: #5fd2a4; --warn: #f0b96a; --bad: #ff9a9a; --code-bg: #0b0f15;
+        --code-ink: #eef5ff; --shadow: 0 14px 38px rgba(0,0,0,.28);
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.62 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    a { color: var(--accent); text-underline-offset: 3px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { padding: .12rem .34rem; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); font-size: .9em; }
+    pre { overflow-x: auto; padding: 16px; border-radius: 12px; color: var(--code-ink); background: var(--code-bg); line-height: 1.5; font-size: .86rem; }
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+    header { position: relative; overflow: hidden; padding: 62px 0 48px; color: #fff; background: linear-gradient(128deg, #173e72 0%, #3158c9 52%, #6d43b6 100%); }
+    header::after { content: ""; position: absolute; width: 420px; height: 420px; right: -120px; top: -230px; border-radius: 50%; background: rgba(255,255,255,.12); }
+    .eyebrow { margin: 0 0 10px; font-size: .78rem; font-weight: 760; letter-spacing: .13em; text-transform: uppercase; opacity: .87; }
+    h1 { max-width: 900px; margin: 0; font-size: clamp(2.15rem, 5vw, 4.1rem); line-height: 1.04; letter-spacing: -.045em; }
+    .lede { max-width: 860px; margin: 22px 0 0; font-size: clamp(1.02rem, 2.2vw, 1.27rem); opacity: .95; }
+    .meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 26px; }
+    .meta span { padding: 7px 11px; border: 1px solid rgba(255,255,255,.36); border-radius: 999px; background: rgba(255,255,255,.1); font-size: .84rem; }
+    .layout { display: grid; grid-template-columns: 255px minmax(0,1fr); gap: 28px; padding: 34px 0 72px; align-items: start; }
+    nav { position: sticky; top: 18px; padding: 18px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+    nav strong { display: block; margin-bottom: 9px; font-size: .82rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+    nav a { display: block; padding: 7px 8px; border-radius: 8px; color: var(--ink); text-decoration: none; font-size: .91rem; }
+    nav a:hover { background: var(--surface-2); color: var(--accent); }
+    main { min-width: 0; }
+    section { margin-bottom: 24px; padding: clamp(22px,4vw,38px); border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); scroll-margin-top: 20px; }
+    h2 { margin: 0 0 18px; font-size: clamp(1.45rem,3vw,2.05rem); letter-spacing: -.025em; }
+    h3 { margin: 25px 0 10px; font-size: 1.12rem; }
+    p { margin: 10px 0; }
+    ul, ol { padding-left: 1.3rem; }
+    li + li { margin-top: .42rem; }
+    .summary-grid, .cards, .steps, .decisions { display: grid; gap: 14px; }
+    .summary-grid { grid-template-columns: repeat(4,minmax(0,1fr)); }
+    .cards, .decisions { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .stat, .card, .step { border: 1px solid var(--line); border-radius: 14px; background: var(--surface-2); }
+    .stat { padding: 16px; }
+    .stat b { display: block; font-size: 1.6rem; line-height: 1.1; color: var(--accent); }
+    .stat span { display: block; margin-top: 6px; color: var(--muted); font-size: .85rem; }
+    .card { padding: 18px; }
+    .card h3 { margin-top: 0; }
+    .good { border-left: 5px solid var(--good); }
+    .warn { border-left: 5px solid var(--warn); }
+    .bad { border-left: 5px solid var(--bad); }
+    .badge { display: inline-flex; padding: 3px 8px; border-radius: 999px; font-size: .72rem; font-weight: 760; letter-spacing: .03em; text-transform: uppercase; }
+    .observed { color: var(--good); background: color-mix(in srgb,var(--good) 13%,transparent); }
+    .session { color: var(--accent-2); background: color-mix(in srgb,var(--accent-2) 13%,transparent); }
+    .tests { color: var(--accent); background: color-mix(in srgb,var(--accent) 13%,transparent); }
+    .risk { color: var(--bad); background: color-mix(in srgb,var(--bad) 13%,transparent); }
+    .callout { margin: 18px 0; padding: 16px 18px; border-left: 5px solid var(--accent); border-radius: 10px; background: color-mix(in srgb,var(--accent) 8%,var(--surface)); }
+    .callout.bad { border-left-color: var(--bad); background: color-mix(in srgb,var(--bad) 8%,var(--surface)); }
+    .callout.warn { border-left-color: var(--warn); background: color-mix(in srgb,var(--warn) 8%,var(--surface)); }
+    .flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 10px; align-items: stretch; margin: 20px 0; }
+    .flow-box { display: grid; place-items: center; min-height: 105px; padding: 15px; text-align: center; border: 1px solid var(--line); border-radius: 14px; background: var(--surface-2); }
+    .arrow { align-self: center; color: var(--accent); font-size: 1.5rem; font-weight: 800; }
+    .table-wrap { overflow-x: auto; margin: 18px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: .91rem; }
+    th, td { padding: 11px 12px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-2); font-size: .78rem; text-transform: uppercase; letter-spacing: .055em; }
+    td code { white-space: nowrap; }
+    .steps { counter-reset: step; }
+    .step { position: relative; padding: 18px 18px 18px 62px; background: var(--surface); }
+    .step::before { counter-increment: step; content: counter(step); position: absolute; left: 17px; top: 17px; width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; color: #fff; background: var(--accent); font-weight: 800; }
+    .step h3 { margin: 0 0 5px; }
+    .checklist { list-style: none; padding: 0; }
+    .checklist li { position: relative; padding-left: 30px; }
+    .checklist li::before { content: "□"; position: absolute; left: 3px; top: -2px; color: var(--accent); font-size: 1.25rem; }
+    .small { color: var(--muted); font-size: .88rem; }
+    footer { padding: 0 0 54px; color: var(--muted); text-align: center; font-size: .85rem; }
+    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } nav { position: static; } nav .links { columns: 2; } .summary-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } .flow { grid-template-columns: 1fr; } .arrow { transform: rotate(90deg); justify-self: center; } }
+    @media (max-width: 620px) { .shell { width: min(100% - 20px,1180px); } header { padding: 44px 0 38px; } section { padding: 20px; } nav .links { columns: 1; } .summary-grid, .cards, .decisions { grid-template-columns: 1fr; } }
+    @media print { :root { --bg:#fff; --surface:#fff; --surface-2:#f5f7fa; --ink:#111; --muted:#444; --line:#bbb; } header { color:#111; background:#fff; border-bottom:2px solid #111; padding:24px 0; } header::after, nav { display:none; } .layout { display:block; padding:18px 0; } section { break-inside:avoid; box-shadow:none; } }
+  </style>
+</head>
+<body>
+<header>
+  <div class="shell">
+    <p class="eyebrow">RepoPrompt CE · Technical Implementation Report</p>
+    <h1>Oracle Continuation Preset Inheritance</h1>
+    <p class="lede">A durable lane-binding and restart-resumption fix: OracleB stays on OracleB when continued by <code>chat_id</code>, including after the app reloads the saved Agent session under a new provider run.</p>
+    <div class="meta">
+      <span>Report updated: 31 July 2026</span>
+      <span>Branch: feat/duo-duel-oracles-knowledge-profile-agent-mode</span>
+      <span>Baseline: c4c2ce73</span>
+      <span>Status: implementation complete; live restart matrix passed</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell layout">
+  <nav aria-label="Report sections">
+    <strong>Contents</strong>
+    <div class="links">
+      <a href="#summary">1. Executive summary</a>
+      <a href="#problem">2. Problem and root cause</a>
+      <a href="#expect">3. What to expect</a>
+      <a href="#mechanism">4. How the fix works</a>
+      <a href="#decisions">5. Major decisions</a>
+      <a href="#inventory">6. Change inventory</a>
+      <a href="#validation">7. Validation evidence</a>
+      <a href="#crash">8. App-crash finding</a>
+      <a href="#review">9. Dual-Oracle review</a>
+      <a href="#test">10. Test it step by step</a>
+      <a href="#risks">11. Risks and limitations</a>
+      <a href="#actions">12. Action items</a>
+      <a href="#evidence">13. Evidence and metrics</a>
+    </div>
+  </nav>
+
+  <main>
+    <section id="summary">
+      <span class="badge observed">Observed in code</span>
+      <h2>Executive summary</h2>
+      <p>The reported bug was real: the two initial Oracle consultations used the intended presets, but a later OracleB critique continued the correct OracleB conversation using OracleA’s model. The result metadata honestly reported <code>model_selection: automatic</code>, revealing that the conversation and the model preset had drifted apart.</p>
+      <p>The first implementation added a durable preset identity to each Oracle chat and inherited it whenever a continuation omitted <code>model</code>. A real restart test then exposed a second boundary: saved chats also carried an ephemeral provider <code>runID</code>, and the old owner check incorrectly required that run ID to survive an app restart. The final implementation treats the durable Agent session ID as the authority for session-owned chats, keeps exact-run ownership for headless lanes, advances the run stamp after a safe explicit continuation, and lets <code>oracle_chat_log</code> recover same-session history read-only across restarts.</p>
+      <p>The combined result preserves exact preset identity through full and lightweight persistence, explicit <code>chat_id</code> continuation, Context Builder follow-ups, controller rotation, and app relaunch. Cross-session adoption still fails closed, while model-selection provenance remains visible as <code>explicit</code>, <code>inherited</code>, or <code>automatic</code>.</p>
+      <div class="callout"><strong>Current readiness:</strong> the focused restart suites, strict lint, authoritative test listing, both product builds, the complete conductor self-test, and the user-visible save/restart/restore matrix are green. The user verified both Oracle lanes, read-only log recovery, inherited continuation after relaunch, deliberate migration, cross-session rejection, and prevention of implicit stale-lane adoption. A separate debug-app assertion crash was recorded earlier, but it did not recur during the successful final matrix and its stack is in unmodified Agent transcript-retention code.</div>
+      <div class="summary-grid" aria-label="Implementation metrics">
+        <div class="stat"><b>18</b><span>implementation files modified, excluding this report</span></div>
+        <div class="stat"><b>+1,727/−159</b><span>implementation diff, excluding this report</span></div>
+        <div class="stat"><b>10/10</b><span>live restart and safety steps passed</span></div>
+        <div class="stat"><b>2/2</b><span>product builds passing</span></div>
+      </div>
+    </section>
+
+    <section id="problem">
+      <span class="badge session">Observed in session</span>
+      <h2>Problem and root cause</h2>
+      <div class="cards">
+        <article class="card bad">
+          <h3>Observed symptom</h3>
+          <p>OracleA and OracleB opened correctly. OracleA’s critique stayed on OracleA. OracleB’s first critique continuation used OracleA even though the call supplied OracleB’s <code>chat_id</code>.</p>
+        </article>
+        <article class="card warn">
+          <h3>Why it happened</h3>
+          <p>The send path selected a model <em>before</em> resolving the target chat. With no explicit <code>model</code>, it chose the first available compatible preset, then attached that model to the requested conversation.</p>
+        </article>
+      </div>
+      <div class="flow" aria-label="Old behavior">
+        <div class="flow-box"><strong>Continue OracleB</strong><br><code>chat_id=B</code><br>no model</div>
+        <div class="arrow">→</div>
+        <div class="flow-box"><strong>Automatic selection</strong><br><code>available.first</code><br>OracleA</div>
+        <div class="arrow">→</div>
+        <div class="flow-box"><strong>Wrong execution</strong><br>OracleB history<br>through OracleA</div>
+      </div>
+      <p><strong>Regression assessment:</strong> session investigation traced the selection-before-chat ordering to the original CE code lineage rather than the Knowledge Agent implementation. Parallel heterogeneous Oracle lanes made the latent defect much easier to encounter and made its impact obvious.</p>
+      <div class="callout bad"><strong>A second bug appeared only after restart.</strong> The saved chat correctly retained both its preset and Agent ownership, but the owner check required the old <code>agentModeRunID</code> to equal the new controller’s run ID. A run ID is minted per provider-controller process and is not restored, so exact tuple matching made a saved chat impossible to continue even from its original Agent session.</div>
+      <div class="flow" aria-label="Restart failure before the fix">
+        <div class="flow-box"><strong>Saved lane</strong><br>session S1<br>run R1</div>
+        <div class="arrow">→</div>
+        <div class="flow-box"><strong>Restart</strong><br>same session S1<br>new run R2</div>
+        <div class="arrow">→</div>
+        <div class="flow-box"><strong>Old guard rejected</strong><br>S1 matched<br>R1 ≠ R2</div>
+      </div>
+    </section>
+
+    <section id="expect">
+      <span class="badge observed">Observed in code</span>
+      <h2>What can we expect from this change?</h2>
+      <div class="cards">
+        <article class="card good">
+          <h3>Explicit chat continuation stays on its lane</h3>
+          <p>Calling <code>ask_oracle</code> with OracleB’s <code>chat_id</code> and no <code>model</code> resolves OracleB’s recorded preset and returns <code>model_selection: inherited</code>.</p>
+        </article>
+        <article class="card good">
+          <h3>Explicit switching remains possible</h3>
+          <p>Passing a different preset together with <code>chat_id</code> deliberately migrates that conversation. The new preset becomes the durable binding for later continuations.</p>
+        </article>
+        <article class="card good">
+          <h3>Binding and ownership survive reloads</h3>
+          <p>The exact preset UUID and durable Agent session owner are encoded in full chat sessions and lightweight headers. A same-session caller may explicitly continue the lane after its process run changes; the new run stamp is then persisted.</p>
+        </article>
+        <article class="card good">
+          <h3>Several unsafe states fail closed</h3>
+          <p>Different Agent sessions, foreign headless runs, deleted presets, mode incompatibility, unavailable models, unresolvable model definitions, and ambiguous legacy model matches return a useful error instead of choosing another lane or preset.</p>
+        </article>
+        <article class="card good">
+          <h3>Saved history is recoverable without mutation</h3>
+          <p><code>oracle_chat_log</code> can read a stale-run lane belonging to the same durable Agent session and echoes its <code>chat_id</code>. Reading the log does not claim or re-stamp the lane.</p>
+        </article>
+        <article class="card warn">
+          <h3>Implicit restart adoption is intentionally avoided</h3>
+          <p>After restart, a model call that supplies neither <code>chat_id</code> nor <code>new_chat:true</code> does not silently adopt a stale-run lane. Recover the ID with <code>oracle_chat_log</code>, then continue explicitly.</p>
+        </article>
+      </div>
+      <div class="callout warn"><strong>Important policy boundary:</strong> fail-closed inheritance applies while model presets are enabled and a specific recorded binding is expected to remain usable. If presets are globally hidden or temporarily disabled, RepoPrompt intentionally uses the single configured planning model and rebinds the chat to it. After presets are re-enabled, pass an explicit <code>model</code> once to move the lane back to the desired preset.</div>
+    </section>
+
+    <section id="mechanism">
+      <span class="badge observed">Observed in code</span>
+      <h2>How the fix works</h2>
+      <h3>1. Persist one exact lane identity</h3>
+      <p><code>ChatSession.lastSendModelPresetID</code> stores the exact <code>ModelPreset</code> UUID used by the most recent preset-backed send. It travels with the existing raw model ID and display name as one attribution unit.</p>
+      <h3>2. Resolve the continuation target before selecting a model</h3>
+      <p>For an explicit <code>chat_id</code> continuation with no model override, the MCP path performs a read-only chat lookup first, applies the same tab and Agent Mode ownership checks, and captures that chat’s attribution. For an implicit continuation—neither <code>chat_id</code> nor <code>new_chat:true</code>—the same helper identifies the exact active/latest eligible chat that the authoritative mutation path will resume.</p>
+      <h3>3. Apply a three-tier inheritance strategy</h3>
+      <ol>
+        <li><strong>Exact preset UUID:</strong> authoritative when present.</li>
+        <li><strong>Legacy raw model ID:</strong> accepted only when it maps uniquely to an available preset.</li>
+        <li><strong>No attribution:</strong> a chat with earlier messages fails closed when multiple presets make its history ambiguous; a never-sent chat may still use automatic selection because it has no historical lane to preserve.</li>
+      </ol>
+      <h3>4. Record the selected identity when the send is reserved</h3>
+      <p><code>sendMessage</code> now accepts <code>overrideModelPresetID</code>. Once the send has passed availability, busy-session, and concurrency checks, it records model ID, model display name, and preset ID together.</p>
+      <h3>5. Preserve identity in Context Builder-created Oracle chats</h3>
+      <p>The Context Builder follow-up resolver now returns the exact model-preset UUID alongside the raw model and chat preset, and the newly created Oracle chat records that binding on its first send. Later <code>chat_id</code> continuation therefore inherits the same preset instead of falling back to raw-model matching.</p>
+      <h3>6. Make durable session ownership authoritative</h3>
+      <p>For an Agent-session-owned chat, <code>agentModeSessionID</code> is the authorization boundary. The run ID is treated as ephemeral metadata: a matching session may continue under a new run, while a different session still cannot adopt the lane. A run-owned-only chat—used by headless or Context Builder flows—continues to require its exact originating run.</p>
+      <h3>7. Load first, then advance the run stamp</h3>
+      <p>Persisted chats may initially exist only as lightweight list stubs. Continuation therefore loads or activates the full session before applying the new run stamp. Stamping first would be unsafe because hydration would replace the in-memory stub with the older disk copy and silently restore the stale run ID.</p>
+      <h3>8. Keep recovery read-only until an explicit send</h3>
+      <p><code>oracle_chat_log</code> ranks exact-run lanes first, then stale lanes from the same durable session, never foreign or agent-owned lanes for an ownerless caller. It returns history and the resolved <code>chat_id</code> without changing ownership. The later explicit continuation performs the re-stamp.</p>
+      <h3>9. Report selection provenance</h3>
+      <pre><code>"model_selection": "explicit"   // caller supplied model
+"model_selection": "inherited"  // chat supplied its binding
+"model_selection": "automatic"  // selection fallback</code></pre>
+      <p>This makes a wrong-lane regression observable without inferring it from prose or model style.</p>
+    </section>
+
+    <section id="decisions">
+      <span class="badge session">Observed in session</span>
+      <h2>Major decisions and why</h2>
+      <div class="decisions">
+        <article class="card">
+          <h3>Preset UUID, not display name</h3>
+          <p>Names and display labels are mutable and can collide. UUID is the durable identity; display name remains error/UI text only.</p>
+        </article>
+        <article class="card">
+          <h3>Explicit override means deliberate migration</h3>
+          <p><code>model + chat_id</code> is preserved as a supported operation rather than rejected. After the send starts, future model-less continuations inherit the new preset.</p>
+        </article>
+        <article class="card">
+          <h3>Last send wins</h3>
+          <p>A normal UI or planning-model send cannot prove an exact preset identity, so it clears the exact binding rather than leaving stale attribution behind.</p>
+        </article>
+        <article class="card">
+          <h3>Fail closed instead of “best effort”</h3>
+          <p>Where history indicates a lane identity but that identity cannot be safely resolved, an actionable error is preferred over silently using the first preset.</p>
+        </article>
+        <article class="card">
+          <h3>Backward-compatible persistence</h3>
+          <p>The new field is optional. Existing session JSON without it still decodes, then follows explicit legacy-resolution rules.</p>
+        </article>
+        <article class="card">
+          <h3>Global preset mode is a deliberate escape hatch</h3>
+          <p>Globally hiding or temporarily disabling presets changes selection to the deterministic planning model instead of making bound chats unusable. That send clears the preset UUID and honestly rebinds the lane; restoring a named preset requires one explicit model call.</p>
+        </article>
+        <article class="card">
+          <h3>Session identity dominates run identity</h3>
+          <p>For normal Agent Mode lanes, the durable Agent session is the owner and the provider run is only a replaceable stamp. This is the minimum relaxation that permits restart recovery without allowing a different Agent session to adopt the chat.</p>
+        </article>
+        <article class="card">
+          <h3>Headless lanes remain exact-run scoped</h3>
+          <p>A lane with no durable Agent session ID still belongs only to its originating run. The restart fix does not turn a short-lived Context Builder or headless lane into globally resumable state.</p>
+        </article>
+        <article class="card">
+          <h3>No silent stale-lane adoption</h3>
+          <p>Implicit sends with a current run resume only exact-run lanes. Restart recovery is deliberate: inspect or recover the saved lane through <code>oracle_chat_log</code>, then pass its explicit <code>chat_id</code>.</p>
+        </article>
+        <article class="card">
+          <h3>Read before write</h3>
+          <p>Log recovery is read-only and never changes the run stamp. Ownership metadata advances only when the same durable session explicitly continues the chat.</p>
+        </article>
+        <article class="card">
+          <h3>Prompt and implementation must agree</h3>
+          <p>Tool descriptions and Agent Mode prompts now explain that a returned <code>chat_id</code> carries the lane preset, that an explicit model intentionally switches it, and that results disclose <code>explicit</code>, <code>inherited</code>, or <code>automatic</code> selection.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="inventory">
+      <span class="badge observed">Observed in git diff</span>
+      <h2>Change inventory</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>File</th><th>Role</th><th>What changed</th></tr></thead>
+          <tbody>
+            <tr><td><code>ChatSession.swift</code></td><td>Persistence model</td><td>Adds optional exact preset UUID and backward-compatible Codable support.</td></tr>
+            <tr><td><code>ChatHistoryManager.swift</code></td><td>Lightweight loading</td><td>Adds the field to the independent session-header decoder and hydrated stub.</td></tr>
+            <tr><td><code>OracleViewModel+MCP.swift</code></td><td>Core routing and ownership</td><td>Adds inherited selection, lane attribution, session-dominant restart ownership, exact-run headless isolation, read-only log recovery, run-stamp advancement, fail-closed resolution, and result provenance.</td></tr>
+            <tr><td><code>OracleViewModel.swift</code></td><td>Send lifecycle</td><td>Records attribution as a unit; preserves or clears it correctly across sends, clones, forks, and saves.</td></tr>
+            <tr><td><code>ContextBuilderAgentViewModel.swift</code></td><td>Context Builder handoff</td><td>Carries the exact model-preset UUID into newly created Oracle follow-up chats.</td></tr>
+            <tr><td><code>MCPOracleToolProvider.swift</code></td><td>Tool contract</td><td>Documents model-less inheritance, explicit migration, and failure behavior.</td></tr>
+            <tr><td><code>AgentModePrompts.swift</code></td><td>Agent guidance</td><td>Tells agents to continue each lane by its own chat ID and explains selection provenance.</td></tr>
+            <tr><td><code>SystemPromptService.swift</code></td><td>General prompt</td><td>Updates Oracle continuation examples and guidance.</td></tr>
+            <tr><td><code>AgentModeMCPToolPolicy.swift</code></td><td>Knowledge profile</td><td>Projects the simpler Knowledge-specific continuation contract.</td></tr>
+            <tr><td><code>AgentOraclePillRoutingTests.swift</code></td><td>Routing tests</td><td>Adds inheritance, preset-order independence, explicit migration, run rotation, persisted-stub hydration, cross-session rejection, log recovery, deletion, mode, and legacy ambiguity cases.</td></tr>
+            <tr><td><code>ChatHistoryJSONOnlyTests.swift</code></td><td>Persistence tests</td><td>Tests full/stub load paths and legacy JSON without the new field.</td></tr>
+            <tr><td><code>ContextBuilderMCPProgressTimelineTests.swift</code></td><td>Tuple/runner contract</td><td>Updates the deterministic follow-up fixture for exact model-preset identity.</td></tr>
+            <tr><td><code>ContextBuilderWorktreeInheritanceTests.swift</code></td><td>Ownership boundary tests</td><td>Updates Context Builder coverage for exact-run headless ownership and non-Agent canonical behavior.</td></tr>
+            <tr><td><code>MCPAskOracleWorktreeTests.swift</code></td><td>MCP ownership tests</td><td>Pins session-dominant explicit continuation, exact-run headless isolation, ranked log recovery, ownerless fail-closed behavior, and non-empty stale-lane preference.</td></tr>
+            <tr><td><code>ToolCatalogSnapshotTests.swift</code></td><td>Schema snapshots</td><td>Locks the revised continuation descriptions for <code>ask_oracle</code> and <code>oracle_send</code>.</td></tr>
+            <tr><td><code>test-suite-contract-ledger.tsv</code></td><td>Test inventory</td><td>Renames outdated contracts and adds the new routing, persistence, rotation, and log-recovery regressions.</td></tr>
+            <tr><td><code>conductor.py</code></td><td>Debug-app lifecycle</td><td>Repairs the compatibility app-bundle link after staged activation and uses a narrowly scoped direct-executable fallback only when LaunchServices reports that it cannot resolve or communicate with the valid packaged app.</td></tr>
+            <tr><td><code>test_conductor_lifecycle.py</code></td><td>Lifecycle regressions</td><td>Covers permanent compatibility-link repair, recognized LaunchServices fallback, and fail-closed behavior for unrelated launch errors.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="validation">
+      <span class="badge tests">Verified from conductor jobs and current diff</span>
+      <h2>Validation evidence</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Check</th><th>Result</th><th>Evidence</th></tr></thead>
+          <tbody>
+            <tr><td>Preset-inheritance focused matrix</td><td>Pass</td><td>100 tests, 0 failures across 10 affected suites before the restart-specific extension; conductor ticket <code>0481abca-47bf-4002-bf49-90469954df8e</code>.</td></tr>
+            <tr><td>Final restart batch A</td><td>Pass</td><td>12 targeted <code>AgentOraclePillRoutingTests</code>, 0 failures; ticket <code>d04153c9-e5fd-45f4-ac4b-e43bef878536</code>.</td></tr>
+            <tr><td>Final restart batch B</td><td>Pass</td><td>9 tests, 0 failures across routing, Context Builder ownership, and MCP ownership/log-recovery boundaries; ticket <code>58c08da0-59e5-4aa2-b3a9-7fc18683cb53</code>.</td></tr>
+            <tr><td>Strict format + SwiftLint</td><td>Pass</td><td>0 of 1,457 Swift files require formatting and strict SwiftLint is clean; ticket <code>9c1f1875-90dd-4cc1-bced-cf1f8273988b</code>.</td></tr>
+            <tr><td>Both products</td><td>Pass</td><td><code>RepoPrompt</code> and <code>repoprompt-mcp</code> built successfully in one coordinated job; ticket <code>fede9e4b-4ac7-4eb4-b463-41f28036c0ad</code>.</td></tr>
+            <tr><td>Authoritative root/provider test listing</td><td>Pass</td><td>Root and provider suites enumerated successfully after the ledger updates; final tickets <code>49e093d6-02a1-42b2-bd60-d5022b9be659</code> and <code>04aac311-8c2c-44f8-954d-26ba3ae02c77</code>.</td></tr>
+            <tr><td>Conductor self-test</td><td>Pass</td><td>The complete <code>make conductor-selftest</code> matrix passed, including all 86 lifecycle tests. Three process-tree cases failed inside the restricted process sandbox but passed individually and in the complete unsandboxed suite, confirming a test-environment artifact rather than a product defect.</td></tr>
+            <tr><td>Debug-app relaunch</td><td>Pass</td><td>The repaired lifecycle path completed through conductor ticket <code>011b520d-9db6-4b4b-a7bd-6e5b4a5d645b</code>. The packaged executable and signature were valid; the fallback addresses macOS LaunchServices errors <code>-10827</code> and <code>-10822</code> without masking unrelated failures.</td></tr>
+            <tr><td>Live dual-Oracle restart matrix</td><td>Pass</td><td>User-executed against the rebuilt app: 10 of 10 steps passed, covering exact openings, in-memory inheritance, persistence and relaunch, read-only history recovery, post-restart inheritance, deliberate migration, cross-session and headless rejection, and no implicit stale adoption.</td></tr>
+            <tr><td><code>git diff --check</code></td><td>Pass</td><td>Performed during this report update; no whitespace errors.</td></tr>
+            <tr><td>Ledger verification</td><td>Known baseline drift</td><td>Performed during this report update. The ledger reports three missing and two stale <code>WorkspaceProjectedPathSearchTests</code>, matching the unrelated pre-existing baseline documented during the Knowledge profile work.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout warn"><strong>Not run for the final restart snapshot:</strong> a full root test execution. Earlier combined-suite attempts became inert during real-workspace skill discovery, while the same checks completed quickly when split into focused batches. The final evidence therefore favors the affected routing, persistence, ownership, Context Builder, and MCP boundaries rather than repeating a long unrelated full suite.</div>
+      <h3>Mutation-test cleanup</h3>
+      <p>A prior verification step intentionally inserted a temporary early return that disabled inheritance. The interrupted session left that marker in the working tree and its test job waiting for a stream that could never open. It was removed before the final batches and builds. The current resolver contains no mutation marker.</p>
+      <h3>Job health</h3>
+      <p>At report time, <code>./conductor job list</code> showed no queued, running, or global-wait jobs. One old queued build was deliberately cancelled after waiting behind an inert combined test; the later combined product build completed successfully.</p>
+    </section>
+
+    <section id="crash">
+      <span class="badge risk">Separate observed issue</span>
+      <h2>What about the apparent app crash?</h2>
+      <p><strong>Yes, the debug app genuinely crashed.</strong> macOS wrote <code>RepoPrompt-2026-07-31-131150.ips</code>; the incident captured the process at approximately 13:11:14 local time with <code>EXC_BREAKPOINT / SIGTRAP</code> on the main thread.</p>
+      <div class="cards">
+        <article class="card bad">
+          <h3>Crash location</h3>
+          <p>The top application frames are <code>TabSession.assertSourceItemDerivedStateIsConsistent</code>, <code>replaceItemSilentlyForRetentionCompaction</code>, and <code>refreshDerivedTranscriptState</code>. In plain language, a DEBUG consistency assertion fired while compacting retained Agent transcript items.</p>
+        </article>
+        <article class="card good">
+          <h3>Why it does not currently implicate this fix</h3>
+          <p>The faulting source files are not in this implementation diff. The Oracle changes operate in chat routing, ownership, persistence, and tests. The crashed app process had been launched the previous evening, and the final validation built products without relaunching that process.</p>
+        </article>
+      </div>
+      <div class="callout warn"><strong>Interpretation:</strong> the crash happened near the earlier test-listing jobs, but timing alone does not establish causation. The available evidence supports a separate Agent transcript-retention invariant failure, not an Oracle continuation failure. The rebuilt app subsequently completed the full live restart matrix without a reported recurrence. If it happens again, capture the exact UI sequence and keep the <code>.ips</code> file for a dedicated investigation.</div>
+    </section>
+
+    <section id="review">
+      <span class="badge observed">Review findings addressed</span>
+      <h2>Dual-Oracle review outcome</h2>
+      <p>OracleA and OracleB reviewed the preset-inheritance implementation independently, with exact identities verified, then cross-critiqued the material gaps. After the user’s restart test exposed the owner mismatch, both Oracles also reviewed the restart diagnosis and the proposed session-dominant contract before implementation. The work was extended where their findings identified a real safety boundary rather than documenting the limitation away.</p>
+      <div class="cards">
+        <article class="card good">
+          <h3>Resolved: implicit resume within one run</h3>
+          <p>A call with neither <code>chat_id</code> nor <code>new_chat:true</code> identifies the authoritative exact-run session and inherits its preset. Across a restart, it intentionally starts fresh instead of guessing which stale lane to adopt.</p>
+        </article>
+        <article class="card good">
+          <h3>Resolved by explicit policy: global preset mode</h3>
+          <p>Globally hiding or temporarily disabling presets intentionally selects the deterministic planning model and rebinds the lane. Per-preset deletion, mode incompatibility, unavailability, unresolvable models, and ambiguous legacy matches still fail closed.</p>
+        </article>
+        <article class="card good">
+          <h3>Resolved: unattributed history</h3>
+          <p>Historical chats with messages and no recoverable attribution fail closed when several presets are possible. Empty, never-sent chats remain eligible for honest automatic selection.</p>
+        </article>
+        <article class="card good">
+          <h3>Resolved: Context Builder identity</h3>
+          <p><code>resolveMCPFollowUpModel</code> now returns the exact model-preset ID and the Context Builder runner records it in the created Oracle chat.</p>
+        </article>
+        <article class="card good">
+          <h3>Resolved: UI sends and stale bindings</h3>
+          <p>A manual UI or other non-preset-backed send records its own raw model attribution and clears the old preset UUID at send reservation, preventing a stale preset/model pair.</p>
+        </article>
+        <article class="card good">
+          <h3>Resolved: restart ownership</h3>
+          <p>Same durable Agent session plus new run is accepted; different session is rejected; run-owned-only headless lanes remain exact-run scoped.</p>
+        </article>
+        <article class="card good">
+          <h3>Resolved: activate before re-stamp</h3>
+          <p>Both reviews highlighted persistence ordering risk. A targeted persisted-stub test now proves the full saved chat is loaded before the new run stamp is applied, so hydration cannot silently revert ownership metadata.</p>
+        </article>
+        <article class="card good">
+          <h3>Resolved: ownerless log fail-open</h3>
+          <p>Post-review inspection found that an ownerless <code>oracle_chat_log</code> request could otherwise see an Agent-owned lane. The final policy exposes only genuinely unowned chats to an ownerless caller.</p>
+        </article>
+        <article class="card warn">
+          <h3>Residual hardening opportunity</h3>
+          <p>The pre-resolution path rechecks that authoritative chat resolution returns the same session ID after model selection. A future defensive refinement could also compare the attribution snapshot immediately before reservation, although normal busy-session rejection already protects overlapping sends.</p>
+        </article>
+      </div>
+      <p class="small"><strong>Review identities:</strong> OracleA → Claude Code Fable 5 XHigh; OracleB → GPT-5.6 Sol XHigh. The supplied session evidence confirms independent review of both the original inheritance work and the restart design; the final state was then validated through deterministic tests, lint, test listing, and builds.</p>
+    </section>
+
+    <section id="test">
+      <span class="badge tests">Test guide</span>
+      <h2>How to test and see the effect</h2>
+      <h3>Fast automated checks</h3>
+      <pre><code>make dev-test FILTER=AgentOraclePillRoutingTests/testOracleLaneSurvivesRunRotationAndRejectsCrossSession
+make dev-test FILTER=MCPAskOracleWorktreeTests/testExplicitOracleContinuationUsesSessionDominantOwnership
+make dev-test FILTER=MCPAskOracleWorktreeTests/testOracleLogLookupPrefersExactRunThenStaleSameSessionNeverLegacy
+make dev-lint
+make dev-swift-build PRODUCT=all</code></pre>
+      <p class="small">These are the shortest discriminating checks for the newly added restart contract. The broader preset-inheritance matrix remains recorded under ticket <code>0481abca-47bf-4002-bf49-90469954df8e</code>; the final restart batches are tickets <code>d04153c9-e5fd-45f4-ac4b-e43bef878536</code> and <code>58c08da0-59e5-4aa2-b3a9-7fc18683cb53</code>.</p>
+      <h3>Human-visible dual-Oracle and restart smoke test <span class="badge tests">Completed: 10/10 passed</span></h3>
+      <div class="steps">
+        <article class="step"><h3>Build and launch the current tree</h3><p>Use <code>make dev-run</code> only after confirming it is safe to replace the visible debug app. This matters because the crash-dump process was an older instance launched the previous evening.</p></article>
+        <article class="step"><h3>Open two independent lanes</h3><p>In one Knowledge Agent session, consult OracleA and OracleB concurrently with <code>new_chat:true</code> and each exact preset.</p></article>
+        <article class="step"><h3>Record both chat IDs</h3><p>Confirm the first results report the intended preset UUIDs and <code>model_selection: explicit</code>.</p></article>
+        <article class="step"><h3>Prove in-memory inheritance</h3><p>Continue OracleB using only B’s <code>chat_id</code>, then do the same for A. Expected: each lane keeps its preset and reports <code>model_selection: inherited</code>.</p></article>
+        <article class="step"><h3>Persist and restart</h3><p>Close or save the workspace/session, quit the debug app, relaunch it, and restore the <em>same Agent Mode session</em>. A brand-new or forked Agent session is intentionally a different owner.</p></article>
+        <article class="step"><h3>Recover saved history read-only</h3><p>Call <code>oracle_chat_log</code> with each saved chat ID. Expected: the history is returned and the response echoes the same <code>chat_id</code>; merely reading does not change ownership.</p></article>
+        <article class="step"><h3>Continue explicitly after restart</h3><p>Call <code>ask_oracle</code> with OracleB’s saved <code>chat_id</code> and no model, then repeat for A. Expected: each returns its original preset with <code>model_selection: inherited</code>, and neither reports “different Agent Mode owner.”</p></article>
+        <article class="step"><h3>Verify deliberate migration</h3><p>Optionally send B’s <code>chat_id</code> with OracleA’s explicit preset. Expected: <code>explicit</code>; the next model-less continuation inherits OracleA.</p></article>
+        <article class="step"><h3>Verify the safety boundary</h3><p>From a genuinely different Agent Mode session, attempt the same explicit continuation. Expected: rejection identifying a different Agent Mode session. A headless/run-only lane should likewise reject a different run.</p></article>
+        <article class="step"><h3>Verify no implicit stale adoption</h3><p>After restart, omit both <code>chat_id</code> and <code>new_chat:true</code>. Expected: a fresh/exact-run lane, not silent adoption of an old saved lane.</p></article>
+        <article class="step"><h3>Watch for the separate crash</h3><p>If the app exits, preserve the newest <code>RepoPrompt*.ips</code> file and note which step was active. A recurrence in transcript compaction should be investigated separately from Oracle preset/owner routing.</p></article>
+      </div>
+    </section>
+
+    <section id="risks">
+      <span class="badge risk">Known limitations</span>
+      <h2>Risks, limitations, and technical debt</h2>
+      <ul>
+        <li><strong>Legacy identity is inherently lossy:</strong> sessions saved before exact preset attribution may only identify the raw model. A unique matching preset can be inherited; multiple matches fail closed and require an explicit model.</li>
+        <li><strong>Global preset disabling intentionally changes lane identity:</strong> this is an escape hatch to the configured planning model, not preservation of the old preset. Re-enable and explicitly select the named preset to restore it.</li>
+        <li><strong>UI sends deliberately reset exact preset binding:</strong> once a person sends into the chat using a non-preset-backed UI model, the old lane UUID is no longer authoritative.</li>
+        <li><strong>A narrow attribution race remains a defensive hardening opportunity:</strong> session identity is revalidated after async model selection, but the full attribution snapshot is not compared again immediately before reservation.</li>
+        <li><strong>Implicit continuation is intentionally run-local:</strong> after restart, callers must recover or retain a chat ID and continue explicitly. This avoids silently selecting the wrong stale lane when one Agent session owns several Oracle conversations.</li>
+        <li><strong>Cold persisted continuation is covered twice:</strong> deterministic persisted-stub tests prove load-before-stamp ordering and message preservation, and the final live provider matrix proves the user-visible save, relaunch, restore, log-recovery, and continuation path.</li>
+        <li><strong>Durable identity means the same Agent session:</strong> restoring as a new or forked Agent Mode session correctly fails the owner check even if the Oracle chat ID is known.</li>
+        <li><strong>A separate debug-app assertion crash was observed:</strong> it is in unmodified Agent transcript-retention code and is not presently linked to this change, but recurrence deserves its own investigation.</li>
+        <li><strong>No migration is required:</strong> the optional JSON field preserves compatibility, but old chats without enough attribution may require one explicit <code>model</code> call.</li>
+        <li><strong>No dependencies, database schemas, feature flags, or environment variables changed.</strong></li>
+      </ul>
+    </section>
+
+    <section id="actions">
+      <span class="badge tests">Recommended next steps</span>
+      <h2>Action items</h2>
+      <ol>
+        <li><strong>Live acceptance is complete.</strong> The rebuilt app passed the full save → restart → restore same Agent session → explicit <code>chat_id</code> continuation matrix, including the intended rejection from a different Agent session.</li>
+        <li><strong>Before committing:</strong> review and stage only the intended Oracle, conductor-lifecycle, test-ledger, and report changes, then run <code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code>. Rerun it after any staging change.</li>
+        <li><strong>Treat another transcript-retention crash as a separate bug.</strong> Preserve the new <code>.ips</code>, exact UI step, and relevant debug diagnostics. The earlier crash did not recur during the successful final matrix.</li>
+        <li><strong>Optional hardening:</strong> re-read the attribution snapshot immediately before send reservation. This is defensively stronger but is not a demonstrated release blocker after session-ID revalidation and busy-send protections.</li>
+      </ol>
+    </section>
+
+    <section id="evidence">
+      <span class="badge observed">Evidence and limitations</span>
+      <h2>Evidence, scope, and metrics</h2>
+      <div class="table-wrap">
+        <table>
+          <tbody>
+            <tr><th>Session context</th><td>Substantial handoff transcript available, including the original OracleB preset drift, user-verified in-memory fix, restart failure, ownership diagnosis, dual-Oracle design review, implementation pivots, and final job evidence.</td></tr>
+            <tr><th>Git scope</th><td>Current uncommitted continuation/restart and debug-launch lifecycle implementation against <code>c4c2ce73</code>; 18 modified implementation files, +1,727/−159, plus this updated report.</td></tr>
+            <tr><th>Source evidence</th><td>Direct inspection of routing, model selection, session/run ownership, log recovery, send lifecycle, persistence, prompts, and tests.</td></tr>
+            <tr><th>Test evidence</th><td>Earlier 100-test inheritance matrix plus 21 final restart-delta tests; strict SwiftFormat/SwiftLint, both product builds, authoritative root/provider listing, the complete conductor self-test, the 10-step live restart matrix, and <code>git diff --check</code> passed.</td></tr>
+            <tr><th>Review evidence</th><td>Independent OracleA/OracleB review and cross-critique for inheritance, followed by independent review of the restart diagnosis/design; identities verified in the supplied session evidence.</td></tr>
+            <tr><th>Crash evidence</th><td>One macOS diagnostic report captured a DEBUG transcript-retention assertion. Its faulting files are outside this diff; causation by this change is not established.</td></tr>
+            <tr><th>Unknown/not completed</th><td>A full root Swift test execution for the final snapshot and release packaging. These are not required to establish the scoped Oracle continuation or conductor-launch contracts; the affected suites, products, lifecycle self-tests, and live workflow are green.</td></tr>
+            <tr><th>Duration</th><td>Not reliably reconstructable from available evidence.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small">Claims marked “observed” come from the current code/diff or command output. Root-cause lineage and product decisions come from the supplied session handoff. Future behavior beyond tested paths is described as an expectation or risk, not as proven fact.</p>
+    </section>
+  </main>
+</div>
+<footer>
+  <div class="shell">Updated from repository state, conductor output, crash evidence, session history, and independent review on 31 July 2026.</div>
+</footer>
+</body>
+</html>

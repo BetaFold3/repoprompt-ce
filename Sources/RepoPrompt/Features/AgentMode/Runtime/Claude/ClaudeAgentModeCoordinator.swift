@@ -43,6 +43,8 @@ final class ClaudeAgentModeCoordinator {
         let permissionMode: String?
         let allowNativeBashTool: Bool?
         let mcpStrictMode: Bool?
+        let sessionProfile: AgentSessionProfile
+        let toolSearchEnabled: Bool?
     }
 
     private static let logger = Logger(subsystem: "com.repoprompt.agents", category: "ClaudeSteering")
@@ -104,7 +106,13 @@ final class ClaudeAgentModeCoordinator {
             runtimeVariant: launchSettings.runtimeVariant,
             permissionMode: launchSettings.permissionMode,
             allowNativeBashTool: launchSettings.allowNativeBashTool,
-            mcpStrictMode: launchSettings.mcpStrictMode
+            disallowedBuiltInTools: ClaudeCodeIntegrationConfiguration.disallowedTools(
+                for: .agentRun,
+                allowNativeBashTool: launchSettings.allowNativeBashTool ?? false,
+                sessionProfile: launchSettings.sessionProfile
+            ),
+            mcpStrictMode: launchSettings.mcpStrictMode,
+            toolSearchEnabled: launchSettings.toolSearchEnabled
         )
         let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: coreConfig, mode: .agentMode)
         return ClaudeCompatibleNativeSessionAdapter(runtimeConfig: runtimeConfig) {
@@ -266,8 +274,9 @@ final class ClaudeAgentModeCoordinator {
             selectedModelRaw: launchModelRaw,
             runtimePermission: runtimePermission
         ).effectiveMode
-        let effectiveAllowNativeBashTool = runtimePermission.allowNativeBashTool
-        let effectiveMCPStrictMode = runtimePermission.mcpStrictMode
+        let effectiveAllowNativeBashTool = session.profile == .knowledge ? false : runtimePermission.allowNativeBashTool
+        let effectiveMCPStrictMode = session.profile == .knowledge ? true : runtimePermission.mcpStrictMode
+        let effectiveToolSearchEnabled = session.profile == .knowledge ? false : nil
 
         // If the session's Claude runtime variant or effective permission mode no
         // longer matches the controller, recycle it so the next process launches
@@ -279,8 +288,11 @@ final class ClaudeAgentModeCoordinator {
         let permissionModeChanged = currentLaunchSettings?.permissionMode != effectivePermissionMode
         let bashToolChanged = currentLaunchSettings?.allowNativeBashTool != effectiveAllowNativeBashTool
         let mcpStrictModeChanged = currentLaunchSettings?.mcpStrictMode != effectiveMCPStrictMode
+        let sessionProfileChanged = currentLaunchSettings?.sessionProfile != session.profile
+        let toolSearchChanged = currentLaunchSettings?.toolSearchEnabled != effectiveToolSearchEnabled
         if let existingController = session.claudeController,
            runtimeVariantChanged || permissionModeChanged || bashToolChanged || mcpStrictModeChanged
+           || sessionProfileChanged || toolSearchChanged
         {
             guard await !(existingController.hasTurnInFlight) else {
                 return
@@ -326,7 +338,9 @@ final class ClaudeAgentModeCoordinator {
                 workspacePath: runtimeWorkspacePath,
                 permissionMode: effectivePermissionMode,
                 allowNativeBashTool: effectiveAllowNativeBashTool,
-                mcpStrictMode: effectiveMCPStrictMode
+                mcpStrictMode: effectiveMCPStrictMode,
+                sessionProfile: session.profile,
+                toolSearchEnabled: effectiveToolSearchEnabled
             )
             let createdController = claudeControllerFactory(
                 runID,
@@ -355,7 +369,8 @@ final class ClaudeAgentModeCoordinator {
                 runtimeVariant: runtimeVariant,
                 effectivePermissionMode: effectivePermissionMode,
                 effectiveAllowNativeBashTool: effectiveAllowNativeBashTool,
-                effectiveMCPStrictMode: effectiveMCPStrictMode
+                effectiveMCPStrictMode: effectiveMCPStrictMode,
+                effectiveToolSearchEnabled: effectiveToolSearchEnabled
             )
             if let launchKey {
                 viewModel?.syncSpawnResolvedClaudeConfiguredContextWindow(
@@ -398,8 +413,10 @@ final class ClaudeAgentModeCoordinator {
             runtimeVariant: runtimeVariant,
             workspacePath: runtimeWorkspacePath,
             permissionMode: effectivePermissionMode,
-            allowNativeBashTool: runtimePermission.allowNativeBashTool,
-            mcpStrictMode: runtimePermission.mcpStrictMode
+            allowNativeBashTool: session.profile == .knowledge ? false : runtimePermission.allowNativeBashTool,
+            mcpStrictMode: session.profile == .knowledge ? true : runtimePermission.mcpStrictMode,
+            sessionProfile: session.profile,
+            toolSearchEnabled: session.profile == .knowledge ? false : nil
         )
         return controllerLaunchSettingsByTabID[session.tabID] != expected
     }
@@ -551,7 +568,8 @@ final class ClaudeAgentModeCoordinator {
         runtimeVariant: ClaudeCodeRuntimeVariant,
         effectivePermissionMode: String,
         effectiveAllowNativeBashTool: Bool?,
-        effectiveMCPStrictMode: Bool?
+        effectiveMCPStrictMode: Bool?,
+        effectiveToolSearchEnabled: Bool?
     ) async throws -> NativeAgentRuntimeSessionRef {
         let existingSessionID = session.providerSessionID
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
@@ -606,7 +624,9 @@ final class ClaudeAgentModeCoordinator {
                 workspacePath: retryWorkspacePath,
                 permissionMode: effectivePermissionMode,
                 allowNativeBashTool: effectiveAllowNativeBashTool,
-                mcpStrictMode: effectiveMCPStrictMode
+                mcpStrictMode: effectiveMCPStrictMode,
+                sessionProfile: session.profile,
+                toolSearchEnabled: effectiveToolSearchEnabled
             )
             let freshController = claudeControllerFactory(
                 freshRunID,
@@ -1364,7 +1384,8 @@ final class ClaudeAgentModeCoordinator {
         SystemPromptService.agentModePrompt(
             agentKind: session.selectedAgent,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
+            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled(),
+            sessionProfile: session.profile
         )
     }
 

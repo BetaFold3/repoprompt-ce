@@ -210,6 +210,35 @@ extension AgentModeViewModel {
         var worktreeBindings: [AgentSessionWorktreeBinding] = []
         /// Persisted resumable worktree-merge operations for this Agent session.
         var worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
+        /// Session-lifetime product profile. This is selected only for a fresh session and
+        /// is never mutated after provider or transcript work begins.
+        private(set) var profile: AgentSessionProfile = .standard
+
+        /// Adopt a profile while this tab is still an untouched construction placeholder.
+        /// Persisted hydration and fresh Knowledge-session creation both use this narrow seam;
+        /// live sessions must create a new tab instead of changing prompts or tool policy in place.
+        @discardableResult
+        func adoptSessionProfile(_ requestedProfile: AgentSessionProfile) -> Bool {
+            guard profile != requestedProfile else { return true }
+            guard runState == .idle,
+                  runID == nil,
+                  activeRunAttemptID == nil,
+                  !hasSentFirstMessage,
+                  providerSessionID == nil,
+                  codexConversationID == nil,
+                  claudeController == nil,
+                  codexController == nil,
+                  acpController == nil,
+                  mcpControlContext == nil,
+                  items.isEmpty,
+                  transcript.turns.isEmpty
+            else {
+                return false
+            }
+            profile = requestedProfile
+            return true
+        }
+
         /// Permission profile for the current session. Set to `.mcpSafeDefaults`
         /// when MCP control is active, `.userConfigured` otherwise.
         var permissionProfile: AgentPermissionProfile = .userConfigured
@@ -553,6 +582,9 @@ extension AgentModeViewModel {
         /// The permission profile the current Codex controller was created with.
         /// Used to detect when MCP control changes require controller recycling.
         var codexControllerPermissionProfile: AgentPermissionProfile?
+        /// The session profile the current Codex controller was created with.
+        /// Used to keep the provider prompt and native-tool surface stable for its lifetime.
+        var codexControllerSessionProfile: AgentSessionProfile?
         /// The task label kind the current Codex controller was created with.
         /// Used to detect when role-specific native tool overrides require controller recycling.
         var codexControllerTaskLabelKind: AgentModelCatalog.TaskLabelKind?

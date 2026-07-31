@@ -56,7 +56,7 @@ final class RemoteAgentSessionTests: XCTestCase {
         let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
 
         XCTAssertEqual(decoded.serializationVersion, AgentSession.currentSerializationVersion)
-        XCTAssertEqual(decoded.serializationVersion, 6)
+        XCTAssertEqual(decoded.serializationVersion, 7)
         XCTAssertEqual(decoded.remoteHost, binding)
     }
 

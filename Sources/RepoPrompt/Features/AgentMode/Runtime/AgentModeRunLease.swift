@@ -8,6 +8,7 @@ extension MCPBootstrapLeaseSpec {
         gateID: UUID,
         windowID: Int,
         agent: AgentProviderKind,
+        sessionProfile: AgentSessionProfile = .standard,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false
     ) -> MCPBootstrapLeaseSpec {
@@ -18,7 +19,14 @@ extension MCPBootstrapLeaseSpec {
             tabID: tabID,
             clientName: agent.mcpClientNameHint,
             restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
-            additionalTools: AgentModeMCPPolicyInstaller.additionalTools(for: agent),
+            additionalTools: AgentModeMCPPolicyInstaller.additionalTools(
+                for: agent,
+                sessionProfile: sessionProfile
+            ),
+            allowedToolsOverride: sessionProfile == .knowledge
+                ? AgentModeMCPToolPolicy.knowledgeAllowedTools
+                : nil,
+            sessionProfile: sessionProfile,
             oneShot: true,
             reason: AgentModeMCPPolicyInstaller.policyReason,
             ttl: AgentModeMCPPolicyInstaller.policyTTL,
@@ -46,6 +54,8 @@ extension MCPBootstrapLease {
                 leaseSpec.tabID,
                 leaseSpec.runID,
                 leaseSpec.additionalTools,
+                leaseSpec.allowedToolsOverride,
+                leaseSpec.sessionProfile,
                 leaseSpec.purpose,
                 leaseSpec.taskLabelKind,
                 leaseSpec.allowsAgentExternalControlTools,

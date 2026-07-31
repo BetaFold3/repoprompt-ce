@@ -181,7 +181,7 @@ import XCTest
             )
         }
 
-        func testExplicitOracleContinuationRequiresExactAgentSessionAndRunOwner() {
+        func testExplicitOracleContinuationUsesSessionDominantOwnership() {
             let tabID = UUID()
             let sessionID = UUID()
             let runID = UUID()
@@ -190,8 +190,19 @@ import XCTest
                 agentModeSessionID: sessionID,
                 agentModeRunID: runID
             )
+            let missingRunStamp = ChatSession(
+                composeTabID: tabID,
+                agentModeSessionID: sessionID
+            )
+            let runOwned = ChatSession(
+                composeTabID: tabID,
+                agentModeRunID: runID
+            )
             let unownedLegacy = ChatSession(composeTabID: tabID)
 
+            // Session-owned lanes: the durable Agent Mode session decides. The run stamp is
+            // ephemeral per-process metadata, so a rotated run (app relaunch or controller
+            // recreation) must not orphan the session's own lane.
             XCTAssertTrue(
                 OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
                     owned,
@@ -199,9 +210,23 @@ import XCTest
                     agentModeRunID: runID
                 )
             )
-            XCTAssertFalse(
+            XCTAssertTrue(
                 OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
                     owned,
+                    agentModeSessionID: sessionID,
+                    agentModeRunID: UUID()
+                )
+            )
+            XCTAssertTrue(
+                OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
+                    owned,
+                    agentModeSessionID: sessionID,
+                    agentModeRunID: nil
+                )
+            )
+            XCTAssertTrue(
+                OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
+                    missingRunStamp,
                     agentModeSessionID: sessionID,
                     agentModeRunID: UUID()
                 )
@@ -215,8 +240,8 @@ import XCTest
             )
             XCTAssertFalse(
                 OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
-                    unownedLegacy,
-                    agentModeSessionID: sessionID,
+                    owned,
+                    agentModeSessionID: nil,
                     agentModeRunID: runID
                 )
             )
@@ -227,11 +252,37 @@ import XCTest
                     agentModeRunID: nil
                 )
             )
+
+            // Run-owned headless lanes die with their exact run; a session-having caller
+            // must not adopt them even when the ephemeral run UUID happens to match.
+            XCTAssertTrue(
+                OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
+                    runOwned,
+                    agentModeSessionID: nil,
+                    agentModeRunID: runID
+                )
+            )
             XCTAssertFalse(
                 OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
-                    owned,
+                    runOwned,
+                    agentModeSessionID: nil,
+                    agentModeRunID: UUID()
+                )
+            )
+            XCTAssertFalse(
+                OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
+                    runOwned,
                     agentModeSessionID: sessionID,
-                    agentModeRunID: nil
+                    agentModeRunID: runID
+                )
+            )
+
+            // Unowned legacy chats never match owned callers on the strict path.
+            XCTAssertFalse(
+                OracleViewModel.sessionMatchesOracleOwnerForExplicitContinuation(
+                    unownedLegacy,
+                    agentModeSessionID: sessionID,
+                    agentModeRunID: runID
                 )
             )
             XCTAssertTrue(
@@ -241,9 +292,35 @@ import XCTest
                     agentModeRunID: nil
                 )
             )
+
+            // Rejection messages keep the load-bearing phrase and discriminate causes.
+            let sessionMismatch = OracleViewModel.oracleOwnerContinuationRejection(
+                owned,
+                chatID: "lane-a",
+                agentModeSessionID: UUID(),
+                agentModeRunID: runID
+            )
+            XCTAssertTrue(sessionMismatch?.contains("different Agent Mode owner") == true)
+            XCTAssertTrue(sessionMismatch?.contains("different Agent Mode session") == true)
+            let headlessLaneMismatch = OracleViewModel.oracleOwnerContinuationRejection(
+                runOwned,
+                chatID: "lane-b",
+                agentModeSessionID: sessionID,
+                agentModeRunID: runID
+            )
+            XCTAssertTrue(headlessLaneMismatch?.contains("different Agent Mode owner") == true)
+            XCTAssertTrue(headlessLaneMismatch?.contains("run-scoped headless lane") == true)
+            XCTAssertNil(
+                OracleViewModel.oracleOwnerContinuationRejection(
+                    owned,
+                    chatID: "lane-c",
+                    agentModeSessionID: sessionID,
+                    agentModeRunID: UUID()
+                )
+            )
         }
 
-        func testOracleLogLookupDoesNotAdoptLegacyOrSiblingRun() {
+        func testOracleLogLookupPrefersExactRunThenStaleSameSessionNeverLegacy() {
             let tabID = UUID()
             let sessionID = UUID()
             let runID = UUID()
@@ -253,7 +330,7 @@ import XCTest
                 agentModeRunID: runID,
                 savedAt: Date(timeIntervalSince1970: 1)
             )
-            let newerSibling = ChatSession(
+            let newerStaleRun = ChatSession(
                 composeTabID: tabID,
                 agentModeSessionID: sessionID,
                 agentModeRunID: UUID(),
@@ -263,25 +340,141 @@ import XCTest
                 composeTabID: tabID,
                 savedAt: Date(timeIntervalSince1970: 4)
             )
+            let otherSession = ChatSession(
+                composeTabID: tabID,
+                agentModeSessionID: UUID(),
+                agentModeRunID: runID,
+                savedAt: Date(timeIntervalSince1970: 5)
+            )
 
+            // Exact-run lane wins over a newer stale-run lane of the same session.
             XCTAssertEqual(
                 OracleViewModel.test_preferredOracleLogSession(
                     forTabID: tabID,
-                    sessions: [newestLegacy, newerSibling, exact],
+                    sessions: [newestLegacy, newerStaleRun, exact],
                     activeSessionID: newestLegacy.id,
                     agentModeSessionID: sessionID,
                     agentModeRunID: runID
                 )?.id,
                 exact.id
             )
+            // Post-rotation recovery: without an exact-run lane, the caller's own session
+            // recovers its stale-run lane; the legacy chat is still never adopted.
+            XCTAssertEqual(
+                OracleViewModel.test_preferredOracleLogSession(
+                    forTabID: tabID,
+                    sessions: [newestLegacy, newerStaleRun],
+                    activeSessionID: newestLegacy.id,
+                    agentModeSessionID: sessionID,
+                    agentModeRunID: runID
+                )?.id,
+                newerStaleRun.id
+            )
+            // Legacy and other-session lanes remain invisible to an owned caller.
             XCTAssertNil(
                 OracleViewModel.test_preferredOracleLogSession(
                     forTabID: tabID,
-                    sessions: [newestLegacy, newerSibling],
+                    sessions: [newestLegacy, otherSession],
                     activeSessionID: newestLegacy.id,
                     agentModeSessionID: sessionID,
                     agentModeRunID: runID
                 )
+            )
+        }
+
+        func testOwnerlessOracleLogLookupSeesOnlyUnownedChats() {
+            let tabID = UUID()
+            let sessionID = UUID()
+            let runID = UUID()
+            let ownedActive = ChatSession(
+                composeTabID: tabID,
+                agentModeSessionID: sessionID,
+                agentModeRunID: runID,
+                savedAt: Date(timeIntervalSince1970: 5),
+                messageCount: 3
+            )
+            let runOwned = ChatSession(
+                composeTabID: tabID,
+                agentModeRunID: runID,
+                savedAt: Date(timeIntervalSince1970: 4),
+                messageCount: 2
+            )
+            let unownedLegacy = ChatSession(
+                composeTabID: tabID,
+                savedAt: Date(timeIntervalSince1970: 1),
+                messageCount: 1
+            )
+
+            // An ownerless Agent Mode caller must not read agent-owned lanes — even the
+            // tab-active one — only genuinely unowned chats.
+            XCTAssertEqual(
+                OracleViewModel.test_preferredOracleLogSession(
+                    forTabID: tabID,
+                    sessions: [ownedActive, runOwned, unownedLegacy],
+                    activeSessionID: ownedActive.id,
+                    agentModeSessionID: nil,
+                    agentModeRunID: nil
+                )?.id,
+                unownedLegacy.id
+            )
+            XCTAssertNil(
+                OracleViewModel.test_preferredOracleLogSession(
+                    forTabID: tabID,
+                    sessions: [ownedActive, runOwned],
+                    activeSessionID: ownedActive.id,
+                    agentModeSessionID: nil,
+                    agentModeRunID: nil
+                )
+            )
+        }
+
+        func testOracleLogRecoveryPrefersNonEmptyStaleLaneOverEmptyExactRunLane() {
+            let tabID = UUID()
+            let sessionID = UUID()
+            let runID = UUID()
+            let staleWithMessages = ChatSession(
+                composeTabID: tabID,
+                agentModeSessionID: sessionID,
+                agentModeRunID: UUID(),
+                savedAt: Date(timeIntervalSince1970: 1),
+                messageCount: 4
+            )
+            let emptyExact = ChatSession(
+                composeTabID: tabID,
+                agentModeSessionID: sessionID,
+                agentModeRunID: runID,
+                savedAt: Date(timeIntervalSince1970: 2)
+            )
+
+            // Log recovery is about reading a conversation: a non-empty stale lane from the
+            // same session beats an empty exact-run lane instead of dead-ending on it.
+            XCTAssertEqual(
+                OracleViewModel.test_preferredOracleLogSession(
+                    forTabID: tabID,
+                    sessions: [emptyExact, staleWithMessages],
+                    activeSessionID: nil,
+                    agentModeSessionID: sessionID,
+                    agentModeRunID: runID
+                )?.id,
+                staleWithMessages.id
+            )
+            // With both lanes non-empty, the exact-run lane still wins.
+            let exactWithMessages = ChatSession(
+                composeTabID: tabID,
+                agentModeSessionID: sessionID,
+                agentModeRunID: runID,
+                savedAt: Date(timeIntervalSince1970: 2),
+                messageCount: 2
+            )
+            XCTAssertEqual(
+                OracleViewModel.test_preferredOracleLogSession(
+                    forTabID: tabID,
+                    sessions: [exactWithMessages, staleWithMessages],
+                    activeSessionID: nil,
+                    agentModeSessionID: sessionID,
+                    agentModeRunID: runID
+                )?.id,
+                exactWithMessages.id
             )
         }
 
@@ -313,7 +506,21 @@ import XCTest
                         bindings: [binding]
                     )
                     let endpoint = try fixture.endpointA()
-                    try await configureAgentModeEndpoint(endpoint, context: context, fixture: fixture)
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: context,
+                        fixture: fixture,
+                        sessionProfile: .knowledge
+                    )
+                    let deniedResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.manageSelection,
+                        arguments: ["op": "get"]
+                    )
+                    XCTAssertTrue(
+                        deniedResponse.rawJSON.contains("not available in this Knowledge session"),
+                        deniedResponse.rawJSON
+                    )
+
                     installOracleCapture(capture, on: fixture.contextA.window)
                     fixture.contextA.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
                         await gate.markStartedAndWaitForRelease()
@@ -2936,23 +3143,57 @@ import XCTest
         private func configureAgentModeEndpoint(
             _ endpoint: PersistentMCPTestEndpoint,
             context: MCPServerViewModel.TabContextSnapshot,
-            fixture: PersistentMCPTestFixture
+            fixture: PersistentMCPTestFixture,
+            sessionProfile: AgentSessionProfile = .standard
         ) async throws {
             _ = try await endpoint.callTool(
                 name: "bind_context",
                 arguments: ["op": "bind", "context_id": context.tabID.uuidString]
             )
             await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
+            let runID = try XCTUnwrap(context.runID)
             try await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,
-                runID: XCTUnwrap(context.runID),
+                runID: runID,
                 purpose: .agentModeRun,
                 windowID: context.windowID
             )
-            await fixture.networkManager.debugSetAdditionalTools(
-                for: endpoint.connectionID,
-                additionalTools: [MCPWindowToolName.askOracle]
-            )
+            if sessionProfile == .knowledge {
+                await fixture.networkManager.installClientConnectionPolicy(
+                    for: endpoint.clientName,
+                    windowID: context.windowID,
+                    restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                    oneShot: true,
+                    reason: "knowledge read-to-oracle integration",
+                    ttl: 10,
+                    tabID: context.tabID,
+                    runID: runID,
+                    additionalTools: AgentModeMCPPolicyInstaller.additionalTools(
+                        for: .codexExec,
+                        sessionProfile: .knowledge
+                    ),
+                    allowedToolsOverride: AgentModeMCPToolPolicy.knowledgeAllowedTools,
+                    sessionProfile: .knowledge,
+                    purpose: .agentModeRun
+                )
+                let admission = await fixture.networkManager.debugApplyPendingPolicy(
+                    clientName: endpoint.clientName,
+                    connectionID: endpoint.connectionID,
+                    requireRunRouting: false
+                )
+                XCTAssertEqual(admission.outcome, "applied")
+                XCTAssertEqual(admission.sessionProfile, .knowledge)
+                let advertisedToolNames = try await endpoint.listToolNames()
+                XCTAssertEqual(
+                    Set(advertisedToolNames),
+                    AgentModeMCPToolPolicy.knowledgeAllowedTools
+                )
+            } else {
+                await fixture.networkManager.debugSetAdditionalTools(
+                    for: endpoint.connectionID,
+                    additionalTools: [MCPWindowToolName.askOracle]
+                )
+            }
             var canonicalTab = try XCTUnwrap(
                 fixture.contextA.window.workspaceManager.composeTab(with: context.tabID)
             )

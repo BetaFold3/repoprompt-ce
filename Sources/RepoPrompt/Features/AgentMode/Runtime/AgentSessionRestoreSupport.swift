@@ -357,6 +357,7 @@ enum AgentSessionRestoreSupport {
             remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
             isMCPOriginated: session.isMCPOriginated,
             origin: session.origin,
+            profile: session.profile,
             worktreeBindingSummaries: session.worktreeBindings.worktreeBindingSummaries,
             activeWorktreeMergeSummaries: session.worktreeMergeOperations.activeWorktreeMergeSummaries
         )

@@ -2166,7 +2166,8 @@ class OracleViewModel: ObservableObject {
                 preferredAIModel: fullSession.preferredAIModel,
                 selectedChatPresetID: fullSession.selectedChatPresetID,
                 lastSendModelID: fullSession.lastSendModelID,
-                lastSendModelDisplayName: fullSession.lastSendModelDisplayName
+                lastSendModelDisplayName: fullSession.lastSendModelDisplayName,
+                lastSendModelPresetID: fullSession.lastSendModelPresetID
             )
 
             // Persist the clone and capture the file URL so the stub can resolve it later
@@ -2280,6 +2281,12 @@ class OracleViewModel: ObservableObject {
             : nil
         let forkLastSendModelDisplayName = forkLatestAssistant?.modelName
             ?? (includesOriginalLatestAssistant ? originalSession.lastSendModelDisplayName : nil)
+        // Preset identity follows the same condition as the model ID: it is per-send, not
+        // per-message, so a truncated fork must not claim a binding it did not inherit.
+        // Display name is deliberately not used to recover identity anywhere.
+        let forkLastSendModelPresetID = includesOriginalLatestAssistant
+            ? originalSession.lastSendModelPresetID
+            : nil
 
         // Create the new forked session
         let newSession = ChatSession(
@@ -2295,7 +2302,8 @@ class OracleViewModel: ObservableObject {
             preferredAIModel: originalSession.preferredAIModel,
             selectedChatPresetID: originalSession.selectedChatPresetID,
             lastSendModelID: forkLastSendModelID,
-            lastSendModelDisplayName: forkLastSendModelDisplayName
+            lastSendModelDisplayName: forkLastSendModelDisplayName,
+            lastSendModelPresetID: forkLastSendModelPresetID
         )
 
         // Add the new session to the list and switch to it
@@ -2714,8 +2722,11 @@ class OracleViewModel: ObservableObject {
                 sessionToSave.selectedPromptIDs = session.selectedPromptIDs
                 sessionToSave.preferredAIModel = session.preferredAIModel
                 sessionToSave.selectedChatPresetID = session.selectedChatPresetID
+                // Last-send attribution is one unit: copying part of it would manufacture a
+                // stale model/preset pair.
                 sessionToSave.lastSendModelID = session.lastSendModelID
                 sessionToSave.lastSendModelDisplayName = session.lastSendModelDisplayName
+                sessionToSave.lastSendModelPresetID = session.lastSendModelPresetID
             } catch {
                 print("Warning: Failed to load full session for stub-safe save, skipping save: \(error)")
                 throw error
@@ -3025,6 +3036,30 @@ class OracleViewModel: ObservableObject {
         return overrideAIMessage
     }
 
+    // MARK: - Last-send attribution
+
+    /// Records durable attribution for the send that just started.
+    ///
+    /// The three attribution fields are written together on purpose: `lastSendModelPresetID`
+    /// must never survive a send that resolved a different model. Callers that have no exact
+    /// `ModelPreset` identity (UI sends, planning-model sends) pass `nil` and the binding is
+    /// cleared rather than left stale, so "last send wins" stays true for a field named
+    /// `lastSend…`.
+    ///
+    /// This runs when a send has been accepted and reserved, not after a successful response.
+    @MainActor
+    private func recordLastSendAttribution(
+        sessionID: UUID,
+        model: AIModel,
+        modelDisplayName: String,
+        modelPresetID: UUID?
+    ) {
+        guard let sessionIndex = sessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        sessions[sessionIndex].lastSendModelID = model.rawValue
+        sessions[sessionIndex].lastSendModelDisplayName = modelDisplayName
+        sessions[sessionIndex].lastSendModelPresetID = modelPresetID
+    }
+
     // MARK: - Main Send/Receive Flow
 
     @MainActor
@@ -3033,6 +3068,7 @@ class OracleViewModel: ObservableObject {
         _ newUserMessage: String,
         sessionID: UUID? = nil,
         overrideModel: AIModel? = nil,
+        overrideModelPresetID: UUID? = nil,
         overrideChatPresetID: UUID? = nil,
         overrideMode: PromptViewModel.PlanActMode? = nil,
         gitInclusionOverride: GitInclusion? = nil,
@@ -3187,10 +3223,12 @@ class OracleViewModel: ObservableObject {
             streamId: nil,
             origin: origin
         )
-        if let sessionIndex = sessions.firstIndex(where: { $0.id == targetSessionID }) {
-            sessions[sessionIndex].lastSendModelID = model.rawValue
-            sessions[sessionIndex].lastSendModelDisplayName = modelDisplayName
-        }
+        recordLastSendAttribution(
+            sessionID: targetSessionID,
+            model: model,
+            modelDisplayName: modelDisplayName,
+            modelPresetID: overrideModelPresetID
+        )
 
         if currentSessionID == targetSessionID {
             updateLatestTokenCounts()

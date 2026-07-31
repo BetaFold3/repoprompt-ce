@@ -132,6 +132,13 @@ struct AgentModeView: View {
                 agentModeVM: agentModeVM
             )
         }
+        .onChange(of: agentModeVM.canCreateKnowledgeSession) { _, _ in
+            navigationController.onWorkspaceModeChanged(
+                isSystem: isSystemWorkspaceMode,
+                windowState: windowState,
+                agentModeVM: agentModeVM
+            )
+        }
         .onReceive(
             NotificationCenter.default.publisher(for: .toggleRepoPromptNavigationSidebar)
         ) { note in
@@ -3269,7 +3276,7 @@ struct AgentModeChatDetailView: View {
             defaultModelRaw: runInteractionSnapshot.selectedModelRaw,
             defaultReasoningEffortRaw: runInteractionSnapshot.selectedReasoningEffortRaw,
             availableAgentsProvider: { [weak agentModeVM] in
-                agentModeVM?.availableAgents ?? []
+                agentModeVM?.selectableAgents(forTabID: runInteractionSnapshot.currentTabID) ?? []
             },
             modelOptionsProvider: { [weak agentModeVM] agent in
                 agentModeVM?.modelOptions(for: agent) ?? []
@@ -5956,45 +5963,99 @@ struct AgentModeChatDetailView: View {
         ]
     }
 
+    private var knowledgeEmptyStateTips: [AgentTipItem] {
+        [
+            AgentTipItem(
+                icon: "doc.text.magnifyingglass",
+                iconColor: .blue,
+                title: "Start with the evidence at hand",
+                description: "Ask about workspace documents, notes, logs, or images. Text stays in RepoPrompt; native media reading is used only where the provider supports it, and PDFs otherwise need extracted text."
+            ),
+            AgentTipItem(
+                icon: "globe",
+                iconColor: .green,
+                title: "Research the current web when useful",
+                description: "Fresh web evidence is available when your chosen provider supports it and web search is enabled."
+            ),
+            AgentTipItem(
+                icon: "bubble.left.and.bubble.right",
+                iconColor: .purple,
+                title: "Ask for a second perspective",
+                description: "The agent can consult two independent Oracle presets, compare their blind spots, and synthesize without forcing a debate."
+            ),
+            AgentTipItem(
+                icon: "square.and.pencil",
+                iconColor: .orange,
+                title: "Keep the result in this workspace",
+                description: "Ask the agent to write or refine a durable note in the active project, folder, or notes vault."
+            )
+        ]
+    }
+
+    @ViewBuilder
     private var emptyStateView: some View {
-        VStack(spacing: 20) {
-            HStack(spacing: 10) {
-                Image(systemName: "bubble.left.and.text.bubble.right")
-                    .font(.system(size: 24, weight: .medium))
-                    .foregroundColor(.secondary.opacity(0.55))
-                Text("What are we building?")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 23, weight: .semibold))
-                    .foregroundColor(.secondary.opacity(0.9))
-            }
+        if statusPillsSnapshot.profile == .knowledge {
+            VStack(spacing: 20) {
+                HStack(spacing: 10) {
+                    Image(systemName: "brain")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundColor(.secondary.opacity(0.55))
+                    Text("What are we exploring?")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 23, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.9))
+                }
 
-            VStack(spacing: 10) {
-                AgentPaginatedWorkflowsView(
-                    workflows: allEmptyStateWorkflows,
-                    selectedWorkflowID: selectedWorkflow?.id,
-                    onSelect: { workflow in
-                        if selectedWorkflow?.id == workflow.definition.id {
-                            agentModeVM.selectWorkflow(nil)
-                        } else {
-                            agentModeVM.selectWorkflow(workflow.definition)
+                Text("Use focused workspace evidence, optional web research, and independent Oracle perspectives to build a clear answer or durable note.")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 560)
+
+                AgentRotatingTipsView(tips: knowledgeEmptyStateTips)
+                    .frame(maxWidth: 500)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 24)
+        } else {
+            VStack(spacing: 20) {
+                HStack(spacing: 10) {
+                    Image(systemName: "bubble.left.and.text.bubble.right")
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundColor(.secondary.opacity(0.55))
+                    Text("What are we building?")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 23, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.9))
+                }
+
+                VStack(spacing: 10) {
+                    AgentPaginatedWorkflowsView(
+                        workflows: allEmptyStateWorkflows,
+                        selectedWorkflowID: selectedWorkflow?.id,
+                        onSelect: { workflow in
+                            if selectedWorkflow?.id == workflow.definition.id {
+                                agentModeVM.selectWorkflow(nil)
+                            } else {
+                                agentModeVM.selectWorkflow(workflow.definition)
+                            }
+                            isInputFocused = true
+                        },
+                        editAction: {
+                            NotificationCenter.default.post(
+                                name: .showAgentWorkflowPopover,
+                                object: nil,
+                                userInfo: ["windowID": windowID]
+                            )
                         }
-                        isInputFocused = true
-                    },
-                    editAction: {
-                        NotificationCenter.default.post(
-                            name: .showAgentWorkflowPopover,
-                            object: nil,
-                            userInfo: ["windowID": windowID]
-                        )
-                    }
-                )
-            }
-            .frame(maxWidth: 620)
+                    )
+                }
+                .frame(maxWidth: 620)
 
-            AgentRotatingTipsView(tips: emptyStateTips)
-                .frame(maxWidth: 460)
+                AgentRotatingTipsView(tips: emptyStateTips)
+                    .frame(maxWidth: 460)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 24)
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 24)
     }
 
     private func emptyStateDescription(for workflow: AgentWorkflowDefinition) -> String {

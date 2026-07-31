@@ -105,6 +105,10 @@ actor ChatDataService {
         let selectedChatPresetID: UUID?
         let lastSendModelID: String?
         let lastSendModelDisplayName: String?
+        /// Must stay in sync with `ChatSession.lastSendModelPresetID`. Omitting it here would let a
+        /// hydrated stub carry `nil` and then overwrite the correct on-disk lane binding during the
+        /// stub-safe save merge.
+        let lastSendModelPresetID: UUID?
         let messageCount: Int?
         let messages: [StoredMessageHeader]?
     }
@@ -278,6 +282,7 @@ actor ChatDataService {
                 selectedChatPresetID: header.selectedChatPresetID,
                 lastSendModelID: header.lastSendModelID,
                 lastSendModelDisplayName: header.lastSendModelDisplayName,
+                lastSendModelPresetID: header.lastSendModelPresetID,
                 messageCount: count,
                 shortID: shortID
             )

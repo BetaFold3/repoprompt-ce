@@ -385,6 +385,8 @@ allowed_tracked_docs=(
   "docs/investigations/workspace-scoped-run-target-label-2026-07-13.md"
   "docs/plans/test-coverage-value-audit-2026-05-29.md"
   "docs/technical_implementation_reports/2026-07-29-parallel-dual-oracle-sessions.md"
+  "docs/technical_implementation_reports/2026-07-30-knowledge-agent-profile.html"
+  "docs/technical_implementation_reports/2026-07-30-oracle-continuation-preset-inheritance.html"
 )
 while IFS= read -r path; do
   allowed_tracked_docs+=("$path")

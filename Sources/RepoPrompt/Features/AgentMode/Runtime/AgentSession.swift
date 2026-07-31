@@ -211,7 +211,7 @@ struct PersistedRemoteResendPayload: Codable, Sendable, Equatable {
 
 /// Persisted agent mode session containing the chat transcript and configuration
 struct AgentSession: Codable, Identifiable {
-    static let currentSerializationVersion = 6
+    static let currentSerializationVersion = 7
     static let legacyUnversionedSerializationVersion = 0
 
     let id: UUID
@@ -294,6 +294,9 @@ struct AgentSession: Codable, Identifiable {
     /// `.remote(deviceID:)`. Source of truth for `isMCPOriginated`.
     var origin: AgentSessionOrigin
 
+    /// Stable top-level behavior profile selected for this session.
+    var profile: AgentSessionProfile
+
     /// Persisted per-session logical-root to worktree bindings.
     /// Runtime cwd/path projection is resolved by downstream worktree-system layers.
     var worktreeBindings: [AgentSessionWorktreeBinding]
@@ -347,6 +350,7 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
         isMCPOriginated: Bool = false,
         origin: AgentSessionOrigin? = nil,
+        profile: AgentSessionProfile = .standard,
         worktreeBindings: [AgentSessionWorktreeBinding] = [],
         worktreeMergeOperations: [AgentSessionWorktreeMergeOperation] = []
     ) {
@@ -388,6 +392,7 @@ struct AgentSession: Codable, Identifiable {
         let resolvedOrigin = origin ?? AgentSessionOrigin(legacyIsMCPOriginated: isMCPOriginated)
         self.origin = resolvedOrigin
         self.isMCPOriginated = resolvedOrigin.isMCPOriginated
+        self.profile = profile
         self.worktreeBindings = worktreeBindings
         self.worktreeMergeOperations = worktreeMergeOperations
     }
@@ -430,6 +435,7 @@ struct AgentSession: Codable, Identifiable {
         case pendingHandoffDefersProviderLockUntilSend
         case isMCPOriginated
         case origin
+        case profile
         case worktreeBindings
         case worktreeMergeOperations
     }
@@ -481,6 +487,20 @@ struct AgentSession: Codable, Identifiable {
             ?? AgentSessionOrigin(legacyIsMCPOriginated: legacyIsMCPOriginated)
         origin = decodedOrigin
         isMCPOriginated = decodedOrigin.isMCPOriginated
+        if container.contains(.profile) {
+            guard try !container.decodeNil(forKey: .profile) else {
+                throw DecodingError.valueNotFound(
+                    AgentSessionProfile.self,
+                    .init(
+                        codingPath: container.codingPath + [CodingKeys.profile],
+                        debugDescription: "Agent session profile cannot be null"
+                    )
+                )
+            }
+            profile = try container.decode(AgentSessionProfile.self, forKey: .profile)
+        } else {
+            profile = .standard
+        }
         worktreeBindings = try container.decodeIfPresent([AgentSessionWorktreeBinding].self, forKey: .worktreeBindings) ?? []
         worktreeMergeOperations = try container.decodeIfPresent([AgentSessionWorktreeMergeOperation].self, forKey: .worktreeMergeOperations) ?? []
     }

@@ -64,6 +64,8 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
 
             To run two independent consultations concurrently, issue two calls with `new_chat:true`, a distinct exact model preset ID/name from `oracle_utils op=models`, and optionally distinct `chat_name` values. Continue each lane with its returned `chat_id`. Reusing a streaming chat returns `oracle_session_busy`; a third simultaneous MCP Oracle stream in the tab returns `oracle_concurrency_limit`. Under parallel use, always pass an explicit `chat_id` to `oracle_chat_log`.
 
+            A `chat_id` continuation stays on the model preset that chat last used, so `model` can be omitted and the lane will not drift. Passing a different `model` with `chat_id` deliberately switches that lane from then on. If the chat's preset was deleted, disabled, or no longer supports the requested `mode`, the call fails instead of silently substituting another model. A manual send into the chat from the app resets its preset binding. Each result reports how the model was chosen through `model_selection` (`explicit`, `inherited`, or `automatic`).
+
             When the user names one or more Oracles, treat those names as model-preset selectors. First resolve them with `oracle_utils op=models`, prefer each returned exact preset UUID, and pass an explicit `model` on every new-chat lane. Issue independent lanes together in one tool-call batch. `chat_name` is display-only and never selects a model. Before synthesizing, verify each result's returned preset ID/name matches the requested preset; if identity is missing or mismatched, do not synthesize.
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
@@ -83,13 +85,13 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         enum: ["chat", "plan", "review"]
                     ),
                     "chat_id": .string(
-                        description: "Continue a specific chat in the current agent tab"
+                        description: "Continue a specific chat in the current agent tab. The chat keeps the model preset it last used, so `model` can be omitted."
                     ),
                     "new_chat": .boolean(
                         description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review or each independent parallel lane. When multiple compatible presets exist, new chats require an explicit model."
                     ),
                     "model": .string(
-                        description: "Exact model preset UUID (preferred) or exact preset name from oracle_utils op=models. Required when the user requests a named Oracle."
+                        description: "Exact model preset UUID (preferred) or exact preset name from oracle_utils op=models. Required when the user requests a named Oracle. Omit it with `chat_id` to keep that chat's current preset; passing a different preset switches the chat to it."
                     ),
                     "chat_name": .string(
                         description: "Optional display-only session name; valid only with new_chat:true. This never selects the model."
@@ -115,6 +117,8 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode.
             Use `oracle_utils` for passive helpers like models and sessions. Pass either `chat_id` to continue or `new_chat:true` to start fresh; the two arguments cannot be combined.
 
+            A `chat_id` continuation stays on the model preset that chat last used, so `model` can be omitted. Passing a different `model` with `chat_id` deliberately switches that chat from then on.
+
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
             Build context first with file reads, `manage_selection`, or `workspace_context`.
@@ -132,13 +136,13 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         enum: ["chat", "plan", "review"]
                     ),
                     "chat_id": .string(
-                        description: "Continue a specific chat in the current tab or current context"
+                        description: "Continue a specific chat in the current tab or current context. The chat keeps the model preset it last used, so `model` can be omitted."
                     ),
                     "new_chat": .boolean(
                         description: "Start a new chat session (default: false). Keep false for continuity; use true for an independent review. Cannot be combined with chat_id."
                     ),
                     "model": .string(
-                        description: "Model preset ID or name override"
+                        description: "Model preset ID or name override. With `chat_id`, omitting it keeps the chat's current preset and passing a different one switches the chat to it."
                     ),
                     "export_response": .boolean(
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."

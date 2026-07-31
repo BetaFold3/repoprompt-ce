@@ -251,6 +251,7 @@ struct AgentModeSidebarSessionBuilder {
             remoteSessionID: entry.remoteSessionID,
             isMCPOriginated: entry.isMCPOriginated,
             origin: entry.origin,
+            profile: entry.profile,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,
             activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries
         )

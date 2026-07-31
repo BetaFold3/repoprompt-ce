@@ -7,12 +7,17 @@ extension AgentModeViewModel {
             selectedWorkflow: selectedWorkflow,
             stagedSlashCommand: stagedSlashCommandProps(tabID: currentTabID),
             selectedAgent: selectedAgent,
-            autoEditPermissionGuidance: autoEditPermissionGuidance,
+            profile: activeSession?.profile ?? .standard,
+            autoEditPermissionGuidance: activeSession?.profile == .knowledge
+                ? nil
+                : autoEditPermissionGuidance,
             runState: runState,
             autoEditEnabled: autoEditEnabled,
             interviewFirst: interviewFirst,
             runLocation: runLocationProps(tabID: currentTabID),
-            executionLocation: executionLocationProps(tabID: currentTabID),
+            executionLocation: activeSession?.profile == .knowledge
+                ? nil
+                : executionLocationProps(tabID: currentTabID),
             activeAgentSessionID: activeSession?.activeAgentSessionID,
             activeRunID: activeSession?.runID
         )

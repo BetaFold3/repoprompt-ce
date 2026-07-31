@@ -448,7 +448,9 @@ extension AgentModeRunServiceLifecycleTests {
                 workspacePath: workspacePath,
                 permissionMode: permissionMode,
                 allowNativeBashTool: allowNativeBashTool,
-                mcpStrictMode: mcpStrictMode
+                mcpStrictMode: mcpStrictMode,
+                sessionProfile: .standard,
+                toolSearchEnabled: nil
             ),
             for: session
         )

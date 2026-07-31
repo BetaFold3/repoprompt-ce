@@ -12,11 +12,22 @@ extension OracleViewModel {
 
     // MARK: - Model Selection
 
+    /// How the model for this send was determined.
+    ///
+    /// `inherited` is distinct on purpose: reporting an inherited continuation as `automatic`
+    /// would be indistinguishable from the wrong-lane defect this resolution exists to fix,
+    /// and reporting it as `explicit` would claim the caller passed a `model` it did not pass.
+    private enum ModelSelectionKind: String {
+        case explicit
+        case automatic
+        case inherited
+    }
+
     /// Encapsulates the result of model selection.
     private struct ModelSelectionResult {
         let model: AIModel
         let mcpControlInfo: String?
-        let isAutoSelected: Bool
+        let selectionKind: ModelSelectionKind
         let chatPresetID: UUID? // The chat preset to use for this mode (always resolved now)
         let modelSource: String
         let modelPresetID: UUID?
@@ -25,7 +36,7 @@ extension OracleViewModel {
         init(
             model: AIModel,
             mcpControlInfo: String?,
-            isAutoSelected: Bool,
+            selectionKind: ModelSelectionKind,
             chatPresetID: UUID?,
             modelSource: String = "planning_model",
             modelPresetID: UUID? = nil,
@@ -33,11 +44,30 @@ extension OracleViewModel {
         ) {
             self.model = model
             self.mcpControlInfo = mcpControlInfo
-            self.isAutoSelected = isAutoSelected
+            self.selectionKind = selectionKind
             self.chatPresetID = chatPresetID
             self.modelSource = modelSource
             self.modelPresetID = modelPresetID
             self.modelPresetName = modelPresetName
+        }
+    }
+
+    /// Durable lane attribution read from an explicitly continued chat.
+    ///
+    /// Used to keep a `chat_id` continuation on the model the conversation was opened with.
+    /// `modelDisplayName` is for error text only — it is never used to match a preset, because
+    /// display names are not stable identifiers.
+    private struct OracleLaneAttribution {
+        let modelPresetID: UUID?
+        let modelRawValue: String?
+        let modelDisplayName: String?
+        let hasMessages: Bool
+
+        init(session: ChatSession) {
+            modelPresetID = session.lastSendModelPresetID
+            modelRawValue = session.lastSendModelID
+            modelDisplayName = session.lastSendModelDisplayName
+            hasMessages = session.hasMessages
         }
     }
 
@@ -193,7 +223,8 @@ extension OracleViewModel {
         allPresets: [ModelPreset],
         promptVM: PromptViewModel,
         planningModelRawOverride: String? = nil,
-        presetMatchPolicy: ModelPresetMatchPolicy = .fuzzyAllowed
+        presetMatchPolicy: ModelPresetMatchPolicy = .fuzzyAllowed,
+        laneAttribution: OracleLaneAttribution? = nil
     ) async throws -> ModelSelectionResult {
         /// Resolve a chat preset for the MCP mode even when the selected model preset
         /// does not map one explicitly. Ensures UI display and prompt building stay in sync.
@@ -281,7 +312,7 @@ extension OracleViewModel {
                     return .init(
                         model: planningModel,
                         mcpControlInfo: info,
-                        isAutoSelected: false,
+                        selectionKind: .explicit,
                         chatPresetID: resolvedPreset.id
                     )
                 }
@@ -296,7 +327,7 @@ extension OracleViewModel {
             return .init(
                 model: planningModel,
                 mcpControlInfo: info,
-                isAutoSelected: true,
+                selectionKind: .automatic,
                 chatPresetID: resolvedPreset.id
             )
         }
@@ -328,7 +359,7 @@ extension OracleViewModel {
                     return .init(
                         model: planningModel,
                         mcpControlInfo: info,
-                        isAutoSelected: false,
+                        selectionKind: .explicit,
                         chatPresetID: resolvedPreset.id
                     )
                 }
@@ -339,7 +370,7 @@ extension OracleViewModel {
             return .init(
                 model: planningModel,
                 mcpControlInfo: info,
-                isAutoSelected: true,
+                selectionKind: .automatic,
                 chatPresetID: resolvedPreset.id
             )
         }
@@ -380,7 +411,7 @@ extension OracleViewModel {
                 return .init(
                     model: preset.model,
                     mcpControlInfo: info,
-                    isAutoSelected: false,
+                    selectionKind: .explicit,
                     chatPresetID: resolvedPreset.id,
                     modelSource: "preset",
                     modelPresetID: preset.id,
@@ -397,6 +428,41 @@ extension OracleViewModel {
             )
         }
 
+        // Continuation inheritance: a `chat_id` continuation that omitted `model` must stay on
+        // the preset the lane was opened with. Re-running automatic selection here is exactly
+        // what moved a lane onto `available.first`.
+        //
+        // This lives inside CASE B.2 deliberately. When presets are globally disabled, hidden, or
+        // undefined, the planning-model paths above are already deterministic — a single
+        // user-configured model, not a guess among peers — so there is no ambiguity to guard. It is
+        // also the only safe choice: in that state an explicit `model` naming a preset is rejected
+        // too, so failing closed on a recorded binding would leave the lane un-continuable with no
+        // in-band remediation. Fail-closed therefore applies to per-preset problems only, never to
+        // a global mode change. The trade-off is that such a send rebinds the lane to the planning
+        // model, so re-enabling presets may need one explicit `model` call to rebind.
+        if let laneAttribution,
+           let inheritedPreset = try inheritedLanePreset(
+               laneAttribution: laneAttribution,
+               mode: mode,
+               effectivePresets: effectivePresets,
+               available: available,
+               promptVM: promptVM
+           )
+        {
+            let resolvedPreset = resolveChatPreset(for: mode, from: inheritedPreset.chatPresetMappings)
+            let info = resolvedPreset.name
+                ?? "\(modeLabel) mode • \(inheritedPreset.name) (\(inheritedPreset.model.displayName))"
+            return .init(
+                model: inheritedPreset.model,
+                mcpControlInfo: info,
+                selectionKind: .inherited,
+                chatPresetID: resolvedPreset.id,
+                modelSource: "preset",
+                modelPresetID: inheritedPreset.id,
+                modelPresetName: inheritedPreset.name
+            )
+        }
+
         // No explicit model → pick first available compatible preset
         if let first = available.first {
             let modelName = first.model.displayName
@@ -406,7 +472,7 @@ extension OracleViewModel {
             return .init(
                 model: first.model,
                 mcpControlInfo: info,
-                isAutoSelected: true,
+                selectionKind: .automatic,
                 chatPresetID: resolvedPreset.id,
                 modelSource: "preset",
                 modelPresetID: first.id,
@@ -437,7 +503,7 @@ extension OracleViewModel {
         modelParam: String? = nil,
         workspaceID: UUID? = nil,
         planningModelRawOverride: String? = nil
-    ) async throws -> (model: AIModel, chatPresetID: UUID?, mcpControlInfo: String?) {
+    ) async throws -> (model: AIModel, chatPresetID: UUID?, modelPresetID: UUID?, mcpControlInfo: String?) {
         let presetsManager = ModelPresetsManager.shared
         let allPresets = presetsManager.allPresets()
         let selection = try await selectModel(
@@ -449,7 +515,10 @@ extension OracleViewModel {
                 GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: $0).planningModelRaw
             }
         )
-        return (selection.model, selection.chatPresetID, selection.mcpControlInfo)
+        // `modelPresetID` is returned so the chat this model is sent into records the same exact
+        // lane binding an `ask_oracle` send would; otherwise a later `chat_id` continuation of that
+        // chat could only fall back to matching on the raw model.
+        return (selection.model, selection.chatPresetID, selection.modelPresetID, selection.mcpControlInfo)
     }
 
     /// Finds a built-in chat preset for the given mode
@@ -518,6 +587,101 @@ extension OracleViewModel {
         if let closestName {
             print("[MCP] Fuzzy matched model '\(normalizedName)' to preset '\(closestName)'")
             return presets.first { $0.name == closestName }
+        }
+
+        return nil
+    }
+
+    /// Resolves the model preset that a `chat_id` continuation should stay on.
+    ///
+    /// Returns `nil` only when the lane has no recorded identity **and** automatic selection is
+    /// unambiguous. Every other unresolvable case throws, because silently substituting a
+    /// different preset is the defect this resolution exists to prevent. Callers can always
+    /// override by passing an explicit `model`, which deliberately migrates the lane.
+    @MainActor
+    private func inheritedLanePreset(
+        laneAttribution: OracleLaneAttribution,
+        mode: String,
+        effectivePresets: [ModelPreset],
+        available: [ModelPreset],
+        promptVM: PromptViewModel
+    ) throws -> ModelPreset? {
+        let remediation = "To choose a preset explicitly, pass `model` with the exact preset UUID from `oracle_utils op=models`."
+
+        // Tier 1: exact recorded preset identity is authoritative.
+        if let recordedPresetID = laneAttribution.modelPresetID {
+            guard let preset = effectivePresets.first(where: { $0.id == recordedPresetID }) else {
+                // Recorded-then-deleted is known identity loss, which is not the same as never
+                // having recorded identity. Recovering by model here would substitute a
+                // different preset behind the caller's back.
+                throw ChatToolError.invalidParams(
+                    "This chat's last send used model preset \(recordedPresetID.uuidString), which no longer exists. " +
+                        "No replacement preset was substituted. " + remediation
+                )
+            }
+
+            func inheritedFailure(_ reason: String) -> ChatToolError {
+                .invalidParams(
+                    "This chat is bound to model preset '\(preset.name)', inherited because no `model` argument was passed. " +
+                        reason + " " + remediation
+                )
+            }
+
+            // `ModelPreset.model` silently falls back to a default model when its stored model
+            // string no longer resolves, so inheriting it unchecked would be a wrong-model send.
+            guard preset.isModelResolvable else {
+                throw inheritedFailure("Its configured model '\(preset.modelString)' can no longer be resolved.")
+            }
+            guard preset.supports(mode: mode) else {
+                throw inheritedFailure("It does not support '\(mode)' mode.")
+            }
+            guard promptVM.isModelAvailable(preset.model) else {
+                throw inheritedFailure(
+                    "Its model '\(preset.model.displayName)' is not available. " +
+                        oracleModelAvailabilityGuidance(for: preset.model)
+                )
+            }
+            return preset
+        }
+
+        // Tier 2: no recorded preset identity, but the lane's model is known. Inherit only on a
+        // unique match, otherwise this becomes a narrower version of the defect it fixes. This is
+        // the migration path for every chat saved before preset identity was recorded.
+        if let recordedModelRawValue = laneAttribution.modelRawValue {
+            // Matching is by model identity only. `lastSendModelDisplayName` is never used to
+            // resolve a preset because display names are not stable identifiers.
+            // `isModelResolvable` is required because `ModelPreset.model` falls back to a default
+            // model when its stored model string no longer resolves; without this a corrupt preset
+            // could become the "unique" match for an unrelated recorded model.
+            let matches = available.filter {
+                $0.isModelResolvable && $0.model.rawValue == recordedModelRawValue
+            }
+            if matches.count == 1 {
+                return matches[0]
+            }
+            let laneModelLabel = laneAttribution.modelDisplayName ?? recordedModelRawValue
+            if matches.isEmpty {
+                throw ChatToolError.invalidParams(
+                    "This chat's last send used model '\(laneModelLabel)', and no available model preset for '\(mode)' mode uses that model. " +
+                        "A different preset was not substituted. " + remediation
+                )
+            }
+            throw ChatToolError.invalidParams(
+                "This chat's last send used model '\(laneModelLabel)', which is shared by \(matches.count) available presets for '\(mode)' mode (\(matches.map(\.name).joined(separator: ", "))). " +
+                    "Which preset owns this chat is ambiguous, so none was chosen. " + remediation
+            )
+        }
+
+        // Tier 3: no recorded identity at all.
+        // A chat that has never been sent has no binding to preserve, so today's automatic
+        // selection cannot mis-route it. A chat that already has messages does have a historical
+        // model that simply was never recorded (pre-attribution sessions, truncated forks);
+        // guessing there would be nondeterministic, so ambiguity fails closed.
+        if laneAttribution.hasMessages, available.count > 1 {
+            throw ChatToolError.invalidParams(
+                "This chat has earlier messages but no recorded model attribution, and \(available.count) model presets support '\(mode)' mode. " +
+                    "Automatic selection could run it on a different model than the chat already used. " + remediation
+            )
         }
 
         return nil
@@ -841,44 +1005,32 @@ extension OracleViewModel {
         return session.composeTabID == tabID
     }
 
+    /// Chat-primary owner matching: the stored chat's strongest identity decides.
+    ///
+    /// - Session-owned chats (`agentModeSessionID != nil`) are owned by that durable Agent
+    ///   Mode session. The caller must present the same session ID. The stored run ID is
+    ///   ephemeral per-process metadata — a fresh UUID is minted whenever a provider
+    ///   controller is (re)created, so it can never match after an app relaunch or a
+    ///   mid-session controller rotation — and it never authorizes or blocks continuation.
+    /// - Run-owned chats (`agentModeSessionID == nil`, `agentModeRunID != nil` — headless /
+    ///   context-builder lanes) require the exact run: they die with their process, and a
+    ///   session-having caller must not adopt them even when the run matches.
+    /// - Unowned legacy chats match unowned callers always, and owned callers only where
+    ///   `allowUnownedLegacy` permits adoption.
     private static func sessionMatchesOracleOwner(
         _ session: ChatSession,
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
         allowUnownedLegacy: Bool
     ) -> Bool {
-        if !allowUnownedLegacy {
-            return session.agentModeSessionID == agentModeSessionID
-                && session.agentModeRunID == agentModeRunID
+        if let ownerSessionID = session.agentModeSessionID {
+            return agentModeSessionID == ownerSessionID
         }
-        guard agentModeSessionID != nil || agentModeRunID != nil else {
-            return session.agentModeSessionID == nil && session.agentModeRunID == nil
+        if let ownerRunID = session.agentModeRunID {
+            return agentModeSessionID == nil && agentModeRunID == ownerRunID
         }
-
-        let sessionIsUnowned = session.agentModeSessionID == nil && session.agentModeRunID == nil
-        if sessionIsUnowned {
-            return allowUnownedLegacy
-        }
-
-        if let agentModeSessionID {
-            guard session.agentModeSessionID == agentModeSessionID else { return false }
-            if let agentModeRunID {
-                if let sessionRunID = session.agentModeRunID {
-                    return sessionRunID == agentModeRunID
-                }
-                return allowUnownedLegacy
-            }
-            return true
-        }
-
-        if let agentModeRunID {
-            if let sessionRunID = session.agentModeRunID {
-                return sessionRunID == agentModeRunID
-            }
-            return allowUnownedLegacy && session.agentModeSessionID == nil
-        }
-
-        return true
+        guard agentModeSessionID != nil || agentModeRunID != nil else { return true }
+        return allowUnownedLegacy
     }
 
     static func sessionMatchesOracleOwnerForExplicitContinuation(
@@ -894,40 +1046,72 @@ extension OracleViewModel {
         )
     }
 
+    /// Rejection message for an explicit continuation whose owner check failed; `nil` when
+    /// the caller may continue the chat. The "different Agent Mode owner" phrase is
+    /// load-bearing for existing callers/tests; the parenthetical discriminates
+    /// session-mismatch from run-scoped causes so field reports are self-diagnosing.
+    static func oracleOwnerContinuationRejection(
+        _ session: ChatSession,
+        chatID: String,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) -> String? {
+        guard !sessionMatchesOracleOwnerForExplicitContinuation(
+            session,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID
+        ) else { return nil }
+
+        let detail = if session.agentModeSessionID != nil {
+            "the chat is owned by a different Agent Mode session"
+        } else if session.agentModeRunID != nil {
+            "the chat is a run-scoped headless lane owned by its originating run"
+        } else {
+            "the chat was created outside Agent Mode ownership"
+        }
+        return "Chat with ID '\(chatID)' belongs to a different Agent Mode owner (\(detail))"
+    }
+
+    /// Owner-scoped candidate tiers:
+    /// - `0`: exact current-run match (session-owned lane stamped with the caller's run, or a
+    ///   run-owned lane on its exact run).
+    /// - `1`: same-session lane whose run stamp is stale or missing — a lane from a previous
+    ///   process/controller rotation of the caller's own Agent Mode session. Eligible for
+    ///   read-only log recovery and for callers without a current run; implicit sends with a
+    ///   run stay exact-run-scoped (see `implicitContinuationCandidate`).
+    /// - `2`: unowned legacy chat, where adoption is permitted.
+    /// `nil` excludes the candidate (different session, foreign run-owned lane, or legacy
+    /// adoption not allowed).
     private static func oracleOwnerRank(
         _ session: ChatSession,
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
         allowUnownedLegacy: Bool
     ) -> Int? {
-        guard agentModeSessionID != nil || agentModeRunID != nil else { return 0 }
-
-        let sessionIsUnowned = session.agentModeSessionID == nil && session.agentModeRunID == nil
-        if let agentModeSessionID {
-            guard session.agentModeSessionID == agentModeSessionID else {
-                return (allowUnownedLegacy && sessionIsUnowned) ? 2 : nil
-            }
-            guard let agentModeRunID else { return 0 }
-            if session.agentModeRunID == agentModeRunID { return 0 }
-            if session.agentModeRunID == nil, allowUnownedLegacy { return 1 }
-            return nil
+        guard agentModeSessionID != nil || agentModeRunID != nil else {
+            // Mirror the matcher: a fully-unowned caller ranks only unowned chats, so a
+            // future call site without a hasOwner gate cannot adopt agent lanes at tier 0.
+            return (session.agentModeSessionID == nil && session.agentModeRunID == nil) ? 0 : nil
         }
 
-        if let agentModeRunID {
-            if session.agentModeRunID == agentModeRunID { return 0 }
-            return (allowUnownedLegacy && sessionIsUnowned) ? 2 : nil
+        if let ownerSessionID = session.agentModeSessionID {
+            guard agentModeSessionID == ownerSessionID else { return nil }
+            guard let agentModeRunID else { return 1 }
+            return session.agentModeRunID == agentModeRunID ? 0 : 1
         }
-
-        return 0
+        if let ownerRunID = session.agentModeRunID {
+            return (agentModeSessionID == nil && agentModeRunID == ownerRunID) ? 0 : nil
+        }
+        return allowUnownedLegacy ? 2 : nil
     }
 
-    private static func strongestOracleOwnerBucket(
+    private static func rankedOracleOwnerPairs(
         _ sessions: [ChatSession],
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
         allowUnownedLegacy: Bool
-    ) -> [ChatSession] {
-        let ranked = sessions.compactMap { session -> (session: ChatSession, rank: Int)? in
+    ) -> [(session: ChatSession, rank: Int)] {
+        sessions.compactMap { session -> (session: ChatSession, rank: Int)? in
             guard let rank = oracleOwnerRank(
                 session,
                 agentModeSessionID: agentModeSessionID,
@@ -936,11 +1120,50 @@ extension OracleViewModel {
             ) else { return nil }
             return (session, rank)
         }
+    }
+
+    private static func strongestOracleOwnerBucket(
+        _ sessions: [ChatSession],
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?,
+        allowUnownedLegacy: Bool,
+        maxRank: Int = Int.max
+    ) -> [ChatSession] {
+        let ranked = rankedOracleOwnerPairs(
+            sessions,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
+            allowUnownedLegacy: allowUnownedLegacy
+        )
+        .filter { $0.rank <= maxRank }
         guard let strongestRank = ranked.map(\.rank).min() else { return [] }
         return ranked
             .filter { $0.rank == strongestRank }
             .map(\.session)
             .sorted { $0.savedAt > $1.savedAt }
+    }
+
+    /// All owner-eligible sessions ordered by (tier, then recency). Unlike
+    /// `strongestOracleOwnerBucket`, weaker tiers stay in the list so log recovery can fall
+    /// through to a non-empty stale same-session lane instead of dead-ending on an empty
+    /// exact-run lane.
+    private static func rankedOracleOwnerCandidates(
+        _ sessions: [ChatSession],
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?,
+        allowUnownedLegacy: Bool
+    ) -> [ChatSession] {
+        rankedOracleOwnerPairs(
+            sessions,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
+            allowUnownedLegacy: allowUnownedLegacy
+        )
+        .sorted {
+            if $0.rank != $1.rank { return $0.rank < $1.rank }
+            return $0.session.savedAt > $1.session.savedAt
+        }
+        .map(\.session)
     }
 
     @MainActor
@@ -963,6 +1186,20 @@ extension OracleViewModel {
             changed = true
         }
         if sessions[index].agentModeRunID == nil, let agentModeRunID {
+            sessions[index].agentModeRunID = agentModeRunID
+            changed = true
+        }
+        if let agentModeSessionID,
+           sessions[index].agentModeSessionID == agentModeSessionID,
+           let agentModeRunID,
+           sessions[index].agentModeRunID != agentModeRunID
+        {
+            // Advance the ephemeral run stamp when the owning session continues its lane
+            // under a new process run (app relaunch or controller rotation). The stamp
+            // records the run that last ADOPTED the lane (even if the subsequent send
+            // fails) — it is metadata, never authorization: it only keeps the adopted
+            // lane exact-run sticky for implicit resolution. Run-owned lanes never reach
+            // here (their nil session ID fails the equality above).
             sessions[index].agentModeRunID = agentModeRunID
             changed = true
         }
@@ -990,6 +1227,80 @@ extension OracleViewModel {
         if let targetTabID {
             workspaceManager.setActiveChatSessionID(session.id, forTabID: targetTabID)
         }
+    }
+
+    /// Read-only resolution of the chat an implicit continuation (no `chat_id`, no `new_chat`)
+    /// would resume.
+    ///
+    /// Extracted so model selection and `locateOrCreateChat` cannot disagree about which chat an
+    /// implicit continuation means. If they disagreed, an inherited preset could be applied to a
+    /// different conversation than the one it came from — a subtler version of the wrong-lane
+    /// defect this inheritance exists to prevent.
+    @MainActor
+    private func implicitContinuationCandidate(
+        tabID resolvedTabID: UUID?,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?,
+        activateInUI: Bool
+    ) -> ChatSession? {
+        func eligible(_ session: ChatSession, allowUnownedLegacy: Bool = true) -> Bool {
+            Self.sessionBelongsToResolvedTab(session, tabID: resolvedTabID) &&
+                Self.sessionMatchesOracleOwner(
+                    session,
+                    agentModeSessionID: agentModeSessionID,
+                    agentModeRunID: agentModeRunID,
+                    allowUnownedLegacy: allowUnownedLegacy
+                )
+        }
+
+        let hasOwner = agentModeSessionID != nil || agentModeRunID != nil
+        func findCandidate(allowUnownedLegacy: Bool) -> ChatSession? {
+            let scopedSessions: [ChatSession]
+            let activeForTab: UUID?
+            if let resolvedTabID {
+                scopedSessions = sessions(forTabID: resolvedTabID)
+                activeForTab = workspaceManager.activeChatSessionID(forTabID: resolvedTabID)
+            } else {
+                scopedSessions = sessions
+                activeForTab = nil
+            }
+
+            let candidates: [ChatSession] = if hasOwner {
+                // Implicit sends never silently adopt a stale-run lane: a caller with a
+                // current run resumes only that run's own lanes; after a rotation/restart
+                // a chat_id-less send starts fresh. Lane recovery is deliberate —
+                // oracle_chat_log (which serves stale same-session lanes read-only and
+                // echoes the chat_id) followed by explicit chat_id continuation.
+                // Callers without a run (owner known, run not yet started) keep
+                // same-session resumption.
+                Self.strongestOracleOwnerBucket(
+                    scopedSessions.filter { Self.sessionBelongsToResolvedTab($0, tabID: resolvedTabID) },
+                    agentModeSessionID: agentModeSessionID,
+                    agentModeRunID: agentModeRunID,
+                    allowUnownedLegacy: allowUnownedLegacy,
+                    maxRank: agentModeRunID == nil ? 1 : 0
+                )
+            } else {
+                scopedSessions.filter { eligible($0, allowUnownedLegacy: allowUnownedLegacy) }
+            }
+
+            if let activeForTab,
+               let activeCandidate = candidates.first(where: { $0.id == activeForTab })
+            {
+                return activeCandidate
+            }
+            if activateInUI,
+               let currentSessionID,
+               let currentCandidate = candidates.first(where: { $0.id == currentSessionID })
+            {
+                return currentCandidate
+            }
+            return candidates.sorted(by: { $0.savedAt > $1.savedAt }).first
+        }
+
+        return hasOwner
+            ? findCandidate(allowUnownedLegacy: false)
+            : findCandidate(allowUnownedLegacy: true)
     }
 
     /// Ensure the requested chat exists (or create one) and make it active.
@@ -1030,21 +1341,26 @@ extension OracleViewModel {
             guard Self.sessionBelongsToResolvedTab(existing, tabID: resolvedTabID) else {
                 throw ChatToolError.invalidParams("Chat with ID '\(idString)' belongs to a different tab")
             }
-            guard Self.sessionMatchesOracleOwnerForExplicitContinuation(
+            if let rejection = Self.oracleOwnerContinuationRejection(
                 existing,
+                chatID: idString,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
-            ) else {
-                throw ChatToolError.invalidParams("Chat with ID '\(idString)' belongs to a different Agent Mode owner")
+            ) {
+                throw ChatToolError.invalidParams(rejection)
             }
 
+            // Activate/load first, then stamp: background activation replaces the
+            // in-memory session with the loaded (disk) copy, so an owner stamp applied
+            // before activation would be silently reverted for any session that still
+            // needs its messages loaded — which post-restart is every reloaded chat.
+            await activateResolvedChatSession(existing, resolvedTabID: resolvedTabID, activateInUI: activateInUI)
             await applyOracleOwnerIfNeeded(
                 sessionID: existing.id,
                 tabID: resolvedTabID,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             )
-            await activateResolvedChatSession(existing, resolvedTabID: resolvedTabID, activateInUI: activateInUI)
 
             if let newName = desiredName,
                !newName.isEmpty,
@@ -1055,65 +1371,22 @@ extension OracleViewModel {
             return existing.id
         }
 
-        func eligible(_ session: ChatSession, allowUnownedLegacy: Bool = true) -> Bool {
-            Self.sessionBelongsToResolvedTab(session, tabID: resolvedTabID) &&
-                Self.sessionMatchesOracleOwner(
-                    session,
-                    agentModeSessionID: agentModeSessionID,
-                    agentModeRunID: agentModeRunID,
-                    allowUnownedLegacy: allowUnownedLegacy
-                )
-        }
-
-        let hasOwner = agentModeSessionID != nil || agentModeRunID != nil
-        func findCandidate(allowUnownedLegacy: Bool) -> ChatSession? {
-            let scopedSessions: [ChatSession]
-            let activeForTab: UUID?
-            if let resolvedTabID {
-                scopedSessions = sessions(forTabID: resolvedTabID)
-                activeForTab = workspaceManager.activeChatSessionID(forTabID: resolvedTabID)
-            } else {
-                scopedSessions = sessions
-                activeForTab = nil
-            }
-
-            let candidates: [ChatSession] = if hasOwner {
-                Self.strongestOracleOwnerBucket(
-                    scopedSessions.filter { Self.sessionBelongsToResolvedTab($0, tabID: resolvedTabID) },
-                    agentModeSessionID: agentModeSessionID,
-                    agentModeRunID: agentModeRunID,
-                    allowUnownedLegacy: allowUnownedLegacy
-                )
-            } else {
-                scopedSessions.filter { eligible($0, allowUnownedLegacy: allowUnownedLegacy) }
-            }
-
-            if let activeForTab,
-               let activeCandidate = candidates.first(where: { $0.id == activeForTab })
-            {
-                return activeCandidate
-            }
-            if activateInUI,
-               let currentSessionID,
-               let currentCandidate = candidates.first(where: { $0.id == currentSessionID })
-            {
-                return currentCandidate
-            }
-            return candidates.sorted(by: { $0.savedAt > $1.savedAt }).first
-        }
-
-        let candidate = hasOwner
-            ? findCandidate(allowUnownedLegacy: false)
-            : findCandidate(allowUnownedLegacy: true)
+        let candidate = implicitContinuationCandidate(
+            tabID: resolvedTabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
+            activateInUI: activateInUI
+        )
 
         if let candidate {
+            // Same ordering invariant as the explicit path: load/activate before stamping.
+            await activateResolvedChatSession(candidate, resolvedTabID: resolvedTabID, activateInUI: activateInUI)
             await applyOracleOwnerIfNeeded(
                 sessionID: candidate.id,
                 tabID: resolvedTabID,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
             )
-            await activateResolvedChatSession(candidate, resolvedTabID: resolvedTabID, activateInUI: activateInUI)
             if let newName = desiredName,
                !newName.isEmpty,
                newName != candidate.name
@@ -1193,12 +1466,75 @@ extension OracleViewModel {
         let presetsManager = ModelPresetsManager.shared
         let allPresets = presetsManager.allPresets()
 
+        let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
+
+        // Implicit-continuation candidate selection depends on the activation flag, so a value is
+        // needed before model selection. It is deliberately NOT reused for `locateOrCreateChat`:
+        // model selection suspends, and a user send starting in that window must still suppress
+        // activation. Step 3 recomputes it against live state immediately before mutating.
+        let preResolutionActivation: Bool
+        if let tabContext {
+            let isFocusedTab = (promptVM.activeComposeTabID == tabContext.tabID)
+            let activeSessionID = workspaceManager.activeChatSessionID(forTabID: tabContext.tabID)
+                ?? currentSessionID.flatMap { currentID in
+                    sessions.first(where: { $0.id == currentID && $0.composeTabID == tabContext.tabID })?.id
+                }
+            let isUserStreaming = isSessionStreaming(activeSessionID)
+            preResolutionActivation = isFocusedTab && !isUserStreaming
+        } else {
+            preResolutionActivation = true
+        }
+
+        // A continuation that omits `model` must inherit the lane's own preset rather than re-run
+        // automatic selection. Resolve the target first, through the same resolver and the same
+        // tab/owner guards `locateOrCreateChat` uses below, so the two can never disagree about
+        // which session this call means.
+        //
+        // This step claims no Agent Mode ownership, activates nothing, and renames nothing, so a
+        // model-resolution failure leaves ownership and UI state untouched. It is not perfectly
+        // side-effect free: resolving a persisted-only chat appends it to the in-memory session
+        // cache, which `locateOrCreateChat` would do moments later on the success path.
+        //
+        // When resolution or a guard fails we leave this nil and fall through: `locateOrCreateChat`
+        // stays the single source of the canonical not-found / wrong-tab / wrong-owner errors.
+        var continuationLane: (sessionID: UUID, attribution: OracleLaneAttribution)?
+        if !newChat, modelParam == nil {
+            let requestedChatID = chatIdIn?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !requestedChatID.isEmpty {
+                if let existing = try await resolveSessionForExplicitContinuation(
+                    id: requestedChatID,
+                    tabID: tabID
+                ),
+                    Self.sessionBelongsToResolvedTab(existing, tabID: tabID),
+                    Self.sessionMatchesOracleOwnerForExplicitContinuation(
+                        existing,
+                        agentModeSessionID: tabContext?.agentModeSessionID,
+                        agentModeRunID: tabContext?.agentModeRunID
+                    )
+                {
+                    continuationLane = (existing.id, OracleLaneAttribution(session: existing))
+                }
+            } else if let resumed = implicitContinuationCandidate(
+                tabID: tabID,
+                agentModeSessionID: tabContext?.agentModeSessionID,
+                agentModeRunID: tabContext?.agentModeRunID,
+                activateInUI: preResolutionActivation
+            ) {
+                // An implicit continuation (no `chat_id`, no `new_chat`) silently resumes the most
+                // recent eligible chat, so it can drift onto another preset exactly like an
+                // explicit continuation could. Compaction-recovery guidance steers agents into
+                // this path, so it inherits on the same terms.
+                continuationLane = (resumed.id, OracleLaneAttribution(session: resumed))
+            }
+        }
+
         let modelSelection = try await selectModel(
             modelParam: modelParam,
             mode: mode,
             allPresets: allPresets,
             promptVM: promptVM,
-            presetMatchPolicy: tabContext?.origin == .askOracle ? .exactOnly : .fuzzyAllowed
+            presetMatchPolicy: tabContext?.origin == .askOracle ? .exactOnly : .fuzzyAllowed,
+            laneAttribution: continuationLane?.attribution
         )
 
         let selectedModel = modelSelection.model
@@ -1218,7 +1554,8 @@ extension OracleViewModel {
         }()
 
         // ────────── 3. Resolve chat session ──────────
-        let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
+        // Recomputed against live state: model selection suspended above, and a user send that
+        // started in that window must still suppress activation.
         let shouldActivate: Bool
         if let tabContext {
             let isFocusedTab = (promptVM.activeComposeTabID == tabContext.tabID)
@@ -1226,8 +1563,7 @@ extension OracleViewModel {
                 ?? currentSessionID.flatMap { currentID in
                     sessions.first(where: { $0.id == currentID && $0.composeTabID == tabContext.tabID })?.id
                 }
-            let isUserStreaming = isSessionStreaming(activeSessionID)
-            shouldActivate = isFocusedTab && !isUserStreaming
+            shouldActivate = isFocusedTab && !isSessionStreaming(activeSessionID)
         } else {
             shouldActivate = true
         }
@@ -1243,6 +1579,15 @@ extension OracleViewModel {
             agentModeSessionID: tabContext?.agentModeSessionID,
             agentModeRunID: tabContext?.agentModeRunID
         )
+        // The inherited preset came from one specific session. If the authoritative resolution
+        // landed on a different one, the model no longer belongs to this lane, so fail instead of
+        // sending an inherited identity into the wrong conversation.
+        if let continuationLane, continuationLane.sessionID != chatID {
+            throw ChatToolError.internalError(
+                "This chat was re-resolved to a different session while its model was being selected. Retry the call."
+            )
+        }
+
         pinSession(chatID)
         defer { unpinSession(chatID) }
 
@@ -1256,6 +1601,7 @@ extension OracleViewModel {
                 message,
                 sessionID: chatID,
                 overrideModel: selectedModel,
+                overrideModelPresetID: modelSelection.modelPresetID,
                 overrideChatPresetID: modelSelection.chatPresetID,
                 overrideMode: effectiveMode,
                 gitInclusionOverride: nil,
@@ -1359,7 +1705,7 @@ extension OracleViewModel {
         }
         dict["model_id"] = .string(selectedModel.rawValue)
         dict["model_name"] = .string(selectedModel.displayName)
-        dict["model_selection"] = .string(modelSelection.isAutoSelected ? "automatic" : "explicit")
+        dict["model_selection"] = .string(modelSelection.selectionKind.rawValue)
         dict["model_source"] = .string(modelSelection.modelSource)
         if let modelPresetID = modelSelection.modelPresetID {
             dict["model_preset_id"] = .string(modelPresetID.uuidString)
@@ -1428,16 +1774,30 @@ extension OracleViewModel {
         let tabSessions = sessions.filter { $0.composeTabID == tabID }
         let hasOwner = agentModeSessionID != nil || agentModeRunID != nil
         let sortedCandidates: [ChatSession] = if hasOwner {
-            Self.strongestOracleOwnerBucket(
+            Self.rankedOracleOwnerCandidates(
                 tabSessions,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID,
                 allowUnownedLegacy: false
             )
         } else {
-            tabSessions.sorted(by: { $0.savedAt > $1.savedAt })
+            // Fail-closed for ownerless callers too: an Agent Mode log request whose
+            // owner resolution came up empty must not read agent-owned lanes. Only
+            // genuinely unowned (UI/legacy) chats stay visible.
+            tabSessions
+                .filter {
+                    Self.sessionMatchesOracleOwner(
+                        $0,
+                        agentModeSessionID: nil,
+                        agentModeRunID: nil,
+                        allowUnownedLegacy: true
+                    )
+                }
+                .sorted(by: { $0.savedAt > $1.savedAt })
         }
 
+        // Policy: the tab's active lane wins across tiers when non-empty — log recovery
+        // follows what the tab currently points at, even over an inactive exact-run lane.
         if let activeSessionID,
            let activeSession = sortedCandidates.first(where: { $0.id == activeSessionID }),
            activeSession.hasMessages
@@ -1497,12 +1857,13 @@ extension OracleViewModel {
                     "Chat with ID '\(normalizedChatID)' belongs to a different tab. oracle_utils op='log' can only read chats from the current tab during agent mode."
                 )
             }
-            guard Self.sessionMatchesOracleOwnerForExplicitContinuation(
+            if let rejection = Self.oracleOwnerContinuationRejection(
                 found,
+                chatID: normalizedChatID,
                 agentModeSessionID: agentModeSessionID,
                 agentModeRunID: agentModeRunID
-            ) else {
-                throw ChatToolError.invalidParams("Chat with ID '\(normalizedChatID)' belongs to a different Agent Mode owner")
+            ) {
+                throw ChatToolError.invalidParams(rejection)
             }
             guard let loaded = await ensureSessionLoadedForBackground(found) else {
                 throw ChatToolError.internalError("Failed to load chat session '\(normalizedChatID)'")

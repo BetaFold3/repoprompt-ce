@@ -78,6 +78,8 @@ final class AgentModeViewModel: ObservableObject {
         _ tabID: UUID?,
         _ runID: UUID?,
         _ additionalTools: Set<String>?,
+        _ allowedToolsOverride: Set<String>?,
+        _ sessionProfile: AgentSessionProfile,
         _ purpose: MCPRunPurpose,
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         _ allowsAgentExternalControlTools: Bool,
@@ -469,6 +471,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func canSelectAgent(_ candidate: AgentProviderKind, for session: TabSession) -> Bool {
+        if session.profile == .knowledge,
+           !KnowledgeSessionPolicy.supportedProviders.contains(candidate)
+        {
+            return false
+        }
         guard session.isProviderSelectionLocked else { return true }
         if candidate == session.selectedAgent {
             return true
@@ -1593,11 +1600,24 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     var hasAvailableAgentProviders: Bool {
-        !availableAgents.isEmpty
+        !selectableAgents(forTabID: currentTabID).isEmpty
+    }
+
+    func selectableAgents(forTabID tabID: UUID?) -> [AgentProviderKind] {
+        guard let tabID,
+              sessions[tabID]?.profile == .knowledge
+        else {
+            return availableAgents
+        }
+        return availableAgents.filter(KnowledgeSessionPolicy.supportedProviders.contains)
     }
 
     var isSelectedAgentAvailable: Bool {
         AgentModelCatalog.isAgentAvailable(selectedAgent, availability: agentAvailabilityContext)
+            && (
+                activeSession?.profile != .knowledge
+                    || KnowledgeSessionPolicy.supportedProviders.contains(selectedAgent)
+            )
     }
 
     var canSendWithCurrentProvider: Bool {
@@ -1610,6 +1630,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func unavailableAgentMessage(for agent: AgentProviderKind) -> String {
+        if activeSession?.profile == .knowledge,
+           !KnowledgeSessionPolicy.supportedProviders.contains(agent)
+        {
+            return "Knowledge sessions currently support Claude Code and Codex. Start a standard session to use \(agent.displayName)."
+        }
         if hasAvailableAgentProviders {
             return "\(agent.displayName) is not connected. Fork or start a new chat to switch providers, or connect it in Settings."
         }
@@ -1651,11 +1676,43 @@ final class AgentModeViewModel: ObservableObject {
         syncComposerUIState()
     }
 
+    nonisolated static func shouldRepairKnowledgeProviderSelection(
+        profile: AgentSessionProfile,
+        selectedAgent: AgentProviderKind
+    ) -> Bool {
+        profile == .knowledge
+            && !KnowledgeSessionPolicy.supportedProviders.contains(selectedAgent)
+    }
+
     private func handleAgentProviderAvailabilityChanged() {
         refreshAvailableAgents()
         if let activeSession,
            activeSession.runState.isActive || activeSession.isProviderSelectionLocked
         {
+            return
+        }
+        if let activeSession,
+           Self.shouldRepairKnowledgeProviderSelection(
+               profile: activeSession.profile,
+               selectedAgent: activeSession.selectedAgent
+           )
+        {
+            guard let fallback = selectableAgents(forTabID: activeSession.tabID).first else {
+                syncAllActiveUIState()
+                return
+            }
+            isRestoringState = true
+            selectedAgent = fallback
+            selectedModelRaw = defaultModelRaw(for: fallback)
+            selectedReasoningEffortRaw = nil
+            isRestoringState = false
+            activeSession.selectedAgent = fallback
+            activeSession.selectedModelRaw = selectedModelRaw
+            activeSession.selectedReasoningEffortRaw = nil
+            codexCoordinator.normalizeCodexSelectionForSession(activeSession, preservingExplicitEffort: false)
+            scheduleSave(for: activeSession.tabID)
+            updateDynamicModelPolling()
+            syncAllActiveUIState()
             return
         }
         let normalized = normalizedSelection(agentRaw: selectedAgent.rawValue, modelRaw: selectedModelRaw)
@@ -1794,6 +1851,8 @@ final class AgentModeViewModel: ObservableObject {
         tabID: UUID?,
         runID: UUID?,
         additionalTools: Set<String>?,
+        allowedToolsOverride: Set<String>? = nil,
+        sessionProfile: AgentSessionProfile = .standard,
         purpose: MCPRunPurpose,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
         allowsAgentExternalControlTools: Bool = false,
@@ -1809,6 +1868,8 @@ final class AgentModeViewModel: ObservableObject {
             tabID: tabID,
             runID: runID,
             additionalTools: additionalTools,
+            allowedToolsOverride: allowedToolsOverride,
+            sessionProfile: sessionProfile,
             purpose: purpose,
             taskLabelKind: taskLabelKind,
             allowsAgentExternalControlTools: allowsAgentExternalControlTools,
@@ -1869,18 +1930,19 @@ final class AgentModeViewModel: ObservableObject {
             }
             return FileManager.default.temporaryDirectory
         }
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, sessionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
+            let isKnowledge = sessionProfile == .knowledge
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 forceExperimentalSteering: true,
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
-                shellToolEnabled: permissionProfile.codexBashToolEnabled(),
-                suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
-                goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
+                shellToolEnabled: isKnowledge ? false : permissionProfile.codexBashToolEnabled(),
+                suppressThirdPartyMCPServers: isKnowledge ? true : permissionProfile.codexSuppressesThirdPartyMCPServers,
+                goalSupportEnabledProvider: { isKnowledge ? false : CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
-                computerUseEnabledProvider: { computerUseEnabled }
+                computerUseEnabledProvider: { isKnowledge ? false : computerUseEnabled }
             )
             return CodexNativeSessionController(
                 client: client,
@@ -1900,7 +1962,7 @@ final class AgentModeViewModel: ObservableObject {
         acpControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
         }
-        connectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
+        connectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
             await Self.defaultConnectionPolicyInstaller(
                 clientName: clientName,
                 windowID: windowID,
@@ -1911,6 +1973,8 @@ final class AgentModeViewModel: ObservableObject {
                 tabID: tabID,
                 runID: runID,
                 additionalTools: additionalTools,
+                allowedToolsOverride: allowedToolsOverride,
+                sessionProfile: sessionProfile,
                 purpose: purpose,
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools,
@@ -2032,7 +2096,7 @@ final class AgentModeViewModel: ObservableObject {
             acpControllerFactory: @escaping ACPControllerFactory = { provider, runRequest in
                 try ACPAgentSessionController(provider: provider, runRequest: runRequest)
             },
-            connectionPolicyInstaller: @escaping ConnectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
+            connectionPolicyInstaller: @escaping ConnectionPolicyInstaller = { clientName, windowID, restrictedTools, oneShot, reason, ttl, tabID, runID, additionalTools, allowedToolsOverride, sessionProfile, purpose, taskLabelKind, allowsAgentExternalControlTools, requiresExpectedAgentPID in
                 await AgentModeViewModel.defaultConnectionPolicyInstaller(
                     clientName: clientName,
                     windowID: windowID,
@@ -2043,6 +2107,8 @@ final class AgentModeViewModel: ObservableObject {
                     tabID: tabID,
                     runID: runID,
                     additionalTools: additionalTools,
+                    allowedToolsOverride: allowedToolsOverride,
+                    sessionProfile: sessionProfile,
                     purpose: purpose,
                     taskLabelKind: taskLabelKind,
                     allowsAgentExternalControlTools: allowsAgentExternalControlTools,
@@ -2099,7 +2165,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             workspacePathProvider = codexWorkspacePathProvider
             let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = codexControllerFactoryWithComputerUse
-                ?? { runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind, _ in
+                ?? { runID, tabID, windowID, workspacePath, permissionProfile, _, taskLabelKind, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind)
                 }
             self.headlessProviderFactory = headlessProviderFactory
@@ -3612,6 +3678,7 @@ final class AgentModeViewModel: ObservableObject {
         session.selectedModelRaw = normalizedSelection.modelRaw
         session.selectedReasoningEffortRaw = indexEntry.agentReasoningEffortRaw
         session.autoEditEnabled = indexEntry.autoEditEnabled
+        _ = session.adoptSessionProfile(indexEntry.profile)
     }
 
     func applyTranscriptViewportBindingState(
@@ -4434,6 +4501,16 @@ final class AgentModeViewModel: ObservableObject {
             return false
         }
         let agentSession = payload.persistedSession
+        guard session.adoptSessionProfile(agentSession.profile) else {
+            #if DEBUG
+                AgentModePerfDiagnostics.event(
+                    "agentSessionHydration.rejected",
+                    tabID: session.tabID,
+                    fields: ["reason": "sessionProfileChangedAfterStart"]
+                )
+            #endif
+            return false
+        }
 
         hydrateSession(
             session,
@@ -6552,6 +6629,7 @@ final class AgentModeViewModel: ObservableObject {
                 remoteSessionID: existingEntry.remoteSessionID ?? session.remoteHost?.normalizedRemoteSessionID,
                 isMCPOriginated: existingEntry.isMCPOriginated || session.isMCPOriginated,
                 origin: AgentSessionOrigin.merged(existingEntry.origin, session.origin),
+                profile: existingEntry.profile,
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
                 activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries
             )
@@ -6574,6 +6652,7 @@ final class AgentModeViewModel: ObservableObject {
             parentSessionID: parentSessionID,
             isMCPOriginated: session.isMCPOriginated,
             origin: session.origin,
+            profile: session.profile,
             remoteHostID: session.remoteHost?.hostID,
             remoteHostName: session.remoteHost?.hostDisplayName,
             remoteSessionID: session.remoteHost?.normalizedRemoteSessionID
@@ -7003,6 +7082,9 @@ final class AgentModeViewModel: ObservableObject {
         requireInactiveRunState: Bool = false
     ) async throws {
         let session = await ensureSessionReady(tabID: tabID)
+        guard session.profile == .standard else {
+            throw MCPError.invalidParams("Knowledge sessions cannot be converted into MCP-controlled coding sessions. Start a standard Agent session instead.")
+        }
         guard sessions[tabID] === session,
               session.activeAgentSessionID == sessionID,
               !session.bindingTransitionInProgress
@@ -10375,6 +10457,7 @@ final class AgentModeViewModel: ObservableObject {
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
         origin: AgentSessionOrigin? = nil,
+        profile: AgentSessionProfile = .standard,
         worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary] = [],
         remoteHostID: String? = nil,
         remoteHostName: String? = nil,
@@ -10400,6 +10483,7 @@ final class AgentModeViewModel: ObservableObject {
             remoteSessionID: remoteSessionID,
             isMCPOriginated: isMCPOriginated,
             origin: origin,
+            profile: profile,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries
         ))
@@ -11672,6 +11756,7 @@ final class AgentModeViewModel: ObservableObject {
             pendingHandoffDefersProviderLockUntilSend: session.pendingHandoff.defersProviderLockUntilSend,
             isMCPOriginated: session.isMCPOriginated,
             origin: session.origin,
+            profile: session.profile,
             worktreeBindings: session.worktreeBindings,
             worktreeMergeOperations: session.worktreeMergeOperations
         )
@@ -11717,6 +11802,7 @@ final class AgentModeViewModel: ObservableObject {
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
                 origin: agentSession.origin,
+                profile: agentSession.profile,
                 worktreeBindingSummaries: agentSession.worktreeBindings.worktreeBindingSummaries,
                 remoteHostID: agentSession.remoteHost?.hostID,
                 remoteHostName: agentSession.remoteHost?.hostDisplayName,
@@ -12127,6 +12213,7 @@ final class AgentModeViewModel: ObservableObject {
         let selectedModelRaw: String
         let selectedReasoningEffortRaw: String?
         let autoEditEnabled: Bool
+        let profile: AgentSessionProfile
         let selectedWorkflow: AgentWorkflowDefinition?
         let imageAttachments: [AgentImageAttachment]
         let taggedFileAttachments: [AgentTaggedFileAttachment]
@@ -12145,6 +12232,7 @@ final class AgentModeViewModel: ObservableObject {
             selectedModelRaw = session?.selectedModelRaw ?? fallbackSelectedModelRaw
             selectedReasoningEffortRaw = session?.selectedReasoningEffortRaw ?? fallbackSelectedReasoningEffortRaw
             autoEditEnabled = session?.autoEditEnabled ?? fallbackAutoEditEnabled
+            profile = session?.profile ?? .standard
             selectedWorkflow = session?.selectedWorkflow
             imageAttachments = session?.pendingImageAttachments ?? []
             taggedFileAttachments = session?.pendingTaggedFileAttachments ?? []
@@ -12159,6 +12247,7 @@ final class AgentModeViewModel: ObservableObject {
                 && selectedModelRaw == session.selectedModelRaw
                 && selectedReasoningEffortRaw == session.selectedReasoningEffortRaw
                 && autoEditEnabled == session.autoEditEnabled
+                && profile == session.profile
                 && selectedWorkflow == session.selectedWorkflow
                 && imageAttachments == session.pendingImageAttachments
                 && taggedFileAttachments == session.pendingTaggedFileAttachments
@@ -12171,6 +12260,7 @@ final class AgentModeViewModel: ObservableObject {
             session.selectedModelRaw = selectedModelRaw
             session.selectedReasoningEffortRaw = selectedReasoningEffortRaw
             session.autoEditEnabled = autoEditEnabled
+            _ = session.adoptSessionProfile(profile)
         }
     }
 
@@ -12191,6 +12281,13 @@ final class AgentModeViewModel: ObservableObject {
         let taggedFiles = session.pendingTaggedFileAttachments
         guard !trimmedText.isEmpty || !attachments.isEmpty || !taggedFiles.isEmpty else {
             return .blocked(message: "")
+        }
+        if session.profile == .knowledge,
+           !KnowledgeSessionPolicy.supportedProviders.contains(session.selectedAgent)
+        {
+            return .blocked(
+                message: "Knowledge sessions currently support Claude Code and Codex. Start a standard session for other providers."
+            )
         }
         if session.remoteHost == nil {
             guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
@@ -14860,7 +14957,8 @@ final class AgentModeViewModel: ObservableObject {
         let systemPrompt = SystemPromptService.agentModePrompt(
             agentKind: session.selectedAgent,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
-            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled()
+            codeMapsDisabled: GlobalSettingsStore.shared.globalCodeMapsDisabled(),
+            sessionProfile: session.profile
         )
         return AgentMessage(systemPrompt: systemPrompt, userMessage: fullMessage, resumeSessionID: resumeSessionID)
     }
@@ -17221,9 +17319,21 @@ final class AgentModeViewModel: ObservableObject {
         return explicitActiveSessionID(for: tabID) != nil
     }
 
-    /// Returns true when a new-session click should be ignored because the current tab is still untouched.
-    /// This prevents creating multiple consecutive empty sessions.
-    func shouldSwallowNewSessionClick(for tabID: UUID?) -> Bool {
+    /// Returns true when a new-session click should be ignored because the current tab is
+    /// still an untouched placeholder for the requested profile.
+    func shouldSwallowNewSessionClick(
+        for tabID: UUID?,
+        requestedProfile: AgentSessionProfile = .standard
+    ) -> Bool {
+        guard let tabID,
+              sessions[tabID]?.profile == requestedProfile
+        else {
+            return false
+        }
+        return isUntouchedSessionPlaceholder(for: tabID)
+    }
+
+    private func isUntouchedSessionPlaceholder(for tabID: UUID?) -> Bool {
         guard let tabID,
               hasLinkedAgentSession(for: tabID),
               let session = sessions[tabID]
@@ -17256,13 +17366,60 @@ final class AgentModeViewModel: ObservableObject {
         _ = ensureSessionBoundToTab(session)
     }
 
+    var canCreateKnowledgeSession: Bool {
+        !availableAgents.filter(KnowledgeSessionPolicy.supportedProviders.contains).isEmpty
+    }
+
     /// Create a brand new session by creating a tab that is already linked to an agent session.
+    /// Profiles are chosen before provider construction and remain immutable for the tab's lifetime.
     @discardableResult
-    func createAndActivateSessionTab() async -> UUID? {
+    func createAndActivateSessionTab(
+        profile requestedProfile: AgentSessionProfile = .standard
+    ) async -> UUID? {
         guard let promptManager else { return nil }
+
+        let knowledgeAgents = availableAgents.filter(KnowledgeSessionPolicy.supportedProviders.contains)
+        guard requestedProfile != .knowledge || !knowledgeAgents.isEmpty else { return nil }
+
+        let priorTabID = currentTabID
+        if shouldSwallowNewSessionClick(
+            for: priorTabID,
+            requestedProfile: requestedProfile
+        ) {
+            return priorTabID
+        }
+        let shouldClosePriorPlaceholder = isUntouchedSessionPlaceholder(for: priorTabID)
+
         await promptManager.createBlankComposeTab(createAgentSession: true)
         guard let tabID = currentTabID else { return nil }
         let session = session(for: tabID)
+        guard session.adoptSessionProfile(requestedProfile) else {
+            await deleteSession(tabID: tabID)
+            return nil
+        }
+
+        if requestedProfile == .knowledge {
+            let knowledgeAgent = knowledgeAgents.contains(selectedAgent)
+                ? selectedAgent
+                : knowledgeAgents[0]
+            let knowledgeModel = knowledgeAgent == selectedAgent
+                && isModelRawValid(selectedModelRaw, for: knowledgeAgent)
+                ? selectedModelRaw
+                : defaultModelRaw(for: knowledgeAgent)
+            session.selectedAgent = knowledgeAgent
+            session.selectedModelRaw = knowledgeModel
+            session.selectedReasoningEffortRaw = knowledgeAgent == selectedAgent
+                ? selectedReasoningEffortRaw
+                : nil
+            codexCoordinator.normalizeCodexSelectionForSession(session, preservingExplicitEffort: true)
+
+            isRestoringState = true
+            selectedAgent = session.selectedAgent
+            selectedModelRaw = session.selectedModelRaw
+            selectedReasoningEffortRaw = session.selectedReasoningEffortRaw
+            isRestoringState = false
+        }
+
         markSessionAsFreshlyCreated(session)
         if applyWorkspaceDefaultRunLocationIfNeeded(to: session) {
             session.isDirty = true
@@ -17270,6 +17427,14 @@ final class AgentModeViewModel: ObservableObject {
         }
         invalidateSidebarRestoreOrdering()
         updateBindingsFromSession(session)
+        syncAllActiveUIState()
+
+        if shouldClosePriorPlaceholder,
+           let priorTabID,
+           priorTabID != tabID
+        {
+            await deleteSession(tabID: priorTabID)
+        }
         return tabID
     }
 
@@ -17462,6 +17627,13 @@ final class AgentModeViewModel: ObservableObject {
         ) else {
             throw AgentSessionError.invalidHandoffCutoff
         }
+        if sourceSession.profile == .knowledge,
+           !KnowledgeSessionPolicy.supportedProviders.contains(destinationAgent)
+        {
+            throw MCPError.invalidParams(
+                "Knowledge handoffs currently support Claude Code and Codex destinations only."
+            )
+        }
 
         // 1) Build the handoff payload from the same transcript universe used for migration.
         let payload = await buildHandoffPayload(
@@ -17499,6 +17671,10 @@ final class AgentModeViewModel: ObservableObject {
 
         // 5) Create destination agent session with migrated transcript + pending payload.
         let destSession = session(for: destTabID)
+        guard destSession.adoptSessionProfile(sourceSession.profile) else {
+            await promptManager.closeComposeTab(destTabID)
+            throw PersistentBindingMutationError.staleTransition
+        }
         destSession.selectedAgent = destinationAgent
         destSession.selectedModelRaw = destinationModelRaw
         destSession.selectedReasoningEffortRaw = destinationReasoningEffortRaw

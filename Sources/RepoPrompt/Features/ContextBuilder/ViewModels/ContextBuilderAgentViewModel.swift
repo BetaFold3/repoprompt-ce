@@ -430,6 +430,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             typealias MCPFollowUpModelSelection = (
                 model: AIModel,
                 chatPresetID: UUID?,
+                modelPresetID: UUID?,
                 mcpControlInfo: String?
             )
             typealias MCPFollowUpRunner = @MainActor @Sendable (
@@ -4253,6 +4254,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         chatName: String,
         model: AIModel,
         chatPresetID: UUID?,
+        modelPresetID: UUID? = nil,
         mcpSessionUIState: OracleViewModel.MCPSessionUIState? = nil,
         gitScopeOverride: GitInclusion? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
@@ -4340,6 +4342,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 prompt,
                 sessionID: createdSession.id,
                 overrideModel: model,
+                overrideModelPresetID: modelPresetID,
                 overrideChatPresetID: chatPresetID,
                 overrideMode: promptMode,
                 gitInclusionOverride: mode == .review ? gitScopeOverride : nil,
@@ -4469,6 +4472,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let modelSelection: (
             model: AIModel,
             chatPresetID: UUID?,
+            modelPresetID: UUID?,
             mcpControlInfo: String?
         )
         #if DEBUG
@@ -4558,6 +4562,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             chatName: chatNameForTab(tabID),
             model: modelSelection.model,
             chatPresetID: modelSelection.chatPresetID,
+            modelPresetID: modelSelection.modelPresetID,
             mcpSessionUIState: mcpSessionUIState,
             gitScopeOverride: gitScopeOverride,
             progressReporter: progressReporter,
