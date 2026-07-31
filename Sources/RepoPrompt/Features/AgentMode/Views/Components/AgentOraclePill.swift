@@ -481,8 +481,10 @@ struct AgentOraclePill: View {
                 bottomOcclusion: 0,
                 showsScrollControls: true,
                 autoScrollOnAppear: true,
-                sessionIDOverride: presentedSessionID
+                sessionIDOverride: presentedSessionID,
+                showsMessageTimestamps: true
             )
+            .messageTimestampEnvironment()
             .frame(minHeight: transcriptMinHeight, idealHeight: transcriptIdealHeight, maxHeight: transcriptMaxHeight)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }

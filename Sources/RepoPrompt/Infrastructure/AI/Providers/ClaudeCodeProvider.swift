@@ -340,11 +340,18 @@ final class ClaudeCodeProvider: AIProvider {
         return prompt
     }
 
-    private func parseCompletionPayload(_ data: Data) throws -> AICompletionResult {
+    /// Internal so root-target tests can exercise the real typed/fallback dispatch.
+    func parseCompletionPayload(_ data: Data) throws -> AICompletionResult {
         if let message = try? decoder.decode(ClaudeResultMessage.self, from: data) {
             return AICompletionResult(
                 text: message.result ?? "",
-                promptTokens: message.usage?.inputTokens,
+                promptTokens: message.usage.map { usage in
+                    Self.cacheInclusiveInputTokens(
+                        input: usage.inputTokens,
+                        cacheRead: usage.cacheReadInputTokens,
+                        cacheCreation: usage.cacheCreationInputTokens
+                    )
+                },
                 completionTokens: message.usage?.outputTokens,
                 cost: message.totalCostUsd
             )
@@ -397,23 +404,56 @@ final class ClaudeCodeProvider: AIProvider {
     private func parseUsage(_ value: [String: Any]?) -> TokenUsage? {
         guard let value else { return nil }
         let input = numberToInt(value["input_tokens"]) ?? numberToInt(value["inputTokens"])
+        let cacheRead = numberToInt(value["cache_read_input_tokens"])
+            ?? numberToInt(value["cacheReadInputTokens"])
+        let cacheCreation = numberToInt(value["cache_creation_input_tokens"])
+            ?? numberToInt(value["cacheCreationInputTokens"])
         let output = numberToInt(value["output_tokens"]) ?? numberToInt(value["outputTokens"])
         if let input, let output {
-            return TokenUsage(inputTokens: input, outputTokens: output)
+            return TokenUsage(
+                inputTokens: Self.cacheInclusiveInputTokens(
+                    input: input,
+                    cacheRead: cacheRead ?? 0,
+                    cacheCreation: cacheCreation ?? 0
+                ),
+                outputTokens: output
+            )
         }
         return nil
+    }
+
+    /// Claude's raw `input_tokens` excludes prompt-cache reads and writes. The chat UI's
+    /// input total represents all input processed for the request, so include every
+    /// component while rejecting negative counters and avoiding integer overflow.
+    private static func cacheInclusiveInputTokens(
+        input: Int,
+        cacheRead: Int,
+        cacheCreation: Int
+    ) -> Int {
+        var total = 0
+        for value in [input, cacheRead, cacheCreation] {
+            let (sum, overflow) = total.addingReportingOverflow(max(0, value))
+            if overflow {
+                return Int.max
+            }
+            total = sum
+        }
+        return total
     }
 
     private func numberToInt(_ value: Any?) -> Int? {
         switch value {
         case let int as Int:
-            int
+            return int
         case let double as Double:
-            Int(double)
+            guard double.isFinite else { return nil }
+            if double >= Double(Int.max) { return Int.max }
+            if double <= Double(Int.min) { return Int.min }
+            return Int(double)
         case let string as String:
-            Int(string)
+            return Int(string)
         default:
-            nil
+            return nil
         }
     }
 
