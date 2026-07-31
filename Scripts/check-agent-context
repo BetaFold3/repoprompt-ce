@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+"""Validate the repository's routed agent-context documentation."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import re
+import shutil
+import subprocess
+import sys
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+EXCLUDED_CONTEXT_TREES = (
+    Path("docs/context/plans/completed"),
+    Path("docs/context/generated"),
+    Path("docs/context/archive"),
+)
+GENERIC_STEM = re.compile(r"(?:file\d+|misc|notes|untitled|temp|scratch)", re.IGNORECASE)
+HEADING = re.compile(r"^\s{0,3}#{1,6}(?:\s+|$)")
+SCOPE = re.compile(r"^Scope: read when the task touches .+\S$")
+AUTHORITY = re.compile(r"^Authority: (Authoritative|Reference|Historical)$")
+LAST_VERIFIED = re.compile(r"^Last-verified: (\d{4}-\d{2}-\d{2})$")
+INLINE_LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\(\s*(?:<([^>\n]+)>|([^\s)\n]+))")
+REFERENCE_DEFINITION = re.compile(
+    r"^\s{0,3}\[([^\]\n]+)\]:\s*(?:<([^>\n]+)>|([^\s]+))", re.MULTILINE
+)
+REFERENCE_LINK = re.compile(r"(?<!!)\[([^\]\n]+)\]\[([^\]\n]*)\]")
+FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+ARCHIVE_MANIFEST_HEADER = (
+    "Original path",
+    "Archive date",
+    "Archived copy",
+    "Reason",
+    "Integrity note",
+)
+ARCHIVE_COPY_LINK = re.compile(r"^\[([^\]\n]+)\]\(([^)\n]+)\)$")
+ARCHIVE_SHA256 = re.compile(r"\bSHA-256\s+`([0-9a-fA-F]{64})`")
+
+
+@dataclass(frozen=True, order=True)
+class Diagnostic:
+    path: str
+    category: str
+    message: str
+
+
+@dataclass(frozen=True)
+class Header:
+    authority: str
+    last_verified: dt.date | None
+
+
+def display_path(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def physical_line_count(text: str) -> int:
+    return text.count("\n") + int(bool(text) and not text.endswith("\n"))
+
+
+def is_excluded(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    return any(relative == tree or tree in relative.parents for tree in EXCLUDED_CONTEXT_TREES)
+
+
+def context_documents(root: Path) -> list[Path]:
+    context = root / "docs/context"
+    if not context.is_dir():
+        return []
+    return sorted(
+        (path for path in context.rglob("*.md") if path.is_file()),
+        key=lambda path: path.relative_to(root).as_posix().casefold(),
+    )
+
+
+def visible_markdown_lines(text: str) -> list[tuple[int, str]]:
+    visible: list[tuple[int, str]] = []
+    fence_marker: str | None = None
+    fence_length = 0
+    for number, line in enumerate(text.splitlines(), start=1):
+        match = FENCE.match(line)
+        if match:
+            marker = match.group(1)
+            if fence_marker is None:
+                fence_marker = marker[0]
+                fence_length = len(marker)
+            elif marker[0] == fence_marker and len(marker) >= fence_length:
+                fence_marker = None
+                fence_length = 0
+            continue
+        if fence_marker is None:
+            line = re.sub(r"`+[^`\n]*?`+", "", line)
+            visible.append((number, line))
+    return visible
+
+
+def reference_label(label: str) -> str:
+    return " ".join(label.split()).casefold()
+
+
+def markdown_links(text: str) -> list[tuple[int, str]]:
+    lines = visible_markdown_lines(text)
+    visible_text = "\n".join(line for _, line in lines)
+    visible_numbers = [number for number, _ in lines]
+    definitions: dict[str, str] = {}
+    for match in REFERENCE_DEFINITION.finditer(visible_text):
+        definitions[reference_label(match.group(1))] = match.group(2) or match.group(3)
+
+    links: list[tuple[int, str]] = []
+    for index, line in enumerate(visible_text.splitlines()):
+        number = visible_numbers[index]
+        for match in INLINE_LINK.finditer(line):
+            links.append((number, match.group(1) or match.group(2)))
+        for match in REFERENCE_LINK.finditer(line):
+            label = match.group(2) or match.group(1)
+            destination = definitions.get(reference_label(label))
+            if destination:
+                links.append((number, destination))
+    return links
+
+
+def resolve_local_link(source: Path, destination: str, root: Path) -> Path | None:
+    destination = destination.strip()
+    if not destination or destination.startswith("#") or destination.startswith("//"):
+        return None
+    parsed = urlsplit(destination)
+    if parsed.scheme:
+        return None
+    link_path = unquote(parsed.path)
+    if not link_path:
+        return None
+    if link_path.startswith("/"):
+        return (root / link_path.lstrip("/")).resolve()
+    return (source.parent / link_path).resolve()
+
+
+def check_header(path: Path, text: str, root: Path, errors: list[Diagnostic]) -> Header | None:
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines) and (not lines[index].strip() or HEADING.match(lines[index])):
+        index += 1
+    shown = display_path(path, root)
+    if index >= len(lines) or not SCOPE.fullmatch(lines[index]):
+        errors.append(
+            Diagnostic(
+                shown,
+                "header",
+                "missing or invalid scope header. Fix: after leading headings/blanks, add "
+                "'Scope: read when the task touches ...' with a specific non-empty scope.",
+            )
+        )
+        return None
+    index += 1
+    if index >= len(lines) or not (authority_match := AUTHORITY.fullmatch(lines[index])):
+        errors.append(
+            Diagnostic(
+                shown,
+                "header",
+                "missing or invalid authority header. Fix: immediately after Scope, add "
+                "'Authority: Authoritative', 'Authority: Reference', or 'Authority: Historical'.",
+            )
+        )
+        return None
+    authority = authority_match.group(1)
+    index += 1
+    last_verified: dt.date | None = None
+    if index < len(lines) and lines[index].startswith("Last-verified:"):
+        date_match = LAST_VERIFIED.fullmatch(lines[index])
+        if not date_match:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "header",
+                    "invalid Last-verified header. Fix: use 'Last-verified: YYYY-MM-DD' immediately "
+                    "after Authority, or remove the optional line.",
+                )
+            )
+            return Header(authority, None)
+        try:
+            last_verified = dt.date.fromisoformat(date_match.group(1))
+        except ValueError:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "header",
+                    "Last-verified is not a real calendar date. Fix: replace it with a valid "
+                    "'Last-verified: YYYY-MM-DD' value.",
+                )
+            )
+    return Header(authority, last_verified)
+
+
+def check_archive_manifest(root: Path, errors: list[Diagnostic]) -> None:
+    archive = root / "docs/context/archive"
+    if not archive.is_dir():
+        return
+
+    manifest = archive / "MANIFEST.md"
+    payloads = sorted(
+        (
+            path
+            for path in archive.rglob("*")
+            if path != manifest and (path.is_file() or path.is_symlink())
+        ),
+        key=lambda path: path.relative_to(root).as_posix().casefold(),
+    )
+    if not payloads and not manifest.exists():
+        return
+    if not manifest.is_file():
+        errors.append(
+            Diagnostic(
+                display_path(manifest, root),
+                "archive",
+                "is required when archive payloads exist. Fix: create MANIFEST.md and add exactly "
+                "one row for every archived payload with its relative link and SHA-256.",
+            )
+        )
+        return
+
+    try:
+        manifest_text = manifest.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        errors.append(
+            Diagnostic(
+                display_path(manifest, root),
+                "archive",
+                f"cannot be read as UTF-8 ({error}). Fix: make MANIFEST.md readable UTF-8 Markdown "
+                "with exactly one row and the SHA-256 for every archive payload.",
+            )
+        )
+        return
+
+    header_seen = False
+    entries: dict[Path, list[tuple[int, str]]] = {}
+    archive_resolved = archive.resolve()
+    manifest_resolved = manifest.resolve()
+    for line_number, line in enumerate(manifest_text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            continue
+        cells = tuple(cell.strip() for cell in stripped[1:-1].split("|"))
+        if cells == ARCHIVE_MANIFEST_HEADER:
+            header_seen = True
+            continue
+        if all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+            continue
+        if not header_seen:
+            continue
+        shown = f"{display_path(manifest, root)}:{line_number}"
+        if len(cells) != len(ARCHIVE_MANIFEST_HEADER):
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    "has a malformed manifest row. Fix: use the five manifest columns and put the "
+                    "archived-copy Markdown link and SHA-256 in their named columns.",
+                )
+            )
+            continue
+        link_match = ARCHIVE_COPY_LINK.fullmatch(cells[2])
+        hash_match = ARCHIVE_SHA256.search(cells[4])
+        if link_match is None or hash_match is None:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    "does not contain both a valid archived-copy Markdown link and a 64-digit "
+                    "SHA-256. Fix: repair the row and record the payload's current SHA-256.",
+                )
+            )
+            continue
+        target = resolve_local_link(manifest, link_match.group(2), root)
+        if target is None:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    "does not point to a local archive payload. Fix: replace the archived-copy link "
+                    "with a relative path under docs/context/archive/.",
+                )
+            )
+            continue
+        try:
+            target.relative_to(archive_resolved)
+        except ValueError:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    "points outside docs/context/archive/. Fix: archive the payload under that "
+                    "directory and link to its relative path.",
+                )
+            )
+            continue
+        if target == manifest_resolved:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    "lists MANIFEST.md as an archive payload. Fix: remove that row and list only "
+                    "archived legacy payloads.",
+                )
+            )
+            continue
+        entries.setdefault(target, []).append((line_number, hash_match.group(1).lower()))
+
+    if not header_seen:
+        errors.append(
+            Diagnostic(
+                display_path(manifest, root),
+                "archive",
+                "is missing the archive manifest table header. Fix: add the five columns "
+                "'Original path', 'Archive date', 'Archived copy', 'Reason', and 'Integrity note'.",
+            )
+        )
+
+    for target, rows in sorted(
+        entries.items(), key=lambda item: display_path(item[0], root).casefold()
+    ):
+        shown = display_path(target, root)
+        if len(rows) != 1:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    f"is listed {len(rows)} times in MANIFEST.md. Fix: keep exactly one manifest "
+                    "row for this archive payload.",
+                )
+            )
+        if not target.is_file():
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    "is listed in MANIFEST.md but is missing or is not a file. Fix: restore the "
+                    "archived payload verbatim; remove the row only if it never represented a "
+                    "legacy instruction surface.",
+                )
+            )
+            continue
+        try:
+            actual_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+        except OSError as error:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    f"cannot be read for integrity validation ({error}). Fix: make the archived "
+                    "payload readable, then record its SHA-256 in MANIFEST.md.",
+                )
+            )
+            continue
+        recorded_hash = rows[0][1]
+        if actual_hash != recorded_hash:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "archive",
+                    f"does not match its recorded SHA-256 ({recorded_hash}). Fix: restore the "
+                    "verbatim archived body; if the recorded digest was wrong, verify the payload "
+                    f"against its original source before recording SHA-256 `{actual_hash}`.",
+                )
+            )
+
+    manifested = set(entries)
+    for payload in payloads:
+        payload_resolved = payload.resolve()
+        if payload_resolved not in manifested:
+            errors.append(
+                Diagnostic(
+                    display_path(payload, root),
+                    "archive",
+                    "is not listed in MANIFEST.md. Fix: add exactly one manifest row with this "
+                    "payload's original path, archive date, relative link, reason, and SHA-256.",
+                )
+            )
+
+
+def git_is_usable(root: Path) -> bool:
+    if shutil.which("git") is None:
+        return False
+    try:
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if inside.returncode != 0 or inside.stdout.strip() != "true":
+            return False
+        shallow = subprocess.run(
+            ["git", "rev-parse", "--is-shallow-repository"],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return shallow.returncode == 0 and shallow.stdout.strip() == "false"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def last_git_modification(root: Path, path: Path) -> int | None:
+    try:
+        relative = path.relative_to(root).as_posix()
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%ct", "--", relative],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        return int(result.stdout.strip())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def run(root: Path) -> int:
+    errors: list[Diagnostic] = []
+    warnings: list[Diagnostic] = []
+    agents = root / "AGENTS.md"
+    texts: dict[Path, str] = {}
+
+    if not agents.is_file():
+        errors.append(
+            Diagnostic(
+                "AGENTS.md",
+                "agents",
+                "required routing file is missing. Fix: create AGENTS.md at the repository root and "
+                "route active docs/context documents from it.",
+            )
+        )
+    else:
+        try:
+            agents_text = agents.read_text(encoding="utf-8")
+            texts[agents] = agents_text
+            line_count = physical_line_count(agents_text)
+            if line_count >= 100:
+                errors.append(
+                    Diagnostic(
+                        "AGENTS.md",
+                        "agents",
+                        f"has {line_count} physical lines; the limit is 99. Fix: move detail into "
+                        "routed docs/context documents and trim AGENTS.md below 100 lines.",
+                    )
+                )
+            elif line_count > 85:
+                warnings.append(
+                    Diagnostic(
+                        "AGENTS.md",
+                        "agents-size",
+                        f"has {line_count} physical lines and is approaching the 100-line limit. "
+                        "Fix: route detail into docs/context before adding more lines.",
+                    )
+                )
+        except (OSError, UnicodeError) as error:
+            errors.append(
+                Diagnostic(
+                    "AGENTS.md",
+                    "agents",
+                    f"cannot be read as UTF-8 ({error}). Fix: make AGENTS.md readable UTF-8 text.",
+                )
+            )
+
+    claude = root / "CLAUDE.md"
+    if claude.is_symlink():
+        errors.append(
+            Diagnostic(
+                "CLAUDE.md",
+                "adapter",
+                "must be a regular non-symlink file. Fix: replace the symlink with a regular file "
+                "whose exact bytes are '@AGENTS.md\\n'.",
+            )
+        )
+    elif not claude.is_file():
+        errors.append(
+            Diagnostic(
+                "CLAUDE.md",
+                "adapter",
+                "required Claude Code compatibility adapter is missing. Fix: create a regular "
+                "CLAUDE.md file whose exact bytes are '@AGENTS.md\\n'.",
+            )
+        )
+    else:
+        try:
+            claude_bytes = claude.read_bytes()
+            if claude_bytes != b"@AGENTS.md\n":
+                errors.append(
+                    Diagnostic(
+                        "CLAUDE.md",
+                        "adapter",
+                        "does not contain the exact compatibility adapter bytes. Fix: replace its "
+                        "contents with exactly '@AGENTS.md' followed by one newline.",
+                    )
+                )
+        except OSError as error:
+            errors.append(
+                Diagnostic(
+                    "CLAUDE.md",
+                    "adapter",
+                    f"cannot be read ({error}). Fix: make it a readable regular file whose exact "
+                    "bytes are '@AGENTS.md\\n'.",
+                )
+            )
+
+    check_archive_manifest(root, errors)
+
+    all_documents = context_documents(root)
+    for document in all_documents:
+        if GENERIC_STEM.fullmatch(document.stem):
+            errors.append(
+                Diagnostic(
+                    display_path(document, root),
+                    "filename",
+                    "uses a generic filename stem. Fix: rename it to a specific task or domain name "
+                    "and update incoming links.",
+                )
+            )
+
+    documents = [document for document in all_documents if not is_excluded(document, root)]
+    headers: dict[Path, Header] = {}
+    for document in documents:
+        shown = display_path(document, root)
+        try:
+            text = document.read_text(encoding="utf-8")
+            texts[document] = text
+            header = check_header(document, text, root, errors)
+            if header is not None:
+                headers[document] = header
+        except (OSError, UnicodeError) as error:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "document",
+                    f"cannot be read as UTF-8 ({error}). Fix: make the active context document readable UTF-8 text.",
+                )
+            )
+
+    active_by_resolved = {path.resolve(): path for path in documents}
+    graph: dict[Path, set[Path]] = {path: set() for path in documents}
+    if agents in texts:
+        graph[agents] = set()
+    for source in sorted(texts, key=lambda path: display_path(path, root).casefold()):
+        if source != agents and source not in active_by_resolved.values():
+            continue
+        for line, destination in markdown_links(texts[source]):
+            target = resolve_local_link(source, destination, root)
+            if target is None:
+                continue
+            if not target.exists():
+                errors.append(
+                    Diagnostic(
+                        f"{display_path(source, root)}:{line}",
+                        "link",
+                        f"local Markdown link target '{destination}' does not exist. Fix: correct the "
+                        "relative path or restore the referenced file.",
+                    )
+                )
+            elif target in active_by_resolved:
+                graph.setdefault(source, set()).add(active_by_resolved[target])
+
+    depths: dict[Path, int] = {}
+    if agents in graph:
+        queue: deque[tuple[Path, int]] = deque([(agents, 0)])
+        while queue:
+            node, depth = queue.popleft()
+            for target in sorted(graph.get(node, ()), key=lambda path: display_path(path, root).casefold()):
+                if target not in depths:
+                    depths[target] = depth + 1
+                    queue.append((target, depth + 1))
+
+    for document in documents:
+        shown = display_path(document, root)
+        if document not in depths:
+            errors.append(
+                Diagnostic(
+                    shown,
+                    "reachability",
+                    "is an orphan active context document. Fix: add a Markdown link from AGENTS.md "
+                    "or from another reachable active docs/context document.",
+                )
+            )
+        elif depths[document] > 3:
+            warnings.append(
+                Diagnostic(
+                    shown,
+                    "route-depth",
+                    f"has shortest reachability depth {depths[document]}, greater than 3. Fix: add a "
+                    "more direct route from AGENTS.md or a nearer routed context document.",
+                )
+            )
+
+    direct_routes = graph.get(agents, set())
+    if len(direct_routes) > 15:
+        warnings.append(
+            Diagnostic(
+                "AGENTS.md",
+                "route-count",
+                f"has {len(direct_routes)} direct docs/context routes, more than 15. Fix: group related "
+                "documents behind a focused routed index while preserving discoverability.",
+            )
+        )
+    index_path = (root / "docs/context/index.md").resolve()
+    index_document = active_by_resolved.get(index_path)
+    if index_document is not None and index_document in direct_routes and len(direct_routes - {index_document}) <= 5:
+        warnings.append(
+            Diagnostic(
+                "AGENTS.md",
+                "index-routing",
+                "routes through docs/context/index.md with five or fewer other direct context routes. "
+                "Fix: directly route the most important task-specific documents from AGENTS.md.",
+            )
+        )
+
+    if git_is_usable(root):
+        cutoff = dt.datetime.now(dt.timezone.utc).timestamp() - 180 * 24 * 60 * 60
+        for document in documents:
+            header = headers.get(document)
+            if header is None or header.authority != "Authoritative" or header.last_verified is not None:
+                continue
+            modified = last_git_modification(root, document)
+            if modified is not None and modified < cutoff:
+                warnings.append(
+                    Diagnostic(
+                        display_path(document, root),
+                        "freshness",
+                        "is Authoritative, lacks Last-verified, and its last git modification is older "
+                        "than 180 days. Fix: verify it and add 'Last-verified: YYYY-MM-DD', or change its authority.",
+                    )
+                )
+
+    for diagnostic in sorted(errors):
+        print(f"ERROR [{diagnostic.category}] {diagnostic.path}: {diagnostic.message}")
+    for diagnostic in sorted(warnings):
+        print(f"WARNING [{diagnostic.category}] {diagnostic.path}: {diagnostic.message}")
+    if errors:
+        print(f"agent context check failed: {len(errors)} error(s), {len(warnings)} warning(s)")
+        return 1
+    print(f"agent context check passed: {len(warnings)} warning(s)")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+        help="repository root (default: parent of this script's directory)",
+    )
+    arguments = parser.parse_args()
+    root = arguments.root.expanduser().resolve()
+    if not root.is_dir():
+        print(
+            f"ERROR [root] {root}: repository root is not a directory. Fix: pass --root with an existing repository directory."
+        )
+        return 1
+    return run(root)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

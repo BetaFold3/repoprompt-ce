@@ -10,12 +10,13 @@ This package intentionally does **not** import the RepoPrompt app target. The ro
 
 ## Local development
 
-For now this package lives under `Packages/RepoPromptAgentProviders` and can be tested directly:
+For now this package lives under `Packages/RepoPromptAgentProviders`. From the repository root, use the coordinated package test lane:
 
 ```bash
-cd Packages/RepoPromptAgentProviders
-swift test
+make dev-provider-test
 ```
+
+Use direct package-local `swift test` only when the developer daemon is unavailable, as described in the [development workflow](../../docs/context/workflows/development.md).
 
 When this package is split out, prefer SwiftPM/Xcode local package overrides for sibling-checkout development rather than requiring a path dependency in RepoPrompt CE's root manifest.
 

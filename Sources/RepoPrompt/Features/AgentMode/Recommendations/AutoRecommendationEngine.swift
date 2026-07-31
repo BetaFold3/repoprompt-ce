@@ -121,11 +121,22 @@ final class AutoRecommendationEngine {
 
     // MARK: - Chat Model Recommendation
 
+    private var recommendedOpenAIPlanningModel: AIModel {
+        guard let selection = OpenAIConfiguredModelSelection(
+            modelID: AIModel.gpt56Sol.modelName,
+            reasoningMode: .pro,
+            reasoningEffort: .high
+        ) else {
+            return .gpt54Pro
+        }
+        return .openAIConfigured(selection: selection)
+    }
+
     private func computeChatModelRecommendation(status: ProviderStatusSnapshot) -> ChatModelRecommendation? {
         let inAppPlanning = BestPracticeProfiles.bestInAppPlanningReview
-        let bestPlanning = BestPracticeProfiles.bestPlanning
-        let apiPlanningModelString = AIModel.gpt54Pro.rawValue
-        let apiPlanningModelLabel = AIModel.gpt54Pro.displayName
+        let apiPlanningModel = recommendedOpenAIPlanningModel
+        let apiPlanningModelString = apiPlanningModel.rawValue
+        let apiPlanningModelLabel = apiPlanningModel.displayName
 
         // Build available options
         var codexOption: ChatBackendOption?
@@ -147,18 +158,17 @@ final class AutoRecommendationEngine {
             )
         }
 
-        // OpenAI API option - shows reasoning but higher cost. GPT-5.6 Sol is ChatGPT Pro export/planning guidance,
-        // not an OpenAI API model in RepoPrompt's guidance.
+        // OpenAI API option - explicit GPT-5.6 Sol Pro reasoning mode with higher API cost.
         if status.openAI == .ready {
             openAIOption = ChatBackendOption(
                 kind: .openAI,
                 displayName: "OpenAI API",
                 modelString: apiPlanningModelString,
-                description: "\(apiPlanningModelLabel) via API – use \(bestPlanning.modelLabel) through ChatGPT Pro export/planning",
+                description: "\(apiPlanningModelLabel) via API",
                 tradeoffs: [
                     "• API-backed planning and review when Codex CLI is unavailable",
                     "• Visible reasoning traces",
-                    "• GPT-5.6 Sol is Codex CLI / ChatGPT Pro guidance, not an API availability claim"
+                    "• Pro reasoning is slower and more expensive than Standard mode"
                 ]
             )
         }
@@ -604,7 +614,7 @@ final class AutoRecommendationEngine {
         case .codex:
             rec.codexOption?.modelString ?? AIModel.codexCliGpt56SolHigh.rawValue
         case .openAI:
-            rec.openAIOption?.modelString ?? AIModel.gpt54Pro.rawValue
+            rec.openAIOption?.modelString ?? recommendedOpenAIPlanningModel.rawValue
         }
         let trimmedModel = modelString.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmedModel.isEmpty ? nil : trimmedModel

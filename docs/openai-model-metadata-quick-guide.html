@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>OpenAI Local Model Metadata — Quick Guide</title>
+  <style>
+    :root {
+      --bg: #f4f7fb; --surface: #fff; --soft: #f7f9fc; --text: #172033;
+      --muted: #5f6b7a; --line: #dce3ec; --brand: #3157d5; --brand-soft: #eaf0ff;
+      --good: #19734b; --good-soft: #e8f7ef; --warn: #8a5a00; --warn-soft: #fff4d6;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111620; --surface: #191f2b; --soft: #202735; --text: #eef2f8;
+        --muted: #b5bfce; --line: #323c4d; --brand: #89a3ff; --brand-soft: #222f59;
+        --good: #78d6a7; --good-soft: #163d2d; --warn: #f0c56c; --warn-soft: #4b3917;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.58 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { width: min(860px, calc(100% - 28px)); margin: 0 auto; padding: 28px 0 64px; }
+    header, section { margin-bottom: 18px; padding: 26px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
+    header { background: linear-gradient(135deg, var(--surface), var(--brand-soft)); }
+    h1 { margin: 0; font-size: clamp(2rem, 5vw, 3rem); line-height: 1.08; letter-spacing: -0.035em; }
+    h2 { margin: 0 0 12px; font-size: 1.35rem; }
+    h3 { margin: 20px 0 6px; }
+    p { margin: 9px 0; }
+    .eyebrow { margin: 0 0 7px; color: var(--brand); font-size: .76rem; font-weight: 800; letter-spacing: .11em; text-transform: uppercase; }
+    .lead, .muted { color: var(--muted); }
+    .lead { font-size: 1.05rem; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    code { padding: .1rem .32rem; border: 1px solid var(--line); border-radius: 5px; background: var(--soft); font-size: .9em; }
+    pre { overflow-x: auto; padding: 16px; border-radius: 11px; background: #101827; color: #eef4ff; font-size: .84rem; line-height: 1.5; }
+    pre code { padding: 0; border: 0; background: transparent; color: inherit; }
+    ol, ul { padding-left: 1.35rem; }
+    li + li { margin-top: .42rem; }
+    .callout { margin: 15px 0; padding: 14px 16px; border-left: 4px solid var(--brand); border-radius: 4px 10px 10px 4px; background: var(--brand-soft); }
+    .callout.good { border-left-color: var(--good); background: var(--good-soft); }
+    .callout.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+    table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); background: var(--soft); font-size: .76rem; letter-spacing: .05em; text-transform: uppercase; }
+    a { color: var(--brand); }
+    .checklist { list-style: none; padding: 0; }
+    .checklist li::before { content: "✓"; margin-right: 8px; color: var(--good); font-weight: 900; }
+    @media (max-width: 600px) { header, section { padding: 20px 16px; } table { display: block; overflow-x: auto; } }
+    @media print { body { background: white; } main { width: 100%; padding: 0; } header, section { break-inside: avoid; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Two-Minute Guide</p>
+      <h1>Add a compatible OpenAI API model locally</h1>
+      <p class="lead">Use this file when a new OpenAI model follows request semantics RepoPrompt CE already understands, but the model is not yet compiled into the app.</p>
+    </header>
+
+    <section>
+      <p class="eyebrow">Before You Start</p>
+      <h2>Two conditions must both be true</h2>
+      <ul class="checklist">
+        <li>Your configured provider’s <code>GET /v1/models</code> response contains the exact model ID.</li>
+        <li>The model works with the Responses API and only uses modes/efforts already accepted by the app.</li>
+      </ul>
+      <div class="callout warn">
+        This file does not grant API access. It only tells the app how to present a model your account can already see.
+      </div>
+    </section>
+
+    <section>
+      <p class="eyebrow">Step 1</p>
+      <h2>Create the folder and file</h2>
+      <p>In Terminal:</p>
+      <pre><code>mkdir -p "$HOME/Library/Application Support/RepoPrompt CE/ModelCatalog"
+open -e "$HOME/Library/Application Support/RepoPrompt CE/ModelCatalog/openai-model-metadata-v1.json"</code></pre>
+      <p class="muted">The second command opens the file in TextEdit. If it does not exist, save it at that exact path.</p>
+    </section>
+
+    <section>
+      <p class="eyebrow">Step 2</p>
+      <h2>Paste a starter document</h2>
+      <pre><code>{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "gpt-future-example",
+      "display_name": "GPT Future Example",
+      "protocols": ["responses"],
+      "reasoning": {
+        "modes": ["standard", "pro"],
+        "efforts": ["none", "low", "medium", "high", "xhigh"]
+      },
+      "streaming": true,
+      "tokens": {
+        "context_window_tokens": 200000,
+        "max_output_tokens": 32000
+      }
+    }
+  ]
+}</code></pre>
+      <p>Replace the example ID, label, capabilities, and token values with accurate provider documentation. The <code>id</code> must match <code>/v1/models</code> exactly, including punctuation and case.</p>
+    </section>
+
+    <section>
+      <p class="eyebrow">Step 3</p>
+      <h2>Use only accepted values</h2>
+      <table>
+        <thead><tr><th>Field</th><th>Current accepted values</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td><code>protocols</code></td><td><code>responses</code>, <code>chat_completions</code></td><td>Use <code>responses</code> for a selectable configured reasoning model.</td></tr>
+          <tr><td><code>modes</code></td><td><code>standard</code>, <code>pro</code></td><td>Include only modes the model really supports.</td></tr>
+          <tr><td><code>efforts</code></td><td><code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code></td><td>GPT-5.6’s built-in picker shows every supported value except <code>minimal</code>; <code>minimal</code> remains accepted for metadata-backed models that support it.</td></tr>
+          <tr><td><code>streaming</code></td><td><code>true</code> or <code>false</code></td><td>This is required and persists with the selection.</td></tr>
+          <tr><td><code>tokens</code></td><td>Positive integers</td><td>Optional. If present, <code>context_window_tokens</code> is required.</td></tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        Pro mode and reasoning effort are independent for GPT-5.6. The built-in picker therefore offers None, Low, Medium, High, XHigh, and Max under both Standard and Pro. Older standalone Pro model IDs had different restrictions.
+      </div>
+    </section>
+
+    <section>
+      <p class="eyebrow">Step 4</p>
+      <h2>Validate the JSON</h2>
+      <pre><code>python3 -m json.tool \
+  "$HOME/Library/Application Support/RepoPrompt CE/ModelCatalog/openai-model-metadata-v1.json" \
+  &gt; /dev/null &amp;&amp; echo "JSON is valid"</code></pre>
+      <p><strong>Expected:</strong> <code>JSON is valid</code>. This checks JSON syntax; RepoPrompt CE still performs stricter schema validation when it loads the file.</p>
+    </section>
+
+    <section>
+      <p class="eyebrow">Step 5</p>
+      <h2>Reload and verify</h2>
+      <ol>
+        <li>Restart RepoPrompt CE or reopen/refresh the configured OpenAI API provider.</li>
+        <li>Open the model picker.</li>
+        <li>Find the exact model ID.</li>
+        <li>Select a supported mode and effort, save, and reopen Settings.</li>
+      </ol>
+      <div class="callout good">
+        Success means the model appears and the selected mode/effort survives reopening Settings. Send a small non-sensitive prompt to verify your account can actually run it.
+      </div>
+    </section>
+
+    <section>
+      <p class="eyebrow">Adding More Models</p>
+      <h2>Append another object inside <code>models</code></h2>
+      <pre><code>{
+  "schema_version": 1,
+  "models": [
+    { "id": "first-model",  "protocols": ["responses"], "reasoning": { "modes": ["standard"], "efforts": ["medium"] }, "streaming": true },
+    { "id": "second-model", "protocols": ["responses"], "reasoning": { "modes": ["standard", "pro"], "efforts": ["low", "high"] }, "streaming": false }
+  ]
+}</code></pre>
+      <p class="muted">Separate model objects with commas. Do not add a comma after the final object.</p>
+    </section>
+
+    <section>
+      <p class="eyebrow">Troubleshooting</p>
+      <h2>If the model does not appear</h2>
+      <ol>
+        <li>Run the JSON validation command again.</li>
+        <li>Confirm the file name is exactly <code>openai-model-metadata-v1.json</code>.</li>
+        <li>Confirm the model ID appears in the configured provider’s <code>/v1/models</code> result.</li>
+        <li>Remove unknown fields; the decoder intentionally uses a strict schema.</li>
+        <li>Confirm <code>protocols</code> includes <code>responses</code> and <code>reasoning</code> is present.</li>
+        <li>Restart the app after saving.</li>
+      </ol>
+      <div class="callout warn">
+        Never put API keys, headers, endpoints, request fragments, or secrets in this file. They are unsupported and may cause the document to be rejected.
+      </div>
+    </section>
+
+    <section>
+      <p class="eyebrow">Current Limitations</p>
+      <h2>Know what metadata does not do</h2>
+      <ul>
+        <li>A new request field or reasoning mode still requires a code update.</li>
+        <li>The picker currently shows the raw model ID instead of <code>display_name</code> for metadata-backed models.</li>
+        <li>Token metadata is validated but does not automatically become the runtime request cap.</li>
+        <li>The file applies to the configured OpenAI-compatible endpoint, including a custom proxy. Treat each entry as your assertion that that endpoint supports the declared request fields; an inaccurate entry can cause an upstream request failure.</li>
+        <li>This file applies only to the OpenAI API-provider catalog, not Anthropic or CLI providers.</li>
+      </ul>
+      <p class="muted">For provider facts, consult the <a href="https://developers.openai.com/api/docs/models">OpenAI model catalog</a> and the specific model’s documentation before adding an entry.</p>
+    </section>
+  </main>
+</body>
+</html>

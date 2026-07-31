@@ -1,0 +1,1015 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>API and CLI Model Modernization — Technical Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --surface: #ffffff;
+      --surface-soft: #f8fafc;
+      --text: #172033;
+      --muted: #5f6b7a;
+      --line: #dce3ec;
+      --brand: #3157d5;
+      --brand-soft: #eaf0ff;
+      --green: #19734b;
+      --green-soft: #e8f7ef;
+      --amber: #966200;
+      --amber-soft: #fff5d9;
+      --red: #a03a3a;
+      --red-soft: #fff0f0;
+      --purple: #6846b8;
+      --purple-soft: #f2edff;
+      --shadow: 0 12px 32px rgba(34, 47, 70, 0.08);
+      --radius: 16px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #111620;
+        --surface: #191f2b;
+        --surface-soft: #202735;
+        --text: #eef2f8;
+        --muted: #b5bfce;
+        --line: #323c4d;
+        --brand: #89a3ff;
+        --brand-soft: #222f59;
+        --green: #78d6a7;
+        --green-soft: #163d2d;
+        --amber: #f0c56c;
+        --amber-soft: #4b3917;
+        --red: #ff9b9b;
+        --red-soft: #4a2528;
+        --purple: #c1a7ff;
+        --purple-soft: #342753;
+        --shadow: none;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--brand); }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    code {
+      padding: 0.1rem 0.35rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-soft);
+      font-size: 0.9em;
+    }
+    pre {
+      overflow-x: auto;
+      margin: 1rem 0;
+      padding: 1rem 1.15rem;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #101827;
+      color: #eef4ff;
+      font-size: 0.86rem;
+      line-height: 1.55;
+    }
+    pre code { padding: 0; border: 0; background: transparent; color: inherit; }
+
+    .page { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 72px; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 44px;
+      border: 1px solid var(--line);
+      border-radius: 24px;
+      background: linear-gradient(135deg, var(--surface) 0%, var(--brand-soft) 100%);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 320px;
+      height: 320px;
+      right: -120px;
+      top: -160px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--brand) 12%, transparent);
+    }
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--brand);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    h1 { max-width: 900px; margin: 0; font-size: clamp(2rem, 4vw, 3.5rem); line-height: 1.08; letter-spacing: -0.035em; }
+    .subtitle { max-width: 850px; margin: 18px 0 0; color: var(--muted); font-size: 1.12rem; }
+    .meta, .badges { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 22px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: 0.83rem;
+      font-weight: 700;
+    }
+    .badge.good { border-color: color-mix(in srgb, var(--green) 35%, var(--line)); background: var(--green-soft); color: var(--green); }
+    .badge.warn { border-color: color-mix(in srgb, var(--amber) 35%, var(--line)); background: var(--amber-soft); color: var(--amber); }
+    .badge.info { border-color: color-mix(in srgb, var(--brand) 35%, var(--line)); background: var(--brand-soft); color: var(--brand); }
+
+    .toc {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 18px 0 28px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+    }
+    .toc a { padding: 5px 9px; border-radius: 8px; color: var(--muted); font-size: 0.88rem; font-weight: 700; text-decoration: none; }
+    .toc a:hover { background: var(--brand-soft); color: var(--brand); }
+
+    section {
+      margin-top: 24px;
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    section > :first-child { margin-top: 0; }
+    section > :last-child { margin-bottom: 0; }
+    h2 { margin: 0 0 16px; font-size: 1.65rem; line-height: 1.2; letter-spacing: -0.02em; }
+    h3 { margin: 24px 0 8px; font-size: 1.12rem; }
+    p { margin: 10px 0; }
+    ul, ol { padding-left: 1.4rem; }
+    li + li { margin-top: 0.35rem; }
+    .lead { color: var(--muted); font-size: 1.05rem; }
+    .muted, small { color: var(--muted); }
+
+    .grid { display: grid; gap: 16px; }
+    .grid.cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface-soft);
+    }
+    .card .value { margin: 4px 0; font-size: 1.35rem; font-weight: 850; letter-spacing: -0.02em; }
+    .card .label { color: var(--muted); font-size: 0.79rem; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
+    .card p { color: var(--muted); font-size: 0.91rem; }
+
+    .callout {
+      margin: 16px 0;
+      padding: 15px 17px;
+      border-left: 4px solid var(--brand);
+      border-radius: 4px 12px 12px 4px;
+      background: var(--brand-soft);
+    }
+    .callout.good { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.risk { border-left-color: var(--red); background: var(--red-soft); }
+    .callout strong { display: block; margin-bottom: 3px; }
+
+    .comparison, .validation, .inventory {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 14px;
+      font-size: 0.92rem;
+    }
+    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-soft); color: var(--muted); font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .status-pass { color: var(--green); font-weight: 800; }
+    .status-open { color: var(--amber); font-weight: 800; }
+    .status-no { color: var(--red); font-weight: 800; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(130px, 1fr));
+      gap: 10px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+    .flow-step {
+      position: relative;
+      min-height: 112px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface-soft);
+    }
+    .flow-step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      z-index: 2;
+      top: calc(50% - 13px);
+      right: -17px;
+      color: var(--brand);
+      font-size: 1.2rem;
+      font-weight: 900;
+    }
+    .flow-step b { display: block; margin-bottom: 5px; }
+    .flow-step span { color: var(--muted); font-size: 0.84rem; }
+
+    .timeline { position: relative; margin: 18px 0 0 11px; padding-left: 25px; border-left: 2px solid var(--line); }
+    .event { position: relative; padding: 0 0 24px; }
+    .event:last-child { padding-bottom: 0; }
+    .event::before {
+      content: "";
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      left: -32px;
+      top: 6px;
+      border: 3px solid var(--surface);
+      border-radius: 50%;
+      background: var(--brand);
+      box-shadow: 0 0 0 1px var(--line);
+    }
+    .event h3 { margin: 0 0 4px; }
+    .event p { margin: 5px 0; color: var(--muted); }
+
+    .step {
+      display: grid;
+      grid-template-columns: 44px 1fr;
+      gap: 14px;
+      padding: 18px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .step:last-child { border-bottom: 0; padding-bottom: 0; }
+    .step-number {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      background: var(--brand);
+      color: white;
+      font-weight: 850;
+    }
+    .step h3 { margin: 4px 0 6px; }
+    .step p { color: var(--muted); }
+
+    details { margin: 12px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-soft); }
+    summary { cursor: pointer; font-weight: 800; }
+    .legend { display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); font-size: 0.86rem; }
+    .dot { display: inline-block; width: 9px; height: 9px; margin-right: 5px; border-radius: 50%; background: var(--brand); }
+    .dot.good { background: var(--green); }
+    .dot.warn { background: var(--amber); }
+    .dot.risk { background: var(--red); }
+
+    footer { padding: 28px 10px 0; color: var(--muted); text-align: center; font-size: 0.84rem; }
+
+    @media (max-width: 900px) {
+      .grid.cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: 1fr; }
+      .flow-step { min-height: auto; }
+      .flow-step:not(:last-child)::after { content: "↓"; top: auto; right: calc(50% - 7px); bottom: -19px; }
+    }
+    @media (max-width: 640px) {
+      .page { width: min(100% - 18px, 1180px); padding-top: 9px; }
+      .hero, section { padding: 22px 18px; border-radius: 15px; }
+      .grid.cards, .grid.two { grid-template-columns: 1fr; }
+      .step { grid-template-columns: 36px 1fr; }
+      .comparison, .validation, .inventory { display: block; overflow-x: auto; }
+    }
+    @media print {
+      :root { --bg: #fff; --surface: #fff; --surface-soft: #f7f8fa; --text: #111; --muted: #444; --line: #d5d8dd; }
+      body { font-size: 10.5pt; }
+      .page { width: 100%; padding: 0; }
+      .hero, section { box-shadow: none; break-inside: avoid; }
+      .toc { display: none; }
+      a { color: inherit; text-decoration: none; }
+      pre { white-space: pre-wrap; word-break: break-word; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Technical Implementation Report</p>
+      <h1>API and CLI Model Modernization</h1>
+      <p class="subtitle">OpenAI API support for GPT-5.6 Sol Pro, pinned Claude Code CLI support for Opus 5, and dynamic model discovery for OpenAI and Anthropic API providers.</p>
+      <div class="meta">
+        <span class="badge info">Report date: 31 July 2026</span>
+        <span class="badge good">Implementation complete in working tree</span>
+        <span class="badge good">Live GPT-5.6 Sol Pro Oracle test passed</span>
+        <span class="badge">Private / personal branch</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Report navigation">
+      <a href="#summary">Summary</a>
+      <a href="#expect">What to expect</a>
+      <a href="#changes">What changed</a>
+      <a href="#architecture">How it works</a>
+      <a href="#decisions">Major decisions</a>
+      <a href="#review">Oracle review</a>
+      <a href="#validation">Validation</a>
+      <a href="#test-guide">Test guide</a>
+      <a href="#actions">Your actions</a>
+      <a href="#risks">Limitations</a>
+      <a href="#inventory">Files</a>
+      <a href="#evidence">Evidence</a>
+    </nav>
+
+    <section id="summary">
+      <p class="eyebrow">Executive Summary</p>
+      <h2>The primary blocker is resolved and live-tested</h2>
+      <p class="lead">The OpenAI API provider can now represent and run <strong>GPT-5.6 Sol in Pro mode</strong>. The model picker exposes mode and reasoning-effort choices, the selected configuration survives settings and job persistence, and the request layer sends the correct OpenAI fields. The user completed a credentialed Oracle run and confirmed that it used GPT-5.6 Sol Pro.</p>
+      <div class="callout good">
+        <strong>Plain-English outcome</strong>
+        You are no longer limited to a hard-coded model name with no way to express “Pro.” The app now treats the model, reasoning mode, reasoning effort, streaming capability, and service tier as related but independently preserved choices.
+      </div>
+      <div class="callout">
+        <strong>Clarification: GPT-5.6 Pro mode still has reasoning effort</strong>
+        OpenAI’s current GPT-5.6 guidance says <code>reasoning.mode</code> and <code>reasoning.effort</code> are independent. Pro does not force or ignore effort; omitting effort defaults to Medium. That differs from older standalone Pro model IDs, which often fixed or restricted effort. The picker now exposes the complete supported ladder—None, Low, Medium, High, XHigh, and Max—under both Standard and Pro.
+      </div>
+      <div class="callout">
+        <strong>Clarification: Flex changes processing priority, not the selected model quality</strong>
+        Choosing <strong>GPT-5.6 Sol (Flex) → Pro → effort</strong> still sends the same <code>gpt-5.6-sol</code> model, Pro mode, and selected effort; Flex is an independent <code>service_tier</code> override. OpenAI documents lower cost in exchange for slower responses and occasional <code>429 Resource Unavailable</code> errors. The user explicitly accepts that availability tradeoff for expensive Pro-powered Oracle runs.
+      </div>
+      <p>Claude Opus 5 is now supported through two deliberately separate paths. The original user goal is covered by a new pinned <strong>Claude Code CLI</strong> row that passes <code>claude-opus-5</code> to the CLI and exposes Low, Medium, High, Max, and XHigh. The separately requested Anthropic API work adds Opus 5 request handling and paginated <code>/v1/models</code> discovery.</p>
+      <p><strong>Important boundary:</strong> API discovery does not populate CLI providers. The Claude Code Opus 5 row was added independently to the CLI catalogs and provider plugin. OpenAI model visibility is combined with trusted local capability metadata; Anthropic API discovery preserves unknown IDs without claiming to infer every future request capability.</p>
+      <p><strong>User acceptance:</strong> the user confirmed a live GPT-5.6 Sol Pro Oracle response and confirmed that the Claude Code CLI picker now exposes Opus 5. The OpenAI smoke test initially continued using Fable 5 XHigh because the active OracleA preset still targeted Fable; updating <strong>Oracle Model Presets → OracleA → Models</strong> to GPT-5.6 Sol Pro made the intended provider take effect.</p>
+      <p><strong>Quick guide:</strong> <a href="../openai-model-metadata-quick-guide.html">OpenAI local model metadata in two minutes</a>.</p>
+
+      <div class="grid cards" style="margin-top:20px">
+        <article class="card">
+          <div class="label">Primary goal</div>
+          <div class="value">Supported</div>
+          <p>GPT-5.6 Sol with Standard or Pro reasoning mode and selectable effort.</p>
+        </article>
+        <article class="card">
+          <div class="label">Secondary goal</div>
+          <div class="value">Supported</div>
+          <p>Pinned Claude Code CLI Opus 5 with the exact model ID and all five documented effort choices.</p>
+        </article>
+        <article class="card">
+          <div class="label">Future OpenAI models</div>
+          <div class="value">Metadata path</div>
+          <p>Compatible models can be admitted through strict local metadata plus live API visibility.</p>
+        </article>
+        <article class="card">
+          <div class="label">Delivery state</div>
+          <div class="value">Uncommitted</div>
+          <p>The implementation and tests are in the private working tree; no push or release occurred.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="expect">
+      <p class="eyebrow">What You Can Expect</p>
+      <h2>Visible behavior after the change</h2>
+      <table class="comparison">
+        <thead>
+          <tr><th>Area</th><th>Before</th><th>After</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>OpenAI model picker</strong></td>
+            <td>GPT-5.6 Sol Pro could not be represented or selected.</td>
+            <td>GPT-5.6 Sol appears with Standard/Pro mode and the full None/Low/Medium/High/XHigh/Max effort ladder under each mode.</td>
+          </tr>
+          <tr>
+            <td><strong>OpenAI request</strong></td>
+            <td>No durable way to send the new reasoning mode.</td>
+            <td>Pro sends model <code>gpt-5.6-sol</code> with <code>reasoning.mode: "pro"</code>; Standard omits the mode field.</td>
+          </tr>
+          <tr>
+            <td><strong>Persistence</strong></td>
+            <td>A richer selection could be lost or flattened across settings and jobs.</td>
+            <td>The complete selection survives settings, presets, sessions, background jobs, and service-tier wrapping.</td>
+          </tr>
+          <tr>
+            <td><strong>Older Pro models</strong></td>
+            <td>Historical IDs such as <code>gpt-5.2-pro</code> were literal model IDs.</td>
+            <td>They remain unchanged; the new mode system does not reinterpret or break them.</td>
+          </tr>
+          <tr>
+            <td><strong>Claude Code CLI picker</strong></td>
+            <td>Only the rolling Opus alias and older pinned Opus versions were available.</td>
+            <td>A pinned Opus 5 group exposes Low/Medium/High/Max/XHigh and resolves to <code>--model claude-opus-5</code>. <strong>Opus Latest</strong> remains available as the rolling alias.</td>
+          </tr>
+          <tr>
+            <td><strong>Anthropic API picker</strong></td>
+            <td>Claude Opus 5 and future account-visible IDs depended on compiled or manual entries.</td>
+            <td><code>claude-opus-5</code> has reviewed adaptive-thinking behavior, while other visible IDs can arrive through paginated API discovery.</td>
+          </tr>
+          <tr>
+            <td><strong>OpenAI catalog refresh</strong></td>
+            <td>New API models depended primarily on compiled lists.</td>
+            <td>Live IDs are fetched, cached, and intersected with trusted capability metadata before becoming selectable.</td>
+          </tr>
+          <tr>
+            <td><strong>Anthropic catalog refresh</strong></td>
+            <td>The direct API provider depended on compiled and manually entered model IDs.</td>
+            <td>The app follows Anthropic’s paginated <code>/v1/models</code> response, deduplicates known IDs, and preserves unknown IDs as Anthropic API selections.</td>
+          </tr>
+          <tr>
+            <td><strong>Transient catalog failure</strong></td>
+            <td>A failed/empty refresh could leave discovery fragile.</td>
+            <td>The last-known-good catalog is retained instead of replacing it with an empty result.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout warn">
+        <strong>Account access still matters</strong>
+        The app can construct the right request, but the provider must expose the model to your API account. A model unavailable to your organization can still return an upstream access or “model not found” error.
+      </div>
+    </section>
+
+    <section id="changes">
+      <p class="eyebrow">Change Inventory by Workstream</p>
+      <h2>Three coordinated pieces</h2>
+      <p class="lead">These correspond to the three private workstreams discussed during planning. They are implemented in one current working tree; no actual pull requests were created.</p>
+
+      <div class="grid two">
+        <article class="card">
+          <div class="label">Workstream 1</div>
+          <div class="value">OpenAI configured selections</div>
+          <ul>
+            <li>Added GPT-5.6 Sol to API-provider selection.</li>
+            <li>Added Standard/Pro reasoning-mode choices.</li>
+            <li>Added None and Max so both modes expose the complete six-level GPT-5.6 effort ladder.</li>
+            <li>Preserved reasoning effort and service tier independently.</li>
+            <li>Added versioned raw-value codecs for durable compatibility.</li>
+            <li>Added a narrow Responses request planner and manual request path for fields not supported by the pinned SDK.</li>
+            <li>Preserved explicit output-token caps while omitting only synthesized defaults.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <div class="label">Workstream 2</div>
+          <div class="value">Claude Opus 5: CLI and API</div>
+          <ul>
+            <li>Added the exact <code>claude-opus-5</code> identifier to Agent Mode, the Claude Code picker, and the Claude-compatible provider plugin.</li>
+            <li>Preserved <strong>Opus Latest</strong> while adding a separately pinned Opus 5 group.</li>
+            <li>Exposed all five documented CLI efforts and verified exact CLI argument resolution.</li>
+            <li>Recorded Opus 5’s 1M context metadata.</li>
+            <li>For the Anthropic API path, added adaptive thinking and <code>output_config.effort</code>, defaulting to High.</li>
+            <li>Omitted incompatible sampling fields during adaptive thinking.</li>
+            <li>Preserved legacy thinking-suffix behavior.</li>
+            <li>Added cancellation propagation for the streaming bridge.</li>
+          </ul>
+        </article>
+      </div>
+
+      <article class="card" style="margin-top:16px">
+        <div class="label">Workstream 3</div>
+        <div class="value">API-provider catalogs and OpenAI metadata</div>
+        <ul>
+          <li>Fetches model visibility from OpenAI-compatible <code>/models</code> endpoints.</li>
+          <li>Admits a model only when its exact ID also has trusted capability metadata.</li>
+          <li>Fetches every page from Anthropic <code>/v1/models</code> with Anthropic-specific authentication and cursor guards.</li>
+          <li>Maps unknown Anthropic IDs to durable Anthropic API selections without feeding the Claude Code catalog.</li>
+          <li>Scopes cache entries by provider, normalized endpoint, and a SHA-256 API-key fingerprint.</li>
+          <li>Uses request coalescing, generation guards, and last-known-good state to avoid stale or destructive refreshes.</li>
+          <li>Accepts a strict local metadata file for future models that fit the supported protocol.</li>
+          <li>Rejects metadata that attempts to carry credentials, headers, endpoints, arbitrary request fragments, or recommendations.</li>
+        </ul>
+      </article>
+
+      <div class="callout">
+        <strong>Recommendation behavior also changed</strong>
+        The automatic recommendation path now selects GPT-5.6 Sol with Pro mode and High effort instead of treating the OpenAI API route as unavailable. High is an explicit quality-first recommendation; it is not implied by Pro mode, and other effort values remain meaningful.
+      </div>
+    </section>
+
+    <section id="architecture">
+      <p class="eyebrow">How It Works</p>
+      <h2>Live visibility plus trusted capabilities</h2>
+      <p>OpenAI’s <code>/v1/models</code> response mainly answers “can this account see the ID?” and provides only basic model information. It does <em>not</em> reliably describe reasoning modes, effort values, streaming behavior, token limits, or request protocol, so this implementation intersects OpenAI IDs with trusted metadata. Anthropic’s <code>/v1/models</code> response is richer; this implementation now consumes its IDs dynamically while continuing to use reviewed local request behavior for known special cases such as Opus 5.</p>
+
+      <div class="flow" aria-label="OpenAI model discovery and request flow">
+        <div class="flow-step"><b>1. Fetch</b><span>Read visible model IDs from the configured OpenAI-compatible <code>/models</code> endpoint.</span></div>
+        <div class="flow-step"><b>2. Match</b><span>Intersect exact IDs with built-in or strict local capability metadata.</span></div>
+        <div class="flow-step"><b>3. Pick</b><span>Show only supported combinations of model, mode, effort, and streaming.</span></div>
+        <div class="flow-step"><b>4. Persist</b><span>Encode the complete choice into a versioned provider-specific raw value.</span></div>
+        <div class="flow-step"><b>5. Send</b><span>Build the correct Responses request while keeping service tier and explicit token caps.</span></div>
+      </div>
+
+      <h3>Why a versioned raw value?</h3>
+      <p>The app already stores model selections as strings across settings, presets, sessions, and jobs. A provider-specific versioned codec extends that existing persistence seam without introducing a broad data migration.</p>
+      <pre><code>v1 built-in selection:
+openai_api_selection_v1__&lt;model&gt;__&lt;mode&gt;__&lt;effort&gt;
+
+v2 metadata-backed selection:
+openai_api_selection_v2__&lt;model&gt;__&lt;mode&gt;__&lt;effort&gt;__&lt;streaming|completion&gt;</code></pre>
+      <p>Version 2 was added after review because future metadata may allow <code>none</code> or <code>minimal</code> effort and may explicitly disable streaming. Both facts must survive persistence.</p>
+
+      <h3>Why not just update the SDK?</h3>
+      <p><strong>The original implementation checked the pinned APIs, but did not audit the latest stable SDK tags rigorously enough.</strong> A follow-up audit on 31 July 2026 found:</p>
+      <ul>
+        <li><strong>SwiftOpenAI:</strong> the repository pins commit <code>1211782</code> from 13 January 2026. The latest stable release found was 4.5.0 from 10 July 2026. Its <code>Reasoning</code> type still exposes effort and summary, but not <code>reasoning.mode</code>, so upgrading alone would not remove the Pro-mode request encoder. The upgrade is still worth evaluating separately for accumulated fixes.</li>
+        <li><strong>SwiftAnthropic:</strong> the repository’s pinned commit <code>b7d030c</code> is exactly release 2.2.2, the latest stable release found. Its source does not expose adaptive thinking, <code>output_config.effort</code>, or a Models API client.</li>
+      </ul>
+      <p>Therefore the narrow local request encoders remain necessary today. An SDK upgrade should be a separate compatibility change rather than being mixed into the model-support fix.</p>
+
+      <h3>What happens with the next model?</h3>
+      <table class="comparison">
+        <thead><tr><th>Future case</th><th>Expected handling</th></tr></thead>
+        <tbody>
+          <tr><td>New OpenAI API model; same known request schema</td><td><strong>Usually no rebuild:</strong> add trusted local metadata, then refresh/restart. The exact model ID must also appear in <code>/models</code>.</td></tr>
+          <tr><td>New OpenAI API reasoning mode, effort vocabulary, service-tier behavior, or protocol</td><td><strong>Code change required:</strong> the strict parser and request planner intentionally reject unknown semantics.</td></tr>
+          <tr><td>New Anthropic API model using existing request semantics</td><td><strong>Usually automatic:</strong> it appears after <code>/v1/models</code> discovery and is sent as its exact Anthropic model ID.</td></tr>
+          <tr><td>New Anthropic model requiring new thinking, effort, beta-header, or request semantics</td><td><strong>Code/metadata work may still be required:</strong> discovery proves visibility, not that every new capability can be inferred safely.</td></tr>
+          <tr><td>New Claude Code model exposed through the rolling family alias</td><td><strong>No rebuild:</strong> selecting <code>opus</code> lets Claude Code move the alias when Anthropic updates it.</td></tr>
+          <tr><td>New pinned Claude Code model, such as a future Opus 5.1</td><td><strong>Not yet automatic:</strong> an explicit row still needs a static update unless a CLI-specific dynamic catalog or user-entered exact-model escape hatch is added.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="decisions">
+      <p class="eyebrow">Major Turns and Decisions</p>
+      <h2>How the implementation direction was chosen</h2>
+      <div class="timeline">
+        <article class="event">
+          <h3>1. The problem was reframed from “missing model” to “missing model configuration”</h3>
+          <p>Adding one static string would not represent GPT-5.6 Sol’s mode, reasoning effort, streaming capability, and service tier. The implementation therefore models a configured selection rather than only a model ID.</p>
+        </article>
+        <article class="event">
+          <h3>2. Two planning Oracles challenged the persistence design</h3>
+          <p>One favored provider-specific raw-string codecs; the other initially favored structured settings and protocol changes. Cross-critique converged on a versioned raw representation because it fits the application’s existing storage contracts and avoids a settings/session migration.</p>
+        </article>
+        <article class="event">
+          <h3>3. SDK limitations changed the transport plan</h3>
+          <p>The pinned dependencies could not encode the new OpenAI and Anthropic fields. The team chose focused URL request planners instead of dependency forks, preserving the existing SDK boundary where it remains useful.</p>
+        </article>
+        <article class="event">
+          <h3>4. Implementation was split across three worker lanes</h3>
+          <p>OpenAI/persistence/UI, Anthropic request encoding, and catalog/metadata were developed as bounded non-overlapping tasks. The root session then integrated shared model behavior, settings, recommendations, and tests.</p>
+        </article>
+        <article class="event">
+          <h3>5. OpenAI dynamic fetching was deliberately made conservative</h3>
+          <p>The Pi-style idea of discovering provider models dynamically was retained for OpenAI, but OpenAI’s live model IDs are treated as visibility—not capability truth. Strict metadata prevents the app from guessing request semantics for an unknown model. Anthropic’s richer Models API received its own adapter because its authentication, pagination, and model namespace differ.</p>
+        </article>
+        <article class="event">
+          <h3>6. Review exposed persistence and request-edge cases</h3>
+          <p>Oracle review found that synthesized token defaults, non-streaming selections, minimal efforts, Anthropic sampling, and stream cancellation needed refinement. Those high-priority issues were corrected before this report.</p>
+        </article>
+        <article class="event">
+          <h3>7. Follow-up documentation audit became implemented scope</h3>
+          <p>OpenAI confirmed that GPT-5.6 Pro mode and effort are independent, so None and Max were added under both modes. Anthropic’s documented Models API then became a dedicated paginated discovery lane rather than a future note.</p>
+        </article>
+        <article class="event">
+          <h3>8. A nested runtime probe separated two confusing test failures</h3>
+          <p>The API-key restart loop came from debug secure-storage policy, not provider validation. The missing explicit Claude Code “Opus 5” row came from a separate static CLI catalog; Anthropic API discovery cannot populate it. Keeping those boundaries separate avoided solving the wrong layer.</p>
+        </article>
+        <article class="event">
+          <h3>9. The original Opus goal was clarified as CLI, not API</h3>
+          <p>The initial implementation spent effort on Anthropic API Opus 5 support. After the user clarified the original intent, a dedicated worker added the pinned model to every Claude Code catalog surface and verified that runtime selection passes the exact ID to the CLI. The Anthropic API work remains because paginated API discovery was also explicitly requested as a separate capability.</p>
+        </article>
+        <article class="event">
+          <h3>10. Live acceptance exposed an Oracle preset-routing distinction</h3>
+          <p>The first live OpenAI attempt still used Fable 5 XHigh because OracleA remained configured for Fable. After the user changed <strong>Oracle Model Presets → OracleA → Models</strong> to GPT-5.6 Sol Pro, the Oracle run used the intended OpenAI API model successfully. This proved the provider implementation while also revealing that explicit per-call native <code>ask_oracle</code> model targeting remains a separate routing limitation.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="review">
+      <p class="eyebrow">Independent Review</p>
+      <h2>Dual-Oracle findings and fixes</h2>
+      <p class="lead">Both requested Oracle presets completed review. Oracle B initially failed because workspace credits were exhausted; after the user asked for a retry and credits were replenished, the exact requested preset completed successfully.</p>
+
+      <div class="grid two">
+        <article class="card">
+          <div class="label">Oracle A</div>
+          <div class="value">Request correctness review</div>
+          <p><code>61D024A4-CCFB-4C9C-A614-CC65E0A1864C</code></p>
+          <ul>
+            <li><strong>Fixed:</strong> synthesized OpenAI output-token defaults were being sent when the API should choose.</li>
+            <li><strong>Fixed:</strong> Anthropic non-thinking streaming sampling behavior had regressed.</li>
+            <li><strong>Fixed:</strong> legacy thinking could produce an invalid token budget relationship.</li>
+            <li><strong>Fixed:</strong> SSE handling and catalog invalid-scope behavior were hardened.</li>
+            <li><strong>Fixed:</strong> configured future model plans no longer assume one hard-coded base.</li>
+            <li><strong>Fixed:</strong> a huge metadata integer could reach a trapping Swift <code>Int</code> conversion; the parser now rejects that boundary safely.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <div class="label">Oracle B</div>
+          <div class="value">Persistence and runtime review</div>
+          <p><code>7CDD523E-1D7C-47EA-98FE-D5FEA24D2D8C</code></p>
+          <ul>
+            <li><strong>Fixed:</strong> explicit caller/provider token caps are preserved; only synthesized defaults are omitted.</li>
+            <li><strong>Fixed:</strong> metadata efforts such as <code>none</code>/<code>minimal</code> survive v2 persistence.</li>
+            <li><strong>Fixed:</strong> a metadata model marked non-streaming remains non-streaming after reload.</li>
+            <li><strong>Fixed:</strong> cancelling an Anthropic stream cancels its bridge task.</li>
+            <li><strong>Fixed:</strong> rotating or deleting OpenAI/Anthropic credentials now cancels refreshes, clears stale models, invalidates the correct cache scope, and prevents an old key’s catalog from being published under a new key.</li>
+            <li><strong>Fixed:</strong> Anthropic discovery is cancelled during view-model teardown; OpenAI scope changes immediately remove stale picker entries.</li>
+            <li><strong>Decision retained:</strong> trusted local OpenAI metadata intentionally applies to the configured OpenAI-compatible endpoint so proxies remain usable. The exact-ID intersection and user-authored metadata file are the trust boundary; an incompatible endpoint can reject the request but cannot inject metadata.</li>
+            <li><strong>Remaining polish:</strong> trusted metadata display names are parsed but the picker currently shows the raw model ID.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="callout good">
+        <strong>Review result</strong>
+        All priority correctness findings recorded in the final reviews were addressed or resolved as an explicit policy decision. The remaining display-name item is cosmetic and does not block OpenAI API GPT-5.6 Sol Pro or Claude Code CLI Opus 5 usage.
+      </div>
+    </section>
+
+    <section id="validation">
+      <p class="eyebrow">Validation and Testing</p>
+      <h2>What was proven locally</h2>
+      <div class="legend">
+        <span><i class="dot good"></i>Passed</span>
+        <span><i class="dot warn"></i>Incomplete / environment-limited</span>
+        <span><i class="dot risk"></i>Not run</span>
+      </div>
+      <table class="validation">
+        <thead><tr><th>Check</th><th>Result</th><th>What it covers</th></tr></thead>
+        <tbody>
+          <tr><td><code>make dev-test FILTER=OpenAIConfiguredModelSelectionTests</code></td><td class="status-pass">10 passed</td><td>Codec round trips, the full effort ladder, picker exposure, persistence, service-tier composition, wire body, explicit token caps, and historical Pro IDs.</td></tr>
+          <tr><td><code>make dev-test FILTER=AnthropicRequestPlanTests</code></td><td class="status-pass">8 passed</td><td>Opus 5 ID, adaptive effort, defaults, legacy suffixes, token budgets, fields, sampling, headers, and endpoint.</td></tr>
+          <tr><td><code>make dev-test FILTER=AnthropicAPIModelsClientTests</code></td><td class="status-pass">10 passed</td><td>Restored and rotated-key integration, deletion cleanup, Anthropic headers, pagination/caps, errors, deduplication, unknown-ID persistence, and CLI-lane isolation.</td></tr>
+          <tr><td><code>make dev-test FILTER=APIModelCatalogTests</code></td><td class="status-pass">5 passed</td><td>Discovery, cache isolation, last-known-good behavior, and refresh safety.</td></tr>
+          <tr><td><code>make dev-test FILTER=OpenAIAPIModelMetadataTests</code></td><td class="status-pass">6 passed</td><td>Strict metadata acceptance including Max, rejection of unknown effort vocabulary, and safe rejection of out-of-range integers.</td></tr>
+          <tr><td><code>make dev-test FILTER=AutoRecommendationEngineScopedSettingsTests</code></td><td class="status-pass">7 passed</td><td>Recommendation behavior and scoped setting propagation.</td></tr>
+          <tr><td><code>make dev-test FILTER=ModelPickerStringOrderingTests</code></td><td class="status-pass">21 passed</td><td>Claude Code Opus 5 picker exposure, all five efforts, 1M context metadata, and exact CLI model-argument resolution.</td></tr>
+          <tr><td><code>make dev-provider-test</code></td><td class="status-pass">7 passed</td><td>The Claude-compatible provider plugin exports Opus 5 and its expanded effort variants consistently.</td></tr>
+          <tr><td><code>make dev-lint</code></td><td class="status-pass">Passed</td><td>Repository lint/style checks.</td></tr>
+          <tr><td><code>make dev-swift-build PRODUCT=RepoPrompt</code></td><td class="status-pass">Passed</td><td>RepoPrompt product compilation.</td></tr>
+          <tr><td><code>make dev-test-list</code></td><td class="status-pass">Passed</td><td>Test discovery and manifest consistency.</td></tr>
+          <tr><td><code>git diff --check</code></td><td class="status-pass">Passed</td><td>Whitespace and patch-integrity issues.</td></tr>
+          <tr><td><code>make guardrails</code></td><td class="status-pass">Passed</td><td>The sandboxed attempt was blocked by SwiftPM manifest inspection; the approved unsandboxed rerun passed source layout, contributor allowlists, dependency notices, scanner checksums, and agent-context checks.</td></tr>
+          <tr><td>Live OpenAI GPT-5.6 Sol Pro Oracle request</td><td class="status-pass">Passed — user-run</td><td>The user configured OracleA for GPT-5.6 Sol Pro and confirmed that a credentialed Oracle request used the intended model and mode.</td></tr>
+          <tr><td>Claude Code CLI Opus 5 picker walkthrough</td><td class="status-pass">Passed — user-run</td><td>The user confirmed that Opus 5 is visible in the Claude Code CLI model dropdown. An actual Opus 5 response was not reported.</td></tr>
+          <tr><td>Anthropic API request</td><td class="status-no">Not run</td><td>The separate direct Anthropic API path still requires optional credentialed validation if it will be used.</td></tr>
+          <tr><td>Visible app UI walkthrough</td><td class="status-open">Partial — user-run</td><td>The user exercised OpenAI settings, OracleA preset selection, a live Oracle request, and the Claude Code Opus 5 picker. Other UI paths were not exhaustively walked.</td></tr>
+          <tr><td>Full test suite</td><td class="status-no">Not recorded</td><td>The smallest focused suites and build/lint checks were used; this report does not claim a complete repository test run.</td></tr>
+        </tbody>
+      </table>
+      <p class="muted"><strong>Total focused evidence:</strong> 74 passing tests across seven focused app suites plus the provider package. That count includes existing and modified tests in the named suites; it should not be read as “74 entirely new tests.”</p>
+    </section>
+
+    <section id="test-guide">
+      <p class="eyebrow">Step-by-Step Test Guide</p>
+      <h2>How you can see the effect</h2>
+
+      <div class="step">
+        <div class="step-number">1</div>
+        <div>
+          <h3>Run the deterministic checks</h3>
+          <p>These do not require API credentials and are the best way to prove the exact request shapes and persistence behavior.</p>
+          <pre><code>make dev-lint
+make dev-swift-build PRODUCT=RepoPrompt
+make dev-test FILTER=OpenAIConfiguredModelSelectionTests
+make dev-test FILTER=AnthropicRequestPlanTests
+make dev-test FILTER=AnthropicAPIModelsClientTests
+make dev-test FILTER=APIModelCatalogTests
+make dev-test FILTER=OpenAIAPIModelMetadataTests
+make dev-test FILTER=AutoRecommendationEngineScopedSettingsTests
+make dev-test FILTER=ModelPickerStringOrderingTests
+make dev-provider-test</code></pre>
+          <p><strong>Expected:</strong> build and lint succeed; every focused suite reports zero failures. See the validation table above for the final counts from this working tree.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">2</div>
+        <div>
+          <h3>Choose a launch route, then configure OpenAI</h3>
+          <p>A normal ad-hoc or auto-detected <code>make dev-run</code> may intentionally use process-local secure storage, so an API key disappears when the app exits. Saving a valid key is designed to refresh provider models live; discovery itself should not require a restart.</p>
+          <p>If you possess an Apple Development identity for the repository’s expected team, use the signed debug route:</p>
+          <pre><code>SIGN_IDENTITY="Apple Development: Your Name (648A27MST5)" \
+DEBUG_SECURE_STORAGE_BACKEND=keychain \
+make dev-run</code></pre>
+          <p>If you do not have that team identity, use the supported persistent local-production install:</p>
+          <pre><code>CONFIRM_LOCAL_PRODUCTION_INSTALL=1 make dev-install-local-production</code></pre>
+          <p>The local-production command builds the current checkout under <code>/Applications</code> with a dedicated certificate trusted only on your Mac. It is local-only and not for redistribution. If you ask an agent to launch, relaunch, stop, or install a visible app, the repository rules require fresh approval at that action boundary.</p>
+          <ol>
+            <li>Open <strong>Settings → API Providers → OpenAI</strong>, configure the key and intended endpoint, then save/validate it.</li>
+            <li>Let the live model refresh complete; do not restart merely to refresh the list.</li>
+            <li>For the general planning choice, open <strong>Settings → Agent Models → Oracle Model</strong>. The equivalent Agent Mode shortcut is the bottom-bar brain button <strong>Models → Oracle / Plan Model</strong>.</li>
+            <li>If the active MCP route uses a named preset, also open <strong>Settings → Oracle Model Presets → OracleA → Models</strong>. A preset left on Fable continues to use Fable even when GPT-5.6 is available elsewhere.</li>
+            <li>Under OpenAI, confirm <strong>GPT-5.6 Sol</strong>, then confirm <strong>Standard</strong>/<strong>Pro</strong> and None/Low/Medium/High/XHigh/Max.</li>
+            <li>Select <strong>GPT-5.6 Sol → Pro → Medium</strong> for Pro with the API’s default effort, or intentionally choose another effort.</li>
+            <li>Choose <strong>GPT-5.6 Sol (Flex)</strong> only when slower, lower-priority processing and occasional capacity errors are acceptable; this does not select a lower-quality model.</li>
+            <li>Save, close the settings view, and reopen it.</li>
+          </ol>
+          <p><strong>Expected:</strong> the same configured model, mode, effort, and service-tier choice remain selected after reopening.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">3</div>
+        <div>
+          <h3>Run a small OpenAI smoke prompt</h3>
+          <ol>
+            <li>Start or continue an Agent Mode session whose Oracle route resolves to the preset updated in Step 2.</li>
+            <li>Invoke <code>ask_oracle</code> with a small, inexpensive prompt such as “Reply with exactly: Sol Pro is connected.”</li>
+            <li>Inspect the selected preset/model shown by the Oracle result; if it still reports Fable, update the preset actually being resolved rather than only the general model picker.</li>
+            <li>If using Flex, accept that a capacity-related HTTP error can occur and retry later or switch the service tier to Auto/Default.</li>
+          </ol>
+          <p><strong>Expected:</strong> a normal response using <code>gpt-5.6-sol</code>, mode <code>pro</code>, and the chosen effort. <strong>User result: passed</strong> after OracleA was updated from Fable 5 XHigh to GPT-5.6 Sol Pro.</p>
+          <div class="callout warn">
+            <strong>Cost and privacy note</strong>
+            A live request may be billable and sends prompt content to the configured provider. Use a minimal non-sensitive prompt.
+          </div>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">4</div>
+        <div>
+          <h3>Verify persistence across an app restart</h3>
+          <ol>
+            <li>Use one of the persistent signing/install routes from Step 2.</li>
+            <li>Keep GPT-5.6 Sol Pro Max selected.</li>
+            <li>Quit and reopen the app.</li>
+            <li>Return to Settings and inspect the provider selection.</li>
+            <li>If you use saved presets or background jobs, create one and reopen it.</li>
+          </ol>
+          <p><strong>Expected:</strong> the API key, model, Pro mode, Max effort, service tier, and streaming capability remain intact. With an ephemeral debug build, key loss across process exit is expected and this restart check is not meaningful.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">5</div>
+        <div>
+          <h3>Verify pinned Opus 5 through Claude Code CLI</h3>
+          <ol>
+            <li>Confirm a current Claude Code CLI is installed and your Claude Code account is connected.</li>
+            <li>Choose <strong>CLI → Claude Code</strong> in Agent Mode.</li>
+            <li>Open the model picker and confirm a separate <strong>Opus 5</strong> group appears alongside <strong>Opus Latest</strong>.</li>
+            <li>Choose an effort such as High or XHigh and send a small prompt.</li>
+          </ol>
+          <p><strong>Expected:</strong> the selection resolves to the exact CLI model argument <code>claude-opus-5</code> and the selected effort. Access still depends on the installed Claude Code version and your account entitlement. If Agent Mode permission level is set to Auto, the pinned model follows the existing unsupported-Auto fallback; Auto remains reserved for the rolling <code>opus</code>/<code>opus[1m]</code> aliases.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">6</div>
+        <div>
+          <h3>Optional: configure the Anthropic API provider</h3>
+          <ol>
+            <li>Add or select your Anthropic API credentials.</li>
+            <li>Open the Anthropic API model picker and confirm <strong>Claude Opus 5</strong>.</li>
+            <li>Confirm other IDs visible to your Anthropic account appear after the live refresh; newly discovered unknown IDs display as Anthropic API models.</li>
+            <li>Select one and send a small prompt.</li>
+          </ol>
+          <p><strong>Expected:</strong> known Opus 5 uses <code>claude-opus-5</code>, adaptive thinking, and High effort by default. This is separate from the Claude Code CLI test above; the current API-provider UI does not expose a separate Anthropic effort picker.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">7</div>
+        <div>
+          <h3>Exercise catalog last-known-good behavior</h3>
+          <ol>
+            <li>With valid OpenAI and Anthropic configurations and a network connection, refresh or reopen each API-provider model list.</li>
+            <li>Confirm visible supported models load.</li>
+            <li>Temporarily disconnect networking or use an unreachable test endpoint, then refresh/reopen.</li>
+          </ol>
+          <p><strong>Expected:</strong> a transient failure does not replace a previously valid cached catalog with an empty list. Anthropic pagination also follows <code>last_id</code> through every page instead of silently accepting only the default first 20 entries.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">8</div>
+        <div>
+          <h3>Optional: prove the no-rebuild metadata path</h3>
+          <p>For a concise copy/paste walkthrough, open the standalone <a href="../openai-model-metadata-quick-guide.html"><strong>OpenAI Local Model Metadata — Two-Minute Guide</strong></a>.</p>
+          <p>Create this local file:</p>
+          <pre><code>~/Library/Application Support/RepoPrompt CE/ModelCatalog/openai-model-metadata-v1.json</code></pre>
+          <p>Use a strict entry like the example below, replacing the ID and capabilities with accurate provider information:</p>
+          <pre><code>{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "gpt-future-example",
+      "display_name": "GPT Future Example",
+      "protocols": ["responses"],
+      "reasoning": {
+        "modes": ["standard", "pro"],
+        "efforts": ["minimal", "low", "medium", "high"]
+      },
+      "streaming": false,
+      "tokens": {
+        "context_window_tokens": 200000,
+        "max_output_tokens": 32000
+      }
+    }
+  ]
+}</code></pre>
+          <ol>
+            <li>Ensure the configured provider’s <code>/models</code> response contains the exact same ID.</li>
+            <li>Refresh the catalog or restart the app.</li>
+            <li>Open the picker and select the model.</li>
+          </ol>
+          <p><strong>Expected:</strong> the model appears only when both live visibility and trusted metadata agree. A model marked <code>streaming: false</code> remains non-streaming after persistence.</p>
+          <div class="callout warn">
+            <strong>Current metadata caveats</strong>
+            The picker currently shows the raw model ID instead of the metadata <code>display_name</code>. Token metadata is validated, but the runtime does not yet automatically use the metadata token ceiling as its request cap; explicit caller/provider caps are preserved and otherwise the API default is allowed to apply.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="actions">
+      <p class="eyebrow">Action Items for You</p>
+      <h2>The primary route is ready; only optional checks remain</h2>
+      <div class="grid two">
+        <article class="card">
+          <div class="label">Recommended now</div>
+          <div class="value">Optional follow-through</div>
+          <ol>
+            <li><strong>Optionally send one Claude Code CLI prompt with pinned Opus 5.</strong> Picker exposure is confirmed; an actual response would additionally prove installed-CLI and account entitlement.</li>
+            <li><strong>Optionally run an Anthropic API smoke test</strong> if you intend to use that separate direct-provider path.</li>
+            <li><strong>Choose persistent local signing/storage only if restart persistence matters.</strong> The working <code>make dev-run</code> process is sufficient for ordinary live validation.</li>
+          </ol>
+        </article>
+        <article class="card">
+          <div class="label">Important follow-ups</div>
+          <div class="value">Choose next scope</div>
+          <ul>
+            <li>Add an Anthropic effort picker instead of always defaulting Opus 5 to High.</li>
+            <li>Decide how much of Anthropic’s returned capability metadata should replace or augment reviewed local request behavior.</li>
+            <li>Evaluate SwiftOpenAI 4.5.0 separately; it does not remove the need for <code>reasoning.mode</code> encoding.</li>
+            <li>Propagate trusted metadata <code>display_name</code> and define token-limit precedence.</li>
+            <li>Add a CLI-specific dynamic catalog or user-entered exact-model escape hatch so a future pinned Opus version can be selected without rebuilding. The rolling <code>opus</code> alias already updates without rebuilding.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="callout">
+        <strong>If you decide to commit the private branch</strong>
+        Review and stage only intended source/test/report files, then run <code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code>. No commit, push, branch deletion, release, or other GitHub-visible action was performed in this session.
+      </div>
+    </section>
+
+    <section id="risks">
+      <p class="eyebrow">Risks, Limitations, and Technical Debt</p>
+      <h2>What this change intentionally does not solve</h2>
+      <table class="comparison">
+        <thead><tr><th>Item</th><th>Impact</th><th>Recommended response</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Credentialed coverage is partial</strong></td><td>The OpenAI GPT-5.6 Sol Pro Oracle route passed a live user-run test, but the direct Anthropic API route and an actual pinned Opus 5 CLI response were not reported.</td><td>Run those optional checks only if you plan to rely on those paths.</td></tr>
+          <tr><td><strong>Native <code>ask_oracle</code> cannot explicitly target a preset</strong></td><td>The Agent Mode tool schema currently omits/rejects <code>model</code>, and its policy does not expose unrestricted <code>oracle_utils</code>. The user therefore had to update the OracleA preset from Fable 5 XHigh to GPT-5.6 Sol Pro.</td><td>Treat this as a separate Oracle-routing follow-up: add safe model targeting and models-only discovery without broadening cross-tab session visibility.</td></tr>
+          <tr><td><strong>Direct API providers are not autonomous Agent Mode runtimes</strong></td><td>OpenAI and Anthropic API models can power built-in Chat and Oracle/Plan work, but they do not appear in the prompt-adjacent CLI/ACP execution picker.</td><td>Use GPT-5.6 Sol Pro through Oracle as validated here; native API-backed Agent Mode execution would require a separate runtime implementation.</td></tr>
+          <tr><td><strong>No general Claude Code dynamic catalog yet</strong></td><td>Pinned Opus 5 is now present, and <code>opus</code> remains a rolling no-rebuild alias. A future exact Opus 5.1 row would still require a static update unless the user can enter the ID or RepoPrompt gains a CLI-specific remote catalog.</td><td>Use <strong>Opus Latest</strong> for automatic family upgrades; add a typed exact-model escape hatch before building a larger remote-catalog service.</td></tr>
+          <tr><td><strong>Pinned Opus 5 and Auto permission mode</strong></td><td>The existing Claude Code policy enables Auto only for <code>opus</code> and <code>opus[1m]</code>. Pinned Opus 5 uses the configured unsupported-Auto fallback.</td><td>Use an explicit supported permission mode, or select the rolling alias when Auto behavior is required.</td></tr>
+          <tr><td><strong>Anthropic discovery currently consumes IDs, not all capabilities</strong></td><td>Unknown models become selectable, but truly new request semantics may not be inferred automatically.</td><td>Add explicit capability-to-request policy only after defining safe precedence and fallbacks.</td></tr>
+          <tr><td><strong>Ephemeral debug secure storage</strong></td><td>API keys disappear after process exit under the ordinary in-memory debug route.</td><td>Use the matching-team Keychain debug route or the local-production installer for restart testing.</td></tr>
+          <tr><td><strong>Strict metadata is intentionally conservative</strong></td><td>A genuinely new model stays hidden until accurate capabilities are supplied.</td><td>Add trusted metadata rather than guessing from the model name.</td></tr>
+          <tr><td><strong>Local metadata applies to compatible endpoints</strong></td><td>A user-configured proxy that advertises an exact model ID receives the locally declared OpenAI-compatible fields. If it does not actually implement them, the upstream request can fail.</td><td>Treat the local file as a capability assertion for the configured endpoint; remove inaccurate entries or use the official endpoint.</td></tr>
+          <tr><td><strong>Display name not propagated</strong></td><td>Metadata-backed future models show a raw ID in the picker.</td><td>Optional UI polish; no request correctness impact.</td></tr>
+          <tr><td><strong>Metadata token limits not automatically consumed</strong></td><td>The request planner preserves explicit limits but otherwise lets the provider decide.</td><td>Define precedence before connecting metadata token ceilings.</td></tr>
+          <tr><td><strong>Manual request transport has maintenance cost</strong></td><td>Provider SSE/protocol evolution may require local parser updates.</td><td>Keep focused wire/SSE tests and reevaluate when pinned SDKs catch up.</td></tr>
+          <tr><td><strong>No performance benchmark</strong></td><td>Catalog caching behavior is tested, but no latency/memory claim is supported.</td><td>Measure only if model refresh becomes operationally noticeable.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="inventory">
+      <p class="eyebrow">Source and Test Inventory</p>
+      <h2>Files involved before this report was added</h2>
+      <p class="lead">The implementation touched 26 source/test files: 15 existing files were modified and 11 files were added in the working tree.</p>
+      <table class="inventory">
+        <thead><tr><th>Area</th><th>Files</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>OpenAI runtime</strong></td>
+            <td><code>AIModel.swift</code><br><code>OpenAIProvider.swift</code><br><code>OpenAIResponseRequestPlan.swift</code></td>
+            <td>Configured selections, streaming capability, request planning, token behavior, and transport.</td>
+          </tr>
+          <tr>
+            <td><strong>OpenAI catalog</strong></td>
+            <td><code>APIModelCatalog.swift</code><br><code>OpenAIAPIModelMetadata.swift</code></td>
+            <td>Dynamic visibility, caching, strict local metadata, and capability matching.</td>
+          </tr>
+          <tr>
+            <td><strong>Anthropic runtime</strong></td>
+            <td><code>AnthropicProvider.swift</code><br><code>AnthropicModelConfiguration.swift</code><br><code>AnthropicRequestPlan.swift</code><br><code>AnthropicAPIModelsClient.swift</code></td>
+            <td>Opus 5 identity, adaptive-thinking configuration, request encoding, streaming, and paginated model discovery.</td>
+          </tr>
+          <tr>
+            <td><strong>Settings and picker UI</strong></td>
+            <td><code>APISettingsViewModel.swift</code><br><code>AIModelDropDown.swift</code><br><code>OptimizedModelPicker.swift</code></td>
+            <td>Catalog-backed choices and hierarchical model/mode/effort selection.</td>
+          </tr>
+          <tr>
+            <td><strong>Recommendations</strong></td>
+            <td><code>AutoRecommendationEngine.swift</code><br><code>RecommendationTypes.swift</code></td>
+            <td>Recommend GPT-5.6 Sol Pro High through the OpenAI API provider.</td>
+          </tr>
+          <tr>
+            <td><strong>Claude Code CLI catalog</strong></td>
+            <td><code>AgentModel.swift</code><br><code>ClaudeCodeAIModelCatalog.swift</code><br><code>ClaudeCompatibleModelCatalogAdapter.swift</code><br><code>ClaudeCompatibleProviderPlugin.swift</code></td>
+            <td>Pinned Opus 5 identity, menu exposure, effort capabilities, context metadata, and provider-plugin export.</td>
+          </tr>
+          <tr>
+            <td><strong>Tests</strong></td>
+            <td><code>OpenAIConfiguredModelSelectionTests.swift</code><br><code>OpenAIAPIModelMetadataTests.swift</code><br><code>APIModelCatalogTests.swift</code><br><code>AnthropicRequestPlanTests.swift</code><br><code>AnthropicAPIModelsClientTests.swift</code><br><code>ModelPickerStringOrderingTests.swift</code><br><code>ClaudeCompatibleRuntimeSupportTests.swift</code><br><code>AutoRecommendationEngineScopedSettingsTests.swift</code></td>
+            <td>Regression coverage for selection, wire shape, metadata, cache behavior, credential rotation, Anthropic requests/discovery, CLI Opus 5 resolution, and recommendations.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <details>
+        <summary>Full repository-relative paths</summary>
+        <ul>
+          <li><code>Sources/RepoPrompt/Features/AgentMode/Recommendations/AutoRecommendationEngine.swift</code></li>
+          <li><code>Sources/RepoPrompt/Features/AgentMode/Recommendations/RecommendationTypes.swift</code></li>
+          <li><code>Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModel.swift</code></li>
+          <li><code>Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/ClaudeCompatibleModelCatalogAdapter.swift</code></li>
+          <li><code>Sources/RepoPrompt/Features/Settings/ViewModels/APISettingsViewModel.swift</code></li>
+          <li><code>Sources/RepoPrompt/Features/Settings/Views/AIModelDropDown.swift</code></li>
+          <li><code>Sources/RepoPrompt/Features/Settings/Views/OptimizedModelPicker.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/AIModel.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/APIModelCatalog.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/AnthropicAPIModelsClient.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ClaudeCodeAIModelCatalog.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/OpenAIAPIModelMetadata.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/AnthropicProvider.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/Anthropic/AnthropicModelConfiguration.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/Anthropic/AnthropicRequestPlan.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIProvider.swift</code></li>
+          <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIResponseRequestPlan.swift</code></li>
+          <li><code>Tests/RepoPromptTests/AI/APIModelCatalogTests.swift</code></li>
+          <li><code>Tests/RepoPromptTests/AI/AnthropicAPIModelsClientTests.swift</code></li>
+          <li><code>Tests/RepoPromptTests/AI/AnthropicRequestPlanTests.swift</code></li>
+          <li><code>Tests/RepoPromptTests/AI/OpenAIAPIModelMetadataTests.swift</code></li>
+          <li><code>Tests/RepoPromptTests/AI/OpenAIConfiguredModelSelectionTests.swift</code></li>
+          <li><code>Tests/RepoPromptTests/AI/ModelPickerStringOrderingTests.swift</code></li>
+          <li><code>Tests/RepoPromptTests/AgentMode/AutoRecommendationEngineScopedSettingsTests.swift</code></li>
+          <li><code>Packages/RepoPromptAgentProviders/Sources/RepoPromptClaudeCompatibleProvider/ClaudeCompatibleProviderPlugin.swift</code></li>
+          <li><code>Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests/Runtime/ClaudeCompatibleRuntimeSupportTests.swift</code></li>
+        </ul>
+      </details>
+    </section>
+
+    <section id="metrics">
+      <p class="eyebrow">Metrics</p>
+      <h2>Change size and evidence count</h2>
+      <div class="grid cards">
+        <article class="card"><div class="label">Implementation files</div><div class="value">26</div><p>15 modified and 11 new source/test files before this HTML report.</p></article>
+        <article class="card"><div class="label">Approximate line delta</div><div class="value">+3,360 / −261</div><p>672 tracked insertions plus 2,688 lines in 11 new source/test files.</p></article>
+        <article class="card"><div class="label">Focused tests</div><div class="value">74 passing</div><p>Across seven app suites and the provider package.</p></article>
+        <article class="card"><div class="label">Dependency/schema changes</div><div class="value">0 / 0</div><p>No package repin and no settings/database migration.</p></article>
+      </div>
+      <p class="muted">No implementation duration, runtime speedup, memory reduction, or API cost metric is claimed because those measurements were not captured.</p>
+    </section>
+
+    <section id="evidence">
+      <p class="eyebrow">Evidence and Limitations</p>
+      <h2>How to read this report</h2>
+      <div class="grid two">
+        <article class="card">
+          <div class="label">Observed</div>
+          <div class="value">Direct evidence</div>
+          <ul>
+            <li>Current uncommitted Git working-tree inventory and diff statistics.</li>
+            <li>Source/test contents created or modified during the implementation.</li>
+            <li>Recorded command outcomes from coordinated build, lint, and focused test runs.</li>
+            <li>Both named Oracle review responses and subsequent fixes.</li>
+            <li>User-reported live acceptance: GPT-5.6 Sol Pro succeeded through the OracleA preset, and Opus 5 appeared in the Claude Code CLI dropdown.</li>
+            <li>No staged changes, commits, pushes, releases, or dependency edits.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <div class="label">Inferred / conditional</div>
+          <div class="value">Requires your environment</div>
+          <ul>
+            <li>GPT-5.6 Sol access was confirmed for the user’s OpenAI account; Opus 5 execution and Anthropic API access still depend on their respective entitlements.</li>
+            <li>The user completed the relevant OpenAI/Oracle and Opus picker UI paths, but no exhaustive visible-app walkthrough was recorded.</li>
+            <li>A future OpenAI model is no-rebuild only when it fits the already supported request semantics.</li>
+            <li>Provider availability, pricing, and API behavior can change independently of this branch.</li>
+          </ul>
+        </article>
+      </div>
+      <div class="callout warn">
+        <strong>Scope baseline</strong>
+        This report describes the current uncommitted implementation diff and session evidence. The current branch head predates this implementation, and no dedicated implementation-start commit was created, so the report does not present a commit-to-commit baseline.
+      </div>
+      <h3>Maintainer notes</h3>
+      <ul>
+        <li>No <code>Package.swift</code> or <code>Package.resolved</code> changes were made.</li>
+        <li>No settings migration, database migration, feature flag, release metadata, signing identity, bundle ID, or update-channel change was introduced.</li>
+        <li>The local metadata file is intentionally data-only and cannot inject endpoints, credentials, headers, arbitrary request bodies, or recommendation policy.</li>
+          <li>The existing Codex/ACP provider catalog behavior was not changed.</li>
+          <li>The SDK follow-up compared the pinned commits with the latest stable releases available on 31 July 2026; no dependency was changed during that audit.</li>
+          <li>Provider references: <a href="https://developers.openai.com/api/docs/guides/latest-model">OpenAI GPT-5.6 model guidance</a>, <a href="https://developers.openai.com/api/docs/models/gpt-5.6-sol">GPT-5.6 Sol model page</a>, <a href="https://developers.openai.com/api/docs/guides/flex-processing">OpenAI Flex processing</a>, <a href="https://platform.claude.com/docs/en/api/models/list">Anthropic List Models API</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/effort">Anthropic effort guidance</a>, and <a href="https://code.claude.com/docs/en/model-config">Claude Code model configuration</a>.</li>
+          <li>This report is HTML because the user explicitly requested a standalone HTML page; it lives in the repository’s established technical-report directory.</li>
+      </ul>
+    </section>
+
+    <footer>
+      Generated from the implementation session’s code, Git state, focused validation, worker summaries, and dual-Oracle review evidence. No external assets or scripts are required to view or print this page.
+    </footer>
+  </main>
+</body>
+</html>

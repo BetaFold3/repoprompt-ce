@@ -144,8 +144,12 @@ third-party notices in
 
 ## Contributor Documentation
 
-- [`AGENTS.md`](AGENTS.md): coordinated builds, tests, launches, live MCP
-  checks, source placement, and contribution preflight
+- [`AGENTS.md`](AGENTS.md): concise commands, pinned invariants, decision rules,
+  and on-demand context routes
+- [`docs/context/workflows/development.md`](docs/context/workflows/development.md):
+  coordinated builds, daemon behavior, debug app, and CE CLI workflow
+- [`docs/context/workflows/validation.md`](docs/context/workflows/validation.md):
+  changed-boundary validation selection and contribution evidence
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): contribution policy and pull request
   steps
 - [`docs/architecture/source-layout.md`](docs/architecture/source-layout.md):

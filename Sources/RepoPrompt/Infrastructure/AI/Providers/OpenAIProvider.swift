@@ -76,6 +76,7 @@ class OpenAIProvider: AIProvider {
         case .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt56Sol, .openAIConfigured,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
             128_000
         // Fallback: Let the API handle it by not setting a token limit.
@@ -95,27 +96,29 @@ class OpenAIProvider: AIProvider {
         let explicitOrProviderMax = configuredMaxTokens
             ?? maxTokens
             ?? providerSpecificMaxTokens(for: model)
-        if case .openaiCustomResponses = model {
+        if let explicitOrProviderMax {
             return explicitOrProviderMax
         }
-        if case .openaiCustomReasoning = model {
-            return explicitOrProviderMax
+        if shouldOmitSynthesizedMaxOutputTokens(for: model) {
+            return nil
         }
-        return explicitOrProviderMax ?? defaultMaxTokens(for: model)
+        return defaultMaxTokens(for: model)
     }
 
-    private func shouldOmitMaxOutputTokens(for model: AIModel) -> Bool {
-        // Respect explicit user configuration
-        if configuredMaxTokens != nil { return false }
+    private func shouldOmitSynthesizedMaxOutputTokens(for model: AIModel) -> Bool {
         let baseModel = model.openAIServiceTierBase
-        // Don't pass max_output_tokens for first-party OpenAI models — let the API handle defaults
+        // Don't synthesize max_output_tokens for first-party OpenAI models — let the API
+        // handle defaults. Explicit provider/caller caps are resolved before this check.
         switch baseModel {
         case .gpt5Pro, .gpt5ProXHigh, .gpt54Pro, .gpt54ProXHigh,
              .o3, .o3Low, .o3High,
              .gpt5, .gpt5Low, .gpt5High, .gpt5XHigh,
              .gpt54, .gpt54Low, .gpt54High, .gpt54XHigh,
              .gpt54Mini, .gpt54MiniLow, .gpt54MiniHigh, .gpt54MiniXHigh, .gpt54Nano,
+             .gpt56Sol, .openAIConfigured,
              .gpt5CodexLow, .gpt5CodexMed, .gpt5CodexHigh, .gpt5CodexXHigh:
+            return true
+        case .openaiCustomResponses, .openaiCustomReasoning:
             return true
         default:
             return false
@@ -143,32 +146,13 @@ class OpenAIProvider: AIProvider {
         maxTokens: Int?,
         stream: Bool
     ) -> ModelResponseParameter {
-        let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
-
-        var parameters = ModelResponseParameter(
+        let plan = responseRequestPlan(for: model)
+        return plan.parameters(
             input: createResponseInput(for: aiMessage),
-            model: baseModel.toProviderModel() as! SwiftOpenAI.Model
+            instructions: aiMessage.systemPrompt.isEmpty ? nil : aiMessage.systemPrompt,
+            maxOutputTokens: maxTokens,
+            delivery: stream ? .stream : .foreground
         )
-
-        if !aiMessage.systemPrompt.isEmpty {
-            parameters.instructions = aiMessage.systemPrompt
-        }
-
-        if !shouldOmitMaxOutputTokens(for: model) {
-            parameters.maxOutputTokens = maxTokens
-        }
-
-        if let effort = reasoningEffort {
-            parameters.reasoning = stream
-                ? Reasoning(effort: effort, summary: "auto")
-                : Reasoning(effort: effort)
-        }
-
-        parameters.stream = stream
-        parameters.serviceTier = resolvedServiceTier(for: model)
-        parameters.tools = nil
-        parameters.toolChoice = nil
-        return parameters
     }
 
     func streamMessage(
@@ -301,7 +285,6 @@ class OpenAIProvider: AIProvider {
         model: AIModel, // Keep model parameter for clarity and potential future use
         maxTokens: Int? // Keep maxTokens parameter
     ) async throws -> AICompletionResult {
-        let service = getService()
         let parameters = buildForegroundResponseParameters(
             aiMessage,
             model: model,
@@ -311,7 +294,7 @@ class OpenAIProvider: AIProvider {
 
         do {
             // Assuming responseCreate exists in the service layer as per previous code.
-            let response = try await service.responseCreate(parameters)
+            let response = try await createResponse(parameters, plan: responseRequestPlan(for: model))
 
             // Check response status and potential errors before extracting text
             guard response.status == .completed else {
@@ -370,7 +353,8 @@ class OpenAIProvider: AIProvider {
             stream: true
         )
 
-        let sseStream = try await service.responseCreateStream(parameters)
+        let plan = responseRequestPlan(for: model)
+        let sseStream = try await createResponseStream(parameters, plan: plan, service: service)
         return bridgeResponseStream(sseStream)
     }
 
@@ -555,35 +539,20 @@ class OpenAIProvider: AIProvider {
         model: AIModel,
         maxTokens: Int?
     ) -> ModelResponseParameter {
-        let (baseModel, reasoningEffort) = resolveBaseModelAndEffort(for: model)
-        var parameters = ModelResponseParameter(
+        let plan = responseRequestPlan(for: model)
+        var parameters = plan.parameters(
             input: aiMessage.openAIResponsesInput(),
-            model: baseModel.toProviderModel() as! SwiftOpenAI.Model
+            instructions: aiMessage.systemPrompt.isEmpty ? nil : aiMessage.systemPrompt,
+            maxOutputTokens: maxTokens,
+            delivery: .background
         )
 
-        if !aiMessage.systemPrompt.isEmpty {
-            parameters.instructions = aiMessage.systemPrompt
-        }
-
-        // Don't pass max_output_tokens for Pro models — the API rejects it.
-        if !shouldOmitMaxOutputTokens(for: model) {
-            parameters.maxOutputTokens = maxTokens
-        }
-
-        if let effort = reasoningEffort {
-            parameters.reasoning = Reasoning(effort: effort)
-        }
-
         // Only apply temperature for non-reasoning models (reasoning models don't support it)
-        if reasoningEffort == nil, let temperature = aiMessage.effectiveTemperature(for: baseModel) {
+        if plan.reasoningEffort == nil,
+           let temperature = aiMessage.effectiveTemperature(for: plan.baseModel)
+        {
             parameters.temperature = temperature
         }
-
-        // Apply service tier if configured (per-model override takes precedence)
-        parameters.serviceTier = resolvedServiceTier(for: model)
-
-        parameters.background = true
-        parameters.stream = false
         return parameters
     }
 
@@ -607,57 +576,115 @@ class OpenAIProvider: AIProvider {
         // No resources to free in this example
     }
 
-    // MARK: - Service Tier Resolution
+    // MARK: - Responses Request Planning
 
-    /// Returns the effective service tier for a request - prefers per-model override over global setting
-    private func resolvedServiceTier(for model: AIModel) -> String? {
-        switch model.openAIServiceTierBase {
-        case .openaiCustomResponses, .openaiCustomReasoning:
-            return nil
-        default:
-            break
-        }
-        return model.openAIServiceTierOverride ?? serviceTier
+    private func responseRequestPlan(for model: AIModel) -> OpenAIResponseRequestPlan {
+        OpenAIResponseRequestPlan.make(model: model, defaultServiceTier: serviceTier)
     }
 
-    // MARK: - Variant Mapping Helper
+    private func createResponse(
+        _ parameters: ModelResponseParameter,
+        plan: OpenAIResponseRequestPlan
+    ) async throws -> ResponseModel {
+        let service = getService()
+        guard plan.requiresProviderEncoding else {
+            return try await service.responseCreate(parameters)
+        }
 
-    /// Returns the canonical base model and its associated reasoning effort
-    /// string ("high", "medium", "low" or `nil` when not applicable).
-    private func resolveBaseModelAndEffort(for model: AIModel)
-        -> (baseModel: AIModel, reasoningEffort: String?)
-    {
-        // Unwrap tier variants first
-        let model = model.openAIServiceTierBase
-        switch model {
-        case .gpt5Pro: return (.gpt5Pro, "high")
-        case .gpt5ProXHigh: return (.gpt5Pro, "xhigh")
-        case .gpt54Pro: return (.gpt54Pro, "high")
-        case .gpt54ProXHigh: return (.gpt54Pro, "xhigh")
-        case .o3High: return (.o3, "high")
-        case .o3Low: return (.o3, "low")
-        case .o3: return (.o3, "medium")
-        case .gpt5XHigh: return (.gpt5, "xhigh")
-        case .gpt5High: return (.gpt5, "high")
-        case .gpt5Low: return (.gpt5, "low")
-        case .gpt5: return (.gpt5, "medium")
-        case .gpt54XHigh: return (.gpt54, "xhigh")
-        case .gpt54High: return (.gpt54, "high")
-        case .gpt54Low: return (.gpt54, "low")
-        case .gpt54: return (.gpt54, "medium")
-        // ── gpt5-codex-max family (Responses API) ──
-        case .gpt5CodexXHigh: return (.gpt5CodexMed, "xhigh")
-        case .gpt5CodexHigh: return (.gpt5CodexMed, "high")
-        case .gpt5CodexMed: return (.gpt5CodexMed, "medium")
-        case .gpt5CodexLow: return (.gpt5CodexMed, "low")
-        // ── gpt-5.4-mini family ──
-        case .gpt54MiniXHigh: return (.gpt54Mini, "xhigh")
-        case .gpt54MiniHigh: return (.gpt54Mini, "high")
-        case .gpt54MiniLow: return (.gpt54Mini, "low")
-        case .gpt54Mini: return (.gpt54Mini, "medium")
-        case .openaiCustomReasoning:
-            return (model, model.defaultReasoningEffort)
-        default: return (model, nil)
+        let request = try makeResponsesRequest(body: plan.encodedBody(for: parameters), acceptsEventStream: false)
+        let (data, response) = try await service.session.data(for: request)
+        try validateHTTPResponse(response, data: data)
+        return try service.decoder.decode(ResponseModel.self, from: data)
+    }
+
+    private func createResponseStream(
+        _ parameters: ModelResponseParameter,
+        plan: OpenAIResponseRequestPlan,
+        service: OpenAIService
+    ) async throws -> AsyncThrowingStream<ResponseStreamEvent, Error> {
+        guard plan.requiresProviderEncoding else {
+            return try await service.responseCreateStream(parameters)
+        }
+
+        let request = try makeResponsesRequest(body: plan.encodedBody(for: parameters), acceptsEventStream: true)
+        let (bytes, response) = try await service.session.bytes(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw AIProviderError.invalidResponse(
+                detail: "OpenAI Responses API stream returned an invalid HTTP response."
+            )
+        }
+        guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            var errorData = Data()
+            for try await byte in bytes.prefix(64 * 1024) {
+                errorData.append(byte)
+            }
+            let body = String(data: errorData, encoding: .utf8) ?? "No response body."
+            throw AIProviderError.invalidResponse(
+                detail: "OpenAI Responses API stream returned HTTP \(httpResponse.statusCode): \(body)"
+            )
+        }
+
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var dataLines: [String] = []
+
+                    func emitPendingEvent() throws {
+                        guard !dataLines.isEmpty else { return }
+                        defer { dataLines.removeAll(keepingCapacity: true) }
+                        let payload = dataLines.joined(separator: "\n")
+                        guard payload != "[DONE]", let data = payload.data(using: .utf8) else { return }
+                        guard let event = try? service.decoder.decode(ResponseStreamEvent.self, from: data) else {
+                            return
+                        }
+                        continuation.yield(event)
+                    }
+
+                    for try await line in bytes.lines {
+                        if Task.isCancelled { break }
+                        if line.isEmpty {
+                            try emitPendingEvent()
+                        } else if line.hasPrefix("data:") {
+                            dataLines.append(String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces))
+                        }
+                    }
+                    try emitPendingEvent()
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func makeResponsesRequest(body: Data, acceptsEventStream: Bool) throws -> URLRequest {
+        let baseURL = cachedBaseURL ?? URL(string: "https://api.openai.com")!
+        let version = (overrideVersion ?? "v1").trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var endpoint = baseURL
+        if !version.isEmpty {
+            endpoint.appendPathComponent(version)
+        }
+        endpoint.appendPathComponent("responses")
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(acceptsEventStream ? "text/event-stream" : "application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(cachedApiKey ?? "")", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    private func validateHTTPResponse(_ response: URLResponse, data: Data) throws {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw AIProviderError.invalidResponse(detail: "OpenAI Responses API returned a non-HTTP response.")
+        }
+        guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            let body = String(data: data, encoding: .utf8) ?? "No response body."
+            throw AIProviderError.invalidResponse(
+                detail: "OpenAI Responses API returned HTTP \(httpResponse.statusCode): \(body)"
+            )
         }
     }
 }
@@ -669,7 +696,7 @@ extension OpenAIProvider: ResponsesJobProvider {
         maxTokens: Int?
     ) async throws -> ResponseModel {
         let parameters = buildBackgroundResponseParameters(message, model: model, maxTokens: maxTokens)
-        let response = try await getService().responseCreate(parameters)
+        let response = try await createResponse(parameters, plan: responseRequestPlan(for: model))
 
         if response.status == .failed {
             let detail = response.error?.message ?? response.incompleteDetails?.reason ?? "Responses API returned a failed status."

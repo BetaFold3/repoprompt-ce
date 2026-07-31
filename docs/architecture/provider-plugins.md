@@ -74,15 +74,18 @@ The package target is Foundation-only and intentionally does **not** import any 
 
 ### Test commands
 
-```bash
-# Root app builds and tests (includes the package transitively):
-swift build --product RepoPrompt
-swift test
+Use coordinated root commands so provider work shares the repository build/test lanes:
 
-# Package-only tests (faster iteration on codec / translator / catalog DTOs):
-cd Packages/RepoPromptAgentProviders
-swift test
+```bash
+# Root app build and tests (includes the package transitively)
+make dev-swift-build PRODUCT=RepoPrompt
+make dev-test
+
+# Package-only tests (faster iteration on codec / translator / catalog DTOs)
+make dev-provider-test
 ```
+
+If the developer daemon is unavailable, use the direct SwiftPM commands documented in the [development workflow](../context/workflows/development.md).
 
 ### Future external repository
 
@@ -266,13 +269,13 @@ Standard checks for changes that touch the seam:
 
 ```bash
 # Root build (includes the path-dependency package)
-swift build --product RepoPrompt
+make dev-swift-build PRODUCT=RepoPrompt
 
 # Focused suites used during Work Items 1–9
-swift test --filter 'ClaudeSDKNDJSONTranslatorTests|ClaudeCompatibleBackendEnvironmentTests|ClaudeNativeApprovalAndResumeTests|ClaudeCompatibleModelCatalogTests|ClaudeCompatiblePluginBridgeTests'
+make dev-test FILTER='ClaudeSDKNDJSONTranslatorTests|ClaudeCompatibleBackendEnvironmentTests|ClaudeNativeApprovalAndResumeTests|ClaudeCompatibleModelCatalogTests|ClaudeCompatiblePluginBridgeTests'
 
 # Package-only iteration
-cd Packages/RepoPromptAgentProviders && swift test
+make dev-provider-test
 ```
 
 Add the relevant focused suite before any catalog/codec change, and snapshot model catalogs across `claudeCode`, `claudeCodeGLM`, `kimiCode`, and `customClaudeCompatible` before touching `AgentModelCatalog` branches.

@@ -350,6 +350,12 @@ allowed_tracked_docs=(
   "docs/architecture/settings-persistence.md"
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
+  "docs/context/archive/2026-07-30-AGENTS.md"
+  "docs/context/archive/2026-07-30-CLAUDE.md"
+  "docs/context/archive/MANIFEST.md"
+  "docs/context/workflows/development.md"
+  "docs/context/workflows/doc-gardening.md"
+  "docs/context/workflows/validation.md"
   "docs/designs/cross-restart-durability-root-search-cas-2026-06-25.md"
   "docs/designs/remote-relay-contract.md"
   "docs/open-source-readiness.md"
@@ -370,6 +376,7 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-07-16-remote-command-tail-stale-recovery.md"
   "docs/technical_implementation_reports/2026-07-25-mcp-instructions-rewrite-provider-guidance.md"
   "docs/technical_implementation_reports/2026-07-26-remote-handoff-fork.md"
+  "docs/openai-model-metadata-quick-guide.html"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/spec/history-query-tools.md"
@@ -387,6 +394,7 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-07-29-parallel-dual-oracle-sessions.md"
   "docs/technical_implementation_reports/2026-07-30-knowledge-agent-profile.html"
   "docs/technical_implementation_reports/2026-07-30-oracle-continuation-preset-inheritance.html"
+  "docs/technical_implementation_reports/2026-07-31-api-provider-model-modernization.html"
 )
 while IFS= read -r path; do
   allowed_tracked_docs+=("$path")

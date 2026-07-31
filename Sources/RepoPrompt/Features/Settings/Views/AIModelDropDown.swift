@@ -146,6 +146,8 @@ struct AIModelDropdown: View {
                         items: group.models.map(aiModelMenuItem)
                     )
                 }
+            } else if provider == .openAI {
+                models.map(aiModelOpenAIMenuItem)
             } else if provider == .openCode {
                 AIModel.openCodeMenu(for: models).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
                     let modelItems = providerGroup.groups.map(aiModelOpenCodeMenuItem)
@@ -272,6 +274,31 @@ struct AIModelDropdown: View {
         return nil
     }
 
+    private func aiModelOpenAIMenuItem(_ model: AIModel) -> StableMenuItem {
+        guard model.openAIServiceTierBase == .gpt56Sol else {
+            return aiModelMenuItem(model)
+        }
+
+        let modeItems = OpenAIReasoningMode.allCases.map { mode in
+            StableMenuItem.submenu(
+                mode.displayName,
+                items: OpenAIConfiguredModelSelection.supportedEfforts.compactMap { effort in
+                    guard let selection = OpenAIConfiguredModelSelection(
+                        modelID: AIModel.gpt56Sol.modelName,
+                        reasoningMode: mode,
+                        reasoningEffort: effort
+                    ) else { return nil }
+                    let configured = AIModel.openAIConfigured(selection: selection)
+                    let selectedModel = model.openAIServiceTierOverride.map {
+                        AIModel.openAIServiceTierVariant(base: configured, tier: $0)
+                    } ?? configured
+                    return aiModelMenuItem(selectedModel, title: effort.displayName)
+                }
+            )
+        }
+        return .submenu(model.displayName, items: modeItems)
+    }
+
     private func aiModelOpenCodeMenuItem(_ group: AIModel.OpenCodePickerMenuGroup) -> StableMenuItem {
         if group.rendersAsSubmenu {
             return StableMenuItem.submenu(
@@ -286,8 +313,12 @@ struct AIModelDropdown: View {
     }
 
     private func aiModelMenuItem(_ model: AIModel) -> StableMenuItem {
+        aiModelMenuItem(model, title: model.displayName)
+    }
+
+    private func aiModelMenuItem(_ model: AIModel, title: String) -> StableMenuItem {
         StableMenuItem.action(
-            truncateHeadIfNeeded(model.displayName),
+            truncateHeadIfNeeded(title),
             isSelected: model.rawValue == destination.currentRawValue
         ) {
             destination.apply(model.rawValue)

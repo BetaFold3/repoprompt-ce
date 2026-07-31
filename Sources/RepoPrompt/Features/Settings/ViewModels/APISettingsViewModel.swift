@@ -332,7 +332,9 @@ public class APISettingsViewModel: ObservableObject {
     @Published var lastErrorMessage: String?
 
     // NEW – fetched model lists per provider
+    @Published private(set) var availableAnthropicModels: [String] = []
     @Published var availableOpenAIModels: [String] = []
+    @Published private(set) var availableOpenAIModelMetadata: [OpenAIAPIModelMetadata] = []
     @Published var availableDeepSeekModels: [String] = []
     @Published var availableFireworksModels: [String] = []
     @Published var availableGrokModels: [String] = [] // NEW
@@ -340,6 +342,7 @@ public class APISettingsViewModel: ObservableObject {
     @Published var availableZAIModels: [String] = []
 
     // ── Model-list fetch tasks (one per provider) ───────────────────────────
+    private var anthropicModelsTask: Task<Void, Never>?
     private var openAIModelsTask: Task<Void, Never>?
     private var deepSeekModelsTask: Task<Void, Never>?
     private var fireworksModelsTask: Task<Void, Never>?
@@ -958,8 +961,12 @@ public class APISettingsViewModel: ObservableObject {
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
     private let codexModelPollingService: CodexModelPollingService
+    private let apiModelCatalog: APIModelCatalog
+    private let anthropicModelsLoader: @Sendable (String) async throws -> [String]
     private let storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)?
     private let contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)?
+    private var activeAnthropicModelCatalogScope: APIModelCatalogScope?
+    private var activeOpenAIModelCatalogScope: APIModelCatalogScope?
     private var hasPreparedForWindowClose = false
 
     init(
@@ -967,12 +974,18 @@ public class APISettingsViewModel: ObservableObject {
         keyManager: KeyManager,
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
+        apiModelCatalog: APIModelCatalog? = nil,
+        anthropicModelsLoader: (@Sendable (String) async throws -> [String])? = nil,
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil
     ) {
         self.aiQueriesService = aiQueriesService
         self.keyManager = keyManager
         self.codexModelPollingService = codexModelPollingService
+        self.apiModelCatalog = apiModelCatalog ?? Self.makeDefaultAPIModelCatalog()
+        self.anthropicModelsLoader = anthropicModelsLoader ?? { apiKey in
+            try await AnthropicAPIModelsClient(apiKey: apiKey).fetchModelIDs()
+        }
         self.storedDataLoadBoundary = storedDataLoadBoundary
         self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
         installCLIConnectionObservers()
@@ -993,6 +1006,8 @@ public class APISettingsViewModel: ObservableObject {
         hasPreparedForWindowClose = true
         initialLoadTask?.cancel()
         initialLoadTask = nil
+        anthropicModelsTask?.cancel()
+        anthropicModelsTask = nil
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
         deepSeekModelsTask?.cancel()
@@ -1021,6 +1036,7 @@ public class APISettingsViewModel: ObservableObject {
 
     deinit {
         initialLoadTask?.cancel()
+        anthropicModelsTask?.cancel()
         openAIModelsTask?.cancel()
         deepSeekModelsTask?.cancel()
         fireworksModelsTask?.cancel()
@@ -1312,6 +1328,8 @@ public class APISettingsViewModel: ObservableObject {
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
         // ── 0. Cancel previous background fetches ───────────────────────────────
+        anthropicModelsTask?.cancel()
+        anthropicModelsTask = nil
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
         deepSeekModelsTask?.cancel()
@@ -1472,7 +1490,8 @@ public class APISettingsViewModel: ObservableObject {
         // 4. Fire-and-forget model-catalogue fetches (always refresh)
         // ----------------------------------------------------------------
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
-        if isOpenAIKeyValid { openAIModelsTask = Task { await self.updateOpenAIModels() } }
+        if isAnthropicKeyValid { startAnthropicModelsRefresh() }
+        if isOpenAIKeyValid { startOpenAIModelsRefresh() }
         if isDeepSeekKeyValid { deepSeekModelsTask = Task { await self.updateDeepSeekModels() } }
         if isFireworksKeyValid { fireworksModelsTask = Task { await self.updateFireworksModels() } }
         if isGrokKeyValid { grokModelsTask = Task { await self.updateGrokModels() } }
@@ -1655,6 +1674,7 @@ public class APISettingsViewModel: ObservableObject {
         // ── Key-/token-based providers ─────────────────────────────────────────
         if isAnthropicKeyValid {
             modelSet.formUnion(AIModel.modelsForProvider(.anthropic))
+            modelSet.formUnion(AnthropicDiscoveredModelCatalog.models(from: availableAnthropicModels))
             if !anthropicCustomModel.isEmpty {
                 modelSet.insert(.anthropicCustom(name: anthropicCustomModel))
             }
@@ -1662,6 +1682,7 @@ public class APISettingsViewModel: ObservableObject {
 
         if isOpenAIKeyValid {
             modelSet.formUnion(AIModel.modelsForProvider(.openAI))
+            modelSet.formUnion(configuredOpenAIModels(from: availableOpenAIModelMetadata))
             if !openAICustomModel.isEmpty {
                 if shouldUseResponsesRoutingForOpenAICustomModel {
                     modelSet.formUnion(AIModel.openAICustomResponsesVariants(for: openAICustomModel))
@@ -1918,11 +1939,19 @@ public class APISettingsViewModel: ObservableObject {
         try await keyManager.deleteAPIKey(for: provider)
         switch provider {
         case .anthropic:
+            let scope = clearAnthropicModelDiscoveryState()
             anthropicApiKey = ""
             isAnthropicKeyValid = false
+            if let scope {
+                await apiModelCatalog.invalidate(scope)
+            }
         case .openAI:
+            let scope = clearOpenAIModelDiscoveryState()
             openAIApiKey = ""
             isOpenAIKeyValid = false
+            if let scope {
+                await apiModelCatalog.invalidate(scope)
+            }
         case .gemini:
             geminiApiKey = ""
             isGeminiKeyValid = false
@@ -2006,7 +2035,7 @@ public class APISettingsViewModel: ObservableObject {
         let condition: (AIModel) -> Bool
         switch provider {
         case .openAI: condition = { $0.isOpenAIModel }
-        case .anthropic: condition = { $0.isAnthropicModel }
+        case .anthropic: condition = { $0.providerType == .anthropic }
         case .gemini: condition = { $0.isGeminiModel }
         case .openRouter: condition = { $0.isOpenRouterModel }
         case .deepseek: condition = { $0.providerType == .deepseek }
@@ -2070,16 +2099,33 @@ public class APISettingsViewModel: ObservableObject {
 
     func validateAnthropicKey() async throws -> Bool {
         let trimmedKey = anthropicApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previousScope = clearAnthropicModelDiscoveryState()
+        isAnthropicKeyValid = false
+        await updateAvailableModels()
+
         let isValid = try await aiQueriesService.testAnthropicAPI(with: trimmedKey)
         if isValid {
             try await keyManager.saveAPIKey(trimmedKey, for: .anthropic)
+            anthropicApiKey = trimmedKey
+            isAnthropicKeyValid = true
+            let nextScope = anthropicModelCatalogScope(apiKey: trimmedKey)
+            if let previousScope, previousScope != nextScope {
+                await apiModelCatalog.invalidate(previousScope)
+            }
+            let refreshTask = startAnthropicModelsRefresh()
+            await refreshTask.value
+        } else {
+            await updateAvailableModels()
         }
-        isAnthropicKeyValid = isValid
         return isValid
     }
 
     func validateOpenAIKey() async throws -> Bool {
         let trimmed = openAIApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previousScope = clearOpenAIModelDiscoveryState()
+        isOpenAIKeyValid = false
+        await updateAvailableModels()
+
         // Use override if present
         let base = normalizedOpenAIBaseURL(openAIBaseURL)
         let ok = try await aiQueriesService.testOpenAIAPI(
@@ -2090,8 +2136,15 @@ public class APISettingsViewModel: ObservableObject {
             try await keyManager.saveAPIKey(trimmed, for: .openAI)
             openAIApiKey = trimmed
             isOpenAIKeyValid = true
-            await updateOpenAIModels()
-        } else { isOpenAIKeyValid = false }
+            let nextScope = openAIModelCatalogRequest(apiKey: trimmed)?.scope
+            if let previousScope, previousScope != nextScope {
+                await apiModelCatalog.invalidate(previousScope)
+            }
+            let refreshTask = startOpenAIModelsRefresh()
+            await refreshTask.value
+        } else {
+            await updateAvailableModels()
+        }
         return ok
     }
 
@@ -2126,7 +2179,8 @@ public class APISettingsViewModel: ObservableObject {
             }
             openAIBaseURL = baseURLString
             isOpenAIBaseURLValid = true
-            await updateOpenAIModels()
+            let refreshTask = startOpenAIModelsRefresh()
+            await refreshTask.value
         } else {
             isOpenAIBaseURLValid = false
         }
@@ -2140,7 +2194,8 @@ public class APISettingsViewModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "customOpenAIVersionOverride")
         openAIBaseURL = ""
         isOpenAIBaseURLValid = false
-        await updateOpenAIModels()
+        let refreshTask = startOpenAIModelsRefresh()
+        await refreshTask.value
     }
 
     func validateOllamaURL() async throws -> Bool {
@@ -3532,27 +3587,243 @@ public class APISettingsViewModel: ObservableObject {
         return (u?.absoluteString ?? "", v)
     }
 
-    private func updateOpenAIModels() async {
-        guard isOpenAIKeyValid else { return }
-        do {
-            // Compute base + version from current field (fallback to stored version if not present in field)
-            let (baseFromField, versionFromField) = normalizedOpenAIBaseURLAndVersion(openAIBaseURL)
-            let base = baseFromField.isEmpty ? "https://api.openai.com" : baseFromField
-            let version = versionFromField ?? (UserDefaults.standard.string(forKey: "customOpenAIVersionOverride") ?? "v1")
+    @discardableResult
+    private func clearAnthropicModelDiscoveryState() -> APIModelCatalogScope? {
+        let scope = activeAnthropicModelCatalogScope
+        anthropicModelsTask?.cancel()
+        anthropicModelsTask = nil
+        activeAnthropicModelCatalogScope = nil
+        availableAnthropicModels = []
+        return scope
+    }
 
+    @discardableResult
+    private func clearOpenAIModelDiscoveryState() -> APIModelCatalogScope? {
+        let scope = activeOpenAIModelCatalogScope
+        openAIModelsTask?.cancel()
+        openAIModelsTask = nil
+        activeOpenAIModelCatalogScope = nil
+        availableOpenAIModels = []
+        availableOpenAIModelMetadata = []
+        return scope
+    }
+
+    @discardableResult
+    private func startAnthropicModelsRefresh() -> Task<Void, Never> {
+        anthropicModelsTask?.cancel()
+        let task = Task { @MainActor [weak self] in
+            guard let self, !hasPreparedForWindowClose else { return }
+            await updateAnthropicModels()
+        }
+        anthropicModelsTask = task
+        return task
+    }
+
+    @discardableResult
+    private func startOpenAIModelsRefresh() -> Task<Void, Never> {
+        openAIModelsTask?.cancel()
+        let task = Task { @MainActor [weak self] in
+            guard let self, !hasPreparedForWindowClose else { return }
+            await updateOpenAIModels()
+        }
+        openAIModelsTask = task
+        return task
+    }
+
+    private func anthropicModelCatalogScope(apiKey: String) -> APIModelCatalogScope? {
+        APIModelCatalogScope(
+            providerID: "anthropic",
+            endpoint: "https://api.anthropic.com/v1",
+            apiKey: apiKey
+        )
+    }
+
+    private struct OpenAIModelCatalogRequest {
+        let scope: APIModelCatalogScope
+        let baseURL: String
+        let apiVersion: String
+    }
+
+    private func openAIModelCatalogRequest(apiKey: String) -> OpenAIModelCatalogRequest? {
+        let (baseFromField, versionFromField) = normalizedOpenAIBaseURLAndVersion(openAIBaseURL)
+        let baseURL = baseFromField.isEmpty ? "https://api.openai.com" : baseFromField
+        let apiVersion = versionFromField
+            ?? (UserDefaults.standard.string(forKey: "customOpenAIVersionOverride") ?? "v1")
+        let endpoint = [
+            baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")),
+            apiVersion.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        ]
+        .filter { !$0.isEmpty }
+        .joined(separator: "/")
+
+        guard let scope = APIModelCatalogScope(
+            providerID: "openai",
+            endpoint: endpoint,
+            apiKey: apiKey
+        ) else {
+            return nil
+        }
+        return OpenAIModelCatalogRequest(
+            scope: scope,
+            baseURL: baseURL,
+            apiVersion: apiVersion
+        )
+    }
+
+    private func updateAnthropicModels() async {
+        guard isAnthropicKeyValid else {
+            activeAnthropicModelCatalogScope = nil
+            availableAnthropicModels = []
+            await updateAvailableModels()
+            return
+        }
+
+        guard let scope = anthropicModelCatalogScope(apiKey: anthropicApiKey) else {
+            activeAnthropicModelCatalogScope = nil
+            availableAnthropicModels = []
+            await updateAvailableModels()
+            return
+        }
+
+        if activeAnthropicModelCatalogScope != scope {
+            activeAnthropicModelCatalogScope = scope
+            availableAnthropicModels = []
+            await updateAvailableModels()
+        }
+
+        let capturedKey = anthropicApiKey
+        let loader = anthropicModelsLoader
+        let snapshots = await apiModelCatalog.snapshots(for: scope) { _ in
+            try await loader(capturedKey)
+        }
+
+        for await snapshot in snapshots {
+            guard !Task.isCancelled,
+                  isAnthropicKeyValid,
+                  activeAnthropicModelCatalogScope == scope
+            else {
+                return
+            }
+            availableAnthropicModels = snapshot.modelIDs
+            await updateAvailableModels()
+        }
+    }
+
+    private func updateOpenAIModels() async {
+        guard isOpenAIKeyValid else {
+            activeOpenAIModelCatalogScope = nil
+            availableOpenAIModels = []
+            availableOpenAIModelMetadata = []
+            await updateAvailableModels()
+            return
+        }
+
+        guard let request = openAIModelCatalogRequest(apiKey: openAIApiKey) else {
+            activeOpenAIModelCatalogScope = nil
+            availableOpenAIModels = []
+            availableOpenAIModelMetadata = []
+            await updateAvailableModels()
+            return
+        }
+        let scope = request.scope
+
+        if activeOpenAIModelCatalogScope != scope {
+            activeOpenAIModelCatalogScope = scope
+            availableOpenAIModels = []
+            availableOpenAIModelMetadata = []
+            await updateAvailableModels()
+        }
+
+        let capturedBase = request.baseURL
+        let capturedKey = openAIApiKey
+        let capturedVersion = request.apiVersion
+        let snapshots = await apiModelCatalog.snapshots(for: scope) { _ in
             let provider = CustomOpenAIProvider(
-                baseURL: base,
-                apiKey: openAIApiKey,
+                baseURL: capturedBase,
+                apiKey: capturedKey,
                 defaultModel: "gpt-3.5-turbo",
                 defaultTemperature: 0.7,
-                apiVersion: version
+                apiVersion: capturedVersion
             )
-            let models = try await provider.getAvailableModels()
-            await MainActor.run { availableOpenAIModels = models }
-        } catch {
-            await MainActor.run { availableOpenAIModels = [] }
+            return try await provider.getAvailableModels()
         }
-        await updateAvailableModels()
+
+        for await snapshot in snapshots {
+            guard !Task.isCancelled,
+                  isOpenAIKeyValid,
+                  activeOpenAIModelCatalogScope == scope
+            else {
+                return
+            }
+            availableOpenAIModels = snapshot.modelIDs
+            availableOpenAIModelMetadata = OpenAIAPIModelCatalogMerge.merge(
+                visibleModelIDs: snapshot.modelIDs,
+                trustedMetadata: loadLocalOpenAIModelMetadata()
+            )
+            await updateAvailableModels()
+        }
+    }
+
+    private func configuredOpenAIModels(
+        from metadata: [OpenAIAPIModelMetadata]
+    ) -> Set<AIModel> {
+        var models = Set<AIModel>()
+        for descriptor in metadata
+            where descriptor.id != AIModel.gpt56Sol.modelName
+            && descriptor.protocols.contains(.responses)
+        {
+            guard let reasoning = descriptor.reasoning else { continue }
+            for mode in reasoning.modes {
+                guard let reasoningMode = OpenAIReasoningMode(rawValue: mode.rawValue) else { continue }
+                for effort in reasoning.efforts {
+                    guard let reasoningEffort = CodexReasoningEffort(rawValue: effort.rawValue),
+                          let selection = OpenAIConfiguredModelSelection(
+                              modelID: descriptor.id,
+                              reasoningMode: reasoningMode,
+                              reasoningEffort: reasoningEffort,
+                              supportsStreaming: descriptor.supportsStreaming
+                          )
+                    else {
+                        continue
+                    }
+                    models.insert(.openAIConfigured(selection: selection))
+                }
+            }
+        }
+        return models
+    }
+
+    private func loadLocalOpenAIModelMetadata() -> [OpenAIAPIModelMetadata] {
+        guard let document = try? OpenAIAPIModelMetadataDecoder.decode(
+            contentsOf: Self.openAIModelMetadataFileURL
+        ) else {
+            return []
+        }
+        return document.models
+    }
+
+    private static func makeDefaultAPIModelCatalog() -> APIModelCatalog {
+        let storage = APIModelCatalogFileStorage(
+            directoryURL: openAIModelCatalogDirectoryURL.appendingPathComponent(
+                "Cache",
+                isDirectory: true
+            )
+        )
+        return APIModelCatalog(storage: storage)
+    }
+
+    private static var openAIModelCatalogDirectoryURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first!
+            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+            .appendingPathComponent("ModelCatalog", isDirectory: true)
+    }
+
+    private static var openAIModelMetadataFileURL: URL {
+        openAIModelCatalogDirectoryURL.appendingPathComponent(
+            "openai-model-metadata-v1.json",
+            isDirectory: false
+        )
     }
 
     private func updateDeepSeekModels() async {

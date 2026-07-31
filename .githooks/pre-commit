@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+repo_root="$(git rev-parse --show-toplevel)"
+# Fast working-tree check only; staged-index preflight remains separately required.
+exec "$repo_root/Scripts/check-agent-context"
