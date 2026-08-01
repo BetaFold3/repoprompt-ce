@@ -66,7 +66,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         WindowStatesManager.shared.registerWindowState(window)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
-        await window.workspaceManager.awaitInitialized()
+        try await window.workspaceManager.awaitInitialized(timeout: .seconds(60))
 
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ContextBuilderPromptFallbackTests-\(UUID().uuidString)")
@@ -1039,7 +1039,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 sharedMCPService: MCPService()
             )
             GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
-            await composition.workspaceManager.awaitInitialized()
+            try await composition.workspaceManager.awaitInitialized(timeout: .seconds(60))
             defer {
                 Task {
                     await composition.mcpServer.stopServer()
@@ -1151,7 +1151,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             contextBuilderProviderFactory: { _, _, _ in providers.next() }
         )
         GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
-        await composition.workspaceManager.awaitInitialized()
+        try await composition.workspaceManager.awaitInitialized(timeout: .seconds(60))
 
         do {
             let workspaceRoot = FileManager.default.temporaryDirectory
@@ -1360,7 +1360,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 contextBuilderProviderFactory: { _, _, _ in providers.next() }
             )
             GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
-            await composition.workspaceManager.awaitInitialized()
+            try await composition.workspaceManager.awaitInitialized(timeout: .seconds(60))
             var firstRunID: UUID?
             var retryRunID: UUID?
             let lateConnectionID = UUID()

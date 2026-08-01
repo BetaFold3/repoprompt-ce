@@ -1484,8 +1484,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             WindowStatesManager.shared.registerWindowState(windowA)
             WindowStatesManager.shared.registerWindowState(windowB)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-            await windowA.workspaceManager.awaitInitialized()
-            await windowB.workspaceManager.awaitInitialized()
+            try await windowA.workspaceManager.awaitInitialized(timeout: .seconds(60))
+            try await windowB.workspaceManager.awaitInitialized(timeout: .seconds(60))
 
             var contextA: PersistentMCPTestContext?
             var contextB: PersistentMCPTestContext?

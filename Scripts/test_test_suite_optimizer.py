@@ -30,6 +30,10 @@ class TestListParsingTests(unittest.TestCase):
             "RepoPromptClaudeCompatibleProviderTests.CodecTests/testRoundTrip\n",
             "provider",
         )
+        core = optimizer.parse_test_list(
+            "RepoPromptCoreTests.JSONRPCBridgeLedgerTests/testRoundTrip\n",
+            "core",
+        )
 
         self.assertEqual([test.method_id for test in root], [
             "root/RepoPromptTests.ExampleTests/testOne",
@@ -38,6 +42,10 @@ class TestListParsingTests(unittest.TestCase):
         self.assertEqual(
             provider[0].method_id,
             "provider/RepoPromptClaudeCompatibleProviderTests.CodecTests/testRoundTrip",
+        )
+        self.assertEqual(
+            core[0].method_id,
+            "core/RepoPromptCoreTests.JSONRPCBridgeLedgerTests/testRoundTrip",
         )
 
     def test_parse_test_list_rejects_duplicate_identifiers(self) -> None:
@@ -247,6 +255,10 @@ class SourceAndLedgerTests(unittest.TestCase):
                 "--json",
             ],
         )
+        self.assertEqual(
+            optimizer.conductor_command(Path("/repo"), "core", list_mode=True),
+            ["/repo/conductor", "core-test", "--list", "--json"],
+        )
         with self.assertRaisesRegex(optimizer.OptimizerError, "--filter cannot be used with list mode"):
             optimizer.conductor_command(Path("/repo"), "provider", list_mode=True, filter_value="Suite")
 
@@ -434,6 +446,7 @@ class SourceAndLedgerTests(unittest.TestCase):
                 )
 
         self.assertFalse(payload["full_root_required"])
+        self.assertNotIn("UNMAPPED (smoke floor only)", payload)
         self.assertEqual(payload["selected_count"], 2)
         self.assertEqual(
             [entry["method_id"] for entry in payload["selected"]],
@@ -444,6 +457,104 @@ class SourceAndLedgerTests(unittest.TestCase):
         )
         self.assertEqual(payload["skipped_heavy_or_opt_in"][0]["method_id"], "root/RepoPromptTests.ScaleTests/testScale")
         self.assertIn(r"RepoPromptTests\.ExampleTests/testOne", payload["filter"])
+
+    def test_impacted_tests_rejects_unmapped_changed_production_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.SmokeTests/testSmoke",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/SmokeTests.swift",
+                    "suite": "RepoPromptTests.SmokeTests",
+                    "method": "testSmoke",
+                    "domain": "Root",
+                    "execution_tier": "fast",
+                }],
+            )
+            unmapped = "Sources/RepoPrompt/Support/Unmapped.swift"
+            with mock.patch.object(optimizer, "changed_files_for_range", return_value=[unmapped]):
+                with self.assertRaises(optimizer.OptimizerError) as ctx:
+                    optimizer.impacted_tests(
+                        root,
+                        ledger,
+                        "HEAD",
+                        smoke_floor_suites=["RepoPromptTests.SmokeTests"],
+                        validate_live_list=False,
+                    )
+
+        message = str(ctx.exception)
+        self.assertIn(unmapped, message)
+        self.assertIn("Add a mapping", message)
+        self.assertIn("make dev-test", message)
+        self.assertIn("--allow-unmapped", message)
+
+    def test_impacted_tests_ignores_unmapped_docs_only_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.SmokeTests/testSmoke",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/SmokeTests.swift",
+                    "suite": "RepoPromptTests.SmokeTests",
+                    "method": "testSmoke",
+                    "domain": "Root",
+                    "execution_tier": "fast",
+                }],
+            )
+            with mock.patch.object(
+                optimizer, "changed_files_for_range", return_value=["docs/notes.md"]
+            ):
+                payload = optimizer.impacted_tests(
+                    root,
+                    ledger,
+                    "HEAD",
+                    smoke_floor_suites=["RepoPromptTests.SmokeTests"],
+                    validate_live_list=False,
+                )
+
+        self.assertFalse(payload["full_root_required"])
+        self.assertNotIn("UNMAPPED (smoke floor only)", payload)
+        self.assertEqual(payload["selected_count"], 1)
+
+    def test_impacted_tests_allow_unmapped_uses_loud_smoke_floor_section(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "ledger.tsv"
+            self.write_ledger(
+                ledger,
+                [{
+                    "method_id": "root/RepoPromptTests.SmokeTests/testSmoke",
+                    "target": "root",
+                    "file": "Tests/RepoPromptTests/SmokeTests.swift",
+                    "suite": "RepoPromptTests.SmokeTests",
+                    "method": "testSmoke",
+                    "domain": "Root",
+                    "execution_tier": "fast",
+                }],
+            )
+            unmapped = "Sources/RepoPrompt/Support/Unmapped.swift"
+            with mock.patch.object(optimizer, "changed_files_for_range", return_value=[unmapped]):
+                payload = optimizer.impacted_tests(
+                    root,
+                    ledger,
+                    "HEAD",
+                    smoke_floor_suites=["RepoPromptTests.SmokeTests"],
+                    validate_live_list=False,
+                    allow_unmapped=True,
+                )
+
+        self.assertEqual(payload["UNMAPPED (smoke floor only)"], [unmapped])
+        self.assertEqual(payload["selected_count"], 1)
+        self.assertEqual(payload["selected"][0]["method_id"], "root/RepoPromptTests.SmokeTests/testSmoke")
+        rendered = json.dumps(payload, indent=2, sort_keys=True)
+        self.assertIn("UNMAPPED (smoke floor only)", rendered)
+        self.assertIn(unmapped, rendered)
 
     def test_impacted_tests_uses_full_root_for_broad_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -977,6 +1088,12 @@ class SourceAndLedgerTests(unittest.TestCase):
                         "RepoPromptClaudeCompatibleProviderTests.CodecTests",
                         "testRoundTrip",
                     ),
+                    (
+                        "core/RepoPromptCoreTests.JSONRPCBridgeLedgerTests/testRoundTrip",
+                        "core",
+                        "RepoPromptCoreTests.JSONRPCBridgeLedgerTests",
+                        "testRoundTrip",
+                    ),
                 ]:
                     row = {column: "" for column in optimizer.LEDGER_COLUMNS}
                     row.update({
@@ -1006,6 +1123,15 @@ class SourceAndLedgerTests(unittest.TestCase):
                     log_text="RepoPromptClaudeCompatibleProviderTests.CodecTests/testRoundTrip\n",
                     ticket="provider-ticket",
                 ),
+                "core": optimizer.ConductorRun(
+                    command=["/repo/conductor", "core-test", "--list", "--json"],
+                    process_exit_code=0,
+                    stdout="{}",
+                    stderr="",
+                    result={"state": "completed", "exitCode": 0, "logPath": "/tmp/core.log"},
+                    log_text="RepoPromptCoreTests.JSONRPCBridgeLedgerTests/testRoundTrip\n",
+                    ticket="core-ticket",
+                ),
             }
             events: list[dict[str, object]] = []
 
@@ -1022,10 +1148,12 @@ class SourceAndLedgerTests(unittest.TestCase):
                     list_timeout_seconds=12,
                 )
 
-        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["count"], 3)
         self.assertEqual(
             [event["event"] for event in events],
             [
+                "verify_ledger_list_start",
+                "verify_ledger_list_end",
                 "verify_ledger_list_start",
                 "verify_ledger_list_end",
                 "verify_ledger_list_start",
@@ -1035,6 +1163,7 @@ class SourceAndLedgerTests(unittest.TestCase):
         self.assertEqual(events[0]["timeout_seconds"], 12)
         self.assertEqual(events[1]["ticket"], "root-ticket")
         self.assertEqual(events[3]["ticket"], "provider-ticket")
+        self.assertEqual(events[5]["ticket"], "core-ticket")
 
     def test_verify_ledger_rejects_missing_list_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1750,9 +1879,9 @@ class AppendOnlyArtifactTests(unittest.TestCase):
     def test_scoreboard_appends_without_rewriting_prior_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "scoreboard.md"
-            optimizer.append_baseline_scoreboard(path, self.payload("2026-06-16T10:00:00Z", "/one.log"), {"root": 2, "provider": 1})
+            optimizer.append_baseline_scoreboard(path, self.payload("2026-06-16T10:00:00Z", "/one.log"), {"root": 2, "provider": 1, "core": 3})
             first = path.read_text(encoding="utf-8")
-            optimizer.append_baseline_scoreboard(path, self.payload("2026-06-16T11:00:00Z", "/two.log"), {"root": 2, "provider": 1})
+            optimizer.append_baseline_scoreboard(path, self.payload("2026-06-16T11:00:00Z", "/two.log"), {"root": 2, "provider": 1, "core": 3})
             second = path.read_text(encoding="utf-8")
 
         self.assertTrue(second.startswith(first))
@@ -1763,6 +1892,7 @@ class AppendOnlyArtifactTests(unittest.TestCase):
         self.assertIn("Build before samples: no", second)
         self.assertIn("| Sample | Valid | Build seconds | Test execution seconds |", second)
         self.assertIn("Primary metric eligible: no", second)
+        self.assertIn("Core methods", second)
 
     def test_json_artifacts_refuse_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

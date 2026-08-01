@@ -18,13 +18,14 @@ The generator writes `.build/xcode/RepoPromptCE.xcworkspace`. Everything under `
 
 ## Schemes in Xcode 26.3
 
-Xcode exposes SwiftPM product schemes, including `RepoPrompt` and `repoprompt-mcp`, alongside three repository convenience schemes:
+Xcode exposes SwiftPM product schemes, including `RepoPrompt`, `repoprompt-mcp`, and `repoprompt-gateway`, alongside four repository convenience schemes:
 
 The native `RepoPrompt` product scheme retains the shipped product, target, and emitted-binary identity. Internally, that executable is now a one-file entry target over the `RepoPromptApp` implementation library. `RepoPromptApp` is an internal SwiftPM target rather than a declared library product, so it does not add a supported product or convenience scheme.
 
 - `RepoPrompt CE App` delegates to conductor to assemble the real debug app through the existing packaging flow, verifies the `.build/debug/RepoPrompt.app` compatibility path, then runs the local debug bundle under `~/Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app`.
 - `RepoPrompt CE MCP` delegates to conductor to build and run `.build/debug/repoprompt-mcp`.
-- `RepoPrompt CE Tests` delegates to the conductor test runner. Root tests import `RepoPromptApp`, but retain their separate `RepoPromptMCP` dependency/imports; the scheme remains a legacy build target rather than a native Xcode test bundle because `RepoPromptMCP` is executable-only.
+- `RepoPrompt CE Gateway` delegates to conductor to build and run `.build/debug/repoprompt-gateway`.
+- `RepoPrompt CE Tests` delegates to the conductor test runner. Root tests import `RepoPromptApp`, `RepoPromptGateway`, and the required `RepoPromptCore` products; the scheme remains the supported coordinated test path across the root and extracted Core package targets.
 
 The native product schemes are useful for source navigation and indexing. Use `RepoPrompt CE Tests` for the supported full test workflow; optional `REPOPROMPT_XCODE_TEST_FILTER` narrows the delegated run. Sparkle's vendored XCFramework declares a `dSYMs` directory that is not present in the repository, so native Xcode package builds involving the app can fail before compilation. The generator deliberately does not mutate `Vendor/`; the packaged app convenience scheme remains the supported app build.
 
@@ -36,6 +37,6 @@ Generated app, MCP, and test builds are conductor-coordinated. Xcode cancellatio
 
 ## Validation ownership
 
-`Scripts/test_xcode_workspace_generator.py` protects deterministic output, the thin `RepoPrompt` → `RepoPromptApp` manifest topology, bridging-header and test dependency ownership, scheme wiring, safe destinations, and stale-output detection. Default CI runs this fast contract through `make xcode-generator-test`; existing SwiftPM/conductor build and test jobs remain authoritative.
+`Scripts/test_xcode_workspace_generator.py` protects deterministic output, the thin `RepoPrompt` → `RepoPromptApp` and `RepoPromptMCP` → `RepoPromptMCPCore` manifest topology, bridging-header and test dependency ownership, gateway/Core product wiring, scheme wiring, safe destinations, and stale-output detection. Default CI runs this fast contract through `make xcode-generator-test`; existing SwiftPM/conductor build and test jobs remain authoritative.
 
 Full generated-workspace validation, including the heavier `xcodebuild -list` check in `make xcode-validate`, is explicit. Run it locally when needed, let `pr-ready` select it for executable Xcode workspace boundary changes, or use the dedicated `Xcode Workspace Validation` workflow for manual, scheduled, PR path-filtered, and `main` path-filtered hosted coverage. The hosted workflow also tracks this documentation page; docs-only changes do not broaden the local `pr-ready` lane.

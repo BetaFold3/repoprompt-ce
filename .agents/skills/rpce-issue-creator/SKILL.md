@@ -32,14 +32,14 @@ Route the affected surface without guessing a fix:
 - Product flow or UI: `Sources/RepoPrompt/Features/<Feature>`
 - App lifecycle, launch, or composition: `Sources/RepoPrompt/App`
 - Cross-cutting file, process, security, MCP, or platform behavior: `Sources/RepoPrompt/Infrastructure/<Area>`
-- CLI-only behavior: `Sources/RepoPromptMCP`
-- Shared app/CLI MCP wire contract: `Sources/RepoPromptShared/MCP`
+- CLI executable entry behavior: `Sources/RepoPromptMCP`; importable CLI implementation: `Packages/RepoPromptCore/Sources/RepoPromptMCPCore`
+- Shared app/client MCP wire contract: `Packages/RepoPromptCore/Sources/RepoPromptShared/MCP`; reusable bootstrap client plumbing: `Packages/RepoPromptCore/Sources/RepoPromptMCPClientKit`
 - Provider catalog, codec, or translation behavior: `Packages/RepoPromptAgentProviders`
 
 ## Use CE-Specific Evidence
 
 - Distinguish the RepoPrompt CE app and `rpce-cli-debug` from production/non-CE `rp-cli` or `rp-cli-debug`, which may connect to a different app. State which executable and app build reproduced the behavior.
-- Prefer coordinated, boundary-specific evidence: focused `make dev-test FILTER=<Suite>` for root logic, `make dev-provider-test` for provider-package behavior, `make dev-swift-build PRODUCT=RepoPrompt|repoprompt-mcp` for build boundaries, and `make dev-smoke` only for live CE app/MCP wiring when an appropriate debug app is already running.
+- Prefer coordinated, boundary-specific evidence: focused `make dev-test FILTER=<Suite>` for root logic, `make dev-core-test FILTER=<Suite>` for Core-package behavior, `make dev-provider-test` for provider-package behavior, `make dev-swift-build PRODUCT=RepoPrompt|repoprompt-mcp|repoprompt-gateway` for build boundaries, and `make dev-smoke` only for live CE app/MCP wiring when an appropriate debug app is already running.
 - Use the minimum bounded evidence needed: command plus result, a short redacted excerpt, counts, timings, or hashes. Never paste entire daemon logs, crash dumps, generated diagnostics, or raw command output.
 - Treat DEBUG-only MCP diagnostics such as `__repoprompt_debug_diagnostics` and diagnostic `app_settings` as sensitive. Prefer structured bounded snapshots, and do not assume built-in redaction makes raw output publishable.
 - Do not enable raw provider logging or launch, relaunch, or stop a visible app merely to draft an issue. If local raw capture is genuinely necessary, require separate approval where repository rules demand it, keep it bounded and owner-only, redact the distilled evidence, and clean up the capture.

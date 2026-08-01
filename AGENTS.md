@@ -5,7 +5,7 @@ RepoPrompt CE is a Swift Package macOS app and agent orchestrator. Read only the
 ## Commands
 - Environment: `make doctor`
 - Build: `make dev-build`
-- Test (all): `make dev-test` · Test (single): `make dev-test FILTER=<SuiteName>`
+- Test (all): `make dev-test` · Test (single): `make dev-test FILTER=<SuiteName>` · Test (instant artifact re-run, not source validation): `make dev-test-artifact FILTER=<SuiteName>` · Test (core package): `make dev-core-test`
 - Lint: `make dev-lint` · Format Swift: `make dev-format`
 - Run locally: `make dev-run`
 - Repository guardrails: `make guardrails` · Agent-context structure: `Scripts/check-agent-context`

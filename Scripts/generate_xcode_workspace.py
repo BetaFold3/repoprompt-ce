@@ -91,6 +91,14 @@ def _by_name_dependencies(target: dict) -> list[str]:
     ]
 
 
+def _product_dependencies(target: dict) -> set[tuple[str, str]]:
+    return {
+        (dependency["product"][0], dependency["product"][1])
+        for dependency in target.get("dependencies", [])
+        if dependency.get("product")
+    }
+
+
 def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if manifest.get("name") != "RepoPromptCE":
         raise GeneratorError("Package.swift must define package 'RepoPromptCE'")
@@ -111,9 +119,7 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         "RepoPromptApp",
         "RepoPromptMCP",
         "RepoPromptGateway",
-        "RepoPromptMCPClientKit",
         "RepoPromptRemoteWire",
-        "RepoPromptShared",
         "RepoPromptC",
         "CSwiftPCRE2",
         "TreeSitterScannerSupport",
@@ -155,23 +161,47 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
     if repo_prompt_remote_wire.get("dependencies", []):
         raise GeneratorError("Target 'RepoPromptRemoteWire' must have no dependencies")
 
-    expected_test_dependencies = {
-        "RepoPromptApp",
-        "RepoPromptMCP",
-        "RepoPromptGateway",
-        "RepoPromptMCPClientKit",
-        "RepoPromptRemoteWire",
-        "RepoPromptShared",
+    expected_core_products = {
+        ("RepoPromptShared", "RepoPromptCore"),
+        ("RepoPromptMCPClientKit", "RepoPromptCore"),
+        ("RepoPromptMCPCore", "RepoPromptCore"),
     }
+    repo_prompt_mcp = targets["RepoPromptMCP"]
+    if _by_name_dependencies(repo_prompt_mcp) or _product_dependencies(repo_prompt_mcp) != {
+        ("RepoPromptMCPCore", "RepoPromptCore")
+    }:
+        raise GeneratorError(
+            "RepoPromptMCP must depend only on the RepoPromptMCPCore package product"
+        )
+
+    repo_prompt_gateway = targets["RepoPromptGateway"]
+    gateway_core_products = {
+        dependency
+        for dependency in _product_dependencies(repo_prompt_gateway)
+        if dependency[1] == "RepoPromptCore"
+    }
+    if gateway_core_products != {
+        ("RepoPromptShared", "RepoPromptCore"),
+        ("RepoPromptMCPClientKit", "RepoPromptCore"),
+    } or "RepoPromptRemoteWire" not in _by_name_dependencies(repo_prompt_gateway):
+        raise GeneratorError(
+            "RepoPromptGateway must retain RemoteWire plus Shared and ClientKit package products"
+        )
+
     repo_prompt_tests = targets["RepoPromptTests"]
+    expected_test_targets = {
+        "RepoPromptApp",
+        "RepoPromptGateway",
+        "RepoPromptRemoteWire",
+    }
     if (
-        len(repo_prompt_tests.get("dependencies", [])) != len(expected_test_dependencies)
-        or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_dependencies
+        len(repo_prompt_tests.get("dependencies", [])) != 6
+        or set(_by_name_dependencies(repo_prompt_tests)) != expected_test_targets
+        or _product_dependencies(repo_prompt_tests) != expected_core_products
     ):
         raise GeneratorError(
-            "RepoPromptTests must depend on RepoPromptApp, RepoPromptMCP, "
-            "RepoPromptGateway, RepoPromptMCPClientKit, RepoPromptRemoteWire, "
-            "and RepoPromptShared"
+            "RepoPromptTests must depend on RepoPromptApp, RepoPromptGateway, "
+            "RepoPromptRemoteWire, and the RepoPromptCore Shared, ClientKit, and MCP products"
         )
 
     unsafe_flags: list[list[str]] = []
@@ -576,8 +606,8 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
   `REPOPROMPT_XCODE_TEST_FILTER` before building to run a focused filter.
 
 The root Swift package reference provides source browsing and indexing. Its native Xcode
-test action is not the supported test workflow because Xcode does not expose the
-`RepoPromptMCP` executable dependency as an importable test module. The vendored Sparkle
+test action is not the supported test workflow; the delegated scheme preserves conductor
+coordination across the root and extracted RepoPromptCore package tests. The vendored Sparkle
 XCFramework also declares an omitted dSYMs directory; this generator deliberately does
 not mutate `Vendor/` to compensate. Use the convenience schemes above.
 

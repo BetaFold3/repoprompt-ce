@@ -7,7 +7,9 @@ included:
   - Sources/RepoPrompt
   - Sources/RepoPromptExecutable
   - Sources/RepoPromptMCP
-  - Sources/RepoPromptShared
+  - Packages/RepoPromptCore/Package.swift
+  - Packages/RepoPromptCore/Sources
+  - Packages/RepoPromptCore/Tests
   - Tests/RepoPromptTests
   - Packages/RepoPromptAgentProviders/Package.swift
   - Packages/RepoPromptAgentProviders/Sources
@@ -23,6 +25,7 @@ excluded:
   - Pods
   - Vendor
   - Packages/RepoPromptAgentProviders/.build
+  - Packages/RepoPromptCore/.build
   - Sources/CSwiftPCRE2
   - Sources/RepoPromptC
   - Sources/RepoPrompt/ThirdParty/SwiftPCRE2

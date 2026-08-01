@@ -20,6 +20,7 @@ CI_APP_TEST_RUNNER_SELFTEST_TARGET = "ci-app-test-runner-selftest"
 SWIFT_LINT_TARGET = "dev-lint"
 ROOT_TEST_TARGET = "dev-test"
 PROVIDER_TEST_TARGET = "dev-provider-test"
+CORE_TEST_TARGET = "dev-core-test"
 REPOPROMPT_BUILD_TARGET = "dev-swift-build PRODUCT=RepoPrompt"
 MCP_BUILD_TARGET = "dev-swift-build PRODUCT=repoprompt-mcp"
 XCODE_GENERATOR_TEST_TARGET = "xcode-generator-test"
@@ -30,6 +31,7 @@ HEAVYWEIGHT_MAKE_TARGETS = [
     SWIFT_LINT_TARGET,
     ROOT_TEST_TARGET,
     PROVIDER_TEST_TARGET,
+    CORE_TEST_TARGET,
     REPOPROMPT_BUILD_TARGET,
     MCP_BUILD_TARGET,
     XCODE_GENERATOR_TEST_TARGET,
@@ -285,9 +287,9 @@ class ContributionPreflightTests(unittest.TestCase):
                 [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, MCP_BUILD_TARGET],
             ),
             (
-                "shared Swift path",
-                "Sources/RepoPromptShared/MCP/Example.swift",
-                [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, MCP_BUILD_TARGET],
+                "Core package Swift path",
+                "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/Example.swift",
+                [GUARDRAILS_TARGET, SWIFT_LINT_TARGET, CORE_TEST_TARGET, MCP_BUILD_TARGET],
             ),
             (
                 "non-selected docs path",

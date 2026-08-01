@@ -95,7 +95,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
     def test_generated_readme_documents_native_xcode_limitations(self) -> None:
         readme = self.outputs[Path("README.md")].decode()
         self.assertIn("not mutate `Vendor/`", readme)
-        self.assertIn("RepoPromptMCP", readme)
+        self.assertIn("RepoPromptCore", readme)
 
     def test_manifest_preserves_thin_app_target_topology(self) -> None:
         products = {product["name"]: product for product in self.manifest["products"]}
@@ -112,13 +112,14 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertEqual(targets["RepoPromptRemoteWire"].get("dependencies", []), [])
         self.assertEqual(
             set(generator._by_name_dependencies(targets["RepoPromptTests"])),
+            {"RepoPromptApp", "RepoPromptGateway", "RepoPromptRemoteWire"},
+        )
+        self.assertEqual(
+            generator._product_dependencies(targets["RepoPromptTests"]),
             {
-                "RepoPromptApp",
-                "RepoPromptMCP",
-                "RepoPromptGateway",
-                "RepoPromptMCPClientKit",
-                "RepoPromptRemoteWire",
-                "RepoPromptShared",
+                ("RepoPromptShared", "RepoPromptCore"),
+                ("RepoPromptMCPClientKit", "RepoPromptCore"),
+                ("RepoPromptMCPCore", "RepoPromptCore"),
             },
         )
         self.assertNotIn("RepoPrompt", generator._by_name_dependencies(targets["RepoPromptTests"]))
@@ -290,9 +291,9 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
 
         missing_target = deepcopy(self.manifest)
         missing_target["targets"] = [
-            target for target in missing_target["targets"] if target["name"] != "RepoPromptShared"
+            target for target in missing_target["targets"] if target["name"] != "RepoPromptMCP"
         ]
-        with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptShared'"):
+        with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptMCP'"):
             generator.validate_manifest(missing_target, generator.REPO_ROOT)
 
         missing_app_target = deepcopy(self.manifest)

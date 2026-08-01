@@ -97,6 +97,57 @@ class OutputSummarizerTests(unittest.TestCase):
         self.assertTrue(any("FooTests.testBar" in line for line in test_failures))
         self.assertTrue(any("Executed 1 test" in line for line in test_failures))
 
+    def test_xctest_active_deadline_summary_preserves_budget_diagnostic(self) -> None:
+        deadline = (
+            "XCTest ACTIVE-METHOD deadline triggered; "
+            "active test method=-[RepoPromptTests.FooTests testBar]; "
+            "budget=90.000s; budget source=ledger-derived; previous=<none>"
+        )
+
+        summary = summarize("test", "failed", 70, [deadline + "\n"])
+
+        self.assertIn(deadline, section(summary, "Timeout or cancellation"))
+
+    def test_completion_header_includes_global_heavy_slot_wait(self) -> None:
+        payload = {
+            "ticket": "ticket",
+            "operation": "test",
+            "args": {},
+            "state": "completed",
+            "exitCode": 0,
+            "logPath": "/tmp/job.log",
+            "globalHeavySlotWaitSeconds": 2.5,
+            "outputSummary": {"headline": "completed successfully", "sections": []},
+        }
+
+        rendered = rendered_terminal_output(payload)
+
+        self.assertIn("global-wait=2.5s", rendered)
+
+    def test_stale_artifact_pass_wording_only_renders_for_completed_exit_zero(self) -> None:
+        base = {
+            "ticket": "ticket",
+            "operation": "test-artifact",
+            "args": {"filter": "AlphaTests"},
+            "logPath": "/tmp/job.log",
+            "artifactScope": "stale",
+            "artifactScopeDifferences": ["dirty digest"],
+            "artifactScopeMessage": (
+                "artifact_scope: stale — current source was NOT validated; differs: dirty digest"
+            ),
+            "outputSummary": {"headline": "test result", "sections": []},
+        }
+
+        completed = rendered_terminal_output({**base, "state": "completed", "exitCode": 0})
+        failed = rendered_terminal_output({**base, "state": "failed", "exitCode": 1})
+        canceled = rendered_terminal_output({**base, "state": "canceled", "exitCode": 130})
+
+        self.assertIn("artifact passed", completed)
+        self.assertNotIn("artifact passed", failed)
+        self.assertNotIn("artifact passed", canceled)
+        self.assertIn("current source was NOT validated", failed)
+        self.assertIn("current source was NOT validated", canceled)
+
     def test_style_findings_extract_swiftlint_lines(self) -> None:
         summary = summarize(
             "lint",
@@ -501,6 +552,17 @@ class OutputSummarizerTests(unittest.TestCase):
             payload = state.list_jobs(None)
 
         self.assertNotIn("outputSummary", payload["jobs"][0])
+
+
+class JobTicketEnvEligibilityTests(unittest.TestCase):
+    def test_direct_swift_invocations_do_not_receive_job_ticket_env(self) -> None:
+        self.assertFalse(conductor.job_ticket_env_eligible(["swift", "test", "--filter", "X"]))
+        self.assertFalse(conductor.job_ticket_env_eligible(["/usr/bin/swift", "build", "--product", "RepoPrompt"]))
+
+    def test_delegated_scripts_receive_job_ticket_env(self) -> None:
+        self.assertTrue(conductor.job_ticket_env_eligible(["/repo/Scripts/package_app.sh", "debug"]))
+        self.assertTrue(conductor.job_ticket_env_eligible(["python3", "Scripts/debug_app_process.py"]))
+        self.assertTrue(conductor.job_ticket_env_eligible([]))
 
 
 if __name__ == "__main__":

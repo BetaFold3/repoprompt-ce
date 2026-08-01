@@ -77,7 +77,7 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 10)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 12)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -404,6 +404,31 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertFalse(job.process_group_identity_confirmed)
         self.assertIn("terminating process tree: unverified group", "".join(job.tail))
         self.assertNotIn("terminating process group: unverified group", "".join(job.tail))
+
+    def test_process_group_signal_refuses_reused_root_pid_identity(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "job-pgid-reused", "fixture", {}, ["build"], job_state="running")
+        job.process_pid = 12345
+        job.process_pgid = 12345
+        job.process_start = "expected-start"
+        job.tracked_processes[12345] = "expected-start"
+        state.jobs[job.ticket] = job
+
+        with mock.patch.object(
+            conductor,
+            "process_group_snapshot",
+            return_value={12345: (1, "expected-start")},
+        ), mock.patch.object(
+            conductor,
+            "process_table_snapshot",
+            return_value={12345: (1, "reused-start")},
+        ), mock.patch.object(conductor.os, "killpg") as killpg:
+            with state.condition:
+                state._terminate_process_group_locked(job, reason="reused root")
+
+        killpg.assert_not_called()
+        self.assertIn("recorded child identity no longer matches", "".join(job.tail))
 
     def test_cancel_signals_process_group_for_reparented_descendant(self) -> None:
         tmp, state = self.make_state()
@@ -899,6 +924,9 @@ class LifecycleQueueTests(LifecycleTestCase):
             with state.condition:
                 self.assertEqual(state.jobs[ticket].state, "running")
                 self.assertIsNone(state.jobs[ticket].process_started_at)
+                status_payload = state._job_payload_locked(state.jobs[ticket], include_tail=False)
+                self.assertEqual(status_payload["state"], "waiting-heavy-slot")
+                self.assertIsNotNone(status_payload["globalHeavySlotWaitSeconds"])
             state.job_cancel(ticket, None)
             job = self.wait_for_terminal_job(state, ticket)
 
@@ -908,6 +936,32 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertIsNone(job.process_pid)
         self.assertIsNone(job.process_started_at)
         self.assertIn("job canceled before global heavy slot", "".join(job.tail))
+
+    def test_xctest_slot_wait_uses_derived_state_and_renders_holder(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(
+            state,
+            "xctest-wait",
+            "test-artifact",
+            {"filter": "AlphaTests"},
+            ["build"],
+            job_state="running",
+        )
+        job.global_xctest_slot_path = "/tmp/global-xctest-0.lock"
+        job.global_xctest_slot_holder = "pid=123 ticket=holder"
+        state.jobs[job.ticket] = job
+
+        with state.lock:
+            payload = state._job_payload_locked(job, include_tail=False)
+        listed = state.list_jobs("waiting-xctest-slot")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            conductor.render_job(payload, include_tail=False)
+
+        self.assertEqual(payload["state"], "waiting-xctest-slot")
+        self.assertEqual([item["ticket"] for item in listed["jobs"]], [job.ticket])
+        self.assertIn("xctest:    /tmp/global-xctest-0.lock", output.getvalue())
+        self.assertIn("holder:    pid=123 ticket=holder", output.getvalue())
 
     def test_socket_parent_does_not_shard_global_heavy_slots(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -1016,7 +1070,931 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual([row.split()[0:2] for row in rows], [["start", "a"], ["end", "a"], ["start", "b"], ["end", "b"]])
 
 
+class ConductorTestContractTests(LifecycleTestCase):
+    LEDGER_HEADER = "method_id\ttarget\tsuite\tmethod\n"
+
+    def write_ledger(self, root: Path) -> None:
+        ledger = root / "Scripts" / "Fixtures" / "test-suite-contract-ledger.tsv"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(
+            self.LEDGER_HEADER
+            + "root/RepoPromptTests.AlphaTests/testOne\troot\tRepoPromptTests.AlphaTests\ttestOne\n"
+            + "root/RepoPromptTests.BetaTests/testTwo\troot\tRepoPromptTests.BetaTests\ttestTwo\n"
+            + "root/RepoPromptTests.GammaTests/testThree\troot\tRepoPromptTests.GammaTests\ttestThree\n"
+            + "core/RepoPromptCoreTests.CoreTests/testCore\tcore\tRepoPromptCoreTests.CoreTests\ttestCore\n",
+            encoding="utf-8",
+        )
+
+    def test_filter_preflight_accepts_suite_and_method_forms(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_ledger(root)
+            for filter_value in [
+                "AlphaTests",
+                "RepoPromptTests.AlphaTests",
+                "AlphaTests/testOne",
+                "RepoPromptTests.AlphaTests/testOne",
+                "Alpha.*testOne",
+            ]:
+                with self.subTest(filter=filter_value):
+                    conductor.preflight_test_filter(root, "test", filter_value)
+            conductor.preflight_test_filter(root, "core-test", "CoreTests/testCore")
+
+    def test_filter_preflight_garbage_exits_64_fast_with_three_suggestions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env["REPOPROMPT_DEV_DAEMON_STATE_DIR"] = str(Path(tmp) / "state")
+            started = time.monotonic()
+            completed = subprocess.run(
+                [sys.executable, str(Path(conductor.__file__)), "test", "--filter", "DefinitelyNoSuchSuite"],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=10.0,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(completed.returncode, 64, completed.stdout + completed.stderr)
+        self.assertLess(elapsed, 5.0)
+        self.assertIn("Closest ledger suites:", completed.stderr)
+        suggestion_text = completed.stderr.split("Closest ledger suites:", 1)[1].split(". Set", 1)[0]
+        self.assertEqual(len(suggestion_text.split(",")), 3)
+        self.assertIn("RPCE_ALLOW_UNKNOWN_FILTER=1", completed.stderr)
+
+    def test_filter_preflight_override_bypasses_unknown_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"RPCE_ALLOW_UNKNOWN_FILTER": "1"}, clear=False
+        ), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            conductor.preflight_test_filter(Path(tmp), "test", "UnknownTests")
+
+        self.assertIn("skipping curated test filter preflight", stderr.getvalue())
+
+    def test_filter_preflight_source_fallback_warns_and_allows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.write_ledger(root)
+            source = root / "Tests" / "RepoPromptTests" / "UncuratedTests.swift"
+            source.parent.mkdir(parents=True)
+            source.write_text("final class UncuratedTests: XCTestCase {}\n", encoding="utf-8")
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                conductor.preflight_test_filter(root, "test", "RepoPromptTests.UncuratedTests")
+
+        self.assertIn("Suite 'UncuratedTests' found in sources but not in the curated ledger", stderr.getvalue())
+        self.assertIn("surgical ledger update", stderr.getvalue())
+
+    def test_filtered_test_timeout_defaults_to_twenty_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            filtered = registry.prepare({"operation": "test", "args": {"filter": "AlphaTests"}})
+            unfiltered = registry.prepare({"operation": "test", "args": {}})
+            overridden = registry.prepare(
+                {"operation": "provider-test", "args": {"filter": "AlphaTests"}, "timeout": 7.0}
+            )
+            core_filtered = registry.prepare({"operation": "core-test", "args": {"filter": "AlphaTests"}})
+
+        self.assertEqual(filtered[-1], conductor.FILTERED_TEST_TIMEOUT_SECONDS)
+        self.assertEqual(unfiltered[-1], conductor.MEDIUM_TIMEOUT_SECONDS)
+        self.assertEqual(overridden[-1], 7.0)
+        self.assertEqual(core_filtered[-1], conductor.FILTERED_TEST_TIMEOUT_SECONDS)
+
+    def initialize_git_repo(self, root: Path) -> Path:
+        source = root / "Tracked.swift"
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        source.write_text("let value = 1\n", encoding="utf-8")
+        (root / ".gitignore").write_text(
+            ".build/\njobs/\nmachine-locks/\nrunning.json\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "Tracked.swift", ".gitignore"], cwd=root, check=True)
+        subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=Conductor Tests",
+                "-c",
+                "user.email=conductor-tests@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "fixture",
+            ],
+            cwd=root,
+            check=True,
+        )
+        return source
+
+    def create_test_artifact(self, root: Path, arch: str = "testarch", contents: bytes = b"test executable") -> Path:
+        artifact = root / ".build" / f"{arch}-apple-macosx" / "debug" / "RepoPromptCEPackageTests.xctest"
+        executable = artifact / "Contents" / "MacOS" / "RepoPromptCEPackageTests"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(contents)
+        return executable
+
+    def create_test_resource_bundle(self, root: Path, arch: str = "testarch") -> Path:
+        resource = (
+            root
+            / ".build"
+            / f"{arch}-apple-macosx"
+            / "debug"
+            / "RepoPromptCE_RepoPromptTests.bundle"
+            / "fixture.txt"
+        )
+        resource.parent.mkdir(parents=True)
+        resource.write_text("resource version one\n", encoding="utf-8")
+        return resource
+
+    def test_source_snapshot_hashes_untracked_file_contents(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        untracked = state.paths.repo_root / "Sources" / "New.swift"
+        untracked.parent.mkdir(parents=True)
+        untracked.write_text("let value = 1\n", encoding="utf-8")
+
+        first = conductor.source_snapshot(state.paths.repo_root)
+        untracked.write_text("let value = 2\n", encoding="utf-8")
+        second = conductor.source_snapshot(state.paths.repo_root)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(first["porcelain_sha256"], second["porcelain_sha256"])
+        self.assertNotEqual(
+            first["dirty_file_sha256"]["Sources/New.swift"],
+            second["dirty_file_sha256"]["Sources/New.swift"],
+        )
+
+    def test_source_snapshot_changes_when_dirty_symlink_is_retargeted(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        link = state.paths.repo_root / "Sources" / "Current.swift"
+        link.parent.mkdir(parents=True)
+        link.symlink_to("First.swift")
+
+        first = conductor.source_snapshot(state.paths.repo_root)
+        link.unlink()
+        link.symlink_to("Second.swift")
+        second = conductor.source_snapshot(state.paths.repo_root)
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertEqual(first["porcelain_sha256"], second["porcelain_sha256"])
+        self.assertNotEqual(
+            first["dirty_file_sha256"]["Sources/Current.swift"],
+            second["dirty_file_sha256"]["Sources/Current.swift"],
+        )
+
+    def test_successful_root_test_job_records_latest_build_ticket(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        job = self.make_job(state, "root-test-ticket", "test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        command = [sys.executable, "-u", "-c", "print('root tests passed', flush=True)"]
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(command, ["build"], state.paths.repo_root, os.environ.copy(), 5.0),
+            ),
+            mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+            mock.patch.object(
+                conductor,
+                "artifact_toolchain_snapshot",
+                return_value={"swift_version": "Swift test", "arch": "testarch", "config": "debug"},
+            ),
+        ):
+            state._run_job(job.ticket)
+
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertTrue(ticket_path.is_file())
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+        self.assertEqual(ticket["ticket_id"], job.ticket)
+        self.assertEqual(ticket["source_snapshot"]["dirty_file_sha256"], {})
+        self.assertEqual(ticket["env_gates"]["REPOPROMPT_ENABLE_SENTRY"], None)
+        self.assertEqual(ticket["toolchain"]["config"], "debug")
+        self.assertEqual(ticket["artifact_fingerprint"]["size"], len(b"test executable"))
+        self.assertIn("closure_manifest_sha256", ticket["artifact_fingerprint"])
+        self.assertEqual(ticket["artifact_fingerprint"]["closure_file_count"], 0)
+
+    def test_root_test_withholds_ticket_when_source_changes_during_successful_run(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        source = self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket_path.write_text('{"ticket_id":"old"}\n', encoding="utf-8")
+        job = self.make_job(state, "source-race", "test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        command = [
+            sys.executable,
+            "-u",
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('let value = 2\\n')",
+            str(source),
+        ]
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(command, ["build"], state.paths.repo_root, os.environ.copy(), 5.0),
+            ),
+            mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+            mock.patch.object(
+                conductor,
+                "artifact_toolchain_snapshot",
+                return_value={"swift_version": "Swift test", "arch": "testarch", "config": "debug"},
+            ),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertFalse(ticket_path.exists())
+        self.assertIn("ticket withheld: source changed during run", "".join(job.tail))
+
+    def test_failed_root_test_invalidates_prior_build_ticket_at_start(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket_path.write_text('{"ticket_id":"old"}\n', encoding="utf-8")
+        job = self.make_job(state, "failed-root", "test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        command = [sys.executable, "-u", "-c", "raise SystemExit(1)"]
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(command, ["build"], state.paths.repo_root, os.environ.copy(), 5.0),
+            ),
+            mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "failed")
+        self.assertFalse(ticket_path.exists())
+
+    def test_swift_build_invalidates_prior_build_ticket_at_start(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket_path.write_text('{"ticket_id":"old"}\n', encoding="utf-8")
+        job = self.make_job(state, "swift-build", "swift-build", {"product": "RepoPrompt"}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        command = [sys.executable, "-u", "-c", "raise SystemExit(1)"]
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(command, ["build"], state.paths.repo_root, os.environ.copy(), 5.0),
+            ),
+            mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "failed")
+        self.assertFalse(ticket_path.exists())
+
+    def test_ineligible_swift_child_drops_inherited_job_ticket(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        observed = state.paths.repo_root / "observed-ticket.txt"
+        swift = state.paths.repo_root / "swift"
+        swift.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(os.environ.get('REPOPROMPT_CONDUCTOR_JOB_TICKET', '<missing>'))\n",
+            encoding="utf-8",
+        )
+        swift.chmod(0o755)
+        inherited_env = os.environ.copy()
+        inherited_env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = "inherited-daemon-value"
+        job = self.make_job(state, "env-pop", "core-test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=([str(swift), str(observed)], ["build"], state.paths.repo_root, inherited_env, 5.0),
+            ),
+            mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertEqual(observed.read_text(encoding="utf-8"), "<missing>")
+
+    def test_test_artifact_refuses_without_ticket_with_exit_65(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            scripts = root / "Scripts"
+            scripts.mkdir(parents=True)
+            shutil.copy2(Path(conductor.__file__), scripts / "conductor.py")
+            shutil.copy2(SCRIPT_DIR / "debug_app_process.py", scripts / "debug_app_process.py")
+            ledger = scripts / "Fixtures" / "test-suite-contract-ledger.tsv"
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(
+                self.LEDGER_HEADER
+                + "root/RepoPromptTests.SyntheticTests/testMissingArtifact\troot\t"
+                "RepoPromptTests.SyntheticTests\ttestMissingArtifact\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["REPOPROMPT_DEV_DAEMON_STATE_DIR"] = str(Path(tmp) / "state")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(scripts / "conductor.py"),
+                    "test-artifact",
+                    "--filter",
+                    "RepoPromptTests.SyntheticTests/testMissingArtifact",
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=2.0,
+            )
+
+        self.assertEqual(completed.returncode, 65, completed.stdout + completed.stderr)
+        self.assertIn("run `make dev-test` first", completed.stderr)
+
+    def test_test_artifact_resource_bundle_swap_is_unavailable(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        resource = self.create_test_resource_bundle(state.paths.repo_root)
+        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
+        env = os.environ.copy()
+        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
+
+        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
+            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
+            self.assertEqual((ticket or {})["artifact_fingerprint"]["closure_file_count"], 1)
+            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+            replacement = resource.with_suffix(".replacement")
+            replacement.write_text("resource version two\n", encoding="utf-8")
+            os.replace(replacement, resource)
+            with self.assertRaisesRegex(conductor.ArtifactUnavailableError, "artifact closure"):
+                conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env)
+
+    def test_test_artifact_same_size_mtime_preserving_resource_swap_is_unavailable(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        resource = self.create_test_resource_bundle(state.paths.repo_root)
+        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
+        env = os.environ.copy()
+        ticket_job = self.make_job(state, "built-mtime", "test", {}, ["build"])
+
+        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
+            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
+            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+            original = resource.read_bytes()
+            original_stat = resource.stat()
+            mutated = bytearray(original)
+            mutated[0] = (mutated[0] + 1) % 256
+            self.assertEqual(len(mutated), len(original))
+            resource.write_bytes(bytes(mutated))
+            os.utime(resource, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+            self.assertEqual(resource.stat().st_size, original_stat.st_size)
+            self.assertEqual(resource.stat().st_mtime_ns, original_stat.st_mtime_ns)
+            with self.assertRaisesRegex(conductor.ArtifactUnavailableError, "artifact closure"):
+                conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env)
+
+    def test_test_artifact_scope_is_current_then_stale_after_source_mutation(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        source = self.initialize_git_repo(state.paths.repo_root)
+        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
+        executable = self.create_test_artifact(state.paths.repo_root)
+        job = self.make_job(state, "ticket-source", "test", {}, ["build"])
+        env = os.environ.copy()
+
+        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
+            ticket = conductor.build_ticket_payload(state.paths.repo_root, job, env)
+            self.assertIsNotNone(ticket)
+            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+            current = conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env)
+            source.write_text("let value = 2\n", encoding="utf-8")
+            stale = conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env)
+
+        self.assertEqual(current["artifactScope"], "current")
+        self.assertEqual(current["artifactScopeDifferences"], [])
+        self.assertEqual(stale["artifactScope"], "stale")
+        self.assertIn("dirty digest", stale["artifactScopeDifferences"])
+        self.assertIn("current source was NOT validated", stale["artifactScopeMessage"])
+        summary = conductor._with_artifact_scope_summary(
+            {
+                "artifactScope": stale["artifactScope"],
+                "artifactScopeDifferences": stale["artifactScopeDifferences"],
+                "artifactScopeMessage": stale["artifactScopeMessage"],
+                "state": "completed",
+                "exitCode": 0,
+            },
+            {"headline": "completed successfully", "sections": []},
+        )
+        self.assertEqual(summary["artifactScope"], "stale")
+        self.assertIn("artifact passed", summary["headline"])
+        self.assertIn("current source was NOT validated", summary["headline"])
+        self.assertIn("dirty digest", summary["sections"][0]["lines"][0])
+
+        executable.write_bytes(b"different executable")
+        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
+            with self.assertRaisesRegex(conductor.ArtifactUnavailableError, "executable fingerprint"):
+                conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env)
+
+    def test_daemon_reverifies_artifact_after_xctest_slot_before_popen(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        resource = self.create_test_resource_bundle(state.paths.repo_root)
+        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
+        env = os.environ.copy()
+        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
+        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
+            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
+            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+            args = {"filter": "AlphaTests"}
+            args.update(conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env))
+        job = self.make_job(state, "slot-race", "test-artifact", args, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        slot_file = (state.paths.repo_root / "xctest-slot.lock").open("a+")
+        self.addCleanup(slot_file.close)
+
+        def acquire_after_mutation(_ticket: str) -> object:
+            resource.write_text("mutated while waiting for slot\n", encoding="utf-8")
+            return slot_file
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(["swift", "test"], ["build"], state.paths.repo_root, env, 5.0),
+            ),
+            mock.patch.object(state, "_acquire_global_xctest_slot", side_effect=acquire_after_mutation),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+            mock.patch.object(conductor.subprocess, "Popen") as popen,
+        ):
+            state._run_job(job.ticket)
+
+        popen.assert_not_called()
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, 65)
+        self.assertIn("artifact closure", job.error or "")
+
+    def test_test_artifact_claims_xctest_slot_not_heavy_and_records_run_duration(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        snapshot = {"head": "head", "porcelain_sha256": "clean", "dirty_file_sha256": {}}
+        executable = self.create_test_artifact(state.paths.repo_root)
+        artifact_path = executable.parents[2]
+        artifact_fingerprint = conductor.test_artifact_fingerprint(artifact_path)
+        job = self.make_job(
+            state,
+            "artifact-slot",
+            "test-artifact",
+            {
+                "filter": "AlphaTests",
+                "artifactScope": "current",
+                "artifactScopeDifferences": [],
+                "artifactScopeMessage": "artifact_scope: current",
+                "artifactTicketSourceSnapshot": snapshot,
+                "artifactPath": str(artifact_path),
+                "artifactFingerprint": artifact_fingerprint,
+            },
+            ["build"],
+            job_state="running",
+        )
+        state.jobs[job.ticket] = job
+        command = [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\", flush=True); "
+                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\", flush=True)"
+            ),
+        ]
+        lock_root = state.paths.repo_root / "machine-locks"
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(command, ["build"], state.paths.repo_root, os.environ.copy(), 5.0),
+            ),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+            mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root),
+            mock.patch.object(conductor, "source_snapshot", return_value=snapshot),
+        ):
+            state._run_job(job.ticket)
+
+        payload = job.to_payload()
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertIsNone(payload["globalHeavySlotPath"])
+        self.assertEqual(payload["xctestSlotPath"], str(lock_root / "global-xctest-0.lock"))
+        self.assertIsNotNone(payload["xctestSlotWaitSeconds"])
+        self.assertIsNotNone(payload["runPhaseSeconds"])
+        self.assertGreaterEqual(payload["runPhaseSeconds"], 0.0)
+        self.assertEqual(payload["artifactScope"], "current")
+        summarized = conductor.payload_with_output_summary(payload)
+        self.assertEqual(summarized["outputSummary"]["artifactScope"], "current")
+        self.assertEqual(summarized["outputSummary"]["sections"][0]["title"], "Artifact scope")
+
+    def test_test_artifact_post_run_source_change_marks_final_scope_stale(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        source = self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
+        env = os.environ.copy()
+        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
+        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
+            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
+            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+            args = {"filter": "AlphaTests"}
+            args.update(conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env))
+        job = self.make_job(state, "post-source-race", "test-artifact", args, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        command = [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('let value = 2\\n'); "
+                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\"); "
+                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\")"
+            ),
+            str(source),
+        ]
+        lock_root = state.paths.repo_root / "machine-locks"
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(command, ["build"], state.paths.repo_root, env, 5.0),
+            ),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+            mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertEqual(job.artifact_scope, "stale")
+        self.assertIn("post-run dirty digest", job.artifact_scope_differences)
+        self.assertNotIn("passed", job.artifact_scope_message or "")
+
+    def test_test_artifact_mutated_during_run_marks_scope_stale_without_failing(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        resource = self.create_test_resource_bundle(state.paths.repo_root)
+        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
+        env = os.environ.copy()
+        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
+        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
+            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
+            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+            args = {"filter": "AlphaTests"}
+            args.update(conductor.evaluate_test_artifact(state.paths.repo_root, state.paths.jobs_dir, env))
+        job = self.make_job(state, "artifact-race", "test-artifact", args, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+        command = [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('mutated during run\\n'); "
+                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\"); "
+                "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\")"
+            ),
+            str(resource),
+        ]
+        lock_root = state.paths.repo_root / "machine-locks"
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(command, ["build"], state.paths.repo_root, env, 5.0),
+            ),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+            mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertEqual(job.exit_code, 0)
+        self.assertEqual(job.artifact_scope, "stale")
+        self.assertIn("artifact mutated during run", job.artifact_scope_differences)
+        self.assertIn("current source was NOT validated", job.artifact_scope_message or "")
+
+    def test_enqueued_artifact_job_real_prepare_copies_stale_scope_to_result(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        source = self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        toolchain = {"swift_version": "Swift test", "arch": "testarch", "config": "debug"}
+        env = os.environ.copy()
+        ticket_job = self.make_job(state, "built", "test", {}, ["build"])
+        with mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain):
+            ticket = conductor.build_ticket_payload(state.paths.repo_root, ticket_job, env)
+            conductor.write_build_ticket(state.paths.jobs_dir / "build-ticket-root.json", ticket or {})
+
+        fake_bin = state.paths.jobs_dir / "fake-bin"
+        fake_bin.mkdir()
+        swift = fake_bin / "swift"
+        swift.write_text(
+            "#!/usr/bin/env python3\n"
+            "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\")\n"
+            "print(\"Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\")\n",
+            encoding="utf-8",
+        )
+        swift.chmod(0o755)
+        lock_root = state.paths.repo_root / "machine-locks"
+        real_popen = conductor.subprocess.Popen
+
+        def launch_fake_swift(argv: object, *args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            command = list(argv) if isinstance(argv, (list, tuple)) else argv
+            if isinstance(command, list) and command and command[0] == "swift":
+                command = [sys.executable, str(swift), *command[1:]]
+            return real_popen(command, *args, **kwargs)
+
+        with (
+            mock.patch.object(conductor, "artifact_toolchain_snapshot", return_value=toolchain),
+            mock.patch.object(conductor.subprocess, "Popen", side_effect=launch_fake_swift),
+            mock.patch.object(state, "_schedule_locked"),
+            mock.patch.object(state, "_xctest_watchdog_enabled", return_value=False),
+            mock.patch.object(conductor, "machine_lock_dir", return_value=lock_root),
+        ):
+            payload = state.enqueue({"operation": "test-artifact", "args": {"filter": "AlphaTests"}})
+            job = state.jobs[payload["ticket"]]
+            self.assertEqual(job.artifact_scope, "current")
+            source.write_text("let value = 2\n", encoding="utf-8")
+            job.state = "running"
+            state.queue.remove(job.ticket)
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "completed", job.result_summary)
+        self.assertEqual(job.artifact_scope, "stale")
+        self.assertIn("dirty digest", job.artifact_scope_differences)
+
+    def test_daemon_runner_preserves_artifact_unavailable_exit_65(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(
+            state,
+            "missing-ticket",
+            "test-artifact",
+            {"filter": "AlphaTests"},
+            ["build"],
+            job_state="running",
+        )
+        state.jobs[job.ticket] = job
+
+        state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, 65)
+        self.assertIn("build ticket is missing", job.error or "")
+        self.assertNotIn("daemon runner error", job.result_summary or "")
+
+    def test_zero_tests_postcondition_fails_filtered_success(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(
+            state,
+            "zero-tests",
+            "test",
+            {"filter": "AlphaTests"},
+            ["build"],
+            job_state="running",
+        )
+        job.log_path.write_text("Build complete! (0.1s)\nExecuted 0 tests\n", encoding="utf-8")
+
+        with state.condition:
+            state._finalize_process_exit_locked(job, 0)
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, conductor.XCTEST_ZERO_TESTS_FAILURE_EXIT_CODE)
+        self.assertEqual(
+            job.error,
+            "0 tests executed for filter 'AlphaTests' — filter matched nothing at runtime "
+            "(stale ledger entry, regex mismatch, or config-gated suite)",
+        )
+
+    def test_zero_tests_postcondition_allows_started_case(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(
+            state,
+            "one-test",
+            "test",
+            {"filter": "AlphaTests"},
+            ["build"],
+            job_state="running",
+        )
+        job.log_path.write_text(
+            "Test Case '-[RepoPromptTests.AlphaTests testOne]' started.\n"
+            "Test Case '-[RepoPromptTests.AlphaTests testOne]' passed (0.001 seconds).\n",
+            encoding="utf-8",
+        )
+
+        with state.condition:
+            state._finalize_process_exit_locked(job, 0)
+
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(job.exit_code, 0)
+
+    def test_zero_tests_postcondition_override_allows_empty_success(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(
+            state,
+            "allowed-zero-tests",
+            "provider-test",
+            {"filter": "AlphaTests"},
+            ["build"],
+            job_state="running",
+        )
+        job.env["RPCE_ALLOW_ZERO_TESTS"] = "1"
+        job.log_path.write_text("Executed 0 tests\n", encoding="utf-8")
+
+        with state.condition:
+            state._finalize_process_exit_locked(job, 0)
+
+        self.assertEqual(job.state, "completed")
+        self.assertEqual(job.exit_code, 0)
+
+
 class XCTestStallWatchdogTests(LifecycleTestCase):
+    def test_active_method_budget_known_small_runtime_uses_floor(self) -> None:
+        self.assertEqual(
+            conductor.xctest_active_method_budget(1.0, None, None),
+            (90.0, "ledger-derived", False),
+        )
+
+    def test_active_method_budget_known_large_runtime_uses_formula(self) -> None:
+        self.assertEqual(
+            conductor.xctest_active_method_budget(40.0, None, None),
+            (190.0, "ledger-derived", False),
+        )
+
+    def test_active_method_budget_empty_runtime_uses_flat_default(self) -> None:
+        self.assertEqual(
+            conductor.xctest_active_method_budget(None, None, None),
+            (180.0, "default", False),
+        )
+
+    def test_active_method_budget_flag_override_wins(self) -> None:
+        self.assertEqual(
+            conductor.xctest_active_method_budget(40.0, 12.0, None),
+            (12.0, "flag-overridden", False),
+        )
+
+    def test_active_method_budget_clamps_to_job_timeout(self) -> None:
+        self.assertEqual(
+            conductor.xctest_active_method_budget(100.0, None, 120.0),
+            (120.0, "ledger-derived", True),
+        )
+
+    def test_xctest_case_name_parser_supports_nested_module_names(self) -> None:
+        self.assertEqual(
+            conductor.parse_xctest_case_name(
+                "-[Company.Product.Tests.DeeplyNestedTests testDeadlineBudget]"
+            ),
+            ("Company.Product.Tests.DeeplyNestedTests", "testDeadlineBudget"),
+        )
+
+    def test_missing_runtime_ledger_logs_once_and_uses_default(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "missing-ledger", "test", {}, ["build"], job_state="running")
+        state.jobs[job.ticket] = job
+
+        for method in ["testOne", "testTwo"]:
+            state._record_xctest_progress_locked(
+                job,
+                f"Test Case '-[RepoPromptTests.MissingLedgerTests {method}]' started.\n",
+                observed_at=1.0,
+            )
+
+        log = job.log_path.read_text(encoding="utf-8")
+        self.assertEqual(log.count("XCTest runtime ledger unavailable"), 1)
+        self.assertEqual(job.xctest_active_method_budget_seconds, 180.0)
+        self.assertEqual(job.xctest_active_method_budget_source, "default")
+
+    def test_negative_runtime_ledger_entry_is_ignored(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        ledger = state.paths.repo_root / "Scripts" / "Fixtures" / "test-suite-contract-ledger.tsv"
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text(
+            "suite\tmethod\truntime_seconds\ttarget\n"
+            "RepoPromptTests.NegativeRuntimeTests\ttestMalformed\t-0.01\troot\n",
+            encoding="utf-8",
+        )
+        job = self.make_job(state, "negative-runtime", "test", {}, ["build"], job_state="running")
+
+        runtimes = state._load_xctest_method_runtimes_locked(job)
+        state._record_xctest_progress_locked(
+            job,
+            "Test Case '-[RepoPromptTests.NegativeRuntimeTests testMalformed]' started.\n",
+            observed_at=1.0,
+        )
+
+        self.assertEqual(runtimes, {})
+        self.assertEqual(job.xctest_active_method_budget_seconds, 180.0)
+        self.assertEqual(job.xctest_active_method_budget_source, "default")
+
+    def test_synthetic_runtime_ledger_controls_active_budget_and_unknown_method_survives(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        ledger = state.paths.repo_root / "Scripts" / "Fixtures" / "test-suite-contract-ledger.tsv"
+        ledger.parent.mkdir(parents=True)
+        suite = "Company.Product.Tests.SyntheticDeadlineTests"
+        ledger.write_text(
+            "suite\tmethod\truntime_seconds\ttarget\n"
+            f"{suite}\ttestLedgerHang\t0.001\tprovider\n",
+            encoding="utf-8",
+        )
+
+        def run_case(ticket: str, method: str, sleep_seconds: float) -> tuple[conductor.Job, float]:
+            test_name = f"-[{suite} {method}]"
+            child_code = (
+                "import time\n"
+                f"print(\"Test Case '{test_name}' started.\", flush=True)\n"
+                f"time.sleep({sleep_seconds!r})\n"
+            )
+            argv = [sys.executable, "-u", "-c", child_code]
+            job = self.make_job(state, ticket, "test", {}, ["build"], job_state="running")
+            job.timeout = 1.5
+            job.env["REPOPROMPT_DEV_XCTEST_ACTIVE_FLOOR_SECONDS"] = "0.1"
+            state.jobs[job.ticket] = job
+            state.active_lanes = {"build": job.ticket}
+
+            def prepare(_request: dict) -> tuple[list[str], list[str], Path, dict[str, str], float]:
+                return argv, ["build"], state.paths.repo_root, os.environ.copy(), 1.5
+
+            started_at = time.monotonic()
+            with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+                conductor, "XCTEST_ACTIVE_METHOD_RUNTIME_PADDING_SECONDS", 0.0
+            ), mock.patch.object(
+                conductor, "source_snapshot", return_value=None
+            ), mock.patch.object(
+                state.registry, "prepare", side_effect=prepare
+            ), mock.patch.object(
+                state, "_xctest_process_snapshot_locked", return_value=(None, [])
+            ), mock.patch.object(
+                state,
+                "_capture_xctest_stall_diagnostics",
+                side_effect=lambda _job, diagnostic, _identity: diagnostic,
+            ), mock.patch.multiple(
+                conductor,
+                TERMINATE_GRACE_SECONDS=0.05,
+                KILL_GRACE_SECONDS=0.2,
+                PROCESS_TREE_POLL_SECONDS=0.01,
+            ):
+                state._run_job(job.ticket)
+            return job, time.monotonic() - started_at
+
+        ledger_job, ledger_elapsed = run_case("ledger-budget", "testLedgerHang", 5.0)
+        unknown_job, unknown_elapsed = run_case("default-budget", "testUnknownMethod", 0.6)
+
+        ledger_method = f"-[{suite} testLedgerHang]"
+        self.assertEqual(ledger_job.state, "failed")
+        self.assertEqual(ledger_job.exit_code, conductor.XCTEST_STALL_FAILURE_EXIT_CODE)
+        self.assertIn(ledger_method, ledger_job.error or "")
+        self.assertIn("budget=0.100s", ledger_job.error or "")
+        self.assertIn("budget source=ledger-derived", ledger_job.error or "")
+        self.assertEqual(ledger_job.diagnostics[0]["budgetSource"], "ledger-derived")
+        self.assertGreaterEqual(ledger_elapsed, 0.07)
+        self.assertLess(ledger_elapsed, 1.2)
+
+        self.assertEqual(unknown_job.state, "completed")
+        self.assertEqual(unknown_job.exit_code, 0)
+        self.assertEqual(unknown_job.xctest_active_method_budget_source, "default")
+        self.assertGreater(unknown_elapsed, ledger_elapsed)
+
     def make_watchdog_job(
         self,
         state: conductor.DaemonState,
@@ -1035,16 +2013,106 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             with self.assertRaises(OSError):
                 os.fstat(fd)
 
+    def run_deadline_hang(
+        self,
+        ticket: str,
+        output_lines: list[str],
+        *,
+        active_budget: float | None = None,
+    ) -> conductor.Job:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        child_code = "import time\n" + "".join(
+            f"print({line!r}, flush=True)\n" for line in output_lines
+        ) + "time.sleep(30)\n"
+        argv = [sys.executable, "-u", "-c", child_code]
+        args: dict[str, object] = {}
+        if active_budget is not None:
+            args["xctestStallSeconds"] = active_budget
+        job = self.make_job(state, ticket, "test", args, ["build"], job_state="running")
+        job.timeout = 5.0
+        state.jobs[job.ticket] = job
+        state.active_lanes = {"build": job.ticket}
+
+        def prepare(_request: dict) -> tuple[list[str], list[str], Path, dict[str, str], float]:
+            return argv, ["build"], state.paths.repo_root, os.environ.copy(), 5.0
+
+        with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+            state.registry, "prepare", side_effect=prepare
+        ), mock.patch.object(
+            state,
+            "_xctest_process_snapshot_locked",
+            return_value=(None, []),
+        ), mock.patch.object(
+            state,
+            "_capture_xctest_stall_diagnostics",
+            side_effect=lambda _job, diagnostic, _identity: diagnostic,
+        ), mock.patch.multiple(
+            conductor,
+            XCTEST_STARTUP_DEADLINE_SECONDS=0.1,
+            XCTEST_BETWEEN_METHOD_DEADLINE_SECONDS=0.1,
+            TERMINATE_GRACE_SECONDS=0.1,
+            KILL_GRACE_SECONDS=0.5,
+            PROCESS_TREE_POLL_SECONDS=0.01,
+        ):
+            state._run_job(job.ticket)
+
+        return job
+
+    def test_startup_deadline_fires_after_build_complete_without_case_start(self) -> None:
+        job = self.run_deadline_hang("startup-deadline", ["Build complete! (0.01s)"])
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, conductor.XCTEST_STALL_FAILURE_EXIT_CODE)
+        self.assertIn("STARTUP", job.error or "")
+        self.assertIn("active test method=<none>", job.error or "")
+        self.assertEqual(job.diagnostics[0]["phase"], "startup")
+
+    def test_active_method_deadline_names_active_case(self) -> None:
+        test_name = "-[RepoPromptTests.DeadlineTests testActiveHang]"
+        job = self.run_deadline_hang(
+            "active-method-deadline",
+            ["Build complete! (0.01s)", f"Test Case '{test_name}' started."],
+            active_budget=0.1,
+        )
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, conductor.XCTEST_STALL_FAILURE_EXIT_CODE)
+        self.assertIn("ACTIVE-METHOD", job.error or "")
+        self.assertIn(test_name, job.error or "")
+        self.assertEqual(job.diagnostics[0]["phase"], "active-method")
+
+    def test_between_method_deadline_fires_after_case_end(self) -> None:
+        test_name = "-[RepoPromptTests.DeadlineTests testBetweenHang]"
+        job = self.run_deadline_hang(
+            "between-method-deadline",
+            [
+                "Build complete! (0.01s)",
+                f"Test Case '{test_name}' started.",
+                f"Test Case '{test_name}' passed (0.001 seconds).",
+            ],
+            active_budget=1.0,
+        )
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(job.exit_code, conductor.XCTEST_STALL_FAILURE_EXIT_CODE)
+        self.assertIn("BETWEEN-METHOD", job.error or "")
+        self.assertIn("active test method=<none>", job.error or "")
+        self.assertEqual(job.diagnostics[0]["phase"], "between-method")
+
     def test_output_transport_selection_is_pty_only_for_watchdog_non_list_tests(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
         jobs = [
             ("build", {}, "pipe"),
-            ("test", {}, "pipe"),
-            ("provider-test", {}, "pipe"),
+            ("test", {}, "pty"),
+            ("provider-test", {}, "pty"),
+            ("core-test", {}, "pty"),
+            ("test", {"xctestDeadlines": False}, "pipe"),
             ("test", {"list": True, "xctestStallSeconds": 5.0}, "pipe"),
             ("test", {"xctestStallSeconds": 5.0}, "pty"),
             ("provider-test", {"xctestStallSeconds": 5.0}, "pty"),
+            ("core-test", {"xctestStallSeconds": 5.0}, "pty"),
             ("test", {"xctestStallSeconds": 5.0, "xctestStallWakeProbe": True}, "pty"),
         ]
 
@@ -1207,7 +2275,7 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
 
         log = job.log_path.read_text(encoding="utf-8")
         marker = f"Test Case '{test_name}' started."
-        watchdog_line = "XCTest progress stall watchdog triggered"
+        watchdog_line = "XCTest ACTIVE-METHOD deadline triggered"
         self.assertEqual(job.state, "failed")
         self.assertEqual(job.exit_code, conductor.XCTEST_STALL_FAILURE_EXIT_CODE)
         self.assertEqual(job.progress_transport, "pty")
@@ -1276,6 +2344,8 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                     fake_process.wait.side_effect = cancel_then_exit
 
                 with mock.patch.object(conductor, "operation_requires_global_heavy_slot", return_value=False), mock.patch.object(
+                    conductor, "source_snapshot", return_value=None
+                ), mock.patch.object(
                     state, "_create_process_output_transport", return_value=transport
                 ), mock.patch.object(
                     conductor.subprocess,
@@ -1379,7 +2449,12 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                     observed_at=observed_at,
                 )
                 self.assertTrue(matched)
-                self.assertEqual(job.xctest_progress_deadline, observed_at + 5.0)
+                budget = (
+                    5.0
+                    if action == "started"
+                    else conductor.XCTEST_BETWEEN_METHOD_DEADLINE_SECONDS
+                )
+                self.assertEqual(job.xctest_progress_deadline, observed_at + budget)
 
     def test_unrelated_output_does_not_reset_xctest_progress_deadline(self) -> None:
         tmp, state = self.make_state()
@@ -1579,7 +2654,7 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         ) as wait_for_exit, mock.patch.object(state, "_kill_process_group_locked") as kill:
             state._terminate_xctest_stalled_job(job)
 
-        terminate.assert_called_once_with(job, reason="XCTest progress stall measurement invalid")
+        terminate.assert_called_once_with(job, reason="XCTest phase deadline fired")
         kill.assert_called_once()
         self.assertEqual(wait_for_exit.call_count, 2)
         self.assertIn("could not confirm descendant exit", job.log_path.read_text(encoding="utf-8"))
@@ -1596,29 +2671,74 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertLessEqual(len(data), 80)
         self.assertIn(b"conductor truncated", data)
 
-    def test_default_test_cli_and_jobs_leave_watchdog_disabled(self) -> None:
+    def test_default_test_cli_and_jobs_enable_deadlines(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
-        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+        with mock.patch.object(conductor, "preflight_test_filter"), mock.patch.object(
+            conductor, "enqueue_and_maybe_wait", return_value=0
+        ) as enqueue:
             code = conductor.handle_real_operation(state.paths, "test", ["--filter", "ExampleTests"])
 
         self.assertEqual(code, 0)
         self.assertEqual(enqueue.call_args.args[2], {"filter": "ExampleTests"})
         job = self.make_job(state, "default-test", "test", {}, ["build"], job_state="running")
-        self.assertFalse(state._xctest_watchdog_enabled(job))
-        self.assertFalse(
+        self.assertTrue(state._xctest_watchdog_enabled(job))
+        self.assertTrue(
             state._record_xctest_progress_locked(
                 job,
                 "Test Case '-[RepoPromptTests.ExampleTests testDefault]' started.\n",
                 observed_at=1.0,
             )
         )
-        self.assertIsNone(job.xctest_progress_deadline)
+        self.assertEqual(
+            job.xctest_progress_deadline,
+            1.0 + conductor.XCTEST_ACTIVE_METHOD_DEADLINE_SECONDS,
+        )
+
+    def test_test_deadline_opt_out_flag_and_environment_use_pipe(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "preflight_test_filter"), mock.patch.object(
+            conductor, "enqueue_and_maybe_wait", return_value=0
+        ) as enqueue:
+            code = conductor.handle_real_operation(
+                state.paths,
+                "test",
+                ["--filter", "ExampleTests", "--no-xctest-deadlines"],
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            enqueue.call_args.args[2],
+            {"filter": "ExampleTests", "xctestDeadlines": False},
+        )
+        flag_job = self.make_job(
+            state,
+            "flag-opt-out",
+            "test",
+            {"xctestDeadlines": False},
+            ["build"],
+            job_state="running",
+        )
+        env_job = self.make_job(
+            state,
+            "env-opt-out",
+            "test",
+            {},
+            ["build"],
+            job_state="running",
+        )
+        env_job.env["REPOPROMPT_DEV_XCTEST_DEADLINES"] = "0"
+        self.assertFalse(state._xctest_watchdog_enabled(flag_job))
+        self.assertFalse(state._xctest_watchdog_enabled(env_job))
+        self.assertEqual(state._create_process_output_transport(flag_job).kind, "pipe")
 
     def test_test_cli_forwards_test_product_for_focused_split_targets(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
-        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+        with mock.patch.object(conductor, "preflight_test_filter"), mock.patch.object(
+            conductor, "enqueue_and_maybe_wait", return_value=0
+        ) as enqueue:
             code = conductor.handle_real_operation(
                 state.paths,
                 "test",
@@ -1662,6 +2782,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         provider_argv, provider_lanes, provider_cwd, _env, _timeout = registry.prepare(
             {"operation": "provider-test", "args": {"list": True}}
         )
+        core_argv, core_lanes, core_cwd, _env, _timeout = registry.prepare(
+            {"operation": "core-test", "args": {"list": True}}
+        )
 
         self.assertEqual(root_argv, ["swift", "test", "list"])
         self.assertEqual(root_lanes, ["build"])
@@ -1672,6 +2795,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             provider_cwd,
             state.paths.repo_root / "Packages" / "RepoPromptAgentProviders",
         )
+        self.assertEqual(core_argv, ["swift", "test", "list"])
+        self.assertEqual(core_lanes, ["build"])
+        self.assertEqual(core_cwd, state.paths.repo_root / "Packages" / "RepoPromptCore")
 
     def test_test_list_rejects_filters_and_stall_diagnostics(self) -> None:
         tmp, state = self.make_state()
@@ -1743,7 +2869,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
     def test_test_cli_forwards_watchdog_options_and_requires_threshold(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
-        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+        with mock.patch.object(conductor, "preflight_test_filter"), mock.patch.object(
+            conductor, "enqueue_and_maybe_wait", return_value=0
+        ) as enqueue:
             code = conductor.handle_real_operation(
                 state.paths,
                 "test",
@@ -1905,6 +3033,9 @@ class ProcessTreeCancellationTests(LifecycleTestCase):
         registry = json.loads(state.paths.running_processes_path.read_text(encoding="utf-8"))
         self.assertEqual(registry["processes"], [])
         self.assertNotIn("build", state.active_lanes)
+        cleanup_log = job.log_path.read_text(encoding="utf-8")
+        self.assertIn("genuine setsid escapee(s)", cleanup_log)
+        self.assertIn(f"setsid escapee pid={child_pid}", cleanup_log)
         if termination == "cancel":
             self.assertEqual(job.state, "canceled")
             self.assertEqual(job.exit_code, 130)

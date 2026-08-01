@@ -6,7 +6,7 @@ import XCTest
 final class WorkspaceSwitchPresentationTests: XCTestCase {
     func testStaleConfirmationDismissalBindingCannotResolveReplacementConfirmation() async throws {
         let manager = makeComposition().workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         manager.registerSwitchSessionProvider(PresentationWorkspaceSwitchSessionProvider())
 
         let firstTarget = manager.createWorkspace(
@@ -47,7 +47,7 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
 
     func testBlockedResultsPublishSharedNoticeAndStaleDismissalCannotClearReplacement() async throws {
         let manager = makeComposition().workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
 
         manager.isRefreshing = true
         let firstTarget = manager.createWorkspace(
@@ -93,7 +93,7 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
 
     func testActiveWorkspaceRequestIsBlockedWithoutPublishingNotice() async throws {
         let manager = makeComposition().workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let active = try XCTUnwrap(manager.activeWorkspace)
 
         let result = await manager.requestWorkspaceSwitch(to: active, reason: "sameWorkspaceNoOp")
@@ -110,7 +110,7 @@ final class WorkspaceSwitchPresentationTests: XCTestCase {
 
     func testSuccessfulSwitchDoesNotClearUnrelatedBlockedNotice() async throws {
         let manager = makeComposition().workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
 
         manager.isRefreshing = true
         let blockedTarget = manager.createWorkspace(

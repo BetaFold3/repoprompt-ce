@@ -172,7 +172,7 @@ final class ContextBuilderSelectionTransactionTests: XCTestCase {
         let window = WindowState()
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         WindowStatesManager.shared.registerWindowState(window)
-        await window.workspaceManager.awaitInitialized()
+        try await window.workspaceManager.awaitInitialized(timeout: .seconds(60))
 
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ContextBuilderSelectionTransactionTests-\(name)-\(UUID().uuidString)")

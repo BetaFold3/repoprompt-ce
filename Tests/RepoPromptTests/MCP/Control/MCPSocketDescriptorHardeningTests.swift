@@ -857,15 +857,15 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
     func testNonImportableCLISourcesHardenDescriptorsAndFenceAdoptedSocketReconnects() throws {
         do {
-            let caseLabel = "testNonImportableCLISourcesUseSharedDescriptorHardening"
+            let caseLabel = "testImportableCoreSourcesUseSharedDescriptorHardening"
             let root = try RepoRoot.url()
-            let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
+            let main = try Self.sourceText("Packages/RepoPromptCore/Sources/RepoPromptMCPCore/RepoPromptMCPCore.swift", relativeTo: root)
             let interactive = try Self.sourceText(
-                "Sources/RepoPromptMCP/Interactive/InteractiveMCPClientSession.swift",
+                "Packages/RepoPromptCore/Sources/RepoPromptMCPCore/Interactive/InteractiveMCPClientSession.swift",
                 relativeTo: root
             )
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
+                "Packages/RepoPromptCore/Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 
@@ -882,11 +882,11 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         }
 
         do {
-            let caseLabel = "testNonImportableCLISourcesCaptureKillWatcherFDAndFenceAdoptedTransportReconnects"
+            let caseLabel = "testImportableCoreSourcesCaptureKillWatcherFDAndFenceAdoptedTransportReconnects"
             let root = try RepoRoot.url()
-            let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
+            let main = try Self.sourceText("Packages/RepoPromptCore/Sources/RepoPromptMCPCore/RepoPromptMCPCore.swift", relativeTo: root)
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
+                "Packages/RepoPromptCore/Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 
@@ -930,7 +930,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
                 relativeTo: root
             )
             let clientKitReader = try Self.sourceText(
-                "Sources/RepoPromptMCPClientKit/Shared/NewlineDelimitedSocketReader.swift",
+                "Packages/RepoPromptCore/Sources/RepoPromptMCPClientKit/Shared/NewlineDelimitedSocketReader.swift",
                 relativeTo: root
             )
 
@@ -959,7 +959,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             let caseLabel = "testClientKitTransportClaimsEarlyAndDelayedReaderCancellationExactlyOnce"
             let root = try RepoRoot.url()
             let transport = try Self.sourceText(
-                "Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
+                "Packages/RepoPromptCore/Sources/RepoPromptMCPClientKit/Transports/BootstrapSocketMCPTransport.swift",
                 relativeTo: root
             )
 

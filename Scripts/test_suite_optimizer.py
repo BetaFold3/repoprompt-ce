@@ -316,7 +316,9 @@ def conductor_command(
         raise OptimizerError("--filter cannot be used with list mode")
     if list_mode and test_product:
         raise OptimizerError("--test-product cannot be used with list mode")
-    operation = "test" if target == "root" else "provider-test"
+    operation = {"root": "test", "provider": "provider-test", "core": "core-test"}.get(target)
+    if operation is None:
+        raise OptimizerError(f"unsupported test target: {target}")
     command = [str(repo_root / "conductor"), operation]
     if list_mode:
         command.append("--list")
@@ -395,13 +397,17 @@ def source_roots(repo_root: Path, target: str) -> list[Path]:
         else:
             roots = []
         return roots or [tests_root / "RepoPromptTests"]
-    return [
-        repo_root
-        / "Packages"
-        / "RepoPromptAgentProviders"
-        / "Tests"
-        / "RepoPromptClaudeCompatibleProviderTests"
-    ]
+    if target == "provider":
+        return [
+            repo_root
+            / "Packages"
+            / "RepoPromptAgentProviders"
+            / "Tests"
+            / "RepoPromptClaudeCompatibleProviderTests"
+        ]
+    if target == "core":
+        return [repo_root / "Packages" / "RepoPromptCore" / "Tests" / "RepoPromptCoreTests"]
+    raise OptimizerError(f"unsupported test target: {target}")
 
 
 def source_files(repo_root: Path, target: str) -> list[Path]:
@@ -419,6 +425,8 @@ def domain_for_file(repo_root: Path, target: str, path: Path) -> str:
     relative = path.relative_to(root)
     if target == "provider":
         return f"Provider/{relative.parts[0] if len(relative.parts) > 1 else 'General'}"
+    if target == "core":
+        return f"Core/{relative.parts[0] if len(relative.parts) > 1 else 'General'}"
     return relative.parts[0] if len(relative.parts) > 1 else "Root"
 
 
@@ -491,7 +499,7 @@ def ledger_rows(
                 "primary_contract_id": "unreviewed",
                 "secondary_contract_tags": "",
                 "validation_class": "unreviewed",
-                "layer": "root_swiftpm" if test.target == "root" else "provider_package",
+                "layer": "root_swiftpm" if test.target == "root" else f"{test.target}_package",
                 "execution_tier": "routine" if test.target == "root" else "fast",
                 "scenario_count": "1",
                 "fixture_ids": "",
@@ -749,7 +757,20 @@ def source_domains_for_changed_path(path: str) -> set[str]:
         return {"CodeMap", "WorkspaceContext/CodeMap"}
     if len(parts) >= 3 and parts[0] == "Packages" and parts[1] == "RepoPromptAgentProviders":
         return {"Provider/Runtime", "Provider/SDK"}
+    if len(parts) >= 3 and parts[0] == "Packages" and parts[1] == "RepoPromptCore":
+        return {"MCP"}
     return set()
+
+
+def is_production_relevant_changed_path(path: str) -> bool:
+    parts = path.split("/")
+    if parts and parts[0] in {"Sources", "Tests"}:
+        return len(parts) >= 2
+    return (
+        len(parts) >= 4
+        and parts[0] == "Packages"
+        and parts[2] in {"Sources", "Tests"}
+    )
 
 
 DEFAULT_IMPACTED_RANGE = "default"
@@ -819,6 +840,7 @@ def impacted_tests(
     smoke_floor_suites: Sequence[str] = DEFAULT_SMOKE_FLOOR_SUITES,
     run_selected: bool = False,
     validate_live_list: bool = True,
+    allow_unmapped: bool = False,
 ) -> dict[str, Any]:
     rows = [row for row in read_ledger_rows(ledger) if row.target == "root"]
     live_ids: set[str] | None = None
@@ -839,11 +861,28 @@ def impacted_tests(
     broad_reasons: list[str] = []
     domains: set[str] = set()
     files = set(changed)
+    ledger_files = {row.file for row in rows if row.file}
+    unmapped: list[str] = []
     for path in changed:
-        if path.startswith(BROAD_IMPACT_PATH_PREFIXES):
+        broad_boundary = path.startswith(BROAD_IMPACT_PATH_PREFIXES)
+        if broad_boundary:
             broad_reasons.append(f"{path}: broad test/build/tooling boundary")
-        for domain in source_domains_for_changed_path(path):
-            domains.add(domain)
+        mapped_domains = source_domains_for_changed_path(path)
+        domains.update(mapped_domains)
+        if (
+            is_production_relevant_changed_path(path)
+            and path not in ledger_files
+            and not broad_boundary
+            and not mapped_domains
+        ):
+            unmapped.append(path)
+    if unmapped and not allow_unmapped:
+        raise OptimizerError(
+            "changed production paths map to no impacted-test domain: "
+            + ", ".join(unmapped)
+            + ". Add a mapping, run full `make dev-test`, or pass --allow-unmapped "
+            "to proceed with the smoke floor."
+        )
     if broad_reasons:
         full_count = len(rows)
         if run_selected:
@@ -868,6 +907,7 @@ def impacted_tests(
             "skipped_heavy_or_opt_in": [],
             "command": [str(repo_root / "conductor"), "test"],
             "run": None,
+            **({"UNMAPPED (smoke floor only)": unmapped} if unmapped else {}),
         }
     for row in rows:
         if row.suite in smoke_floor_suites:
@@ -937,6 +977,7 @@ def impacted_tests(
             for method_id, reasons in sorted(skipped.items())
         ],
         "run": run_payload,
+        **({"UNMAPPED (smoke floor only)": unmapped} if unmapped else {}),
     }
 
 
@@ -999,6 +1040,9 @@ def measurement_source_paths(repo_root: Path) -> list[Path]:
         repo_root / "Packages" / "RepoPromptAgentProviders" / "Package.swift",
         repo_root / "Packages" / "RepoPromptAgentProviders" / "Sources",
         repo_root / "Packages" / "RepoPromptAgentProviders" / "Tests",
+        repo_root / "Packages" / "RepoPromptCore" / "Package.swift",
+        repo_root / "Packages" / "RepoPromptCore" / "Sources",
+        repo_root / "Packages" / "RepoPromptCore" / "Tests",
     ]
     files: list[Path] = []
     for root in roots:
@@ -1410,8 +1454,8 @@ def scoreboard_scaffold() -> str:
 - Runtime-heavy Workspace/Codemap suites are optimized only from parsed XCTest method/suite
   timings in complete or focused baseline artifacts. Do not claim a Workspace/Codemap runtime
   win from build/link, process-startup, or package-resolution overhead changes.
-- Provider package timing is measured separately with `Scripts/test_suite_optimizer.py baseline --target provider`.
-- A root+provider number may be reported only as a derived secondary serial estimate, not as an observed single-process wallclock.
+- Provider and core package timing are measured separately with `Scripts/test_suite_optimizer.py baseline --target provider|core`.
+- A root+provider+core number may be reported only as a derived secondary serial estimate, not as an observed single-process wallclock.
 - Normal timing samples must not enable XCTest stall diagnostics or wake probes.
 - Comparable baseline series use 3–5 valid samples; iteration-0 and release-gate series prefer five valid samples.
 - Invalid samples are excluded only by optimizer-recorded invalid reasons.
@@ -1421,8 +1465,8 @@ def scoreboard_scaffold() -> str:
 
 ## Baseline summary
 
-| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
-|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Core methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
 
 ## Derived complete-suite secondary
 
@@ -1459,7 +1503,7 @@ def scoreboard_scaffold() -> str:
 
 ## Baseline run records
 
-Append complete root/provider baseline records here. Include raw sample values, invalid reasons, slowest suites/tests, inventory path, and conductor log paths.
+Append complete root/provider/core baseline records here. Include raw sample values, invalid reasons, slowest suites/tests, inventory path, and conductor log paths.
 
 ## Focused run records
 
@@ -1472,7 +1516,7 @@ Append focused before/after records here. Focused records are not primary metric
 - Complete old→new/removed mapping when IDs change.
 - Scenario-count rationale and before/after affected-suite plus repository totals for consolidations.
 - Surgical ledger update confirmed; curated ledger was not regenerated.
-- Focused command results and full-root/provider baseline artifact paths.
+- Focused command results and full-root/provider/core baseline artifact paths.
 - Median, observed p95, relative MAD, and noise class for comparable series.
 - Validation commands and exit codes.
 - Any deliberately omitted or moved coverage with justification.
@@ -1569,7 +1613,8 @@ def append_baseline_scoreboard(
     counts = method_counts or {}
     root_count = counts.get("root", 0)
     provider_count = counts.get("provider", 0)
-    total_count = root_count + provider_count if counts else 0
+    core_count = counts.get("core", 0)
+    total_count = root_count + provider_count + core_count if counts else 0
     record_heading = "Focused" if scope in {"filtered", "test-product"} else "Baseline"
     lines = [
         f"### {record_heading}: {payload['timestamp']} — {target} — {payload['label']}",
@@ -1606,9 +1651,9 @@ def append_baseline_scoreboard(
     lines.extend(
         [
             "",
-            "| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |",
-            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
-            "| {date}/{commit} | {label} | {target} | {scope_filter} | {valid} valid + {invalid} invalid | {root} | {provider} | {total} | {median:.3f} | {p95:.3f} | {mad:.4f} | {noise} | `{artifact}` | source guard `{guard}`; build-lane coordinated |".format(
+            "| Date/commit | Label | Target | Scope/filter | Samples | Root methods | Provider methods | Core methods | Total executable methods | Median executionSeconds | Observed p95 | Relative MAD | Noise | Artifact | Notes |",
+            "|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|",
+            "| {date}/{commit} | {label} | {target} | {scope_filter} | {valid} valid + {invalid} invalid | {root} | {provider} | {core} | {total} | {median:.3f} | {p95:.3f} | {mad:.4f} | {noise} | `{artifact}` | source guard `{guard}`; build-lane coordinated |".format(
                 date=payload["timestamp"],
                 commit=metadata["commit"][:12],
                 label=payload["label"],
@@ -1618,6 +1663,7 @@ def append_baseline_scoreboard(
                 invalid=summary["invalid_samples"],
                 root=root_count or "",
                 provider=provider_count or "",
+                core=core_count or "",
                 total=total_count or "",
                 median=summary["median_seconds"],
                 p95=summary["observed_p95_seconds"],
@@ -1689,7 +1735,7 @@ def write_json_new(path: Path, payload: dict[str, Any]) -> None:
 
 
 def inventory(repo_root: Path, ledger: Path, output: Path | None, force: bool) -> dict[str, Any]:
-    runs = {target: run_conductor(repo_root, target, list_mode=True) for target in ("root", "provider")}
+    runs = {target: run_conductor(repo_root, target, list_mode=True) for target in ("root", "provider", "core")}
     tests: list[ListedTest] = []
     for target, run in runs.items():
         if run.process_exit_code != 0 or run.result.get("state") != "completed" or run.result.get("exitCode") != 0:
@@ -1700,11 +1746,12 @@ def inventory(repo_root: Path, ledger: Path, output: Path | None, force: bool) -
     counts = {
         "root": sum(test.target == "root" for test in tests),
         "provider": sum(test.target == "provider" for test in tests),
+        "core": sum(test.target == "core" for test in tests),
     }
     payload = {
         "timestamp": utc_now(),
         "git": git_metadata(repo_root),
-        "counts": {**counts, "total": counts["root"] + counts["provider"]},
+        "counts": {**counts, "total": counts["root"] + counts["provider"] + counts["core"]},
         "ledger": str(ledger),
         "list_runs": {
             target: {
@@ -1742,7 +1789,7 @@ def verify_ledger_with_progress(
         raise OptimizerError("--list-timeout-seconds must be greater than zero")
     listed: list[ListedTest] = []
     logs: dict[str, str] = {}
-    for target in ("root", "provider"):
+    for target in ("root", "provider", "core"):
         if progress_sink is not None:
             progress_sink({
                 "event": "verify_ledger_list_start",
@@ -2042,7 +2089,11 @@ def load_counts(path: Path | None) -> dict[str, int] | None:
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
     counts = payload.get("counts") or {}
-    return {"root": int(counts.get("root") or 0), "provider": int(counts.get("provider") or 0)}
+    return {
+        "root": int(counts.get("root") or 0),
+        "provider": int(counts.get("provider") or 0),
+        "core": int(counts.get("core") or 0),
+    }
 
 
 def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
@@ -2200,7 +2251,7 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_parser.add_argument("--force", action="store_true")
 
     baseline_parser = subparsers.add_parser("baseline", help="collect coordinated warm timing samples")
-    baseline_parser.add_argument("--target", choices=["root", "provider"], required=True)
+    baseline_parser.add_argument("--target", choices=["root", "provider", "core"], required=True)
     baseline_parser.add_argument("--samples", type=int, required=True)
     baseline_parser.add_argument("--label", default="warm-baseline")
     baseline_parser.add_argument("--scoreboard", type=Path, required=True)
@@ -2227,7 +2278,7 @@ def build_parser() -> argparse.ArgumentParser:
         "focused-cost",
         help="collect filtered compile/link/runtime overhead diagnostics without primary metric eligibility",
     )
-    focused_cost_parser.add_argument("--target", choices=["root", "provider"], required=True)
+    focused_cost_parser.add_argument("--target", choices=["root", "provider", "core"], required=True)
     focused_cost_parser.add_argument("--filter", required=True, help="XCTest filter for the focused diagnostic run")
     focused_cost_parser.add_argument("--samples", type=int, required=True)
     focused_cost_parser.add_argument("--label", required=True)
@@ -2279,6 +2330,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--run",
         action="store_true",
         help="run the selected exact filters through conductor after printing the plan",
+    )
+    impacted_parser.add_argument(
+        "--allow-unmapped",
+        action="store_true",
+        help="proceed loudly with only the smoke floor for changed paths that map to no domain",
     )
     impacted_parser.add_argument(
         "--skip-live-list-validation",
@@ -2367,6 +2423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 smoke_floor_suites=smoke_floor,
                 run_selected=args.run,
                 validate_live_list=not args.skip_live_list_validation,
+                allow_unmapped=args.allow_unmapped,
             )
         elif args.command == "shard-plan":
             payload = shard_root_tests(args.ledger, args.shards, include_heavy=args.include_heavy)

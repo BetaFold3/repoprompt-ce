@@ -103,16 +103,18 @@ run_pr_ready_path_validations() {
   local swift_paths_pattern='\.swift$'
   local root_test_paths_pattern='^(Sources/RepoPrompt/|Tests/RepoPrompt[^/]*Tests/)'
   local provider_package_paths_pattern='^Packages/RepoPromptAgentProviders/'
+  local core_package_paths_pattern='^Packages/RepoPromptCore/'
   local repoprompt_product_paths_pattern='^Sources/RepoPrompt/'
-  local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Sources/RepoPromptShared/)'
-  local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
-  local xcode_generator_test_paths_pattern='^(Package\.swift|Package\.resolved|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|Scripts/test_xcode_workspace_generator\.py|\.github/workflows/xcode-workspace\.yml)$'
+  local mcp_product_paths_pattern='^(Sources/RepoPromptMCP/|Packages/RepoPromptCore/Sources/(RepoPromptShared|RepoPromptMCPClientKit|RepoPromptMCPCore)/)'
+  local xcode_full_validation_paths_pattern='^(Package\.swift|Package\.resolved|Packages/RepoPromptCore/Package\.(swift|resolved)|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|\.github/workflows/xcode-workspace\.yml)$'
+  local xcode_generator_test_paths_pattern='^(Package\.swift|Package\.resolved|Packages/RepoPromptCore/Package\.(swift|resolved)|Makefile|Scripts/generate_xcode_workspace\.py|Scripts/xcode_developer_workflow\.sh|Scripts/test_xcode_workspace_generator\.py|\.github/workflows/xcode-workspace\.yml)$'
 
   local has_control_plane_changes=0
   local has_ci_app_test_runner_changes=0
   local has_swift_changes=0
   local has_root_test_changes=0
   local has_provider_package_changes=0
+  local has_core_package_changes=0
   local has_repoprompt_product_changes=0
   local has_mcp_product_changes=0
   local has_xcode_generator_test_changes=0
@@ -125,6 +127,7 @@ run_pr_ready_path_validations() {
     [[ "$file" =~ $swift_paths_pattern ]] && has_swift_changes=1
     [[ "$file" =~ $root_test_paths_pattern ]] && has_root_test_changes=1
     [[ "$file" =~ $provider_package_paths_pattern ]] && has_provider_package_changes=1
+    [[ "$file" =~ $core_package_paths_pattern ]] && has_core_package_changes=1
     [[ "$file" =~ $repoprompt_product_paths_pattern ]] && has_repoprompt_product_changes=1
     [[ "$file" =~ $mcp_product_paths_pattern ]] && has_mcp_product_changes=1
     [[ "$file" =~ $xcode_generator_test_paths_pattern ]] && has_xcode_generator_test_changes=1
@@ -150,6 +153,10 @@ run_pr_ready_path_validations() {
   if (( has_provider_package_changes )); then
     log "Run coordinated provider tests"
     make dev-provider-test
+  fi
+  if (( has_core_package_changes )); then
+    log "Run coordinated Core package tests"
+    make dev-core-test
   fi
   if (( has_repoprompt_product_changes )); then
     log "Build RepoPrompt product"

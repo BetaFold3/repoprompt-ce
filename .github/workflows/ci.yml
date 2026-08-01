@@ -134,6 +134,27 @@ jobs:
         working-directory: Packages/RepoPromptAgentProviders
         run: swift test
 
+  core-tests:
+    name: Core Tests
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Restore SwiftPM build cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            .build
+            Packages/RepoPromptCore/.build
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-core-${{ hashFiles('Package.swift', 'Package.resolved', 'Packages/RepoPromptCore/Package.swift', 'Packages/RepoPromptCore/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-
+
+      - name: Run core package tests
+        working-directory: Packages/RepoPromptCore
+        run: swift test
+
   secret-scan:
     name: Secret Scan
     runs-on: macos-26
