@@ -17,7 +17,7 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
         window.attachWindow(nsWindow)
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        await window.workspaceManager.awaitInitialized()
+        try await window.workspaceManager.awaitInitialized(timeout: .seconds(60))
 
         do {
             let workspaceName = "Displayed Title \(UUID().uuidString.prefix(8))"
@@ -54,7 +54,7 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
         window.attachWindow(nsWindow)
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        await window.workspaceManager.awaitInitialized()
+        try await window.workspaceManager.awaitInitialized(timeout: .seconds(60))
 
         do {
             let workspaceName = "Rename Title \(UUID().uuidString.prefix(8))"

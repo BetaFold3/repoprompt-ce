@@ -77,7 +77,7 @@ final class MCPFilesystemIdentityTests: XCTestCase {
             let root = try RepoRoot.url()
             let paths = [
                 "Sources/RepoPrompt/Infrastructure/MCP/AppShared/MCPFilesystemConstants.swift",
-                "Sources/RepoPromptMCP/Shared/MCPFilesystemConstants.swift"
+                "Packages/RepoPromptCore/Sources/RepoPromptMCPCore/Shared/MCPFilesystemConstants.swift"
             ]
 
             for path in paths {

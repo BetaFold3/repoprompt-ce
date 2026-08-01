@@ -231,6 +231,23 @@ enum WorkspaceOpenError: LocalizedError {
     }
 }
 
+enum WorkspaceInitializationWaitError: LocalizedError, Equatable {
+    case timedOut(
+        elapsed: Duration,
+        isInitialized: Bool,
+        isSwitchingWorkspace: Bool
+    )
+
+    var errorDescription: String? {
+        switch self {
+        case let .timedOut(elapsed, isInitialized, isSwitchingWorkspace):
+            "Workspace initialization timed out after \(elapsed); "
+                + "isInitialized=\(isInitialized), "
+                + "isSwitchingWorkspace=\(isSwitchingWorkspace)."
+        }
+    }
+}
+
 /// The main WorkspaceManager, refactored to store each WorkspaceModel
 /// in its own folder + workspace.json, and maintain an index file for all known workspaces.
 @MainActor
@@ -489,10 +506,53 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Gets set to false after successful restore to prevent future restores
     @AppStorage("shouldAutoRestoreFromDownloadsV2") var shouldAutoRestoreFromDownloads: Bool = true
 
+    private struct WaiterRegistry<Resolution> {
+        typealias Completion = @MainActor (Resolution) -> Void
+
+        private var completionsByID: [UUID: Completion] = [:]
+        private var registrationOrder: [UUID] = []
+
+        var count: Int {
+            completionsByID.count
+        }
+
+        @discardableResult
+        mutating func register(
+            id: UUID = UUID(),
+            completion: @escaping Completion
+        ) -> UUID {
+            precondition(completionsByID[id] == nil, "Duplicate workspace waiter ID")
+            completionsByID[id] = completion
+            registrationOrder.append(id)
+            return id
+        }
+
+        mutating func remove(id: UUID) -> Completion? {
+            guard let completion = completionsByID.removeValue(forKey: id) else { return nil }
+            registrationOrder.removeAll { $0 == id }
+            return completion
+        }
+
+        mutating func removeAll() -> [Completion] {
+            let completions = registrationOrder.compactMap { completionsByID.removeValue(forKey: $0) }
+            registrationOrder.removeAll(keepingCapacity: true)
+            return completions
+        }
+    }
+
+    @MainActor
+    private final class InitializationTimeoutTaskBox {
+        var task: Task<Void, Never>?
+    }
+
     // Tracks whether initialization is complete
     private(set) var isInitialized = false
-    private var initializationCallbacks: [() -> Void] = []
-    private var switchingCompletionCallbacks: [() -> Void] = []
+    private var initializationCallbackWaiters = WaiterRegistry<Void>()
+    private var switchingCompletionWaiters = WaiterRegistry<Void>()
+    private var initializationReadinessWaiters = WaiterRegistry<Result<Void, Error>>()
+    #if DEBUG
+        private var activeInitializationTimeoutTaskCount = 0
+    #endif
 
     /// Computed property to get/set the active workspace using the cache
     var activeWorkspace: WorkspaceModel? {
@@ -839,14 +899,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    /// Method to register a callback for when initialization is complete
+    /// Method to register a callback for when initialization is complete.
     func onceInitialized(_ callback: @escaping () -> Void) {
         if isInitialized {
-            // If already initialized, execute immediately
             callback()
         } else {
-            // Store callbacks for later execution
-            initializationCallbacks.append(callback)
+            initializationCallbackWaiters.register { _ in callback() }
         }
     }
 
@@ -854,52 +912,166 @@ class WorkspaceManagerViewModel: ObservableObject {
         if !isSwitchingWorkspace {
             callback()
         } else {
-            switchingCompletionCallbacks.append(callback)
+            switchingCompletionWaiters.register { _ in callback() }
         }
     }
 
-    /// Async helper to await initialization completion.
+    /// Async helper to await initialization completion indefinitely.
+    ///
+    /// Cancellation intentionally preserves the historical non-throwing behavior:
+    /// the waiter remains registered until initialization and workspace switching finish.
+    ///
+    /// Ordering contract: readiness waiters resume only after every `onceInitialized`
+    /// callback has run and no workspace switch is in progress. Relative to the
+    /// legacy shared-callback-array implementation a waiter may therefore resume
+    /// later (never earlier), and never into a switch started by an initialization
+    /// callback.
     func awaitInitialized() async {
         if isInitialized, !isSwitchingWorkspace { return }
         await withCheckedContinuation { continuation in
-            onceInitialized { [weak self] in
-                guard let self else {
-                    continuation.resume()
-                    return
-                }
-                if !isSwitchingWorkspace {
-                    continuation.resume()
-                    return
-                }
-                onceSwitchingComplete {
-                    continuation.resume()
-                }
+            initializationReadinessWaiters.register { _ in
+                continuation.resume()
             }
         }
     }
 
-    /// Method to mark initialization as complete and trigger callback
+    /// Async helper to await initialization and workspace-switch completion with a deadline.
+    func awaitInitialized(timeout: Duration) async throws {
+        try Task.checkCancellation()
+        if isInitialized, !isSwitchingWorkspace { return }
+
+        let waiterID = UUID()
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let timeoutTaskBox = InitializationTimeoutTaskBox()
+                initializationReadinessWaiters.register(id: waiterID) { result in
+                    timeoutTaskBox.task?.cancel()
+                    switch result {
+                    case .success:
+                        continuation.resume()
+                    case let .failure(error):
+                        continuation.resume(throwing: error)
+                    }
+                }
+
+                initializationTimeoutTaskStarted()
+                timeoutTaskBox.task = Task { @MainActor in
+                    defer { initializationTimeoutTaskFinished() }
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    let error = WorkspaceInitializationWaitError.timedOut(
+                        elapsed: startedAt.duration(to: clock.now),
+                        isInitialized: isInitialized,
+                        isSwitchingWorkspace: isSwitchingWorkspace
+                    )
+                    resolveInitializationReadinessWaiter(
+                        waiterID,
+                        with: .failure(error)
+                    )
+                }
+
+                if Task.isCancelled {
+                    resolveInitializationReadinessWaiter(
+                        waiterID,
+                        with: .failure(CancellationError())
+                    )
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                self.resolveInitializationReadinessWaiter(
+                    waiterID,
+                    with: .failure(CancellationError())
+                )
+            }
+        }
+    }
+
+    private func resolveInitializationReadinessWaiter(
+        _ id: UUID,
+        with result: Result<Void, Error>
+    ) {
+        guard let completion = initializationReadinessWaiters.remove(id: id) else { return }
+        completion(result)
+    }
+
+    private func fireInitializationReadinessWaitersIfReady() {
+        guard isInitialized, !isSwitchingWorkspace else { return }
+        let completions = initializationReadinessWaiters.removeAll()
+        for completion in completions {
+            completion(.success(()))
+        }
+    }
+
+    private func initializationTimeoutTaskStarted() {
+        #if DEBUG
+            activeInitializationTimeoutTaskCount += 1
+        #endif
+    }
+
+    private func initializationTimeoutTaskFinished() {
+        #if DEBUG
+            activeInitializationTimeoutTaskCount -= 1
+        #endif
+    }
+
+    /// Method to mark initialization as complete and trigger callbacks.
     private func completeInitialization() {
         guard !isInitialized else { return }
 
         isInitialized = true
 
-        // Execute callbacks if any
-        let callbacks = initializationCallbacks
-        initializationCallbacks.removeAll()
+        let callbacks = initializationCallbackWaiters.removeAll()
         for callback in callbacks {
-            callback()
+            callback(())
         }
+        fireInitializationReadinessWaitersIfReady()
     }
 
     private func notifySwitchingComplete() {
-        guard !switchingCompletionCallbacks.isEmpty else { return }
-        let callbacks = switchingCompletionCallbacks
-        switchingCompletionCallbacks.removeAll()
+        let callbacks = switchingCompletionWaiters.removeAll()
         for callback in callbacks {
-            callback()
+            callback(())
         }
+        fireInitializationReadinessWaitersIfReady()
     }
+
+    #if DEBUG
+        func test_resetInitializationForWaiting() {
+            precondition(initializationReadinessWaiters.count == 0)
+            isInitialized = false
+        }
+
+        func test_completeInitializationForWaiting() {
+            completeInitialization()
+        }
+
+        func test_beginWorkspaceSwitchForInitializationWaiting() {
+            precondition(!isSwitchingWorkspace)
+            isSwitchingWorkspace = true
+        }
+
+        func test_endWorkspaceSwitchForInitializationWaiting() {
+            precondition(isSwitchingWorkspace)
+            isSwitchingWorkspace = false
+            notifySwitchingComplete()
+        }
+
+        func test_initializationReadinessWaiterCount() -> Int {
+            initializationReadinessWaiters.count
+        }
+
+        func test_activeInitializationTimeoutTaskCount() -> Int {
+            activeInitializationTimeoutTaskCount
+        }
+    #endif
 
     private var pollTimer: Timer?
     private var pollTimerSaveTask: Task<Void, Never>?

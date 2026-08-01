@@ -41,11 +41,12 @@ var packageDependencies: [Package.Dependency] = [
     .package(url: "https://github.com/loopwork-ai/JSONSchema.git", exact: "1.3.0"),
     .package(url: "https://github.com/loopwork-ai/ontology.git", exact: "0.6.0"),
     .package(url: "https://github.com/getsentry/sentry-cocoa", exact: "9.17.1"),
-    .package(path: "Packages/RepoPromptAgentProviders")
+    .package(path: "Packages/RepoPromptAgentProviders"),
+    .package(path: "Packages/RepoPromptCore")
 ]
 
 var repoPromptAppDependencies: [Target.Dependency] = [
-    "RepoPromptShared",
+    .product(name: "RepoPromptShared", package: "RepoPromptCore"),
     "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
     "Sparkle",
     .product(name: "Logging", package: "swift-log"),
@@ -88,8 +89,8 @@ var repoPromptAppSwiftSettings: [SwiftSetting] = [
 
 var repoPromptTestDependencies: [Target.Dependency] = [
     "RepoPromptApp",
-    "RepoPromptMCP",
-    "RepoPromptShared"
+    .product(name: "RepoPromptMCPCore", package: "RepoPromptCore"),
+    .product(name: "RepoPromptShared", package: "RepoPromptCore")
 ]
 
 var repoPromptTestSwiftSettings: [SwiftSetting] = [
@@ -130,13 +131,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "RepoPromptMCP",
-            dependencies: ["RepoPromptShared", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: [
+                .product(name: "RepoPromptMCPCore", package: "RepoPromptCore")
+            ],
             path: "Sources/RepoPromptMCP",
-            swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
-        ),
-        .target(
-            name: "RepoPromptShared",
-            path: "Sources/RepoPromptShared",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),

@@ -24,7 +24,7 @@ import XCTest
             defer { try? FileManager.default.removeItem(at: storageRoot) }
             let composition = makeComposition(windowID: -981)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let workspaceA = makeWorkspace(name: "A", storage: storageRoot.appendingPathComponent("A"))
             let workspaceB = makeWorkspace(name: "B", storage: storageRoot.appendingPathComponent("B"))
             manager.workspaces.append(contentsOf: [workspaceA, workspaceB])
@@ -60,7 +60,7 @@ import XCTest
             defer { try? FileManager.default.removeItem(at: storageRoot) }
             let composition = makeComposition(windowID: -982)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let workspace = makeWorkspace(name: "Removed", storage: storageRoot.appendingPathComponent("Removed"))
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
@@ -90,7 +90,7 @@ import XCTest
             defer { try? FileManager.default.removeItem(at: storageRoot) }
             let composition = makeComposition(windowID: -983)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let workspace = makeWorkspace(name: "Retry", storage: storageRoot.appendingPathComponent("Retry"))
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
@@ -128,7 +128,7 @@ import XCTest
             try Data("block".utf8).write(to: blockingFile)
             let composition = makeComposition(windowID: -984)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let workspace = makeWorkspace(name: "Failure", storage: blockingFile)
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)
@@ -146,7 +146,7 @@ import XCTest
             defer { try? FileManager.default.removeItem(at: storageRoot) }
             let composition = makeComposition(windowID: -985)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let workspace = makeWorkspace(name: "Publication", storage: storageRoot.appendingPathComponent("Publication"))
             manager.workspaces.append(workspace)
             let switchResult = await manager.switchWorkspace(to: workspace, saveState: false)

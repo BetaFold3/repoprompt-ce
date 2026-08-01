@@ -276,7 +276,7 @@ final class NewlineDelimitedSocketReaderFairnessTests: XCTestCase {
         )
         let cliCopy = try Data(
             contentsOf: root.appendingPathComponent(
-                "Sources/RepoPromptMCP/Shared/NewlineDelimitedSocketReader.swift"
+                "Packages/RepoPromptCore/Sources/RepoPromptMCPCore/Shared/NewlineDelimitedSocketReader.swift"
             )
         )
         XCTAssertEqual(appCopy, cliCopy)

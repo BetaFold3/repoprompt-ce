@@ -1,0 +1,875 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Human-friendly technical implementation report for RepoPrompt CE developer test-loop and conductor optimizations.">
+  <title>Faster RepoPrompt CE Test Loop — Technical Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f3f6fb;
+      --surface: #ffffff;
+      --surface-2: #f8fafc;
+      --text: #172033;
+      --muted: #627083;
+      --line: #dbe3ed;
+      --brand: #2459d1;
+      --brand-soft: #eaf0ff;
+      --green: #14784d;
+      --green-soft: #e8f7ef;
+      --amber: #986500;
+      --amber-soft: #fff5d8;
+      --red: #a43a3a;
+      --red-soft: #fff0f0;
+      --purple: #6b48b8;
+      --purple-soft: #f2edff;
+      --shadow: 0 14px 38px rgba(28, 43, 69, .08);
+      --radius: 18px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #101620;
+        --surface: #19212d;
+        --surface-2: #202a38;
+        --text: #edf2f8;
+        --muted: #b3bfce;
+        --line: #344052;
+        --brand: #8ba6ff;
+        --brand-soft: #22325d;
+        --green: #75d3a3;
+        --green-soft: #153d2c;
+        --amber: #f0c56b;
+        --amber-soft: #4a3818;
+        --red: #ff9b9b;
+        --red-soft: #49272a;
+        --purple: #c4adff;
+        --purple-soft: #342953;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    a { color: var(--brand); }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    code {
+      padding: .1rem .34rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-2);
+      font-size: .9em;
+    }
+    pre {
+      overflow-x: auto;
+      margin: 12px 0;
+      padding: 15px 17px;
+      border: 1px solid #2e3b51;
+      border-radius: 12px;
+      background: #101827;
+      color: #edf4ff;
+      font-size: .87rem;
+      line-height: 1.55;
+    }
+    pre code { padding: 0; border: 0; background: transparent; color: inherit; }
+    .page { width: min(1180px, calc(100% - 30px)); margin: 0 auto; padding: 28px 0 72px; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 44px;
+      border: 1px solid var(--line);
+      border-radius: 25px;
+      background: linear-gradient(135deg, var(--surface) 0%, var(--brand-soft) 100%);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 360px;
+      height: 360px;
+      right: -155px;
+      top: -190px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--brand) 13%, transparent);
+    }
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--brand);
+      font-size: .78rem;
+      font-weight: 850;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+    h1 { max-width: 920px; margin: 0; font-size: clamp(2.1rem, 4vw, 3.55rem); line-height: 1.07; letter-spacing: -.035em; }
+    .subtitle { max-width: 900px; margin: 18px 0 0; color: var(--muted); font-size: 1.12rem; }
+    .badges, .meta { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 21px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: .82rem;
+      font-weight: 750;
+    }
+    .badge.good { border-color: color-mix(in srgb, var(--green) 38%, var(--line)); background: var(--green-soft); color: var(--green); }
+    .badge.warn { border-color: color-mix(in srgb, var(--amber) 38%, var(--line)); background: var(--amber-soft); color: var(--amber); }
+    .badge.info { border-color: color-mix(in srgb, var(--brand) 38%, var(--line)); background: var(--brand-soft); color: var(--brand); }
+    .toc {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin: 18px 0 28px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+    }
+    .toc a { padding: 5px 9px; border-radius: 8px; color: var(--muted); font-size: .87rem; font-weight: 750; text-decoration: none; }
+    .toc a:hover { background: var(--brand-soft); color: var(--brand); }
+    section {
+      margin-top: 24px;
+      padding: 30px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    section > :first-child { margin-top: 0; }
+    section > :last-child { margin-bottom: 0; }
+    h2 { margin: 0 0 15px; font-size: 1.65rem; line-height: 1.2; letter-spacing: -.02em; }
+    h3 { margin: 24px 0 8px; font-size: 1.12rem; }
+    p { margin: 10px 0; }
+    ul, ol { padding-left: 1.4rem; }
+    li + li { margin-top: .38rem; }
+    .lead { color: var(--muted); font-size: 1.04rem; }
+    .muted, small { color: var(--muted); }
+    .grid { display: grid; gap: 15px; }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .card {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface-2);
+    }
+    .card .label { color: var(--muted); font-size: .76rem; font-weight: 850; letter-spacing: .075em; text-transform: uppercase; }
+    .card .value { margin: 4px 0; font-size: 1.38rem; font-weight: 870; letter-spacing: -.025em; }
+    .card p { margin-bottom: 0; color: var(--muted); font-size: .91rem; }
+    .callout {
+      margin: 16px 0;
+      padding: 15px 17px;
+      border-left: 4px solid var(--brand);
+      border-radius: 4px 12px 12px 4px;
+      background: var(--brand-soft);
+    }
+    .callout.good { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.risk { border-left-color: var(--red); background: var(--red-soft); }
+    .callout.purple { border-left-color: var(--purple); background: var(--purple-soft); }
+    .callout strong { display: block; margin-bottom: 3px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: .91rem; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-2); color: var(--muted); font-size: .76rem; letter-spacing: .06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .scroll { overflow-x: auto; }
+    .pass { color: var(--green); font-weight: 850; }
+    .open { color: var(--amber); font-weight: 850; }
+    .risk { color: var(--red); font-weight: 850; }
+    .observed, .session, .inferred {
+      display: inline-block;
+      margin-right: 5px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: .72rem;
+      font-weight: 850;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+    .observed { background: var(--green-soft); color: var(--green); }
+    .session { background: var(--brand-soft); color: var(--brand); }
+    .inferred { background: var(--amber-soft); color: var(--amber); }
+    .timeline { margin: 18px 0 0 10px; padding-left: 25px; border-left: 2px solid var(--line); }
+    .event { position: relative; padding: 0 0 23px; }
+    .event:last-child { padding-bottom: 0; }
+    .event::before {
+      content: "";
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      left: -32px;
+      top: 6px;
+      border: 3px solid var(--surface);
+      border-radius: 50%;
+      background: var(--brand);
+      box-shadow: 0 0 0 1px var(--line);
+    }
+    .event h3 { margin: 0 0 4px; }
+    .event p { margin: 5px 0; color: var(--muted); }
+    .step {
+      display: grid;
+      grid-template-columns: 44px 1fr;
+      gap: 14px;
+      padding: 18px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .step:last-child { border-bottom: 0; padding-bottom: 0; }
+    .step-number {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      background: var(--brand);
+      color: white;
+      font-weight: 900;
+    }
+    .step h3 { margin: 0 0 5px; }
+    .step p { margin: 5px 0; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 18px 0;
+    }
+    .flow-item { position: relative; min-height: 116px; padding: 15px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); }
+    .flow-item:not(:last-child)::after { content: "→"; position: absolute; top: calc(50% - 14px); right: -17px; z-index: 2; color: var(--brand); font-weight: 900; font-size: 1.25rem; }
+    .flow-item b { display: block; margin-bottom: 5px; }
+    .flow-item span { color: var(--muted); font-size: .86rem; }
+    details { margin-top: 12px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-2); }
+    summary { cursor: pointer; font-weight: 800; }
+    footer { margin-top: 26px; color: var(--muted); text-align: center; font-size: .84rem; }
+    @media (max-width: 900px) {
+      .grid.four, .grid.three, .grid.two, .flow { grid-template-columns: 1fr 1fr; }
+      .flow-item::after { display: none; }
+    }
+    @media (max-width: 620px) {
+      .page { width: min(100% - 18px, 1180px); padding-top: 10px; }
+      .hero, section { padding: 22px; }
+      .grid.four, .grid.three, .grid.two, .flow { grid-template-columns: 1fr; }
+      .step { grid-template-columns: 36px 1fr; }
+    }
+    @media print {
+      :root { --bg: #fff; --surface: #fff; --surface-2: #f7f7f7; --text: #111; --muted: #444; --line: #ccc; --shadow: none; }
+      body { font-size: 11pt; }
+      .page { width: 100%; padding: 0; }
+      .hero, section { break-inside: avoid; box-shadow: none; }
+      .toc { display: none; }
+      a { color: inherit; text-decoration: none; }
+      pre { white-space: pre-wrap; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Technical implementation report · 1 August 2026</p>
+      <h1>Faster, safer RepoPrompt CE test loops</h1>
+      <p class="subtitle">
+        The local developer workflow now rejects bad filters before building, bounds hanging XCTest work,
+        supports trusted seconds-class artifact re-runs, moves suitable MCP/shared tests into a smaller package,
+        and replaces unbounded workspace-initialization waits in tests with diagnosable deadlines.
+      </p>
+      <div class="badges">
+        <span class="badge good">✓ Oracle A approved</span>
+        <span class="badge good">✓ Oracle B approved</span>
+        <span class="badge info">81 implementation files vs HEAD</span>
+        <span class="badge warn">Working tree only — not committed</span>
+      </div>
+      <div class="meta">
+        <span class="badge">Repository: RepoPrompt CE</span>
+        <span class="badge">Branch: feat/personal-touch-system-prompt</span>
+        <span class="badge">Observed HEAD: 073fb069</span>
+        <span class="badge">Report scope: supplied session + current diff</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Report sections">
+      <a href="#summary">Summary</a>
+      <a href="#expect">What to expect</a>
+      <a href="#changes">What changed</a>
+      <a href="#decisions">Major decisions</a>
+      <a href="#verify">Try it step by step</a>
+      <a href="#validation">Validation</a>
+      <a href="#inventory">Change inventory</a>
+      <a href="#risks">Risks &amp; limits</a>
+      <a href="#actions">Your action items</a>
+      <a href="#evidence">Evidence</a>
+    </nav>
+
+    <section id="summary">
+      <h2>Executive summary</h2>
+      <p class="lead">
+        The work attacks two different sources of slowness: unavoidable compilation of a very large SwiftPM
+        test product, and avoidable overhead or failure modes around that build. It does not pretend the root
+        application can always rebuild instantly. Instead, it makes incorrect and hanging runs fail quickly,
+        provides a trustworthy fast path when a valid test artifact already exists, and extracts a narrow group
+        of tests that can avoid the full application graph altogether.
+      </p>
+
+      <div class="grid four">
+        <article class="card">
+          <div class="label">Bad filter</div>
+          <div class="value">112.6s → 0.21s</div>
+          <p>Observed session example. The new preflight exits before SwiftPM builds and suggests close suite names.</p>
+        </article>
+        <article class="card">
+          <div class="label">Artifact backend</div>
+          <div class="value">0.69s median</div>
+          <p>Measured warm <code>swift test --skip-build</code> backend. Live conductor runs were reported around 1.7–4.8s.</p>
+        </article>
+        <article class="card">
+          <div class="label">Hang containment</div>
+          <div class="value">Phase-bounded</div>
+          <p>Startup 90s, active method ledger-derived, between-method 60s, plus a 20-minute filtered-job ceiling.</p>
+        </article>
+        <article class="card">
+          <div class="label">Ledger coverage</div>
+          <div class="value">507 blanks → 3</div>
+          <p>504 original blank runtimes were filled. Three Sentry-gated methods still need measurements.</p>
+        </article>
+      </div>
+
+      <div class="callout good">
+        <strong>Plain-language outcome</strong>
+        A typo should fail almost immediately; a hanging test should no longer hold the shared build lane for
+        ten minutes or an hour; and repeated checks against an unchanged successful build should complete in seconds.
+      </div>
+      <div class="callout warn">
+        <strong>Important boundary</strong>
+        <code>make dev-test-artifact</code> proves only what the recorded artifact ran. It does not replace
+        <code>make dev-test</code> after source changes and never counts as source-validation evidence when labeled stale.
+      </div>
+    </section>
+
+    <section id="expect">
+      <h2>What can you expect from this change?</h2>
+      <div class="grid two">
+        <article class="card">
+          <div class="label">Faster feedback</div>
+          <div class="value">Pay the build once</div>
+          <p>After a source-valid focused run succeeds, repeat the same suite through the artifact path without rebuilding.</p>
+        </article>
+        <article class="card">
+          <div class="label">Safer failures</div>
+          <div class="value">Located, bounded, loud</div>
+          <p>Unknown filters, zero executed tests, stale artifacts, and XCTest phase stalls now have distinct exit codes and diagnostics.</p>
+        </article>
+        <article class="card">
+          <div class="label">Less queue hostage</div>
+          <div class="value">Separate xctest slot</div>
+          <p>Run-only artifact jobs use their own machine-wide slot instead of occupying the heavyweight Swift build slot.</p>
+        </article>
+        <article class="card">
+          <div class="label">Smaller domain loop</div>
+          <div class="value">Core package lane</div>
+          <p>MCP/shared tests that do not need the app now run through <code>make dev-core-test</code>.</p>
+        </article>
+      </div>
+
+      <h3>The intended daily loop</h3>
+      <div class="flow" aria-label="Developer test flow">
+        <div class="flow-item"><b>1. Edit source</b><span>Make the smallest intended change.</span></div>
+        <div class="flow-item"><b>2. Validate source</b><span>Run lint and a focused <code>make dev-test</code>. This performs the incremental build and mints a trusted ticket on success.</span></div>
+        <div class="flow-item"><b>3. Iterate instantly</b><span>While the source and build remain unchanged, use <code>make dev-test-artifact</code>.</span></div>
+        <div class="flow-item"><b>4. Prepare contribution</b><span>Run impacted or broader source-valid checks, then the repository contribution preflight.</span></div>
+      </div>
+
+      <h3>What it intentionally does not promise</h3>
+      <ul>
+        <li>It does not make the first root build after a source edit seconds-class; that run still compiles and links what SwiftPM requires.</li>
+        <li>It does not make an artifact-scoped pass equivalent to a source-valid pass or CI.</li>
+        <li>It does not split the whole application into new modules, increase heavyweight concurrency, or parallelize stateful root tests.</li>
+        <li>It does not guarantee the recorded timing numbers on other machines, toolchains, dependency caches, or workloads.</li>
+      </ul>
+    </section>
+
+    <section id="changes">
+      <h2>What was implemented</h2>
+      <p class="lead">The six requested tracks landed as one coherent developer-workflow change, followed by the three requested reliability follow-ups.</p>
+
+      <h3>1. Filter fail-fast and zero-test protection</h3>
+      <p>
+        <span class="observed">Observed in code</span>
+        <code>Scripts/conductor.py</code> checks a requested filter against the curated ledger before building.
+        A source-suite fallback supports a genuinely new suite that has not yet been added to the ledger.
+        Invalid filters return exit 64 with close-match suggestions. A filtered run that starts no test case
+        returns exit 66 unless explicitly permitted.
+      </p>
+      <ul>
+        <li><code>RPCE_ALLOW_UNKNOWN_FILTER=1</code> is the narrow override for a real new suite.</li>
+        <li><code>RPCE_ALLOW_ZERO_TESTS=1</code> is the narrow override for intentionally gated execution.</li>
+        <li>The new checks cover root, provider, core, and artifact test operations.</li>
+      </ul>
+
+      <h3>2. Default XCTest hang containment and clearer contention</h3>
+      <p>
+        <span class="observed">Observed in code</span>
+        The watchdog now understands XCTest phases rather than treating every period of silence the same.
+        The active-method allowance is <code>max(90s, 4 × ledger runtime + 30s)</code>; methods without a
+        runtime use 180 seconds. Startup after the build is bounded at 90 seconds and the gap between methods
+        at 60 seconds. Filtered jobs have a 20-minute outer limit; full-root jobs retain the longer ceiling.
+      </p>
+      <ul>
+        <li>Exit 70 identifies a startup, active-method, or between-method deadline.</li>
+        <li><code>--xctest-stall-seconds</code> overrides only the active-method budget.</li>
+        <li>Run-only artifact tests claim a separate machine-wide <code>xctest</code> slot.</li>
+        <li>Job status exposes <code>waiting-heavy-slot</code> or <code>waiting-xctest-slot</code> and wait telemetry.</li>
+        <li>Termination guards against process-group identifier reuse and re-enumerates descendants after group kill, including escaped child processes.</li>
+      </ul>
+
+      <h3>3. Measurement before architecture surgery</h3>
+      <p>
+        <span class="session">Observed in session</span>
+        A dedicated measurement spike decomposed the warm path and compared
+        <code>swift test --skip-build</code> with direct <code>xcrun xctest</code>. Direct XCTest was faster
+        in isolation (0.06s median), but the agreed adoption rule favored the more portable SwiftPM fast path
+        because its 0.69s median was below the 3-second threshold. The investigation also confirmed one aggregate
+        root test bundle, so merely adding more root test targets would not avoid aggregate linking.
+      </p>
+      <div class="callout purple">
+        <strong>Bonus root cause found during measurement</strong>
+        Conductor had injected a unique per-job environment variable into direct Swift children. SwiftPM keys
+        planning caches on the environment, so the unique value forced repeated planning. The implementation now
+        removes that variable for direct Swift invocations while retaining it where child tooling actually needs it.
+      </div>
+
+      <h3>4. Ticket-bound artifact re-run</h3>
+      <p>
+        <span class="observed">Observed in code</span>
+        A successful root <code>dev-test</code> records a build ticket that binds the source snapshot, environment
+        gates, toolchain, test executable, and resource closure. <code>make dev-test-artifact FILTER=…</code>
+        verifies the ticket and bundle before using <code>swift test --skip-build</code>.
+      </p>
+      <ul>
+        <li>Dirty tracked and untracked file contents are hashed; symlink identity is preserved.</li>
+        <li>Dirty submodules and unreadable dirty files fail closed, withholding trusted artifact status.</li>
+        <li>The test executable and every regular file in the <code>.xctest</code>/sibling resource-bundle closure contribute SHA-256 content hashes.</li>
+        <li>The bundle is rechecked after slot acquisition and source/artifact state is checked around the run to close mutation races.</li>
+        <li>Missing or changed ticket/artifact state returns exit 65.</li>
+        <li>A changed source tree can still run the prior artifact, but the result is visibly labeled <code>artifact_scope: stale — current source was NOT validated</code>.</li>
+      </ul>
+
+      <h3>5. Owner-side bounded workspace initialization waits</h3>
+      <p>
+        <span class="observed">Observed in code</span>
+        <code>WorkspaceManagerViewModel</code> now owns an additive
+        <code>awaitInitialized(timeout:) async throws</code> API. Its waiter registry performs remove-then-resume
+        exactly once on the main actor and supports timeout, cancellation, initialization completion, and
+        workspace-switch completion. The historical indefinite API remains for compatibility.
+      </p>
+      <ul>
+        <li>The 52 remaining untimed test call sites were migrated; the current test tree contains 59 bounded calls across 15 files and zero <code>awaitInitialized()</code> calls.</li>
+        <li>Six focused tests cover immediate return, success, timeout diagnostics, cancellation, a 100-iteration success/timeout race, and waiting through a workspace switch.</li>
+        <li><code>TimedWaits.swift</code> adds bounded polling and semaphore helpers for waits owned by tests.</li>
+        <li>Waiters now resume conservatively after initialization callbacks and any resulting workspace switch, never into a partially switched state.</li>
+      </ul>
+
+      <h3>6. Core-package extraction and tiered policy</h3>
+      <p>
+        <span class="observed">Observed in code</span>
+        <code>Packages/RepoPromptCore</code> now owns <code>RepoPromptShared</code> and a reusable
+        <code>RepoPromptMCPCore</code> library. The root <code>repoprompt-mcp</code> product keeps the same product
+        name through a six-line executable entry point. Nine suites and 55 ledgered methods moved to the core target.
+      </p>
+      <ul>
+        <li><code>make dev-core-test</code> and conductor’s <code>core-test</code> operation provide the smaller local lane.</li>
+        <li>CI now has a dedicated core-package job and cache key.</li>
+        <li>Package, layout guardrails, Swift style configuration, and source-layout documentation were updated together.</li>
+        <li><code>AGENTS.md</code>, development guidance, and validation guidance now distinguish source-valid tests from artifact-only re-runs.</li>
+        <li><code>dev-test-impacted</code> now fails on unmapped production paths instead of silently degrading; docs-only paths remain exempt.</li>
+      </ul>
+
+      <h3>7. Runtime-aware deadlines and ledger backfill</h3>
+      <p>
+        <span class="observed">Observed in code</span>
+        Conductor loads per-method <code>runtime_seconds</code> from the curated ledger at XCTest case boundaries.
+        The current ledger contains 3,285 rows: 3,223 root, 55 core, and 7 provider. Runtime coverage rose from
+        2,772 of 3,279 rows at HEAD to 3,282 of 3,285 rows in the working tree.
+      </p>
+      <div class="callout warn">
+        <strong>Honest completion note</strong>
+        The original 507 missing runtimes were reduced by 504. Three Sentry-gated privacy methods still have blank
+        runtimes. They safely receive the 180-second default budget, but the requested backfill is not literally 100% complete.
+      </div>
+    </section>
+
+    <section id="decisions">
+      <h2>Major turns and why they mattered</h2>
+      <div class="timeline">
+        <article class="event">
+          <h3>Start with evidence, not package surgery</h3>
+          <p>The first measurements separated queueing, planning, compilation, linking, and test execution. This prevented the team from attributing a 633-second queued sample to healthy incremental compilation.</p>
+        </article>
+        <article class="event">
+          <h3>Oracle C rejected a test-only timeout race</h3>
+          <p>A task-group race around the old indefinite continuation could itself hang or leak a waiter that retained the full per-window graph. The design moved the deadline into the state owner, where registration, cancellation, and completion can be resolved exactly once.</p>
+        </article>
+        <article class="event">
+          <h3>“Silence watchdog” became phase-aware deadlines</h3>
+          <p>XCTest often emits no output while a legitimate method runs. The final design keys deadlines to case-boundary output and uses ledger runtimes, avoiding a flat 90-second cap for every method.</p>
+        </article>
+        <article class="event">
+          <h3>New root test targets were rejected</h3>
+          <p>SwiftPM produces one aggregate root <code>.xctest</code> bundle on this toolchain. Splitting files into additional root targets would still link the whole aggregate. A separate local package is the mechanism that actually reduces the graph.</p>
+        </article>
+        <article class="event">
+          <h3>Artifact speed was separated from source validity</h3>
+          <p>The team rejected a repo-wide “probably fresh” hash cache as an unbounded input inventory. The final interface is explicit: ordinary <code>dev-test</code> builds and validates source; <code>dev-test-artifact</code> re-runs a recorded artifact and labels its scope.</p>
+        </article>
+        <article class="event">
+          <h3>Oracle review changed provenance from metadata to content</h3>
+          <p>Reviewers found false-green paths involving untracked edits, a ticket not bound to the exact bundle, same-size resource replacement with preserved timestamps, dirty submodules, and unreadable files. Multiple review rounds added content hashes, fail-closed behavior, post-slot verification, and regression tests.</p>
+        </article>
+        <article class="event">
+          <h3>Scheduler changes stayed deliberately small</h3>
+          <p>Build-lane ownership remains in place so a concurrent build cannot relink a bundle while XCTest is using it. The lower-risk improvement is a separate machine-wide XCTest slot, not a broad admission-order rewrite or more heavyweight concurrency.</p>
+        </article>
+      </div>
+
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Decision</th><th>Chosen approach</th><th>Rejected alternative</th><th>Reason</th></tr></thead>
+          <tbody>
+            <tr><td>Fast backend</td><td><code>swift test --skip-build</code></td><td>Custom direct <code>xcrun xctest</code> runner</td><td>0.69s median met the ≤3s rule and preserves SwiftPM selection behavior.</td></tr>
+            <tr><td>Timeout ownership</td><td>Owner-side waiter registry</td><td>Test-side task race</td><td>A cancelled checked continuation may never resume; the owner can safely deregister and resolve exactly once.</td></tr>
+            <tr><td>Test extraction</td><td>Separate <code>RepoPromptCore</code> package</td><td>More root test targets</td><td>The root package still links one aggregate test executable.</td></tr>
+            <tr><td>Staleness</td><td>Build ticket + source/artifact fingerprints</td><td>Implicit “fresh enough” cache</td><td>Validity is explicit, fail-closed, and human/machine readable.</td></tr>
+            <tr><td>Concurrency</td><td>Dedicated XCTest slot</td><td>More heavy slots or lane reorder</td><td>Reduces contention without exposing a live bundle to concurrent relinking.</td></tr>
+            <tr><td>PCH</td><td>No change</td><td>Immediately re-enable bridging PCH</td><td>History showed no rationale, but the evidence was insufficient to safely change the compiler flag in this tranche.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="verify">
+      <h2>How to test and see the effect, step by step</h2>
+      <p class="lead">
+        Run these from the repository root. Because the current tree is already dirty, preserve it first or use a
+        disposable worktree if you want a clean benchmark. Do not run duplicate Swift jobs if conductor reports a global wait.
+      </p>
+
+      <div class="step">
+        <div class="step-number">1</div>
+        <div>
+          <h3>Confirm the tooling and queue are ready</h3>
+          <pre><code>make doctor
+./conductor job list</code></pre>
+          <p><strong>Look for:</strong> a healthy environment and no unexpected long-running build-lane holder.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">2</div>
+        <div>
+          <h3>See a bad filter fail before building</h3>
+          <pre><code>time make dev-test FILTER=OracleMessageTimestmpTests</code></pre>
+          <p><strong>Expected:</strong> exit 64, a “matched no curated ledger entry or source suite” message, and close-name suggestions. There should be no Swift build phase.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">3</div>
+        <div>
+          <h3>Create source-valid evidence and a build ticket</h3>
+          <pre><code>make dev-lint
+time make dev-test FILTER=ClaudeCodeProviderUsageTests</code></pre>
+          <p><strong>Expected:</strong> the ordinary focused test performs an incremental build, executes the suite, and records a ticket only after success with an unchanged source snapshot.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">4</div>
+        <div>
+          <h3>Re-run the same artifact in seconds</h3>
+          <pre><code>time make dev-test-artifact FILTER=ClaudeCodeProviderUsageTests
+time make dev-test-artifact FILTER=ClaudeCodeProviderUsageTests</code></pre>
+          <p><strong>Expected:</strong> both pass with <code>artifact_scope: current</code>. The session observed roughly 1.7–4.8 seconds end to end; your machine may differ.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">5</div>
+        <div>
+          <h3>Demonstrate stale-source labeling safely</h3>
+          <pre><code>touch rpce-artifact-stale-probe.tmp
+make dev-test-artifact FILTER=ClaudeCodeProviderUsageTests
+rm rpce-artifact-stale-probe.tmp</code></pre>
+          <p><strong>Expected:</strong> the old artifact may still execute, but the result must say <code>artifact_scope: stale</code> and <code>current source was NOT validated</code>. This is a demonstration only; do not use the pass as contribution evidence.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">6</div>
+        <div>
+          <h3>Exercise bounded workspace waits</h3>
+          <pre><code>make dev-test FILTER=WorkspaceManagerInitializationWaitTests
+make dev-test-artifact FILTER=WorkspaceManagerInitializationWaitTests
+make dev-test FILTER=AgentOraclePillRoutingTests</code></pre>
+          <p><strong>Expected:</strong> six focused waiter tests pass, the unchanged artifact re-run is fast, and the formerly hanging pill-routing fixture completes without an indefinite initialization wait.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">7</div>
+        <div>
+          <h3>Exercise the smaller core package</h3>
+          <pre><code>time make dev-core-test
+make dev-core-test FILTER=InteractiveMCPClientSessionCancellationTests</code></pre>
+          <p><strong>Expected:</strong> MCP/shared tests build and run under <code>Packages/RepoPromptCore</code> without linking the full app test product.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">8</div>
+        <div>
+          <h3>Verify the conductor safety contracts</h3>
+          <pre><code>make conductor-selftest</code></pre>
+          <p><strong>Expected:</strong> the Python regression suite covers filter validation, zero-test detection, phase deadlines, slot telemetry, process termination, source snapshots, and artifact races without intentionally hanging your real XCTest bundle.</p>
+        </div>
+      </div>
+
+      <div class="step">
+        <div class="step-number">9</div>
+        <div>
+          <h3>Run broader source validation when ready</h3>
+          <pre><code>make dev-test-impacted
+# Broadest local evidence:
+make dev-test</code></pre>
+          <p><strong>Expected:</strong> impacted mode fails loudly if a changed production path has no mapping. The full run remains the broad local check and may be substantially slower than the inner loop.</p>
+        </div>
+      </div>
+
+      <div class="callout warn">
+        <strong>Do not benchmark by deleting <code>.build</code> under an active job</strong>
+        The workflow protects coordinated jobs, but it cannot protect source or build artifacts from manual concurrent mutation. Wait for conductor activity to settle before cleaning or editing shared inputs.
+      </div>
+    </section>
+
+    <section id="validation">
+      <h2>Validation and review evidence</h2>
+      <p class="lead">The table distinguishes evidence recorded during the implementation session from checks performed while generating this report.</p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Check</th><th>Result</th><th>Evidence and notes</th></tr></thead>
+          <tbody>
+            <tr><td>Conductor/optimizer Python selftests</td><td class="pass">Pass</td><td><span class="session">Session</span> Initial sweep reported 188/188. Later targeted lifecycle, output, and optimizer sweeps were reported green after provenance hardening.</td></tr>
+            <tr><td>Python AST parse for conductor</td><td class="pass">Pass</td><td><span class="session">Session</span> Re-run after content-hash fixes.</td></tr>
+            <tr><td><code>make dev-lint</code></td><td class="pass">Pass</td><td><span class="session">Session</span> SwiftFormat lint and SwiftLint reported clean.</td></tr>
+            <tr><td><code>WorkspaceManagerInitializationWaitTests</code></td><td class="pass">6/6</td><td><span class="session">Session</span> Covers success, timeout, cancellation, race, and switch ordering.</td></tr>
+            <tr><td><code>AgentOraclePillRoutingTests</code></td><td class="pass">7/7</td><td><span class="session">Session</span> Reported 0.26s XCTest execution after bounded fixture initialization.</td></tr>
+            <tr><td>Full root <code>make dev-test</code></td><td class="pass">Exit 0</td><td><span class="session">Session</span> Later follow-up run completed successfully. Its historical ticket is no longer present, so the raw job output could not be reopened during report generation.</td></tr>
+            <tr><td><code>make dev-core-test</code></td><td class="pass">Pass</td><td><span class="session">Session</span> Reported warm execution around 0.84s. Current ledger maps 55 methods across nine core suites.</td></tr>
+            <tr><td><code>repoprompt-mcp</code> product build</td><td class="pass">Pass</td><td><span class="session">Session</span> Verified after converting the root target to a thin entry point.</td></tr>
+            <tr><td>Artifact current/stale flows</td><td class="pass">Pass</td><td><span class="session">Session</span> Both scopes were exercised; full closure hashing live path was reported around 4.8s.</td></tr>
+            <tr><td>Same-size, mtime-preserving resource replacement</td><td class="pass">Rejected as unavailable</td><td><span class="session">Session</span> Regression test verifies content hashing catches the adversarial replacement.</td></tr>
+            <tr><td><code>Scripts/check-agent-context</code></td><td class="pass">Pass</td><td><span class="session">Session</span> Reported zero warnings after workflow documentation changes.</td></tr>
+            <tr><td>HTML structure and internal anchors</td><td class="pass">Pass</td><td><span class="observed">Report generation</span> Python HTML parsing verified the doctype, title, ten unique section IDs, ten internal links, required content sections, entity escaping, and absence of trailing whitespace.</td></tr>
+            <tr><td><code>make guardrails</code></td><td class="open">Incomplete / failed</td><td><span class="observed">Report generation</span> SwiftPM manifest compilation was blocked by the sandbox and the unsandboxed retry was denied. The remaining scan also reported three allowlist entries: the intent-to-add measurement report and two previously tracked HTML documents. The new report is untracked and did not add to this failure.</td></tr>
+            <tr><td>Independent Oracle review</td><td class="pass">Approved</td><td><span class="session">Session</span> Oracle A: “APPROVE stands (unamended).” Oracle B: “APPROVE,” with no remaining blocking correctness or false-green issue.</td></tr>
+            <tr><td>Hosted CI</td><td class="open">Not run locally</td><td>New CI configuration was inspected, but GitHub-hosted jobs require a pushed branch or pull request.</td></tr>
+            <tr><td>Commit preflight</td><td class="open">Not run</td><td>No commit was requested; the current staged index is incomplete and must be corrected first.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>Conflicting intermediate evidence, resolved conservatively</strong>
+        An earlier sweep reported 13 failures judged pre-existing, including a settings-persistence leak; the later
+        full-root follow-up reported exit 0. Because the old raw job log is no longer available, this report records
+        both facts and treats the later exit-0 run as the final session result without claiming why the earlier failures disappeared.
+      </div>
+    </section>
+
+    <section id="inventory">
+      <h2>Change inventory</h2>
+      <p class="lead">
+        Relative to current HEAD, the implementation spans 81 files: 7 added, 37 modified, and 37 recognized renames,
+        totaling 7,798 insertions and 4,428 deletions. Large source moves appear much larger in the index because the
+        destinations are not staged.
+      </p>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Git state</th><th>Files / area</th><th>Role</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td>Modified, unstaged</td><td><code>Scripts/conductor.py</code></td><td>Developer tooling</td><td>Filter preflight, zero-test postcondition, phase deadlines, slots, process-tree kill, build tickets, artifact verification, environment hygiene.</td></tr>
+            <tr><td>Modified, unstaged</td><td><code>Scripts/test_conductor_lifecycle.py</code>, <code>test_conductor_output.py</code></td><td>Regression tests</td><td>Lifecycle, output, deadline, slot, provenance, and race coverage.</td></tr>
+            <tr><td>Modified, unstaged</td><td><code>Scripts/test_suite_optimizer.py</code>, its tests, and ledger TSV</td><td>Test planning/data</td><td>Unmapped-path hard failure, runtime capture, core-target inventory, and runtime backfill.</td></tr>
+            <tr><td>Modified, unstaged</td><td><code>WorkspaceManagerViewModel.swift</code></td><td>App source</td><td>Additive bounded initialization API and owner-held waiter registry.</td></tr>
+            <tr><td>Added/modified, unstaged</td><td>30 root Swift test files</td><td>Tests</td><td>Bounded wait migration, new waiter tests/helpers, and core-package import adjustments.</td></tr>
+            <tr><td>37 staged deletions + unstaged destinations</td><td><code>Sources/RepoPromptMCP/**</code>, <code>Sources/RepoPromptShared/**</code>, selected MCP tests → <code>Packages/RepoPromptCore/**</code></td><td>Source/test relocation</td><td>Separate smaller package with reusable libraries and nine extracted test suites.</td></tr>
+            <tr><td>Modified, unstaged</td><td><code>Package.swift</code>, <code>Makefile</code>, <code>.swiftlint.yml</code>, CI, guardrails, style script</td><td>Build/configuration</td><td>Wire the local core package, commands, cache/job, paths, and lint/layout ownership.</td></tr>
+            <tr><td>Modified, unstaged</td><td><code>AGENTS.md</code>, development, validation, and source-layout docs</td><td>Durable guidance</td><td>Document the tiered loop, exit codes, artifact evidence boundary, and new package ownership.</td></tr>
+            <tr><td>Intent-to-add, content unstaged</td><td><code>docs/investigations/dev-loop-measurement-20260731.md</code></td><td>Raw investigation</td><td>Machine-specific benchmark and architecture evidence. Its current index intent makes the tracked-doc guardrail see it; repository policy says keep it local unless intentionally promoted.</td></tr>
+            <tr><td>Untracked after report creation</td><td><code>docs/technical_implementation_reports/2026-08-01-dev-loop-conductor-optimization.html</code></td><td>Human report</td><td>This standalone implementation report.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout risk">
+        <strong>Current staged index is not commit-safe</strong>
+        The index contains only 37 deletions (15,051 deleted lines), while the destination files and all other
+        implementation changes are unstaged or intent-to-add. A commit made from the current index would record
+        destructive-looking deletions rather than the intended renames and complete change.
+      </div>
+    </section>
+
+    <section id="risks">
+      <h2>Risks, limitations, and technical debt</h2>
+      <div class="grid two">
+        <article class="card">
+          <div class="label">Observed gap</div>
+          <div class="value">3 runtime blanks</div>
+          <p>The Sentry privacy methods are configuration-gated and still use the safe 180-second default active-method budget.</p>
+        </article>
+        <article class="card">
+          <div class="label">Earlier inventory finding</div>
+          <div class="value">43 missing / 2 stale</div>
+          <p>The session previously reported ledger identity drift. Runtime backfill is not proof that this separate inventory issue is resolved; strict inventory was not rerun for this report.</p>
+        </article>
+        <article class="card">
+          <div class="label">Accepted overhead</div>
+          <div class="value">Closure hashing</div>
+          <p>Strong provenance hashes the artifact closure multiple times. Oracle A noted caching as an optional optimization if the ~4.8s live path becomes material.</p>
+        </article>
+        <article class="card">
+          <div class="label">Compiler experiment deferred</div>
+          <div class="value">PCH unchanged</div>
+          <p><code>-disable-bridging-pch</code> remains. History contains no rationale, but an A/B result was not strong enough to change it safely.</p>
+        </article>
+      </div>
+      <ul>
+        <li><strong>Artifact tests are point-in-time attestations.</strong> A later external edit does not retroactively invalidate a completed job, but it does require a new source-valid run before further contribution evidence.</li>
+        <li><strong>Build tickets depend on Git readability.</strong> Dirty submodules, unreadable files, or an unreadable artifact deliberately cause a fail-closed result.</li>
+        <li><strong>Core extraction adds a nested package boundary.</strong> It has its own manifest and lockfile, CI cache key, and ownership rules; dependency updates must keep root and core needs deliberate.</li>
+        <li><strong>The indefinite API still exists.</strong> This preserves compatibility. Production callers can still choose indefinite semantics; the completed migration targeted test call sites.</li>
+        <li><strong>One reviewer nit remains optional.</strong> Oracle A noted that <code>conductor test --list</code> may also mint a ticket and that closure verification is repeated. Neither was considered a correctness blocker.</li>
+        <li><strong>No database, migration, signing, release-channel, bundle-ID, or external API change was observed.</strong> The root <code>repoprompt-mcp</code> product name and CLI version contract remain intact.</li>
+      </ul>
+    </section>
+
+    <section id="actions">
+      <h2>Highlighted action items for you</h2>
+
+      <div class="callout risk">
+        <strong>1. Do not commit the current staged index</strong>
+        Review the working tree, then stage the complete intended logical changes so source moves are represented with
+        their destinations. After every staging change, run the required commit preflight.
+      </div>
+      <pre><code>git status --short
+git diff --cached --name-status
+# Stage only the reviewed, intended files.
+.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code></pre>
+
+      <div class="callout warn">
+        <strong>2. Decide which local reports should become contributor-visible</strong>
+        <code>docs/investigations/dev-loop-measurement-20260731.md</code> should remain local unless you explicitly
+        want to promote it. It currently has intent-to-add index state, so clear that state if it is meant to remain local.
+        This HTML report is also outside the current tracked-doc allowlist. If you want it in a commit, intentionally add
+        its exact path to the documentation allowlist and rerun guardrails; do not stage it accidentally.
+      </div>
+
+      <div class="callout warn">
+        <strong>3. Finish the last three runtime measurements</strong>
+        Run the Sentry-enabled privacy suite through the coordinated path, capture its three method runtimes, and
+        update only those ledger rows. Then rerun the optimizer/ledger checks.
+      </div>
+      <pre><code>REPOPROMPT_ENABLE_SENTRY=1 make dev-test FILTER=SentryTelemetryPrivacyTests
+make conductor-selftest</code></pre>
+
+      <h3>Recommended before opening a pull request</h3>
+      <ol>
+        <li>Normalize the staged index and inspect rename detection with <code>git diff --cached --stat</code>.</li>
+        <li>Resolve or explicitly document the earlier 43-missing/2-stale ledger inventory finding.</li>
+        <li>Run <code>make dev-lint</code>, focused source-valid suites, <code>make dev-core-test</code>, <code>make guardrails</code>, and the commit preflight.</li>
+        <li>Push only after the push preflight; hosted CI remains authoritative for the new core job and root shards.</li>
+      </ol>
+
+      <h3>Optional later optimizations</h3>
+      <ul>
+        <li>Cache artifact-closure fingerprints within a single invocation if profiling shows hashing is a meaningful fraction of the fast path.</li>
+        <li>Decide whether test-list operations should be allowed to mint a root artifact ticket.</li>
+        <li>Run a controlled bridging-PCH A/B experiment before changing the compiler flag.</li>
+        <li>Evaluate Oracle-routing extraction as the second separate-package pilot after checking bridging-header cleanliness.</li>
+      </ul>
+    </section>
+
+    <section id="evidence">
+      <h2>Evidence, provenance, and limitations</h2>
+      <div class="grid two">
+        <article class="card">
+          <div class="label">Session context</div>
+          <div class="value">Available</div>
+          <p>The supplied forked transcript contains the original slow-run examples, three-Oracle planning, implementation summaries, follow-up requests, validation results, and final reviewer verdicts.</p>
+        </article>
+        <article class="card">
+          <div class="label">Git baseline</div>
+          <div class="value">Current HEAD</div>
+          <p>No separate session-start commit was supplied. The transcript says implementation remained uncommitted; the report therefore uses <code>git diff HEAD</code> at observed HEAD <code>073fb069</code>.</p>
+        </article>
+        <article class="card">
+          <div class="label">Code inspection</div>
+          <div class="value">Current working tree</div>
+          <p>Conductor, waiter API/tests, manifests, CI, ledger, Makefile, source-layout guardrails, and routed workflow documents were inspected directly.</p>
+        </article>
+        <article class="card">
+          <div class="label">Raw historical logs</div>
+          <div class="value">Partially unavailable</div>
+          <p>The old full-suite ticket could not be reopened during report generation. Historical results in this page are labeled as session evidence rather than newly reproduced output.</p>
+        </article>
+      </div>
+
+      <h3>Metrics snapshot</h3>
+      <ul>
+        <li><strong>Implementation files vs HEAD:</strong> 81 (7 added, 37 modified, 37 renames).</li>
+        <li><strong>Implementation line delta:</strong> +7,798 / −4,428 with rename detection.</li>
+        <li><strong>Staged patch at report time:</strong> 37 deletions, +0 / −15,051; incomplete and not commit-ready. Several destinations and the measurement report also carry intent-to-add state without staged content.</li>
+        <li><strong>Ledger:</strong> 3,285 rows; 3 blank runtimes; 55 core methods across nine suites.</li>
+        <li><strong>Bounded workspace waits in tests:</strong> 59 calls across 15 files; zero untimed calls.</li>
+        <li><strong>Session duration:</strong> unknown; the transcript does not provide a reliable complete start/end duration.</li>
+      </ul>
+
+      <details>
+        <summary>Exit-code quick reference</summary>
+        <table>
+          <thead><tr><th>Exit</th><th>Meaning</th><th>Next action</th></tr></thead>
+          <tbody>
+            <tr><td><code>64</code></td><td>Filter did not match ledger or source suite.</td><td>Fix the name; override only for a genuinely new suite.</td></tr>
+            <tr><td><code>65</code></td><td>Artifact ticket or bundle missing, unreadable, or changed.</td><td>Run source-valid <code>make dev-test</code> first.</td></tr>
+            <tr><td><code>66</code></td><td>Filtered command ran zero test cases.</td><td>Fix filter/ledger/config gate; do not accept a false green.</td></tr>
+            <tr><td><code>70</code></td><td>XCTest startup, active-method, or between-method deadline fired.</td><td>Read phase diagnostics and fix the hang or justify a deliberate override.</td></tr>
+          </tbody>
+        </table>
+      </details>
+
+      <details>
+        <summary>Key files for maintainers</summary>
+        <ul>
+          <li><code>Scripts/conductor.py</code> — coordination, deadlines, tickets, fingerprints, slots, termination.</li>
+          <li><code>Scripts/test_conductor_lifecycle.py</code> — safety and race regressions.</li>
+          <li><code>Scripts/Fixtures/test-suite-contract-ledger.tsv</code> — filter authority and runtime budgets.</li>
+          <li><code>Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift</code> — owner-side bounded wait.</li>
+          <li><code>Tests/RepoPromptTests/Workspaces/WorkspaceManagerInitializationWaitTests.swift</code> — exactly-once and ordering tests.</li>
+          <li><code>Packages/RepoPromptCore/Package.swift</code> — extracted package boundary.</li>
+          <li><code>docs/context/workflows/development.md</code> and <code>validation.md</code> — authoritative developer contract.</li>
+          <li><code>docs/investigations/dev-loop-measurement-20260731.md</code> — local measurement details.</li>
+        </ul>
+      </details>
+    </section>
+
+    <footer>
+      Generated from AI-agent coding-session evidence and current repository state on 2026-08-01.
+      No secrets, credentials, or private diagnostic payloads are included.
+    </footer>
+  </main>
+</body>
+</html>

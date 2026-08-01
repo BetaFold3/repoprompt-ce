@@ -2139,7 +2139,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let composition = makeComposition(store: store)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let source = manager.createWorkspace(
                 name: "Search Readiness Source \(UUID().uuidString.prefix(8))",
                 repoPaths: [root.path],
@@ -2242,7 +2242,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let composition = makeComposition(store: store)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let source = manager.createWorkspace(
                 name: "Readiness Fence Source \(UUID().uuidString.prefix(8))",
                 repoPaths: [sourceRoot.path],
@@ -2359,7 +2359,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let composition = makeComposition(store: store)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let source = manager.createWorkspace(
                 name: "Queued Search Source \(UUID().uuidString.prefix(8))",
                 repoPaths: [root.path],
@@ -2457,7 +2457,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let composition = makeComposition(store: store)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
             let source = manager.createWorkspace(
                 name: "Ingress Search Source \(UUID().uuidString.prefix(8))",
                 repoPaths: [root.path],

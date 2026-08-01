@@ -27,7 +27,7 @@ required_dirs=(
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
-  "Sources/RepoPromptShared/MCP"
+  "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP"
   "Tests/RepoPromptTests"
 )
 for dir in "${required_dirs[@]}"; do
@@ -59,9 +59,9 @@ if [[ "$repo_prompt_entry_main_count" -ne 1 ]]; then
 fi
 
 shared_mcp_required_files=(
-  "Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
-  "Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift"
-  "Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift"
+  "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
+  "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift"
+  "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift"
 )
 for file in "${shared_mcp_required_files[@]}"; do
   if [[ ! -f "$file" ]]; then
@@ -238,9 +238,9 @@ print_matches \
 mcp_control_files=()
 while IFS= read -r file; do
   mcp_control_files+=("$file")
-done < <(find Sources -name MCPControlMessages.swift -type f -print | sort)
-if [[ "${#mcp_control_files[@]}" -ne 1 || "${mcp_control_files[0]:-}" != "Sources/RepoPromptShared/MCP/MCPControlMessages.swift" ]]; then
-  fail "MCPControlMessages.swift must exist only at Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
+done < <(find Sources Packages/RepoPromptCore/Sources -name MCPControlMessages.swift -type f -print | sort)
+if [[ "${#mcp_control_files[@]}" -ne 1 || "${mcp_control_files[0]:-}" != "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/MCPControlMessages.swift" ]]; then
+  fail "MCPControlMessages.swift must exist only at Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
   printf '%s\n' "${mcp_control_files[@]}" >&2
 fi
 
@@ -248,14 +248,14 @@ fi
 mcp_identity_files=()
 while IFS= read -r file; do
   mcp_identity_files+=("$file")
-done < <(find Sources -name MCPFilesystemIdentity.swift -type f -print | sort)
-if [[ "${#mcp_identity_files[@]}" -ne 1 || "${mcp_identity_files[0]:-}" != "Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift" ]]; then
+done < <(find Sources Packages/RepoPromptCore/Sources -name MCPFilesystemIdentity.swift -type f -print | sort)
+if [[ "${#mcp_identity_files[@]}" -ne 1 || "${mcp_identity_files[0]:-}" != "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift" ]]; then
   fail "MCPFilesystemIdentity.swift must exist only under RepoPromptShared"
   printf '%s\n' "${mcp_identity_files[@]}" >&2
 fi
 
-mcp_event_declarations="$(grep -R -l -E '^(public )?struct MCPExternalClientEvent' Sources --include='*.swift' | sort || true)"
-if [[ "$mcp_event_declarations" != "Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift" ]]; then
+mcp_event_declarations="$(grep -R -l -E '^(public )?struct MCPExternalClientEvent' Sources Packages/RepoPromptCore/Sources --include='*.swift' | sort || true)"
+if [[ "$mcp_event_declarations" != "Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift" ]]; then
   fail "MCPExternalClientEvent wire DTO must be declared only under RepoPromptShared"
   printf '%s\n' "$mcp_event_declarations" >&2
 fi

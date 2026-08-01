@@ -204,7 +204,7 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
-        await window.workspaceManager.awaitInitialized()
+        try await window.workspaceManager.awaitInitialized(timeout: .seconds(60))
 
         do {
             let workspace = window.workspaceManager.createWorkspace(

@@ -29,7 +29,9 @@ STYLE_PATHS=(
     "Sources/RepoPrompt"
     "Sources/RepoPromptExecutable"
     "Sources/RepoPromptMCP"
-    "Sources/RepoPromptShared"
+    "Packages/RepoPromptCore/Package.swift"
+    "Packages/RepoPromptCore/Sources"
+    "Packages/RepoPromptCore/Tests"
     "Tests/RepoPromptTests"
     "Packages/RepoPromptAgentProviders/Package.swift"
     "Packages/RepoPromptAgentProviders/Sources"
@@ -39,6 +41,7 @@ STYLE_PATHS=(
 EXCLUDED_SWIFT_PREFIXES=(
     "Sources/RepoPrompt/ThirdParty/SwiftPCRE2/"
     "Packages/RepoPromptAgentProviders/.build/"
+    "Packages/RepoPromptCore/.build/"
 )
 
 EXCLUDED_SWIFT_FILES=(

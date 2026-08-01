@@ -401,7 +401,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             deferredInitialAgentSystemWorkspaceRefresh: true,
             sharedMCPService: MCPService()
         )
-        await composition.workspaceManager.awaitInitialized()
+        try await composition.workspaceManager.awaitInitialized(timeout: .seconds(60))
 
         let storageRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("AgentOraclePillRoutingTests-\(UUID().uuidString)", isDirectory: true)

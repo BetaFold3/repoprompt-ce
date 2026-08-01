@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPromptApp
-@testable import RepoPromptMCP
+@testable import RepoPromptMCPCore
 import RepoPromptShared
 import XCTest
 

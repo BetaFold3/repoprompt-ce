@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import ctypes
 import dataclasses
+import difflib
 import errno
 import fcntl
 import hashlib
@@ -36,7 +38,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 12
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -62,6 +64,13 @@ XCTEST_WAKE_PROGRESS_WAIT_SECONDS = 10.0
 XCTEST_STALL_DIAGNOSTIC_MAX_PROCESSES = 64
 XCTEST_STALL_SAMPLE_MAX_BYTES = 128 * 1024
 XCTEST_STALL_FAILURE_EXIT_CODE = 70
+XCTEST_ZERO_TESTS_FAILURE_EXIT_CODE = 66
+XCTEST_STARTUP_DEADLINE_SECONDS = 90.0
+XCTEST_ACTIVE_METHOD_FLOOR_SECONDS = 90.0
+XCTEST_ACTIVE_METHOD_RUNTIME_MULTIPLIER = 4.0
+XCTEST_ACTIVE_METHOD_RUNTIME_PADDING_SECONDS = 30.0
+XCTEST_ACTIVE_METHOD_DEADLINE_SECONDS = 180.0
+XCTEST_BETWEEN_METHOD_DEADLINE_SECONDS = 60.0
 XCTEST_WATCHDOG_JOIN_SECONDS = 25.0
 FORCE_STOP_RPC_TIMEOUT_SECONDS = 30.0
 APP_STOP_POLL_SECONDS = 0.2
@@ -72,9 +81,12 @@ APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS = 25.0
 GLOBAL_HEAVY_SLOT_POLL_SECONDS = 0.2
 MACHINE_LOCK_POLL_SECONDS = 0.2
 MAX_GLOBAL_HEAVY_SLOTS = 64
+MAX_GLOBAL_XCTEST_SLOTS = 64
 DEBUG_APP_PROVENANCE_RELATIVE_PATH = "Contents/Resources/RepoPromptDebugProvenance.json"
 
 SHORT_TIMEOUT_SECONDS = 5 * 60
+FILTERED_TEST_TIMEOUT_SECONDS = 20 * 60
+ARTIFACT_TEST_TIMEOUT_SECONDS = 10 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
 SMOKE_AGENT_WAIT_SECONDS = 120.0
@@ -92,7 +104,9 @@ IMPLEMENTED_OPERATIONS = {
     "build",
     "package",
     "test",
+    "test-artifact",
     "provider-test",
+    "core-test",
     "install-debug-cli",
     "debug-cli-status",
     "run",
@@ -115,7 +129,7 @@ Daemon lifecycle:
   ./conductor daemon stop [--force] [--json]
 
 Job commands:
-  ./conductor job list [--state queued|running|completed|failed|canceled] [--json]
+  ./conductor job list [--state queued|running|waiting-heavy-slot|waiting-xctest-slot|completed|failed|canceled] [--json]
   ./conductor job status <ticket> [--json] [--full-log]
   ./conductor job status --request-key <key> [--json] [--full-log]
   ./conductor job wait <ticket> [--timeout <seconds>] [--json] [--full-log]
@@ -135,8 +149,10 @@ Operation commands:
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
   ./conductor build
   ./conductor package debug|release
-  ./conductor test [--list | --filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
-  ./conductor provider-test [--list | --filter <filter>] [--test-product <product>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor test-artifact --filter <filter> [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor provider-test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor core-test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
   ./conductor run [-- <app args...>]                  # build/package, then FIFO coordinated launch
@@ -164,6 +180,12 @@ Global operation flags:
   --verbose            execution verbosity: pass VERBOSE=1 to delegated scripts where applicable
   --full-log           human output rendering: replay raw full job log at completion
 
+XCTest controls:
+  deadlines default on; disable with --no-xctest-deadlines or REPOPROMPT_DEV_XCTEST_DEADLINES=0
+  active-method budgets use the curated runtime ledger unless --xctest-stall-seconds overrides them
+  REPOPROMPT_DEV_XCTEST_ACTIVE_FLOOR_SECONDS=N overrides the 90s floor for diagnostic selftests only
+  RPCE_ALLOW_UNKNOWN_FILTER=1 bypasses filter preflight; RPCE_ALLOW_ZERO_TESTS=1 permits filtered zero-test success
+
 Output:
   Synchronous jobs and job wait/status use concise human summaries by default and
   print the full log path. Raw logs are preserved under the daemon jobs directory.
@@ -175,6 +197,7 @@ State paths:
   socket default:    /tmp/conductor-<uid>/<repo-root-hash16>.sock (directory mode 0700)
   machine locks:     /tmp/repoprompt-ce-dev-locks-<uid>/ (directory mode 0700; independent of socket overrides)
   heavy slots:       REPOPROMPT_DEV_HEAVY_SLOTS=N (default 1)
+  XCTest slots:      REPOPROMPT_DEV_XCTEST_SLOTS=N (default 1)
   overrides: REPOPROMPT_DEV_DAEMON_STATE_DIR, REPOPROMPT_DEV_DAEMON_SOCKET (socket parent must be owned 0700)
 
 Protocol version: {PROTOCOL_VERSION}
@@ -185,20 +208,514 @@ class ConductorError(Exception):
     pass
 
 
+class FilterPreflightError(ConductorError):
+    pass
+
+
+class ArtifactUnavailableError(ConductorError):
+    pass
+
+
 XCTEST_PROGRESS_RE = re.compile(
     r"^Test Case '(.+)' (started|passed|failed|skipped)(?: \([^)]*\))?\.\s*$"
 )
+XCTEST_CASE_NAME_RE = re.compile(r"^-\[([^\s\]]+)\s+([^\s\]]+)\]$")
 XCTEST_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9:;]*m")
+
+
+def _test_ledger_path(repo_root: Path) -> Path:
+    return repo_root / "Scripts" / "Fixtures" / "test-suite-contract-ledger.tsv"
+
+
+def _read_test_ledger_rows(repo_root: Path) -> List[Dict[str, str]]:
+    with _test_ledger_path(repo_root).open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+def _ledger_filter_rows(repo_root: Path, operation: str) -> List[Tuple[str, str]]:
+    ledger_path = _test_ledger_path(repo_root)
+    target = "root" if operation in {"test", "test-artifact"} else "core" if operation == "core-test" else "provider"
+    try:
+        rows = _read_test_ledger_rows(repo_root)
+    except (OSError, csv.Error, UnicodeError) as exc:
+        raise FilterPreflightError(f"could not read curated test ledger {ledger_path}: {exc}") from exc
+    return [
+        (str(row.get("suite") or ""), str(row.get("method") or ""))
+        for row in rows
+        if row.get("target") == target and row.get("suite") and row.get("method")
+    ]
+
+
+def parse_xctest_case_name(test_name: str) -> Optional[Tuple[str, str]]:
+    match = XCTEST_CASE_NAME_RE.match(test_name.strip())
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
+
+
+def xctest_active_method_budget(
+    ledger_runtime_seconds: Optional[float],
+    flag_override_seconds: Optional[float],
+    job_timeout_seconds: Optional[float],
+    *,
+    floor_seconds: float = XCTEST_ACTIVE_METHOD_FLOOR_SECONDS,
+) -> Tuple[float, str, bool]:
+    if flag_override_seconds is not None:
+        budget = float(flag_override_seconds)
+        source = "flag-overridden"
+    elif ledger_runtime_seconds is not None:
+        budget = max(
+            float(floor_seconds),
+            XCTEST_ACTIVE_METHOD_RUNTIME_MULTIPLIER * float(ledger_runtime_seconds)
+            + XCTEST_ACTIVE_METHOD_RUNTIME_PADDING_SECONDS,
+        )
+        source = "ledger-derived"
+    else:
+        budget = XCTEST_ACTIVE_METHOD_DEADLINE_SECONDS
+        source = "default"
+
+    clamped = False
+    if job_timeout_seconds is not None and budget > float(job_timeout_seconds):
+        budget = max(0.0, float(job_timeout_seconds))
+        clamped = True
+    return budget, source, clamped
+
+
+def _xctest_active_method_floor(env: Dict[str, str]) -> float:
+    raw = env.get("REPOPROMPT_DEV_XCTEST_ACTIVE_FLOOR_SECONDS")
+    if raw is None:
+        return XCTEST_ACTIVE_METHOD_FLOOR_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return XCTEST_ACTIVE_METHOD_FLOOR_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        return XCTEST_ACTIVE_METHOD_FLOOR_SECONDS
+    return value
+
+
+def _filter_aliases(suite: str, method: str) -> Tuple[str, str, str, str]:
+    short_suite = suite.split(".", 1)[1] if "." in suite else suite
+    return suite, short_suite, f"{suite}/{method}", f"{short_suite}/{method}"
+
+
+def _source_contains_suite(test_root: Path, candidate: str) -> bool:
+    if not candidate or not test_root.exists():
+        return False
+    class_pattern = re.compile(rf"\bclass\s+{re.escape(candidate)}\b")
+    for source_path in test_root.rglob("*.swift"):
+        try:
+            if class_pattern.search(source_path.read_text(encoding="utf-8", errors="replace")):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def preflight_test_filter(repo_root: Path, operation: str, filter_value: str) -> None:
+    if os.environ.get("RPCE_ALLOW_UNKNOWN_FILTER") == "1":
+        print("RPCE_ALLOW_UNKNOWN_FILTER=1: skipping curated test filter preflight.", file=sys.stderr)
+        return
+
+    rows = _ledger_filter_rows(repo_root, operation)
+    aliases = {alias for suite, method in rows for alias in _filter_aliases(suite, method)}
+    if filter_value in aliases:
+        return
+    try:
+        filter_pattern = re.compile(filter_value)
+    except re.error:
+        filter_pattern = None
+    if filter_pattern is not None and any(filter_pattern.search(alias) for alias in aliases):
+        return
+
+    suite_part = filter_value.split("/", 1)[0]
+    candidate = suite_part.rsplit(".", 1)[-1]
+    if operation in {"test", "test-artifact"}:
+        test_root = repo_root / "Tests" / "RepoPromptTests"
+    elif operation == "core-test":
+        test_root = repo_root / "Packages" / "RepoPromptCore" / "Tests"
+    else:
+        test_root = repo_root / "Packages" / "RepoPromptAgentProviders" / "Tests"
+    if _source_contains_suite(test_root, candidate):
+        print(
+            f"Suite '{candidate}' found in sources but not in the curated ledger — "
+            "remember the surgical ledger update (docs/testing.md).",
+            file=sys.stderr,
+        )
+        return
+
+    suites = sorted({suite for suite, _method in rows})
+    suggestions = difflib.get_close_matches(suite_part, suites, n=3, cutoff=0.0)
+    suggestion_text = ", ".join(suggestions) if suggestions else "none available"
+    raise FilterPreflightError(
+        f"test filter '{filter_value}' matched no curated ledger entry or source suite. "
+        f"Closest ledger suites: {suggestion_text}. "
+        "Set RPCE_ALLOW_UNKNOWN_FILTER=1 to override."
+    )
+
+
+def _run_snapshot_command(
+    argv: Sequence[str],
+    repo_root: Path,
+    env: Optional[Dict[str, str]] = None,
+) -> Optional[bytes]:
+    try:
+        completed = subprocess.run(
+            list(argv),
+            cwd=str(repo_root),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return bytes(completed.stdout)
+
+
+def source_snapshot(repo_root: Path, env: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+    head_raw = _run_snapshot_command(["git", "rev-parse", "HEAD"], repo_root, env)
+    porcelain = _run_snapshot_command(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        repo_root,
+        env,
+    )
+    dirty_paths_raw = _run_snapshot_command(
+        ["git", "diff", "--name-only", "-z", "HEAD", "--"],
+        repo_root,
+        env,
+    )
+    if head_raw is None or porcelain is None or dirty_paths_raw is None:
+        return None
+    porcelain_digest_input = porcelain
+    if (repo_root / ".gitmodules").exists():
+        submodule_status = _run_snapshot_command(
+            ["git", "submodule", "status", "--recursive"],
+            repo_root,
+            env,
+        )
+        if submodule_status is None:
+            return None
+        porcelain_digest_input += b"\0git submodule status --recursive\0" + submodule_status
+        # Fail closed on any dirty submodule worktree: inner uncommitted content is
+        # not representable in the outer porcelain/status digests.
+        submodule_dirty = _run_snapshot_command(
+            ["git", "submodule", "--quiet", "foreach", "--recursive", "git status --porcelain -uall"],
+            repo_root,
+            env,
+        )
+        if submodule_dirty is None or submodule_dirty.strip():
+            return None
+    dirty_paths = {raw_path for raw_path in dirty_paths_raw.split(b"\0") if raw_path}
+    porcelain_entries = porcelain.split(b"\0")
+    for entry in porcelain_entries:
+        if entry.startswith(b"?? "):
+            dirty_paths.add(entry[3:])
+    dirty_file_sha256: Dict[str, str] = {}
+    for raw_path in dirty_paths:
+        if not raw_path:
+            continue
+        path_text = raw_path.decode("utf-8", errors="surrogateescape")
+        path = repo_root / path_text
+        if path.is_symlink():
+            try:
+                link_target = os.readlink(path)
+            except OSError:
+                return None
+            link_value = f"link:{link_target}".encode("utf-8", errors="surrogateescape")
+            dirty_file_sha256[path_text] = hashlib.sha256(link_value).hexdigest()
+            continue
+        if not path.is_file():
+            continue
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            # Fail closed: an unreadable dirty file must never let two differing
+            # trees produce equal snapshots.
+            return None
+        dirty_file_sha256[path_text] = digest.hexdigest()
+    return {
+        "head": head_raw.decode("utf-8", errors="replace").strip(),
+        "porcelain_sha256": hashlib.sha256(porcelain_digest_input).hexdigest(),
+        "dirty_file_sha256": dict(sorted(dirty_file_sha256.items())),
+    }
+
+
+def artifact_toolchain_snapshot(
+    repo_root: Path,
+    env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    version_raw = _run_snapshot_command(["swift", "--version"], repo_root, env)
+    arch_raw = _run_snapshot_command(["uname", "-m"], repo_root, env)
+    version_line = ""
+    if version_raw:
+        version_line = version_raw.decode("utf-8", errors="replace").splitlines()[0]
+    arch = arch_raw.decode("utf-8", errors="replace").strip() if arch_raw else ""
+    return {"swift_version": version_line, "arch": arch, "config": "debug"}
+
+
+def artifact_env_gates(env: Dict[str, str]) -> Dict[str, Optional[str]]:
+    # Only Package.swift compiled-graph gates belong here; RPCE_RUN_SCALE_TESTS/RPCE_RUN_CODEMAP_E2E are runtime-only and zero-test-backstopped.
+    return {
+        "REPOPROMPT_ENABLE_SENTRY": env.get("REPOPROMPT_ENABLE_SENTRY"),
+        "RPCE_ENABLE_BENCHMARK_TESTS": env.get("RPCE_ENABLE_BENCHMARK_TESTS"),
+    }
+
+
+def build_ticket_payload(
+    repo_root: Path,
+    job: "Job",
+    env: Dict[str, str],
+    snapshot: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    if snapshot is None:
+        snapshot = source_snapshot(repo_root, env)
+    if snapshot is None:
+        return None
+    toolchain = artifact_toolchain_snapshot(repo_root, env)
+    artifact_path = discover_root_test_artifact(repo_root, toolchain.get("arch", ""))
+    if artifact_path is None:
+        raise ArtifactUnavailableError("root test artifact is missing; run `make dev-test` first")
+    return {
+        "ticket_id": job.ticket,
+        "created_at": now(),
+        "source_snapshot": snapshot,
+        "env_gates": artifact_env_gates(env),
+        "toolchain": toolchain,
+        "artifact_fingerprint": test_artifact_fingerprint(artifact_path),
+    }
+
+
+def write_build_ticket(path: Path, payload: Dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary.unlink()
+
+
+def discover_root_test_artifact(repo_root: Path, arch: str) -> Optional[Path]:
+    preferred = repo_root / ".build" / f"{arch}-apple-macosx" / "debug" / "RepoPromptCEPackageTests.xctest"
+    if preferred.exists():
+        return preferred
+    debug_link = repo_root / ".build" / "debug" / "RepoPromptCEPackageTests.xctest"
+    if debug_link.exists():
+        return debug_link
+    if not arch:
+        return None
+    candidates = sorted(
+        repo_root.glob(f".build/{arch}-apple-macosx*/debug/RepoPromptCEPackageTests.xctest")
+    )
+    return candidates[0] if candidates else None
+
+
+def discover_test_artifact_executable(artifact_path: Path) -> Optional[Path]:
+    expected = artifact_path / "Contents" / "MacOS" / artifact_path.stem
+    if expected.is_file() and not expected.is_symlink():
+        return expected
+    executable_dir = artifact_path / "Contents" / "MacOS"
+    try:
+        candidates = [path for path in executable_dir.iterdir() if path.is_file() and not path.is_symlink()]
+    except OSError:
+        candidates = []
+    if len(candidates) == 1:
+        return candidates[0]
+    if artifact_path.is_file() and not artifact_path.is_symlink():
+        return artifact_path
+    return None
+
+
+def test_artifact_fingerprint(artifact_path: Path) -> Dict[str, Any]:
+    executable = discover_test_artifact_executable(artifact_path)
+    if executable is None:
+        raise ArtifactUnavailableError(
+            "root test artifact executable is missing; run `make dev-test` first"
+        )
+    try:
+        metadata = executable.stat()
+        digest = hashlib.sha256()
+        with executable.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise ArtifactUnavailableError(
+            f"root test artifact executable is unreadable ({exc}); run `make dev-test` first"
+        ) from exc
+
+    try:
+        products_dir = artifact_path.parent
+        closure_roots = [artifact_path] if artifact_path.is_dir() else []
+        closure_roots.extend(
+            path
+            for path in sorted(products_dir.glob("*.bundle"))
+            if path.is_dir() and not path.is_symlink()
+        )
+        manifest_lines: List[str] = []
+
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
+        for closure_root in closure_roots:
+            for directory, directory_names, file_names in os.walk(
+                closure_root,
+                topdown=True,
+                onerror=raise_walk_error,
+                followlinks=False,
+            ):
+                directory_path = Path(directory)
+                directory_names[:] = [
+                    name for name in directory_names if not (directory_path / name).is_symlink()
+                ]
+                for file_name in file_names:
+                    path = directory_path / file_name
+                    if path == executable or path.is_symlink() or not path.is_file():
+                        continue
+                    file_metadata = path.stat()
+                    relative_path = path.relative_to(products_dir).as_posix()
+                    file_digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            file_digest.update(chunk)
+                    manifest_lines.append(
+                        f"{relative_path}\0{file_metadata.st_size}\0{file_metadata.st_mtime_ns}\0"
+                        f"{file_digest.hexdigest()}\n"
+                    )
+        manifest_lines.sort()
+        closure_digest = hashlib.sha256(
+            "".join(manifest_lines).encode("utf-8", errors="surrogateescape")
+        ).hexdigest()
+    except OSError as exc:
+        raise ArtifactUnavailableError(
+            f"root test artifact closure is unreadable ({exc}); run `make dev-test` first"
+        ) from exc
+    return {
+        "executable_path": str(executable.resolve()),
+        "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "sha256": digest.hexdigest(),
+        "closure_manifest_sha256": closure_digest,
+        "closure_file_count": len(manifest_lines),
+    }
+
+
+def artifact_fingerprint_differences(
+    recorded: Any,
+    current: Dict[str, Any],
+) -> List[str]:
+    if not isinstance(recorded, dict):
+        return ["recorded artifact fingerprint"]
+    differences: List[str] = []
+    executable_keys = ("executable_path", "size", "mtime_ns", "sha256")
+    closure_keys = ("closure_manifest_sha256", "closure_file_count")
+    if any(recorded.get(key) != current.get(key) for key in executable_keys):
+        differences.append("executable fingerprint")
+    if any(recorded.get(key) != current.get(key) for key in closure_keys):
+        differences.append("artifact closure")
+    return differences
+
+
+def verify_test_artifact_fingerprint(artifact_path: Path, recorded: Any) -> Dict[str, Any]:
+    current = test_artifact_fingerprint(artifact_path)
+    differences = artifact_fingerprint_differences(recorded, current)
+    if differences:
+        raise ArtifactUnavailableError(
+            "root test artifact no longer matches its build ticket; changed: "
+            + ", ".join(differences)
+            + "; run `make dev-test` first"
+        )
+    return current
+
+
+def source_snapshot_differences(recorded: Any, current: Optional[Dict[str, Any]]) -> List[str]:
+    recorded_snapshot = recorded if isinstance(recorded, dict) else {}
+    differences: List[str] = []
+    if current is None or current.get("head") != recorded_snapshot.get("head"):
+        differences.append("HEAD")
+    if (
+        current is None
+        or current.get("porcelain_sha256") != recorded_snapshot.get("porcelain_sha256")
+        or current.get("dirty_file_sha256") != recorded_snapshot.get("dirty_file_sha256")
+    ):
+        differences.append("dirty digest")
+    return differences
+
+
+def artifact_scope_message(scope: str, differences: Sequence[str], passed: bool = False) -> str:
+    if scope == "current":
+        return "artifact_scope: current"
+    detail = "current source was NOT validated"
+    if differences:
+        detail += f"; differs: {', '.join(differences)}"
+    if passed:
+        detail = f"artifact passed; {detail}"
+    return f"artifact_scope: stale — {detail}"
+
+
+def evaluate_test_artifact(
+    repo_root: Path,
+    jobs_dir: Path,
+    env: Dict[str, str],
+) -> Dict[str, Any]:
+    ticket_path = jobs_dir / "build-ticket-root.json"
+    try:
+        ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise ArtifactUnavailableError(
+            "test artifact build ticket is missing or unreadable; run `make dev-test` first"
+        )
+    if not isinstance(ticket, dict):
+        raise ArtifactUnavailableError(
+            "test artifact build ticket is missing or unreadable; run `make dev-test` first"
+        )
+    current_toolchain = artifact_toolchain_snapshot(repo_root, env)
+    artifact_path = discover_root_test_artifact(repo_root, current_toolchain.get("arch", ""))
+    if artifact_path is None:
+        raise ArtifactUnavailableError(
+            "root test artifact is missing; run `make dev-test` first"
+        )
+    current_fingerprint = verify_test_artifact_fingerprint(
+        artifact_path, ticket.get("artifact_fingerprint")
+    )
+    current_source = source_snapshot(repo_root, env)
+    ticket_source_value = ticket.get("source_snapshot")
+    ticket_source = ticket_source_value if isinstance(ticket_source_value, dict) else {}
+    differences = source_snapshot_differences(ticket_source, current_source)
+    if artifact_env_gates(env) != (ticket.get("env_gates") or {}):
+        differences.append("env gates")
+    if current_toolchain != (ticket.get("toolchain") or {}):
+        differences.append("toolchain")
+    scope = "stale" if differences else "current"
+    return {
+        "artifactPath": str(artifact_path),
+        "artifactFingerprint": current_fingerprint,
+        "artifactScope": scope,
+        "artifactScopeDifferences": differences,
+        "artifactScopeMessage": artifact_scope_message(scope, differences),
+        "artifactTicketSourceSnapshot": ticket_source,
+        "buildTicketId": ticket.get("ticket_id"),
+    }
 
 
 @dataclasses.dataclass(frozen=True)
 class XCTestStallClaim:
+    phase: str
     progress_transport: str
     progress_sequence: int
     last_progress_test: Optional[str]
     last_progress_action: Optional[str]
     last_progress_observed_at: Optional[float]
     threshold_seconds: float
+    budget_source: Optional[str]
     current_test: Optional[str]
     previous_test: Optional[str]
     wake_probe: bool
@@ -410,6 +927,24 @@ def configured_global_heavy_slots(env: Optional[Dict[str, str]] = None) -> int:
 def global_heavy_slot_paths(env: Optional[Dict[str, str]] = None) -> List[Path]:
     root = machine_lock_dir()
     return [root / f"global-heavy-{index}.lock" for index in range(configured_global_heavy_slots(env))]
+
+
+def configured_global_xctest_slots(env: Optional[Dict[str, str]] = None) -> int:
+    raw = (env or os.environ).get("REPOPROMPT_DEV_XCTEST_SLOTS")
+    if raw is None or raw == "":
+        return 1
+    try:
+        slots = int(raw)
+    except ValueError as exc:
+        raise ConductorError("REPOPROMPT_DEV_XCTEST_SLOTS must be a positive integer") from exc
+    if slots < 1 or slots > MAX_GLOBAL_XCTEST_SLOTS:
+        raise ConductorError(f"REPOPROMPT_DEV_XCTEST_SLOTS must be between 1 and {MAX_GLOBAL_XCTEST_SLOTS}")
+    return slots
+
+
+def global_xctest_slot_paths(env: Optional[Dict[str, str]] = None) -> List[Path]:
+    root = machine_lock_dir()
+    return [root / f"global-xctest-{index}.lock" for index in range(configured_global_xctest_slots(env))]
 
 
 def live_app_lock_path() -> Path:
@@ -629,6 +1164,36 @@ def process_table_snapshot() -> Dict[int, Tuple[int, str]]:
     return snapshot
 
 
+def process_group_snapshot(pgid: int) -> Dict[int, Tuple[int, str]]:
+    if pgid <= 0:
+        return {}
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,lstart="],
+            text=True,
+            capture_output=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if completed.returncode != 0:
+        return {}
+    snapshot: Dict[int, Tuple[int, str]] = {}
+    for line in completed.stdout.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) != 4:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+            candidate_pgid = int(parts[2])
+        except ValueError:
+            continue
+        if pid > 0 and candidate_pgid == pgid and parts[3]:
+            snapshot[pid] = (ppid, parts[3])
+    return snapshot
+
+
 def process_command_snapshot(pids: Sequence[int]) -> Dict[int, str]:
     selected = sorted({pid for pid in pids if pid > 0})[:XCTEST_STALL_DIAGNOSTIC_MAX_PROCESSES]
     if not selected:
@@ -802,7 +1367,10 @@ class OutputSummarizer:
     STYLE_FINDING_RE = re.compile(
         r"(SwiftFormat|SwiftLint|linting|Missing required tool|Run 'make install-format-tools'|ERROR: Missing required Swift style tools|[^\s:]+:\d+:\d+: (warning|error):)"
     )
-    TIMEOUT_RE = re.compile(r"(timed out after|terminating process (?:group|tree)|killing process (?:group|tree)|canceled)", re.IGNORECASE)
+    TIMEOUT_RE = re.compile(
+        r"(timed out after|XCTest .* deadline triggered|terminating process (?:group|tree)|killing process (?:group|tree)|canceled)",
+        re.IGNORECASE,
+    )
     PHASE_RE = re.compile(r"^(==>|\$ |\+ )")
     ARTIFACT_RE = re.compile(
         r"^(Created:|APP_BUNDLE=|COMPAT_APP_BUNDLE=|CLI_PATH=|Output written to:|Agent Mode diagnostics enabled|Resolved rpce-cli-debug:|Build cache diagnostics|Current \.build:|Managed worktree container:|Worktree \.build total:|Top \.build directories:|\s+[0-9.]+ [KMGT]?i?B\s+)"
@@ -1055,14 +1623,42 @@ def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
     )
 
 
+def job_ticket_env_eligible(argv: Sequence[str]) -> bool:
+    """Whether the child process should receive REPOPROMPT_CONDUCTOR_JOB_TICKET.
+
+    Direct swift invocations must not receive per-job environment values:
+    SwiftPM keys its manifest/build-plan caches on the child environment, so a
+    unique per-job value forces a full multi-second re-plan on every
+    coordinated swift build/test job. Delegated scripts (packaging, debug-CLI
+    install, release) still receive the ticket for lock metadata.
+    """
+    if not argv:
+        return True
+    return Path(str(argv[0])).name != "swift"
+
+
+def operation_invalidates_root_build_ticket(operation: str, args: Dict[str, Any]) -> bool:
+    if operation in {"test", "swift-build", "build", "package", "install-debug-cli"}:
+        return True
+    return operation == "release" and args.get("subcommand") in {
+        "artifact",
+        "package",
+        "local-install",
+    }
+
+
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"swift-build", "build", "package", "test", "provider-test", "install-debug-cli"}:
+    if operation in {"swift-build", "build", "package", "test", "provider-test", "core-test", "install-debug-cli"}:
         return True
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
         return True
     if operation == "release" and args.get("subcommand") in {"artifact", "package", "local-install"}:
         return True
     return False
+
+
+def operation_requires_global_xctest_slot(operation: str, args: Dict[str, Any]) -> bool:
+    return operation == "test-artifact"
 
 
 def format_duration(seconds: Optional[float]) -> str:
@@ -1121,6 +1717,13 @@ class Job:
     global_heavy_slot_wait_seconds: Optional[float] = None
     global_heavy_slot_path: Optional[str] = None
     global_heavy_slot_holder: Optional[str] = None
+    global_xctest_slot_wait_seconds: Optional[float] = None
+    global_xctest_slot_path: Optional[str] = None
+    global_xctest_slot_holder: Optional[str] = None
+    artifact_scope: Optional[str] = None
+    artifact_scope_differences: List[str] = dataclasses.field(default_factory=list)
+    artifact_scope_message: Optional[str] = None
+    run_phase_seconds: Optional[float] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
     result_summary: Optional[str] = None
@@ -1131,7 +1734,14 @@ class Job:
     measurement_invalid: bool = False
     progress_transport: Optional[str] = None
     xctest_progress_sequence: int = 0
+    xctest_started_count: int = 0
+    xctest_deadline_phase: Optional[str] = None
     xctest_progress_deadline: Optional[float] = None
+    xctest_active_method_budget_seconds: Optional[float] = None
+    xctest_active_method_budget_source: Optional[str] = None
+    xctest_method_runtimes: Optional[Dict[Tuple[str, str], float]] = dataclasses.field(
+        default=None, repr=False
+    )
     xctest_current_test: Optional[str] = None
     xctest_previous_test: Optional[str] = None
     xctest_last_progress_test: Optional[str] = None
@@ -1179,6 +1789,13 @@ class Job:
             "globalHeavySlotWaitSeconds": self.global_heavy_slot_wait_seconds,
             "globalHeavySlotPath": self.global_heavy_slot_path,
             "globalHeavySlotHolder": self.global_heavy_slot_holder,
+            "xctestSlotWaitSeconds": self.global_xctest_slot_wait_seconds,
+            "xctestSlotPath": self.global_xctest_slot_path,
+            "xctestSlotHolder": self.global_xctest_slot_holder,
+            "artifactScope": self.artifact_scope,
+            "artifactScopeDifferences": list(self.artifact_scope_differences),
+            "artifactScopeMessage": self.artifact_scope_message,
+            "runPhaseSeconds": self.run_phase_seconds,
             "exitCode": self.exit_code,
             "error": self.error,
             "resultSummary": self.result_summary,
@@ -1251,12 +1868,16 @@ class OperationRegistry:
         "HOMEBREW_CACHE",
     ]
     TEST_ENV_KEYS = [
+        "RPCE_ALLOW_ZERO_TESTS",
         "RPCE_ENABLE_BENCHMARK_TESTS",
         "RPCE_RUN_CODEMAP_E2E",
         "RPCE_RUN_SCALE_TESTS",
+        "REPOPROMPT_DEV_XCTEST_DEADLINES",
+        "REPOPROMPT_DEV_XCTEST_ACTIVE_FLOOR_SECONDS",
     ]
     CONDUCTOR_ENV_KEYS = [
         "REPOPROMPT_DEV_HEAVY_SLOTS",
+        "REPOPROMPT_DEV_XCTEST_SLOTS",
     ]
     TELEMETRY_ENV_KEYS = [
         "REPOPROMPT_ENABLE_SENTRY",
@@ -1280,8 +1901,9 @@ class OperationRegistry:
         )
     )
 
-    def __init__(self, repo_root: Path) -> None:
+    def __init__(self, repo_root: Path, jobs_dir: Optional[Path] = None) -> None:
         self.repo_root = repo_root
+        self.jobs_dir = jobs_dir or compute_paths(repo_root).jobs_dir
         self.script_path = Path(__file__).resolve()
 
     @classmethod
@@ -1321,10 +1943,10 @@ class OperationRegistry:
         if operation not in IMPLEMENTED_OPERATIONS:
             raise ConductorError(f"operation '{operation}' is not implemented")
 
-        if operation in {"test", "provider-test"}:
+        if operation in {"test", "test-artifact", "provider-test", "core-test"}:
             self._validate_xctest_stall_options(args)
 
-        env = self._base_env(verbose, request)
+        env = self.request_environment(verbose, request)
         effective_timeout = self._default_timeout(operation, args)
         if timeout is not None:
             effective_timeout = float(timeout)
@@ -1370,7 +1992,12 @@ class OperationRegistry:
             elif args.get("filter"):
                 argv.extend(["--filter", str(args["filter"])])
             return argv, ["build"], cwd, env, effective_timeout
-        if operation == "provider-test":
+        if operation == "test-artifact":
+            if not args.get("filter"):
+                raise ConductorError("test-artifact requires --filter")
+            args.update(evaluate_test_artifact(self.repo_root, self.jobs_dir, env))
+            return ["swift", "test", "--skip-build", "--filter", str(args["filter"])], ["build"], cwd, env, effective_timeout
+        if operation in {"provider-test", "core-test"}:
             argv = ["swift", "test"]
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
@@ -1378,7 +2005,8 @@ class OperationRegistry:
                 argv.append("list")
             elif args.get("filter"):
                 argv.extend(["--filter", str(args["filter"])])
-            return argv, ["build"], self.repo_root / "Packages" / "RepoPromptAgentProviders", env, effective_timeout
+            package_name = "RepoPromptCore" if operation == "core-test" else "RepoPromptAgentProviders"
+            return argv, ["build"], self.repo_root / "Packages" / package_name, env, effective_timeout
         if operation == "install-debug-cli":
             return [script("install_debug_cli.sh"), "install", "--build"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "debug-cli-status":
@@ -1438,6 +2066,8 @@ class OperationRegistry:
             raise ConductorError("test list mode cannot be combined with XCTest stall diagnostics")
         if list_mode and args.get("testProduct"):
             raise ConductorError("test list mode cannot be combined with --test-product")
+        if args.get("xctestDeadlines") is False and (raw_seconds is not None or wake_probe):
+            raise ConductorError("disabled XCTest deadlines cannot be combined with XCTest stall diagnostics")
         if raw_seconds is None:
             if wake_probe:
                 raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")
@@ -1475,7 +2105,7 @@ class OperationRegistry:
             "sys.exit(exit_code)\n"
         )
         argv = [sys.executable, "-u", "-c", child_code, str(seconds), message, str(exit_code)]
-        env = self._base_env(bool(request.get("verbose")), request)
+        env = self.request_environment(bool(request.get("verbose")), request)
         effective_timeout = float(timeout) if timeout is not None else max(30.0, seconds + 30.0)
         return argv, lanes, self.repo_root, env, effective_timeout
 
@@ -1484,6 +2114,9 @@ class OperationRegistry:
         if verbose:
             env["VERBOSE"] = "1"
         return env
+
+    def request_environment(self, verbose: bool, request: Dict[str, Any]) -> Dict[str, str]:
+        return self._base_env(verbose, request)
 
     def _internal_argv(self, kind: str, args: Dict[str, Any]) -> List[str]:
         payload = {"kind": kind, "args": args, "repoRoot": str(self.repo_root)}
@@ -1500,6 +2133,10 @@ class OperationRegistry:
             return MEDIUM_TIMEOUT_SECONDS
         if operation == "diagnostics":
             return SHORT_TIMEOUT_SECONDS
+        if operation == "test-artifact":
+            return ARTIFACT_TEST_TIMEOUT_SECONDS
+        if operation in {"test", "provider-test", "core-test"} and args.get("filter"):
+            return FILTERED_TEST_TIMEOUT_SECONDS
         return MEDIUM_TIMEOUT_SECONDS
 
     def fingerprint(self, request: Dict[str, Any]) -> str:
@@ -1518,7 +2155,7 @@ class OperationRegistry:
 class DaemonState:
     def __init__(self, paths: Paths) -> None:
         self.paths = paths
-        self.registry = OperationRegistry(paths.repo_root)
+        self.registry = OperationRegistry(paths.repo_root, paths.jobs_dir)
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.jobs: Dict[str, Job] = {}
@@ -1530,6 +2167,9 @@ class DaemonState:
 
     def _global_heavy_slot_paths(self, env: Optional[Dict[str, str]] = None) -> List[Path]:
         return global_heavy_slot_paths(env)
+
+    def _global_xctest_slot_paths(self, env: Optional[Dict[str, str]] = None) -> List[Path]:
+        return global_xctest_slot_paths(env)
 
     def status_payload(self) -> Dict[str, Any]:
         with self.lock:
@@ -1550,6 +2190,8 @@ class DaemonState:
                 "stateDir": str(self.paths.state_dir),
                 "globalHeavySlotPaths": [str(path) for path in self._global_heavy_slot_paths()],
                 "globalHeavySlotCount": configured_global_heavy_slots(),
+                "xctestSlotPaths": [str(path) for path in self._global_xctest_slot_paths()],
+                "xctestSlotCount": configured_global_xctest_slots(),
                 "liveAppLockPath": str(live_app_lock_path()),
                 "activeJobsByLane": active_by_lane,
                 "runningJobs": running_jobs,
@@ -1561,9 +2203,22 @@ class DaemonState:
 
     def _job_payload_locked(self, job: Job, include_tail: bool = True, include_summary: bool = True) -> Dict[str, Any]:
         payload = job.to_payload(include_tail=include_tail, include_summary=include_summary)
+        slot_wait_state = self._machine_slot_wait_state_locked(job)
+        if slot_wait_state:
+            payload["state"] = slot_wait_state
         if job.state == "queued":
             payload["blockedBy"] = self._blocked_by_locked(job)
         return payload
+
+    @staticmethod
+    def _machine_slot_wait_state_locked(job: Job) -> Optional[str]:
+        if job.state != "running" or job.process_started_at is not None:
+            return None
+        if job.global_heavy_slot_path and job.global_heavy_slot_holder is not None:
+            return "waiting-heavy-slot"
+        if job.global_xctest_slot_path and job.global_xctest_slot_holder is not None:
+            return "waiting-xctest-slot"
+        return None
 
     def _blocked_by_locked(self, job: Job) -> List[Dict[str, Any]]:
         blockers: List[Dict[str, Any]] = []
@@ -1653,6 +2308,15 @@ class DaemonState:
                 env=env_snapshot,
                 created_at=now(),
                 log_path=log_path,
+                global_heavy_slot_wait_seconds=(
+                    0.0 if operation_requires_global_heavy_slot(operation, args) else None
+                ),
+                global_xctest_slot_wait_seconds=(
+                    0.0 if operation_requires_global_xctest_slot(operation, args) else None
+                ),
+                artifact_scope=args.get("artifactScope"),
+                artifact_scope_differences=list(args.get("artifactScopeDifferences") or []),
+                artifact_scope_message=args.get("artifactScopeMessage"),
             )
             intent = latest_lifecycle_intent(job.operation, job.args)
             superseded_jobs: List[Dict[str, Any]] = []
@@ -1743,8 +2407,14 @@ class DaemonState:
         with self.lock:
             jobs = list(self.jobs.values())
             jobs.sort(key=lambda job: job.created_at)
-            if state_filter:
-                jobs = [job for job in jobs if job.state == state_filter]
+            if state_filter in {"waiting-heavy-slot", "waiting-xctest-slot"}:
+                jobs = [job for job in jobs if self._machine_slot_wait_state_locked(job) == state_filter]
+            elif state_filter:
+                jobs = [
+                    job
+                    for job in jobs
+                    if (self._machine_slot_wait_state_locked(job) or job.state) == state_filter
+                ]
             return {"jobs": [self._job_payload_locked(job, include_tail=False, include_summary=False) for job in jobs]}
 
     def resolve_job_locked(self, ticket: Optional[str], request_key: Optional[str]) -> Job:
@@ -1901,12 +2571,31 @@ class DaemonState:
         if to_start:
             self.condition.notify_all()
 
-    def _acquire_global_heavy_slot(self, ticket: str) -> Optional[Any]:
+    def _acquire_global_slot(self, ticket: str, slot_class: str) -> Optional[Any]:
+        if slot_class == "heavy":
+            slot_label = "heavy"
+            lock_kind = "global-heavy"
+            paths_getter = self._global_heavy_slot_paths
+            wait_attr = "global_heavy_slot_wait_seconds"
+            path_attr = "global_heavy_slot_path"
+            holder_attr = "global_heavy_slot_holder"
+        elif slot_class == "xctest":
+            slot_label = "xctest"
+            lock_kind = "global-xctest"
+            paths_getter = self._global_xctest_slot_paths
+            wait_attr = "global_xctest_slot_wait_seconds"
+            path_attr = "global_xctest_slot_path"
+            holder_attr = "global_xctest_slot_holder"
+        else:
+            raise ConductorError(f"unknown global slot class '{slot_class}'")
+
         wait_start = now()
         with self.condition:
             job = self.jobs.get(ticket)
+            if job:
+                setattr(job, wait_attr, 0.0)
             env = dict(job.env) if job else {}
-        lock_paths = self._global_heavy_slot_paths(env)
+        lock_paths = paths_getter(env)
         ensure_private_dir(machine_lock_dir())
         lock_files = [(path, path.open("a+", encoding="utf-8")) for path in lock_paths]
         did_log_wait = False
@@ -1921,9 +2610,9 @@ class DaemonState:
                     if job.cancel_requested:
                         job.state = "canceled"
                         job.exit_code = 130
-                        job.result_summary = "canceled before global heavy slot"
+                        job.result_summary = f"canceled before global {slot_label} slot"
                         job.finished_at = now()
-                        self._append_system_line_locked(job, "job canceled before global heavy slot\n")
+                        self._append_system_line_locked(job, f"job canceled before global {slot_label} slot\n")
                         self.condition.notify_all()
                         return None
                 for lock_path, lock_file in lock_files:
@@ -1944,12 +2633,14 @@ class DaemonState:
                 with self.condition:
                     job = self.jobs.get(ticket)
                     if job and job.state == "running":
-                        job.global_heavy_slot_path = ",".join(str(path) for path, _file in lock_files)
-                        job.global_heavy_slot_holder = "; ".join(holders)
+                        setattr(job, wait_attr, max(0.0, now() - wait_start))
+                        setattr(job, path_attr, ",".join(str(path) for path, _file in lock_files))
+                        setattr(job, holder_attr, "; ".join(holders))
                         if not did_log_wait:
                             self._append_system_line_locked(
                                 job,
-                                f"waiting for global heavy slot ({len(lock_files)} configured): {job.global_heavy_slot_path}; {job.global_heavy_slot_holder}\n",
+                                f"waiting for global {slot_label} slot ({len(lock_files)} configured): "
+                                f"{getattr(job, path_attr)}; {getattr(job, holder_attr)}\n",
                             )
                             self.condition.notify_all()
                             did_log_wait = True
@@ -1959,7 +2650,7 @@ class DaemonState:
                 job = self.jobs.get(ticket)
                 if job and job.state == "running":
                     metadata = display_lock_metadata(
-                        lock_kind="global-heavy",
+                        lock_kind=lock_kind,
                         ticket=job.ticket,
                         operation=job.operation,
                         operation_label=operation_display_name(job.operation, job.args),
@@ -1967,12 +2658,12 @@ class DaemonState:
                         repo_hash=self.paths.repo_hash,
                     )
                     write_display_lock_metadata(selected_file, metadata)
-                    job.global_heavy_slot_wait_seconds = waited
-                    job.global_heavy_slot_path = str(selected_path)
-                    job.global_heavy_slot_holder = None
+                    setattr(job, wait_attr, waited)
+                    setattr(job, path_attr, str(selected_path))
+                    setattr(job, holder_attr, None)
                     self._append_system_line_locked(
                         job,
-                        f"acquired global heavy slot {selected_path} after {format_duration(waited)}\n",
+                        f"acquired global {slot_label} slot {selected_path} after {format_duration(waited)}\n",
                     )
                     self.condition.notify_all()
             return selected_file
@@ -1983,8 +2674,14 @@ class DaemonState:
                 with contextlib.suppress(OSError):
                     lock_file.close()
 
+    def _acquire_global_heavy_slot(self, ticket: str) -> Optional[Any]:
+        return self._acquire_global_slot(ticket, "heavy")
+
+    def _acquire_global_xctest_slot(self, ticket: str) -> Optional[Any]:
+        return self._acquire_global_slot(ticket, "xctest")
+
     @staticmethod
-    def _release_global_heavy_slot(lock_file: Optional[Any]) -> None:
+    def _release_global_slot(lock_file: Optional[Any]) -> None:
         if lock_file is None:
             return
         with contextlib.suppress(OSError):
@@ -1996,12 +2693,25 @@ class DaemonState:
         with contextlib.suppress(OSError):
             lock_file.close()
 
+    def _invalidate_root_build_ticket_locked(self, job: Job) -> None:
+        ticket_path = self.paths.jobs_dir / "build-ticket-root.json"
+        try:
+            ticket_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            self._append_system_line_locked(
+                job, f"could not invalidate prior root build ticket: {exc}\n"
+            )
+
     def _run_job(self, ticket: str) -> None:
         job: Optional[Job] = None
+        root_test_start_snapshot: Optional[Dict[str, Any]] = None
         process: Optional[subprocess.Popen[bytes]] = None
         output_transport: Optional[ProcessOutputTransport] = None
         watchdog: Optional[threading.Thread] = None
         global_heavy_slot: Optional[Any] = None
+        global_xctest_slot: Optional[Any] = None
         try:
             with self.lock:
                 job = self.jobs[ticket]
@@ -2012,6 +2722,8 @@ class DaemonState:
                     "verbose": job.verbose,
                     "env": job.env,
                 }
+                if operation_invalidates_root_build_ticket(job.operation, job.args):
+                    self._invalidate_root_build_ticket_locked(job)
                 if job.cancel_requested:
                     job.state = "canceled"
                     job.exit_code = 130
@@ -2019,11 +2731,29 @@ class DaemonState:
                     job.finished_at = now()
                     self._append_system_line_locked(job, "job canceled before process start\n")
                     return
+            if job.operation == "test":
+                # Snapshot failures must never break the runner; a missing start
+                # snapshot simply withholds the build ticket (fail-closed).
+                try:
+                    root_test_start_snapshot = source_snapshot(self.paths.repo_root, job.env)
+                except Exception:
+                    root_test_start_snapshot = None
             argv, _lanes, cwd, env, effective_timeout = self.registry.prepare(request)
-            env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
+            with self.condition:
+                job.artifact_scope = job.args.get("artifactScope")
+                job.artifact_scope_differences = list(job.args.get("artifactScopeDifferences") or [])
+                job.artifact_scope_message = job.args.get("artifactScopeMessage")
+            if job_ticket_env_eligible(argv):
+                env["REPOPROMPT_CONDUCTOR_JOB_TICKET"] = job.ticket
+            else:
+                env.pop("REPOPROMPT_CONDUCTOR_JOB_TICKET", None)
             if operation_requires_global_heavy_slot(job.operation, job.args):
                 global_heavy_slot = self._acquire_global_heavy_slot(job.ticket)
                 if global_heavy_slot is None:
+                    return
+            if operation_requires_global_xctest_slot(job.operation, job.args):
+                global_xctest_slot = self._acquire_global_xctest_slot(job.ticket)
+                if global_xctest_slot is None:
                     return
             start_line = f"$ {format_argv(argv)}\n"
             with job.log_path.open("ab") as log_file:
@@ -2033,6 +2763,16 @@ class DaemonState:
                 log_file.flush()
                 output_transport = self._create_process_output_transport(job)
                 job.progress_transport = output_transport.kind
+                if job.operation == "test-artifact":
+                    artifact_path_value = job.args.get("artifactPath")
+                    artifact_fingerprint = job.args.get("artifactFingerprint")
+                    if not isinstance(artifact_path_value, str) or artifact_fingerprint is None:
+                        raise ArtifactUnavailableError(
+                            "test artifact fingerprint is unavailable; run `make dev-test` first"
+                        )
+                    verify_test_artifact_fingerprint(
+                        Path(artifact_path_value), artifact_fingerprint
+                    )
                 process = subprocess.Popen(
                     argv,
                     cwd=str(cwd),
@@ -2045,6 +2785,19 @@ class DaemonState:
                 output_transport.attach_process(process)
                 with self.condition:
                     job.process_started_at = now()
+                    if self._xctest_watchdog_enabled(job):
+                        swiftpm_build_expected = (
+                            len(argv) >= 2
+                            and Path(argv[0]).name == "swift"
+                            and argv[1] == "test"
+                            and "--skip-build" not in argv
+                        )
+                        if swiftpm_build_expected:
+                            job.xctest_deadline_phase = "build"
+                            job.xctest_progress_deadline = None
+                        else:
+                            job.xctest_deadline_phase = "startup"
+                            job.xctest_progress_deadline = time.monotonic() + XCTEST_STARTUP_DEADLINE_SECONDS
                     job.process_pid = process.pid
                     with contextlib.suppress(OSError):
                         job.process_pgid = os.getpgid(process.pid)
@@ -2152,9 +2905,81 @@ class DaemonState:
                             job.measurement_invalid = True
                             job.error = "XCTest progress stall watchdog did not finish bounded diagnostics"
                             self._append_system_line_locked(job, job.error + "\n")
+                ticket_payload = None
+                ticket_error = None
+                ticket_withheld_reason = None
+                if exit_code == 0 and job.operation == "test":
+                    try:
+                        root_test_end_snapshot = source_snapshot(self.paths.repo_root, env)
+                        if root_test_start_snapshot is None or root_test_end_snapshot is None:
+                            ticket_withheld_reason = "ticket withheld: source snapshot unavailable during run"
+                        elif root_test_start_snapshot != root_test_end_snapshot:
+                            ticket_withheld_reason = "ticket withheld: source changed during run"
+                        else:
+                            ticket_payload = build_ticket_payload(
+                                self.paths.repo_root,
+                                job,
+                                env,
+                                snapshot=root_test_start_snapshot,
+                            )
+                    except Exception as exc:
+                        ticket_error = str(exc)
+                artifact_post_differences: List[str] = []
+                if job.operation == "test-artifact":
+                    post_snapshot = source_snapshot(self.paths.repo_root, env)
+                    recorded_snapshot = job.args.get("artifactTicketSourceSnapshot")
+                    artifact_post_differences = [
+                        f"post-run {difference}"
+                        for difference in source_snapshot_differences(recorded_snapshot, post_snapshot)
+                    ]
+                    artifact_path_value = job.args.get("artifactPath")
+                    artifact_fingerprint = job.args.get("artifactFingerprint")
+                    artifact_mutated = False
+                    if isinstance(artifact_path_value, str) and artifact_fingerprint is not None:
+                        try:
+                            post_fingerprint = test_artifact_fingerprint(Path(artifact_path_value))
+                            artifact_mutated = bool(
+                                artifact_fingerprint_differences(
+                                    artifact_fingerprint, post_fingerprint
+                                )
+                            )
+                        except ArtifactUnavailableError:
+                            artifact_mutated = True
+                    if artifact_mutated:
+                        artifact_post_differences.append("artifact mutated during run")
                 with self.condition:
+                    if ticket_error:
+                        self._append_system_line_locked(job, f"could not compute root build ticket: {ticket_error}\n")
+                    if ticket_withheld_reason:
+                        self._append_system_line_locked(job, ticket_withheld_reason + "\n")
+                    if job.operation == "test-artifact" and artifact_post_differences:
+                        for difference in artifact_post_differences:
+                            if difference not in job.artifact_scope_differences:
+                                job.artifact_scope_differences.append(difference)
+                        job.artifact_scope = "stale"
+                        job.artifact_scope_message = artifact_scope_message(
+                            "stale", job.artifact_scope_differences
+                        )
                     self._finalize_process_exit_locked(job, exit_code)
+                    if job.operation == "test-artifact" and job.process_started_at is not None and job.process_finished_at is not None:
+                        job.run_phase_seconds = max(0.0, job.process_finished_at - job.process_started_at)
+                    if job.state == "completed" and job.operation == "test" and ticket_payload is not None:
+                        try:
+                            write_build_ticket(self.paths.jobs_dir / "build-ticket-root.json", ticket_payload)
+                        except OSError as exc:
+                            self._append_system_line_locked(job, f"could not write root build ticket: {exc}\n")
+                    if job.state == "completed" and job.operation == "test-artifact" and job.artifact_scope_message:
+                        job.result_summary = job.artifact_scope_message
                     job.finished_at = now()
+        except ArtifactUnavailableError as exc:
+            if job is not None:
+                with self.condition:
+                    job.state = "failed"
+                    job.exit_code = 65
+                    job.error = str(exc)
+                    job.result_summary = str(exc)
+                    job.finished_at = now()
+                    self._append_system_line_locked(job, f"artifact unavailable: {exc}\n")
         except Exception as exc:  # defensive: preserve daemon health
             if job is not None:
                 with self.condition:
@@ -2165,7 +2990,8 @@ class DaemonState:
                     job.finished_at = now()
                     self._append_system_line_locked(job, f"daemon runner error: {exc}\n")
         finally:
-            self._release_global_heavy_slot(global_heavy_slot)
+            self._release_global_slot(global_xctest_slot)
+            self._release_global_slot(global_heavy_slot)
             if output_transport is not None:
                 output_transport.close_all()
             refresh_after_release = False
@@ -2225,6 +3051,19 @@ class DaemonState:
                 self._submit_process_output_line(ticket, bytes(pending))
             output_transport.close_reader()
 
+    @staticmethod
+    def _filtered_test_log_has_started_case(job: Job) -> bool:
+        try:
+            with job.log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for raw_line in handle:
+                    line = XCTEST_ANSI_SGR_RE.sub("", raw_line.rstrip("\r\n")).strip()
+                    marker = XCTEST_PROGRESS_RE.match(line)
+                    if marker is not None and marker.group(2) == "started":
+                        return True
+        except OSError:
+            return job.xctest_started_count > 0
+        return False
+
     def _finalize_process_exit_locked(self, job: Job, exit_code: int) -> None:
         if job.cancel_requested:
             job.state = "canceled"
@@ -2239,6 +3078,22 @@ class DaemonState:
             job.state = "failed"
             job.exit_code = 124
             job.result_summary = job.error or "timed out"
+        elif (
+            exit_code == 0
+            and job.operation in {"test", "test-artifact", "provider-test", "core-test"}
+            and bool(job.args.get("filter"))
+            and job.env.get("RPCE_ALLOW_ZERO_TESTS") != "1"
+            and not self._filtered_test_log_has_started_case(job)
+        ):
+            filter_value = str(job.args.get("filter"))
+            job.state = "failed"
+            job.exit_code = XCTEST_ZERO_TESTS_FAILURE_EXIT_CODE
+            job.error = (
+                f"0 tests executed for filter '{filter_value}' — filter matched nothing at runtime "
+                "(stale ledger entry, regex mismatch, or config-gated suite)"
+            )
+            job.result_summary = job.error
+            self._append_system_line_locked(job, job.error + "\n")
         elif exit_code == 0:
             job.state = "completed"
             job.exit_code = 0
@@ -2251,14 +3106,75 @@ class DaemonState:
 
     def _xctest_watchdog_enabled(self, job: Job) -> bool:
         return (
-            job.operation in {"test", "provider-test"}
+            job.operation in {"test", "test-artifact", "provider-test", "core-test"}
             and not bool(job.args.get("list"))
-            and job.args.get("xctestStallSeconds") is not None
+            and job.args.get("xctestDeadlines") is not False
+            and job.env.get("REPOPROMPT_DEV_XCTEST_DEADLINES") != "0"
         )
 
     def _create_process_output_transport(self, job: Job) -> ProcessOutputTransport:
         kind = "pty" if self._xctest_watchdog_enabled(job) else "pipe"
         return ProcessOutputTransport.create(kind)
+
+    def _load_xctest_method_runtimes_locked(self, job: Job) -> Dict[Tuple[str, str], float]:
+        if job.xctest_method_runtimes is not None:
+            return job.xctest_method_runtimes
+
+        job.xctest_method_runtimes = {}
+        ledger_path = _test_ledger_path(self.paths.repo_root)
+        try:
+            rows = _read_test_ledger_rows(self.paths.repo_root)
+        except (OSError, csv.Error, UnicodeError) as exc:
+            self._append_system_line_locked(
+                job,
+                f"XCTest runtime ledger unavailable at {ledger_path}; "
+                f"using flat {XCTEST_ACTIVE_METHOD_DEADLINE_SECONDS:.3f}s active-method defaults: {exc}\n",
+            )
+            return job.xctest_method_runtimes
+
+        for row in rows:
+            suite = str(row.get("suite") or "").strip()
+            method = str(row.get("method") or "").strip()
+            raw_runtime = str(row.get("runtime_seconds") or "").strip()
+            if not suite or not method or not raw_runtime:
+                continue
+            try:
+                runtime = float(raw_runtime)
+            except ValueError:
+                continue
+            if not math.isfinite(runtime) or runtime < 0:
+                continue
+            job.xctest_method_runtimes.setdefault((suite, method), runtime)
+        return job.xctest_method_runtimes
+
+    def _set_xctest_active_method_budget_locked(self, job: Job, test_name: str) -> float:
+        flag_override = job.args.get("xctestStallSeconds")
+        runtime: Optional[float] = None
+        if flag_override is None:
+            case_key = parse_xctest_case_name(test_name)
+            if case_key is not None:
+                runtime = self._load_xctest_method_runtimes_locked(job).get(case_key)
+        budget, source, clamped = xctest_active_method_budget(
+            runtime,
+            float(flag_override) if flag_override is not None else None,
+            job.timeout,
+            floor_seconds=_xctest_active_method_floor(job.env),
+        )
+        job.xctest_active_method_budget_seconds = budget
+        job.xctest_active_method_budget_source = source
+        if clamped:
+            unclamped_budget, _source, _clamped = xctest_active_method_budget(
+                runtime,
+                float(flag_override) if flag_override is not None else None,
+                None,
+                floor_seconds=_xctest_active_method_floor(job.env),
+            )
+            self._append_system_line_locked(
+                job,
+                f"XCTest active-method budget clamped from {unclamped_budget:.3f}s "
+                f"to job timeout {budget:.3f}s for method={test_name}; source={source}\n",
+            )
+        return budget
 
     def _record_xctest_progress_locked(
         self,
@@ -2271,26 +3187,34 @@ class DaemonState:
         matched = False
         timestamp = time.monotonic() if observed_at is None else observed_at
         progress_observed_at = now() if observed_at is None else observed_at
-        threshold = float(job.args["xctestStallSeconds"])
         for raw_line in text.splitlines():
             matchable_line = XCTEST_ANSI_SGR_RE.sub("", raw_line.rstrip("\r\n")).strip()
+            if "Build complete!" in matchable_line and job.xctest_progress_sequence == 0:
+                job.xctest_deadline_phase = "startup"
+                job.xctest_progress_deadline = timestamp + XCTEST_STARTUP_DEADLINE_SECONDS
+                continue
             marker = XCTEST_PROGRESS_RE.match(matchable_line)
             if marker is None:
                 continue
             test_name, action = marker.groups()
-            if action != "started" and job.xctest_progress_deadline is None:
+            if action != "started" and job.xctest_progress_sequence == 0:
                 continue
             matched = True
             job.xctest_progress_sequence += 1
-            job.xctest_progress_deadline = timestamp + threshold
             job.xctest_last_progress_test = test_name
             job.xctest_last_progress_action = action
             job.xctest_last_progress_observed_at = progress_observed_at
             if action == "started":
+                job.xctest_started_count += 1
+                job.xctest_deadline_phase = "active-method"
+                active_method_budget = self._set_xctest_active_method_budget_locked(job, test_name)
+                job.xctest_progress_deadline = timestamp + active_method_budget
                 if job.xctest_current_test and job.xctest_current_test != test_name:
                     job.xctest_previous_test = job.xctest_current_test
                 job.xctest_current_test = test_name
             else:
+                job.xctest_deadline_phase = "between-method"
+                job.xctest_progress_deadline = timestamp + XCTEST_BETWEEN_METHOD_DEADLINE_SECONDS
                 job.xctest_previous_test = test_name
                 if job.xctest_current_test == test_name:
                     job.xctest_current_test = None
@@ -2307,19 +3231,44 @@ class DaemonState:
         deadline = job.xctest_progress_deadline
         if deadline is None or timestamp < deadline:
             return None
+        phase = job.xctest_deadline_phase or "startup"
+        thresholds = {
+            "startup": XCTEST_STARTUP_DEADLINE_SECONDS,
+            "active-method": (
+                job.xctest_active_method_budget_seconds
+                if job.xctest_active_method_budget_seconds is not None
+                else XCTEST_ACTIVE_METHOD_DEADLINE_SECONDS
+            ),
+            "between-method": XCTEST_BETWEEN_METHOD_DEADLINE_SECONDS,
+        }
+        threshold_seconds = thresholds.get(phase, XCTEST_STARTUP_DEADLINE_SECONDS)
+        active_test = job.xctest_current_test if phase == "active-method" else None
+        active_label = active_test or "<none>"
+        budget_source = job.xctest_active_method_budget_source if phase == "active-method" else None
         job.xctest_watchdog_triggered = True
         job.measurement_invalid = True
-        job.error = "XCTest progress stall watchdog invalidated this measurement"
+        if phase == "active-method":
+            job.error = (
+                f"XCTest ACTIVE-METHOD deadline fired; active test method={active_label}; "
+                f"budget={threshold_seconds:.3f}s; budget source={budget_source or 'default'}"
+            )
+        else:
+            job.error = (
+                f"XCTest {phase.upper()} deadline fired after {threshold_seconds:.3f}s; "
+                f"active test method={active_label}"
+            )
         return XCTestStallClaim(
+            phase=phase,
             progress_transport=job.progress_transport or "pty",
             progress_sequence=job.xctest_progress_sequence,
             last_progress_test=job.xctest_last_progress_test,
             last_progress_action=job.xctest_last_progress_action,
             last_progress_observed_at=job.xctest_last_progress_observed_at,
-            threshold_seconds=float(job.args["xctestStallSeconds"]),
-            current_test=job.xctest_current_test,
+            threshold_seconds=threshold_seconds,
+            budget_source=budget_source,
+            current_test=active_test,
             previous_test=job.xctest_previous_test,
-            wake_probe=bool(job.args.get("xctestStallWakeProbe")),
+            wake_probe=phase == "active-method" and bool(job.args.get("xctestStallWakeProbe")),
             triggered_at=timestamp,
         )
 
@@ -2455,7 +3404,7 @@ class DaemonState:
         with self.condition:
             if job.state != "running":
                 return
-            self._terminate_process_group_locked(job, reason="XCTest progress stall measurement invalid")
+            self._terminate_process_group_locked(job, reason=job.error or "XCTest phase deadline fired")
             descendants_alive = self._wait_for_process_tree_exit_locked(
                 job,
                 now() + TERMINATE_GRACE_SECONDS,
@@ -2464,7 +3413,7 @@ class DaemonState:
             if descendants_alive:
                 self._kill_process_group_locked(
                     job,
-                    reason="XCTest progress stall cleanup; SIGKILL after grace period",
+                    reason="XCTest phase deadline cleanup; SIGKILL after grace period",
                 )
                 descendants_alive = self._wait_for_process_tree_exit_locked(
                     job,
@@ -2474,7 +3423,7 @@ class DaemonState:
             if descendants_alive:
                 self._append_system_line_locked(
                     job,
-                    "XCTest stall watchdog cleanup could not confirm descendant exit after SIGKILL\n",
+                    "XCTest deadline watchdog cleanup could not confirm descendant exit after SIGKILL\n",
                 )
             self.condition.notify_all()
 
@@ -2485,9 +3434,11 @@ class DaemonState:
                 return
             xctest_identity, process_tree = self._xctest_process_snapshot_locked(job)
             diagnostic: Dict[str, Any] = {
-                "kind": "xctest-progress-stall",
+                "kind": "xctest-phase-deadline",
+                "phase": claim.phase,
                 "capturedAt": now(),
                 "thresholdSeconds": claim.threshold_seconds,
+                "budgetSource": claim.budget_source,
                 "progressTransport": claim.progress_transport,
                 "progressSequence": claim.progress_sequence,
                 "lastProgressTest": claim.last_progress_test,
@@ -2501,13 +3452,20 @@ class DaemonState:
             if xctest_identity is not None:
                 diagnostic["xctestPID"] = xctest_identity[0]
                 diagnostic["xctestStartToken"] = xctest_identity[1]
-            current = claim.current_test or "<between XCTest cases>"
+            current = claim.current_test or "<none>"
             previous = claim.previous_test or "<none>"
-            self._append_system_line_locked(
-                job,
-                f"XCTest progress stall watchdog triggered after {claim.threshold_seconds:.3f}s; "
-                f"current={current}; previous={previous}\n",
-            )
+            if claim.phase == "active-method":
+                deadline_line = (
+                    f"XCTest ACTIVE-METHOD deadline triggered; active test method={current}; "
+                    f"budget={claim.threshold_seconds:.3f}s; budget source={claim.budget_source or 'default'}; "
+                    f"previous={previous}\n"
+                )
+            else:
+                deadline_line = (
+                    f"XCTest {claim.phase.upper()} deadline triggered after {claim.threshold_seconds:.3f}s; "
+                    f"active test method={current}; previous={previous}\n"
+                )
+            self._append_system_line_locked(job, deadline_line)
             self._append_system_line_locked(job, "XCTest descendant process tree:\n")
             for entry in process_tree:
                 self._append_system_line_locked(
@@ -2695,9 +3653,45 @@ class DaemonState:
         verified, _depths = self._refresh_process_tree_locked(job)
         return bool(verified)
 
+    def _verified_process_group_members_locked(
+        self,
+        job: Job,
+        pgid: int,
+    ) -> Dict[int, Tuple[int, str]]:
+        group_members = process_group_snapshot(pgid)
+        root_pid = job.process_pid
+        if root_pid is not None:
+            root_record = process_table_snapshot().get(root_pid)
+            expected_root_start = job.process_start or job.tracked_processes.get(root_pid)
+            if root_record is not None and (
+                not expected_root_start
+                or root_record[1] != expected_root_start
+                or root_pid not in group_members
+            ):
+                return {}
+        if root_pid is not None and root_pid in group_members:
+            expected_start = job.process_start or job.tracked_processes.get(root_pid)
+            if expected_start and group_members[root_pid][1] != expected_start:
+                return {}
+            if expected_start:
+                job.tracked_processes[root_pid] = expected_start
+        elif not job.process_group_identity_confirmed:
+            return {}
+
+        verified_members = {
+            pid: record
+            for pid, record in group_members.items()
+            if job.tracked_processes.get(pid) == record[1]
+        }
+        if root_pid is not None and root_pid in verified_members:
+            for pid, (_ppid, start_token) in group_members.items():
+                job.tracked_processes[pid] = start_token
+            verified_members = dict(group_members)
+        if verified_members:
+            job.process_group_identity_confirmed = True
+        return verified_members
+
     def _process_group_id_alive_locked(self, job: Job) -> bool:
-        if not job.process_group_identity_confirmed:
-            return False
         try:
             pgid = int(job.process_pgid) if job.process_pgid is not None else 0
         except (TypeError, ValueError):
@@ -2707,11 +3701,7 @@ class DaemonState:
         with contextlib.suppress(OSError):
             if pgid == os.getpgrp():
                 return False
-        try:
-            os.killpg(pgid, 0)
-            return True
-        except (ProcessLookupError, PermissionError, OSError):
-            return False
+        return bool(self._verified_process_group_members_locked(job, pgid))
 
     def _wait_for_process_tree_exit_locked(
         self,
@@ -2742,24 +3732,12 @@ class DaemonState:
             if pgid == os.getpgrp():
                 return False
 
-        # Once a start-token-verified job process is observed in the job PGID, keep
-        # trusting that PGID for this job's short TERM -> KILL cleanup window. This
-        # lets escalation reach same-PGID descendants that reparent after the root
-        # exits and are no longer discoverable by PPID tree walking.
-        group_identity_confirmed = job.process_group_identity_confirmed
-        if not group_identity_confirmed:
-            verified, _depths = self._refresh_process_tree_locked(job)
-            for pid, (_ppid, _start_token) in verified.items():
-                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                    if os.getpgid(pid) == pgid:
-                        group_identity_confirmed = True
-                        break
-            if group_identity_confirmed:
-                job.process_group_identity_confirmed = True
-
-        if not group_identity_confirmed:
+        if not self._verified_process_group_members_locked(job, pgid):
+            self._append_system_line_locked(
+                job,
+                f"refusing to signal process group {pgid}: recorded child identity no longer matches\n",
+            )
             return False
-
         try:
             os.killpg(pgid, sig)
             return True
@@ -2767,15 +3745,69 @@ class DaemonState:
             return False
 
     def _terminate_process_group_locked(self, job: Job, reason: str) -> None:
+        ancestry_snapshot, depths = self._refresh_process_tree_locked(job)
         if self._signal_process_group_id_locked(job, signal.SIGTERM):
             self._append_system_line_locked(job, f"terminating process group: {reason}\n")
         self._append_system_line_locked(job, f"terminating process tree: {reason}\n")
-        self._signal_process_tree_locked(job, signal.SIGTERM)
+        self._signal_verified_processes_locked(
+            job,
+            signal.SIGTERM,
+            ancestry_snapshot,
+            depths,
+        )
+
+    def _kill_escaped_descendants_locked(
+        self,
+        job: Job,
+        ancestry_snapshot: Dict[int, Tuple[int, str]],
+        depths: Dict[int, int],
+    ) -> None:
+        confirmation = process_table_snapshot()
+        escapees = {
+            pid: confirmation[pid]
+            for pid, (_ppid, start_token) in ancestry_snapshot.items()
+            if confirmation.get(pid) is not None and confirmation[pid][1] == start_token
+        }
+        if not escapees:
+            return
+        commands = process_command_snapshot(escapees.keys())
+        group_members: set[int] = set()
+        setsid_escapees: set[int] = set()
+        unclassified: set[int] = set()
+        for pid in escapees:
+            try:
+                if job.process_pgid is not None and os.getpgid(pid) == job.process_pgid:
+                    group_members.add(pid)
+                else:
+                    setsid_escapees.add(pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                unclassified.add(pid)
+        self._append_system_line_locked(
+            job,
+            f"found {len(group_members)} unreaped process-group member(s) (expected) and "
+            f"{len(setsid_escapees)} genuine setsid escapee(s), with {len(unclassified)} "
+            "descendant identity unavailable after process-group SIGKILL\n",
+        )
+        for pid in sorted(escapees):
+            if pid in group_members:
+                label = "unreaped group member"
+            elif pid in setsid_escapees:
+                label = "setsid escapee"
+            else:
+                label = "unclassified descendant"
+            self._append_system_line_locked(
+                job,
+                f"  {label} pid={pid} command={commands.get(pid, '')[:500]}\n",
+            )
+        killed = self._signal_verified_processes_locked(job, signal.SIGKILL, escapees, depths)
+        self._append_system_line_locked(job, f"SIGKILL sent to {killed} remaining descendant(s)\n")
 
     def _kill_process_group_locked(self, job: Job, reason: str) -> None:
+        ancestry_snapshot, depths = self._refresh_process_tree_locked(job)
         if self._signal_process_group_id_locked(job, signal.SIGKILL):
             self._append_system_line_locked(job, f"killing process group: {reason}\n")
         self._append_system_line_locked(job, f"killing process tree: {reason}\n")
+        self._kill_escaped_descendants_locked(job, ancestry_snapshot, depths)
         self._signal_process_tree_locked(job, signal.SIGKILL)
 
     def _retention_pass_locked(self) -> None:
@@ -2854,7 +3886,12 @@ class RequestHandler(socketserver.StreamRequestHandler):
             payload = handle_request(state, request)
             response = {"id": request_id, "ok": True, "payload": payload}
         except Exception as exc:
-            response = {"id": request_id, "ok": False, "error": str(exc)}
+            response = {
+                "id": request_id,
+                "ok": False,
+                "error": str(exc),
+                "errorType": type(exc).__name__,
+            }
         self.wfile.write((json.dumps(response) + "\n").encode("utf-8"))
         self.wfile.flush()
 
@@ -2952,7 +3989,10 @@ def request_daemon(paths: Paths, payload: Dict[str, Any], timeout: Optional[floa
     finally:
         sock.close()
     if not response.get("ok"):
-        raise ConductorError(response.get("error") or "daemon request failed")
+        message = response.get("error") or "daemon request failed"
+        if response.get("errorType") == "ArtifactUnavailableError":
+            raise ArtifactUnavailableError(message)
+        raise ConductorError(message)
     return response.get("payload") or {}
 
 
@@ -3142,6 +4182,9 @@ def render_daemon_status(payload: Dict[str, Any], shorthand: bool = False) -> No
             global_wait = job.get("globalHeavySlotWaitSeconds")
             if global_wait is not None:
                 timing += f" global-wait={format_duration(float(global_wait))}"
+            xctest_wait = job.get("xctestSlotWaitSeconds")
+            if xctest_wait is not None:
+                timing += f" xctest-wait={format_duration(float(xctest_wait))}"
             print(f"  {lane}: {job.get('ticket')} {job.get('operationLabel') or job.get('operation')} [{job.get('state')}]{timing}")
     else:
         print("active lanes: none")
@@ -3189,15 +4232,52 @@ def select_progress_lines(operation: str, lines: Sequence[str]) -> List[str]:
     return selected
 
 
+def _with_artifact_scope_summary(payload: Dict[str, Any], summary: Dict[str, Any]) -> Dict[str, Any]:
+    scope = payload.get("artifactScope")
+    if scope not in {"current", "stale"}:
+        return summary
+    if summary.get("artifactScope") == scope:
+        return summary
+    enriched = dict(summary)
+    enriched["artifactScope"] = scope
+    differences = list(payload.get("artifactScopeDifferences") or [])
+    enriched["artifactScopeDifferences"] = differences
+    passed = (
+        scope == "stale"
+        and payload.get("state") == "completed"
+        and payload.get("exitCode") == 0
+    )
+    message = (
+        artifact_scope_message(scope, differences, passed=passed)
+        if scope == "stale"
+        else str(payload.get("artifactScopeMessage") or "artifact_scope: current")
+    )
+    sections = list(enriched.get("sections") or [])
+    detail = message
+    sections.insert(
+        0,
+        {
+            "title": "Artifact scope",
+            "lines": [detail],
+            "truncated": False,
+            "omittedLineCount": 0,
+        },
+    )
+    enriched["sections"] = sections
+    if passed:
+        enriched["headline"] = message
+    return enriched
+
+
 def output_summary_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     summary = payload.get("outputSummary")
     label = payload.get("operationLabel") or operation_display_name(str(payload.get("operation") or ""), payload.get("args") or {})
     requires_lifecycle_classification = label == "app relaunch" and payload.get("state") == "failed"
     if isinstance(summary, dict) and (not requires_lifecycle_classification or isinstance(summary.get("launchLifecycle"), dict)):
-        return summary
+        return _with_artifact_scope_summary(payload, summary)
     log_path = payload.get("logPath")
     if log_path:
-        return OutputSummarizer.summarize_file(
+        generated = OutputSummarizer.summarize_file(
             str(payload.get("operation") or ""),
             payload.get("args") or {},
             str(payload.get("state") or ""),
@@ -3205,12 +4285,14 @@ def output_summary_for_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             bool(payload.get("timedOut")),
             Path(str(log_path)),
         )
-    return OutputSummarizer._minimal_summary(
-        str(payload.get("operation") or ""),
-        str(payload.get("state") or ""),
-        payload.get("exitCode"),
-        "no log path available for summary",
-    )
+    else:
+        generated = OutputSummarizer._minimal_summary(
+            str(payload.get("operation") or ""),
+            str(payload.get("state") or ""),
+            payload.get("exitCode"),
+            "no log path available for summary",
+        )
+    return _with_artifact_scope_summary(payload, generated)
 
 
 def payload_with_output_summary(payload: Dict[str, Any], include_log_tail: bool = False) -> Dict[str, Any]:
@@ -3219,9 +4301,16 @@ def payload_with_output_summary(payload: Dict[str, Any], include_log_tail: bool 
     existing_summary = payload.get("outputSummary")
     label = payload.get("operationLabel") or operation_display_name(str(payload.get("operation") or ""), payload.get("args") or {})
     needs_lifecycle_classification = label == "app relaunch" and payload.get("state") == "failed"
+    needs_artifact_scope = (
+        payload.get("artifactScope") in {"current", "stale"}
+        and (
+            not isinstance(existing_summary, dict)
+            or existing_summary.get("artifactScope") != payload.get("artifactScope")
+        )
+    )
     needs_summary = not isinstance(existing_summary, dict) or (
         needs_lifecycle_classification and not isinstance(existing_summary.get("launchLifecycle"), dict)
-    )
+    ) or needs_artifact_scope
     tail = payload.get("logTail")
     needs_tail_trim = include_log_tail and isinstance(tail, list) and len(tail) > LOG_TAIL_LINES
     has_tail = "logTail" in payload
@@ -3258,6 +4347,10 @@ def print_job_result_header(payload: Dict[str, Any], summary: Optional[Dict[str,
         timing_parts.append(f"exec={format_duration(float(payload.get('executionSeconds')))}")
     if payload.get("globalHeavySlotWaitSeconds") is not None:
         timing_parts.append(f"global-wait={format_duration(float(payload.get('globalHeavySlotWaitSeconds')))}")
+    if payload.get("xctestSlotWaitSeconds") is not None:
+        timing_parts.append(f"xctest-wait={format_duration(float(payload.get('xctestSlotWaitSeconds')))}")
+    if payload.get("runPhaseSeconds") is not None:
+        timing_parts.append(f"run={format_duration(float(payload.get('runPhaseSeconds')))}")
     if timing_parts:
         print(f"Timing:   {', '.join(timing_parts)}")
     if payload.get("error"):
@@ -3382,12 +4475,20 @@ def render_job(job: Dict[str, Any], output_mode: str = "summary", include_tail: 
         timing_parts.append(f"running={format_duration(max(0.0, now() - float(job.get('startedAt'))))}")
     if job.get("globalHeavySlotWaitSeconds") is not None:
         timing_parts.append(f"global-wait={format_duration(float(job.get('globalHeavySlotWaitSeconds')))}")
+    if job.get("xctestSlotWaitSeconds") is not None:
+        timing_parts.append(f"xctest-wait={format_duration(float(job.get('xctestSlotWaitSeconds')))}")
+    if job.get("runPhaseSeconds") is not None:
+        timing_parts.append(f"run={format_duration(float(job.get('runPhaseSeconds')))}")
     if timing_parts:
         print(f"timing:    {', '.join(timing_parts)}")
-    if job.get("globalHeavySlotPath") and job.get("state") == "running":
+    if job.get("globalHeavySlotPath") and job.get("state") in {"running", "waiting-heavy-slot"}:
         print(f"heavy:     {job.get('globalHeavySlotPath')}")
-    if job.get("globalHeavySlotHolder") and job.get("state") == "running":
+    if job.get("globalHeavySlotHolder") and job.get("state") in {"running", "waiting-heavy-slot"}:
         print(f"holder:    {job.get('globalHeavySlotHolder')}")
+    if job.get("xctestSlotPath") and job.get("state") in {"running", "waiting-xctest-slot"}:
+        print(f"xctest:    {job.get('xctestSlotPath')}")
+    if job.get("xctestSlotHolder") and job.get("state") in {"running", "waiting-xctest-slot"}:
+        print(f"holder:    {job.get('xctestSlotHolder')}")
     print(f"log:       {job.get('logPath')}")
     if job.get("startedAtISO"):
         print(f"started:   {job.get('startedAtISO')}")
@@ -3502,7 +4603,20 @@ def handle_job_command(paths: Paths, argv: List[str]) -> int:
         )
 
     if sub == "list":
-        parser.add_argument("--state", choices=sorted(["queued", "running", "completed", "failed", "canceled"]))
+        parser.add_argument(
+            "--state",
+            choices=sorted(
+                [
+                    "queued",
+                    "running",
+                    "waiting-heavy-slot",
+                    "waiting-xctest-slot",
+                    "completed",
+                    "failed",
+                    "canceled",
+                ]
+            ),
+        )
         ns = parser.parse_args(argv[1:])
         payload = request_daemon(paths, {"type": "job-list", "state": ns.state}, timeout=5.0)
         if ns.json:
@@ -4632,12 +5746,10 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("config", choices=["debug", "release"])
         ns = parser.parse_args(rest)
         args["config"] = ns.config
-    elif operation in {"test", "provider-test"}:
-        parser = argparse.ArgumentParser(prog=f"conductor {operation}")
-        mode = parser.add_mutually_exclusive_group()
-        mode.add_argument("--list", action="store_true")
-        mode.add_argument("--filter")
-        parser.add_argument("--test-product")
+    elif operation == "test-artifact":
+        parser = argparse.ArgumentParser(prog="conductor test-artifact")
+        parser.add_argument("--filter", required=True)
+        parser.add_argument("--no-xctest-deadlines", action="store_true")
         parser.add_argument("--xctest-stall-seconds", type=float)
         parser.add_argument("--xctest-stall-wake-probe", action="store_true")
         ns = parser.parse_args(rest)
@@ -4647,6 +5759,40 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             raise ConductorError("--xctest-stall-seconds must be greater than zero")
         if ns.xctest_stall_wake_probe and ns.xctest_stall_seconds is None:
             raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")
+        if ns.no_xctest_deadlines and (ns.xctest_stall_seconds is not None or ns.xctest_stall_wake_probe):
+            raise ConductorError("--no-xctest-deadlines cannot be combined with XCTest stall diagnostics")
+        args["filter"] = ns.filter
+        if ns.no_xctest_deadlines or os.environ.get("REPOPROMPT_DEV_XCTEST_DEADLINES") == "0":
+            args["xctestDeadlines"] = False
+        if ns.xctest_stall_seconds is not None:
+            args["xctestStallSeconds"] = ns.xctest_stall_seconds
+        if ns.xctest_stall_wake_probe:
+            args["xctestStallWakeProbe"] = True
+        preflight_test_filter(paths.repo_root, operation, ns.filter)
+        client_env = OperationRegistry.client_env_snapshot()
+        effective_env = OperationRegistry(paths.repo_root, paths.jobs_dir).request_environment(
+            False,
+            {"env": client_env},
+        )
+        args.update(evaluate_test_artifact(paths.repo_root, paths.jobs_dir, effective_env))
+    elif operation in {"test", "provider-test", "core-test"}:
+        parser = argparse.ArgumentParser(prog=f"conductor {operation}")
+        mode = parser.add_mutually_exclusive_group()
+        mode.add_argument("--list", action="store_true")
+        mode.add_argument("--filter")
+        parser.add_argument("--test-product")
+        parser.add_argument("--no-xctest-deadlines", action="store_true")
+        parser.add_argument("--xctest-stall-seconds", type=float)
+        parser.add_argument("--xctest-stall-wake-probe", action="store_true")
+        ns = parser.parse_args(rest)
+        if ns.xctest_stall_seconds is not None and (
+            not math.isfinite(ns.xctest_stall_seconds) or ns.xctest_stall_seconds <= 0
+        ):
+            raise ConductorError("--xctest-stall-seconds must be greater than zero")
+        if ns.xctest_stall_wake_probe and ns.xctest_stall_seconds is None:
+            raise ConductorError("--xctest-stall-wake-probe requires --xctest-stall-seconds")
+        if ns.no_xctest_deadlines and (ns.xctest_stall_seconds is not None or ns.xctest_stall_wake_probe):
+            raise ConductorError("--no-xctest-deadlines cannot be combined with XCTest stall diagnostics")
         if ns.list and (ns.xctest_stall_seconds is not None or ns.xctest_stall_wake_probe):
             raise ConductorError("--list cannot be combined with XCTest stall diagnostics")
         if ns.list and ns.test_product:
@@ -4657,10 +5803,15 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             args["filter"] = ns.filter
         if ns.test_product:
             args["testProduct"] = ns.test_product
+        deadlines_disabled = ns.no_xctest_deadlines or os.environ.get("REPOPROMPT_DEV_XCTEST_DEADLINES") == "0"
+        if deadlines_disabled and not ns.list:
+            args["xctestDeadlines"] = False
         if ns.xctest_stall_seconds is not None:
             args["xctestStallSeconds"] = ns.xctest_stall_seconds
         if ns.xctest_stall_wake_probe:
             args["xctestStallWakeProbe"] = True
+        if ns.filter:
+            preflight_test_filter(paths.repo_root, operation, ns.filter)
     elif operation == "run":
         app_args = rest[1:] if rest and rest[0] == "--" else rest
         args["appArgs"] = app_args
@@ -4778,6 +5929,12 @@ if __name__ == "__main__":
         raise SystemExit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         raise SystemExit(130)
+    except FilterPreflightError as exc:
+        print(f"conductor: {exc}", file=sys.stderr)
+        raise SystemExit(64)
+    except ArtifactUnavailableError as exc:
+        print(f"conductor: {exc}", file=sys.stderr)
+        raise SystemExit(65)
     except ConductorError as exc:
         print(f"conductor: {exc}", file=sys.stderr)
         raise SystemExit(1)

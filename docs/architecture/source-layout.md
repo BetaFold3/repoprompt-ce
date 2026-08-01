@@ -1,10 +1,16 @@
 # Source Layout Ownership Map
 
-Current as of 2026-07-08 after the source-layout refactor, provider extraction, upstream Tree-sitter grammar migration, and the thin-executable split. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
+Current as of 2026-08-01 after the source-layout refactor, provider/core extraction, upstream Tree-sitter grammar migration, and the thin-executable splits. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
 
 ## Current source tree shape
 
 ```text
+Packages/
+  RepoPromptCore/
+    Sources/
+      RepoPromptShared/MCP/      # shared app/CLI MCP control protocol definitions
+      RepoPromptMCPCore/         # importable MCP CLI implementation library
+    Tests/RepoPromptCoreTests/   # isolated Shared/MCP core XCTest target
 Sources/
   RepoPromptExecutable/          # thin shipped RepoPrompt executable target; sole @main and delegation only
     RepoPromptExecutable.swift
@@ -46,9 +52,7 @@ Sources/
       VCS/                       # git/VCS substrate
       WorkspaceContext/          # context store, indexing, path lookup, slices, search, token accounting
     ThirdParty/                  # vendored SwiftPCRE2 wrapper
-  RepoPromptShared/
-    MCP/                         # shared app/CLI MCP control protocol definitions
-  RepoPromptMCP/                 # MCP CLI implementation
+  RepoPromptMCP/                 # thin repoprompt-mcp executable entry delegating to RepoPromptMCPCore
   RepoPromptC/                   # C support target
   CSwiftPCRE2/                   # C PCRE2 target
   TreeSitterScannerSupport/      # narrow exact-snapshot JavaScript/Python scanner ABI fallback
@@ -56,7 +60,7 @@ Tests/
   RepoPromptTests/               # XCTest tests, support, and fixtures
 ```
 
-The external target graph is intentionally stable at its boundary: the executable product and emitted binary remain `RepoPrompt`, while the `RepoPrompt` executable target contains only the process entry and delegates to the internal `RepoPromptApp` target. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. Root app tests import `RepoPromptApp`; the separate `RepoPromptMCP` executable dependency remains unchanged.
+The external target graph is intentionally stable at its boundary: the executable products and emitted binaries remain `RepoPrompt` and `repoprompt-mcp`. The `RepoPrompt` executable target delegates to the internal `RepoPromptApp` target, while the `RepoPromptMCP` executable target contains only its process entry and delegates to the `RepoPromptMCPCore` package product. `RepoPromptApp` is not declared as a library product or separate Xcode convenience scheme. Root app tests import `RepoPromptApp` and the required `RepoPromptCore` products.
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
 
@@ -89,10 +93,10 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
 - New generic extensions/helpers should prefer a narrow feature or infrastructure owner first; otherwise use `Sources/RepoPrompt/Infrastructure/Utilities`.
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
-- New app/CLI protocol definitions shared by both executables go under `Sources/RepoPromptShared`.
-- MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
+- New app/CLI protocol definitions shared by both executables go under `Packages/RepoPromptCore/Sources/RepoPromptShared`.
+- MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Packages/RepoPromptCore/Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
-- New CLI-only implementation code goes under `Sources/RepoPromptMCP`.
+- New importable CLI implementation code goes under `Packages/RepoPromptCore/Sources/RepoPromptMCPCore`; `Sources/RepoPromptMCP` remains the thin executable entry only.
 - New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
@@ -152,7 +156,7 @@ The guardrail script verifies:
 - `Package.swift` keeps the `RepoPrompt` executable as a thin dependency on the internal `RepoPromptApp` target at `Sources/RepoPrompt`;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
-- `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
+- `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Packages/RepoPromptCore/Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
 - the narrow `TreeSitterScannerSupport` compatibility target has exactly its approved JavaScript/Python scanner snapshots and helper headers, matches curated checksums, remains wired in `Package.swift`, preserves the seven migrated grammar pins/products in `Package.swift` and `Package.resolved`, and keeps the seven retired local grammar directories absent;
 - Agent/MCP runtime code does not depend on `WorkspaceFilesViewModel`, `FileViewModel`, or `FolderViewModel`;
@@ -164,7 +168,7 @@ The guardrail script verifies:
 
 ## Historical resolved items
 
-- `MCPControlMessages.swift`, `MCPFilesystemIdentity.swift`, and the `MCPExternalClientEvent` wire DTO now have one source of truth in `Sources/RepoPromptShared/MCP`; the app and CLI targets depend on `RepoPromptShared`.
+- `MCPControlMessages.swift`, `MCPFilesystemIdentity.swift`, and the `MCPExternalClientEvent` wire DTO have one source of truth in `Packages/RepoPromptCore/Sources/RepoPromptShared/MCP`; the app and CLI targets depend on the `RepoPromptShared` package product.
 - The old production dependency on a test-named filesystem seam was renamed to `FileSystemProviding`; test doubles/support live under tests.
 - The dead Dart parser fixture under app source was removed rather than retained as production code.
 - Workspace, Agent Mode, MCP infrastructure, workspace context/files, Prompt, Context Builder, Chat, Search, Settings, Code Map, and syntax parsing were moved toward the hybrid feature/infrastructure layout.

@@ -1,6 +1,6 @@
 import Foundation
 import MCP
-@testable import RepoPromptMCP
+@testable import RepoPromptMCPCore
 import XCTest
 
 #if DEBUG

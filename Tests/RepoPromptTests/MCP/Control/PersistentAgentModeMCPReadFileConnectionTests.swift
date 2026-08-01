@@ -2868,8 +2868,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState()
             let routingGuardWindow = WindowState()
-            await window.workspaceManager.awaitInitialized()
-            await routingGuardWindow.workspaceManager.awaitInitialized()
+            try await window.workspaceManager.awaitInitialized(timeout: .seconds(60))
+            try await routingGuardWindow.workspaceManager.awaitInitialized(timeout: .seconds(60))
             if agentOwned {
                 window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
                     guard sessionID == agentSessionID, tabID == Self.tabID else { return .hydrated([]) }

@@ -57,7 +57,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
             )
         )
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
 
         let source = manager.createWorkspace(
             name: "Recovery Source \(UUID().uuidString.prefix(8))",
@@ -158,7 +158,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
             )
         )
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let previousWorkspaceID = manager.activeWorkspaceID
         let provider = StickyBusyWorkspaceSwitchSessionProvider(workspaceManager: manager)
         manager.registerSwitchSessionProvider(provider)
@@ -200,7 +200,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
     func testConfirmationCancellationClearsOnlyOwnedContinuation() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let provider = StaticWorkspaceSwitchSessionProvider()
         manager.registerSwitchSessionProvider(provider)
 
@@ -251,7 +251,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
     func testExplicitSwitchCancellationResolvesOwnedConfirmation() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         manager.registerSwitchSessionProvider(StaticWorkspaceSwitchSessionProvider())
 
         let target = manager.createWorkspace(
@@ -279,10 +279,10 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertNil(manager.activeWorkspaceSwitch)
     }
 
-    func testSaveAndExitReturnsExactRequestResult() async {
+    func testSaveAndExitReturnsExactRequestResult() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let activeName = manager.activeWorkspace?.name ?? ""
 
         let result = await manager.saveAndExitToFallback()
@@ -297,10 +297,10 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         )
     }
 
-    func testCancellationRequestedBySwitchListenerAfterNotificationReturnsSwitched() async {
+    func testCancellationRequestedBySwitchListenerAfterNotificationReturnsSwitched() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let target = manager.createWorkspace(
             name: "Listener Commit Target \(UUID().uuidString.prefix(8))",
             repoPaths: [],
@@ -327,10 +327,10 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertFalse(manager.isSwitchingWorkspace)
     }
 
-    func testListenerRemovalTokensDropRegisteredCallbacks() async {
+    func testListenerRemovalTokensDropRegisteredCallbacks() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let initialBeforeSaveCount = manager.test_beforeSaveListenerCount()
 
         let workspaceSwitchToken = manager.addWorkspaceDidSwitchListener(label: "removal-token-test") { _ in
@@ -383,7 +383,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         )
         let composition = makeComposition(store: store)
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let fallbackID = try XCTUnwrap(manager.activeWorkspaceID)
 
         let source = manager.createWorkspace(
@@ -487,7 +487,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let store = WorkspaceFileContextStore()
         let composition = makeComposition(store: store)
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let fallbackID = try XCTUnwrap(manager.activeWorkspaceID)
         let active = manager.createWorkspace(
             name: "Same ID Cancellation \(UUID().uuidString.prefix(8))",
@@ -543,7 +543,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let store = WorkspaceFileContextStore()
         let composition = makeComposition(store: store)
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let source = manager.createWorkspace(
             name: "Blocked Recovery Source \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
@@ -586,7 +586,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let store = WorkspaceFileContextStore()
         let composition = makeComposition(store: store)
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let source = manager.createWorkspace(
             name: "Owning Notice Source \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
@@ -646,7 +646,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let store = WorkspaceFileContextStore()
         let composition = makeComposition(store: store)
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let active = manager.createWorkspace(
             name: "Same ID Reload \(UUID().uuidString.prefix(8))",
             repoPaths: [rootA.path],
@@ -700,7 +700,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
 
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         manager.workspaces.append(fixture.workspace)
 
         let initialResult = await manager.switchWorkspace(to: fixture.workspace, saveState: false)
@@ -747,7 +747,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         for _ in 0 ..< 2 {
             let composition = makeComposition(storageRoot: storageRoot)
             let manager = composition.workspaceManager
-            await manager.awaitInitialized()
+            try await manager.awaitInitialized(timeout: .seconds(60))
 
             XCTAssertEqual(manager.activeWorkspaceID, fixture.workspace.id)
             assertSelectionFixture(fixture, composition: composition)
@@ -807,7 +807,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
 
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         manager.workspaces.append(workspace)
 
         var injectedBlankSnapshot = false
@@ -888,7 +888,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
 
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         manager.workspaces.append(workspace)
 
         var updatedCanonicalSelection = false
@@ -917,7 +917,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
     func testWorkspaceSearchReadinessWaitsForExactSwitchGenerationAndRejectsStaleTicket() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
 
         let readinessGate = WorkspaceSwitchRecoveryGate()
         manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
@@ -985,7 +985,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
     func testWorkspaceSearchReadinessCancellationAndTimeoutRemoveWaiters() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
 
         let readinessGate = WorkspaceSwitchRecoveryGate()
         manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
@@ -1061,7 +1061,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let store = WorkspaceFileContextStore()
         let composition = makeComposition(store: store)
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let source = manager.createWorkspace(
             name: "Readiness Source \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
@@ -1157,7 +1157,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         await store.setWatcherActivationFailureForNewServicesForTesting(.streamStart)
         let composition = makeComposition(store: store)
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let target = manager.createWorkspace(
             name: "Watcher Activation Failure \(UUID().uuidString.prefix(8))",
             repoPaths: [root.path],
@@ -1187,7 +1187,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
     func testSessionCancellationAdvancesBackToPreparationBeforeSwitchCleanup() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
         let cancellationGate = WorkspaceSwitchRecoveryGate()
         manager.registerSwitchSessionProvider(GatedWorkspaceSwitchSessionProvider(gate: cancellationGate))
         var phases: [WorkspaceSwitchPhase] = []
@@ -1233,7 +1233,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         await store.setWatcherActivationFailureForNewServicesForTesting(.streamStart)
         let composition = makeComposition(store: store)
         let manager = composition.workspaceManager
-        await manager.awaitInitialized()
+        try await manager.awaitInitialized(timeout: .seconds(60))
 
         let workspace = manager.createWorkspace(
             name: "Watcher Failure Slices \(UUID().uuidString.prefix(8))",
