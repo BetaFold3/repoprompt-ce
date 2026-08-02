@@ -17,12 +17,35 @@ import SwiftUI
 
 // MARK: - Enhanced Markdown Compiler
 
+/// The information an opt-in image renderer needs to replace Markdown image text with an attachment.
+///
+/// The hook is intentionally synchronous because the compiler itself is synchronous. Preview callers
+/// perform compilation off the main actor; transcript callers leave the hook `nil` and retain the
+/// compiler's historical alt-text output byte-for-byte.
+struct EnhancedMarkdownImageRequest {
+    let source: String
+    let altText: String
+    let maximumDisplayWidth: CGFloat
+    let fontSize: CGFloat
+}
+
+/// Additive image-rendering seam for callers that own a trusted local-asset boundary.
+struct EnhancedMarkdownImageProvider {
+    let attributedImage: @Sendable (EnhancedMarkdownImageRequest) -> NSAttributedString?
+}
+
 struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     typealias Result = NSAttributedString
 
     var forceTextColor: Color?
     var fontSize: CGFloat = 16.0
     var useMonospaced: Bool = false
+    /// `nil` everywhere except the utility-panel Preview's rendered Markdown path.
+    var imageProvider: EnhancedMarkdownImageProvider?
+    /// Width available to the attachment, excluding the reading surface's horizontal padding.
+    var maximumImageDisplayWidth: CGFloat = 560
+    /// Opt-in rendered-storage anchors for the utility-panel outline. Disabled for transcripts.
+    var indexesHeadingsForNavigation = false
 
     private static let maxTextTableRowsForInlineLayout = 300
     private static let maxTextTableCharactersForInlineLayout = 50000
@@ -30,8 +53,10 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     // Internal state for list depth
     private var currentListDepth: Int = 0
     private var currentListTracker: OrderedListMarkerGenerator? // For ordered lists
+    private var nextNavigationHeadingIndex = 0
 
     mutating func attributedString(from markup: Markdown.Markup) -> NSAttributedString {
+        nextNavigationHeadingIndex = 0
         let result = visit(markup).mutableCopy() as! NSMutableAttributedString
         guard useMonospaced else {
             return result
@@ -315,7 +340,20 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         }
 
         let headingFont = NSFont.systemFont(ofSize: headingFontSize, weight: .bold).rounded()
-        result.addAttribute(.font, value: headingFont, range: NSRange(location: 0, length: result.length))
+        let headingRange = NSRange(location: 0, length: result.length)
+        result.addAttribute(.font, value: headingFont, range: headingRange)
+        if indexesHeadingsForNavigation,
+           (1 ... 4).contains(heading.level),
+           !heading.plainText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           headingRange.length > 0
+        {
+            result.addAttribute(
+                .markdownHeadingAnchor,
+                value: nextNavigationHeadingIndex,
+                range: headingRange
+            )
+            nextNavigationHeadingIndex += 1
+        }
 
         if heading.hasSuccessorConsideringBlockElements {
             result.append(NSAttributedString(string: "\n\n", attributes: attributes(font: NSFont.systemFont(ofSize: fontSize).rounded())))
@@ -511,7 +549,20 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     }
 
     mutating func visitImage(_ image: Markdown.Image) -> NSAttributedString {
-        // Basic image handling: display alt text with a link if available
+        if let source = image.source,
+           let rendered = imageProvider?.attributedImage(EnhancedMarkdownImageRequest(
+               source: source,
+               altText: image.plainText,
+               maximumDisplayWidth: maximumImageDisplayWidth,
+               fontSize: fontSize
+           ))
+        {
+            return rendered
+        }
+
+        // Historical fallback. Keep this branch byte-for-byte stable: chat transcripts and every
+        // other renderer leave `imageProvider` nil, and remote images deliberately fall through so
+        // they remain links rather than becoming network fetches.
         var text = image.plainText
         if let source = image.source, let url = URL(string: source) {
             text += " (\(url.host ?? source))"

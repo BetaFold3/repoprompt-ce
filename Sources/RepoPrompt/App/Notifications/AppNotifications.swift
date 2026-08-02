@@ -1,5 +1,10 @@
 import Foundation
 
+/// User-info keys for window-targeted utility-panel notifications.
+enum AgentUtilityPanelNotificationUserInfoKey {
+    static let windowID = "windowID"
+}
+
 extension Notification.Name {
     static let showAPISettingsTab = Notification.Name("showAPISettingsTab")
     /// General request to open/focus the dedicated Settings window (Appearance / current tab).
@@ -85,6 +90,10 @@ extension Notification.Name {
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.
     static let toggleRepoPromptNavigationSidebar = Notification.Name("toggleRepoPromptNavigationSidebar")
+
+    /// Toggle the Agent Mode right utility panel (Changes / Preview) for the focused window.
+    /// `userInfo[AgentUtilityPanelNotificationUserInfoKey.windowID]` should be the target window ID.
+    static let toggleAgentUtilityPanel = Notification.Name("toggleAgentUtilityPanel")
 
     /// Show the Agent navigation HUD for the target window.
     /// userInfo: ["windowID": Int, "mode": AgentNavigationHUDMode.rawValue]

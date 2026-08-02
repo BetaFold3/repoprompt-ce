@@ -1956,30 +1956,11 @@ private struct ReceiptFixture {
     }
 
     func gitOutput(_ arguments: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = root
-        process.environment = ProcessInfo.processInfo.environment.merging([
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0"
-        ]) { _, new in new }
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let detail = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(
-                domain: "GitWorktreeCreationReceiptTests.git",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: detail]
-            )
-        }
-        return String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        try TestGitCommandRunner.run(
+            arguments,
+            cwd: root,
+            failureDomain: "GitWorktreeCreationReceiptTests.git"
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func cleanup() {

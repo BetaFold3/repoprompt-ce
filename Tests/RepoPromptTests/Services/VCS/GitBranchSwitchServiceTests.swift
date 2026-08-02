@@ -277,10 +277,7 @@ final class GitBranchSwitchServiceTests: XCTestCase {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = arguments
         process.currentDirectoryURL = cwd
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
+        let environment = TestGitCommandRunner.processEnvironment()
         process.environment = environment
         let output = Pipe()
         process.standardOutput = output

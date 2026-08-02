@@ -9,4 +9,5 @@ final class AgentModeUIFacades {
     let transcript = AgentTranscriptUIStore()
     let runInteraction = AgentRunInteractionUIStore()
     let remoteStartPicker = AgentRemoteStartPickerUIStore()
+    let utilityPanel = AgentUtilityPanelUIStore()
 }

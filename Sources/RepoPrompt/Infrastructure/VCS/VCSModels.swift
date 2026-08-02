@@ -17,6 +17,12 @@ public struct VCSCapabilities: Sendable {
     /// Git: true, Jujutsu: false (working copy is auto-committed)
     public let hasStagingArea: Bool
 
+    /// Whether this backend can mutate the staging area, i.e. whether it conforms
+    /// to `VCSIndexMutationBackend`. Distinct from `hasStagingArea`, which only
+    /// describes the VCS model: a read-only backend could describe an index it
+    /// cannot stage into.
+    public let supportsStaging: Bool
+
     /// Whether the VCS has an "untracked files" concept.
     /// Git: true, Jujutsu: false (all files in working copy are tracked)
     public let hasUntrackedFilesConcept: Bool
@@ -32,12 +38,14 @@ public struct VCSCapabilities: Sendable {
 
     public init(
         hasStagingArea: Bool,
+        supportsStaging: Bool,
         hasUntrackedFilesConcept: Bool,
         supportsFetch: Bool,
         supportsTags: Bool,
         supportsRemoteBranches: Bool
     ) {
         self.hasStagingArea = hasStagingArea
+        self.supportsStaging = supportsStaging
         self.hasUntrackedFilesConcept = hasUntrackedFilesConcept
         self.supportsFetch = supportsFetch
         self.supportsTags = supportsTags
@@ -47,6 +55,7 @@ public struct VCSCapabilities: Sendable {
     /// Capabilities for Git backend.
     public static let git = VCSCapabilities(
         hasStagingArea: true,
+        supportsStaging: true,
         hasUntrackedFilesConcept: true,
         supportsFetch: true,
         supportsTags: true,
@@ -56,6 +65,7 @@ public struct VCSCapabilities: Sendable {
     /// Capabilities for Jujutsu backend.
     public static let jujutsu = VCSCapabilities(
         hasStagingArea: false,
+        supportsStaging: false, // no index to mutate; never conforms to VCSIndexMutationBackend
         hasUntrackedFilesConcept: false,
         supportsFetch: true, // via `jj git fetch`
         supportsTags: false, // jj doesn't have native tags (uses git backend)

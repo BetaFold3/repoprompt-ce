@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!--
+  Scripted-mode pass criteria:
+  1. After explicit Enable once, the inline script runs.
+  2. Loading ../sibling/script-oracle.js through repoprompt-preview: fails.
+  3. The page shows PASS and never shows LEAKED.
+  Network blocking is not the oracle here; this probes the handler's narrowed subtree.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Scripted folder boundary probe</title>
+  </head>
+  <body>
+    <h1>Scripted folder boundary probe</h1>
+    <p id="result">Inline script did not run.</p>
+    <script>
+      const result = document.getElementById("result");
+      result.textContent = "Inline script ran; checking ../sibling via scheme URL…";
+
+      const siblingURL = new URL("../sibling/script-oracle.js", window.location.href);
+      const probe = document.createElement("script");
+      probe.src = siblingURL;
+      probe.onload = () => {
+        result.textContent = "LEAKED: ../sibling/script-oracle.js executed.";
+      };
+      probe.onerror = () => {
+        result.textContent = "PASS: ../sibling/script-oracle.js was denied by the folder boundary.";
+      };
+      document.head.appendChild(probe);
+    </script>
+  </body>
+</html>

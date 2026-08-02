@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<!--
+  Manual verification entry point for the locked-down HTML preview.
+  Load this file as the preview document; every link below is an in-scope
+  repoprompt-preview:// navigation and MUST work. Each linked fixture states its
+  own pass criteria.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Secure HTML preview — hostile fixture index</title>
+  </head>
+  <body>
+    <h1>Hostile fixture index</h1>
+    <p>Navigating to any fixture below is in-scope and must succeed.</p>
+    <ul>
+      <li><a href="script-execution.html">script-execution.html</a> — script tags</li>
+      <li><a href="external-image.html">external-image.html</a> — remote images</li>
+      <li><a href="css-import-remote.html">css-import-remote.html</a> — CSS @import over http</li>
+      <li><a href="nested-iframe.html">nested-iframe.html</a> — nested browsing contexts</li>
+      <li><a href="form-post.html">form-post.html</a> — form submission</li>
+      <li><a href="meta-refresh.html">meta-refresh.html</a> — meta refresh redirect</li>
+      <li><a href="path-traversal.html">path-traversal.html</a> — path traversal and file://</li>
+      <li><a href="popup-links.html">popup-links.html</a> — popups and external links</li>
+      <li>
+        <a href="scripted/script-folder-boundary.html">scripted/script-folder-boundary.html</a>
+        — scripted ../sibling scheme read
+      </li>
+    </ul>
+    <p id="anchor-target">In-page anchor target.</p>
+    <p><a href="#anchor-target">Jump to anchor</a> — fragment navigation must work.</p>
+  </body>
+</html>

@@ -793,10 +793,7 @@ final class GitBlobIdentityServiceTests: XCTestCase {
     private func hermeticGitBlobIdentityService(
         hooks: GitBlobIdentityServiceHooks = .none
     ) -> GitBlobIdentityService {
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
+        let environment = TestGitCommandRunner.processEnvironment()
         return GitBlobIdentityService(
             gitService: GitService(inheritedProcessEnvironment: environment),
             hooks: hooks
@@ -878,10 +875,7 @@ private actor GitBlobIdentityRaceMutator {
         let url = root.appendingPathComponent(path)
         try? Data("let generation = \(generation)\n".utf8).write(to: url, options: .atomic)
         guard stage else { return }
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
+        let environment = TestGitCommandRunner.processEnvironment()
         _ = try? TestProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/git"),
             arguments: ["add", "--", path],
@@ -906,10 +900,7 @@ private actor GitBlobConfigurationRaceMutator {
             atomically: true,
             encoding: .utf8
         )
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
+        let environment = TestGitCommandRunner.processEnvironment()
         _ = try? TestProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/git"),
             arguments: ["config", "filter.race.clean", generation.isMultiple(of: 2) ? "cat" : "sed s/a/b/"],

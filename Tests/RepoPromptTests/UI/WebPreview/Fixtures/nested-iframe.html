@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<!--
+  Probes: nested browsing contexts.
+  Blocked by frame-src 'none'; the navigation policy additionally cancels every
+  subframe navigation, so even a same-scheme frame must not commit.
+  PASS: all four frames are empty/blank.
+  FAIL: any frame renders content.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>nested iframe</title>
+  </head>
+  <body>
+    <h1>Nested iframes</h1>
+    <iframe src="http://127.0.0.1:9/page" title="http frame" width="200" height="60"></iframe>
+    <iframe src="https://127.0.0.1:9/page" title="https frame" width="200" height="60"></iframe>
+    <iframe src="index.html" title="same-scheme frame" width="200" height="60"></iframe>
+    <iframe src="data:text/html,%3Ch1%3Enested%3C/h1%3E" title="data frame" width="200" height="60"></iframe>
+    <object data="http://127.0.0.1:9/object" width="200" height="60"></object>
+    <embed src="http://127.0.0.1:9/embed" width="200" height="60" />
+  </body>
+</html>

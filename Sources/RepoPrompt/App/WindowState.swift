@@ -178,6 +178,10 @@ class WindowState: ObservableObject {
     /// Narrow titlebar state observed only by the principal toolbar title cluster.
     let agentChatTitleCluster = AgentChatTitleClusterModel(title: WindowTitleFormatter.defaultTitle)
 
+    /// Right utility panel (Changes / Preview) presentation state.
+    /// Visibility is per-window by design; only the preferred width persists globally.
+    let agentUtilityPanel = AgentUtilityPanelPresentationStore()
+
     /// The sticky instance number assigned for this window's current workspace (monotonically increasing per workspace).
     /// Nil when no workspace is active yet.
     @Published var workspaceInstanceNumber: Int? = nil

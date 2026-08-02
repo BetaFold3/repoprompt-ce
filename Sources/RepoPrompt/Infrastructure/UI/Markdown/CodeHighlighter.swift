@@ -311,11 +311,21 @@ enum CodeHighlighter {
     private static func isDarkMode() -> Bool {
         // NSApp appearance must be queried on main thread.
         if Thread.isMainThread {
-            NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            effectiveAppearanceIsDark()
         } else {
             DispatchQueue.main.sync {
-                NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                effectiveAppearanceIsDark()
             }
         }
+    }
+
+    /// `NSApp` is an implicitly unwrapped optional that is nil in headless
+    /// contexts such as unit tests, where no `NSApplication` is ever created.
+    /// Highlighting is a presentation detail, so fall back to the light palette
+    /// rather than trapping. In the running app `NSApp` is always present, so
+    /// this changes no shipped behaviour.
+    private static func effectiveAppearanceIsDark() -> Bool {
+        guard let appearance = NSApp?.effectiveAppearance else { return false }
+        return appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
     }
 }

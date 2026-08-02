@@ -357,6 +357,32 @@ actor GitBackend: VCSBackend {
     }
 }
 
+// MARK: - Git Index Mutation
+
+/// Git owns a real index, so it is the only backend that can stage. Jujutsu
+/// deliberately does not conform: it has no staging area to mutate.
+extension GitBackend: VCSIndexMutationBackend {
+    func loadIndexStatus(at repoURL: URL) async throws -> [VCSIndexStatusEntry] {
+        try await gitService.loadIndexStatusEntries(at: repoURL)
+    }
+
+    func stage(_ identities: [VCSIndexPathIdentity], at repoURL: URL) async throws {
+        try await gitService.stageIndexPaths(identities, at: repoURL)
+    }
+
+    func unstage(_ identities: [VCSIndexPathIdentity], at repoURL: URL) async throws {
+        try await gitService.unstageIndexPaths(identities, at: repoURL)
+    }
+
+    func markResolved(_ identity: VCSIndexPathIdentity, at repoURL: URL) async throws {
+        try await gitService.markIndexPathResolved(identity, at: repoURL)
+    }
+
+    func hasHeadCommit(at repoURL: URL) async throws -> Bool {
+        try await gitService.hasHeadCommit(at: repoURL)
+    }
+}
+
 // MARK: - Git Backend with Warnings
 
 extension GitBackend: VCSBackendWithWarnings {

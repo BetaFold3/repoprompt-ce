@@ -423,6 +423,28 @@ extension VCSService {
     }
 }
 
+// MARK: - VCS Service Capability Access
+
+public extension VCSService {
+    /// Get the capabilities of the backend that owns a repository.
+    /// - Parameter repoURL: The repository root URL.
+    /// - Returns: The capabilities of the resolved backend.
+    func capabilities(forRepoRoot repoURL: URL) async -> VCSCapabilities {
+        await backend(forRepoRoot: repoURL).capabilities
+    }
+
+    /// Get the index-mutation backend for a repository, if its backend has an index.
+    ///
+    /// This keeps the optional-protocol cast in one place: call sites gate on
+    /// `VCSCapabilities.supportsStaging` and ask for the backend, rather than
+    /// casting a `VCSBackend` themselves.
+    /// - Parameter repoURL: The repository root URL.
+    /// - Returns: The index-mutation backend, or nil for backends without a staging area.
+    func indexMutationBackend(forRepoRoot repoURL: URL) async -> (any VCSIndexMutationBackend)? {
+        await backend(forRepoRoot: repoURL) as? any VCSIndexMutationBackend
+    }
+}
+
 public extension VCSService {
     /// Get the working status.
     func getWorkingStatus(at repoURL: URL) async throws -> VCSWorkingStatus {

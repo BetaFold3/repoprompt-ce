@@ -1,0 +1,4 @@
+/* Local stylesheet that tries to pull a remote one. The @import must be blocked
+   while the local rule below still applies. */
+@import url("http://127.0.0.1:9/second-level.css");
+.box-from-local-css { outline: 2px solid blue; }

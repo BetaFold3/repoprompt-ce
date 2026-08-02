@@ -439,15 +439,11 @@ import XCTest
                 .appendingPathComponent("GitProcessSpawnMigrationTests-\(UUID().uuidString)", isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             tempRoot = root
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-            process.arguments = ["init", "--initial-branch=main"]
-            process.currentDirectoryURL = root
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
+            let result = try TestGitCommandRunner.runResult(
+                ["init", "--initial-branch=main"],
+                cwd: root
+            )
+            guard result.terminationStatus == 0 else {
                 throw XCTSkip("git init unavailable in this environment")
             }
             return root

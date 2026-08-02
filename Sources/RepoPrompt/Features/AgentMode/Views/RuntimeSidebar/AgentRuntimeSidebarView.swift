@@ -160,7 +160,7 @@ struct AgentRuntimeSidebarView: View {
                 }
             }
         }
-        .sidebarCard(highlight: isContextBuilderRunning ? .blue : nil)
+        .agentSidebarCard(highlight: isContextBuilderRunning ? .blue : nil)
     }
 
     // MARK: - Oracle Chat
@@ -208,7 +208,7 @@ struct AgentRuntimeSidebarView: View {
                 }
             }
         }
-        .sidebarCard(highlight: isOracleStreaming ? .purple : nil)
+        .agentSidebarCard(highlight: isOracleStreaming ? .purple : nil)
         .onAppear { selectLatestOracleSessionIfNeeded() }
     }
 
@@ -308,7 +308,7 @@ struct AgentRuntimeSidebarView: View {
                 }
             }
         }
-        .sidebarCard()
+        .agentSidebarCard()
     }
 
     // MARK: - Context Usage
@@ -334,7 +334,7 @@ struct AgentRuntimeSidebarView: View {
                     isContextWindowKnown: runtimeVM.snapshot.displayContextWindowTokens != nil,
                     style: .labeled
                 )
-                .sidebarCard()
+                .agentSidebarCard()
             }
         }
     }
@@ -353,7 +353,7 @@ struct AgentRuntimeSidebarView: View {
             activeAgentSessionID: activeAgentSessionID,
             worktreeBindingsProvider: worktreeBindingsProvider
         )
-        .sidebarCard()
+        .agentSidebarCard()
     }
 }
 
@@ -443,22 +443,7 @@ private struct AgentRuntimeSidebarHeaderStatusView: View {
     }
 }
 
-// MARK: - Card Modifier
-
-private extension View {
-    func sidebarCard(highlight: Color? = nil) -> some View {
-        padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color(NSColor.controlBackgroundColor).opacity(0.35))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(highlight?.opacity(0.25) ?? Color.clear, lineWidth: 1)
-            )
-    }
-}
+// Card styling lives in AgentSidebarCardStyle.swift so the utility panel can reuse it.
 
 private extension ChatSession {
     func oracleSessionDetailLabel(modelDisplayName: String?) -> String {

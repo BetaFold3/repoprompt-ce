@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!--
+  Probes: remote subresource loads (tracking pixels / exfiltration beacons).
+  Blocked by img-src repoprompt-preview: and by the WKContentRuleList http/https block.
+  PASS: all three remote images render as broken; no network request leaves the app.
+  FAIL: any remote image renders.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>external image</title>
+  </head>
+  <body>
+    <h1>External images</h1>
+    <img src="http://127.0.0.1:9/pixel.png" alt="http image must not load" width="32" height="32" />
+    <img src="https://127.0.0.1:9/pixel.png" alt="https image must not load" width="32" height="32" />
+    <img src="//127.0.0.1:9/protocol-relative.png" alt="protocol-relative image must not load" width="32" height="32" />
+    <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'%3E%3C/svg%3E" alt="data image must not load" width="32" height="32" />
+  </body>
+</html>

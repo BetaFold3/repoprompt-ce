@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!--
+  Probes: script execution.
+  Blocked by three independent locks: allowsContentJavaScript=false on the
+  configuration, the same flag re-asserted per navigation, and script-src 'none'.
+  PASS: the status line still reads "BLOCKED" and the heading is unchanged.
+  FAIL: the status line reads "SCRIPT RAN" or the heading changes.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>script execution</title>
+    <script>
+      document.title = "SCRIPT RAN";
+    </script>
+    <script src="http://127.0.0.1:9/remote.js"></script>
+    <script src="payload.js"></script>
+  </head>
+  <body onload="document.getElementById('status').textContent = 'SCRIPT RAN (onload)';">
+    <h1 id="heading">Script execution</h1>
+    <p id="status">BLOCKED</p>
+    <img src="missing.png" onerror="document.getElementById('status').textContent = 'SCRIPT RAN (onerror)';" alt="" />
+    <a href="javascript:document.getElementById('status').textContent='SCRIPT RAN (href)'">javascript: link — must do nothing</a>
+    <script>
+      document.getElementById("status").textContent = "SCRIPT RAN (inline)";
+    </script>
+  </body>
+</html>

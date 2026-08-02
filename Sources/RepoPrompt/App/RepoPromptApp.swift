@@ -157,6 +157,9 @@ struct RepoPromptSwiftUIApp: App {
             // ➜ New File-menu commands (Save Workspace / Exit Workspace)
             WorkspaceCommands(windowStatesManager: windowStatesManager)
 
+            // ➜ View-menu command for the Agent Mode right utility panel (⌥⌘0)
+            AgentUtilityPanelCommands(windowStatesManager: windowStatesManager)
+
             CommandGroup(before: .saveItem) {
                 Button("Close Window") {
                     NSApplication.shared.keyWindow?.performClose(nil)

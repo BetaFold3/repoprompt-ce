@@ -119,6 +119,46 @@ final class CodeBlockTextView: NSTextView {
         !isEditable
     }
 
+    /// Scrolls the surrounding SwiftUI reading surface to a character laid out by this text view.
+    @discardableResult
+    func scrollToCharacter(at utf16Offset: Int, animated: Bool) -> Bool {
+        guard window != nil,
+              bounds.width > 1,
+              let storage = textStorage,
+              storage.length > 0,
+              let layoutManager,
+              let textContainer,
+              textContainer.containerSize.width > 1,
+              let scrollView = scrollWheelForwardingTarget(),
+              let documentView = scrollView.documentView
+        else { return false }
+
+        let location = min(max(utf16Offset, 0), storage.length - 1)
+        layoutManager.ensureLayout(for: textContainer)
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: NSRange(location: location, length: 1),
+            actualCharacterRange: nil
+        )
+        var targetRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        targetRect.origin.x += textContainerOrigin.x
+        targetRect.origin.y += textContainerOrigin.y
+        let documentRect = convert(targetRect, to: documentView)
+        var destination = scrollView.contentView.bounds.origin
+        destination.y = max(0, documentRect.minY - 8)
+
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                scrollView.contentView.animator().setBoundsOrigin(destination)
+            }
+        } else {
+            scrollView.contentView.scroll(to: destination)
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        }
+        return true
+    }
+
     override func scrollWheel(with event: NSEvent) {
         guard shouldForwardScrollWheelToAncestorScrollView(),
               let target = scrollWheelForwardingTarget()
@@ -356,8 +396,66 @@ final class CodeBlockTextView: NSTextView {
 
 // MARK: - AttributedTextView with Custom Drawing ----------------------
 
+struct MarkdownTextScrollRequest: Equatable {
+    /// Monotonic caller-owned token, so selecting the same heading twice still scrolls twice.
+    let id: Int
+    let utf16Offset: Int
+    let animated: Bool
+}
+
 final class MarkdownTextViewCoordinator: NSObject, NSTextViewDelegate {
     var opener: MarkdownFileLinkOpener?
+    private(set) var appliedScrollRequestID: Int?
+    private var pendingScrollRequestID: Int?
+    private var pendingScrollTask: Task<Void, Never>?
+
+    deinit {
+        pendingScrollTask?.cancel()
+    }
+
+    func scheduleScroll(_ request: MarkdownTextScrollRequest, in textView: CodeBlockTextView) {
+        guard appliedScrollRequestID != request.id,
+              pendingScrollRequestID != request.id
+        else { return }
+
+        pendingScrollTask?.cancel()
+        pendingScrollRequestID = request.id
+        let expectedContentVersion = textView.contentVersion
+        pendingScrollTask = Task { @MainActor [weak self, weak textView] in
+            for _ in 0 ..< 12 {
+                guard !Task.isCancelled,
+                      let self,
+                      let textView,
+                      pendingScrollRequestID == request.id
+                else { return }
+                guard textView.contentVersion == expectedContentVersion else {
+                    pendingScrollRequestID = nil
+                    pendingScrollTask = nil
+                    return
+                }
+
+                if textView.scrollToCharacter(
+                    at: request.utf16Offset,
+                    animated: request.animated
+                ) {
+                    appliedScrollRequestID = request.id
+                    pendingScrollRequestID = nil
+                    pendingScrollTask = nil
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 16_000_000)
+            }
+            guard let self, pendingScrollRequestID == request.id else { return }
+            pendingScrollRequestID = nil
+            pendingScrollTask = nil
+        }
+    }
+
+    func cancelPendingScroll() {
+        pendingScrollTask?.cancel()
+        pendingScrollTask = nil
+        pendingScrollRequestID = nil
+    }
 
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
         guard let target = fileLinkTarget(in: textView, link: link, charIndex: charIndex) else {
@@ -381,7 +479,18 @@ final class MarkdownTextViewCoordinator: NSObject, NSTextViewDelegate {
         }
 
         if let rawDestination {
-            return MarkdownFileLinkTarget.parse(rawDestination: rawDestination)
+            let isObsidianEmbed = if let storage = textView.textStorage,
+                                     charIndex >= 0,
+                                     charIndex < storage.length
+            {
+                storage.attribute(.markdownObsidianEmbed, at: charIndex, effectiveRange: nil) != nil
+            } else {
+                false
+            }
+            return MarkdownFileLinkTarget.parse(
+                rawDestination: rawDestination,
+                isObsidianEmbed: isObsidianEmbed
+            )
         }
         if let link = link as? URL {
             return MarkdownFileLinkTarget.parse(rawDestination: link.absoluteString)
@@ -442,19 +551,22 @@ struct AttributedTextView: NSViewRepresentable {
     let allowsTextSelection: Bool
     let linkOpener: MarkdownFileLinkOpener?
     let fallbackMeasurementWidth: CGFloat?
+    let scrollRequest: MarkdownTextScrollRequest?
 
     init(
         attributedString: NSAttributedString,
         isEditable: Bool,
         allowsTextSelection: Bool,
         linkOpener: MarkdownFileLinkOpener? = nil,
-        fallbackMeasurementWidth: CGFloat? = nil
+        fallbackMeasurementWidth: CGFloat? = nil,
+        scrollRequest: MarkdownTextScrollRequest? = nil
     ) {
         self.attributedString = attributedString
         self.isEditable = isEditable
         self.allowsTextSelection = allowsTextSelection
         self.linkOpener = linkOpener
         self.fallbackMeasurementWidth = fallbackMeasurementWidth
+        self.scrollRequest = scrollRequest
     }
 
     // MARK: Coordinator -------------------------------------------------
@@ -501,6 +613,12 @@ struct AttributedTextView: NSViewRepresentable {
         textView.delegate = context.coordinator
         if textView.layoutManager?.allowsNonContiguousLayout != false {
             textView.layoutManager?.allowsNonContiguousLayout = false
+        }
+
+        if let scrollRequest {
+            context.coordinator.scheduleScroll(scrollRequest, in: textView)
+        } else {
+            context.coordinator.cancelPendingScroll()
         }
     }
 

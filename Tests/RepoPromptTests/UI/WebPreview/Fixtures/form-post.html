@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<!--
+  Probes: credential/data exfiltration through form submission.
+  Blocked by form-action 'none' and by the navigation policy, which cancels every
+  formSubmitted/formResubmitted navigation regardless of destination.
+  PASS: clicking any submit button does nothing; the page does not navigate.
+  FAIL: the view navigates, or a request leaves the app.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>form post</title>
+  </head>
+  <body>
+    <h1>Forms</h1>
+    <form action="http://127.0.0.1:9/collect" method="post">
+      <input type="password" name="secret" value="hunter2" />
+      <button type="submit">POST to remote (must do nothing)</button>
+    </form>
+    <form action="index.html" method="get">
+      <button type="submit">GET to in-scope document (must do nothing)</button>
+    </form>
+    <form action="" method="post">
+      <button type="submit">POST to self (must do nothing)</button>
+    </form>
+  </body>
+</html>

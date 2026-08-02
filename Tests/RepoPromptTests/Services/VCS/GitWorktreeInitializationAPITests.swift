@@ -151,12 +151,11 @@ final class GitWorktreeInitializationAPITests: XCTestCase {
         defer { fixture.cleanup() }
         let nested = fixture.root.appendingPathComponent("Root/Nested", isDirectory: true)
         try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
-        let nestedProcess = Process()
-        nestedProcess.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        nestedProcess.arguments = ["init", "--quiet", nested.path]
-        try nestedProcess.run()
-        nestedProcess.waitUntilExit()
-        XCTAssertEqual(nestedProcess.terminationStatus, 0)
+        try TestGitCommandRunner.run(
+            ["init", "--quiet", nested.path],
+            cwd: fixture.root,
+            failureDomain: "GitWorktreeInitializationAPITests.git"
+        )
 
         let git = GitService()
         let layout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: fixture.root))
@@ -958,30 +957,11 @@ private func runGitEvidenceTestCommand(
     _ arguments: [String],
     at root: URL
 ) throws {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-    process.arguments = arguments
-    process.currentDirectoryURL = root
-    process.environment = ProcessInfo.processInfo.environment.merging([
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_TERMINAL_PROMPT": "0"
-    ]) { _, new in new }
-    let stderr = Pipe()
-    process.standardOutput = Pipe()
-    process.standardError = stderr
-    try process.run()
-    process.waitUntilExit()
-    guard process.terminationStatus == 0 else {
-        let detail = String(
-            data: stderr.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
-        throw NSError(
-            domain: "GitTargetEvidenceTestCommand",
-            code: Int(process.terminationStatus),
-            userInfo: [NSLocalizedDescriptionKey: detail]
-        )
-    }
+    try TestGitCommandRunner.run(
+        arguments,
+        cwd: root,
+        failureDomain: "GitTargetEvidenceTestCommand"
+    )
 }
 
 private struct GitInitializationFixture {
@@ -1030,27 +1010,11 @@ private struct GitInitializationFixture {
     }
 
     func git(_ arguments: [String]) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = root
-        process.environment = ProcessInfo.processInfo.environment.merging([
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0"
-        ]) { _, new in new }
-        let stderr = Pipe()
-        process.standardOutput = Pipe()
-        process.standardError = stderr
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let detail = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(
-                domain: "GitWorktreeInitializationAPITests.git",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: detail]
-            )
-        }
+        try TestGitCommandRunner.run(
+            arguments,
+            cwd: root,
+            failureDomain: "GitWorktreeInitializationAPITests.git"
+        )
     }
 
     func cleanup() {

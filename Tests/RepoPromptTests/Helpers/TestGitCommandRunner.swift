@@ -21,8 +21,18 @@ enum TestGitCommandRunner {
     ) -> [String: String] {
         var processEnvironment = base
         processEnvironment["GIT_CONFIG_NOSYSTEM"] = "1"
+        processEnvironment["GIT_ATTR_NOSYSTEM"] = "1"
         if environment.globalConfig == .disabled {
             processEnvironment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+            processEnvironment["GIT_CONFIG_COUNT"] = nil
+            processEnvironment["GIT_CONFIG_PARAMETERS"] = nil
+
+            let commandScopeKeys = processEnvironment.keys.filter {
+                $0.hasPrefix("GIT_CONFIG_KEY_") || $0.hasPrefix("GIT_CONFIG_VALUE_")
+            }
+            for key in commandScopeKeys {
+                processEnvironment[key] = nil
+            }
         }
         processEnvironment["GIT_TERMINAL_PROMPT"] = "0"
         return processEnvironment

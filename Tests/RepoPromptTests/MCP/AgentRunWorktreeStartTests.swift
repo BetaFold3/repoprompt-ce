@@ -4041,10 +4041,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
     }
 
     private func runGitOutput(_ arguments: [String], cwd: URL) throws -> String {
-        var environment = ProcessInfo.processInfo.environment
-        environment["GIT_CONFIG_NOSYSTEM"] = "1"
-        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
-        environment["GIT_TERMINAL_PROMPT"] = "0"
+        let environment = TestGitCommandRunner.processEnvironment()
         let result = try TestProcessRunner.run(
             executableURL: URL(fileURLWithPath: "/usr/bin/git"),
             arguments: arguments,

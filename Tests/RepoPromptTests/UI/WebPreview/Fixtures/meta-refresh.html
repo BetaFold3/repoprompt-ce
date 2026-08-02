@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!--
+  Probes: automatic navigation without user intent.
+  A meta refresh reaches the delegate as a non-linkActivated navigation, which the
+  policy cancels; it must never produce an external-open confirmation prompt.
+  PASS: the page stays here and NO confirmation dialog appears.
+  FAIL: the view navigates, or a confirmation prompt is shown for a click the user
+        never made.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content="0; url=http://127.0.0.1:9/redirected" />
+    <title>meta refresh</title>
+  </head>
+  <body>
+    <h1>Meta refresh</h1>
+    <p>This document must remain visible.</p>
+  </body>
+</html>

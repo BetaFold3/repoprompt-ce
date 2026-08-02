@@ -206,6 +206,11 @@ extension AgentModeViewModel {
         /// Persisted from local success only; inbound binding/catch-up events must never infer this attribution.
         var locallyAttributedStartItemID: UUID?
 
+        /// Right utility panel state for this tab: segment, compare target, expansion, preview
+        /// document. Intentionally never mapped into the persisted `AgentSession` DTO — see
+        /// `AgentUtilityPanelTabState` for why none of it survives a relaunch.
+        var utilityPanel = AgentUtilityPanelTabState()
+
         /// Persisted logical-root to worktree bindings for this Agent session.
         var worktreeBindings: [AgentSessionWorktreeBinding] = []
         /// Persisted resumable worktree-merge operations for this Agent session.

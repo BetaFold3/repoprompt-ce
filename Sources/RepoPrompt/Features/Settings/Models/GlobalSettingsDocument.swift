@@ -378,6 +378,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var enableKeyboardShortcuts: Bool?
         var fontScaleBodySize: Double?
         var showDatesInMessageTimestamps: Bool?
+        /// Preferred width of the Agent Mode right utility panel, stored unscaled (at the
+        /// `.normal` font preset) so the value stays stable across font-scale changes.
+        var agentUtilityPanelWidth: Double?
 
         init(
             appearanceMode: String? = nil,
@@ -388,7 +391,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
             fileMentionPickerStyle: String? = nil,
             enableKeyboardShortcuts: Bool? = nil,
             fontScaleBodySize: Double? = nil,
-            showDatesInMessageTimestamps: Bool? = nil
+            showDatesInMessageTimestamps: Bool? = nil,
+            agentUtilityPanelWidth: Double? = nil
         ) {
             self.appearanceMode = appearanceMode
             self.useTransparency = useTransparency
@@ -399,6 +403,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.enableKeyboardShortcuts = enableKeyboardShortcuts
             self.fontScaleBodySize = fontScaleBodySize
             self.showDatesInMessageTimestamps = showDatesInMessageTimestamps
+            self.agentUtilityPanelWidth = agentUtilityPanelWidth
         }
     }
 

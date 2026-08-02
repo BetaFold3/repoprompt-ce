@@ -828,6 +828,24 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    /// Preferred width of the Agent Mode right utility panel, stored unscaled.
+    ///
+    /// Clamped on read as well as write: the settings document is user-editable on disk, and a
+    /// non-finite or out-of-range value would otherwise reach a SwiftUI frame.
+    func agentUtilityPanelWidth() -> Double {
+        guard let rawValue = scalarPreferences.ui?.agentUtilityPanelWidth else {
+            return Double(AgentUtilityPanelLayoutMetrics.defaultPanelWidth)
+        }
+        return Double(AgentUtilityPanelLayoutMetrics.clampPreferredWidth(CGFloat(rawValue)))
+    }
+
+    func setAgentUtilityPanelWidth(_ width: Double, commit: Bool = true) {
+        let normalized = Double(AgentUtilityPanelLayoutMetrics.clampPreferredWidth(CGFloat(width)))
+        updateUIScalar(commit: commit) { settings in
+            settings.agentUtilityPanelWidth = normalized
+        }
+    }
+
     func promptSectionsOrderRaw() -> String {
         scalarPreferences.promptPackaging?.promptSectionsOrder ?? ""
     }

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!--
+  Probes: reading files outside the document root.
+  The scheme handler resolves symlinks before the containment check and rejects
+  dot-segments; file:// URLs are cancelled by the navigation policy.
+  PASS: every image is broken and every link does nothing.
+  FAIL: any file outside the document root is rendered or navigated to.
+
+  Note: escape.txt / away/ are created by the manual-pass setup as real symlinks
+  pointing outside the root. Their absence just makes those rows inert.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>path traversal</title>
+  </head>
+  <body>
+    <h1>Path traversal</h1>
+    <img src="../outside/secret.txt" alt="dot-dot must not load" />
+    <img src="%2e%2e/outside/secret.txt" alt="encoded dot-dot must not load" />
+    <img src="/etc/passwd" alt="absolute path must not load" />
+    <img src="escape.txt" alt="symlink escaping the root must not load" />
+    <img src="away/secret.txt" alt="symlinked directory must not load" />
+    <ul>
+      <li><a href="file:///etc/passwd">file:///etc/passwd</a> — must do nothing</li>
+      <li><a href="../outside/secret.txt">../outside/secret.txt</a> — must do nothing</li>
+      <li><a href="repoprompt-preview://evil/report.html">foreign host</a> — must do nothing</li>
+    </ul>
+  </body>
+</html>

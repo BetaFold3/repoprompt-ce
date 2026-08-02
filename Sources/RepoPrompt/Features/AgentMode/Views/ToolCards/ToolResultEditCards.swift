@@ -17,7 +17,7 @@ struct ApplyEditsResultCard: View {
 
     private static func shouldAutoExpandInitially(item: AgentChatItem, isMostRecentEdit: Bool) -> Bool {
         guard isMostRecentEdit else { return false }
-        let dto = ToolJSON.decode(ToolResultDTOs.EditSummary.self, from: item.toolResultJSON)
+        let dto = AgentEditToolResultDecoder.applyEditsSummary(resultJSON: item.toolResultJSON)
         // Keep the most recent live apply_edits card openable when it carries an in-memory
         // compact preview diff, even if the payload is otherwise summary-oriented.
         if hasCompactDisplayDiff(dto) {
@@ -50,8 +50,8 @@ struct ApplyEditsResultCard: View {
     }
 
     private func buildPresentation() -> Presentation {
-        let dto = ToolJSON.decode(ToolResultDTOs.EditSummary.self, from: item.toolResultJSON)
-        let args = ToolJSON.decodeArgs(ToolArgsDTOs.ApplyEditsArgs.self, from: item.toolArgsJSON)
+        let dto = AgentEditToolResultDecoder.applyEditsSummary(resultJSON: item.toolResultJSON)
+        let args = AgentEditToolResultDecoder.applyEditsArguments(argsJSON: item.toolArgsJSON)
         let displayDiff = Self.resolvedDisplayDiff(from: dto)
         let status = resolvedStatus(from: dto)
         return Presentation(
@@ -65,10 +65,7 @@ struct ApplyEditsResultCard: View {
     }
 
     private static func resolvedDisplayDiff(from dto: ToolResultDTOs.EditSummary?) -> String? {
-        guard let dto else { return nil }
-        if let diff = dto.cardUnifiedDiff, !diff.isEmpty { return diff }
-        if let diff = dto.unifiedDiff, !diff.isEmpty { return diff }
-        return nil
+        AgentEditToolResultDecoder.applyEditsDisplayDiff(from: dto)
     }
 
     private static func hasCompactDisplayDiff(_ dto: ToolResultDTOs.EditSummary?) -> Bool {
@@ -216,7 +213,7 @@ struct CursorNativeEditResultPresentation: Equatable {
     let renderMode: AgentToolCardRenderMode
 
     static func build(for item: AgentChatItem) -> CursorNativeEditResultPresentation {
-        let dto = ToolJSON.decode(ToolResultDTOs.CursorNativeEditSummary.self, from: item.toolResultJSON)
+        let dto = AgentEditToolResultDecoder.nativeEditSummary(resultJSON: item.toolResultJSON)
         let diffs = displayDiffs(from: dto)
         let title = displayTitle(from: dto)
         let status = resolvedStatus(item: item, dto: dto, diffs: diffs)
@@ -233,7 +230,7 @@ struct CursorNativeEditResultPresentation: Equatable {
 
     static func shouldAutoExpandInitially(item: AgentChatItem, isMostRecentEdit: Bool) -> Bool {
         guard isMostRecentEdit else { return false }
-        return !displayDiffs(from: ToolJSON.decode(ToolResultDTOs.CursorNativeEditSummary.self, from: item.toolResultJSON)).isEmpty
+        return !displayDiffs(from: AgentEditToolResultDecoder.nativeEditSummary(resultJSON: item.toolResultJSON)).isEmpty
     }
 
     private static func displayTitle(from dto: ToolResultDTOs.CursorNativeEditSummary?) -> String {
@@ -262,41 +259,14 @@ struct CursorNativeEditResultPresentation: Equatable {
         return "Edit"
     }
 
+    /// Projection of the shared decoder's per-file facts onto what this card draws. The block
+    /// filtering, diff selection, and old/new diff construction all live in
+    /// `AgentEditToolResultDecoder` so the artifact index sees the same files this card lists.
     private static func displayDiffs(from dto: ToolResultDTOs.CursorNativeEditSummary?) -> [DisplayDiff] {
-        guard let content = dto?.content else { return [] }
-        return content.compactMap { block in
-            let blockType = block.type?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            guard blockType == nil || blockType == "diff",
-                  let rawPath = block.path?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !rawPath.isEmpty
-            else {
-                return nil
-            }
-            let isTruncated = block.diffTruncated == true
-                || block.oldTextTruncated == true
-                || block.newTextTruncated == true
-            if let persistedDiff = block.unifiedDiff?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !persistedDiff.isEmpty
-            {
-                return DisplayDiff(path: rawPath, diff: persistedDiff, isTruncated: isTruncated)
-            }
-            guard let oldText = block.oldText,
-                  let newText = block.newText else { return nil }
-            let diff = unifiedDiff(path: rawPath, oldText: oldText, newText: newText)
-            guard !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-            return DisplayDiff(path: rawPath, diff: diff, isTruncated: isTruncated)
+        AgentEditToolResultDecoder.nativeEditFiles(summary: dto).compactMap { file in
+            guard let diff = file.diffText else { return nil }
+            return DisplayDiff(path: file.path, diff: diff, isTruncated: file.isDiffTruncated)
         }
-    }
-
-    private static func unifiedDiff(path: String, oldText: String, newText: String) -> String {
-        let oldLines = String.splitContentPreservingLineEndings(oldText).0
-        let newLines = String.splitContentPreservingLineEndings(newText).0
-        let chunks = UnifiedDiffGenerator.diffChunks(
-            oldLines: oldLines,
-            newLines: newLines,
-            context: 2
-        )
-        return UnifiedDiffGenerator.build(filePath: path, chunks: chunks, context: 2)
     }
 
     private static func resolvedStatus(
@@ -431,7 +401,7 @@ struct ApplyPatchResultCard: View {
 
     private static func shouldAutoExpandInitially(item: AgentChatItem, isMostRecentEdit: Bool) -> Bool {
         guard isMostRecentEdit, toolResultHasPayload(item), !toolResultIsSummaryOnly(item) else { return false }
-        guard let dto = ToolJSON.decode(ToolResultDTOs.ApplyPatchSummary.self, from: item.toolResultJSON) else {
+        guard let dto = AgentEditToolResultDecoder.applyPatchSummary(resultJSON: item.toolResultJSON) else {
             return false
         }
         return !dto.changes.isEmpty
@@ -439,6 +409,8 @@ struct ApplyPatchResultCard: View {
 
     private struct Presentation {
         let dto: ToolResultDTOs.ApplyPatchSummary?
+        /// The patch's changes as normalized facts, one per payload change and in payload order.
+        let files: [AgentEditedFileFact]
         let summary: String
         let status: ToolCardStatus
         let isExpandable: Bool
@@ -455,24 +427,29 @@ struct ApplyPatchResultCard: View {
     }
 
     private func buildPresentation() -> Presentation {
-        let dto = ToolJSON.decode(ToolResultDTOs.ApplyPatchSummary.self, from: item.toolResultJSON)
+        let dto = AgentEditToolResultDecoder.applyPatchSummary(resultJSON: item.toolResultJSON)
+        let files = AgentEditToolResultDecoder.applyPatchFiles(summary: dto)
         let args = ToolJSON.decodeArgs(ToolArgsDTOs.ApplyPatchArgs.self, from: item.toolArgsJSON)
         let changeCount = resolvedChangeCount(dto: dto, args: args)
         return Presentation(
             dto: dto,
+            files: files,
             summary: buildSummary(dto: dto, args: args, changeCount: changeCount),
             status: resolvedStatus(from: dto),
             isExpandable: toolResultHasPayload(item) && !toolResultIsSummaryOnly(item),
-            renderMode: resolvedApplyPatchRenderMode(dto: dto)
+            renderMode: resolvedApplyPatchRenderMode(dto: dto, files: files)
         )
     }
 
-    private func resolvedApplyPatchRenderMode(dto: ToolResultDTOs.ApplyPatchSummary?) -> AgentToolCardRenderMode {
+    private func resolvedApplyPatchRenderMode(
+        dto: ToolResultDTOs.ApplyPatchSummary?,
+        files: [AgentEditedFileFact]
+    ) -> AgentToolCardRenderMode {
         guard let dto else { return .markdownFallback }
-        if dto.changes.contains(where: { isUnifiedDiff($0.diff, kind: $0.kind) }) {
+        if files.contains(where: { isUnifiedDiff($0) }) {
             return .diffPreview
         }
-        if dto.changes.isEmpty {
+        if files.isEmpty {
             if let output = dto.output, !output.isEmpty {
                 return .toolSpecificNoDiff
             }
@@ -555,29 +532,29 @@ struct ApplyPatchResultCard: View {
         ) {
             if let dto = presentation.dto {
                 VStack(alignment: .leading, spacing: 10) {
-                    if dto.changes.isEmpty {
+                    if presentation.files.isEmpty {
                         if let output = dto.output, !output.isEmpty {
                             ToolScrollableMarkdownTextView(text: output, maxHeight: 180)
                         } else {
                             ToolMarkdownExpandedContent(item: item)
                         }
                     } else {
-                        ForEach(Array(dto.changes.enumerated()), id: \.offset) { _, change in
+                        ForEach(Array(presentation.files.enumerated()), id: \.offset) { _, file in
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                                    Text(shortenPath(change.path))
+                                    Text(shortenPath(file.path))
                                         .font(.system(size: 11, weight: .semibold))
                                         .textSelection(.enabled)
-                                    if let movePath = change.movePath, !movePath.isEmpty {
+                                    if let movePath = file.movedToPath {
                                         Text("→ \(shortenPath(movePath))")
                                             .font(.system(size: 11))
                                             .foregroundColor(.secondary)
                                     }
                                 }
-                                if isUnifiedDiff(change.diff, kind: change.kind) {
-                                    UnifiedDiffView(diff: change.diff, largeBodyMaxHeight: 440)
+                                if isUnifiedDiff(file) {
+                                    UnifiedDiffView(diff: file.diffText ?? "", largeBodyMaxHeight: 440)
                                 } else {
-                                    ToolScrollableMarkdownTextView(text: change.diff, maxHeight: 180)
+                                    ToolScrollableMarkdownTextView(text: file.diffText ?? "", maxHeight: 180)
                                 }
                             }
                         }
@@ -602,11 +579,10 @@ struct ApplyPatchResultCard: View {
         }
     }
 
-    private func isUnifiedDiff(_ diff: String, kind: String) -> Bool {
-        let normalizedKind = kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalizedKind != "update" {
-            return false
-        }
+    /// Only an update carries a unified diff; adds and deletes carry whole-file text that the diff
+    /// view would mis-render. The change word comes from the decoder already normalized.
+    private func isUnifiedDiff(_ file: AgentEditedFileFact) -> Bool {
+        guard file.rawChangeKind == "update", let diff = file.diffText else { return false }
         let trimmed = diff.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.contains("@@") || trimmed.contains("--- ") || trimmed.contains("+++ ")
     }

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+  Probes: popups and the one sanctioned way out of the preview.
+  PASS: the two user-clicked http(s) links raise an external-open confirmation and
+        open nothing until confirmed; every other row does nothing at all, and no
+        new window is ever created.
+  FAIL: a popup window appears, a non-http scheme is handed to the system, or an
+        external open happens without confirmation.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>popup links</title>
+  </head>
+  <body>
+    <h1>Popups and external links</h1>
+    <ul>
+      <li><a href="https://example.com/clicked">https link</a> — confirmation expected</li>
+      <li><a href="http://example.com/clicked" target="_blank">http link, target=_blank</a> — confirmation expected</li>
+      <li><a href="ws://127.0.0.1:9/socket">ws:// link</a> — must do nothing</li>
+      <li><a href="mailto:someone@example.com">mailto link</a> — must do nothing</li>
+      <li><a href="x-some-other-app://run">custom app scheme</a> — must do nothing</li>
+      <li><a href="#" onclick="window.open('https://example.com/popup')">window.open</a> — must do nothing</li>
+    </ul>
+  </body>
+</html>

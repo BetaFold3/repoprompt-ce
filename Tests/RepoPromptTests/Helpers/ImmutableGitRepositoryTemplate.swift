@@ -72,7 +72,7 @@ private final class TemplateRepository: @unchecked Sendable {
             case .reviewFixture:
                 .hermetic
             case .receiptFixture:
-                .inheritedGlobalConfig
+                .hermetic
             }
         }
     }

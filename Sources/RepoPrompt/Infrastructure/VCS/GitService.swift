@@ -7,6 +7,21 @@ enum GitPrefixControlEvidenceCacheMode {
     case bypassReadAndAdmission
 }
 
+/// Bounded object-content read failures used by diff-context expansion.
+enum GitFileContentReadError: LocalizedError, Equatable {
+    case tooLarge(limit: Int)
+    case unavailable(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .tooLarge(limit):
+            "File content exceeds the \(limit)-byte inline diff limit."
+        case let .unavailable(message):
+            message
+        }
+    }
+}
+
 struct GitLoadedRootTreeInventorySpool: @unchecked Sendable {
     static let commandFormat = "git-ls-tree-recursive-full-tree-z-v1"
 
@@ -90,6 +105,10 @@ actor GitService {
     private static let gitCheckAttrOutputByteLimit = 4 * 1024 * 1024
     private static let gitBlobSizeOutputByteLimit = 64
     private static let gitBlobDiagnosticOutputByteLimit = 64 * 1024
+    /// Above either bound an index mutation switches to a NUL-delimited stdin
+    /// pathspec list, which has no argument-length or quoting limits.
+    private static let indexMutationPathspecByteLimit = 128 * 1024
+    private static let indexMutationArgumentPathLimit = 3000
     /// Root/search startup snapshots and receipts are process-local. A process-local salt
     /// provides one path-free repository namespace shared by all GitService instances while
     /// intentionally making restart/receipt loss fall back to the full crawler.
@@ -104,6 +123,12 @@ actor GitService {
         var errorDescription: String? {
             GitService.friendlyErrorDescription(for: message)
         }
+    }
+
+    enum RevisionResolution: Equatable {
+        case resolved(objectID: String)
+        case invalid(String)
+        case ambiguous(String)
     }
 
     enum GitProcessCaptureError: Error, Equatable {
@@ -2029,6 +2054,40 @@ actor GitService {
         return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Resolve arbitrary user-entered commit-ish syntax without allowing it to become an option.
+    func resolveCommitRevision(_ revision: String, at repoURL: URL) async throws -> RevisionResolution {
+        let candidate = revision.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty,
+              candidate.utf8.count <= 4096,
+              !candidate.utf8.contains(0),
+              !candidate.contains("\n"),
+              !candidate.contains("\r")
+        else {
+            return .invalid("Enter a revision such as a tag, SHA, HEAD~3, or origin/main.")
+        }
+
+        let (stdout, stderr, exitCode) = try await runGit(
+            ["rev-parse", "--verify", "--end-of-options", "\(candidate)^{commit}"],
+            at: repoURL
+        )
+        guard exitCode == 0 else {
+            let diagnostic = stderr.lowercased()
+            if diagnostic.contains("ambiguous") || diagnostic.contains("short object id") {
+                return .ambiguous("Revision “\(candidate)” is ambiguous. Enter more characters.")
+            }
+            return .invalid("Revision “\(candidate)” does not resolve to a commit.")
+        }
+
+        let values = stdout.split(whereSeparator: \.isNewline).map(String.init)
+        guard values.count == 1,
+              [40, 64].contains(values[0].count),
+              values[0].allSatisfy(\.isHexDigit)
+        else {
+            return .invalid("Git returned an invalid object ID for “\(candidate)”.")
+        }
+        return .resolved(objectID: values[0].lowercased())
+    }
+
     /// Get git status output in porcelain format with NUL delimiters.
     func getStatusPorcelainZ(at repoURL: URL) async throws -> Data {
         let (stdout, stderr, exitCode) = try await runGit(
@@ -2719,6 +2778,52 @@ actor GitService {
             paths: paths,
             at: repoURL
         )
+    }
+
+    /// Reads one bounded file version from the index or an object-tree reference.
+    ///
+    /// A nil reference addresses the stage-0 index entry (`:path`); a non-nil reference addresses
+    /// `ref:path`. Passing the object expression as one argv element avoids shell interpretation,
+    /// and disabling text conversion keeps the bytes equal to the repository object.
+    func getFileContent(
+        ref: String?,
+        path: String,
+        byteLimit: Int,
+        at repoURL: URL
+    ) async throws -> Data {
+        guard !path.isEmpty, byteLimit >= 0 else {
+            throw GitFileContentReadError.unavailable("The requested Git file path is invalid.")
+        }
+        let (captureLimit, overflow) = byteLimit.addingReportingOverflow(1)
+        guard !overflow else { throw GitFileContentReadError.tooLarge(limit: byteLimit) }
+
+        let object = ref.map { "\($0):\(path)" } ?? ":\(path)"
+        do {
+            let (stdout, stderr, exitCode) = try await runGitData(
+                ["show", "--no-textconv", "--no-ext-diff", "--end-of-options", object],
+                at: repoURL,
+                stdoutByteLimit: captureLimit,
+                stderrByteLimit: Self.gitBlobDiagnosticOutputByteLimit,
+                admissionPriority: .userInitiatedAuthority,
+                commandFamily: .repositoryRead
+            )
+            guard exitCode == 0 else {
+                let message = String(data: stderr, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let detail: String = if let message, !message.isEmpty {
+                    message
+                } else {
+                    "Git could not read \(object)."
+                }
+                throw GitFileContentReadError.unavailable(detail)
+            }
+            guard stdout.count <= byteLimit else {
+                throw GitFileContentReadError.tooLarge(limit: byteLimit)
+            }
+            return stdout
+        } catch GitProcessCaptureError.stdoutByteLimitExceeded {
+            throw GitFileContentReadError.tooLarge(limit: byteLimit)
+        }
     }
 
     /// Get diff for specific files with error handling per file
@@ -3425,6 +3530,237 @@ actor GitService {
     /// Compatibility wrapper for callers that only need working-tree paths.
     func getWorkingStatus(at repoURL: URL) async throws -> WorkingStatus {
         try await getRepositoryStatus(at: repoURL).workingStatus
+    }
+
+    // MARK: - Git Index Staging
+
+    /// Read detailed per-path index and working-tree state from one porcelain-v2 snapshot.
+    ///
+    /// The projection reuses the shared parser rather than reading status a second
+    /// time, so section membership and staging always agree on one observation.
+    func loadIndexStatusEntries(at repoURL: URL) async throws -> [VCSIndexStatusEntry] {
+        let args = ["status", "--porcelain=v2", "-z", "--untracked-files=all"]
+        let (stdoutData, stderrData, exitCode) = try await runGitData(args, at: repoURL)
+        let stderr = String(decoding: stderrData, as: UTF8.self)
+        guard exitCode == 0 else {
+            throw GitIndexMutationError.gitRefused("git status --porcelain=v2 failed: \(stderr)")
+        }
+        let stdout = try Self.decodeIndexStatusOutput(stdoutData)
+        let parsed = try MCPToolWorkCountDiagnostics.measureGitParse {
+            try GitStatusPorcelainV2Parser.parse(stdout)
+        }
+        return VCSIndexStatusEntry.project(parsed.pathRecords)
+    }
+
+    nonisolated static func decodeIndexStatusOutput(_ data: Data) throws -> String {
+        guard let decoded = String(data: data, encoding: .utf8) else {
+            throw GitIndexMutationError.invalidStatusEncoding
+        }
+        return decoded
+    }
+
+    /// Check whether HEAD resolves to a commit. An unborn HEAD is reported as false,
+    /// not as an error, because a fresh repository is a normal state here.
+    func hasHeadCommit(at repoURL: URL) async throws -> Bool {
+        let args = ["rev-parse", "--verify", "--quiet", "--end-of-options", "HEAD^{commit}"]
+        let (_, stderr, exitCode) = try await runGit(args, at: repoURL)
+        switch exitCode {
+        case 0:
+            return true
+        case 1:
+            return false
+        default:
+            throw GitIndexMutationError.gitRefused("git rev-parse --verify HEAD failed: \(stderr)")
+        }
+    }
+
+    /// Stage the given path identities.
+    ///
+    /// `git add -A` covers modifications, deletions, and untracked files in one
+    /// command, and rename origins are staged alongside their current path so the
+    /// index never records half a rename.
+    func stageIndexPaths(_ identities: [VCSIndexPathIdentity], at repoURL: URL) async throws {
+        let paths = try Self.normalizedIndexMutationPaths(identities)
+        guard !paths.isEmpty else { return }
+        try await withIndexMutationLock(at: repoURL) { [weak self] in
+            guard let self else {
+                throw GitIndexMutationError.unavailable("git service was released before index mutation")
+            }
+            try await runIndexMutationCommandOnce(
+                command: ["add", "-A"],
+                label: "git add",
+                paths: paths,
+                at: repoURL
+            )
+        }
+    }
+
+    /// Mark one conflicted path resolved by recording its current contents.
+    ///
+    /// Deliberately uses plain `git add -- <path>` rather than the broader ordinary-staging `-A`
+    /// command. The row action names one conflict and must not acquire any neighboring changes.
+    func markIndexPathResolved(_ identity: VCSIndexPathIdentity, at repoURL: URL) async throws {
+        let paths = try Self.normalizedIndexMutationPaths([
+            VCSIndexPathIdentity(path: identity.path)
+        ])
+        guard !paths.isEmpty else { return }
+        try await withIndexMutationLock(at: repoURL) { [weak self] in
+            guard let self else {
+                throw GitIndexMutationError.unavailable("git service was released before index mutation")
+            }
+            try await runIndexMutationCommandOnce(
+                command: ["add"],
+                label: "git add",
+                paths: paths,
+                at: repoURL
+            )
+        }
+    }
+
+    /// Unstage the given path identities without touching working-tree contents.
+    ///
+    /// With a born HEAD this restores index entries from HEAD. With an unborn HEAD
+    /// there is nothing to restore from, so the entries are removed from the index
+    /// only; `--ignore-unmatch` keeps the request idempotent when a path was never
+    /// staged.
+    func unstageIndexPaths(_ identities: [VCSIndexPathIdentity], at repoURL: URL) async throws {
+        let paths = try Self.normalizedIndexMutationPaths(identities)
+        guard !paths.isEmpty else { return }
+        try await withIndexMutationLock(at: repoURL) { [weak self] in
+            guard let self else {
+                throw GitIndexMutationError.unavailable("git service was released before index mutation")
+            }
+            // Probed inside the lock: a first commit landing through this service
+            // between the probe and the mutation would otherwise turn an unstage
+            // into a staged deletion.
+            if try await hasHeadCommit(at: repoURL) {
+                try await runIndexMutationCommandOnce(
+                    command: ["restore", "--staged"],
+                    label: "git restore --staged",
+                    paths: paths,
+                    at: repoURL
+                )
+            } else {
+                try await runIndexMutationCommandOnce(
+                    command: ["rm", "--cached", "-r", "--ignore-unmatch", "--quiet"],
+                    label: "git rm --cached",
+                    paths: paths,
+                    at: repoURL
+                )
+            }
+        }
+    }
+
+    /// Serialize index mutations for one repository against this service's other
+    /// mutations of the same checkout.
+    private func withIndexMutationLock<T: Sendable>(
+        at repoURL: URL,
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        let mutationKey = getLayout(for: repoURL)?.commonDir.standardizedFileURL.path
+            ?? repoURL.standardizedFileURL.path
+        return try await worktreeMutationCoordinator.withLock(key: mutationKey, operation: operation)
+    }
+
+    /// Execute exactly one index mutation attempt.
+    ///
+    /// Contention is surfaced to the repository instead of retried here. Only that layer still has
+    /// the reviewed content revisions and authoritative status set needed to revalidate safely
+    /// before the design's single retry.
+    private func runIndexMutationCommandOnce(
+        command: [String],
+        label: String,
+        paths: [String],
+        at repoURL: URL
+    ) async throws {
+        let result = try await runIndexMutationCommand(command: command, paths: paths, at: repoURL)
+        if result.exitCode == 0 { return }
+        guard !Self.isIndexLockContention(result.stderr) else {
+            throw GitIndexMutationError.indexLocked
+        }
+        throw GitIndexMutationError.gitRefused("\(label) failed: \(result.stderr)")
+    }
+
+    /// Invoke one index-mutating Git command.
+    ///
+    /// Pathspecs are always separated by `--` so a leading-dash filename cannot be
+    /// read as an option, and `GIT_LITERAL_PATHSPECS` stops filenames containing
+    /// glob or pathspec-magic characters from matching anything but themselves.
+    /// Large batches move to a NUL-delimited stdin pathspec list instead of being
+    /// chunked, because chunking would apply a stage-all as several non-atomic
+    /// mutations.
+    private func runIndexMutationCommand(
+        command: [String],
+        paths: [String],
+        at repoURL: URL
+    ) async throws -> (stderr: String, exitCode: Int32) {
+        let pathspecBytes = paths.reduce(0) { $0 + $1.lengthOfBytes(using: .utf8) + 1 }
+        var args = command
+        var stdin: Data?
+        if pathspecBytes >= Self.indexMutationPathspecByteLimit
+            || paths.count > Self.indexMutationArgumentPathLimit
+        {
+            args.append(contentsOf: ["--pathspec-from-file=-", "--pathspec-file-nul"])
+            stdin = makePathspecStdinData(paths)
+        } else {
+            args.append("--")
+            args.append(contentsOf: paths)
+        }
+        let (_, stderr, exitCode) = try await runGit(
+            args,
+            at: repoURL,
+            env: ["GIT_LITERAL_PATHSPECS": "1"],
+            stdin: stdin
+        )
+        return (stderr, exitCode)
+    }
+
+    /// Normalize and de-duplicate the repository-relative paths a mutation touches,
+    /// preserving request order so failures name the path the caller asked for.
+    private nonisolated static func normalizedIndexMutationPaths(
+        _ identities: [VCSIndexPathIdentity]
+    ) throws -> [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+        for identity in identities {
+            for rawPath in identity.mutationPaths {
+                let path = try normalizedIndexMutationPath(rawPath)
+                if seen.insert(path).inserted {
+                    ordered.append(path)
+                }
+            }
+        }
+        return ordered
+    }
+
+    /// Reduce one caller-supplied path to a plain repository-relative path.
+    ///
+    /// Rejecting empty components also rejects absolute paths, trailing slashes, and
+    /// doubled separators, and rejecting `.` and `..` components stops a request from
+    /// widening to the whole repository or escaping it. A leading dash stays legal:
+    /// `--` separation already makes such filenames safe.
+    private nonisolated static func normalizedIndexMutationPath(_ path: String) throws -> String {
+        var value = path
+        while value.hasPrefix("./") {
+            value.removeFirst(2)
+        }
+        let components = value.split(separator: "/", omittingEmptySubsequences: false)
+        guard !value.isEmpty,
+              !value.utf8.contains(0),
+              !components.isEmpty,
+              !components.contains(where: { $0.isEmpty || $0 == "." || $0 == ".." })
+        else {
+            throw GitIndexMutationError.invalidPath(path)
+        }
+        return value
+    }
+
+    /// Match only the failure that a concurrent Git process causes, so unrelated
+    /// failures are never retried.
+    private nonisolated static func isIndexLockContention(_ stderr: String) -> Bool {
+        let message = stderr.lowercased()
+        guard message.contains("index.lock") else { return false }
+        return message.contains("file exists") || message.contains("another git process")
     }
 
     // MARK: - Git Blob Identity Shadow Plumbing

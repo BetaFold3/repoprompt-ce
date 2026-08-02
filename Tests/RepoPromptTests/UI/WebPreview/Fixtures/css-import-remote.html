@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<!--
+  Probes: stylesheet-driven remote fetches (@import, url() backgrounds, webfonts).
+  Inline and local CSS are permitted; remote CSS is not.
+  PASS: the box below is GREEN (local inline CSS applied) and never red; no remote fetch occurs.
+  FAIL: the box is red, or a remote font/background loads.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>css import</title>
+    <link rel="stylesheet" href="http://127.0.0.1:9/remote.css" />
+    <link rel="stylesheet" href="remote-import.css" />
+    <style>
+      @import url("http://127.0.0.1:9/imported.css");
+      @font-face {
+        font-family: "RemoteFont";
+        src: url("http://127.0.0.1:9/font.woff2") format("woff2");
+      }
+      .box {
+        width: 120px;
+        height: 40px;
+        background: green;
+      }
+      .beacon {
+        background-image: url("http://127.0.0.1:9/beacon.png");
+      }
+    </style>
+  </head>
+  <body>
+    <h1>CSS imports</h1>
+    <div class="box beacon"></div>
+    <p style="font-family: RemoteFont, serif;">Remote webfont must not load.</p>
+  </body>
+</html>

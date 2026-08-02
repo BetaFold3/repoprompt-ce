@@ -2138,6 +2138,7 @@ private final class AuthorityEvidenceFixture {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = ["fast-import", "--quiet"]
         process.currentDirectoryURL = root
+        process.environment = TestGitCommandRunner.processEnvironment()
         let stdin = Pipe()
         process.standardInput = stdin
         process.standardOutput = FileHandle.nullDevice
@@ -2153,21 +2154,10 @@ private final class AuthorityEvidenceFixture {
 
     @discardableResult
     private static func git(_ arguments: [String], at root: URL) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = root
-        let stdout = Pipe()
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw NSError(domain: "GitLoadedRootAuthorityEvidenceTests", code: Int(process.terminationStatus))
-        }
-        return String(
-            data: stdout.fileHandleForReading.readDataToEndOfFile(),
-            encoding: .utf8
-        ) ?? ""
+        try TestGitCommandRunner.run(
+            arguments,
+            cwd: root,
+            failureDomain: "GitLoadedRootAuthorityEvidenceTests"
+        )
     }
 }
