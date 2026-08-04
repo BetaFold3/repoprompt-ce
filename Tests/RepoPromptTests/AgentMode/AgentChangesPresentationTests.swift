@@ -381,7 +381,7 @@ final class AgentChangesPresentationTests: XCTestCase {
         let rootID = UUID()
         let reference = AgentChangesArtifactLinkResolver.reference(
             forArtifactPath: "docs/coverage.html",
-            checkout: checkout(path: "/tmp/panel-repo"),
+            checkouts: [checkout(path: "/tmp/panel-repo")],
             logicalRoots: [AgentPanelLogicalRoot(path: "/tmp/panel-repo")],
             rootIDsByPath: ["/tmp/panel-repo": rootID]
         )
@@ -396,7 +396,7 @@ final class AgentChangesPresentationTests: XCTestCase {
         let inner = UUID()
         let reference = AgentChangesArtifactLinkResolver.reference(
             forArtifactPath: "/tmp/panel-repo/packages/app/docs/report.md",
-            checkout: checkout(path: "/tmp/panel-repo"),
+            checkouts: [checkout(path: "/tmp/panel-repo")],
             logicalRoots: [
                 AgentPanelLogicalRoot(path: "/tmp/panel-repo"),
                 AgentPanelLogicalRoot(path: "/tmp/panel-repo/packages/app")
@@ -427,7 +427,7 @@ final class AgentChangesPresentationTests: XCTestCase {
 
         let reference = AgentChangesArtifactLinkResolver.reference(
             forArtifactPath: "/tmp/worktrees/agent-1/docs/report.md",
-            checkout: worktreeCheckout,
+            checkouts: [worktreeCheckout],
             logicalRoots: [AgentPanelLogicalRoot(path: "/tmp/panel-repo")],
             rootIDsByPath: ["/tmp/panel-repo": rootID]
         )
@@ -441,7 +441,7 @@ final class AgentChangesPresentationTests: XCTestCase {
         XCTAssertNil(
             AgentChangesArtifactLinkResolver.reference(
                 forArtifactPath: "/private/var/tmp/scratch.md",
-                checkout: checkout(path: "/tmp/panel-repo"),
+                checkouts: [checkout(path: "/tmp/panel-repo")],
                 logicalRoots: [AgentPanelLogicalRoot(path: "/tmp/panel-repo")],
                 rootIDsByPath: ["/tmp/panel-repo": UUID()]
             )
@@ -540,6 +540,194 @@ final class AgentChangesPresentationTests: XCTestCase {
         XCTAssertEqual(AgentChangesPatchPresentation.summary(for: .binary), "Binary file — no text to show.")
         XCTAssertEqual(AgentChangesPatchPresentation.summary(for: .renamed(from: "Old.swift")), "Renamed from Old.swift.")
         XCTAssertNil(AgentChangesPatchPresentation.summary(for: .modified))
+    }
+
+    // MARK: - Grouped search and partial-staging presentation
+
+    func testHighlightCompositionGivesSearchPrecedenceOnlyOnOverlap() {
+        let spans = AgentChangesHighlightComposition.spans(
+            utf16Length: 10,
+            intralineRanges: [1 ..< 8],
+            searchHighlights: [
+                AgentChangesSearchHighlight(utf16Range: 3 ..< 6, isCurrent: false),
+                AgentChangesSearchHighlight(utf16Range: 5 ..< 7, isCurrent: true)
+            ]
+        )
+
+        XCTAssertEqual(spans, [
+            AgentChangesTextHighlightSpan(utf16Range: 1 ..< 3, kind: .intraline),
+            AgentChangesTextHighlightSpan(utf16Range: 3 ..< 5, kind: .search),
+            AgentChangesTextHighlightSpan(utf16Range: 5 ..< 7, kind: .currentSearch),
+            AgentChangesTextHighlightSpan(utf16Range: 7 ..< 8, kind: .intraline)
+        ])
+    }
+
+    func testGroupHeaderPresentationNamesCollapsedRootsAndActualCheckout() {
+        let worktree = AgentPanelWorktreeIdentity(binding: AgentSessionWorktreeBinding(
+            id: "binding",
+            repositoryID: "repo",
+            repoKey: "key",
+            logicalRootPath: "/tmp/repo",
+            worktreeID: "worktree",
+            worktreeRootPath: "/tmp/worktrees/agent",
+            branch: "agent/panel",
+            boundAt: Date(timeIntervalSince1970: 0),
+            source: "test"
+        ))
+        let target = AgentPanelResolvedCheckout(
+            checkoutURL: URL(fileURLWithPath: "/tmp/worktrees/agent"),
+            repoRootURL: URL(fileURLWithPath: "/tmp/worktrees/agent"),
+            backendKind: .git,
+            pathspecPrefixes: [],
+            logicalRoots: [
+                AgentPanelLogicalRoot(path: "/tmp/repo/App", name: "App"),
+                AgentPanelLogicalRoot(path: "/tmp/repo/Docs", name: "Docs")
+            ],
+            worktree: worktree,
+            substitutesUnavailableWorktree: false
+        )
+
+        let presentation = AgentChangesGroupHeaderPresentation(target: target)
+        XCTAssertEqual(presentation.title, "App + Docs")
+        XCTAssertEqual(presentation.checkoutIdentity, "agent/panel")
+        XCTAssertEqual(presentation.checkoutTooltip, "Agent worktree at /tmp/worktrees/agent")
+
+        let substituted = AgentPanelResolvedCheckout(
+            checkoutURL: URL(fileURLWithPath: "/tmp/repo"),
+            repoRootURL: URL(fileURLWithPath: "/tmp/repo"),
+            backendKind: .git,
+            pathspecPrefixes: [],
+            logicalRoots: target.logicalRoots,
+            worktree: worktree,
+            substitutesUnavailableWorktree: true
+        )
+        XCTAssertEqual(
+            AgentChangesGroupHeaderPresentation(target: substituted).checkoutIdentity,
+            "repo",
+            "A substitution identifies the checkout being read, not the unavailable worktree"
+        )
+    }
+
+    func testAggregateFooterPresentationUsesQualifiedTotals() {
+        XCTAssertEqual(
+            AgentChangesFooterPresentation.totals(
+                fileCount: 3,
+                additions: 14,
+                deletions: 2
+            ),
+            "3 files · +14 \u{2212}2"
+        )
+        XCTAssertEqual(
+            AgentChangesFooterPresentation.totals(
+                fileCount: 1,
+                additions: 0,
+                deletions: 0
+            ),
+            "1 file"
+        )
+    }
+
+    func testPanelSearchShortcutRoutingRequiresPanelFirstResponderAncestry() {
+        XCTAssertNil(AgentChangesPanelKeyCommandRouting.command(
+            character: "f",
+            keyCode: 3,
+            isCommandPressed: true,
+            isShiftPressed: false,
+            hasOtherModifiers: false,
+            isFirstResponderInsidePanel: false,
+            isSearchActive: false
+        ))
+        XCTAssertEqual(
+            AgentChangesPanelKeyCommandRouting.command(
+                character: "f",
+                keyCode: 3,
+                isCommandPressed: true,
+                isShiftPressed: false,
+                hasOtherModifiers: false,
+                isFirstResponderInsidePanel: true,
+                isSearchActive: false
+            ),
+            .focusSearch
+        )
+        XCTAssertEqual(
+            AgentChangesPanelKeyCommandRouting.command(
+                character: "g",
+                keyCode: 5,
+                isCommandPressed: true,
+                isShiftPressed: true,
+                hasOtherModifiers: false,
+                isFirstResponderInsidePanel: true,
+                isSearchActive: true
+            ),
+            .previousMatch
+        )
+        XCTAssertEqual(
+            AgentChangesPanelKeyCommandRouting.command(
+                character: nil,
+                keyCode: 53,
+                isCommandPressed: false,
+                isShiftPressed: false,
+                hasOtherModifiers: false,
+                isFirstResponderInsidePanel: true,
+                isSearchActive: true
+            ),
+            .clearAndResign
+        )
+        XCTAssertNil(AgentChangesPanelKeyCommandRouting.command(
+            character: nil,
+            keyCode: 53,
+            isCommandPressed: false,
+            isShiftPressed: false,
+            hasOtherModifiers: false,
+            isFirstResponderInsidePanel: true,
+            isSearchActive: false
+        ))
+    }
+
+    func testSearchBarPresentationReportsSelectionAndBounds() {
+        let groupID = AgentChangesGroupID(targetKey: "group")
+        let rowKey = AgentChangesRowKey(groupID: groupID, rowID: "unstaged:a.swift")
+        let matches = [
+            AgentChangesSearchMatch(
+                rowKey: rowKey,
+                groupOrder: 0,
+                sectionOrder: 0,
+                rowOrder: 0,
+                locatorOrder: 0,
+                locator: .filePath,
+                utf16Range: 0 ..< 1,
+                displayedText: "a.swift"
+            ),
+            AgentChangesSearchMatch(
+                rowKey: rowKey,
+                groupOrder: 0,
+                sectionOrder: 0,
+                rowOrder: 0,
+                locatorOrder: 0,
+                locator: .filePath,
+                utf16Range: 2 ..< 3,
+                displayedText: "a.swift"
+            )
+        ]
+        let state = AgentChangesSearchState(
+            query: "a",
+            phase: .ready,
+            matches: matches,
+            selectedMatchIndex: 1,
+            skippedFileCount: 2,
+            isTruncated: true
+        )
+
+        let presentation = AgentChangesSearchBarPresentation(state: state)
+        XCTAssertEqual(presentation.resultText, "2 of 2")
+        XCTAssertEqual(presentation.limitText, "2 files skipped · results limited")
+        XCTAssertEqual(
+            AgentChangesSearchBarPresentation(state: AgentChangesSearchState(
+                query: "missing",
+                phase: .ready
+            )).resultText,
+            "No matches"
+        )
     }
 
     // MARK: - Builders

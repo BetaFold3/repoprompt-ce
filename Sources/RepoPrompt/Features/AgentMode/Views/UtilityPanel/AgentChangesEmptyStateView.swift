@@ -8,9 +8,9 @@ import SwiftUI
 /// the user most wants to review something, and vs-Base is where that work is.
 struct AgentChangesEmptyStateView: View {
     let state: AgentChangesEmptyState
-    let baseBranchCandidates: [String]
+    let baseRevisionCandidates: [String]
     let onCompareAgainstBase: () -> Void
-    let onSelectBaseBranch: (String) -> Void
+    let onSelectBaseRevision: (String) -> Void
     let onSelectCustomRevision: () -> Void
     let onRetry: () -> Void
 
@@ -79,11 +79,14 @@ struct AgentChangesEmptyStateView: View {
                 .buttonStyle(.link)
                 .font(preset.swiftUIFont(sizeAtNormal: Layout.messageSizeAtNormal, weight: .medium))
                 .padding(.top, Layout.actionTopPadding)
+                .hoverTooltip("Choose a base revision for this repository")
+                .accessibilityLabel("Compare against a base revision")
+                .accessibilityValue("available")
         case .baseNotChosen:
-            AgentChangesBaseBranchMenu(
-                selectedBranch: nil,
-                candidates: baseBranchCandidates,
-                onSelect: onSelectBaseBranch,
+            AgentChangesBaseRevisionMenu(
+                selectedRevision: nil,
+                candidates: baseRevisionCandidates,
+                onSelect: onSelectBaseRevision,
                 onSelectCustom: onSelectCustomRevision
             )
             .padding(.top, Layout.actionTopPadding)
@@ -93,6 +96,9 @@ struct AgentChangesEmptyStateView: View {
                 .font(preset.swiftUIFont(sizeAtNormal: Layout.messageSizeAtNormal, weight: .medium))
                 .padding(.top, Layout.actionTopPadding)
                 .accessibilityHint(message)
+                .hoverTooltip("Retry reading this repository")
+                .accessibilityLabel("Try reading changes again")
+                .accessibilityValue("available")
         case .cleanTree, .loading, .noWorkspaceRoot, .notARepository, .blockedRootsOnly, .unbornHead:
             EmptyView()
         }

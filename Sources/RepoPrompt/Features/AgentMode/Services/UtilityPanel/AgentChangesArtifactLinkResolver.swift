@@ -10,22 +10,43 @@ import Foundation
 /// Pure and static: every input is passed in, so the mapping rules are testable without a
 /// workspace, a session, or a repository on disk.
 enum AgentChangesArtifactLinkResolver {
-    /// Resolves an artifact path against the workspace.
+    /// Resolves an artifact path against every checkout visible in the active tab.
     ///
-    /// - Parameters:
-    ///   - path: the path exactly as the tool payload reported it — absolute, relative, or
-    ///     tilde-prefixed.
-    ///   - checkout: the checkout the Changes panel is currently reading, used both to anchor a
-    ///     relative path and to translate a worktree path back onto its logical root.
-    ///   - logicalRoots: every logical root in the workspace, not just the active checkout's. An
-    ///     agent can write a report into a root the panel is not currently pointed at, and the
-    ///     Preview segment can still open it.
-    ///   - rootIDsByPath: `WorkspaceRootRef.id` keyed by standardized logical root path.
-    /// - Returns: a reference, or `nil` when the path lies outside every known root. The caller
-    ///   suppresses the banner in that case rather than offering an action that cannot work.
+    /// Relative tool paths are anchored independently in every checkout. Exactly one resulting
+    /// logical-root reference is required; if two repositories could both own the path, guessing
+    /// would open the right-looking name in the wrong root and the banner is suppressed.
     static func reference(
         forArtifactPath path: String,
-        checkout: AgentPanelResolvedCheckout?,
+        checkouts: [AgentPanelResolvedCheckout],
+        logicalRoots: [AgentPanelLogicalRoot],
+        rootIDsByPath: [String: UUID]
+    ) -> PreviewDocumentReference? {
+        let expanded = (path as NSString).expandingTildeInPath
+
+        if expanded.hasPrefix("/") {
+            let absolute = URL(fileURLWithPath: expanded).standardizedFileURL.path
+            if let match = longestContainingRoot(absolute, in: logicalRoots),
+               let rootID = rootIDsByPath[match.root.path]
+            {
+                return PreviewDocumentReference(rootID: rootID, relativePath: match.relativePath)
+            }
+        }
+
+        let candidates = Set(checkouts.compactMap {
+            reference(
+                forArtifactPath: path,
+                checkout: $0,
+                logicalRoots: logicalRoots,
+                rootIDsByPath: rootIDsByPath
+            )
+        })
+        guard candidates.count == 1 else { return nil }
+        return candidates.first
+    }
+
+    private static func reference(
+        forArtifactPath path: String,
+        checkout: AgentPanelResolvedCheckout,
         logicalRoots: [AgentPanelLogicalRoot],
         rootIDsByPath: [String: UUID]
     ) -> PreviewDocumentReference? {
@@ -39,13 +60,10 @@ enum AgentChangesArtifactLinkResolver {
             return PreviewDocumentReference(rootID: rootID, relativePath: match.relativePath)
         }
 
-        guard let checkout,
-              let checkoutRelative = AgentPanelCheckoutResolver.repositoryRelativePath(
-                  of: URL(fileURLWithPath: absolute),
-                  underRepositoryRoot: checkout.checkoutURL
-              ),
-              !checkoutRelative.isEmpty
-        else { return nil }
+        guard let checkoutRelative = AgentPanelCheckoutResolver.repositoryRelativePath(
+            of: URL(fileURLWithPath: absolute),
+            underRepositoryRoot: checkout.checkoutURL
+        ), !checkoutRelative.isEmpty else { return nil }
 
         guard let projection = projectOntoLogicalRoot(
             checkoutRelativePath: checkoutRelative,
@@ -95,23 +113,12 @@ enum AgentChangesArtifactLinkResolver {
     }
 
     /// Maps a path inside a worktree checkout back onto the logical root it stands in for.
-    ///
-    /// The resolver reproduces a logical root's position inside the worktree that replaced it, so a
-    /// checkout-relative path carries that same position as its leading components. Two shapes are
-    /// possible, and both are decidable from the checkout alone:
-    ///
-    /// - The checkout represents whole roots (`pathspecPrefixes` empty). With one logical root the
-    ///   checkout-relative path *is* the root-relative path.
-    /// - The checkout represents scoped roots. The matching pathspec prefix names the position, and
-    ///   the logical root that ends with those same components is the one it belongs to.
     private static func projectOntoLogicalRoot(
         checkoutRelativePath: String,
         checkout: AgentPanelResolvedCheckout
     ) -> RootMatch? {
         guard !checkout.pathspecPrefixes.isEmpty else {
             guard checkout.logicalRoots.count == 1, let root = checkout.logicalRoots.first else {
-                // Several unscoped roots on one checkout cannot be told apart by path alone;
-                // guessing one would open the right file under the wrong root identity.
                 return nil
             }
             return RootMatch(root: root, relativePath: checkoutRelativePath)

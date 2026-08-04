@@ -57,7 +57,9 @@ struct AgentChangesSectionHeaderView: View {
                     .buttonStyle(.link)
                     .font(preset.swiftUIFont(sizeAtNormal: Layout.actionSizeAtNormal, weight: .medium))
                     .disabled(isBulkDisabled)
+                    .hoverTooltip(presentation.bulkActionAccessibilityLabel ?? title)
                     .accessibilityLabel(presentation.bulkActionAccessibilityLabel ?? title)
+                    .accessibilityValue(isBulkDisabled ? "unavailable" : "available")
             }
         }
         .padding(.horizontal, Layout.horizontalPadding)
@@ -84,8 +86,11 @@ struct AgentChangesFileRowView: View {
     let isMutationDisabled: Bool
     let viewedStatus: AgentChangesViewedStatus
     let pendingResolution: AgentChangesPanelViewModel.PendingResolution?
+    let pendingPartial: AgentChangesPanelViewModel.PendingPartialMutation?
     let markResolvedDisabledReason: String?
     let isFlashing: Bool
+    let pathSearchMatches: [AgentChangesSearchMatch]
+    let isCurrentSearchMatch: (AgentChangesSearchMatch) -> Bool
     let onToggleExpansion: () -> Void
     let onSetStaged: (Bool) -> Void
     let onSetViewed: (Bool) -> Void
@@ -93,6 +98,7 @@ struct AgentChangesFileRowView: View {
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
     @State private var isHovered = false
     @State private var showsResolveConfirmation = false
 
@@ -150,6 +156,10 @@ struct AgentChangesFileRowView: View {
                     disabledReason: markResolvedDisabledReason,
                     onRequestConfirmation: { showsResolveConfirmation = true }
                 )
+            }
+
+            if let pendingPartial {
+                AgentChangesPartialPendingIndicator(row: row, pending: pendingPartial)
             }
 
             stats
@@ -216,14 +226,53 @@ struct AgentChangesFileRowView: View {
     /// whole: two separate labels would each truncate on their own and could hide the file name to
     /// keep showing a directory nobody needed.
     private var path: some View {
-        (
-            Text(presentation.directory).foregroundStyle(.tertiary)
-                + Text(presentation.name).foregroundStyle(.primary)
+        Text(attributedPath)
+            .font(preset.swiftUIFont(sizeAtNormal: Layout.pathSizeAtNormal))
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .overlay(AgentChangesSearchAnchorOverlay(matches: pathSearchMatches))
+            .accessibilityHidden(true)
+    }
+
+    private var attributedPath: AttributedString {
+        let highlights = pathSearchMatches.map {
+            AgentChangesSearchHighlight(
+                utf16Range: $0.utf16Range,
+                isCurrent: isCurrentSearchMatch($0)
+            )
+        }
+        var attributed = AgentChangesHighlightedText.make(
+            row.path,
+            searchHighlights: highlights,
+            searchBackground: AgentChangesDiffPalette.searchBackgroundColor(
+                current: false,
+                colorScheme: colorScheme
+            ),
+            currentSearchBackground: AgentChangesDiffPalette.searchBackgroundColor(
+                current: true,
+                colorScheme: colorScheme
+            )
         )
-        .font(preset.swiftUIFont(sizeAtNormal: Layout.pathSizeAtNormal))
-        .lineLimit(1)
-        .truncationMode(.middle)
-        .accessibilityHidden(true)
+        let directoryEnd = presentation.directory.utf16.count
+        if directoryEnd > 0,
+           let range = AgentChangesHighlightedText.attributedRange(
+               0 ..< directoryEnd,
+               text: row.path,
+               attributed: attributed
+           )
+        {
+            attributed[range].foregroundColor = .secondary.opacity(0.7)
+        }
+        if directoryEnd < row.path.utf16.count,
+           let range = AgentChangesHighlightedText.attributedRange(
+               directoryEnd ..< row.path.utf16.count,
+               text: row.path,
+               attributed: attributed
+           )
+        {
+            attributed[range].foregroundColor = .primary
+        }
+        return attributed
     }
 
     @ViewBuilder
@@ -253,6 +302,70 @@ struct AgentChangesFileRowView: View {
         if isFlashing { return Color.accentColor.opacity(Layout.flashOpacity) }
         if isHovered { return Color.secondary.opacity(Layout.hoverOpacity) }
         return .clear
+    }
+}
+
+// MARK: - Partial pending and search anchors
+
+private struct AgentChangesPartialPendingIndicator: View {
+    let row: AgentChangesFileRow
+    let pending: AgentChangesPanelViewModel.PendingPartialMutation
+
+    @ObservedObject private var fontScale = FontScaleManager.shared
+
+    private enum Layout {
+        static let glyphSizeAtNormal: CGFloat = 9
+        static let frameSizeAtNormal: CGFloat = 16
+        static let progressScale: CGFloat = 0.45
+    }
+
+    private var label: String {
+        let verb = pending.action == .stage ? "Staging" : "Unstaging"
+        switch pending.selectionKind {
+        case .hunk: return "\(verb) a hunk in \(row.path)"
+        case let .lines(count): return "\(verb) \(count) selected lines in \(row.path)"
+        }
+    }
+
+    var body: some View {
+        Group {
+            if pending.showsSpinner {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(Layout.progressScale)
+            } else {
+                Image(systemName: pending.action == .stage ? "arrow.down.to.line" : "arrow.up.to.line")
+                    .font(.system(
+                        size: fontScale.preset.scaledMetric(Layout.glyphSizeAtNormal),
+                        weight: .medium
+                    ))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(
+            width: fontScale.preset.scaledMetric(Layout.frameSizeAtNormal),
+            height: fontScale.preset.scaledMetric(Layout.frameSizeAtNormal)
+        )
+        .hoverTooltip(label)
+        .accessibilityLabel(label)
+    }
+}
+
+/// Zero-size IDs colocated with the visible match target. Multiple occurrences in one displayed
+/// string share a scroll position but retain distinct navigation identity.
+struct AgentChangesSearchAnchorOverlay: View {
+    let matches: [AgentChangesSearchMatch]
+
+    var body: some View {
+        ZStack {
+            ForEach(matches) { match in
+                Color.clear
+                    .frame(width: 0, height: 0)
+                    .id(match.id)
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -342,6 +455,9 @@ private struct AgentChangesMarkResolvedButton: View {
             disabledReason ?? "Marks \(row.path) resolved by staging its current contents"
         )
         .accessibilityLabel("Mark \(row.path) resolved")
+        .accessibilityValue(
+            showsSpinner ? "in progress" : (disabledReason == nil ? "available" : "unavailable")
+        )
         .accessibilityHint(disabledReason ?? "Stages the file's current contents after confirmation")
     }
 }

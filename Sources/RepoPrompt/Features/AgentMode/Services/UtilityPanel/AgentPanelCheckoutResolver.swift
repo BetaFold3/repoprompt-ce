@@ -232,19 +232,68 @@ struct AgentPanelResolvedCheckout: Equatable, Identifiable {
     }
 }
 
+/// One logical-root-positioned outcome in a checkout resolution.
+///
+/// Resolved checkouts may represent several logical roots. They appear once, where their first root
+/// occurred, while blocked roots remain interleaved at their own positions.
+enum AgentPanelCheckoutResolutionItem: Equatable {
+    case resolved(AgentPanelResolvedCheckout)
+    case blocked(AgentPanelBlockedCheckout)
+}
+
 /// What the panel should show for one request.
 struct AgentPanelCheckoutResolution: Equatable {
-    /// Readable checkouts, in the order their first logical root appeared.
-    let targets: [AgentPanelResolvedCheckout]
-
-    /// Roots that resolved to nothing, with the reason and whether an override is offered.
-    let blocked: [AgentPanelBlockedCheckout]
+    /// Resolved and blocked outcomes in logical-root order.
+    let items: [AgentPanelCheckoutResolutionItem]
 
     /// The request signature this resolution was computed from; a change means retry.
     let retrySignature: String
 
+    init(
+        items: [AgentPanelCheckoutResolutionItem],
+        retrySignature: String
+    ) {
+        self.items = items
+        self.retrySignature = retrySignature
+    }
+
+    /// Compatibility initializer for callers that still supply the former split collections.
+    ///
+    /// Separate arrays cannot express interleaving, so this Wave-1 bridge preserves their historical
+    /// resolved-then-blocked representation. The resolver itself always uses ordered ``items``.
+    init(
+        targets: [AgentPanelResolvedCheckout],
+        blocked: [AgentPanelBlockedCheckout],
+        retrySignature: String
+    ) {
+        items = targets.map(AgentPanelCheckoutResolutionItem.resolved)
+            + blocked.map(AgentPanelCheckoutResolutionItem.blocked)
+        self.retrySignature = retrySignature
+    }
+
+    /// Readable checkouts, in the order their first logical root appeared.
+    ///
+    /// Kept as a computed convenience so the current single-checkout view model remains untouched
+    /// until the Wave-2 repository-pool cutover.
+    var targets: [AgentPanelResolvedCheckout] {
+        items.compactMap { item in
+            guard case let .resolved(target) = item else { return nil }
+            return target
+        }
+    }
+
+    /// Roots that resolved to nothing, retaining their logical-root order.
+    ///
+    /// Kept as a computed convenience for the Wave-1 compatibility boundary.
+    var blocked: [AgentPanelBlockedCheckout] {
+        items.compactMap { item in
+            guard case let .blocked(blockedCheckout) = item else { return nil }
+            return blockedCheckout
+        }
+    }
+
     var isEmpty: Bool {
-        targets.isEmpty && blocked.isEmpty
+        items.isEmpty
     }
 
     /// True when at least one root is waiting on worktree hydration.
@@ -308,26 +357,52 @@ enum AgentPanelCheckoutResolver {
         _ request: AgentPanelCheckoutRequest,
         probe: some AgentPanelCheckoutProbing
     ) async -> AgentPanelCheckoutResolution {
-        var candidates: [Candidate] = []
-        var blocked: [AgentPanelBlockedCheckout] = []
+        var outcomes: [RootOutcome] = []
 
         for root in request.logicalRoots {
             switch await candidate(for: root, request: request, probe: probe) {
             case let .resolved(candidate):
-                candidates.append(candidate)
+                outcomes.append(.resolved(candidate))
             case let .blocked(reason):
-                blocked.append(AgentPanelBlockedCheckout(logicalRoot: root, reason: reason))
+                outcomes.append(.blocked(AgentPanelBlockedCheckout(logicalRoot: root, reason: reason)))
+            }
+        }
+
+        let targets = collapse(outcomes.compactMap { outcome in
+            guard case let .resolved(candidate) = outcome else { return nil }
+            return candidate
+        })
+        let targetsByCheckoutPath = Dictionary(uniqueKeysWithValues: targets.map {
+            ($0.checkoutURL.standardizedFileURL.path, $0)
+        })
+        var emittedCheckoutPaths: Set<String> = []
+        let items = outcomes.compactMap { outcome -> AgentPanelCheckoutResolutionItem? in
+            switch outcome {
+            case let .blocked(blockedCheckout):
+                return .blocked(blockedCheckout)
+            case let .resolved(candidate):
+                let checkoutPath = candidate.checkoutURL.standardizedFileURL.path
+                guard emittedCheckoutPaths.insert(checkoutPath).inserted,
+                      let target = targetsByCheckoutPath[checkoutPath]
+                else {
+                    return nil
+                }
+                return .resolved(target)
             }
         }
 
         return AgentPanelCheckoutResolution(
-            targets: collapse(candidates),
-            blocked: blocked,
+            items: items,
             retrySignature: request.retrySignature
         )
     }
 
     // MARK: - Per-root resolution
+
+    private enum RootOutcome {
+        case resolved(Candidate)
+        case blocked(AgentPanelBlockedCheckout)
+    }
 
     private struct Candidate {
         let checkoutURL: URL

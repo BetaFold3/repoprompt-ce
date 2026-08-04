@@ -63,22 +63,21 @@ protocol AgentChangesPanelEnvironment: AnyObject {
 
     // MARK: Tab-state writes
 
-    func selectRootOverride(_ rootID: UUID?, tabID: UUID?)
     func setCompareSelection(_ selection: AgentChangesCompareSelection, tabID: UUID?)
     func setDiffViewMode(_ mode: AgentChangesDiffViewMode, tabID: UUID?)
     func setChangesFilter(_ filter: AgentChangesFilter, tabID: UUID?)
-    func selectBaseBranch(_ branch: String?, forRepoRoot repoRoot: String, tabID: UUID?)
-    func lastUsedBaseBranch(forRepoRoot repoRoot: String, tabID: UUID?) -> String?
-    func setFileExpansion(_ isExpanded: Bool, filePath: String, tabID: UUID?)
+    func selectBaseRevision(_ revision: String?, forRepoRoot repoRoot: String, tabID: UUID?)
+    func setFileExpansion(_ isExpanded: Bool, file: AgentChangesFileStateKey, tabID: UUID?)
     func setFileViewed(
         _ viewed: Bool,
         revision: AgentChangesViewedRevision,
         compareTargetKey: String,
-        collapseFilePath: String?,
+        collapseFile: AgentChangesFileStateKey?,
         tabID: UUID?
     )
     @discardableResult
-    func escalateContext(filePath: String, tabID: UUID?) -> AgentChangesContextLevel
+    func escalateContext(file: AgentChangesFileStateKey, tabID: UUID?) -> AgentChangesContextLevel
+
     func showPreview(of document: PreviewDocumentReference, tabID: UUID?)
     func dismissBanner(artifactID: String, tabID: UUID?)
 }
@@ -169,10 +168,6 @@ final class AgentChangesPanelLiveEnvironment: AgentChangesPanelEnvironment {
 
     // MARK: Tab-state writes
 
-    func selectRootOverride(_ rootID: UUID?, tabID: UUID?) {
-        agentModeVM?.selectUtilityPanelRootOverride(rootID, tabID: tabID)
-    }
-
     func setCompareSelection(_ selection: AgentChangesCompareSelection, tabID: UUID?) {
         agentModeVM?.setUtilityPanelCompareSelection(selection, tabID: tabID)
     }
@@ -185,37 +180,36 @@ final class AgentChangesPanelLiveEnvironment: AgentChangesPanelEnvironment {
         agentModeVM?.setUtilityPanelChangesFilter(filter, tabID: tabID)
     }
 
-    func selectBaseBranch(_ branch: String?, forRepoRoot repoRoot: String, tabID: UUID?) {
-        agentModeVM?.selectUtilityPanelBaseBranch(branch, forRepoRoot: repoRoot, tabID: tabID)
+    func selectBaseRevision(_ revision: String?, forRepoRoot repoRoot: String, tabID: UUID?) {
+        agentModeVM?.selectUtilityPanelBaseRevision(revision, forRepoRoot: repoRoot, tabID: tabID)
     }
 
-    func lastUsedBaseBranch(forRepoRoot repoRoot: String, tabID: UUID?) -> String? {
-        agentModeVM?.utilityPanelLastUsedBaseBranch(forRepoRoot: repoRoot, tabID: tabID)
-    }
-
-    func setFileExpansion(_ isExpanded: Bool, filePath: String, tabID: UUID?) {
-        agentModeVM?.setUtilityPanelFileExpansion(isExpanded, filePath: filePath, tabID: tabID)
+    func setFileExpansion(_ isExpanded: Bool, file: AgentChangesFileStateKey, tabID: UUID?) {
+        agentModeVM?.setUtilityPanelFileExpansion(isExpanded, file: file, tabID: tabID)
     }
 
     func setFileViewed(
         _ viewed: Bool,
         revision: AgentChangesViewedRevision,
         compareTargetKey: String,
-        collapseFilePath: String?,
+        collapseFile: AgentChangesFileStateKey?,
         tabID: UUID?
     ) {
         agentModeVM?.setUtilityPanelFileViewed(
             viewed,
             revision: revision,
             compareTargetKey: compareTargetKey,
-            collapseFilePath: collapseFilePath,
+            collapseFile: collapseFile,
             tabID: tabID
         )
     }
 
     @discardableResult
-    func escalateContext(filePath: String, tabID: UUID?) -> AgentChangesContextLevel {
-        agentModeVM?.escalateUtilityPanelContext(filePath: filePath, tabID: tabID) ?? .standard
+    func escalateContext(
+        file: AgentChangesFileStateKey,
+        tabID: UUID?
+    ) -> AgentChangesContextLevel {
+        agentModeVM?.escalateUtilityPanelContext(file: file, tabID: tabID) ?? .standard
     }
 
     func showPreview(of document: PreviewDocumentReference, tabID: UUID?) {

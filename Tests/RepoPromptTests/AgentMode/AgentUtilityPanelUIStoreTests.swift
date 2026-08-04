@@ -97,12 +97,13 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        XCTAssertTrue(viewModel.toggleUtilityPanelFileExpansion(filePath: "Sources/App.swift"))
-        XCTAssertTrue(session.utilityPanel.isExpanded(filePath: "Sources/App.swift"))
-        XCTAssertEqual(viewModel.ui.utilityPanel.snapshot.panel.expandedFilePaths, ["Sources/App.swift"])
+        let app = fileKey("Sources/App.swift")
+        XCTAssertTrue(viewModel.toggleUtilityPanelFileExpansion(file: app))
+        XCTAssertTrue(session.utilityPanel.isExpanded(file: app))
+        XCTAssertEqual(viewModel.ui.utilityPanel.snapshot.panel.expandedFiles, [app])
 
-        XCTAssertFalse(viewModel.toggleUtilityPanelFileExpansion(filePath: "Sources/App.swift"))
-        XCTAssertTrue(viewModel.ui.utilityPanel.snapshot.panel.expandedFilePaths.isEmpty)
+        XCTAssertFalse(viewModel.toggleUtilityPanelFileExpansion(file: app))
+        XCTAssertTrue(viewModel.ui.utilityPanel.snapshot.panel.expandedFiles.isEmpty)
     }
 
     func testContextEscalationReturnsTheLevelToRequestFromTheDiffEngine() async throws {
@@ -112,9 +113,10 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        XCTAssertEqual(viewModel.escalateUtilityPanelContext(filePath: "a.swift"), .expanded)
-        XCTAssertEqual(viewModel.escalateUtilityPanelContext(filePath: "a.swift"), .fullFile)
-        XCTAssertEqual(viewModel.ui.utilityPanel.snapshot.panel.contextLevel(forFilePath: "a.swift"), .fullFile)
+        let a = fileKey("a.swift")
+        XCTAssertEqual(viewModel.escalateUtilityPanelContext(file: a), .expanded)
+        XCTAssertEqual(viewModel.escalateUtilityPanelContext(file: a), .fullFile)
+        XCTAssertEqual(viewModel.ui.utilityPanel.snapshot.panel.contextLevel(forFile: a), .fullFile)
     }
 
     func testTheArtifactBannerDeepLinkOpensThePreviewSegmentOnThatDocument() async throws {
@@ -156,7 +158,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        viewModel.selectUtilityPanelBaseBranch("develop", forRepoRoot: "/repos/alpha")
+        viewModel.selectUtilityPanelBaseRevision("develop", forRepoRoot: "/repos/alpha")
 
         XCTAssertEqual(viewModel.utilityPanelLastUsedBaseBranch(forRepoRoot: "/repos/alpha"), "develop")
         XCTAssertNil(viewModel.utilityPanelLastUsedBaseBranch(forRepoRoot: "/repos/beta"))
@@ -175,7 +177,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
             "the panel must offer a base picker rather than infer one"
         )
 
-        viewModel.selectUtilityPanelBaseBranch("main", forRepoRoot: "/repos/alpha")
+        viewModel.selectUtilityPanelBaseRevision("main", forRepoRoot: "/repos/alpha")
 
         XCTAssertEqual(viewModel.ui.utilityPanel.snapshot.panel.resolvedCompareMode, .vsBase(base: "main"))
     }
@@ -232,6 +234,14 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     private func id(_ value: Int) -> UUID {
         let suffix = String(format: "%012d", value)
         return UUID(uuidString: "00000000-0000-0000-0000-\(suffix)")!
+    }
+
+    /// One checkout-qualified file key for the single-checkout facade scenarios.
+    private func fileKey(_ path: String) -> AgentChangesFileStateKey {
+        AgentChangesFileStateKey(
+            groupID: AgentChangesGroupID(targetKey: "checkout-alpha"),
+            repositoryRelativePath: path
+        )
     }
 }
 

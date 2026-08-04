@@ -19,15 +19,19 @@ struct AgentChangesDiffMetadata: Equatable {
 /// caller ask for the file it wanted by the same key its row already carries.
 struct AgentChangesPatchPayload: Equatable {
     let perFile: [String: String]
+    /// Original per-file patch bytes. Missing entries remain renderable but cannot mint review tokens.
+    let rawPerFile: [String: Data]
     let fingerprint: GitDiffFingerprint
     let oldSourceReference: String?
 
     init(
         perFile: [String: String],
+        rawPerFile: [String: Data] = [:],
         fingerprint: GitDiffFingerprint,
         oldSourceReference: String? = nil
     ) {
         self.perFile = perFile
+        self.rawPerFile = rawPerFile
         self.fingerprint = fingerprint
         self.oldSourceReference = oldSourceReference
     }
@@ -97,14 +101,57 @@ enum AgentChangesFileContentReadError: LocalizedError, Equatable {
 ///
 /// Deliberately not `VCSIndexMutationBackend` itself: that protocol refines `VCSBackend`, so a test
 /// double would have to implement branch listing, blame, log, and worktree management to exercise a
-/// staging preflight. This is the same five calls with none of that surface.
+/// staging preflight. This is the same narrow index surface with none of those unrelated calls.
 protocol AgentChangesIndexBackend: Sendable {
     func capabilities(at checkout: URL) async -> VCSCapabilities
     func hasHeadCommit(at checkout: URL) async throws -> Bool
     func loadIndexStatus(at checkout: URL) async throws -> [VCSIndexStatusEntry]
-    func stage(_ identities: [VCSIndexPathIdentity], at checkout: URL) async throws
-    func unstage(_ identities: [VCSIndexPathIdentity], at checkout: URL) async throws
-    func markResolved(_ identity: VCSIndexPathIdentity, at checkout: URL) async throws
+    func loadIndexStatus(
+        at checkout: URL,
+        paths: [String]
+    ) async throws -> [VCSIndexStatusEntry]
+    func stage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws
+    func unstage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws
+    func applyCachedPatch(
+        _ data: Data,
+        reverse: Bool,
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws
+    func markResolved(
+        _ identity: VCSIndexPathIdentity,
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws
+}
+
+extension AgentChangesIndexBackend {
+    func loadIndexStatus(
+        at checkout: URL,
+        paths: [String]
+    ) async throws -> [VCSIndexStatusEntry] {
+        let reviewedPaths = Set(paths)
+        return try await loadIndexStatus(at: checkout).filter { entry in
+            !reviewedPaths.isDisjoint(with: entry.identity.allPaths)
+        }
+    }
+
+    func applyCachedPatch(
+        _: Data,
+        reverse _: Bool,
+        at _: URL,
+        authorize _: VCSIndexMutationAuthorization
+    ) async throws {
+        throw GitIndexMutationError.unavailable("This test index backend does not apply cached patches.")
+    }
 }
 
 /// Live index backend, resolved per checkout through `VCSService`.
@@ -132,16 +179,53 @@ struct AgentChangesLiveIndexBackend: AgentChangesIndexBackend {
         try await requireBackend(at: checkout).loadIndexStatus(at: checkout)
     }
 
-    func stage(_ identities: [VCSIndexPathIdentity], at checkout: URL) async throws {
-        try await requireBackend(at: checkout).stage(identities, at: checkout)
+    func loadIndexStatus(
+        at checkout: URL,
+        paths: [String]
+    ) async throws -> [VCSIndexStatusEntry] {
+        try await requireBackend(at: checkout).loadIndexStatus(at: checkout, paths: paths)
     }
 
-    func unstage(_ identities: [VCSIndexPathIdentity], at checkout: URL) async throws {
-        try await requireBackend(at: checkout).unstage(identities, at: checkout)
+    func stage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await requireBackend(at: checkout).stage(identities, at: checkout, authorize: authorize)
     }
 
-    func markResolved(_ identity: VCSIndexPathIdentity, at checkout: URL) async throws {
-        try await requireBackend(at: checkout).markResolved(identity, at: checkout)
+    func unstage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await requireBackend(at: checkout).unstage(identities, at: checkout, authorize: authorize)
+    }
+
+    func applyCachedPatch(
+        _ data: Data,
+        reverse: Bool,
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await requireBackend(at: checkout).applyCachedPatch(
+            data,
+            reverse: reverse,
+            at: checkout,
+            authorize: authorize
+        )
+    }
+
+    func markResolved(
+        _ identity: VCSIndexPathIdentity,
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await requireBackend(at: checkout).markResolved(
+            identity,
+            at: checkout,
+            authorize: authorize
+        )
     }
 
     private func requireBackend(at checkout: URL) async throws -> any VCSIndexMutationBackend {
@@ -258,6 +342,7 @@ struct AgentChangesLiveDiffSource: AgentChangesDiffSource {
         guard let perFile = result.perFile, !perFile.isEmpty else { return nil }
         return AgentChangesPatchPayload(
             perFile: perFile,
+            rawPerFile: result.rawPerFile ?? [:],
             fingerprint: result.fingerprint,
             oldSourceReference: pinned.oldSourceReference
         )

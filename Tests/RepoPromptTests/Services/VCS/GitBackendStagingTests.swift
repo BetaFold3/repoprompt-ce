@@ -38,6 +38,39 @@ final class GitBackendStagingTests: XCTestCase {
         XCTAssertEqual(after.values.filter(\.hasWorkTreeChange).count, 0)
     }
 
+    func testScopedStatusCarriesIndexOIDAndExcludesUnreviewedPaths() async throws {
+        let repo = try makeGitFixture(committing: [
+            "reviewed.txt": "one\n",
+            "bystander.txt": "two\n"
+        ])
+        let backend = GitBackend()
+
+        try write("reviewed change\n", to: "reviewed.txt", in: repo)
+        try write("bystander change\n", to: "bystander.txt", in: repo)
+
+        let entries = try await backend.loadIndexStatus(
+            at: repo,
+            paths: ["reviewed.txt"]
+        )
+
+        let entry = try XCTUnwrap(entries.first)
+        XCTAssertEqual(entries.map(\.path), ["reviewed.txt"])
+        XCTAssertEqual(entry.indexStatus, ".")
+        XCTAssertEqual(entry.workTreeStatus, "M")
+        XCTAssertEqual(entry.headMode, "100644")
+        XCTAssertEqual(entry.indexMode, "100644")
+        XCTAssertEqual(entry.headOID, try gitOutput(["rev-parse", "HEAD:reviewed.txt"], cwd: repo))
+        XCTAssertEqual(entry.repositoryHeadIdentity, try gitOutput(["rev-parse", "HEAD"], cwd: repo))
+        XCTAssertEqual(
+            entry.indexOID,
+            try indexEntry(for: "reviewed.txt", in: repo)
+                .split(whereSeparator: \.isWhitespace)
+                .dropFirst()
+                .first
+                .map(String.init)
+        )
+    }
+
     func testStagesRenameUsingBothPathsAndUnstageRestoresBothSides() async throws {
         let repo = try makeGitFixture(committing: ["origin.txt": "content\n"])
         let backend = GitBackend()
@@ -279,6 +312,126 @@ final class GitBackendStagingTests: XCTestCase {
         XCTAssertEqual(entries["tracked.txt"]?.hasStagedChange, false)
     }
 
+    // MARK: - Authorization inside the index-mutation lock
+
+    func testAuthorityRevokedWhileWaitingForTheIndexLockRunsNoGitAndLeavesTheEntryIdentical() async throws {
+        let repo = try makeGitFixture(committing: ["tracked.txt": "one\n", "holder.txt": "one\n"])
+        let gitService = GitService()
+        let backend = GitBackend(gitService: gitService)
+
+        try write("changed\n", to: "tracked.txt", in: repo)
+        try write("changed\n", to: "holder.txt", in: repo)
+        let indexEntryBefore = try indexEntry(for: "tracked.txt", in: repo)
+
+        // The holder's own hook is the pause point, so the lock is genuinely held by a mutation that
+        // has already claimed it rather than by an approximation of one.
+        let holderEnteredHook = AsyncSignal()
+        let holderMayProceed = AsyncSignal()
+        let revocation = MutationRevocationRecorder()
+
+        let holder = Task {
+            try await backend.stage(
+                [VCSIndexPathIdentity(path: "holder.txt")],
+                at: repo,
+                authorize: {
+                    holderEnteredHook.signal()
+                    await holderMayProceed.wait()
+                    return true
+                }
+            )
+        }
+        await holderEnteredHook.wait()
+
+        let waiter = Task { () -> (any Error)? in
+            do {
+                try await backend.stage(
+                    [VCSIndexPathIdentity(path: "tracked.txt")],
+                    at: repo,
+                    authorize: { await revocation.evaluate() }
+                )
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+
+        // Revoked only once the second mutation is provably parked on the lock. A hook evaluated
+        // before that wait would have authorized here and staged unreviewed content.
+        await revocation.revoke()
+        holderMayProceed.signal()
+        try await holder.value
+        let waiterError = await waiter.value
+
+        let evaluatedAfterRevocation = await revocation.wasEvaluatedAfterRevocation
+        XCTAssertEqual(waiterError as? GitIndexMutationError, .authorizationRevoked)
+        XCTAssertTrue(
+            evaluatedAfterRevocation,
+            "The hook must be evaluated after the lock wait, not before it"
+        )
+        XCTAssertEqual(
+            try indexEntry(for: "tracked.txt", in: repo),
+            indexEntryBefore,
+            "A refused mutation leaves its index entry byte-identical"
+        )
+
+        let entries = try await entriesByPath(backend, at: repo)
+        XCTAssertEqual(entries["tracked.txt"]?.hasStagedChange, false)
+        XCTAssertEqual(entries["tracked.txt"]?.workTreeStatus, "M")
+        XCTAssertEqual(
+            entries["holder.txt"]?.indexStatus,
+            "M",
+            "The mutation that held the lock still ran to completion"
+        )
+    }
+
+    func testRefusedUnstageAndResolutionRunNoGitAtAll() async throws {
+        let repo = try makeGitFixture(committing: ["tracked.txt": "one\n"])
+        let backend = GitBackend()
+
+        try write("changed\n", to: "tracked.txt", in: repo)
+        try await backend.stage([VCSIndexPathIdentity(path: "tracked.txt")], at: repo)
+        let indexEntryBefore = try indexEntry(for: "tracked.txt", in: repo)
+
+        let refusals: [(name: String, run: @Sendable () async throws -> Void)] = [
+            ("stage", {
+                try await backend.stage(
+                    [VCSIndexPathIdentity(path: "tracked.txt")],
+                    at: repo,
+                    authorize: neverAuthorizedIndexMutation
+                )
+            }),
+            ("unstage", {
+                try await backend.unstage(
+                    [VCSIndexPathIdentity(path: "tracked.txt")],
+                    at: repo,
+                    authorize: neverAuthorizedIndexMutation
+                )
+            }),
+            ("markResolved", {
+                try await backend.markResolved(
+                    VCSIndexPathIdentity(path: "tracked.txt"),
+                    at: repo,
+                    authorize: neverAuthorizedIndexMutation
+                )
+            })
+        ]
+
+        for refusal in refusals {
+            do {
+                try await refusal.run()
+                XCTFail("Expected \(refusal.name) to refuse")
+            } catch let error as GitIndexMutationError {
+                XCTAssertEqual(error, .authorizationRevoked, refusal.name)
+            }
+            XCTAssertEqual(
+                try indexEntry(for: "tracked.txt", in: repo),
+                indexEntryBefore,
+                "\(refusal.name) must leave the index entry byte-identical"
+            )
+        }
+    }
+
     // MARK: - Conflict resolution
 
     func testMarkResolvedStagesOnlyTheConfirmedConflictCurrentContents() async throws {
@@ -428,6 +581,19 @@ final class GitBackendStagingTests: XCTestCase {
         return Dictionary(entries.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
+    /// The index's own record for one path, so a refusal can be shown to change nothing.
+    private func indexEntry(for path: String, in repo: URL) throws -> String {
+        try TestGitCommandRunner.runResult(
+            ["ls-files", "--stage", "--", path],
+            cwd: repo
+        ).outputText
+    }
+
+    private func gitOutput(_ arguments: [String], cwd: URL) throws -> String {
+        try TestGitCommandRunner.runResult(arguments, cwd: cwd).outputText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func indexLockURL(in repo: URL) -> URL {
         repo.appendingPathComponent(".git", isDirectory: true)
             .appendingPathComponent("index.lock")
@@ -447,5 +613,52 @@ final class GitBackendStagingTests: XCTestCase {
             cwd: cwd,
             failureDomain: "GitBackendStagingTests.git"
         )
+    }
+}
+
+/// A one-shot signal usable from either side of an `await`, so an authorization hook can announce
+/// that it is running inside the lock and then park until the test lets it continue.
+private final class AsyncSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSignalled = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func signal() {
+        let pending: [CheckedContinuation<Void, Never>] = lock.withLock {
+            isSignalled = true
+            let current = waiters
+            waiters = []
+            return current
+        }
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let resumeNow: Bool = lock.withLock {
+                guard !isSignalled else { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+}
+
+/// Records when a final-authority hook was evaluated relative to the revocation, which is what
+/// separates an in-lock check from one made before the mutation ever waited.
+private actor MutationRevocationRecorder {
+    private var isRevoked = false
+    private(set) var wasEvaluatedAfterRevocation = false
+
+    func revoke() {
+        isRevoked = true
+    }
+
+    func evaluate() -> Bool {
+        if isRevoked { wasEvaluatedAfterRevocation = true }
+        return !isRevoked
     }
 }

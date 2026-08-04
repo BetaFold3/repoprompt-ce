@@ -17,12 +17,13 @@ final class AgentUtilityPanelTabStateTests: XCTestCase {
         XCTAssertEqual(state.resolvedCompareMode, .workingTree)
         XCTAssertEqual(state.diffViewMode, .unified)
         XCTAssertEqual(state.changesFilter, .all)
-        XCTAssertNil(state.rootOverride)
         XCTAssertNil(state.baseBranchOverride, "a base must be chosen explicitly, never inferred")
         XCTAssertNil(state.previewDocument)
         XCTAssertEqual(state.htmlDisplayMode, .rendered)
         XCTAssertNil(state.scriptedHTMLDocument, "scripts must be off for every fresh tab")
-        XCTAssertTrue(state.expandedFilePaths.isEmpty)
+        XCTAssertTrue(state.expandedFiles.isEmpty)
+        XCTAssertTrue(state.contextLevelsByFile.isEmpty)
+        XCTAssertTrue(state.baseRevisionByRepoRoot.isEmpty)
         XCTAssertTrue(state.dismissedBannerArtifactIDs.isEmpty)
     }
 
@@ -155,115 +156,175 @@ final class AgentUtilityPanelTabStateTests: XCTestCase {
 
     func testTogglingAFileExpandsThenCollapsesItAndReportsTheResultingState() {
         var state = AgentUtilityPanelTabState()
+        let app = file("Sources/App.swift")
 
-        XCTAssertTrue(state.toggleExpansion(ofFilePath: "Sources/App.swift"))
-        XCTAssertTrue(state.isExpanded(filePath: "Sources/App.swift"))
+        XCTAssertTrue(state.toggleExpansion(ofFile: app))
+        XCTAssertTrue(state.isExpanded(file: app))
 
-        XCTAssertFalse(state.toggleExpansion(ofFilePath: "Sources/App.swift"))
-        XCTAssertFalse(state.isExpanded(filePath: "Sources/App.swift"))
+        XCTAssertFalse(state.toggleExpansion(ofFile: app))
+        XCTAssertFalse(state.isExpanded(file: app))
     }
 
     func testExpansionIsTrackedPerFile() {
         var state = AgentUtilityPanelTabState()
+        let a = file("a.swift")
+        let b = file("b.swift")
 
-        state.setExpansion(true, ofFilePath: "a.swift")
-        state.setExpansion(true, ofFilePath: "b.swift")
-        state.setExpansion(false, ofFilePath: "a.swift")
+        state.setExpansion(true, ofFile: a)
+        state.setExpansion(true, ofFile: b)
+        state.setExpansion(false, ofFile: a)
 
-        XCTAssertFalse(state.isExpanded(filePath: "a.swift"))
-        XCTAssertTrue(state.isExpanded(filePath: "b.swift"))
+        XCTAssertFalse(state.isExpanded(file: a))
+        XCTAssertTrue(state.isExpanded(file: b))
     }
 
     func testCollapsingAllFilesClearsEveryExpandedPath() {
         var state = AgentUtilityPanelTabState()
-        state.setExpansion(true, ofFilePath: "a.swift")
-        state.setExpansion(true, ofFilePath: "b.swift")
+        state.setExpansion(true, ofFile: file("a.swift"))
+        state.setExpansion(true, ofFile: file("b.swift"))
 
         state.collapseAllFiles()
 
-        XCTAssertTrue(state.expandedFilePaths.isEmpty)
+        XCTAssertTrue(state.expandedFiles.isEmpty)
+    }
+
+    func testQualifiedExpansionAndContextDoNotCollideAcrossGroups() {
+        var state = AgentUtilityPanelTabState()
+        let first = AgentChangesFileStateKey(
+            groupID: AgentChangesGroupID(targetKey: "checkout-alpha"),
+            repositoryRelativePath: "Sources/App.swift"
+        )
+        let second = AgentChangesFileStateKey(
+            groupID: AgentChangesGroupID(targetKey: "checkout-beta"),
+            repositoryRelativePath: "Sources/App.swift"
+        )
+
+        state.setExpansion(true, ofFile: first)
+        state.escalateContext(forFile: first)
+
+        XCTAssertTrue(state.isExpanded(file: first))
+        XCTAssertFalse(state.isExpanded(file: second))
+        XCTAssertEqual(state.contextLevel(forFile: first), .expanded)
+        XCTAssertEqual(state.contextLevel(forFile: second), .standard)
+
+        state.setExpansion(true, ofFile: second)
+        state.escalateContext(forFile: second)
+        state.escalateContext(forFile: first)
+
+        XCTAssertEqual(state.expandedFiles, [first, second])
+        XCTAssertEqual(state.contextLevel(forFile: first), .fullFile)
+        XCTAssertEqual(state.contextLevel(forFile: second), .expanded)
     }
 
     // MARK: - Context escalation
 
     func testContextEscalationStepsFromThreeLinesToTwelveToTheWholeFile() {
         var state = AgentUtilityPanelTabState()
-        let path = "Sources/App.swift"
+        let key = file("Sources/App.swift")
 
-        XCTAssertEqual(state.contextLevel(forFilePath: path), .standard)
-        XCTAssertEqual(state.contextLevel(forFilePath: path).contextLines, 3)
+        XCTAssertEqual(state.contextLevel(forFile: key), .standard)
+        XCTAssertEqual(state.contextLevel(forFile: key).contextLines, 3)
 
-        XCTAssertEqual(state.escalateContext(forFilePath: path), .expanded)
-        XCTAssertEqual(state.contextLevel(forFilePath: path).contextLines, 12)
+        XCTAssertEqual(state.escalateContext(forFile: key), .expanded)
+        XCTAssertEqual(state.contextLevel(forFile: key).contextLines, 12)
 
-        XCTAssertEqual(state.escalateContext(forFilePath: path), .fullFile)
-        XCTAssertEqual(state.contextLevel(forFilePath: path).projectionLevel, .fullFile)
+        XCTAssertEqual(state.escalateContext(forFile: key), .fullFile)
+        XCTAssertEqual(state.contextLevel(forFile: key).projectionLevel, .fullFile)
     }
 
     func testEscalatingPastTheWholeFileSaturatesInsteadOfWrapping() {
         var state = AgentUtilityPanelTabState()
-        state.contextLevelsByFilePath["a.swift"] = .fullFile
+        state.contextLevelsByFile[file("a.swift")] = .fullFile
 
-        XCTAssertEqual(state.escalateContext(forFilePath: "a.swift"), .fullFile)
+        XCTAssertEqual(state.escalateContext(forFile: file("a.swift")), .fullFile)
         XCTAssertNil(AgentChangesContextLevel.fullFile.escalated)
     }
 
     func testContextEscalationAppliesToOneFileOnly() {
         var state = AgentUtilityPanelTabState()
 
-        state.escalateContext(forFilePath: "a.swift")
+        state.escalateContext(forFile: file("a.swift"))
 
-        XCTAssertEqual(state.contextLevel(forFilePath: "a.swift"), .expanded)
-        XCTAssertEqual(state.contextLevel(forFilePath: "b.swift"), .standard)
+        XCTAssertEqual(state.contextLevel(forFile: file("a.swift")), .expanded)
+        XCTAssertEqual(state.contextLevel(forFile: file("b.swift")), .standard)
     }
 
     // MARK: - Retargeting
 
-    func testRetargetingTheRootClearsPathKeyedExpansionAndContext() {
-        var state = AgentUtilityPanelTabState()
-        state.setExpansion(true, ofFilePath: "README.md")
-        state.escalateContext(forFilePath: "README.md")
-
-        state.selectRootOverride(UUID())
-
-        XCTAssertTrue(
-            state.expandedFilePaths.isEmpty,
-            "the same relative path in another repository is a different file"
-        )
-        XCTAssertEqual(state.contextLevel(forFilePath: "README.md"), .standard)
-    }
-
-    func testRetargetingTheRootKeepsHowTheUserWantsToReadARepository() {
-        var state = AgentUtilityPanelTabState()
-        state.setCompareSelection(.vsBase)
-        state.selectBaseBranch("main", forRepoRoot: "/repo")
-
-        state.selectRootOverride(UUID())
-
-        XCTAssertEqual(state.compareSelection, .vsBase)
-        XCTAssertEqual(state.baseBranchOverride, "main")
-    }
-
-    func testSelectingTheSameRootAgainLeavesExpansionUntouched() {
-        let rootID = UUID()
-        var state = AgentUtilityPanelTabState()
-        state.selectRootOverride(rootID)
-        state.setExpansion(true, ofFilePath: "README.md")
-
-        state.selectRootOverride(rootID)
-
-        XCTAssertTrue(state.isExpanded(filePath: "README.md"))
-    }
-
     func testChangingCompareSelectionKeepsExpansionBecauseTheCheckoutIsUnchanged() {
         var state = AgentUtilityPanelTabState()
-        state.setExpansion(true, ofFilePath: "README.md")
-        state.escalateContext(forFilePath: "README.md")
+        let readme = file("README.md")
+        state.setExpansion(true, ofFile: readme)
+        state.escalateContext(forFile: readme)
 
         state.setCompareSelection(.vsBase)
 
-        XCTAssertTrue(state.isExpanded(filePath: "README.md"))
-        XCTAssertEqual(state.contextLevel(forFilePath: "README.md"), .expanded)
+        XCTAssertTrue(state.isExpanded(file: readme))
+        XCTAssertEqual(state.contextLevel(forFile: readme), .expanded)
+    }
+
+    // MARK: - Base revisions
+
+    func testExplicitBaseRevisionsAreRepositoryQualifiedAndResolveIndependently() {
+        var state = AgentUtilityPanelTabState()
+        let alpha = checkout(at: "/repos/alpha")
+        let beta = checkout(at: "/repos/beta")
+        state.setCompareSelection(.vsBase)
+
+        state.selectBaseRevision("develop", forRepoRoot: alpha.repoRootURL.path)
+        state.selectBaseRevision("release", forRepoRoot: beta.repoRootURL.path)
+
+        XCTAssertEqual(
+            state.resolvedCompareMode(for: alpha),
+            .vsBase(base: "develop")
+        )
+        XCTAssertEqual(
+            state.resolvedCompareMode(for: beta),
+            .vsBase(base: "release")
+        )
+        XCTAssertEqual(
+            state.baseRevisionByRepoRoot,
+            ["/repos/alpha": "develop", "/repos/beta": "release"]
+        )
+
+        state.selectBaseRevision(nil, forRepoRoot: alpha.repoRootURL.path)
+
+        XCTAssertNil(state.selectedBaseRevision(forRepoRoot: alpha.repoRootURL.path))
+        XCTAssertNil(
+            state.resolvedCompareMode(for: alpha),
+            "clearing one repository must restore Choose base rather than reuse a hidden value"
+        )
+        XCTAssertEqual(state.resolvedCompareMode(for: beta), .vsBase(base: "release"))
+
+        state.selectBaseRevision("", forRepoRoot: beta.repoRootURL.path)
+
+        XCTAssertNil(
+            state.resolvedCompareMode(for: beta),
+            "an empty revision is also no explicit choice"
+        )
+        XCTAssertTrue(state.baseRevisionByRepoRoot.isEmpty)
+    }
+
+    func testBaseCandidatesAndLegacyMemoryNeverPopulateTheExplicitBaseMap() {
+        var state = AgentUtilityPanelTabState()
+        let target = checkout(at: "/repos/alpha")
+        let presentedCandidates = ["main", "origin/main"]
+        state.setCompareSelection(.vsBase)
+
+        state.selectBaseBranch(presentedCandidates[0], forRepoRoot: target.repoRootURL.path)
+
+        XCTAssertEqual(state.baseBranchOverride, "main")
+        XCTAssertEqual(state.lastUsedBaseBranch(forRepoRoot: target.repoRootURL.path), "main")
+        XCTAssertTrue(
+            state.baseRevisionByRepoRoot.isEmpty,
+            "candidate presentation and the scalar base API must not infer a grouped choice"
+        )
+        XCTAssertNil(state.selectedBaseRevision(forRepoRoot: target.repoRootURL.path))
+        XCTAssertNil(state.resolvedCompareMode(for: target))
+        XCTAssertTrue(
+            state.baseRevisionByRepoRoot.isEmpty,
+            "resolving an absent choice must be a read, never lazy candidate reconciliation"
+        )
     }
 
     // MARK: - Base branch memory
@@ -440,5 +501,31 @@ final class AgentUtilityPanelTabStateTests: XCTestCase {
         state.dismissBanner(artifactID: "artifact-1")
 
         XCTAssertEqual(state.dismissedBannerArtifactIDs, ["artifact-1"])
+    }
+
+    // MARK: - Fixtures
+
+    /// One checkout-qualified file key, so path-keyed scenarios name the checkout they mean.
+    private func file(
+        _ path: String,
+        in targetKey: String = "checkout-alpha"
+    ) -> AgentChangesFileStateKey {
+        AgentChangesFileStateKey(
+            groupID: AgentChangesGroupID(targetKey: targetKey),
+            repositoryRelativePath: path
+        )
+    }
+
+    private func checkout(at path: String) -> AgentPanelResolvedCheckout {
+        let rootURL = URL(fileURLWithPath: path)
+        return AgentPanelResolvedCheckout(
+            checkoutURL: rootURL,
+            repoRootURL: rootURL,
+            backendKind: .git,
+            pathspecPrefixes: [],
+            logicalRoots: [AgentPanelLogicalRoot(path: path)],
+            worktree: nil,
+            substitutesUnavailableWorktree: false
+        )
     }
 }

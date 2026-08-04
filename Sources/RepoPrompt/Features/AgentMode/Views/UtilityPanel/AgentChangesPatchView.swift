@@ -2,13 +2,23 @@ import SwiftUI
 
 /// One expanded file's diff body.
 ///
-/// Unified and split layouts consume the same projection and the same vertical stack. Split rows
-/// are derived at render time, so gutters stay synchronized without two competing scroll views.
+/// Unified and split layouts consume the same projection and partial-staging descriptor. Search and
+/// intraline ranges are composed before rendering so search wins only on their overlap.
 struct AgentChangesPatchView: View {
     let row: AgentChangesFileRow
     let state: AgentChangesPatchLoadState
     let diffViewMode: AgentChangesDiffViewMode
     let gapContextState: AgentChangesPanelViewModel.GapContextState
+    let partialDescriptor: AgentChangesPartialStagingDescriptor?
+    let pendingPartial: AgentChangesPanelViewModel.PendingPartialMutation?
+    let isPartialMutationDisabled: Bool
+    let selectedPartialLineKeys: (String) -> Set<AgentChangesDiffLineKey>
+    let searchMatches: (AgentChangesSearchLocator) -> [AgentChangesSearchMatch]
+    let isCurrentSearchMatch: (AgentChangesSearchMatch) -> Bool
+    let onSetPartialLineSelected: (Bool, AgentChangesDiffLineKey, String) -> Void
+    let onClearPartialSelection: (String) -> Void
+    let onApplyPartialHunk: (String) -> Void
+    let onApplySelectedPartialLines: (String) -> Void
     let onExpandGap: (DiffContextSplicer.Gap, DiffContextSplicer.ExpansionAmount) -> Void
     let onOpenFile: () -> Void
 
@@ -73,6 +83,10 @@ struct AgentChangesPatchView: View {
                 notice(summary, actionTitle: nil)
             }
 
+            if let partialNotice {
+                notice(partialNotice, actionTitle: nil, isSubdued: true)
+            }
+
             let digits = AgentChangesPatchPresentation.maximumLineNumberDigits(in: document)
             let gaps: [DiffContextSplicer.Gap] = if gapContextState.unavailableReason == nil {
                 DiffContextSplicer.gaps(
@@ -89,11 +103,7 @@ struct AgentChangesPatchView: View {
             }
 
             ForEach(document.hunks.indices, id: \.self) { index in
-                AgentChangesHunkView(
-                    hunk: document.hunks[index],
-                    lineNumberDigits: digits,
-                    diffViewMode: diffViewMode
-                )
+                hunkView(document.hunks[index], lineNumberDigits: digits)
                 if let gap = gap(afterHunkAt: index, gaps: gaps) {
                     gapView(gap)
                 }
@@ -121,6 +131,51 @@ struct AgentChangesPatchView: View {
         )
     }
 
+    private var partialNotice: String? {
+        guard let partialDescriptor,
+              case let .unavailable(reason) = partialDescriptor.availability
+        else { return nil }
+        return AgentChangesPartialStagingPresentation.unavailableMessage(for: reason)
+    }
+
+    private func hunkView(
+        _ hunk: FileDiffProjection.Hunk,
+        lineNumberDigits: Int
+    ) -> some View {
+        let availableAction: AgentChangesPartialAction? = {
+            guard let partialDescriptor,
+                  partialDescriptor.availability == .available,
+                  partialDescriptor.changedLineKeysByHunkID[hunk.id]?.isEmpty == false
+            else { return nil }
+            return partialDescriptor.action
+        }()
+        // A hunk the repository withheld from line selection (a no-newline annotation makes partial
+        // recombination unsafe) still shows its hunk action, just no per-line selection column.
+        let selectableLineKeys = partialDescriptor.map {
+            ($0.changedLineKeysByHunkID[hunk.id] ?? []).intersection($0.selectableChangedLineKeys)
+        } ?? []
+        return AgentChangesHunkView(
+            hunk: hunk,
+            lineNumberDigits: lineNumberDigits,
+            diffViewMode: diffViewMode,
+            partialAction: availableAction,
+            selectableLineKeys: selectableLineKeys,
+            selectedLineKeys: selectedPartialLineKeys(hunk.id),
+            isPartialMutationDisabled: isPartialMutationDisabled || pendingPartial != nil,
+            headingSearchMatches: searchMatches(.hunkHeading(hunkID: hunk.id)),
+            lineSearchMatches: { line in
+                searchMatches(.line(kind: line.kind, oldLine: line.oldLine, newLine: line.newLine))
+            },
+            isCurrentSearchMatch: isCurrentSearchMatch,
+            onSetLineSelected: { selected, key in
+                onSetPartialLineSelected(selected, key, hunk.id)
+            },
+            onClearSelection: { onClearPartialSelection(hunk.id) },
+            onApplyHunk: { onApplyPartialHunk(hunk.id) },
+            onApplySelectedLines: { onApplySelectedPartialLines(hunk.id) }
+        )
+    }
+
     private func gap(
         afterHunkAt index: Int,
         gaps: [DiffContextSplicer.Gap]
@@ -145,17 +200,23 @@ struct AgentChangesPatchView: View {
         )
     }
 
-    private func notice(_ message: String, actionTitle: String?) -> some View {
+    private func notice(
+        _ message: String,
+        actionTitle: String?,
+        isSubdued: Bool = false
+    ) -> some View {
         HStack(spacing: Layout.noticeSpacing) {
             Text(message)
                 .font(preset.swiftUIFont(sizeAtNormal: Layout.messageSizeAtNormal))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(isSubdued ? .tertiary : .secondary)
                 .fixedSize(horizontal: false, vertical: true)
             if let actionTitle {
                 Button(actionTitle, action: onOpenFile)
                     .buttonStyle(.link)
                     .font(preset.swiftUIFont(sizeAtNormal: Layout.messageSizeAtNormal, weight: .medium))
+                    .hoverTooltip("\(actionTitle) \(row.path)")
                     .accessibilityLabel("\(actionTitle) \(row.path)")
+                    .accessibilityValue("available")
             }
             Spacer(minLength: 0)
         }
@@ -204,12 +265,16 @@ private struct AgentChangesGapExpanderView: View {
                     Button("Expand 12 lines") {
                         onExpand(.lines(12))
                     }
+                    .hoverTooltip("Show 12 more lines of hidden context")
                     .accessibilityLabel("Expand 12 lines of hidden diff context")
+                    .accessibilityValue("available")
                 }
                 Button("Expand all") {
                     onExpand(.all)
                 }
+                .hoverTooltip("Show all hidden context")
                 .accessibilityLabel("Expand all hidden diff context")
+                .accessibilityValue("available")
             }
             separator
         }
@@ -231,9 +296,22 @@ struct AgentChangesHunkView: View {
     let hunk: FileDiffProjection.Hunk
     let lineNumberDigits: Int
     let diffViewMode: AgentChangesDiffViewMode
+    let partialAction: AgentChangesPartialAction?
+    let selectableLineKeys: Set<AgentChangesDiffLineKey>
+    let selectedLineKeys: Set<AgentChangesDiffLineKey>
+    let isPartialMutationDisabled: Bool
+    let headingSearchMatches: [AgentChangesSearchMatch]
+    let lineSearchMatches: (FileDiffProjection.Line) -> [AgentChangesSearchMatch]
+    let isCurrentSearchMatch: (AgentChangesSearchMatch) -> Bool
+    let onSetLineSelected: (Bool, AgentChangesDiffLineKey) -> Void
+    let onClearSelection: () -> Void
+    let onApplyHunk: () -> Void
+    let onApplySelectedLines: () -> Void
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @Environment(\.colorScheme) private var colorScheme
+    @State private var isHeaderHovered = false
+    @FocusState private var isHeaderActionFocused: Bool
 
     private enum Layout {
         static let headerSpacing: CGFloat = 6
@@ -241,12 +319,19 @@ struct AgentChangesHunkView: View {
         static let headerVerticalPadding: CGFloat = 3
         static let rangeSizeAtNormal: CGFloat = 9.5
         static let headingSizeAtNormal: CGFloat = 9.5
+        static let actionSizeAtNormal: CGFloat = 9
         static let cornerRadius: CGFloat = 4
         static let bodyTopPadding: CGFloat = 1
+        static let selectionRowSpacing: CGFloat = 7
+        static let selectionRowVerticalPadding: CGFloat = 3
     }
 
     private var preset: FontScalePreset {
         fontScale.preset
+    }
+
+    private var showsSelectionColumn: Bool {
+        partialAction != nil && !selectableLineKeys.isEmpty
     }
 
     var body: some View {
@@ -258,20 +343,37 @@ struct AgentChangesHunkView: View {
                     ForEach(hunk.lines) { line in
                         AgentChangesDiffLineView(
                             line: line,
-                            lineNumberDigits: lineNumberDigits
+                            lineNumberDigits: lineNumberDigits,
+                            showsSelectionColumn: showsSelectionColumn,
+                            selection: selection(for: line),
+                            searchMatches: lineSearchMatches(line),
+                            isCurrentSearchMatch: isCurrentSearchMatch,
+                            onSetSelected: { selected in
+                                guard let key = line.partialLineKey else { return }
+                                onSetLineSelected(selected, key)
+                            }
                         )
                     }
                 case .split:
                     ForEach(SplitDiffRowProjector.rows(for: hunk)) { row in
                         AgentChangesSplitDiffRowView(
                             row: row,
-                            lineNumberDigits: lineNumberDigits
+                            lineNumberDigits: lineNumberDigits,
+                            showsSelectionColumn: showsSelectionColumn,
+                            selectionForLine: selection(for:),
+                            searchMatchesForLine: lineSearchMatches,
+                            isCurrentSearchMatch: isCurrentSearchMatch,
+                            onSetLineSelected: onSetLineSelected
                         )
                     }
                 }
             }
             .padding(.top, Layout.bodyTopPadding)
             .textSelection(.enabled)
+
+            if let partialAction, !selectedLineKeys.isEmpty {
+                selectedLinesActionRow(action: partialAction)
+            }
         }
     }
 
@@ -282,14 +384,35 @@ struct AgentChangesHunkView: View {
                 .foregroundStyle(.tertiary)
 
             if let heading = hunk.heading, !heading.isEmpty {
-                Text(heading)
+                Text(highlightedHeading(heading))
                     .font(preset.swiftUIFont(sizeAtNormal: Layout.headingSizeAtNormal, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .overlay(AgentChangesSearchAnchorOverlay(matches: headingSearchMatches))
             }
 
             Spacer(minLength: Layout.headerSpacing)
+
+            if let partialAction {
+                Button(
+                    AgentChangesPartialStagingPresentation.actionTitle(partialAction, noun: "hunk"),
+                    action: onApplyHunk
+                )
+                .buttonStyle(.plain)
+                .font(preset.swiftUIFont(sizeAtNormal: Layout.actionSizeAtNormal, weight: .medium))
+                .foregroundStyle(.secondary)
+                .focused($isHeaderActionFocused)
+                .opacity(isHeaderHovered || isHeaderActionFocused ? 1 : 0)
+                .disabled(isPartialMutationDisabled)
+                .hoverTooltip(
+                    AgentChangesPartialStagingPresentation.actionTitle(partialAction, noun: "this hunk")
+                )
+                .accessibilityLabel(
+                    AgentChangesPartialStagingPresentation.actionTitle(partialAction, noun: "hunk")
+                )
+                .accessibilityValue(isPartialMutationDisabled ? "unavailable" : "available on hover")
+            }
         }
         .padding(.horizontal, Layout.headerHorizontalPadding)
         .padding(.vertical, Layout.headerVerticalPadding)
@@ -298,7 +421,81 @@ struct AgentChangesHunkView: View {
             RoundedRectangle(cornerRadius: Layout.cornerRadius, style: .continuous)
                 .fill(AgentChangesDiffPalette.hunkHeaderBackground(colorScheme: colorScheme))
         )
-        .accessibilityElement(children: .combine)
+        .onHover { isHeaderHovered = $0 }
+        .accessibilityElement(children: .contain)
+    }
+
+    private func highlightedHeading(_ heading: String) -> AttributedString {
+        AgentChangesHighlightedText.make(
+            heading,
+            searchHighlights: headingSearchMatches.map {
+                AgentChangesSearchHighlight(
+                    utf16Range: $0.utf16Range,
+                    isCurrent: isCurrentSearchMatch($0)
+                )
+            },
+            searchBackground: AgentChangesDiffPalette.searchBackgroundColor(
+                current: false,
+                colorScheme: colorScheme
+            ),
+            currentSearchBackground: AgentChangesDiffPalette.searchBackgroundColor(
+                current: true,
+                colorScheme: colorScheme
+            )
+        )
+    }
+
+    private func selection(for line: FileDiffProjection.Line) -> AgentChangesLineSelection? {
+        guard let partialAction,
+              let key = line.partialLineKey,
+              selectableLineKeys.contains(key)
+        else { return nil }
+        return AgentChangesLineSelection(
+            key: key,
+            action: partialAction,
+            isSelected: selectedLineKeys.contains(key),
+            isDisabled: isPartialMutationDisabled
+        )
+    }
+
+    private func selectedLinesActionRow(action: AgentChangesPartialAction) -> some View {
+        HStack(spacing: Layout.selectionRowSpacing) {
+            Spacer(minLength: 0)
+            Button(
+                AgentChangesPartialStagingPresentation.selectedLinesTitle(
+                    action,
+                    count: selectedLineKeys.count
+                ),
+                action: onApplySelectedLines
+            )
+            .buttonStyle(.link)
+            .font(preset.swiftUIFont(sizeAtNormal: Layout.actionSizeAtNormal, weight: .medium))
+            .disabled(isPartialMutationDisabled)
+            .hoverTooltip(
+                AgentChangesPartialStagingPresentation.selectedLinesTitle(
+                    action,
+                    count: selectedLineKeys.count
+                )
+            )
+            .accessibilityLabel(
+                AgentChangesPartialStagingPresentation.selectedLinesTitle(
+                    action,
+                    count: selectedLineKeys.count
+                )
+            )
+            .accessibilityValue(isPartialMutationDisabled ? "unavailable" : "available")
+
+            Button("Clear", action: onClearSelection)
+                .buttonStyle(.plain)
+                .font(preset.swiftUIFont(sizeAtNormal: Layout.actionSizeAtNormal))
+                .foregroundStyle(.tertiary)
+                .disabled(isPartialMutationDisabled)
+                .hoverTooltip("Clear selected lines in this hunk")
+                .accessibilityLabel("Clear selected lines in this hunk")
+                .accessibilityValue(isPartialMutationDisabled ? "unavailable" : "available")
+        }
+        .padding(.vertical, Layout.selectionRowVerticalPadding)
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -307,6 +504,11 @@ struct AgentChangesHunkView: View {
 struct AgentChangesDiffLineView: View {
     let line: FileDiffProjection.Line
     let lineNumberDigits: Int
+    let showsSelectionColumn: Bool
+    let selection: AgentChangesLineSelection?
+    let searchMatches: [AgentChangesSearchMatch]
+    let isCurrentSearchMatch: (AgentChangesSearchMatch) -> Bool
+    let onSetSelected: (Bool) -> Void
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @Environment(\.colorScheme) private var colorScheme
@@ -336,17 +538,35 @@ struct AgentChangesDiffLineView: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: Layout.columnSpacing) {
-            number(line.oldLine)
-            number(line.newLine)
-
-            HStack(alignment: .top, spacing: Layout.markerSpacing) {
-                Text(AgentChangesDiffPalette.marker(for: line.kind))
-                    .frame(width: AgentChangesDiffMetrics.markerWidth(preset: preset), alignment: .leading)
-                Text(attributedText)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
+            if showsSelectionColumn {
+                AgentChangesLineSelectionButton(
+                    line: line,
+                    selection: selection,
+                    onSetSelected: onSetSelected
+                )
             }
-            .foregroundStyle(AgentChangesDiffPalette.textColor(for: line.kind, colorScheme: colorScheme))
+
+            HStack(alignment: .top, spacing: Layout.columnSpacing) {
+                number(line.oldLine)
+                number(line.newLine)
+
+                HStack(alignment: .top, spacing: Layout.markerSpacing) {
+                    Text(AgentChangesDiffPalette.marker(for: line.kind))
+                        .frame(
+                            width: AgentChangesDiffMetrics.markerWidth(preset: preset),
+                            alignment: .leading
+                        )
+                    Text(attributedText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .overlay(AgentChangesSearchAnchorOverlay(matches: searchMatches))
+                }
+                .foregroundStyle(
+                    AgentChangesDiffPalette.textColor(for: line.kind, colorScheme: colorScheme)
+                )
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(accessibilityLabel)
         }
         .font(font)
         .padding(.leading, Layout.leadingPadding)
@@ -354,22 +574,33 @@ struct AgentChangesDiffLineView: View {
         .padding(.vertical, Layout.verticalPadding)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(AgentChangesDiffPalette.backgroundColor(for: line.kind, colorScheme: colorScheme))
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityLabel)
+        .accessibilityElement(children: .contain)
     }
 
     private var displayText: String {
-        line.kind == .noNewlineMarker
-            ? line.text.trimmingCharacters(in: .whitespaces)
-            : line.text
+        line.text
     }
 
     private var attributedText: AttributedString {
-        AgentChangesIntralineText.make(
+        AgentChangesHighlightedText.make(
             displayText,
-            ranges: line.kind == .noNewlineMarker ? [] : line.intralineRanges,
-            background: AgentChangesDiffPalette.intralineBackgroundColor(
+            intralineRanges: line.kind == .noNewlineMarker ? [] : line.intralineRanges,
+            searchHighlights: searchMatches.map {
+                AgentChangesSearchHighlight(
+                    utf16Range: $0.utf16Range,
+                    isCurrent: isCurrentSearchMatch($0)
+                )
+            },
+            intralineBackground: AgentChangesDiffPalette.intralineBackgroundColor(
                 for: line.kind,
+                colorScheme: colorScheme
+            ),
+            searchBackground: AgentChangesDiffPalette.searchBackgroundColor(
+                current: false,
+                colorScheme: colorScheme
+            ),
+            currentSearchBackground: AgentChangesDiffPalette.searchBackgroundColor(
+                current: true,
                 colorScheme: colorScheme
             )
         )
@@ -394,31 +625,142 @@ struct AgentChangesDiffLineView: View {
     }
 }
 
+// MARK: - Line selection
+
+struct AgentChangesLineSelection {
+    let key: AgentChangesDiffLineKey
+    let action: AgentChangesPartialAction
+    let isSelected: Bool
+    let isDisabled: Bool
+}
+
+private struct AgentChangesLineSelectionButton: View {
+    let line: FileDiffProjection.Line
+    let selection: AgentChangesLineSelection?
+    let onSetSelected: (Bool) -> Void
+
+    @ObservedObject private var fontScale = FontScaleManager.shared
+
+    private enum Layout {
+        static let glyphSizeAtNormal: CGFloat = 8
+        static let frameSizeAtNormal: CGFloat = 15
+        static let cornerRadius: CGFloat = 3
+        static let selectedOpacity: Double = 0.72
+    }
+
+    private var preset: FontScalePreset {
+        fontScale.preset
+    }
+
+    var body: some View {
+        Group {
+            if let selection {
+                Button { onSetSelected(!selection.isSelected) } label: {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(
+                            size: preset.scaledMetric(Layout.glyphSizeAtNormal),
+                            weight: .semibold
+                        ))
+                        .foregroundStyle(selection.isSelected ? Color.white : Color.secondary)
+                        .frame(
+                            width: preset.scaledMetric(Layout.frameSizeAtNormal),
+                            height: preset.scaledMetric(Layout.frameSizeAtNormal)
+                        )
+                        .background(
+                            RoundedRectangle(cornerRadius: Layout.cornerRadius, style: .continuous)
+                                .fill(
+                                    selection.isSelected
+                                        ? Color.accentColor.opacity(Layout.selectedOpacity)
+                                        : Color.clear
+                                )
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(selection.isDisabled)
+                .hoverTooltip(accessibilityLabel(selection))
+                .accessibilityLabel(accessibilityLabel(selection))
+                .accessibilityValue(selection.isSelected ? "selected" : "not selected")
+            } else {
+                Color.clear
+                    .frame(
+                        width: preset.scaledMetric(Layout.frameSizeAtNormal),
+                        height: preset.scaledMetric(Layout.frameSizeAtNormal)
+                    )
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+
+    private func accessibilityLabel(_ selection: AgentChangesLineSelection) -> String {
+        let verb = selection.isSelected ? "Remove" : "Select"
+        let direction = selection.action == .stage ? "staging" : "unstaging"
+        switch selection.key {
+        case let .addition(newLine):
+            return "\(verb) added line \(newLine) for \(direction)"
+        case let .deletion(oldLine):
+            return "\(verb) removed line \(oldLine) for \(direction)"
+        }
+    }
+}
+
 // MARK: - Split row
 
 private struct AgentChangesSplitDiffRowView: View {
     let row: SplitDiffRowProjector.Row
     let lineNumberDigits: Int
+    let showsSelectionColumn: Bool
+    let selectionForLine: (FileDiffProjection.Line) -> AgentChangesLineSelection?
+    let searchMatchesForLine: (FileDiffProjection.Line) -> [AgentChangesSearchMatch]
+    let isCurrentSearchMatch: (AgentChangesSearchMatch) -> Bool
+    let onSetLineSelected: (Bool, AgentChangesDiffLineKey) -> Void
 
     var body: some View {
         if row.spansBoth, let context = row.new ?? row.old {
-            AgentChangesDiffLineView(line: context, lineNumberDigits: lineNumberDigits)
+            AgentChangesDiffLineView(
+                line: context,
+                lineNumberDigits: lineNumberDigits,
+                showsSelectionColumn: showsSelectionColumn,
+                selection: selectionForLine(context),
+                searchMatches: searchMatchesForLine(context),
+                isCurrentSearchMatch: isCurrentSearchMatch,
+                onSetSelected: { selected in
+                    guard let key = context.partialLineKey else { return }
+                    onSetLineSelected(selected, key)
+                }
+            )
         } else {
             HStack(alignment: .top, spacing: 0) {
                 AgentChangesSplitDiffCellView(
                     line: row.old,
                     side: .old,
-                    lineNumberDigits: lineNumberDigits
+                    lineNumberDigits: lineNumberDigits,
+                    showsSelectionColumn: showsSelectionColumn,
+                    selection: row.old.flatMap(selectionForLine),
+                    searchMatches: row.old.map(searchMatchesForLine) ?? [],
+                    isCurrentSearchMatch: isCurrentSearchMatch,
+                    onSetSelected: { selected in
+                        guard let key = row.old?.partialLineKey else { return }
+                        onSetLineSelected(selected, key)
+                    }
                 )
                 Divider()
                 AgentChangesSplitDiffCellView(
                     line: row.new,
                     side: .new,
-                    lineNumberDigits: lineNumberDigits
+                    lineNumberDigits: lineNumberDigits,
+                    showsSelectionColumn: showsSelectionColumn,
+                    selection: row.new.flatMap(selectionForLine),
+                    searchMatches: row.new.map(searchMatchesForLine) ?? [],
+                    isCurrentSearchMatch: isCurrentSearchMatch,
+                    onSetSelected: { selected in
+                        guard let key = row.new?.partialLineKey else { return }
+                        onSetLineSelected(selected, key)
+                    }
                 )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityElement(children: .combine)
+            .accessibilityElement(children: .contain)
         }
     }
 }
@@ -427,6 +769,11 @@ private struct AgentChangesSplitDiffCellView: View {
     let line: FileDiffProjection.Line?
     let side: DiffContextSplicer.SourceSide
     let lineNumberDigits: Int
+    let showsSelectionColumn: Bool
+    let selection: AgentChangesLineSelection?
+    let searchMatches: [AgentChangesSearchMatch]
+    let isCurrentSearchMatch: (AgentChangesSearchMatch) -> Bool
+    let onSetSelected: (Bool) -> Void
 
     @ObservedObject private var fontScale = FontScaleManager.shared
     @Environment(\.colorScheme) private var colorScheme
@@ -451,27 +798,40 @@ private struct AgentChangesSplitDiffCellView: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: Layout.spacing) {
-            number
-            if let line {
-                Text(AgentChangesDiffPalette.marker(for: line.kind))
-                    .frame(
-                        width: AgentChangesDiffMetrics.markerWidth(preset: preset),
-                        alignment: .leading
-                    )
-                Text(attributedText(for: line))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .foregroundStyle(
-                        AgentChangesDiffPalette.textColor(
-                            for: line.kind,
-                            colorScheme: colorScheme
-                        )
-                    )
-            } else {
-                Text(" ")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityHidden(true)
+            if showsSelectionColumn {
+                AgentChangesLineSelectionButton(
+                    line: line ?? emptyLine,
+                    selection: selection,
+                    onSetSelected: onSetSelected
+                )
             }
+
+            HStack(alignment: .top, spacing: Layout.spacing) {
+                number
+                if let line {
+                    Text(AgentChangesDiffPalette.marker(for: line.kind))
+                        .frame(
+                            width: AgentChangesDiffMetrics.markerWidth(preset: preset),
+                            alignment: .leading
+                        )
+                    Text(attributedText(for: line))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .foregroundStyle(
+                            AgentChangesDiffPalette.textColor(
+                                for: line.kind,
+                                colorScheme: colorScheme
+                            )
+                        )
+                        .overlay(AgentChangesSearchAnchorOverlay(matches: searchMatches))
+                } else {
+                    Text(" ")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityHidden(true)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(accessibilityLabel)
         }
         .font(font)
         .padding(.leading, Layout.leadingPadding)
@@ -483,7 +843,19 @@ private struct AgentChangesSplitDiffCellView: View {
                 AgentChangesDiffPalette.backgroundColor(for: $0.kind, colorScheme: colorScheme)
             }
         )
-        .accessibilityLabel(accessibilityLabel)
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Used only by the inert selection-column spacer in an empty split cell.
+    private var emptyLine: FileDiffProjection.Line {
+        FileDiffProjection.Line(
+            id: "empty",
+            kind: .context,
+            oldLine: nil,
+            newLine: nil,
+            text: "",
+            intralineRanges: []
+        )
     }
 
     private var number: some View {
@@ -502,14 +874,25 @@ private struct AgentChangesSplitDiffCellView: View {
     }
 
     private func attributedText(for line: FileDiffProjection.Line) -> AttributedString {
-        let text = line.kind == .noNewlineMarker
-            ? line.text.trimmingCharacters(in: .whitespaces)
-            : line.text
-        return AgentChangesIntralineText.make(
-            text,
-            ranges: line.kind == .noNewlineMarker ? [] : line.intralineRanges,
-            background: AgentChangesDiffPalette.intralineBackgroundColor(
+        AgentChangesHighlightedText.make(
+            line.text,
+            intralineRanges: line.kind == .noNewlineMarker ? [] : line.intralineRanges,
+            searchHighlights: searchMatches.map {
+                AgentChangesSearchHighlight(
+                    utf16Range: $0.utf16Range,
+                    isCurrent: isCurrentSearchMatch($0)
+                )
+            },
+            intralineBackground: AgentChangesDiffPalette.intralineBackgroundColor(
                 for: line.kind,
+                colorScheme: colorScheme
+            ),
+            searchBackground: AgentChangesDiffPalette.searchBackgroundColor(
+                current: false,
+                colorScheme: colorScheme
+            ),
+            currentSearchBackground: AgentChangesDiffPalette.searchBackgroundColor(
+                current: true,
                 colorScheme: colorScheme
             )
         )
@@ -525,27 +908,15 @@ private struct AgentChangesSplitDiffCellView: View {
     }
 }
 
-private enum AgentChangesIntralineText {
-    static func make(
-        _ text: String,
-        ranges: [Range<Int>],
-        background: Color?
-    ) -> AttributedString {
-        var attributed = AttributedString(text)
-        guard let background else { return attributed }
-
-        for range in ranges {
-            guard range.lowerBound >= 0,
-                  range.upperBound <= text.utf16.count,
-                  range.lowerBound < range.upperBound
-            else { continue }
-            let stringLower = String.Index(utf16Offset: range.lowerBound, in: text)
-            let stringUpper = String.Index(utf16Offset: range.upperBound, in: text)
-            guard let lower = AttributedString.Index(stringLower, within: attributed),
-                  let upper = AttributedString.Index(stringUpper, within: attributed)
-            else { continue }
-            attributed[lower ..< upper].backgroundColor = background
+private extension FileDiffProjection.Line {
+    var partialLineKey: AgentChangesDiffLineKey? {
+        switch kind {
+        case .addition:
+            newLine.map(AgentChangesDiffLineKey.addition(newLine:))
+        case .deletion:
+            oldLine.map(AgentChangesDiffLineKey.deletion(oldLine:))
+        case .context, .noNewlineMarker:
+            nil
         }
-        return attributed
     }
 }

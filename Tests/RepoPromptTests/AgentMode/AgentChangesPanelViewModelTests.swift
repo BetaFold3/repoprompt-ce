@@ -30,17 +30,17 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
 
         harness.sync(tabID: tabA)
         await harness.viewModel.settle()
-        XCTAssertEqual(harness.viewModel.snapshot.target?.checkoutURL.path, repoA)
+        XCTAssertEqual(harness.snapshot.target?.checkoutURL.path, repoA)
         XCTAssertEqual(harness.unstagedPaths, ["a.swift"])
 
         harness.sync(tabID: tabB)
         XCTAssertEqual(
-            harness.viewModel.snapshot,
+            harness.snapshot,
             .empty,
             "The previous tab's file list must disappear synchronously under the new header"
         )
         await harness.viewModel.settle()
-        XCTAssertEqual(harness.viewModel.snapshot.target?.checkoutURL.path, repoB)
+        XCTAssertEqual(harness.snapshot.target?.checkoutURL.path, repoB)
         XCTAssertEqual(harness.unstagedPaths, ["b.swift"])
         XCTAssertNil(
             harness.viewModel.statusMessage,
@@ -59,8 +59,17 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
 
-        XCTAssertEqual(harness.viewModel.emptyState, .notARepository(rootName: "agent-changes-panel-notes"))
-        XCTAssertNil(harness.viewModel.activeTarget)
+        XCTAssertNil(harness.activeTarget)
+        XCTAssertTrue(harness.viewModel.groups.isEmpty, "A directory that is not a repository resolves no group")
+        XCTAssertEqual(
+            AgentChangesEmptyState.resolve(
+                resolution: harness.viewModel.resolution,
+                snapshot: .empty,
+                compareSelection: harness.viewModel.panel.compareSelection,
+                hasResolvedCompare: false
+            ),
+            .notARepository(rootName: "agent-changes-panel-notes")
+        )
     }
 
     // MARK: - Lazy patch loading
@@ -79,23 +88,26 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
 
-        XCTAssertEqual(harness.environment.state(forTab: tab).expandedFilePaths, ["a.swift"])
+        XCTAssertEqual(
+            harness.environment.state(forTab: tab).expandedFiles.map(\.repositoryRelativePath),
+            ["a.swift"]
+        )
         XCTAssertEqual(harness.diffSource.patchCallCount, 1, "Only the auto-expanded file is fetched")
         guard let rowA = harness.unstagedRow("a.swift"), let rowB = harness.unstagedRow("b.swift") else {
             return XCTFail("Expected both files in the unstaged section")
         }
-        XCTAssertNotNil(harness.viewModel.patchState(for: rowA).document)
-        XCTAssertEqual(harness.viewModel.patchState(for: rowB), .idle)
+        XCTAssertNotNil(harness.viewModel.patchState(for: rowA, in: harness.groupID).document)
+        XCTAssertEqual(harness.viewModel.patchState(for: rowB, in: harness.groupID), .idle)
 
-        harness.viewModel.toggleExpansion(rowB)
+        harness.viewModel.toggleExpansion(rowB, in: harness.groupID)
         await harness.viewModel.settle()
         XCTAssertEqual(harness.diffSource.patchCallCount, 2)
-        XCTAssertNotNil(harness.viewModel.patchState(for: rowB).document)
+        XCTAssertNotNil(harness.viewModel.patchState(for: rowB, in: harness.groupID).document)
 
-        harness.viewModel.toggleExpansion(rowB)
+        harness.viewModel.toggleExpansion(rowB, in: harness.groupID)
         await harness.viewModel.settle()
         XCTAssertEqual(
-            harness.viewModel.patchState(for: rowB),
+            harness.viewModel.patchState(for: rowB, in: harness.groupID),
             .idle,
             "A collapsed file releases its projection instead of holding a rendered diff nobody can see"
         )
@@ -114,11 +126,11 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         guard let row = harness.unstagedRow("a.swift") else { return XCTFail("Expected a row") }
         XCTAssertEqual(harness.diffSource.requestedContextLines, [3])
 
-        harness.viewModel.escalateContext(for: row)
+        harness.viewModel.escalateContext(for: row, in: harness.groupID)
         await harness.viewModel.settle()
 
         XCTAssertEqual(harness.diffSource.requestedContextLines, [3, 12])
-        XCTAssertEqual(harness.viewModel.contextLevel(for: row), .expanded)
+        XCTAssertEqual(harness.viewModel.contextLevel(for: row, in: harness.groupID), .expanded)
     }
 
     func testFingerprintChangeReloadsTheRemainingPartiallyStagedPatch() async {
@@ -183,7 +195,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.sync(tabID: tabB)
         await waitUntil("checkout B's patch to load") {
             guard let row = harness.unstagedRow("same.swift"),
-                  let document = harness.viewModel.patchState(for: row).document
+                  let document = harness.viewModel.patchState(for: row, in: harness.groupID).document
             else { return false }
             return document.hunks.flatMap(\.lines).contains { $0.text.contains("33") }
         }
@@ -192,7 +204,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         await harness.viewModel.settle()
 
         let row = try? XCTUnwrap(harness.unstagedRow("same.swift"))
-        let document = row.flatMap { harness.viewModel.patchState(for: $0).document }
+        let document = row.flatMap { harness.viewModel.patchState(for: $0, in: harness.groupID).document }
         XCTAssertTrue(document?.hunks.flatMap(\.lines).contains { $0.text.contains("33") } == true)
         XCTAssertFalse(document?.hunks.flatMap(\.lines).contains { $0.text.contains("22") } == true)
     }
@@ -213,13 +225,13 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
             return XCTFail("Expected both files in the unstaged section")
         }
         harness.backend.holdStageCalls()
-        harness.viewModel.setStaged(true, row: rowA)
+        harness.viewModel.setStaged(true, row: rowA, in: harness.groupID)
 
-        XCTAssertEqual(harness.viewModel.pendingStaging(for: rowA)?.requestedStage, true)
-        XCTAssertTrue(harness.viewModel.isStagedForDisplay(rowA), "The checkbox shows the request immediately")
-        XCTAssertTrue(harness.viewModel.isMutationDisabled(rowA))
-        XCTAssertFalse(harness.viewModel.isMutationDisabled(rowB), "A mutation elsewhere leaves other rows clickable")
-        XCTAssertTrue(harness.viewModel.isBulkActionDisabled(for: .unstaged))
+        XCTAssertEqual(harness.viewModel.pendingStaging(for: rowA, in: harness.groupID)?.requestedStage, true)
+        XCTAssertTrue(harness.viewModel.isStagedForDisplay(rowA, in: harness.groupID), "The checkbox shows the request immediately")
+        XCTAssertTrue(harness.viewModel.isMutationDisabled(rowA, in: harness.groupID))
+        XCTAssertFalse(harness.viewModel.isMutationDisabled(rowB, in: harness.groupID), "A mutation elsewhere leaves other rows clickable")
+        XCTAssertTrue(harness.viewModel.isBulkActionDisabled(for: .unstaged, in: harness.groupID))
         XCTAssertEqual(
             harness.unstagedPaths,
             ["a.swift", "b.swift"],
@@ -229,10 +241,95 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.backend.releaseStageCalls()
         await harness.viewModel.settle()
 
-        XCTAssertNil(harness.viewModel.pendingStaging(for: rowA))
+        XCTAssertNil(harness.viewModel.pendingStaging(for: rowA, in: harness.groupID))
         XCTAssertEqual(harness.stagedPaths, ["a.swift"])
         XCTAssertEqual(harness.unstagedPaths, ["b.swift"])
-        XCTAssertFalse(harness.viewModel.isBulkActionDisabled(for: .unstaged))
+        XCTAssertFalse(harness.viewModel.isBulkActionDisabled(for: .unstaged, in: harness.groupID))
+    }
+
+    func testShutdownSynchronouslyRevokesAStageParkedInsideTheBackendLock() async {
+        let harness = makeHarness()
+        let tab = UUID()
+        harness.configure(checkout: repoA, entries: [modified("a.swift")])
+        harness.environment.setRoots([(repoA, UUID())], forTab: tab)
+        harness.sync(tabID: tab)
+        await harness.viewModel.settle()
+
+        let before = harness.backend.entries(at: repoA)
+        let row = try? XCTUnwrap(harness.unstagedRow("a.swift"))
+        guard let row else { return XCTFail("Expected an unstaged row") }
+        harness.backend.holdStageCalls()
+        harness.viewModel.setStaged(true, row: row, in: harness.groupID)
+        await waitUntil("the stage to park inside the backend lock") {
+            harness.backend.heldStageCallCount == 1
+        }
+
+        harness.viewModel.shutdown()
+        harness.backend.releaseStageCalls()
+        await waitUntil("the revoked stage to be refused") {
+            harness.backend.refusedMutationCount == 1
+        }
+
+        XCTAssertEqual(harness.backend.stagedPathBatches, [])
+        XCTAssertEqual(harness.backend.entries(at: repoA), before)
+    }
+
+    func testTabChangeSynchronouslyRevokesAStageParkedInsideTheBackendLock() async {
+        let harness = makeHarness()
+        let tabA = UUID()
+        let tabB = UUID()
+        harness.configure(checkout: repoA, entries: [modified("a.swift")])
+        harness.configure(checkout: repoB, entries: [modified("b.swift")])
+        harness.environment.setRoots([(repoA, UUID())], forTab: tabA)
+        harness.environment.setRoots([(repoB, UUID())], forTab: tabB)
+        harness.sync(tabID: tabA)
+        await harness.viewModel.settle()
+
+        let before = harness.backend.entries(at: repoA)
+        let row = try? XCTUnwrap(harness.unstagedRow("a.swift"))
+        guard let row else { return XCTFail("Expected an unstaged row") }
+        harness.backend.holdStageCalls()
+        harness.viewModel.setStaged(true, row: row, in: harness.groupID)
+        await waitUntil("the stage to park inside the backend lock") {
+            harness.backend.heldStageCallCount == 1
+        }
+
+        harness.sync(tabID: tabB)
+        harness.backend.releaseStageCalls()
+        await waitUntil("the tab-revoked stage to be refused") {
+            harness.backend.refusedMutationCount == 1
+        }
+
+        XCTAssertEqual(harness.backend.stagedPathBatches, [])
+        XCTAssertEqual(harness.backend.entries(at: repoA), before)
+    }
+
+    func testCompareRetargetSynchronouslyRevokesAStageParkedInsideTheBackendLock() async {
+        let harness = makeHarness()
+        let tab = UUID()
+        harness.configure(checkout: repoA, entries: [modified("a.swift")])
+        harness.environment.setRoots([(repoA, UUID())], forTab: tab)
+        harness.sync(tabID: tab)
+        await harness.viewModel.settle()
+
+        let before = harness.backend.entries(at: repoA)
+        let row = try? XCTUnwrap(harness.unstagedRow("a.swift"))
+        guard let row else { return XCTFail("Expected an unstaged row") }
+        harness.backend.holdStageCalls()
+        harness.viewModel.setStaged(true, row: row, in: harness.groupID)
+        await waitUntil("the stage to park inside the backend lock") {
+            harness.backend.heldStageCallCount == 1
+        }
+
+        harness.environment.setCompareSelection(.vsBase, tabID: tab)
+        harness.sync(tabID: tab)
+        harness.backend.releaseStageCalls()
+        await waitUntil("the retarget-revoked stage to be refused") {
+            harness.backend.refusedMutationCount == 1
+        }
+
+        XCTAssertEqual(harness.backend.stagedPathBatches, [])
+        XCTAssertEqual(harness.backend.entries(at: repoA), before)
     }
 
     /// The spinner appears only once the mutation outlives its grace period. A spinner on every
@@ -248,18 +345,18 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
 
         guard let row = harness.unstagedRow("a.swift") else { return XCTFail("Expected a row") }
         harness.backend.holdStageCalls()
-        harness.viewModel.setStaged(true, row: row)
+        harness.viewModel.setStaged(true, row: row, in: harness.groupID)
 
-        XCTAssertEqual(harness.viewModel.pendingStaging(for: row)?.showsSpinner, false)
+        XCTAssertEqual(harness.viewModel.pendingStaging(for: row, in: harness.groupID)?.showsSpinner, false)
 
         scheduler.releaseAll()
         await waitUntil("the grace period elapses") {
-            harness.viewModel.pendingStaging(for: row)?.showsSpinner == true
+            harness.viewModel.pendingStaging(for: row, in: harness.groupID)?.showsSpinner == true
         }
 
         harness.backend.releaseStageCalls()
         await harness.viewModel.settle()
-        XCTAssertNil(harness.viewModel.pendingStaging(for: row))
+        XCTAssertNil(harness.viewModel.pendingStaging(for: row, in: harness.groupID))
     }
 
     /// A file edited between the render and the click is refreshed rather than staged, and the row
@@ -279,7 +376,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         await harness.repository.refresh(.contentDelta(paths: [repoA + "/a.swift"]))
         await harness.repository.waitUntilIdle()
 
-        harness.viewModel.setStaged(true, row: row)
+        harness.viewModel.setStaged(true, row: row, in: harness.groupID)
         await harness.viewModel.settle()
 
         XCTAssertTrue(harness.backend.stagedPathBatches.isEmpty, "Nothing unreviewed reached the index")
@@ -289,7 +386,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
             true,
             "The panel explains why the row did not move"
         )
-        XCTAssertTrue(harness.viewModel.isFlashing(row))
+        XCTAssertTrue(harness.viewModel.isFlashing(row, in: harness.groupID))
     }
 
     /// Conflicts get a checkbox that is present and refused; a read-only vs-Base list gets none at
@@ -306,13 +403,13 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         guard let conflict = harness.row(section: .conflicts, path: "merge.swift") else {
             return XCTFail("Expected a conflicted row")
         }
-        XCTAssertTrue(harness.viewModel.showsStagingCheckbox(for: conflict))
-        XCTAssertTrue(harness.viewModel.isMutationDisabled(conflict))
-        harness.viewModel.setStaged(true, row: conflict)
+        XCTAssertTrue(harness.viewModel.showsStagingCheckbox(for: conflict, in: harness.groupID))
+        XCTAssertTrue(harness.viewModel.isMutationDisabled(conflict, in: harness.groupID))
+        harness.viewModel.setStaged(true, row: conflict, in: harness.groupID)
         await harness.viewModel.settle()
         XCTAssertTrue(harness.backend.stagedPathBatches.isEmpty, "A refused checkbox reaches no backend")
 
-        harness.environment.selectBaseBranch("main", forRepoRoot: repoA, tabID: tab)
+        harness.environment.selectBaseRevision("main", forRepoRoot: repoA, tabID: tab)
         harness.environment.setCompareSelection(.vsBase, tabID: tab)
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
@@ -320,8 +417,8 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         guard let vsBaseRow = harness.row(section: .vsBase, path: "a.swift") else {
             return XCTFail("Expected a vs-Base row")
         }
-        XCTAssertFalse(harness.viewModel.snapshot.supportsStaging)
-        XCTAssertFalse(harness.viewModel.showsStagingCheckbox(for: vsBaseRow))
+        XCTAssertFalse(harness.snapshot.supportsStaging)
+        XCTAssertFalse(harness.viewModel.showsStagingCheckbox(for: vsBaseRow, in: harness.groupID))
     }
 
     // MARK: - Viewed, filters, and conflict resolution
@@ -335,12 +432,12 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         await harness.viewModel.settle()
 
         guard let reviewed = harness.unstagedRow("a.swift") else { return XCTFail("Expected a row") }
-        XCTAssertTrue(harness.viewModel.isExpanded(reviewed), "The first file starts expanded")
+        XCTAssertTrue(harness.viewModel.isExpanded(reviewed, in: harness.groupID), "The first file starts expanded")
 
-        harness.viewModel.setViewed(true, for: reviewed)
+        harness.viewModel.setViewed(true, for: reviewed, in: harness.groupID)
 
-        XCTAssertFalse(harness.viewModel.isExpanded(reviewed), "Viewed files collapse")
-        XCTAssertEqual(harness.viewModel.viewedStatus(for: reviewed), .viewed)
+        XCTAssertFalse(harness.viewModel.isExpanded(reviewed, in: harness.groupID), "Viewed files collapse")
+        XCTAssertEqual(harness.viewModel.viewedStatus(for: reviewed, in: harness.groupID), .viewed)
         XCTAssertEqual(
             harness.viewModel.viewedProgress,
             AgentChangesViewedProgress(viewedFileCount: 1, totalFileCount: 2)
@@ -350,7 +447,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         await harness.viewModel.settle()
         guard let edited = harness.unstagedRow("a.swift") else { return XCTFail("Expected refreshed row") }
 
-        XCTAssertEqual(harness.viewModel.viewedStatus(for: edited), .editedSinceViewed)
+        XCTAssertEqual(harness.viewModel.viewedStatus(for: edited, in: harness.groupID), .editedSinceViewed)
         XCTAssertEqual(harness.viewModel.viewedProgress.viewedFileCount, 0)
     }
 
@@ -373,8 +470,8 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         )
 
         harness.viewModel.selectFilter(.staged)
-        XCTAssertEqual(harness.viewModel.visibleSections.map(\.kind), [.staged])
-        XCTAssertEqual(harness.viewModel.visibleSections.flatMap(\.rows).map(\.path), ["staged.swift"])
+        XCTAssertEqual(harness.viewModel.visibleSections(for: harness.groupID).map(\.kind), [.staged])
+        XCTAssertEqual(harness.viewModel.visibleSections(for: harness.groupID).flatMap(\.rows).map(\.path), ["staged.swift"])
         XCTAssertEqual(harness.environment.state(forTab: tab).changesFilter, .staged)
         XCTAssertTrue(harness.backend.stagedPathBatches.isEmpty, "Filtering is presentation-only")
     }
@@ -390,20 +487,20 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         guard let conflict = harness.row(section: .conflicts, path: "merge.swift"),
               let other = harness.unstagedRow("other.swift")
         else { return XCTFail("Expected conflict and bystander") }
-        XCTAssertNil(harness.viewModel.markResolvedDisabledReason(for: conflict))
+        XCTAssertNil(harness.viewModel.markResolvedDisabledReason(for: conflict, in: harness.groupID))
 
         harness.backend.holdStageCalls()
-        harness.viewModel.markResolved(conflict)
+        harness.viewModel.markResolved(conflict, in: harness.groupID)
 
-        XCTAssertNotNil(harness.viewModel.pendingResolution(for: conflict))
-        XCTAssertNotNil(harness.viewModel.markResolvedDisabledReason(for: conflict))
-        XCTAssertFalse(harness.viewModel.isMutationDisabled(other), "An unrelated row stays interactive")
-        XCTAssertTrue(harness.viewModel.isBulkActionDisabled(for: .unstaged))
+        XCTAssertNotNil(harness.viewModel.pendingResolution(for: conflict, in: harness.groupID))
+        XCTAssertNotNil(harness.viewModel.markResolvedDisabledReason(for: conflict, in: harness.groupID))
+        XCTAssertFalse(harness.viewModel.isMutationDisabled(other, in: harness.groupID), "An unrelated row stays interactive")
+        XCTAssertTrue(harness.viewModel.isBulkActionDisabled(for: .unstaged, in: harness.groupID))
 
         harness.backend.releaseStageCalls()
         await harness.viewModel.settle()
 
-        XCTAssertNil(harness.viewModel.pendingResolution(for: conflict))
+        XCTAssertNil(harness.viewModel.pendingResolution(for: conflict, in: harness.groupID))
         XCTAssertEqual(harness.backend.resolvedPathBatches, [["merge.swift"]])
         XCTAssertNil(harness.row(section: .conflicts, path: "merge.swift"))
         XCTAssertEqual(harness.stagedPaths, ["merge.swift"])
@@ -422,7 +519,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
 
         await harness.repository.refresh(.contentDelta(paths: [repoA + "/merge.swift"]))
         await harness.repository.waitUntilIdle()
-        harness.viewModel.markResolved(reviewed)
+        harness.viewModel.markResolved(reviewed, in: harness.groupID)
         await harness.viewModel.settle()
 
         XCTAssertTrue(harness.backend.resolvedPathBatches.isEmpty)
@@ -443,7 +540,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
 
-        XCTAssertEqual(harness.viewModel.emptyState, .cleanTree(offersBaseComparison: true))
+        XCTAssertEqual(harness.viewModel.emptyState(for: harness.groupID), .cleanTree(offersBaseComparison: true))
 
         harness.viewModel.offerBaseComparison()
         harness.sync(tabID: tab)
@@ -451,57 +548,51 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
 
         XCTAssertEqual(harness.environment.state(forTab: tab).compareSelection, .vsBase)
         XCTAssertNil(harness.environment.state(forTab: tab).baseBranchOverride)
-        XCTAssertEqual(harness.viewModel.emptyState, .baseNotChosen)
-        XCTAssertNil(harness.viewModel.snapshot.target, "No compare means no target, not a stale one")
+        XCTAssertEqual(harness.viewModel.emptyState(for: harness.groupID), .baseNotChosen)
+        XCTAssertNil(harness.snapshot.target, "No compare means no target, not a stale one")
     }
 
-    /// A base branch means something only inside one repository, so switching the active repository
-    /// re-reads this tab's repo-scoped memory instead of carrying a branch name across.
+    /// A base revision means something only inside one repository. Grouped mode retains both
+    /// choices simultaneously and one missing choice never blocks the other checkout.
     func testTheBaseBranchIsScopedToTheRepositoryItWasChosenFor() async {
         let harness = makeHarness()
         let tab = UUID()
-        let rootA = UUID()
-        let rootB = UUID()
         harness.configure(checkout: repoA, entries: [modified("a.swift")])
         harness.configure(checkout: repoB, entries: [modified("b.swift")])
-        harness.environment.setRoots([(repoA, rootA), (repoB, rootB)], forTab: tab)
+        harness.environment.setRoots([(repoA, UUID()), (repoB, UUID())], forTab: tab)
         harness.environment.setCompareSelection(.vsBase, tabID: tab)
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
 
-        harness.viewModel.selectBaseBranch("release/1.0")
-        harness.sync(tabID: tab)
-        await harness.viewModel.settle()
-        XCTAssertEqual(harness.environment.state(forTab: tab).baseBranchOverride, "release/1.0")
+        guard let groupA = harness.viewModel.groups.first(where: { $0.target.checkoutURL.path == repoA }),
+              let groupB = harness.viewModel.groups.first(where: { $0.target.checkoutURL.path == repoB })
+        else { return XCTFail("Expected both repositories to resolve") }
 
-        guard let second = harness.viewModel.availableTargets.first(where: { $0.checkoutURL.path == repoB }) else {
-            return XCTFail("Expected both repositories to resolve")
-        }
-        harness.viewModel.selectRoot(second)
-        harness.sync(tabID: tab)
-        await harness.viewModel.settle()
-
-        XCTAssertNil(
-            harness.environment.state(forTab: tab).baseBranchOverride,
-            "A branch the user picked for another repository is not a base for this one"
-        )
-        XCTAssertEqual(harness.viewModel.emptyState, .baseNotChosen)
-
-        harness.viewModel.selectBaseBranch("main")
-        harness.sync(tabID: tab)
-        await harness.viewModel.settle()
-
-        guard let first = harness.viewModel.availableTargets.first(where: { $0.checkoutURL.path == repoA }) else {
-            return XCTFail("Expected the first repository to still resolve")
-        }
-        harness.viewModel.selectRoot(first)
+        harness.viewModel.selectBaseRevision("release/1.0", for: groupA.id)
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
 
         XCTAssertEqual(
-            harness.environment.state(forTab: tab).baseBranchOverride,
-            "release/1.0",
-            "Coming back re-offers the base this tab already chose for that repository"
+            harness.environment.state(forTab: tab).selectedBaseRevision(forRepoRoot: repoA),
+            "release/1.0"
+        )
+        XCTAssertNil(
+            harness.environment.state(forTab: tab).selectedBaseRevision(forRepoRoot: repoB),
+            "A revision chosen in one repository must not become another group's base"
+        )
+        XCTAssertEqual(harness.viewModel.emptyState(for: groupB.id), .baseNotChosen)
+
+        harness.viewModel.selectBaseRevision("main", for: groupB.id)
+        harness.sync(tabID: tab)
+        await harness.viewModel.settle()
+
+        XCTAssertEqual(
+            harness.environment.state(forTab: tab).selectedBaseRevision(forRepoRoot: repoA),
+            "release/1.0"
+        )
+        XCTAssertEqual(
+            harness.environment.state(forTab: tab).selectedBaseRevision(forRepoRoot: repoB),
+            "main"
         )
     }
 
@@ -519,8 +610,8 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
 
-        XCTAssertEqual(harness.viewModel.emptyState, .baseNotChosen)
-        XCTAssertEqual(harness.viewModel.baseBranchCandidates, ["main", "release/1.0"])
+        XCTAssertEqual(harness.viewModel.emptyState(for: harness.groupID), .baseNotChosen)
+        XCTAssertEqual(harness.viewModel.baseCandidates(for: harness.groupID), ["main", "release/1.0"])
     }
 
     func testCustomRevisionValidationAcceptsOnlyValidInputAndKeepsTheLastGoodBase() async {
@@ -538,7 +629,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
 
-        harness.viewModel.beginCustomRevisionEntry()
+        harness.viewModel.beginCustomRevisionEntry(for: harness.groupID)
         harness.viewModel.updateCustomRevisionText("HEAD~3")
         harness.viewModel.submitCustomRevision()
         await harness.viewModel.settle()
@@ -550,7 +641,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         )
         XCTAssertNil(harness.viewModel.customRevisionEditor)
 
-        harness.viewModel.beginCustomRevisionEntry()
+        harness.viewModel.beginCustomRevisionEntry(for: harness.groupID)
         harness.viewModel.updateCustomRevisionText("missing")
         harness.viewModel.submitCustomRevision()
         await harness.viewModel.settle()
@@ -583,8 +674,8 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.sync(tabID: tab)
         await harness.viewModel.settle()
 
-        XCTAssertNil(harness.viewModel.activeTarget, "A missing worktree never falls back on its own")
-        guard let blocked = harness.viewModel.blockedCheckouts.first else {
+        XCTAssertNil(harness.activeTarget, "A missing worktree never falls back on its own")
+        guard let blocked = (harness.viewModel.resolution?.blocked ?? []).first else {
             return XCTFail("Expected the bound root to be reported as blocked")
         }
         XCTAssertTrue(blocked.reason.allowsWorkspaceCheckoutOverride)
@@ -592,10 +683,10 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.viewModel.showWorkspaceCheckoutInstead(for: blocked)
         await harness.viewModel.settle()
 
-        XCTAssertEqual(harness.viewModel.activeTarget?.checkoutURL.path, repoA)
+        XCTAssertEqual(harness.activeTarget?.checkoutURL.path, repoA)
         XCTAssertEqual(harness.unstagedPaths, ["a.swift"])
         XCTAssertTrue(
-            harness.viewModel.isSubstitutingWorkspaceCheckout,
+            harness.viewModel.isSubstitutingWorkspaceCheckout(in: harness.groupID),
             "The warning chip persists for the rest of the session, because the substitution does"
         )
     }
@@ -622,7 +713,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         harness.environment.releaseRootInputs(forTab: tab)
         await harness.viewModel.settle()
         XCTAssertFalse(harness.viewModel.isRefreshing)
-        XCTAssertEqual(harness.viewModel.snapshot.target?.checkoutURL.path, repoA)
+        XCTAssertEqual(harness.snapshot.target?.checkoutURL.path, repoA)
     }
 
     // MARK: - Artifact banner
@@ -686,11 +777,29 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
     @MainActor
     private struct Harness {
         let viewModel: AgentChangesPanelViewModel
-        let repository: AgentChangesRepository
+        let repositories: PanelRepositoryFactory
         let environment: PanelFakeEnvironment
         let backend: PanelFakeIndexBackend
         let diffSource: PanelFakeDiffSource
         let probe: PanelFakeProbe
+
+        var repository: AgentChangesRepository {
+            repositories.latest
+        }
+
+        /// The single resolved checkout these scenarios drive. Every row and bulk action is
+        /// qualified by it, so a path is never interpreted without its checkout.
+        var groupID: AgentChangesGroupID {
+            viewModel.groups.first?.id ?? AgentChangesGroupID(targetKey: "<no-resolved-checkout>")
+        }
+
+        var snapshot: AgentChangesSnapshot {
+            viewModel.groups.first?.snapshot ?? .empty
+        }
+
+        var activeTarget: AgentPanelResolvedCheckout? {
+            viewModel.groups.first?.target
+        }
 
         func sync(tabID: UUID) {
             viewModel.sync(tabID: tabID, panel: environment.state(forTab: tabID))
@@ -702,11 +811,11 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         }
 
         var unstagedPaths: [String] {
-            viewModel.snapshot.section(.unstaged)?.rows.map(\.path) ?? []
+            snapshot.section(.unstaged)?.rows.map(\.path) ?? []
         }
 
         var stagedPaths: [String] {
-            viewModel.snapshot.section(.staged)?.rows.map(\.path) ?? []
+            snapshot.section(.staged)?.rows.map(\.path) ?? []
         }
 
         func unstagedRow(_ path: String) -> AgentChangesFileRow? {
@@ -714,7 +823,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         }
 
         func row(section: AgentChangesSectionKind, path: String) -> AgentChangesFileRow? {
-            viewModel.snapshot.section(section)?.rows.first { $0.path == path }
+            snapshot.section(section)?.rows.first { $0.path == path }
         }
     }
 
@@ -725,17 +834,13 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         let diffSource = PanelFakeDiffSource()
         let probe = PanelFakeProbe()
         let environment = PanelFakeEnvironment()
-        let repository = AgentChangesRepository(
-            indexBackend: backend,
-            diffSource: diffSource,
-            invalidationPublisher: PanelInertInvalidationPublisher(),
-            scheduler: PanelImmediateScheduler(),
-            contentDeltaWindow: .zero,
-            makeTriggerFeed: { _ in PanelInertTriggerFeed() }
+        let repositories = PanelRepositoryFactory(
+            backend: backend,
+            diffSource: diffSource
         )
         let viewModel = AgentChangesPanelViewModel(
             environment: environment,
-            repository: repository,
+            repositoryFactory: { repositories.makeRepository() },
             probe: probe,
             scheduler: viewModelScheduler ?? PanelImmediateScheduler(),
             stagingGrace: .zero,
@@ -743,7 +848,7 @@ final class AgentChangesPanelViewModelTests: XCTestCase {
         )
         return Harness(
             viewModel: viewModel,
-            repository: repository,
+            repositories: repositories,
             environment: environment,
             backend: backend,
             diffSource: diffSource,
@@ -902,10 +1007,6 @@ private final class PanelFakeEnvironment: AgentChangesPanelEnvironment {
 
     // MARK: Writes
 
-    func selectRootOverride(_ rootID: UUID?, tabID: UUID?) {
-        mutate(tabID) { $0.selectRootOverride(rootID) }
-    }
-
     func setCompareSelection(_ selection: AgentChangesCompareSelection, tabID: UUID?) {
         mutate(tabID) { $0.setCompareSelection(selection) }
     }
@@ -918,38 +1019,43 @@ private final class PanelFakeEnvironment: AgentChangesPanelEnvironment {
         mutate(tabID) { $0.setChangesFilter(filter) }
     }
 
-    func selectBaseBranch(_ branch: String?, forRepoRoot repoRoot: String, tabID: UUID?) {
-        mutate(tabID) { $0.selectBaseBranch(branch, forRepoRoot: repoRoot) }
+    func selectBaseRevision(_ revision: String?, forRepoRoot repoRoot: String, tabID: UUID?) {
+        mutate(tabID) {
+            $0.selectBaseRevision(revision, forRepoRoot: repoRoot)
+            $0.selectBaseBranch(revision, forRepoRoot: repoRoot)
+        }
     }
 
-    func lastUsedBaseBranch(forRepoRoot repoRoot: String, tabID: UUID?) -> String? {
-        guard let tabID else { return nil }
-        return state(forTab: tabID).lastUsedBaseBranch(forRepoRoot: repoRoot)
-    }
-
-    func setFileExpansion(_ isExpanded: Bool, filePath: String, tabID: UUID?) {
-        mutate(tabID) { $0.setExpansion(isExpanded, ofFilePath: filePath) }
+    func setFileExpansion(
+        _ isExpanded: Bool,
+        file: AgentChangesFileStateKey,
+        tabID: UUID?
+    ) {
+        mutate(tabID) { $0.setExpansion(isExpanded, ofFile: file) }
     }
 
     func setFileViewed(
         _ viewed: Bool,
         revision: AgentChangesViewedRevision,
         compareTargetKey: String,
-        collapseFilePath: String?,
+        collapseFile: AgentChangesFileStateKey?,
         tabID: UUID?
     ) {
         mutate(tabID) { state in
             state.setViewed(viewed, revision: revision, compareTargetKey: compareTargetKey)
-            if let collapseFilePath {
-                state.setExpansion(false, ofFilePath: collapseFilePath)
+            if let collapseFile {
+                state.setExpansion(false, ofFile: collapseFile)
             }
         }
     }
 
     @discardableResult
-    func escalateContext(filePath: String, tabID: UUID?) -> AgentChangesContextLevel {
+    func escalateContext(
+        file: AgentChangesFileStateKey,
+        tabID: UUID?
+    ) -> AgentChangesContextLevel {
         var level = AgentChangesContextLevel.standard
-        mutate(tabID) { level = $0.escalateContext(forFilePath: filePath) }
+        mutate(tabID) { level = $0.escalateContext(forFile: file) }
         return level
     }
 
@@ -994,6 +1100,38 @@ private final class PanelFakeProbe: AgentPanelCheckoutProbing, @unchecked Sendab
 }
 
 // MARK: - Repository fakes
+
+@MainActor
+private final class PanelRepositoryFactory {
+    private let backend: PanelFakeIndexBackend
+    private let diffSource: PanelFakeDiffSource
+    private(set) var repositories: [AgentChangesRepository] = []
+
+    init(backend: PanelFakeIndexBackend, diffSource: PanelFakeDiffSource) {
+        self.backend = backend
+        self.diffSource = diffSource
+    }
+
+    var latest: AgentChangesRepository {
+        guard let latest = repositories.last else {
+            preconditionFailure("A repository slot has not been created yet")
+        }
+        return latest
+    }
+
+    func makeRepository() -> AgentChangesRepository {
+        let repository = AgentChangesRepository(
+            indexBackend: backend,
+            diffSource: diffSource,
+            invalidationPublisher: PanelInertInvalidationPublisher(),
+            scheduler: PanelImmediateScheduler(),
+            contentDeltaWindow: .zero,
+            makeTriggerFeed: { _ in PanelInertTriggerFeed() }
+        )
+        repositories.append(repository)
+        return repository
+    }
+}
 
 private struct PanelImmediateScheduler: AgentChangesScheduler {
     func sleep(for _: Duration) async throws {
@@ -1053,6 +1191,7 @@ private final class PanelFakeIndexBackend: AgentChangesIndexBackend, @unchecked 
     private var resolvedBatches: [[String]] = []
     private var isHoldingStage = false
     private var stageWaiters: [CheckedContinuation<Void, Never>] = []
+    private var refusedMutations = 0
 
     var stagedPathBatches: [[String]] {
         lock.withLock { stagedBatches }
@@ -1060,6 +1199,18 @@ private final class PanelFakeIndexBackend: AgentChangesIndexBackend, @unchecked 
 
     var resolvedPathBatches: [[String]] {
         lock.withLock { resolvedBatches }
+    }
+
+    var heldStageCallCount: Int {
+        lock.withLock { stageWaiters.count }
+    }
+
+    var refusedMutationCount: Int {
+        lock.withLock { refusedMutations }
+    }
+
+    func entries(at checkout: String) -> [VCSIndexStatusEntry] {
+        lock.withLock { entriesByCheckout[checkout] ?? [] }
     }
 
     func setEntries(_ entries: [VCSIndexStatusEntry], at checkout: String) {
@@ -1094,8 +1245,13 @@ private final class PanelFakeIndexBackend: AgentChangesIndexBackend, @unchecked 
         lock.withLock { entriesByCheckout[checkout.standardizedFileURL.path] ?? [] }
     }
 
-    func stage(_ identities: [VCSIndexPathIdentity], at checkout: URL) async throws {
+    func stage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
         await waitIfHolding()
+        try await requireAuthorization(authorize)
         lock.withLock { stagedBatches.append(identities.map(\.path)) }
         mutate(identities, at: checkout) { entry in
             VCSIndexStatusEntry(
@@ -1109,7 +1265,12 @@ private final class PanelFakeIndexBackend: AgentChangesIndexBackend, @unchecked 
         }
     }
 
-    func unstage(_ identities: [VCSIndexPathIdentity], at checkout: URL) async throws {
+    func unstage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await requireAuthorization(authorize)
         mutate(identities, at: checkout) { entry in
             VCSIndexStatusEntry(
                 path: entry.path,
@@ -1122,8 +1283,13 @@ private final class PanelFakeIndexBackend: AgentChangesIndexBackend, @unchecked 
         }
     }
 
-    func markResolved(_ identity: VCSIndexPathIdentity, at checkout: URL) async throws {
+    func markResolved(
+        _ identity: VCSIndexPathIdentity,
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
         await waitIfHolding()
+        try await requireAuthorization(authorize)
         lock.withLock { resolvedBatches.append([identity.path]) }
         mutate([identity], at: checkout) { entry in
             VCSIndexStatusEntry(
@@ -1134,6 +1300,15 @@ private final class PanelFakeIndexBackend: AgentChangesIndexBackend, @unchecked 
                 isUntracked: false,
                 isConflicted: false
             )
+        }
+    }
+
+    /// Evaluated after the hold, exactly where a real backend evaluates it: past the serialized
+    /// index slot and immediately before the command.
+    private func requireAuthorization(_ authorize: VCSIndexMutationAuthorization) async throws {
+        guard await authorize() else {
+            lock.withLock { refusedMutations += 1 }
+            throw GitIndexMutationError.authorizationRevoked
         }
     }
 

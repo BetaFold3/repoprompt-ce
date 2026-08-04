@@ -15,6 +15,7 @@ actor GitDiffEngine {
         let requestedPaths: [String]?
         let diffText: String?
         let perFile: [String: String]?
+        let rawPerFile: [String: Data]?
         let changedFiles: [VCSUncommittedFile]
         let summary: (files: Int, insertions: Int, deletions: Int)
     }
@@ -127,11 +128,11 @@ actor GitDiffEngine {
 
         var diffText: String?
         var perFile: [String: String]?
+        var rawPerFile: [String: Data]?
         if generateDiffText, !filtered.isEmpty {
             let pathFilter = normalizedPathspecs
-
-            // Get diff text via backend (handles normalization for jj)
-            let trackedDiff = try await backend.getDiffText(
+            let tracked = try await diffOutput(
+                backend: backend,
                 compare: normalizedCompare,
                 paths: pathFilter,
                 contextLines: contextLines,
@@ -139,21 +140,28 @@ actor GitDiffEngine {
                 at: repoURL
             )
 
-            // Get untracked diff (for git; jj returns empty as it has no untracked concept)
+            // Untracked patches require path normalization after `--no-index`; partial staging never
+            // accepts them, but retaining their rendered bytes keeps the combined splitter aligned.
             let untrackedPaths = filtered.filter { $0.status == "??" }.map(\.path)
-            let untrackedDiff: String = if !untrackedPaths.isEmpty {
+            let untrackedText: String = if !untrackedPaths.isEmpty {
                 try await backend.getUntrackedDiff(for: untrackedPaths, contextLines: contextLines, at: repoURL)
             } else {
                 ""
             }
-
-            let combined = [trackedDiff, untrackedDiff]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n")
+            let parts = [
+                (text: tracked.text, data: tracked.data),
+                (text: untrackedText, data: Data(untrackedText.utf8))
+            ].filter { !$0.text.isEmpty }
+            let combined = parts.map(\.text).joined(separator: "\n")
 
             if !combined.isEmpty {
                 diffText = combined
-                perFile = GitService.splitUnifiedDiffByFile(combined)
+                let rendered = GitService.splitUnifiedDiffByFile(combined)
+                perFile = rendered
+                rawPerFile = GitRawDiffFileSplitter.split(
+                    Self.joinDiffData(parts.map(\.data)),
+                    matching: rendered
+                )
             }
         }
 
@@ -164,6 +172,7 @@ actor GitDiffEngine {
             requestedPaths: requestedPaths,
             diffText: diffText,
             perFile: perFile,
+            rawPerFile: rawPerFile,
             changedFiles: filtered,
             summary: (files: summaryFiles, insertions: summaryInsertions, deletions: summaryDeletions)
         )
@@ -247,11 +256,12 @@ actor GitDiffEngine {
 
         var diffText: String?
         var perFile: [String: String]?
+        var rawPerFile: [String: Data]?
         if generateDiffText {
             let pathFilter = (scope == .selected) ? requestedPaths : nil
             if scope == .all || (pathFilter?.isEmpty == false) {
-                // Get diff text via backend (handles normalization for jj)
-                let trackedDiff = try await backend.getDiffText(
+                let tracked = try await diffOutput(
+                    backend: backend,
                     compare: normalizedCompare,
                     paths: pathFilter,
                     contextLines: contextLines,
@@ -259,21 +269,26 @@ actor GitDiffEngine {
                     at: repoURL
                 )
 
-                // Get untracked diff (for git; jj returns empty as it has no untracked concept)
                 let untrackedPaths = filtered.filter { $0.status == "??" }.map(\.path)
-                let untrackedDiff: String = if !untrackedPaths.isEmpty, includeUntrackedInUnstaged {
+                let untrackedText: String = if !untrackedPaths.isEmpty, includeUntrackedInUnstaged {
                     try await backend.getUntrackedDiff(for: untrackedPaths, contextLines: contextLines, at: repoURL)
                 } else {
                     ""
                 }
-
-                let combined = [trackedDiff, untrackedDiff]
-                    .filter { !$0.isEmpty }
-                    .joined(separator: "\n")
+                let parts = [
+                    (text: tracked.text, data: tracked.data),
+                    (text: untrackedText, data: Data(untrackedText.utf8))
+                ].filter { !$0.text.isEmpty }
+                let combined = parts.map(\.text).joined(separator: "\n")
 
                 if !combined.isEmpty {
                     diffText = combined
-                    perFile = GitService.splitUnifiedDiffByFile(combined)
+                    let rendered = GitService.splitUnifiedDiffByFile(combined)
+                    perFile = rendered
+                    rawPerFile = GitRawDiffFileSplitter.split(
+                        Self.joinDiffData(parts.map(\.data)),
+                        matching: rendered
+                    )
                 }
             }
         }
@@ -285,9 +300,51 @@ actor GitDiffEngine {
             requestedPaths: requestedPaths,
             diffText: diffText,
             perFile: perFile,
+            rawPerFile: rawPerFile,
             changedFiles: filtered,
             summary: (files: summaryFiles, insertions: summaryInsertions, deletions: summaryDeletions)
         )
+    }
+
+    /// Uses Git's raw process path when possible; other backends remain text-only and therefore
+    /// naturally fail the later raw/text provenance check for index mutation.
+    private func diffOutput(
+        backend: any VCSBackend,
+        compare: GitDiffCompareSpec,
+        paths: [String]?,
+        contextLines: Int,
+        detectRenames: Bool,
+        at repoURL: URL
+    ) async throws -> (text: String, data: Data) {
+        if backend.kind == .git {
+            let data = try await gitService.getDiffData(
+                compare: compare,
+                paths: paths,
+                contextLines: contextLines,
+                detectRenames: detectRenames,
+                at: repoURL
+            )
+            return (String(decoding: data, as: UTF8.self), data)
+        }
+        let text = try await backend.getDiffText(
+            compare: compare,
+            paths: paths,
+            contextLines: contextLines,
+            detectRenames: detectRenames,
+            at: repoURL
+        )
+        return (text, Data(text.utf8))
+    }
+
+    private nonisolated static func joinDiffData(_ parts: [Data]) -> Data {
+        var combined = Data()
+        for (index, part) in parts.enumerated() {
+            if index > 0 {
+                combined.append(0x0A)
+            }
+            combined.append(part)
+        }
+        return combined
     }
 
     func diffText(

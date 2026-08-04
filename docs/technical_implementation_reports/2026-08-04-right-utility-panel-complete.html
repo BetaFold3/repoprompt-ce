@@ -1,0 +1,1471 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Human-friendly technical implementation report for RepoPrompt CE's right utility panel, including Git diff review, partial staging, multi-root search, Markdown preview, and secure HTML preview.">
+  <title>Right Utility Panel — Complete Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f4f1ec;
+      --surface: #fffdf9;
+      --surface-raised: #ffffff;
+      --surface-soft: #f7f3ed;
+      --ink: #1d2630;
+      --muted: #64707c;
+      --faint: #89939d;
+      --line: #ded8ce;
+      --blue: #315fcb;
+      --blue-soft: #eaf0ff;
+      --green: #19734e;
+      --green-soft: #e7f6ee;
+      --amber: #9a6500;
+      --amber-soft: #fff2cf;
+      --red: #a94242;
+      --red-soft: #ffebeb;
+      --purple: #7550b5;
+      --purple-soft: #f0e9ff;
+      --cyan: #16758b;
+      --cyan-soft: #e5f5f7;
+      --add: #08784f;
+      --add-bg: #e7f7ef;
+      --del: #ae3b49;
+      --del-bg: #ffebee;
+      --code-bg: #151c26;
+      --code-fg: #edf3fa;
+      --shadow: 0 18px 52px rgba(48, 42, 34, .08);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f141a;
+        --surface: #171d25;
+        --surface-raised: #1c2430;
+        --surface-soft: #202833;
+        --ink: #edf2f8;
+        --muted: #b3bec9;
+        --faint: #8491a0;
+        --line: #343e4a;
+        --blue: #8da8ff;
+        --blue-soft: #27345d;
+        --green: #78d4aa;
+        --green-soft: #173d2d;
+        --amber: #edc46e;
+        --amber-soft: #4b3818;
+        --red: #ff9da5;
+        --red-soft: #4a272e;
+        --purple: #c6adff;
+        --purple-soft: #372b54;
+        --cyan: #7bd1df;
+        --cyan-soft: #173c45;
+        --add: #74d7a8;
+        --add-bg: #183c2e;
+        --del: #ff9da8;
+        --del-bg: #48262d;
+        --code-bg: #090e15;
+        --code-fg: #edf3fa;
+        --shadow: none;
+      }
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 94% -8%, color-mix(in srgb, var(--blue) 12%, transparent), transparent 31rem),
+        radial-gradient(circle at -8% 24%, color-mix(in srgb, var(--purple) 7%, transparent), transparent 28rem),
+        var(--bg);
+      color: var(--ink);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    }
+
+    a { color: var(--blue); text-underline-offset: 3px; }
+    a:hover { text-decoration-thickness: 2px; }
+    code, pre, kbd { font-family: var(--mono); }
+    code {
+      padding: .08rem .34rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-soft);
+      font-size: .9em;
+    }
+    pre {
+      overflow-x: auto;
+      margin: 1rem 0;
+      padding: 1rem 1.15rem;
+      border: 1px solid color-mix(in srgb, var(--line) 72%, transparent);
+      border-radius: 13px;
+      background: var(--code-bg);
+      color: var(--code-fg);
+      font-size: .83rem;
+      line-height: 1.56;
+      white-space: pre;
+    }
+    pre code { padding: 0; border: 0; background: transparent; color: inherit; }
+    kbd {
+      display: inline-block;
+      min-width: 1.7em;
+      padding: .1rem .38rem;
+      border: 1px solid var(--line);
+      border-bottom-width: 2px;
+      border-radius: 5px;
+      background: var(--surface-soft);
+      color: var(--ink);
+      font-size: .82em;
+      text-align: center;
+    }
+
+    .skip-link {
+      position: fixed;
+      z-index: 100;
+      left: 12px;
+      top: -60px;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--surface-raised);
+      color: var(--ink);
+    }
+    .skip-link:focus { top: 12px; }
+
+    .page { width: min(1220px, calc(100% - 30px)); margin: 0 auto; padding: 26px 0 74px; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(28px, 5vw, 52px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background:
+        linear-gradient(135deg, var(--surface-raised) 0%, color-mix(in srgb, var(--blue-soft) 70%, var(--surface)) 100%);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 390px;
+      height: 390px;
+      right: -155px;
+      top: -230px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--blue) 13%, transparent);
+    }
+    .eyebrow {
+      margin: 0 0 9px;
+      color: var(--blue);
+      font-size: .77rem;
+      font-weight: 850;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 940px;
+      margin: 0;
+      font-size: clamp(2.25rem, 5.6vw, 4.55rem);
+      line-height: 1.01;
+      letter-spacing: -.052em;
+    }
+    .subtitle {
+      position: relative;
+      z-index: 1;
+      max-width: 900px;
+      margin: 20px 0 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.18rem);
+    }
+    .badges { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .badge, .evidence-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-weight: 760;
+    }
+    .badge { padding: 6px 10px; background: var(--surface-raised); color: var(--muted); font-size: .8rem; }
+    .badge.good { border-color: color-mix(in srgb, var(--green) 42%, var(--line)); background: var(--green-soft); color: var(--green); }
+    .badge.info { border-color: color-mix(in srgb, var(--blue) 42%, var(--line)); background: var(--blue-soft); color: var(--blue); }
+    .badge.warn { border-color: color-mix(in srgb, var(--amber) 42%, var(--line)); background: var(--amber-soft); color: var(--amber); }
+
+    .toc {
+      position: sticky;
+      z-index: 20;
+      top: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin: 18px 0 28px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--surface-raised) 90%, transparent);
+      box-shadow: 0 7px 24px rgba(26, 31, 38, .07);
+      backdrop-filter: blur(16px);
+    }
+    .toc a {
+      padding: 5px 8px;
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: .81rem;
+      font-weight: 720;
+      text-decoration: none;
+    }
+    .toc a:hover { background: var(--blue-soft); color: var(--blue); }
+
+    section {
+      margin-top: 24px;
+      padding: clamp(22px, 4vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      scroll-margin-top: 86px;
+    }
+    section > :first-child { margin-top: 0; }
+    section > :last-child { margin-bottom: 0; }
+    h2 { margin: 0 0 15px; font-size: clamp(1.45rem, 3vw, 1.82rem); line-height: 1.18; letter-spacing: -.03em; }
+    h3 { margin: 26px 0 8px; font-size: 1.14rem; line-height: 1.28; }
+    h4 { margin: 18px 0 5px; font-size: .98rem; }
+    p { margin: 10px 0; }
+    ul, ol { padding-left: 1.35rem; }
+    li + li { margin-top: .42rem; }
+    .lead { color: var(--muted); font-size: 1.06rem; }
+    .muted, small { color: var(--muted); }
+    .fine { color: var(--faint); font-size: .82rem; }
+    .nowrap { white-space: nowrap; }
+
+    .grid { display: grid; gap: 15px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      min-width: 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-soft);
+    }
+    .card .label {
+      color: var(--muted);
+      font-size: .73rem;
+      font-weight: 840;
+      letter-spacing: .09em;
+      text-transform: uppercase;
+    }
+    .card .value { margin: 4px 0; font-size: 1.35rem; font-weight: 870; letter-spacing: -.025em; }
+    .card h3 { margin: 2px 0 8px; }
+    .card p:last-child { margin-bottom: 0; }
+
+    .callout {
+      margin: 16px 0;
+      padding: 15px 17px;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--blue);
+      border-radius: 11px;
+      background: var(--blue-soft);
+    }
+    .callout strong { display: block; margin-bottom: 3px; }
+    .callout.good { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.danger { border-left-color: var(--red); background: var(--red-soft); }
+
+    .evidence-tag {
+      padding: 2px 7px;
+      background: var(--surface-raised);
+      color: var(--muted);
+      font-size: .68rem;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      vertical-align: .12em;
+    }
+    .evidence-tag.code { color: var(--blue); background: var(--blue-soft); }
+    .evidence-tag.test { color: var(--green); background: var(--green-soft); }
+    .evidence-tag.session { color: var(--purple); background: var(--purple-soft); }
+    .evidence-tag.inferred { color: var(--amber); background: var(--amber-soft); }
+
+    .table-wrap { overflow-x: auto; margin: 14px 0; border: 1px solid var(--line); border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; background: var(--surface-raised); font-size: .91rem; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-soft); color: var(--muted); font-size: .74rem; letter-spacing: .06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .status-good { color: var(--green); font-weight: 800; }
+    .status-open { color: var(--amber); font-weight: 800; }
+    .status-local { color: var(--purple); font-weight: 800; }
+
+    .journey { display: grid; gap: 12px; margin-top: 16px; }
+    .journey-item {
+      display: grid;
+      grid-template-columns: 46px minmax(0, 1fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .journey-number {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line));
+      border-radius: 13px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-weight: 880;
+    }
+    .journey-body { padding: 2px 0 16px; border-bottom: 1px solid var(--line); }
+    .journey-item:last-child .journey-body { border-bottom: 0; padding-bottom: 0; }
+    .journey-body h3 { margin: 0 0 5px; }
+
+    .roadmap { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .phase {
+      position: relative;
+      overflow: hidden;
+      padding: 20px;
+      border: 1px solid var(--line);
+      border-radius: 15px;
+      background: var(--surface-soft);
+    }
+    .phase::before {
+      content: "";
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 4px;
+      background: var(--blue);
+    }
+    .phase:nth-child(2)::before { background: var(--purple); }
+    .phase:nth-child(3)::before { background: var(--green); }
+    .phase .phase-label { color: var(--muted); font-size: .74rem; font-weight: 850; letter-spacing: .1em; text-transform: uppercase; }
+    .phase h3 { margin: 5px 0 8px; }
+    .phase ul { margin-bottom: 0; }
+
+    .product-shot {
+      overflow: hidden;
+      margin: 20px 0 4px;
+      border: 1px solid #303946;
+      border-radius: 16px;
+      background: #131a23;
+      color: #e8eef6;
+      box-shadow: 0 24px 55px rgba(20, 24, 31, .18);
+      font-size: .82rem;
+    }
+    .window-bar {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 10px 13px;
+      border-bottom: 1px solid #303946;
+      background: #1b2430;
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #697485; }
+    .dot.red { background: #ff6b62; } .dot.amber { background: #ffc04d; } .dot.green { background: #37c85d; }
+    .window-title { margin-left: 8px; color: #aeb9c7; font-weight: 700; }
+    .panel-sim { display: grid; grid-template-columns: minmax(300px, 1fr) minmax(320px, .82fr); min-height: 390px; }
+    .chat-sim {
+      display: grid;
+      place-items: center;
+      padding: 28px;
+      border-right: 1px solid #303946;
+      background: linear-gradient(145deg, #161d27, #111821);
+      color: #8997a8;
+      text-align: center;
+    }
+    .utility-sim { min-width: 0; background: #17202b; }
+    .utility-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; margin: 10px; padding: 3px; border-radius: 8px; background: #0e151e; }
+    .utility-tabs span { padding: 5px; border-radius: 6px; color: #8d9aaa; text-align: center; }
+    .utility-tabs .selected { background: #2b3747; color: #f0f5fb; font-weight: 750; }
+    .search-sim { margin: 0 10px 9px; padding: 6px 9px; border: 1px solid #344052; border-radius: 7px; color: #aab5c4; background: #111923; }
+    .repo-sim { margin: 8px 10px; border: 1px solid #303b49; border-radius: 9px; overflow: hidden; }
+    .repo-head { display: flex; justify-content: space-between; gap: 8px; padding: 8px 9px; background: #202a37; font-weight: 760; }
+    .repo-meta { color: #93a0b0; font-weight: 550; }
+    .file-sim { padding: 7px 9px; border-top: 1px solid #2b3542; color: #cbd4df; }
+    .hunk-sim { display: grid; grid-template-columns: 28px 28px 18px 1fr auto; padding: 2px 9px; font: .78rem/1.45 var(--mono); }
+    .hunk-sim.add { background: #17362d; color: #8ee0bb; }
+    .hunk-sim.del { background: #3c242b; color: #ffafb7; }
+    .hunk-sim .num { color: #718094; }
+    .hunk-action { color: #9bb4ff; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      align-items: stretch;
+      gap: 9px;
+      margin: 18px 0;
+    }
+    .flow-step {
+      position: relative;
+      padding: 14px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface-soft);
+      text-align: center;
+      font-size: .87rem;
+    }
+    .flow-step:not(:last-child)::after {
+      content: "›";
+      position: absolute;
+      right: -8px;
+      top: 50%;
+      z-index: 2;
+      transform: translateY(-52%);
+      color: var(--blue);
+      font-size: 1.4rem;
+      font-weight: 900;
+    }
+    .flow-step strong { display: block; margin-bottom: 3px; color: var(--blue); }
+
+    .steps { list-style: none; padding: 0; counter-reset: step; }
+    .steps > li {
+      position: relative;
+      margin: 0;
+      padding: 5px 0 27px 62px;
+      counter-increment: step;
+    }
+    .steps > li::before {
+      content: counter(step);
+      position: absolute;
+      left: 0;
+      top: 6px;
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line));
+      border-radius: 13px;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-weight: 880;
+    }
+    .steps > li::after {
+      content: "";
+      position: absolute;
+      left: 20px;
+      top: 52px;
+      bottom: 7px;
+      width: 1px;
+      background: var(--line);
+    }
+    .steps > li:last-child::after { display: none; }
+    .steps h3 { margin: 6px 0 7px; }
+
+    details {
+      margin: 12px 0;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: var(--surface-soft);
+    }
+    summary { cursor: pointer; padding: 12px 14px; font-weight: 780; }
+    details > div { padding: 0 14px 14px; }
+
+    .checklist { list-style: none; padding: 0; }
+    .checklist li { position: relative; padding-left: 28px; }
+    .checklist li::before {
+      content: "□";
+      position: absolute;
+      left: 2px;
+      top: -.05em;
+      color: var(--blue);
+      font-size: 1.15rem;
+      font-weight: 800;
+    }
+
+    .tag {
+      display: inline-block;
+      margin: 3px 3px 3px 0;
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface-soft);
+      color: var(--muted);
+      font-size: .79rem;
+      font-weight: 710;
+    }
+
+    footer { padding: 28px 8px 0; color: var(--faint); font-size: .81rem; text-align: center; }
+
+    @media (max-width: 900px) {
+      .grid.three, .grid.four, .roadmap { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .panel-sim { grid-template-columns: 1fr; }
+      .chat-sim { display: none; }
+      .flow { grid-template-columns: 1fr; }
+      .flow-step:not(:last-child)::after { content: "⌄"; right: auto; left: 50%; top: auto; bottom: -15px; transform: translateX(-50%); }
+    }
+    @media (max-width: 640px) {
+      .page { width: min(100% - 18px, 1220px); padding-top: 9px; }
+      .hero { border-radius: 19px; }
+      .grid.two, .grid.three, .grid.four, .roadmap { grid-template-columns: 1fr; }
+      section { padding: 20px 17px; }
+      .toc { position: static; }
+      .journey-item { grid-template-columns: 38px minmax(0, 1fr); }
+      .journey-number { width: 36px; height: 36px; }
+      .steps > li { padding-left: 50px; }
+      .steps > li::before { width: 36px; height: 36px; }
+      .steps > li::after { left: 17px; top: 47px; }
+    }
+    @media print {
+      body { background: #fff; color: #111; }
+      .page { width: 100%; padding: 0; }
+      .hero, section { break-inside: avoid; box-shadow: none; }
+      .toc { position: static; }
+      details > div { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to report</a>
+  <main class="page" id="content">
+    <header class="hero">
+      <p class="eyebrow">Technical implementation report · 4 August 2026</p>
+      <h1>Right Utility Panel:<br>the complete Changes + Preview experience</h1>
+      <p class="subtitle">
+        RepoPrompt can now keep code review and document reading beside the agent conversation:
+        live Git diffs, safe file/hunk/line staging, multi-repository grouping, diff search,
+        semi-rendered Markdown, and locked-down HTML preview—without switching applications.
+      </p>
+      <div class="badges" aria-label="Implementation status">
+        <span class="badge good">✓ Phases 1–3 implemented</span>
+        <span class="badge good">✓ Both Oracle review lanes approved</span>
+        <span class="badge info">Phase 1–2 committed</span>
+        <span class="badge warn">Phase 3 remains local and unstaged</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Report sections">
+      <a href="#summary">Summary</a>
+      <a href="#expect">What to expect</a>
+      <a href="#tour">Visual tour</a>
+      <a href="#architecture">How it works</a>
+      <a href="#decisions">Major decisions</a>
+      <a href="#reviews">Review turns</a>
+      <a href="#validation">Validation</a>
+      <a href="#test-drive">Test drive</a>
+      <a href="#inventory">Inventory</a>
+      <a href="#risks">Limits</a>
+      <a href="#actions">Your actions</a>
+    </nav>
+
+    <section id="summary">
+      <h2>Executive summary</h2>
+      <p class="lead">
+        The original idea—a tasteful right sidebar for Git differences and Markdown/HTML output—has
+        become a full review surface designed for live agent work. The implementation is complete
+        through Phase 3 and has passed independent post-implementation reviews from both Oracle lanes.
+      </p>
+
+      <div class="grid four">
+        <article class="card">
+          <div class="label">Review</div>
+          <div class="value">Changes</div>
+          <p>Working-tree and vs-base diffs, staged/unstaged/conflict sections, split or unified presentation, context expansion, filters, and Viewed tracking.</p>
+        </article>
+        <article class="card">
+          <div class="label">Act</div>
+          <div class="value">Safe staging</div>
+          <p>Stage or unstage a file, a whole hunk, or selected changed lines, with fail-closed checks that prevent stale review content from authorizing a mutation.</p>
+        </article>
+        <article class="card">
+          <div class="label">Find</div>
+          <div class="value">Multi-root search</div>
+          <p>Every resolved repository appears as its own group. Literal search spans file paths and visible patch content across those groups.</p>
+        </article>
+        <article class="card">
+          <div class="label">Read</div>
+          <div class="value">Preview</div>
+          <p>Markdown can be read in Semi or Rendered form; HTML opens in an isolated WebKit preview with selectable source and carefully constrained script opt-in.</p>
+        </article>
+      </div>
+
+      <div class="callout warn">
+        <strong>Important delivery state</strong>
+        Commit <code>695a4e92</code> contains Phases 1 and 2. Phase 3 plus seven rounds of Lane A
+        hardening are still present only in the working tree: 30 modified tracked files and 18
+        untracked files, with nothing staged. Another checkout or machine will not receive Phase 3
+        until those files are intentionally committed and shared.
+      </div>
+
+      <div class="roadmap" aria-label="Implementation phases">
+        <article class="phase">
+          <div class="phase-label">Phase 1 · foundation</div>
+          <h3>The panel becomes useful</h3>
+          <ul>
+            <li>Responsive right-side shell</li>
+            <li>Live Git diff and file staging</li>
+            <li>Semi-rendered Markdown</li>
+            <li>Secure HTML preview</li>
+            <li>Agent-created artifact shortcut</li>
+          </ul>
+        </article>
+        <article class="phase">
+          <div class="phase-label">Phase 2 · review depth</div>
+          <h3>The experience becomes rich</h3>
+          <ul>
+            <li>Unified and split diffs</li>
+            <li>Viewed progress and filters</li>
+            <li>Intraline emphasis and gap expansion</li>
+            <li>Markdown images and navigation</li>
+            <li>Explicit HTML script opt-in</li>
+          </ul>
+        </article>
+        <article class="phase">
+          <div class="phase-label">Phase 3 · precision</div>
+          <h3>The panel becomes a workspace tool</h3>
+          <ul>
+            <li>Per-hunk and per-line staging</li>
+            <li>All repositories shown as groups</li>
+            <li>Cross-group diff search</li>
+            <li>Byte-exact patch authority</li>
+            <li>Final dual-Oracle hardening</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="expect">
+      <h2>What you can expect in the application</h2>
+      <p>
+        <span class="evidence-tag code">Observed in code</span>
+        The panel is mounted beside Agent Mode and uses a <strong>Changes | Preview</strong> switch.
+        It preserves the conversation’s protected width: wide windows dock the panel, while narrower
+        windows use a trailing overlay instead of crushing the transcript.
+      </p>
+
+      <div class="grid two">
+        <article class="card">
+          <h3>A review loop that stays in context</h3>
+          <ul>
+            <li>Open from the toolbar, View menu, or <kbd>⌥⌘0</kbd>.</li>
+            <li>Review live edits while the agent continues writing.</li>
+            <li>Expand files and hidden context without opening an editor.</li>
+            <li>Mark files Viewed and see when later edits invalidate that state.</li>
+            <li>Jump directly from an “agent wrote this document” banner to Preview.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>A panel that follows real workspace structure</h3>
+          <ul>
+            <li>Each repository or worktree is shown as a distinct ordered group.</li>
+            <li>Every group owns its checkout identity, activity state, capabilities, and base choice.</li>
+            <li>Unavailable agent worktrees never silently fall back to the main checkout.</li>
+            <li>Git offers index controls; Jujutsu degrades to read-only working-copy review.</li>
+            <li>Non-Git roots receive a clear friendly state rather than a broken panel.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Precise staging, not a second Git client</h3>
+          <ul>
+            <li>File-level controls remain the simplest path.</li>
+            <li>Hovering a safe hunk reveals Stage Hunk or Unstage Hunk.</li>
+            <li>Selectable changed lines gain quiet line controls and a single “Stage selected lines” action.</li>
+            <li>Unsafe structures—renames, copies, binary patches, conflicts, added/deleted files, and truncated diffs—do not pretend partial staging is available.</li>
+            <li>Section moves are never optimistic; the UI waits for authoritative Git refresh.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Documents that are pleasant to read</h3>
+          <ul>
+            <li><strong>Semi Markdown</strong> keeps source markers visible but subdued while applying readable typography.</li>
+            <li><strong>Rendered Markdown</strong> provides the familiar clean reading mode.</li>
+            <li>Wiki links, local document navigation, headings, and supported local media stay inside the preview workflow.</li>
+            <li><strong>Rendered HTML</strong> blocks scripts by default; Source shows selectable highlighted HTML.</li>
+            <li>Script execution is a one-document, explicit action with tighter navigation rules.</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="callout good">
+        <strong>The expected everyday benefit</strong>
+        When an agent edits several files and writes a final report, you can inspect the code,
+        selectively stage reviewed changes, search for a symbol or phrase, and read the report
+        alongside the conversation. The implementation reduces application switching; it does not
+        claim measured speed or memory improvements.
+      </div>
+    </section>
+
+    <section id="tour">
+      <h2>A compact visual tour</h2>
+      <p class="lead">
+        This schematic reflects the implemented information hierarchy rather than being a screenshot.
+        It shows the restrained, repository-grouped Changes view introduced by Phase 3.
+      </p>
+
+      <div class="product-shot" role="img" aria-label="Schematic of RepoPrompt conversation with a right Changes panel showing search, repository groups, and selectable diff lines">
+        <div class="window-bar">
+          <span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span>
+          <span class="window-title">RepoPrompt · Agent Mode</span>
+        </div>
+        <div class="panel-sim">
+          <div class="chat-sim">
+            <div>
+              <strong style="display:block;color:#d8e0ea;font-size:1.08rem">Conversation remains readable</strong>
+              The panel docks when there is room and overlays when there is not.
+            </div>
+          </div>
+          <div class="utility-sim">
+            <div class="utility-tabs"><span class="selected">Changes</span><span>Preview</span></div>
+            <div class="search-sim">⌕ Search paths and diffs · 3 of 18</div>
+            <div class="repo-sim">
+              <div class="repo-head"><span>RepoPrompt</span><span class="repo-meta">feature/panel</span></div>
+              <div class="file-sim">▾ AgentChangesRepository.swift <span style="float:right;color:#78d7a8">+24</span></div>
+              <div class="hunk-sim del"><span class="num">616</span><span class="num"></span><span>−</span><span>old scope check</span><span></span></div>
+              <div class="hunk-sim add"><span class="num"></span><span class="num">622</span><span>+</span><span>validate every mutation path</span><span class="hunk-action">Stage line</span></div>
+              <div class="hunk-sim add"><span class="num"></span><span class="num">623</span><span>+</span><span>re-check review authority</span><span>○</span></div>
+            </div>
+            <div class="repo-sim">
+              <div class="repo-head"><span>Documentation</span><span class="repo-meta">main</span></div>
+              <div class="file-sim">▸ docs/report.md <span style="float:right;color:#9bb4ff">2 matches</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <h3>Interaction details that matter</h3>
+      <div class="grid three">
+        <article class="card">
+          <div class="label">Quiet until useful</div>
+          <p>Hunk actions appear on hover or keyboard focus. Partial-line controls appear only where the patch compiler can safely represent the requested operation.</p>
+        </article>
+        <article class="card">
+          <div class="label">Keyboard stays local</div>
+          <p><kbd>⌘F</kbd> opens diff search only when focus is inside the utility panel, so the panel does not steal transcript search.</p>
+        </article>
+        <article class="card">
+          <div class="label">Responsive by design</div>
+          <p>The user-resizable panel is width-gated for split diffs and falls back to overlay presentation on narrow windows.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="architecture">
+      <h2>How it works, without the internal jargon</h2>
+      <p>
+        <span class="evidence-tag code">Observed in code</span>
+        The implementation separates what Git reports, what the user sees, and what may mutate the
+        index. That separation is the core safety and maintainability decision.
+      </p>
+
+      <div class="flow" aria-label="Changes data flow">
+        <div class="flow-step"><strong>1. Observe</strong>Git status and scoped file events detect repository state.</div>
+        <div class="flow-step"><strong>2. Group</strong>One repository actor owns each resolved checkout.</div>
+        <div class="flow-step"><strong>3. Project</strong>Raw diff data becomes files, hunks, lines, and search ranges.</div>
+        <div class="flow-step"><strong>4. Review</strong>The UI renders only target- and epoch-matched snapshots.</div>
+        <div class="flow-step"><strong>5. Mutate</strong>A reviewed token is revalidated inside the Git index lock.</div>
+      </div>
+
+      <h3>Changes data layer</h3>
+      <ul>
+        <li><code>AgentPanelCheckoutResolver</code> translates logical workspace roots and agent worktree bindings into explicit checkout targets.</li>
+        <li><code>AgentChangesPanelViewModel</code> owns a pool of checkout-local repository actors for the active tab; switching tabs tears the pool down so background tabs own no watchers.</li>
+        <li><code>AgentChangesRepository</code> combines porcelain-v2 status with lazy patches, search reads, review tokens, refresh events, and serialized staging operations.</li>
+        <li><code>GitDiffEngine</code>, <code>GitRawDiffFileSplitter</code>, and <code>DiffLineProjector</code> preserve raw bytes for authority while producing rich, Unicode-aware presentation models.</li>
+        <li><code>AgentChangesPartialPatchCompiler</code> is a bounded pure compiler for selected hunk or line patches; it never reconstructs authority from rendered text.</li>
+      </ul>
+
+      <h3>Preview data layer</h3>
+      <ul>
+        <li>The Markdown path decorates the original source string, preserving <code>output.string == source</code> in Semi mode so copy/paste round-trips by construction.</li>
+        <li>The HTML path uses a custom <code>repoprompt-preview://</code> scheme, a non-persistent WebKit data store, content-security policy, network-blocking rules, and a pure navigation policy.</li>
+        <li>Local HTML reads use a one-shot file-descriptor flow with containment checks before bytes are served, avoiding path re-open races.</li>
+        <li>Agent edit payloads are normalized outside the view layer so the “new report available” banner and transcript edit cards agree about document identity.</li>
+      </ul>
+
+      <details>
+        <summary>Why one repository actor per checkout?</summary>
+        <div>
+          <p>
+            It preserves generation fencing, cache ownership, mutation ordering, and watcher
+            lifecycle locally. A single multiplexed actor would serialize unrelated repositories
+            and make it easier for one group’s retarget or failure to corrupt another group’s state.
+          </p>
+        </div>
+      </details>
+      <details>
+        <summary>Why does search not authorize staging?</summary>
+        <div>
+          <p>
+            Search may load patches for collapsed files automatically. Machine-loading a patch is not
+            evidence that a person reviewed it, so search uses a separate cache and never mints the
+            review token required by partial staging.
+          </p>
+        </div>
+      </details>
+    </section>
+
+    <section id="decisions">
+      <h2>Major product and architecture decisions</h2>
+      <p class="lead">
+        The implementation moved through several consequential choices. These are the decisions a
+        future maintainer should preserve unless the product contract intentionally changes.
+      </p>
+
+      <div class="journey">
+        <article class="journey-item">
+          <div class="journey-number">1</div>
+          <div class="journey-body">
+            <h3>Use a custom responsive panel, not SwiftUI’s standard inspector</h3>
+            <p>
+              The obvious first option was <code>.inspector()</code>. The chosen custom layout better
+              supports programmatic deep links, per-window visibility, persisted resizable width,
+              font-scaled limits, and a narrow-window overlay while protecting transcript width.
+            </p>
+          </div>
+        </article>
+        <article class="journey-item">
+          <div class="journey-number">2</div>
+          <div class="journey-body">
+            <h3>Working Tree is the default; vs Base is explicit and first-class</h3>
+            <p>
+              Most immediate review happens against staged and unstaged work. But agents may commit
+              during a session, so vs Base shipped early rather than leaving the panel empty after
+              commits. Base selection is per repository and never silently inferred or fetched.
+            </p>
+          </div>
+        </article>
+        <article class="journey-item">
+          <div class="journey-number">3</div>
+          <div class="journey-body">
+            <h3>Semi-rendered Markdown is a source decorator, not a lossy renderer</h3>
+            <p>
+              The defining “Xcode-style” experience keeps <code>#</code>, <code>**</code>, backticks,
+              list markers, and quotes visible but tasteful. Styling the verbatim string means a range
+              mistake can miss styling, but cannot corrupt copied Markdown.
+            </p>
+          </div>
+        </article>
+        <article class="journey-item">
+          <div class="journey-number">4</div>
+          <div class="journey-body">
+            <h3>Agent-written HTML is treated as untrusted content</h3>
+            <p>
+              A plain local <code>WKWebView</code> would expose too much. The final boundary resolves
+              paths inside a permitted document root, blocks traversal and network loads, uses no
+              persistent website data, and disables scripts by default. In scripted mode, external
+              links are cancelled without even showing the browser prompt.
+            </p>
+          </div>
+        </article>
+        <article class="journey-item">
+          <div class="journey-number">5</div>
+          <div class="journey-body">
+            <h3>Content changes bypass Git-status fingerprints</h3>
+            <p>
+              Editing an already-modified file often leaves porcelain status unchanged. File events
+              therefore bypass the metadata fingerprint gate, invalidate affected patches, and
+              refresh within a bounded batching window. Without this, the most common agent edit could
+              leave the panel stale.
+            </p>
+          </div>
+        </article>
+        <article class="journey-item">
+          <div class="journey-number">6</div>
+          <div class="journey-body">
+            <h3>Partial staging was deliberately last and byte-exact</h3>
+            <p>
+              Hunk and line staging carries greater index risk than viewing or file-level staging.
+              Phase 3 retained Git’s raw bytes, limited eligibility to ordinary tracked same-path
+              modifications, and made review tokens the only staging authority. Whole hunks replay
+              Git bytes; selected lines alter only patch markers and hunk ranges.
+            </p>
+          </div>
+        </article>
+        <article class="journey-item">
+          <div class="journey-number">7</div>
+          <div class="journey-body">
+            <h3>Multi-root became grouped, not selected</h3>
+            <p>
+              The earlier root picker hid the workspace’s full state. Phase 3 removed it and shows
+              every resolved checkout in ordered groups, each with an independent base, status,
+              staging capability, worktree identity, and error state.
+            </p>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section id="reviews">
+      <h2>Major turns from the implementation reviews</h2>
+      <p>
+        <span class="evidence-tag session">Observed in session</span>
+        The implementation was reviewed after Phases 1–2 and again after Phase 3. Lane B found one
+        critical partial-patch edge case; Lane A later ran a fresh adversarial review and seven
+        fix/verification rounds. Both lanes ultimately returned <strong>APPROVED</strong>.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Finding or turn</th><th>Why it mattered</th><th>Final resolution</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Rename origin escaped represented scope</td>
+              <td>A rename into a workspace root could have staged the deletion of its origin outside that root.</td>
+              <td>Every mutation path is scope-validated; copy origins are observed but never mutated.</td>
+            </tr>
+            <tr>
+              <td>Continuous writes could starve refresh</td>
+              <td>A trailing debounce could postpone updates forever while an agent wrote faster than the debounce interval.</td>
+              <td>Batching retains debounce but forces a flush at a bounded maximum age; FSEvents history gaps trigger full resync.</td>
+            </tr>
+            <tr>
+              <td>HTML scheme-handler path re-open race</td>
+              <td>A symlink could change between containment validation and file reading.</td>
+              <td>Resolve, descriptor open, path verification, bounded read, and response happen as one operation.</td>
+            </tr>
+            <tr>
+              <td>No-newline partial-patch corruption</td>
+              <td>Git could accept a synthesized selected-line patch that glued two lines into index bytes the UI never displayed.</td>
+              <td>No-newline-annotated hunks are whole-hunk-only, with independent compiler refusal and real-Git integration tests.</td>
+            </tr>
+            <tr>
+              <td>Pathspec magic changed read meaning</td>
+              <td>A hostile-looking filename could make a diff read and later literal staging operation refer to different files.</td>
+              <td>Every diff read path now sets <code>GIT_LITERAL_PATHSPECS=1</code>, including large stdin path batches.</td>
+            </tr>
+            <tr>
+              <td>A→B→A async retarget race</td>
+              <td>Old work could arrive after the UI returned to an apparently identical target and be accepted.</td>
+              <td>A monotonic target epoch fences snapshots, patch keys, gaps, descriptors, and mutation requests.</td>
+            </tr>
+            <tr>
+              <td>Review authority could expire while waiting</td>
+              <td>Checks made before a slow status read or lock wait do not prove the same content is still authorized at mutation time.</td>
+              <td>The lease, target epoch, content revisions, HEAD identity, modes, blob IDs, and scoped porcelain identity are rechecked inside the index-mutation lock.</td>
+            </tr>
+            <tr>
+              <td>Search top-N and render costs</td>
+              <td>Early path hits could starve better patch matches; repeated sorting and scanning could scale poorly.</td>
+              <td>The cap applies to the merged corpus stream, results are bucketed per row, and selection survives incremental publication.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout good">
+        <strong>What “approved” means here</strong>
+        It means both independent review lanes found no remaining blocking defect within the supplied
+        scope after their fixes were verified. It does not replace a live visual smoke test, measured
+        performance work, or the repository’s contribution preflight.
+      </div>
+    </section>
+
+    <section id="validation">
+      <h2>Validation and testing evidence</h2>
+      <p>
+        <span class="evidence-tag test">Observed in tests</span>
+        The final review record reports all panel-focused suites green after the last hardening wave,
+        together with a clean coordinated build, lint, and non-mutating format check.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Check</th><th>Recorded result</th><th>What it covers</th></tr></thead>
+          <tbody>
+            <tr><td><code>make dev-build</code></td><td class="status-good">Passed</td><td>Swift package/application compilation after the final fix waves.</td></tr>
+            <tr><td><code>make dev-lint</code></td><td class="status-good">Passed</td><td>Repository lint rules for the changed source.</td></tr>
+            <tr><td><code>make dev-format-check</code></td><td class="status-good">Passed</td><td>Non-mutating Swift formatting validation.</td></tr>
+            <tr><td><code>AgentChangesRepositoryTests</code></td><td class="status-good">87 passed</td><td>Refresh, cache, authority, lifecycle, full-file staging, and concurrency gates.</td></tr>
+            <tr><td><code>AgentChangesRepositoryPartialStagingTests</code></td><td class="status-good">17 passed</td><td>Review tokens, hunk/line mutation preflight, drift, and eligibility.</td></tr>
+            <tr><td><code>GitBackendStagingTests</code></td><td class="status-good">19 passed</td><td>File-level Git index operations, literal paths, lock behavior, and edge filenames.</td></tr>
+            <tr><td><code>GitIndexPatchMutationIntegrationTests</code></td><td class="status-good">13 passed</td><td>Real-repository partial patch application, including no-newline corruption guards.</td></tr>
+            <tr><td><code>AgentChangesPanelViewModelTests</code></td><td class="status-good">25 passed</td><td>Targeting, snapshot acceptance, teardown, panel state, and mutation coordination.</td></tr>
+            <tr><td><code>AgentChangesPanelMultiRootViewModelTests</code></td><td class="status-good">14 passed</td><td>Repository pool, ordered groups, independent bases, and checkout-qualified state.</td></tr>
+            <tr><td><code>AgentChangesPanelSearchViewModelTests</code></td><td class="status-good">12 passed</td><td>Search orchestration, loading, navigation, expansion, and selected-match stability.</td></tr>
+            <tr><td><code>AgentChangesSearchEngineTests</code></td><td class="status-good">14 passed</td><td>Literal Unicode-aware matching, corpus ordering, budgets, and result caps.</td></tr>
+            <tr><td><code>AgentChangesPartialPatchCompilerTests</code></td><td class="status-good">11 passed</td><td>Safe byte-level compilation and fail-closed patch structure rules.</td></tr>
+            <tr><td><code>VCSIndexStatusEntryProjectionTests</code></td><td class="status-good">3 passed</td><td>Exact index identity used by staging authorization.</td></tr>
+            <tr><td>Feature test ledger</td><td class="status-good">Panel scope: 0 missing / 0 stale</td><td>Final ledger recorded 4,596 rows including header; global 267-missing/3-stale drift is pre-existing.</td></tr>
+            <tr><td>Oracle Lane B review</td><td class="status-good">Approved</td><td>Phase 3 post-implementation review and verification of its fix wave.</td></tr>
+            <tr><td>Oracle Lane A review</td><td class="status-good">Approved</td><td>Fresh independent adversarial review plus seven verification rounds.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>What was not established</h3>
+      <ul>
+        <li>No final live-app visual walkthrough is recorded after the complete Phase 3 fix series.</li>
+        <li>No measured performance benchmark exists for very large repositories, diff corpora, or documents.</li>
+        <li>A final full repository-wide test run after the last Lane A micro-fix is not explicitly recorded; the final targeted panel suites are recorded green. Earlier full-gate failures were reproduced at clean HEAD and treated as pre-existing, consistent with the user’s note that Git tests are known flaky.</li>
+        <li>This reporting pass does not relaunch the app or rerun the expensive Swift gate; it validates only the generated HTML document.</li>
+      </ul>
+    </section>
+
+    <section id="test-drive">
+      <h2>How to test and see the effect, step by step</h2>
+      <div class="callout danger">
+        <strong>Use disposable repositories for staging tests</strong>
+        The panel intentionally mutates Git’s index. Do not begin hunk/line staging experiments in a
+        checkout containing valuable unstaged work.
+      </div>
+
+      <ol class="steps">
+        <li>
+          <h3>Build and launch the current source</h3>
+          <p>From the RepoPrompt CE repository:</p>
+          <pre><code>make doctor
+make dev-build
+make dev-run</code></pre>
+          <p>
+            Launching the app yourself with <code>make dev-run</code> is the simplest path. An agent
+            must ask for explicit approval immediately before a visible launch or relaunch.
+          </p>
+        </li>
+
+        <li>
+          <h3>Create a disposable repository with two distant hunks</h3>
+          <p>Paste this in Terminal. It prints the path to open in RepoPrompt:</p>
+          <pre><code>DEMO="$(mktemp -d)/rpce-panel-demo"
+mkdir -p "$DEMO/Sources" "$DEMO/docs"
+cd "$DEMO"
+git init -b main
+git config user.name "RepoPrompt Panel Demo"
+git config user.email "panel-demo@example.invalid"
+
+python3 - &lt;&lt;'PY'
+from pathlib import Path
+Path("Sources/Greeting.swift").write_text(
+    "\n".join(f"let line{i} = {i}" for i in range(1, 31)) + "\n",
+    encoding="utf-8",
+)
+Path("docs/notes.md").write_text(
+    "# Linked note\n\nThis is a second document.\n",
+    encoding="utf-8",
+)
+PY
+
+git add .
+git commit -m "Base"
+git switch -c feature/panel-demo
+
+python3 - &lt;&lt;'PY'
+from pathlib import Path
+path = Path("Sources/Greeting.swift")
+lines = path.read_text(encoding="utf-8").splitlines()
+lines[4] = 'let line5 = "first changed hunk"'
+lines[24] = 'let line25 = "second changed hunk"'
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+
+cat &gt; docs/report.md &lt;&lt;'EOF'
+# Agent report
+
+## Summary
+
+- A readable **Markdown** document
+- A link to [[notes]]
+- Source markers remain copyable in Semi mode
+EOF
+
+git add docs/report.md
+printf '\nThis line was added after staging.\n' &gt;&gt; docs/report.md
+
+cat &gt; docs/report.html &lt;&lt;'EOF'
+&lt;!doctype html&gt;
+&lt;meta charset="utf-8"&gt;
+&lt;title&gt;Panel HTML demo&lt;/title&gt;
+&lt;style&gt;body { font: 18px system-ui; padding: 2rem }&lt;/style&gt;
+&lt;h1&gt;HTML report&lt;/h1&gt;
+&lt;p id="status"&gt;Scripts are blocked.&lt;/p&gt;
+&lt;p&gt;&lt;a href="https://example.com"&gt;External link&lt;/a&gt;&lt;/p&gt;
+&lt;script&gt;
+document.getElementById("status").textContent = "Local script ran.";
+&lt;/script&gt;
+EOF
+
+printf 'Demo workspace: %s\n' "$DEMO"
+git status --short</code></pre>
+          <p>
+            Expected setup: <code>Greeting.swift</code> has two unstaged hunks,
+            <code>report.md</code> appears in both Staged and Unstaged, and
+            <code>report.html</code> is untracked.
+          </p>
+        </li>
+
+        <li>
+          <h3>Open the panel and check responsive behavior</h3>
+          <p>
+            Open the printed demo folder as a RepoPrompt workspace root, then open an Agent Mode tab.
+            Click the right-sidebar toolbar icon, choose <strong>View → Utility Panel</strong>, or
+            press <kbd>⌥⌘0</kbd>.
+          </p>
+          <ul class="checklist">
+            <li>The panel offers <strong>Changes</strong> and <strong>Preview</strong>.</li>
+            <li>Dragging its left edge changes width; double-clicking resets it.</li>
+            <li>A wide window docks it; a narrow window overlays instead of over-compressing chat.</li>
+          </ul>
+        </li>
+
+        <li>
+          <h3>Review staged and unstaged changes</h3>
+          <p>
+            Keep <strong>Working Tree</strong> selected. Expand
+            <code>Sources/Greeting.swift</code> and <code>docs/report.md</code>.
+          </p>
+          <ul class="checklist">
+            <li>Staged, Unstaged, and Conflicts are distinct sections.</li>
+            <li><code>report.md</code> appears twice with different patches.</li>
+            <li>Unified mode shows old/new line-number gutters.</li>
+            <li>Split mode becomes available when the panel is sufficiently wide.</li>
+            <li>Expand-context controls reveal hidden lines without changing staging authority.</li>
+            <li>Viewed progress changes when you mark a file and becomes stale after another edit.</li>
+          </ul>
+        </li>
+
+        <li>
+          <h3>Try literal in-diff search</h3>
+          <p>
+            Click inside the panel and press <kbd>⌘F</kbd>. Search for
+            <code>changed hunk</code>, then use Return or <kbd>⌘G</kbd> to advance and Shift variants
+            to go back.
+          </p>
+          <ul class="checklist">
+            <li>Matches span file paths and patch text.</li>
+            <li>Navigation wraps and auto-expands matching collapsed files temporarily.</li>
+            <li>The current result is visually distinct from other matches.</li>
+            <li>Clearing search restores search-owned expansion without collapsing files you opened manually.</li>
+            <li>Search inside the panel does not hijack search when focus is in the transcript.</li>
+          </ul>
+        </li>
+
+        <li>
+          <h3>Stage one hunk, then selected lines</h3>
+          <p>
+            Hover the first hunk header in <code>Greeting.swift</code> and choose
+            <strong>Stage Hunk</strong>. For a different safe hunk, select individual changed lines
+            and choose <strong>Stage selected lines</strong>. Inspect Git after each action:
+          </p>
+          <pre><code>cd "$DEMO"
+git diff -- Sources/Greeting.swift
+git diff --cached -- Sources/Greeting.swift
+git status --short</code></pre>
+          <ul class="checklist">
+            <li>Only the chosen hunk or lines move into the index.</li>
+            <li>Unselected working-tree content remains untouched.</li>
+            <li>The panel waits for authoritative refresh before moving rows.</li>
+            <li>The corresponding Staged row offers Unstage Hunk/selected lines.</li>
+          </ul>
+        </li>
+
+        <li>
+          <h3>Verify stale-review refusal</h3>
+          <p>
+            Expand and review a remaining patch, then edit the file from Terminal before clicking a
+            staging action:
+          </p>
+          <pre><code>printf '\n// changed after review\n' &gt;&gt; "$DEMO/Sources/Greeting.swift"</code></pre>
+          <p>
+            Expected: the reviewed authority is revoked; the panel refreshes or refuses the action
+            instead of staging content that was not displayed under that review token.
+          </p>
+        </li>
+
+        <li>
+          <h3>Verify vs Base</h3>
+          <p>
+            Switch to <strong>vs Base</strong>, explicitly choose <code>main</code>, and inspect the
+            flat comparison. Try <strong>Custom revision…</strong> with <code>HEAD~1</code>.
+          </p>
+          <ul class="checklist">
+            <li>No base is silently selected for you.</li>
+            <li>Staging controls disappear in read-only vs-Base mode.</li>
+            <li>An invalid revision affects only its repository group.</li>
+          </ul>
+        </li>
+
+        <li>
+          <h3>Read Markdown without leaving the app</h3>
+          <p>
+            Switch to <strong>Preview</strong>, find <code>docs/report.md</code>, and compare
+            <strong>Semi</strong> with <strong>Rendered</strong>.
+          </p>
+          <ul class="checklist">
+            <li>Semi mode shows readable typography while keeping Markdown markers visible.</li>
+            <li>Copying the entire Semi document reproduces valid original Markdown.</li>
+            <li>The heading outline navigates to “Summary.”</li>
+            <li><code>[[notes]]</code> opens the linked document within the preview workflow.</li>
+          </ul>
+        </li>
+
+        <li>
+          <h3>Verify the secure HTML modes</h3>
+          <p>Open <code>docs/report.html</code>.</p>
+          <ul class="checklist">
+            <li>Default Rendered mode leaves the text as <strong>Scripts are blocked.</strong></li>
+            <li>An external link requires confirmation only while scripts are disabled.</li>
+            <li>Source mode shows selectable HTML source.</li>
+            <li>After <strong>Run scripts → Enable once</strong>, the text changes to <strong>Local script ran.</strong></li>
+            <li>While scripts are enabled, the external link does nothing and cannot summon a browser prompt.</li>
+            <li>Navigating away and back clears the one-document script grant.</li>
+          </ul>
+        </li>
+
+        <li>
+          <h3>Add a second repository to see multi-root grouping</h3>
+          <p>Create another disposable repository:</p>
+          <pre><code>DEMO_TWO="$(mktemp -d)/rpce-panel-second"
+mkdir -p "$DEMO_TWO"
+cd "$DEMO_TWO"
+git init -b main
+git config user.name "RepoPrompt Panel Demo"
+git config user.email "panel-demo@example.invalid"
+printf 'second repository\n' &gt; README.md
+git add README.md
+git commit -m "Base"
+printf 'new local line\n' &gt;&gt; README.md
+printf 'Second repository: %s\n' "$DEMO_TWO"</code></pre>
+          <p>
+            Add both demo folders as roots in the same RepoPrompt workspace/session context.
+            Expected: Changes renders two ordered repository headers at once, each with its own
+            checkout identity, activity, explicit base, counts, and staging controls. Search for
+            <code>new local line</code> to jump across groups.
+          </p>
+        </li>
+
+        <li>
+          <h3>Finish with edge states</h3>
+          <ul class="checklist">
+            <li>Open a non-Git folder and confirm the friendly state.</li>
+            <li>Use a Git repository before its first commit and verify unborn-HEAD staging.</li>
+            <li>Use an agent-bound worktree and confirm there is no silent main-checkout fallback.</li>
+            <li>Create a disposable merge conflict and confirm ordinary partial controls are unavailable.</li>
+            <li>Ask an agent to create or overwrite a new Markdown/HTML report and use the Changes banner’s <strong>View →</strong> deep link.</li>
+          </ul>
+        </li>
+      </ol>
+    </section>
+
+    <section id="inventory">
+      <h2>Change inventory and delivery state</h2>
+      <p>
+        <span class="evidence-tag code">Observed in Git</span>
+        The feature spans a committed foundation and a local Phase 3 delta. The counts below describe
+        repository state before this report file was created.
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Git state</th><th>Area</th><th>Count / size</th><th>Role</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><span class="status-good">Committed</span><br><code>695a4e92</code></td>
+              <td>Phases 1–2</td>
+              <td class="nowrap">139 files<br>+32,653 / −381</td>
+              <td>Panel shell, live Changes experience, file staging, Preview, security boundary, Phase 2 review depth, tests, fixtures, and the August 2 report.</td>
+            </tr>
+            <tr>
+              <td><span class="status-local">Modified, unstaged</span></td>
+              <td><code>Sources/RepoPrompt/Features</code></td>
+              <td>17 tracked files</td>
+              <td>Multi-root pool, checkout-qualified state, search orchestration, partial staging authority, and presentation cutover.</td>
+            </tr>
+            <tr>
+              <td><span class="status-local">Modified, unstaged</span></td>
+              <td><code>Sources/RepoPrompt/Infrastructure</code></td>
+              <td>5 tracked files</td>
+              <td>Raw diff data, literal Git reads, index authorization, and mutation implementation.</td>
+            </tr>
+            <tr>
+              <td><span class="status-local">Untracked</span></td>
+              <td>Feature + infrastructure source</td>
+              <td>9 files</td>
+              <td>Group/search/partial-staging models and services, group/search UI, raw patch codec and splitter.</td>
+            </tr>
+            <tr>
+              <td><span class="status-local">Modified, unstaged</span></td>
+              <td><code>Tests/RepoPromptTests</code></td>
+              <td>7 tracked files</td>
+              <td>Expanded existing contracts for view model, repository, presentation, staging, and state.</td>
+            </tr>
+            <tr>
+              <td><span class="status-local">Untracked</span></td>
+              <td><code>Tests/RepoPromptTests</code></td>
+              <td>9 files</td>
+              <td>New multi-root, search, raw-patch, partial-compiler, and real-Git integration suites/support.</td>
+            </tr>
+            <tr>
+              <td><span class="status-local">Modified, unstaged</span></td>
+              <td>Test ledger</td>
+              <td>1 file</td>
+              <td>Surgically reconciled entries for the affected contracts.</td>
+            </tr>
+            <tr>
+              <td><span class="status-open">Ignored local docs</span></td>
+              <td><code>docs/plans/</code></td>
+              <td>2 design records</td>
+              <td>The August 1 adjudicated design and August 3 Phase 3 plan exist locally but are ignored by <code>.gitignore</code>.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Operational and integration impact</h3>
+      <ul>
+        <li><strong>Dependencies:</strong> no third-party dependency or lockfile change is observed; HTML uses the system WebKit framework.</li>
+        <li><strong>Configuration:</strong> no new environment variable, secret, or release setting is observed.</li>
+        <li><strong>Database/migration:</strong> none.</li>
+        <li><strong>Public API:</strong> internal VCS capability and mutation seams expand; no external service API is described as changed.</li>
+        <li><strong>Persistence:</strong> per-tab compare/group/search/review state stays non-durable; preferred panel width persists in existing settings.</li>
+        <li><strong>Runtime:</strong> the active tab owns one changes repository actor and watcher per resolved checkout; background tabs own none.</li>
+        <li><strong>Backend compatibility:</strong> Git provides staging; Jujutsu remains review-only through capability checks.</li>
+      </ul>
+    </section>
+
+    <section id="risks">
+      <h2>Known limits, residual risk, and technical debt</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Item</th><th>Status</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>Independent external Git process between final status check and mutation spawn</td>
+              <td class="status-open">Accepted residual risk</td>
+              <td>
+                Another terminal or agent can theoretically write the index in the milliseconds
+                between the inside-lock identity check and the panel’s Git command. Eliminating this
+                requires a temporary <code>GIT_INDEX_FILE</code> transaction and manual lock install,
+                a larger architecture with its own corruption risk. Both orchestration and Lane A
+                accepted deferral unless real-world reports justify it.
+              </td>
+            </tr>
+            <tr>
+              <td>Final visual polish</td>
+              <td class="status-open">Manual pass needed</td>
+              <td>Automated tests cannot prove hover subtlety, typography, light/dark balance, panel transitions, Reduce Motion, or all font presets.</td>
+            </tr>
+            <tr>
+              <td>Large-repository performance</td>
+              <td class="status-open">Bounded, not benchmarked</td>
+              <td>Search and lazy patch reads have concurrency/byte/result limits, but no measured latency, scrolling, CPU, or memory data is recorded.</td>
+            </tr>
+            <tr>
+              <td>Third diff counter walker</td>
+              <td class="status-open">Deferred debt</td>
+              <td><code>GitDiffSnapshotStore.parseDeepArtifacts</code> still has a separate counter walk without golden coverage; lock its output before consolidating.</td>
+            </tr>
+            <tr>
+              <td>Content-event ignore rules</td>
+              <td class="status-open">Partial</td>
+              <td><code>.git/</code> paths are filtered and revision state is pruned, but complete build-artifact ignore filtering remains follow-up work.</td>
+            </tr>
+            <tr>
+              <td>Non-UTF-8 Git paths</td>
+              <td class="status-open">Fail-closed by design</td>
+              <td>Undecodable porcelain paths produce a typed safety error rather than risk staging the wrong file.</td>
+            </tr>
+            <tr>
+              <td>Repository-wide ledger debt</td>
+              <td class="status-open">Pre-existing</td>
+              <td>The panel’s suites are reconciled; the final record still reports 267 missing and 3 stale rows elsewhere.</td>
+            </tr>
+            <tr>
+              <td>HTML report guardrail</td>
+              <td class="status-open">Pre-existing policy conflict</td>
+              <td>The session recorded <code>make guardrails</code> failing at clean feature HEAD because the tracked August 2 HTML report is not accepted by current source-layout guardrails. This new requested HTML page may need the same maintainer decision before commit.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <strong>No broad safety claim</strong>
+        The design narrows and tests the panel’s mutation and HTML boundaries. It does not make
+        arbitrary Git concurrency or arbitrary untrusted HTML universally safe, and it does not
+        replace normal repository backups, review, or contribution gates.
+      </div>
+    </section>
+
+    <section id="actions">
+      <h2>Action items for you</h2>
+
+      <h3>Recommended next</h3>
+      <ol>
+        <li>
+          <strong>Run the manual smoke path above.</strong>
+          Focus first on multi-root grouping, hunk/line staging in both directions, search navigation,
+          live refresh, Markdown copy round-trip, and scripted/no-script HTML link behavior.
+        </li>
+        <li>
+          <strong>Review the Phase 3 working-tree diff before staging.</strong>
+          It currently consists of 30 modified tracked files and 18 untracked source/test files.
+          Nothing is staged, so the remote branch still lacks Phase 3.
+        </li>
+        <li>
+          <strong>Resolve the HTML-report guardrail policy.</strong>
+          Decide whether technical HTML reports should be explicitly permitted by source-layout
+          guardrails, or whether this page and the August 2 page should remain local artifacts.
+        </li>
+        <li>
+          <strong>Decide whether the ignored design records should ship.</strong>
+          Both <code>docs/plans/right-utility-panel-2026-08-01.md</code> and
+          <code>right-utility-panel-phase3-2026-08-03.md</code> contain maintainability-critical
+          reasoning but are ignored by repository policy. Move distilled durable facts to the owning
+          routed document if maintainers need them.
+        </li>
+      </ol>
+
+      <h3>At the commit boundary</h3>
+      <ul>
+        <li>Read <code>.agents/skills/rpce-contribution-check/SKILL.md</code> immediately before commit.</li>
+        <li>Stage only intended Phase 3 files and any explicitly accepted report/documentation files.</li>
+        <li>Run <code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code>, and rerun it after every staging change.</li>
+        <li>Do not include local investigation artifacts or ignored plans by accident.</li>
+      </ul>
+
+      <h3>Do not prioritize unless evidence changes</h3>
+      <p>
+        The temporary-index transaction for the external-process TOCTOU window is intentionally not
+        recommended now. Revisit it only if a reproducible real-world index-overwrite report appears.
+      </p>
+    </section>
+
+    <section id="evidence">
+      <h2>Evidence, provenance, and limitations</h2>
+      <ul>
+        <li><strong>Session context:</strong> available through the supplied continuation transcript, including the original request, design duel, implementation waves, review findings, fixes, user steering, and recorded validation.</li>
+        <li><strong>Git baseline:</strong> the Phase 1–2 commit is identifiable as <code>695a4e92</code>; current Phase 3 state is observable in the working tree.</li>
+        <li><strong>Design records:</strong> the local August 1 design record and August 3 Phase 3 plan were inspected. Both are ignored by Git.</li>
+        <li><strong>Code inspection:</strong> current grouped Changes UI, search UI, hunk/line controls, repository actor, VCS mutation seam, and relevant tests were inspected.</li>
+        <li><strong>Validation provenance:</strong> build/test/lint results above come from the implementation and review records. They were not rerun during this report-only pass.</li>
+        <li><strong>Unknown:</strong> total elapsed implementation duration, final live visual quality, and measured performance.</li>
+        <li><strong>Report scope:</strong> this page summarizes the coherent three-phase feature. It does not attempt to document unrelated repository work outside commit <code>695a4e92</code> and the observable Phase 3 delta.</li>
+      </ul>
+
+      <h3>Metrics</h3>
+      <div class="grid four">
+        <article class="card">
+          <div class="label">Committed foundation</div>
+          <div class="value">139 files</div>
+          <p>Phase 1–2 commit: +32,653 / −381.</p>
+        </article>
+        <article class="card">
+          <div class="label">Local Phase 3 delta</div>
+          <div class="value">48 files</div>
+          <p>30 modified + 18 untracked; +14,832 / −1,581 in RepoPrompt’s diff inventory before this report.</p>
+        </article>
+        <article class="card">
+          <div class="label">Final focused tests</div>
+          <div class="value">215</div>
+          <p>Sum of the ten final panel-suite counts recorded in the Lane A review summary.</p>
+        </article>
+        <article class="card">
+          <div class="label">Review status</div>
+          <div class="value">2 approvals</div>
+          <p>Independent Lane A and Lane B post-implementation approvals.</p>
+        </article>
+      </div>
+
+      <div class="callout">
+        <strong>How to read evidence labels</strong>
+        “Observed in code” means directly visible in current source; “Observed in tests” means reported
+        command/suite evidence; “Observed in session” means captured user/agent/reviewer history.
+        Product-benefit statements are expectations from those mechanisms, not measured outcomes.
+      </div>
+    </section>
+
+    <footer>
+      Generated from repository state and AI-agent coding-session evidence on 2026-08-04.
+      This self-contained report loads no external assets and contains no executable scripts.
+    </footer>
+  </main>
+</body>
+</html>

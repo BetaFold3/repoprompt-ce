@@ -59,6 +59,7 @@ struct AgentChangesFilterPillsView: View {
                     .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
+                .hoverTooltip("Show \(filter.title.lowercased()) files across repositories")
                 .accessibilityLabel("\(filter.title), \(counts.count(for: filter)) files")
                 .accessibilityValue(selected == filter ? "selected" : "not selected")
             }

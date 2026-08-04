@@ -136,6 +136,18 @@ struct AgentChangesFileRow: Equatable, Identifiable {
     /// Porcelain's working-tree status character, or nil when the record carries no XY pair.
     let workTreeStatus: Character?
 
+    /// The modes and HEAD blob captured with the reviewed porcelain row.
+    let headMode: String?
+    let indexMode: String?
+    let headOID: String?
+
+    /// The blob object ID recorded in the index when the reviewed porcelain row was built.
+    let indexOID: String?
+
+    /// The repository HEAD captured by the same porcelain read.
+    let repositoryHeadIdentity: String
+    let isMutationIdentityRepresentable: Bool
+
     let isUntracked: Bool
     let isConflicted: Bool
 
@@ -164,6 +176,12 @@ struct AgentChangesFileRow: Equatable, Identifiable {
         section: AgentChangesSectionKind,
         indexStatus: Character?,
         workTreeStatus: Character?,
+        headMode: String? = nil,
+        indexMode: String? = nil,
+        headOID: String? = nil,
+        indexOID: String? = nil,
+        repositoryHeadIdentity: String = "(initial)",
+        isMutationIdentityRepresentable: Bool = true,
         isUntracked: Bool,
         isConflicted: Bool,
         additions: Int?,
@@ -179,6 +197,12 @@ struct AgentChangesFileRow: Equatable, Identifiable {
         self.section = section
         self.indexStatus = indexStatus
         self.workTreeStatus = workTreeStatus
+        self.headMode = headMode
+        self.indexMode = indexMode
+        self.headOID = headOID
+        self.indexOID = indexOID
+        self.repositoryHeadIdentity = repositoryHeadIdentity
+        self.isMutationIdentityRepresentable = isMutationIdentityRepresentable
         self.isUntracked = isUntracked
         self.isConflicted = isConflicted
         self.additions = additions
@@ -186,6 +210,23 @@ struct AgentChangesFileRow: Equatable, Identifiable {
         self.hasCounterpartSection = hasCounterpartSection
         self.contentRevision = contentRevision
         self.isMutationScopeSafe = isMutationScopeSafe
+    }
+
+    var statusEntry: VCSIndexStatusEntry {
+        VCSIndexStatusEntry(
+            path: path,
+            originalPath: originalPath,
+            indexStatus: indexStatus,
+            workTreeStatus: workTreeStatus,
+            headMode: headMode,
+            indexMode: indexMode,
+            headOID: headOID,
+            indexOID: indexOID,
+            isUntracked: isUntracked,
+            isConflicted: isConflicted,
+            repositoryHeadIdentity: repositoryHeadIdentity,
+            isMutationIdentityRepresentable: isMutationIdentityRepresentable
+        )
     }
 
     var identity: VCSIndexPathIdentity {
@@ -469,6 +510,10 @@ struct AgentChangesSnapshot: Equatable {
     /// generation are dropped rather than published.
     let generation: UInt64
 
+    /// View-model targeting epoch that produced this snapshot. Unlike target/mode identity, this
+    /// remains distinct across an A → B → A retarget.
+    let targetRequestID: UInt64
+
     let target: AgentPanelResolvedCheckout?
     let mode: AgentChangesCompareMode
     let sections: [AgentChangesSection]
@@ -493,6 +538,7 @@ struct AgentChangesSnapshot: Equatable {
 
     init(
         generation: UInt64,
+        targetRequestID: UInt64 = 0,
         target: AgentPanelResolvedCheckout?,
         mode: AgentChangesCompareMode,
         sections: [AgentChangesSection],
@@ -504,6 +550,7 @@ struct AgentChangesSnapshot: Equatable {
         fingerprint: GitDiffFingerprint? = nil
     ) {
         self.generation = generation
+        self.targetRequestID = targetRequestID
         self.target = target
         self.mode = mode
         self.sections = sections
@@ -642,7 +689,20 @@ enum AgentChangesRefreshTrigger: Equatable {
 enum AgentChangesMutationOutcome: Equatable {
     /// The index now matches the request because it already did. No Git ran.
     case noOp
-    case applied
+    /// The reviewed mutation reached the index. The associated bit distinguishes a later observed
+    /// content move while preserving exhaustive Phase-2 switches that intentionally match `.applied`.
+    case applied(contentChanged: Bool)
+
+    /// An apply that completed without a later observed content revision.
+    static var applied: AgentChangesMutationOutcome {
+        .applied(contentChanged: false)
+    }
+
+    /// The reviewed bytes reached the index, then a later content revision was observed.
+    static var appliedThenContentChanged: AgentChangesMutationOutcome {
+        .applied(contentChanged: true)
+    }
+
     /// The file changed on disk between the render the user reviewed and the click. The panel
     /// refreshes instead of staging content nobody has seen.
     case contentChanged
@@ -653,7 +713,8 @@ enum AgentChangesMutationOutcome: Equatable {
     case failed(String)
 
     var didMutate: Bool {
-        self == .applied
+        if case .applied = self { return true }
+        return false
     }
 }
 
@@ -661,15 +722,22 @@ enum AgentChangesMutationOutcome: Equatable {
 struct AgentChangesResolveRequest: Equatable {
     let identity: VCSIndexPathIdentity
     let expectedContentRevision: UInt64
+    let targetRequestID: UInt64
 
-    init(row: AgentChangesFileRow) {
+    init(row: AgentChangesFileRow, targetRequestID: UInt64 = 0) {
         identity = row.identity
         expectedContentRevision = row.contentRevision
+        self.targetRequestID = targetRequestID
     }
 
-    init(identity: VCSIndexPathIdentity, expectedContentRevision: UInt64) {
+    init(
+        identity: VCSIndexPathIdentity,
+        expectedContentRevision: UInt64,
+        targetRequestID: UInt64 = 0
+    ) {
         self.identity = identity
         self.expectedContentRevision = expectedContentRevision
+        self.targetRequestID = targetRequestID
     }
 }
 
@@ -680,17 +748,26 @@ struct AgentChangesMutationRequest: Equatable {
     /// The content revision the reviewed row carried. The preflight rejects the mutation when the
     /// file has moved on since.
     let expectedContentRevision: UInt64
+    /// The repository-target epoch that displayed the reviewed row.
+    let targetRequestID: UInt64
 
-    init(row: AgentChangesFileRow, stage: Bool) {
+    init(row: AgentChangesFileRow, stage: Bool, targetRequestID: UInt64 = 0) {
         identity = row.identity
         self.stage = stage
         expectedContentRevision = row.contentRevision
+        self.targetRequestID = targetRequestID
     }
 
-    init(identity: VCSIndexPathIdentity, stage: Bool, expectedContentRevision: UInt64) {
+    init(
+        identity: VCSIndexPathIdentity,
+        stage: Bool,
+        expectedContentRevision: UInt64,
+        targetRequestID: UInt64 = 0
+    ) {
         self.identity = identity
         self.stage = stage
         self.expectedContentRevision = expectedContentRevision
+        self.targetRequestID = targetRequestID
     }
 }
 
@@ -704,12 +781,20 @@ struct AgentChangesBulkMutationRequest: Equatable {
     let section: AgentChangesSectionKind
     let stage: Bool
     let reviewed: [ReviewedIdentity]
+    /// The repository-target epoch that displayed the reviewed section.
+    let targetRequestID: UInt64
 
-    init(section: AgentChangesSectionKind, stage: Bool, rows: [AgentChangesFileRow]) {
+    init(
+        section: AgentChangesSectionKind,
+        stage: Bool,
+        rows: [AgentChangesFileRow],
+        targetRequestID: UInt64 = 0
+    ) {
         self.section = section
         self.stage = stage
         reviewed = rows.map {
             ReviewedIdentity(identity: $0.identity, contentRevision: $0.contentRevision)
         }
+        self.targetRequestID = targetRequestID
     }
 }

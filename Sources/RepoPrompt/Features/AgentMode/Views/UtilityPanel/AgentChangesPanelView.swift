@@ -1,46 +1,85 @@
 import AppKit
 import SwiftUI
 
-/// The Changes segment.
-///
-/// Three bands: fixed chrome that says what is being compared, a scrolling file list, and a fixed
-/// footer that says how much and how fresh. The header and footer do not scroll because both answer
-/// questions about the list as a whole — a diff read without its compare mode in view is a diff
-/// that can be misread, and a refresh control that has scrolled away is a control the user cannot
-/// find at the moment they doubt what they are seeing.
+/// The Changes segment: fixed global compare/search chrome, one ordered multi-repository list, and
+/// an aggregate footer. All row actions are checkout-qualified at the call site.
 struct AgentChangesPanelView: View {
     @ObservedObject var viewModel: AgentChangesPanelViewModel
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    @State private var searchFocusRequest = 0
+    @State private var searchResignRequest = 0
 
     private enum Layout {
         static let chromeSpacing: CGFloat = 8
         static let horizontalPadding: CGFloat = 10
         static let listBottomPadding: CGFloat = 8
         static let emptyStateTopPadding: CGFloat = 4
+        static let groupTopPadding: CGFloat = 5
+        static let navigationDuration: Double = 0.16
     }
 
-    /// The list flattened into one sequence of pinned sections.
-    ///
-    /// Section headers and file headers share one level on purpose: SwiftUI pins the most recent
-    /// section header, so a flat sequence gives exactly the behavior the design asks for — the
-    /// group header sticks until the first file arrives, then each file header sticks while its own
-    /// hunks scroll past. Nesting sections would pin two headers on top of each other instead.
+    /// One flat sequence keeps only the most recent repository/section/file header pinned. That
+    /// avoids stacked sticky chrome while preserving group order and file identity through a patch.
     private enum Entry: Identifiable {
-        case section(AgentChangesSection)
-        case file(AgentChangesFileRow)
+        case group(AgentChangesGroupState)
+        case section(AgentChangesGroupID, AgentChangesSection)
+        case file(AgentChangesGroupID, AgentChangesFileRow)
+        case groupEmpty(AgentChangesGroupState, AgentChangesEmptyState)
+        case filteredEmpty(AgentChangesGroupID, String)
+        case blocked(AgentPanelBlockedCheckout)
 
         var id: String {
             switch self {
-            case let .section(section): "section:\(section.id)"
-            case let .file(row): "file:\(row.id)"
+            case let .group(group):
+                "group:\(group.id.targetKey)"
+            case let .section(groupID, section):
+                "section:\(groupID.targetKey):\(section.id)"
+            case let .file(groupID, row):
+                "file:\(groupID.targetKey):\(row.id)"
+            case let .groupEmpty(group, state):
+                "empty:\(group.id.targetKey):\(String(describing: state))"
+            case let .filteredEmpty(groupID, message):
+                "filtered:\(groupID.targetKey):\(message)"
+            case let .blocked(blocked):
+                "blocked:\(blocked.logicalRoot.path)"
             }
         }
     }
 
-    private var entries: [Entry] {
-        viewModel.visibleSections.flatMap { section in
-            [Entry.section(section)] + section.rows.map(Entry.file)
+    private var orderedEntries: [Entry] {
+        guard let resolution = viewModel.resolution else { return [] }
+        let groupsByID = Dictionary(uniqueKeysWithValues: viewModel.groups.map { ($0.id, $0) })
+        var entries: [Entry] = []
+
+        for item in resolution.items {
+            switch item {
+            case let .blocked(blocked):
+                entries.append(.blocked(blocked))
+            case let .resolved(target):
+                let groupID = AgentChangesGroupID(target: target)
+                guard let group = groupsByID[groupID] else { continue }
+                entries.append(.group(group))
+
+                if let emptyState = viewModel.emptyState(for: groupID) {
+                    entries.append(.groupEmpty(group, emptyState))
+                } else if let message = viewModel.filteredEmptyMessage(for: groupID) {
+                    entries.append(.filteredEmpty(groupID, message))
+                } else {
+                    for section in viewModel.visibleSections(for: groupID) {
+                        entries.append(.section(groupID, section))
+                        entries.append(contentsOf: section.rows.map { .file(groupID, $0) })
+                    }
+                }
+            }
         }
+        return entries
+    }
+
+    private var globalEmptyState: AgentChangesEmptyState? {
+        guard let resolution = viewModel.resolution else { return .loading }
+        return resolution.items.isEmpty ? .noWorkspaceRoot : nil
     }
 
     var body: some View {
@@ -52,9 +91,8 @@ struct AgentChangesPanelView: View {
                 chrome(isSplitViewAvailable: splitAvailable)
                 list
                 AgentChangesFooterView(
-                    snapshot: viewModel.snapshot,
+                    summary: viewModel.footerSummary,
                     viewedProgress: viewModel.viewedProgress,
-                    lastRefreshedAt: viewModel.lastRefreshedAt,
                     isRefreshing: viewModel.isRefreshing,
                     statusMessage: viewModel.statusMessage,
                     onRefresh: { viewModel.refresh() },
@@ -62,6 +100,15 @@ struct AgentChangesPanelView: View {
                 )
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .overlay {
+                AgentChangesPanelKeyCommandBridge(
+                    isSearchActive: !viewModel.searchState.query.isEmpty,
+                    onFocusSearch: { searchFocusRequest &+= 1 },
+                    onNext: { viewModel.selectNextSearchMatch() },
+                    onPrevious: { viewModel.selectPreviousSearchMatch() },
+                    onEscape: clearSearchAndResign
+                )
+            }
             .onAppear {
                 enforceWidthGate(isSplitViewAvailable: splitAvailable)
             }
@@ -75,6 +122,11 @@ struct AgentChangesPanelView: View {
         if !isSplitViewAvailable, viewModel.panel.diffViewMode == .split {
             viewModel.selectDiffViewMode(.unified)
         }
+    }
+
+    private func clearSearchAndResign() {
+        viewModel.clearSearch()
+        searchResignRequest &+= 1
     }
 
     // MARK: - Chrome
@@ -91,21 +143,10 @@ struct AgentChangesPanelView: View {
 
             AgentChangesHeaderView(
                 compareSelection: viewModel.panel.compareSelection,
-                baseBranch: viewModel.panel.baseBranchOverride,
-                baseBranchCandidates: viewModel.baseBranchCandidates,
-                targets: viewModel.availableTargets,
-                activeTarget: viewModel.activeTarget,
                 diffViewMode: viewModel.panel.diffViewMode,
                 isSplitViewAvailable: isSplitViewAvailable,
-                customRevisionEditor: viewModel.customRevisionEditor,
                 onSelectCompare: { viewModel.selectCompare($0) },
-                onSelectDiffViewMode: { viewModel.selectDiffViewMode($0) },
-                onSelectBaseBranch: { viewModel.selectBaseBranch($0) },
-                onBeginCustomRevision: { viewModel.beginCustomRevisionEntry() },
-                onUpdateCustomRevision: { viewModel.updateCustomRevisionText($0) },
-                onSubmitCustomRevision: { viewModel.submitCustomRevision() },
-                onCancelCustomRevision: { viewModel.cancelCustomRevisionEntry() },
-                onSelectRoot: { viewModel.selectRoot($0) }
+                onSelectDiffViewMode: { viewModel.selectDiffViewMode($0) }
             )
 
             if viewModel.showsFilterPills {
@@ -117,127 +158,248 @@ struct AgentChangesPanelView: View {
                 )
             }
 
-            ForEach(viewModel.blockedCheckouts) { blocked in
-                AgentChangesBlockedCheckoutCard(
-                    blocked: blocked,
-                    onShowWorkspaceCheckout: { viewModel.showWorkspaceCheckoutInstead(for: blocked) }
-                )
-            }
+            AgentChangesSearchBarView(
+                state: viewModel.searchState,
+                focusRequest: searchFocusRequest,
+                resignRequest: searchResignRequest,
+                onUpdateQuery: { viewModel.updateSearchQuery($0) },
+                onNext: { viewModel.selectNextSearchMatch() },
+                onPrevious: { viewModel.selectPreviousSearchMatch() },
+                onClearAndResign: clearSearchAndResign
+            )
         }
         .padding(.horizontal, Layout.horizontalPadding)
         .padding(.bottom, Layout.chromeSpacing)
     }
 
-    // MARK: - List
+    // MARK: - Ordered list
 
     private var list: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
-                if let emptyState = viewModel.emptyState {
-                    AgentChangesEmptyStateView(
-                        state: emptyState,
-                        baseBranchCandidates: viewModel.baseBranchCandidates,
-                        onCompareAgainstBase: { viewModel.offerBaseComparison() },
-                        onSelectBaseBranch: { viewModel.selectBaseBranch($0) },
-                        onSelectCustomRevision: { viewModel.beginCustomRevisionEntry() },
-                        onRetry: { viewModel.refresh() }
-                    )
-                    .padding(.top, Layout.emptyStateTopPadding)
-                } else if let filteredEmptyMessage = viewModel.filteredEmptyMessage {
-                    Text(filteredEmptyMessage)
-                        .font(fontScale.preset.swiftUIFont(sizeAtNormal: 11))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .center)
-                        .padding(.top, Layout.emptyStateTopPadding + 12)
-                        .accessibilityLabel(filteredEmptyMessage)
-                } else {
-                    ForEach(entries) { entry in
-                        switch entry {
-                        case let .section(section):
-                            Section {
-                                EmptyView()
-                            } header: {
-                                sectionHeader(section)
-                            }
-                        case let .file(row):
-                            Section {
-                                fileBody(row)
-                            } header: {
-                                fileHeader(row)
-                            }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                    if let globalEmptyState {
+                        AgentChangesEmptyStateView(
+                            state: globalEmptyState,
+                            baseRevisionCandidates: [],
+                            onCompareAgainstBase: { viewModel.selectCompare(.vsBase) },
+                            onSelectBaseRevision: { _ in },
+                            onSelectCustomRevision: {},
+                            onRetry: { viewModel.refresh() }
+                        )
+                        .padding(.top, Layout.emptyStateTopPadding)
+                    } else {
+                        ForEach(orderedEntries) { entry in
+                            entryView(entry)
                         }
                     }
                 }
+                .padding(.horizontal, Layout.horizontalPadding)
+                .padding(.bottom, Layout.listBottomPadding)
             }
-            .padding(.horizontal, Layout.horizontalPadding)
-            .padding(.bottom, Layout.listBottomPadding)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onChange(of: viewModel.searchNavigationAnchor) { _, anchor in
+                guard let anchor else { return }
+                if reduceMotion {
+                    proxy.scrollTo(anchor.matchID, anchor: .center)
+                } else {
+                    withAnimation(.easeInOut(duration: Layout.navigationDuration)) {
+                        proxy.scrollTo(anchor.matchID, anchor: .center)
+                    }
+                }
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func sectionHeader(_ section: AgentChangesSection) -> some View {
+    @ViewBuilder
+    private func entryView(_ entry: Entry) -> some View {
+        switch entry {
+        case let .group(group):
+            Section {
+                EmptyView()
+            } header: {
+                groupHeader(group)
+                    .padding(.top, Layout.groupTopPadding)
+            }
+        case let .section(groupID, section):
+            Section {
+                EmptyView()
+            } header: {
+                sectionHeader(section, groupID: groupID)
+            }
+        case let .file(groupID, row):
+            Section {
+                fileBody(row, groupID: groupID)
+            } header: {
+                fileHeader(row, groupID: groupID)
+            }
+        case let .groupEmpty(group, state):
+            AgentChangesEmptyStateView(
+                state: state,
+                baseRevisionCandidates: viewModel.baseCandidates(for: group.id),
+                onCompareAgainstBase: { viewModel.selectCompare(.vsBase) },
+                onSelectBaseRevision: { viewModel.selectBaseRevision($0, for: group.id) },
+                onSelectCustomRevision: { viewModel.beginCustomRevisionEntry(for: group.id) },
+                onRetry: { viewModel.refresh() }
+            )
+            .padding(.top, Layout.emptyStateTopPadding)
+        case let .filteredEmpty(_, message):
+            Text(message)
+                .font(fontScale.preset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, Layout.emptyStateTopPadding + 10)
+                .accessibilityLabel(message)
+        case let .blocked(blocked):
+            AgentChangesBlockedCheckoutCard(
+                blocked: blocked,
+                onShowWorkspaceCheckout: {
+                    viewModel.showWorkspaceCheckoutInstead(for: blocked)
+                }
+            )
+            .padding(.top, Layout.groupTopPadding)
+        }
+    }
+
+    private func groupHeader(_ group: AgentChangesGroupState) -> some View {
+        AgentChangesGroupHeaderView(
+            group: group,
+            compareSelection: viewModel.panel.compareSelection,
+            customRevisionEditor: viewModel.customRevisionEditor,
+            onSelectBaseRevision: { viewModel.selectBaseRevision($0, for: group.id) },
+            onBeginCustomRevision: { viewModel.beginCustomRevisionEntry(for: group.id) },
+            onUpdateCustomRevision: { viewModel.updateCustomRevisionText($0) },
+            onSubmitCustomRevision: { viewModel.submitCustomRevision() },
+            onCancelCustomRevision: { viewModel.cancelCustomRevisionEntry() }
+        )
+    }
+
+    private func sectionHeader(
+        _ section: AgentChangesSection,
+        groupID: AgentChangesGroupID
+    ) -> some View {
         AgentChangesSectionHeaderView(
             section: section,
-            supportsStaging: viewModel.snapshot.supportsStaging,
-            isBulkDisabled: viewModel.isBulkActionDisabled(for: section.kind),
-            isBulkPending: viewModel.isBulkActionPending(for: section.kind),
+            supportsStaging: viewModel.groupState(for: groupID)?.snapshot.supportsStaging == true,
+            isBulkDisabled: viewModel.isBulkActionDisabled(for: section.kind, in: groupID),
+            isBulkPending: viewModel.isBulkActionPending(for: section.kind, in: groupID),
             onBulkAction: {
-                // Unstaged stages, Staged unstages: the action a section offers is the one that
-                // moves its own rows out of it.
-                viewModel.applyBulkStaging(section.kind == .unstaged, section: section.kind)
+                viewModel.applyBulkStaging(
+                    section.kind == .unstaged,
+                    section: section.kind,
+                    in: groupID
+                )
             }
         )
     }
 
-    private func fileHeader(_ row: AgentChangesFileRow) -> some View {
+    private func fileHeader(
+        _ row: AgentChangesFileRow,
+        groupID: AgentChangesGroupID
+    ) -> some View {
         AgentChangesFileRowView(
             row: row,
-            isExpanded: viewModel.isExpanded(row),
-            showsCheckbox: viewModel.showsStagingCheckbox(for: row),
-            isStagedForDisplay: viewModel.isStagedForDisplay(row),
-            pending: viewModel.pendingStaging(for: row),
-            isMutationDisabled: viewModel.isMutationDisabled(row),
-            viewedStatus: viewModel.viewedStatus(for: row),
-            pendingResolution: viewModel.pendingResolution(for: row),
-            markResolvedDisabledReason: viewModel.markResolvedDisabledReason(for: row),
-            isFlashing: viewModel.isFlashing(row),
-            onToggleExpansion: { viewModel.toggleExpansion(row) },
-            onSetStaged: { viewModel.setStaged($0, row: row) },
-            onSetViewed: { viewModel.setViewed($0, for: row) },
-            onMarkResolved: { viewModel.markResolved(row) }
+            isExpanded: viewModel.isExpanded(row, in: groupID),
+            showsCheckbox: viewModel.showsStagingCheckbox(for: row, in: groupID),
+            isStagedForDisplay: viewModel.isStagedForDisplay(row, in: groupID),
+            pending: viewModel.pendingStaging(for: row, in: groupID),
+            isMutationDisabled: viewModel.isMutationDisabled(row, in: groupID),
+            viewedStatus: viewModel.viewedStatus(for: row, in: groupID),
+            pendingResolution: viewModel.pendingResolution(for: row, in: groupID),
+            pendingPartial: viewModel.pendingPartial(for: row, in: groupID),
+            markResolvedDisabledReason: viewModel.markResolvedDisabledReason(
+                for: row,
+                in: groupID
+            ),
+            isFlashing: viewModel.isFlashing(row, in: groupID),
+            pathSearchMatches: viewModel.searchMatches(
+                for: row,
+                in: groupID,
+                locator: .filePath
+            ),
+            isCurrentSearchMatch: { viewModel.isCurrentSearchMatch($0) },
+            onToggleExpansion: { viewModel.toggleExpansion(row, in: groupID) },
+            onSetStaged: { viewModel.setStaged($0, row: row, in: groupID) },
+            onSetViewed: { viewModel.setViewed($0, for: row, in: groupID) },
+            onMarkResolved: { viewModel.markResolved(row, in: groupID) }
         )
     }
 
     @ViewBuilder
-    private func fileBody(_ row: AgentChangesFileRow) -> some View {
-        if viewModel.isExpanded(row) {
+    private func fileBody(
+        _ row: AgentChangesFileRow,
+        groupID: AgentChangesGroupID
+    ) -> some View {
+        if viewModel.isExpanded(row, in: groupID) {
             AgentChangesPatchView(
                 row: row,
-                state: viewModel.patchState(for: row),
+                state: viewModel.patchState(for: row, in: groupID),
                 diffViewMode: viewModel.panel.diffViewMode,
-                gapContextState: viewModel.gapContextState(for: row),
-                onExpandGap: { gap, amount in
-                    viewModel.expandContextGap(gap, amount: amount, for: row)
+                gapContextState: viewModel.gapContextState(for: row, in: groupID),
+                partialDescriptor: viewModel.partialDescriptor(for: row, in: groupID),
+                pendingPartial: viewModel.pendingPartial(for: row, in: groupID),
+                isPartialMutationDisabled: viewModel.isPartialMutationDisabled(
+                    for: row,
+                    in: groupID
+                ),
+                selectedPartialLineKeys: {
+                    viewModel.selectedPartialLineKeys(
+                        for: row,
+                        hunkID: $0,
+                        in: groupID
+                    )
                 },
-                onOpenFile: { openFile(row) }
+                searchMatches: {
+                    viewModel.searchMatches(for: row, in: groupID, locator: $0)
+                },
+                isCurrentSearchMatch: { viewModel.isCurrentSearchMatch($0) },
+                onSetPartialLineSelected: { selected, key, hunkID in
+                    viewModel.setPartialLineSelected(
+                        selected,
+                        lineKey: key,
+                        hunkID: hunkID,
+                        row: row,
+                        in: groupID
+                    )
+                },
+                onClearPartialSelection: {
+                    viewModel.clearPartialSelection(for: row, hunkID: $0, in: groupID)
+                },
+                onApplyPartialHunk: {
+                    viewModel.applyPartialHunk(for: row, hunkID: $0, in: groupID)
+                },
+                onApplySelectedPartialLines: {
+                    viewModel.applySelectedPartialLines(for: row, hunkID: $0, in: groupID)
+                },
+                onExpandGap: { gap, amount in
+                    viewModel.expandContextGap(
+                        gap,
+                        amount: amount,
+                        for: row,
+                        in: groupID
+                    )
+                },
+                onOpenFile: { openFile(row, groupID: groupID) }
             )
         }
     }
 
-    /// Opens the file itself, for the diffs the panel deliberately will not render inline.
-    private func openFile(_ row: AgentChangesFileRow) {
-        guard let checkout = viewModel.activeTarget?.checkoutURL else { return }
+    /// Opens relative to the row's own checkout, never whichever group happened to publish first.
+    private func openFile(
+        _ row: AgentChangesFileRow,
+        groupID: AgentChangesGroupID
+    ) {
+        guard let checkout = viewModel.groupState(for: groupID)?.target.checkoutURL else { return }
         NSWorkspace.shared.open(checkout.appendingPathComponent(row.path))
     }
 }
 
 // MARK: - Footer
 
-/// Totals, freshness, refresh, and the panel's one error surface.
+/// Aggregate totals, oldest-success freshness, refresh, and the panel's mutation message surface.
 struct AgentChangesFooterView: View {
-    let snapshot: AgentChangesSnapshot
+    let summary: AgentChangesPanelViewModel.FooterSummary
     let viewedProgress: AgentChangesViewedProgress
-    let lastRefreshedAt: Date?
     let isRefreshing: Bool
     let statusMessage: AgentChangesPanelViewModel.StatusMessage?
     let onRefresh: () -> Void
@@ -255,7 +417,6 @@ struct AgentChangesFooterView: View {
         static let buttonSize: CGFloat = 22
         static let horizontalPadding: CGFloat = 10
         static let verticalPadding: CGFloat = 6
-        static let hoverFillOpacity: Double = 0.12
         static let progressScale: CGFloat = 0.5
         static let separatorOpacity: Double = 0.15
         static let viewedBarHeight: CGFloat = 2
@@ -266,22 +427,12 @@ struct AgentChangesFooterView: View {
         fontScale.preset
     }
 
-    /// A failed rebuild is surfaced here whenever there are still rows on screen; with no rows the
-    /// empty state has already said it, and saying it twice would read as two failures.
-    private var message: AgentChangesPanelViewModel.StatusMessage? {
-        if let statusMessage { return statusMessage }
-        if case let .failed(text) = snapshot.loadState, !snapshot.sections.allSatisfy(\.isEmpty) {
-            return .failure(text)
-        }
-        return nil
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: Layout.messageSpacing) {
             Divider().opacity(Layout.separatorOpacity)
 
-            if let message {
-                messageRow(message)
+            if let statusMessage {
+                messageRow(statusMessage)
             }
 
             if viewedProgress.totalFileCount > 0 {
@@ -289,26 +440,33 @@ struct AgentChangesFooterView: View {
             }
 
             HStack(spacing: Layout.rowSpacing) {
-                Text(AgentChangesFooterPresentation.totals(for: snapshot))
-                    .font(preset.swiftUIFont(sizeAtNormal: Layout.totalsSizeAtNormal, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-                    .lineLimit(1)
+                Text(AgentChangesFooterPresentation.totals(
+                    fileCount: summary.fileCount,
+                    additions: summary.additions,
+                    deletions: summary.deletions
+                ))
+                .font(preset.swiftUIFont(sizeAtNormal: Layout.totalsSizeAtNormal, weight: .medium))
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
 
                 Spacer(minLength: Layout.rowSpacing)
 
-                if snapshot.isPollingDegraded {
+                if summary.isPollingDegraded {
                     Image(systemName: "wifi.exclamationmark")
                         .font(.system(size: preset.scaledMetric(Layout.glyphSizeAtNormal)))
                         .foregroundStyle(.orange)
-                        .hoverTooltip("This checkout could not be watched, so it is being polled every few seconds.")
-                        .accessibilityLabel("File watching unavailable; polling instead")
+                        .hoverTooltip("At least one checkout cannot be watched and is being polled.")
+                        .accessibilityLabel("File watching unavailable for at least one checkout")
                 }
 
-                Text(AgentChangesFooterPresentation.lastRefreshed(lastRefreshedAt, now: Date()))
-                    .font(preset.swiftUIFont(sizeAtNormal: Layout.freshnessSizeAtNormal))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
+                Text(AgentChangesFooterPresentation.lastRefreshed(
+                    summary.lastRefreshedAt,
+                    now: Date()
+                ))
+                .font(preset.swiftUIFont(sizeAtNormal: Layout.freshnessSizeAtNormal))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
 
                 refreshButton
             }
@@ -364,7 +522,9 @@ struct AgentChangesFooterView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .hoverTooltip("Dismiss changes message")
             .accessibilityLabel("Dismiss message")
+            .accessibilityValue(message.isFailure ? "failure" : "information")
         }
         .padding(.horizontal, Layout.horizontalPadding)
         .accessibilityElement(children: .contain)
@@ -394,5 +554,6 @@ struct AgentChangesFooterView: View {
         .disabled(isRefreshing)
         .hoverTooltip("Refresh changes")
         .accessibilityLabel("Refresh changes")
+        .accessibilityValue(isRefreshing ? "refreshing" : "ready")
     }
 }

@@ -40,7 +40,7 @@ final class AgentUtilityPanelUIStore: ObservableObject {
                     "segment": snapshot.panel.segment.rawValue,
                     "compareSelection": snapshot.panel.compareSelection.rawValue,
                     "diffViewMode": snapshot.panel.diffViewMode.rawValue,
-                    "expandedFileCount": String(snapshot.panel.expandedFilePaths.count),
+                    "expandedFileCount": String(snapshot.panel.expandedFiles.count),
                     "hasPreviewDocument": String(snapshot.panel.previewDocument != nil)
                 ]
             )

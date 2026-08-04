@@ -158,9 +158,9 @@ enum DiffLineProjector {
             } else if line.hasPrefix("old mode ") || line.hasPrefix("new mode ") {
                 changesMode = true
             } else if let source = Self.remainder(of: line, after: "rename from ") {
-                renameSource = DiffLineProjector.gitPath(source)
+                renameSource = GitPatchPathCodec.decode(source)
             } else if let source = Self.remainder(of: line, after: "copy from ") {
-                copySource = DiffLineProjector.gitPath(source)
+                copySource = GitPatchPathCodec.decode(source)
             }
         }
 
@@ -184,68 +184,5 @@ enum DiffLineProjector {
             guard line.hasPrefix(prefix) else { return nil }
             return String(line.dropFirst(prefix.count))
         }
-    }
-
-    // MARK: - Paths
-
-    /// Decodes a path as Git writes it in `rename from`/`copy from` metadata.
-    ///
-    /// Git C-quotes a path only when it holds controls, a quote, a backslash, or non-ASCII bytes;
-    /// anything else is written verbatim. Octal escapes are UTF-8 *bytes*, so they are accumulated
-    /// and decoded as one sequence — turning each escape into its own scalar would render
-    /// `caf\303\251` as mojibake instead of `café`.
-    private static func gitPath(_ raw: String) -> String {
-        guard raw.count >= 2, raw.hasPrefix("\""), raw.hasSuffix("\"") else { return raw }
-
-        var bytes: [UInt8] = []
-        var index = raw.index(after: raw.startIndex)
-        let end = raw.index(before: raw.endIndex)
-
-        while index < end {
-            let character = raw[index]
-            guard character == "\\" else {
-                bytes.append(contentsOf: String(character).utf8)
-                index = raw.index(after: index)
-                continue
-            }
-
-            index = raw.index(after: index)
-            guard index < end else { break }
-            let escaped = raw[index]
-
-            if let leadingDigit = octalDigit(escaped) {
-                var byte = leadingDigit
-                var digits = 1
-                index = raw.index(after: index)
-                while digits < 3, index < end, let digit = octalDigit(raw[index]) {
-                    byte = byte * 8 + digit
-                    digits += 1
-                    index = raw.index(after: index)
-                }
-                bytes.append(UInt8(truncatingIfNeeded: byte))
-                continue
-            }
-
-            switch escaped {
-            case "n":
-                bytes.append(0x0A)
-            case "t":
-                bytes.append(0x09)
-            case "r":
-                bytes.append(0x0D)
-            default:
-                bytes.append(contentsOf: String(escaped).utf8)
-            }
-            index = raw.index(after: index)
-        }
-
-        return String(decoding: bytes, as: UTF8.self)
-    }
-
-    private static func octalDigit(_ character: Character) -> Int? {
-        guard character.isASCII, let value = character.wholeNumberValue, (0 ... 7).contains(value) else {
-            return nil
-        }
-        return value
     }
 }

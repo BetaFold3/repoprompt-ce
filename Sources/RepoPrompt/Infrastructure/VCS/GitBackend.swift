@@ -366,16 +366,49 @@ extension GitBackend: VCSIndexMutationBackend {
         try await gitService.loadIndexStatusEntries(at: repoURL)
     }
 
-    func stage(_ identities: [VCSIndexPathIdentity], at repoURL: URL) async throws {
-        try await gitService.stageIndexPaths(identities, at: repoURL)
+    func loadIndexStatus(
+        at repoURL: URL,
+        paths: [String]
+    ) async throws -> [VCSIndexStatusEntry] {
+        try await gitService.loadIndexStatusEntries(at: repoURL, paths: paths)
     }
 
-    func unstage(_ identities: [VCSIndexPathIdentity], at repoURL: URL) async throws {
-        try await gitService.unstageIndexPaths(identities, at: repoURL)
+    func stage(
+        _ identities: [VCSIndexPathIdentity],
+        at repoURL: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await gitService.stageIndexPaths(identities, at: repoURL, authorize: authorize)
     }
 
-    func markResolved(_ identity: VCSIndexPathIdentity, at repoURL: URL) async throws {
-        try await gitService.markIndexPathResolved(identity, at: repoURL)
+    func unstage(
+        _ identities: [VCSIndexPathIdentity],
+        at repoURL: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await gitService.unstageIndexPaths(identities, at: repoURL, authorize: authorize)
+    }
+
+    func applyCachedPatch(
+        _ data: Data,
+        reverse: Bool,
+        at repoURL: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await gitService.applyIndexPatch(
+            data: data,
+            reverse: reverse,
+            repoURL: repoURL,
+            authorize: authorize
+        )
+    }
+
+    func markResolved(
+        _ identity: VCSIndexPathIdentity,
+        at repoURL: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await gitService.markIndexPathResolved(identity, at: repoURL, authorize: authorize)
     }
 
     func hasHeadCommit(at repoURL: URL) async throws -> Bool {

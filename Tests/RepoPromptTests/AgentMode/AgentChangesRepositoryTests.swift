@@ -363,6 +363,33 @@ final class AgentChangesRepositoryTests: XCTestCase {
         XCTAssertEqual(snapshot.section(.unstaged)?.rows.map(\.path), ["second.swift"])
     }
 
+    func testSameTargetEpochAdvanceDuringInitialRebuildPublishesReadyUnderNewestEpoch() async throws {
+        let target = makeCheckout(path: "/tmp/same-target-epoch-rebuild")
+        let backend = FakeIndexBackend(entriesByCheckout: [
+            target.checkoutURL.path: [modified("ready.swift")]
+        ])
+        let repository = makeRepository(backend: backend, diffSource: FakeDiffSource())
+        backend.holdNextStatusReads()
+
+        await repository.setTarget(target, mode: .workingTree, requestID: 1)
+        try await AsyncTestWait.waitUntil("the epoch-one rebuild to reach status") {
+            backend.statusCallCount == 1
+        }
+        await repository.setTarget(target, mode: .workingTree, requestID: 3)
+
+        let whileRebuilding = await repository.currentSnapshot()
+        XCTAssertEqual(whileRebuilding.targetRequestID, 3)
+        XCTAssertEqual(whileRebuilding.loadState, .initial)
+
+        backend.releaseHeldStatusReads()
+        await repository.waitUntilIdle()
+
+        let final = await repository.currentSnapshot()
+        XCTAssertEqual(final.targetRequestID, 3)
+        XCTAssertEqual(final.loadState, .ready)
+        XCTAssertEqual(final.section(.unstaged)?.rows.map(\.path), ["ready.swift"])
+    }
+
     func testCancellingAContentWindowDuringRetargetResumesIdleWaiters() async throws {
         let target = makeCheckout(path: "/tmp/idle-window")
         let backend = FakeIndexBackend(entriesByCheckout: [
@@ -975,7 +1002,11 @@ final class AgentChangesRepositoryTests: XCTestCase {
         scheduler.releaseAll()
         let outcome = await mutation.value
 
-        XCTAssertEqual(outcome, .noOp)
+        XCTAssertEqual(
+            outcome,
+            .contentChanged,
+            "The contender changed the reviewed index identity, so the retry must refuse"
+        )
         XCTAssertEqual(environment.backend.stagedPathBatches.count, 1, "No blind second Git command ran")
         XCTAssertGreaterThanOrEqual(
             environment.backend.statusCallCount,
@@ -1100,6 +1131,148 @@ final class AgentChangesRepositoryTests: XCTestCase {
         XCTAssertEqual(environment.publisher.publishCount, 0)
     }
 
+    // MARK: - Authority revoked while a mutation waits for the index
+
+    // Every repository-side preflight has already passed when a mutation reaches the backend, and
+    // the backend then serializes mutations per checkout. These cover the window that opens while a
+    // request waits there for another app mutation to finish: the fake parks each mutation exactly
+    // where the real backend parks one, after the wait and before the command.
+
+    func testRetargetWhileAStageWaitsForTheIndexRefusesBeforeGitRuns() async {
+        let environment = makeEnvironment(entries: [modified("a.swift")])
+        await environment.start()
+        let row = await environment.unstagedRow("a.swift")
+        environment.backend.holdMutationsBeforeAuthorization()
+
+        let task = Task {
+            await environment.repository.applyMutation(
+                AgentChangesMutationRequest(row: row, stage: true)
+            )
+        }
+        await environment.backend.waitForParkedMutation()
+        await environment.repository.setTarget(
+            makeCheckout(path: "/tmp/agent-changes-other-checkout"),
+            mode: .workingTree
+        )
+        environment.backend.releaseHeldMutations()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(
+            environment.backend.stagedPathBatches,
+            [],
+            "Git must not run against a checkout this actor no longer owns"
+        )
+        XCTAssertEqual(environment.backend.refusedMutationCount, 1)
+    }
+
+    func testShutdownWhileAnUnstageWaitsForTheIndexRefusesBeforeGitRuns() async {
+        let environment = makeEnvironment(entries: [
+            VCSIndexStatusEntry(path: "a.swift", indexStatus: "M", workTreeStatus: ".")
+        ])
+        await environment.start()
+        let row = await XCTUnwrapped(
+            environment.repository.currentSnapshot().section(.staged)?.rows.first
+        )
+        environment.backend.holdMutationsBeforeAuthorization()
+
+        let task = Task {
+            await environment.repository.applyMutation(
+                AgentChangesMutationRequest(row: row, stage: false)
+            )
+        }
+        await environment.backend.waitForParkedMutation()
+        await environment.repository.shutdown()
+        environment.backend.releaseHeldMutations()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(
+            environment.backend.unstagedPathBatches,
+            [],
+            "Terminal shutdown stays terminal even for a mutation already queued at the backend"
+        )
+        XCTAssertEqual(environment.backend.refusedMutationCount, 1)
+    }
+
+    func testContentMoveWhileAStageWaitsForTheIndexRefusesBeforeGitRuns() async {
+        let environment = makeEnvironment(entries: [modified("a.swift")])
+        await environment.start()
+        let row = await environment.unstagedRow("a.swift")
+        environment.backend.holdMutationsBeforeAuthorization()
+
+        let task = Task {
+            await environment.repository.applyMutation(
+                AgentChangesMutationRequest(row: row, stage: true)
+            )
+        }
+        await environment.backend.waitForParkedMutation()
+        await environment.repository.refresh(
+            .contentDelta(paths: [environment.absolutePath("a.swift")])
+        )
+        environment.backend.releaseHeldMutations()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(
+            environment.backend.stagedPathBatches,
+            [],
+            "An edit landing during the wait must refresh rather than stage unreviewed content"
+        )
+        XCTAssertEqual(environment.backend.refusedMutationCount, 1)
+    }
+
+    func testRetargetWhileABulkStageWaitsForTheIndexRefusesBeforeGitRuns() async {
+        let environment = makeEnvironment(entries: [modified("a.swift"), modified("b.swift")])
+        await environment.start()
+        let request = await environment.bulkRequest(section: .unstaged, stage: true)
+        environment.backend.holdMutationsBeforeAuthorization()
+
+        let task = Task { await environment.repository.applyBulkMutation(request) }
+        await environment.backend.waitForParkedMutation()
+        await environment.repository.setTarget(
+            makeCheckout(path: "/tmp/agent-changes-other-checkout"),
+            mode: .workingTree
+        )
+        environment.backend.releaseHeldMutations()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(environment.backend.stagedPathBatches, [])
+        XCTAssertEqual(environment.backend.refusedMutationCount, 1)
+    }
+
+    func testRetargetWhileMarkResolvedWaitsForTheIndexRefusesBeforeGitRuns() async {
+        let environment = makeEnvironment(entries: [
+            VCSIndexStatusEntry(
+                path: "conflict.swift",
+                indexStatus: "U",
+                workTreeStatus: "U",
+                isConflicted: true
+            )
+        ])
+        await environment.start()
+        let row = await XCTUnwrapped(
+            environment.repository.currentSnapshot().section(.conflicts)?.rows.first
+        )
+        environment.backend.holdMutationsBeforeAuthorization()
+
+        let task = Task {
+            await environment.repository.markResolved(AgentChangesResolveRequest(row: row))
+        }
+        await environment.backend.waitForParkedMutation()
+        await environment.repository.setTarget(
+            makeCheckout(path: "/tmp/agent-changes-other-checkout"),
+            mode: .workingTree
+        )
+        environment.backend.releaseHeldMutations()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(environment.backend.resolvedPathBatches, [])
+        XCTAssertEqual(environment.backend.refusedMutationCount, 1)
+    }
+
     func testConcurrentMutationsSerializeWithAnAuthoritativeRebuildBetweenThem() async {
         let environment = makeEnvironment(entries: [modified("a.swift"), modified("b.swift")])
         await environment.start()
@@ -1181,6 +1354,67 @@ final class AgentChangesRepositoryTests: XCTestCase {
         }
         XCTAssertGreaterThan(environment.backend.statusCallCount, baseline + 1)
         XCTAssertEqual(environment.publisher.publishCount, 0, "A refused mutation changed no index")
+    }
+
+    func testShutdownDuringStagingPreflightRefusesMutationAndClearsTarget() async throws {
+        let environment = makeEnvironment(entries: [modified("a.swift")])
+        await environment.start()
+        let snapshot = await environment.repository.currentSnapshot()
+        let row = await environment.unstagedRow("a.swift")
+        let baseline = environment.backend.statusCallCount
+        environment.backend.holdNextStatusReads()
+
+        let mutation = Task {
+            await environment.repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: true,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        try await AsyncTestWait.waitUntil("the staging preflight to suspend") {
+            environment.backend.statusCallCount == baseline + 1
+        }
+
+        await environment.repository.shutdown()
+        environment.backend.releaseHeldStatusReads()
+        let outcome = await mutation.value
+
+        XCTAssertEqual(outcome, .unsupported)
+        XCTAssertTrue(environment.backend.stagedPathBatches.isEmpty)
+        let terminalSnapshot = await environment.repository.currentSnapshot()
+        XCTAssertNil(terminalSnapshot.target)
+    }
+
+    func testShutdownIsTerminalAndLateRetargetsCannotRecreateAFeed() async {
+        let target = makeCheckout(path: "/tmp/terminal-repository")
+        let backend = FakeIndexBackend(entriesByCheckout: [target.checkoutURL.path: []])
+        let feeds = FeedCreationRecorder()
+        let repository = AgentChangesRepository(
+            indexBackend: backend,
+            diffSource: FakeDiffSource(),
+            invalidationPublisher: FakeInvalidationPublisher(),
+            scheduler: ImmediateScheduler(),
+            contentDeltaWindow: .zero,
+            makeTriggerFeed: { checkout in feeds.makeFeed(for: checkout) }
+        )
+
+        await repository.setTarget(target, mode: .workingTree, requestID: 1)
+        await repository.waitUntilIdle()
+        XCTAssertEqual(feeds.creationCount, 1)
+
+        await repository.shutdown()
+        let cancelledRetarget = Task {
+            await repository.setTarget(target, mode: .workingTree, requestID: 2)
+        }
+        cancelledRetarget.cancel()
+        _ = await cancelledRetarget.value
+        await repository.setTarget(target, mode: .workingTree, requestID: 3)
+
+        XCTAssertEqual(feeds.creationCount, 1)
+        let terminalSnapshot = await repository.currentSnapshot()
+        XCTAssertNil(terminalSnapshot.target)
     }
 
     // MARK: - Capability degradation
@@ -1442,6 +1676,809 @@ final class AgentChangesRepositoryTests: XCTestCase {
         await repository.shutdown()
     }
 
+    func testRecreatedRenameOriginWhileStageWaitsForIndexIsRefusedWithoutChangingIndex() async throws {
+        let repo = try makeGitFixture(committing: [
+            "origin.txt": "reviewed\n",
+            "holder.txt": "holder\n"
+        ])
+        try runGit(["config", "status.renames", "true"], cwd: repo)
+        try FileManager.default.moveItem(
+            at: repo.appendingPathComponent("origin.txt"),
+            to: repo.appendingPathComponent("renamed.txt")
+        )
+        try runGit(["add", "-N", "renamed.txt"], cwd: repo)
+
+        let gitService = GitService()
+        let repository = makeLiveRepository(gitService: gitService)
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.unstaged)?.rows.first(where: { $0.path == "renamed.txt" })
+        )
+        XCTAssertEqual(row.originalPath, "origin.txt")
+
+        let holderFence = TestReleaseFence(name: "rename-origin index-lock holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task { () -> (any Error)? in
+            do {
+                try await holderBackend.stage(
+                    [VCSIndexPathIdentity(path: "holder.txt")],
+                    at: repo,
+                    authorize: {
+                        await holderFence.enterAndWait()
+                        return false
+                    }
+                )
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(AgentChangesMutationRequest(row: row, stage: true))
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        try write("reviewed\n", to: "origin.txt", in: repo)
+        await repository.refresh(.contentDelta(paths: [repo.appendingPathComponent("origin.txt").path]))
+        await repository.waitUntilIdle()
+        let indexBefore = try indexData(in: repo)
+        holderFence.release()
+
+        let holderError = await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(holderError as? GitIndexMutationError, .authorizationRevoked)
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(try indexData(in: repo), indexBefore)
+        await repository.shutdown()
+    }
+
+    func testRecreatedRenameOriginWhileBulkStageWaitsForIndexIsRefusedWithoutChangingIndex() async throws {
+        let repo = try makeGitFixture(committing: [
+            "origin.txt": "reviewed\n",
+            "holder.txt": "holder\n"
+        ])
+        try runGit(["config", "status.renames", "true"], cwd: repo)
+        try FileManager.default.moveItem(
+            at: repo.appendingPathComponent("origin.txt"),
+            to: repo.appendingPathComponent("renamed.txt")
+        )
+        try runGit(["add", "-N", "renamed.txt"], cwd: repo)
+
+        let gitService = GitService()
+        let repository = makeLiveRepository(gitService: gitService)
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        let snapshot = await repository.currentSnapshot()
+        let reviewedRows = try XCTUnwrap(snapshot.section(.unstaged)?.rows)
+        XCTAssertEqual(reviewedRows.first(where: { $0.path == "renamed.txt" })?.originalPath, "origin.txt")
+        let request = AgentChangesBulkMutationRequest(
+            section: .unstaged,
+            stage: true,
+            rows: reviewedRows,
+            targetRequestID: snapshot.targetRequestID
+        )
+
+        let holderFence = TestReleaseFence(name: "bulk rename-origin index-lock holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task { () -> (any Error)? in
+            do {
+                try await holderBackend.stage(
+                    [VCSIndexPathIdentity(path: "holder.txt")],
+                    at: repo,
+                    authorize: {
+                        await holderFence.enterAndWait()
+                        return false
+                    }
+                )
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task { await repository.applyBulkMutation(request) }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        try write("reviewed\n", to: "origin.txt", in: repo)
+        await repository.refresh(.contentDelta(paths: [repo.appendingPathComponent("origin.txt").path]))
+        await repository.waitUntilIdle()
+        let indexBefore = try indexData(in: repo)
+        holderFence.release()
+
+        let holderError = await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(holderError as? GitIndexMutationError, .authorizationRevoked)
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(try indexData(in: repo), indexBefore)
+        await repository.shutdown()
+    }
+
+    func testIndexDriftWhileUnstageWaitsForLockRefusesAndPreservesBothStagedHunks() async throws {
+        let (repo, gitService, repository) = try await makeIndexDriftRepository()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.staged)?.rows.first(where: { $0.path == "file.txt" })
+        )
+
+        let holderFence = TestReleaseFence(name: "unstage index-drift holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task {
+            try await holderBackend.stage(
+                [VCSIndexPathIdentity(path: "file.txt")],
+                at: repo,
+                authorize: {
+                    await holderFence.enterAndWait()
+                    return true
+                }
+            )
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: false,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        holderFence.release()
+
+        try await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(
+            try gitOutput(["show", ":file.txt"], cwd: repo),
+            indexDriftContents(firstChanged: true, secondChanged: true)
+        )
+        let rebuilt = await repository.currentSnapshot()
+        XCTAssertNotNil(rebuilt.section(.staged)?.rows.first(where: { $0.path == "file.txt" }))
+        XCTAssertNil(rebuilt.section(.unstaged)?.rows.first(where: { $0.path == "file.txt" }))
+        await repository.shutdown()
+    }
+
+    func testIndexDriftWhileStageWaitsForLockRefusesAndPreservesHolderIndex() async throws {
+        let (repo, gitService, repository) = try await makeIndexDriftRepository()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.unstaged)?.rows.first(where: { $0.path == "file.txt" })
+        )
+
+        let holderFence = TestReleaseFence(name: "stage index-drift holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task {
+            try await holderBackend.unstage(
+                [VCSIndexPathIdentity(path: "file.txt")],
+                at: repo,
+                authorize: {
+                    await holderFence.enterAndWait()
+                    return true
+                }
+            )
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: true,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        holderFence.release()
+
+        try await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(
+            try gitOutput(["show", ":file.txt"], cwd: repo),
+            indexDriftContents(firstChanged: false, secondChanged: false)
+        )
+        let rebuilt = await repository.currentSnapshot()
+        XCTAssertNil(rebuilt.section(.staged)?.rows.first(where: { $0.path == "file.txt" }))
+        XCTAssertNotNil(rebuilt.section(.unstaged)?.rows.first(where: { $0.path == "file.txt" }))
+        await repository.shutdown()
+    }
+
+    func testIndexDriftWhilePartialStageWaitsForLockRefusesAndPreservesHolderIndex() async throws {
+        let (repo, gitService, repository) = try await makeIndexDriftRepository()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.unstaged)?.rows.first(where: { $0.path == "file.txt" })
+        )
+        let patch = await repository.patch(for: row)
+        let document = try XCTUnwrap(patch.document)
+        let descriptor = await repository.partialStagingDescriptor(
+            for: row,
+            renderedDocument: document,
+            contextLevel: .standard
+        )
+        let reviewToken = try XCTUnwrap(descriptor.reviewToken)
+        let reviewedHunk = try XCTUnwrap(descriptor.changedLineKeysByHunkID.first)
+        let request = AgentChangesPartialMutationRequest(
+            reviewToken: reviewToken,
+            row: row,
+            selection: .hunk(
+                projectedHunkID: reviewedHunk.key,
+                lines: reviewedHunk.value
+            )
+        )
+
+        let holderFence = TestReleaseFence(name: "partial-stage index-drift holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task {
+            try await holderBackend.unstage(
+                [VCSIndexPathIdentity(path: "file.txt")],
+                at: repo,
+                authorize: {
+                    await holderFence.enterAndWait()
+                    return true
+                }
+            )
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task { await repository.applyPartialMutation(request) }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        holderFence.release()
+
+        try await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(
+            try gitOutput(["show", ":file.txt"], cwd: repo),
+            indexDriftContents(firstChanged: false, secondChanged: false)
+        )
+        let rebuilt = await repository.currentSnapshot()
+        XCTAssertNil(rebuilt.section(.staged)?.rows.first(where: { $0.path == "file.txt" }))
+        XCTAssertNotNil(rebuilt.section(.unstaged)?.rows.first(where: { $0.path == "file.txt" }))
+        await repository.shutdown()
+    }
+
+    func testModeOnlyIndexDriftWhileStageWaitsForLockIsRefused() async throws {
+        let repo = try makeGitFixture(committing: [
+            "file.txt": "base\n",
+            "holder.txt": "holder\n"
+        ])
+        try write("reviewed index\n", to: "file.txt", in: repo)
+        try runGit(["add", "--", "file.txt"], cwd: repo)
+        try write("reviewed worktree\n", to: "file.txt", in: repo)
+
+        let gitService = GitService()
+        let repository = makeLiveRepository(gitService: gitService)
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.unstaged)?.rows.first(where: { $0.path == "file.txt" })
+        )
+
+        let holderFence = TestReleaseFence(name: "mode-only index-drift holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task { () -> (any Error)? in
+            do {
+                try await holderBackend.stage(
+                    [VCSIndexPathIdentity(path: "holder.txt")],
+                    at: repo,
+                    authorize: {
+                        await holderFence.enterAndWait()
+                        return false
+                    }
+                )
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: true,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        try runGit(["update-index", "--chmod=+x", "--", "file.txt"], cwd: repo)
+        let driftedIndexEntry = try gitOutput(["ls-files", "--stage", "--", "file.txt"], cwd: repo)
+        XCTAssertTrue(driftedIndexEntry.hasPrefix("100755 "))
+        holderFence.release()
+
+        let holderError = await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(holderError as? GitIndexMutationError, .authorizationRevoked)
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(
+            try gitOutput(["ls-files", "--stage", "--", "file.txt"], cwd: repo),
+            driftedIndexEntry
+        )
+        await repository.shutdown()
+    }
+
+    func testSoftResetHeadDriftWhileUnstageWaitsForLockIsRefused() async throws {
+        let repo = try makeGitFixture(committing: [
+            "file.txt": "first commit\n",
+            "holder.txt": "holder\n"
+        ])
+        try write("second commit\n", to: "file.txt", in: repo)
+        try runGit(["commit", "-am", "Second commit"], cwd: repo)
+        try write("reviewed index\n", to: "file.txt", in: repo)
+        try runGit(["add", "--", "file.txt"], cwd: repo)
+        try write("reviewed worktree\n", to: "file.txt", in: repo)
+
+        let gitService = GitService()
+        let repository = makeLiveRepository(gitService: gitService)
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.staged)?.rows.first(where: { $0.path == "file.txt" })
+        )
+
+        let holderFence = TestReleaseFence(name: "soft-reset HEAD-drift holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task { () -> (any Error)? in
+            do {
+                try await holderBackend.stage(
+                    [VCSIndexPathIdentity(path: "holder.txt")],
+                    at: repo,
+                    authorize: {
+                        await holderFence.enterAndWait()
+                        return false
+                    }
+                )
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: false,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        try runGit(["reset", "--soft", "HEAD~1"], cwd: repo)
+        let indexAfterReset = try gitOutput(["show", ":file.txt"], cwd: repo)
+        XCTAssertEqual(indexAfterReset, "reviewed index\n")
+        holderFence.release()
+
+        let holderError = await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(holderError as? GitIndexMutationError, .authorizationRevoked)
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(try gitOutput(["show", ":file.txt"], cwd: repo), indexAfterReset)
+        await repository.shutdown()
+    }
+
+    func testUnmergedIndexDriftWhileUnstageWaitsForLockIsRefused() async throws {
+        let repo = try makeGitFixture(committing: [
+            "file.txt": "base\n",
+            "holder.txt": "holder\n"
+        ])
+        let baseRevision = try gitOutput(["rev-parse", "HEAD"], cwd: repo)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try runGit(["switch", "-c", "ours"], cwd: repo)
+        try write("ours\n", to: "file.txt", in: repo)
+        try runGit(["commit", "-am", "Ours"], cwd: repo)
+        let oursRevision = try gitOutput(["rev-parse", "HEAD"], cwd: repo)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try runGit(["switch", "-c", "theirs", baseRevision], cwd: repo)
+        try write("theirs\n", to: "file.txt", in: repo)
+        try runGit(["commit", "-am", "Theirs"], cwd: repo)
+        let theirsRevision = try gitOutput(["rev-parse", "HEAD"], cwd: repo)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try runGit(["switch", "ours"], cwd: repo)
+        try write("reviewed index\n", to: "file.txt", in: repo)
+        try runGit(["add", "--", "file.txt"], cwd: repo)
+
+        let gitService = GitService()
+        let repository = makeLiveRepository(gitService: gitService)
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.staged)?.rows.first(where: { $0.path == "file.txt" })
+        )
+
+        let holderFence = TestReleaseFence(name: "unmerged index-drift holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task { () -> (any Error)? in
+            do {
+                try await holderBackend.stage(
+                    [VCSIndexPathIdentity(path: "holder.txt")],
+                    at: repo,
+                    authorize: {
+                        await holderFence.enterAndWait()
+                        return false
+                    }
+                )
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: false,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        try runGit(["reset", "--hard", oursRevision], cwd: repo)
+        let mergeResult = try TestGitCommandRunner.runResult(
+            ["merge", "--no-commit", theirsRevision],
+            cwd: repo
+        )
+        XCTAssertNotEqual(mergeResult.terminationStatus, 0)
+        let unmergedIndex = try gitOutput(["ls-files", "--stage", "--", "file.txt"], cwd: repo)
+        XCTAssertEqual(unmergedIndex.split(separator: "\n").count, 3)
+        holderFence.release()
+
+        let holderError = await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(holderError as? GitIndexMutationError, .authorizationRevoked)
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(
+            try gitOutput(["ls-files", "--stage", "--", "file.txt"], cwd: repo),
+            unmergedIndex
+        )
+        await repository.shutdown()
+    }
+
+    func testDetectedCopySingleStageAndUnstageLeaveSourceIndexUntouched() async throws {
+        let repo = try makeGitFixture(committing: ["source.txt": "original\n"])
+        try runGit(["config", "status.renames", "copies"], cwd: repo)
+        try write("original\n", to: "copy.txt", in: repo)
+        try write("source worktree edit\n", to: "source.txt", in: repo)
+        try runGit(["add", "-N", "--", "copy.txt"], cwd: repo)
+
+        let repository = makeLiveRepository()
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        var snapshot = await repository.currentSnapshot()
+        let copyToStage = try XCTUnwrap(
+            snapshot.section(.unstaged)?.rows.first(where: { $0.path == "copy.txt" })
+        )
+        XCTAssertEqual(copyToStage.originalPath, "source.txt")
+        let sourceIndexBeforeStage = try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo)
+
+        let stageOutcome = await repository.applyMutation(
+            AgentChangesMutationRequest(
+                row: copyToStage,
+                stage: true,
+                targetRequestID: snapshot.targetRequestID
+            )
+        )
+        XCTAssertEqual(stageOutcome, .applied)
+        XCTAssertEqual(
+            try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo),
+            sourceIndexBeforeStage
+        )
+        XCTAssertFalse(try gitOutput(["diff", "--", "source.txt"], cwd: repo).isEmpty)
+
+        try runGit(["add", "--", "source.txt"], cwd: repo)
+        try write("later source worktree edit\n", to: "source.txt", in: repo)
+        await repository.refresh(.manual)
+        await repository.waitUntilIdle()
+        snapshot = await repository.currentSnapshot()
+        let copyToUnstage = try XCTUnwrap(
+            snapshot.section(.staged)?.rows.first(where: { $0.path == "copy.txt" })
+        )
+        XCTAssertEqual(copyToUnstage.originalPath, "source.txt")
+        let sourceIndexBeforeUnstage = try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo)
+
+        let unstageOutcome = await repository.applyMutation(
+            AgentChangesMutationRequest(
+                row: copyToUnstage,
+                stage: false,
+                targetRequestID: snapshot.targetRequestID
+            )
+        )
+        XCTAssertEqual(unstageOutcome, .applied)
+        XCTAssertEqual(
+            try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo),
+            sourceIndexBeforeUnstage
+        )
+        XCTAssertFalse(try gitOutput(["diff", "--", "source.txt"], cwd: repo).isEmpty)
+        await repository.shutdown()
+    }
+
+    func testDetectedCopyBulkStageAndUnstageLeaveOutOfScopeSourceIndexUntouched() async throws {
+        let repo = try makeGitFixture(committing: ["source.txt": "original\n"])
+        try runGit(["config", "status.renames", "copies"], cwd: repo)
+        try write("original\n", to: "copies/copy.txt", in: repo)
+        try write("source worktree edit\n", to: "source.txt", in: repo)
+        try runGit(["add", "-N", "--", "copies/copy.txt"], cwd: repo)
+
+        let repository = makeLiveRepository()
+        await repository.setTarget(
+            makeCheckout(url: repo, pathspecPrefixes: ["copies/"]),
+            mode: .workingTree
+        )
+        await repository.waitUntilIdle()
+        var snapshot = await repository.currentSnapshot()
+        var reviewedRows = try XCTUnwrap(snapshot.section(.unstaged)?.rows)
+        XCTAssertEqual(reviewedRows.map(\.path), ["copies/copy.txt"])
+        XCTAssertEqual(reviewedRows.first?.originalPath, "source.txt")
+        let sourceIndexBeforeStage = try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo)
+
+        let stageOutcome = await repository.applyBulkMutation(
+            AgentChangesBulkMutationRequest(
+                section: .unstaged,
+                stage: true,
+                rows: reviewedRows,
+                targetRequestID: snapshot.targetRequestID
+            )
+        )
+        XCTAssertEqual(stageOutcome, .applied)
+        XCTAssertEqual(
+            try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo),
+            sourceIndexBeforeStage
+        )
+        XCTAssertFalse(try gitOutput(["diff", "--", "source.txt"], cwd: repo).isEmpty)
+
+        try runGit(["add", "--", "source.txt"], cwd: repo)
+        try write("later source worktree edit\n", to: "source.txt", in: repo)
+        await repository.refresh(.manual)
+        await repository.waitUntilIdle()
+        snapshot = await repository.currentSnapshot()
+        reviewedRows = try XCTUnwrap(snapshot.section(.staged)?.rows)
+        XCTAssertEqual(reviewedRows.map(\.path), ["copies/copy.txt"])
+        XCTAssertEqual(reviewedRows.first?.originalPath, "source.txt")
+        let sourceIndexBeforeUnstage = try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo)
+
+        let unstageOutcome = await repository.applyBulkMutation(
+            AgentChangesBulkMutationRequest(
+                section: .staged,
+                stage: false,
+                rows: reviewedRows,
+                targetRequestID: snapshot.targetRequestID
+            )
+        )
+        XCTAssertEqual(unstageOutcome, .applied)
+        XCTAssertEqual(
+            try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo),
+            sourceIndexBeforeUnstage
+        )
+        XCTAssertFalse(try gitOutput(["diff", "--", "source.txt"], cwd: repo).isEmpty)
+        await repository.shutdown()
+    }
+
+    func testDetectedCopyDestinationDriftWhileStageWaitsForLockIsRefused() async throws {
+        let repo = try makeGitFixture(committing: [
+            "source.txt": "original\n",
+            "holder.txt": "holder\n"
+        ])
+        try runGit(["config", "status.renames", "copies"], cwd: repo)
+        try write("original\n", to: "copy.txt", in: repo)
+        try write("source worktree edit\n", to: "source.txt", in: repo)
+        try runGit(["add", "-N", "--", "copy.txt"], cwd: repo)
+
+        let gitService = GitService()
+        let repository = makeLiveRepository(gitService: gitService)
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.unstaged)?.rows.first(where: { $0.path == "copy.txt" })
+        )
+        XCTAssertEqual(row.originalPath, "source.txt")
+
+        let holderFence = TestReleaseFence(name: "copy destination-drift holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task { () -> (any Error)? in
+            do {
+                try await holderBackend.stage(
+                    [VCSIndexPathIdentity(path: "holder.txt")],
+                    at: repo,
+                    authorize: {
+                        await holderFence.enterAndWait()
+                        return false
+                    }
+                )
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: true,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        try write("destination drift\n", to: "copy.txt", in: repo)
+        let indexBeforeRefusal = try indexData(in: repo)
+        holderFence.release()
+
+        let holderError = await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(holderError as? GitIndexMutationError, .authorizationRevoked)
+        XCTAssertEqual(outcome, .contentChanged)
+        XCTAssertEqual(try indexData(in: repo), indexBeforeRefusal)
+        await repository.shutdown()
+    }
+
+    func testDetectedCopySourceOnlyContentRevisionWhileStageWaitsForLockStillStagesDestination() async throws {
+        let repo = try makeGitFixture(committing: [
+            "source.txt": "original\n",
+            "holder.txt": "holder\n"
+        ])
+        try runGit(["config", "status.renames", "copies"], cwd: repo)
+        try write("original\n", to: "copy.txt", in: repo)
+        try write("source worktree edit\n", to: "source.txt", in: repo)
+        try runGit(["add", "-N", "--", "copy.txt"], cwd: repo)
+
+        let gitService = GitService()
+        let repository = makeLiveRepository(gitService: gitService)
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.unstaged)?.rows.first(where: { $0.path == "copy.txt" })
+        )
+        XCTAssertEqual(row.originalPath, "source.txt")
+        let sourceIndexBeforeStage = try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo)
+
+        let holderFence = TestReleaseFence(name: "copy source-revision holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task { () -> (any Error)? in
+            do {
+                try await holderBackend.stage(
+                    [VCSIndexPathIdentity(path: "holder.txt")],
+                    at: repo,
+                    authorize: {
+                        await holderFence.enterAndWait()
+                        return false
+                    }
+                )
+                return nil
+            } catch {
+                return error
+            }
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: true,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        await repository.refresh(
+            .contentDelta(paths: [repo.appendingPathComponent("source.txt").path])
+        )
+        await repository.waitUntilIdle()
+        let refreshedSnapshot = await repository.currentSnapshot()
+        let refreshedCopy = try XCTUnwrap(
+            refreshedSnapshot.section(.unstaged)?.rows.first(where: { $0.path == "copy.txt" })
+        )
+        XCTAssertEqual(refreshedCopy.identity, row.identity)
+        holderFence.release()
+
+        let holderError = await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(holderError as? GitIndexMutationError, .authorizationRevoked)
+        XCTAssertEqual(outcome, .applied)
+        XCTAssertEqual(try gitOutput(["show", ":copy.txt"], cwd: repo), "original\n")
+        XCTAssertEqual(
+            try gitOutput(["ls-files", "--stage", "--", "source.txt"], cwd: repo),
+            sourceIndexBeforeStage
+        )
+        XCTAssertFalse(try gitOutput(["diff", "--", "source.txt"], cwd: repo).isEmpty)
+        await repository.shutdown()
+    }
+
+    func testUnrelatedIndexMutationWhileUnstageWaitsForLockAllowsReviewedMutation() async throws {
+        let (repo, gitService, repository) = try await makeIndexDriftRepository()
+        try write("holder changed\n", to: "holder.txt", in: repo)
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.staged)?.rows.first(where: { $0.path == "file.txt" })
+        )
+
+        let holderFence = TestReleaseFence(name: "unrelated index-mutation holder")
+        let holderBackend = GitBackend(gitService: gitService)
+        let holder = Task {
+            try await holderBackend.stage(
+                [VCSIndexPathIdentity(path: "holder.txt")],
+                at: repo,
+                authorize: {
+                    await holderFence.enterAndWait()
+                    return true
+                }
+            )
+        }
+        await holderFence.waitUntilEntered()
+
+        let mutation = Task {
+            await repository.applyMutation(
+                AgentChangesMutationRequest(
+                    row: row,
+                    stage: false,
+                    targetRequestID: snapshot.targetRequestID
+                )
+            )
+        }
+        await gitService.waitForWorktreeMutationWaiterForTesting(at: repo)
+        holderFence.release()
+
+        try await holder.value
+        let outcome = await mutation.value
+        XCTAssertEqual(outcome, .applied)
+        XCTAssertEqual(
+            try gitOutput(["show", ":file.txt"], cwd: repo),
+            indexDriftContents(firstChanged: false, secondChanged: false)
+        )
+        XCTAssertEqual(try gitOutput(["show", ":holder.txt"], cwd: repo), "holder changed\n")
+        await repository.shutdown()
+    }
+
+    func testCleanReviewedRenameStillStagesBothMutationPaths() async throws {
+        let repo = try makeGitFixture(committing: ["origin.txt": "reviewed\n"])
+        try runGit(["config", "status.renames", "true"], cwd: repo)
+        try FileManager.default.moveItem(
+            at: repo.appendingPathComponent("origin.txt"),
+            to: repo.appendingPathComponent("renamed.txt")
+        )
+        try runGit(["add", "-N", "renamed.txt"], cwd: repo)
+
+        let repository = makeLiveRepository()
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        let snapshot = await repository.currentSnapshot()
+        let row = try XCTUnwrap(
+            snapshot.section(.unstaged)?.rows.first(where: { $0.path == "renamed.txt" })
+        )
+        XCTAssertEqual(row.originalPath, "origin.txt")
+
+        let outcome = await repository.applyMutation(AgentChangesMutationRequest(row: row, stage: true))
+
+        XCTAssertEqual(outcome, .applied)
+        let staged = try TestGitCommandRunner.run(
+            ["diff", "--cached", "--name-status"],
+            cwd: repo,
+            failureDomain: "AgentChangesRepositoryTests.git"
+        )
+        XCTAssertTrue(staged.hasPrefix("R"))
+        XCTAssertTrue(staged.contains("origin.txt"))
+        XCTAssertTrue(staged.contains("renamed.txt"))
+        await repository.shutdown()
+    }
+
     func testARealRepositoryPatchLoadProjectsTheExpandedFilesHunk() async throws {
         let repo = try makeGitFixture(committing: ["main.swift": "let a = 1\nlet b = 2\nlet c = 3\n"])
         try write("let a = 1\nlet b = 22\nlet c = 3\n", to: "main.swift", in: repo)
@@ -1657,6 +2694,48 @@ final class AgentChangesRepositoryTests: XCTestCase {
         )
     }
 
+    private func makeIndexDriftRepository() async throws -> (
+        repo: URL,
+        gitService: GitService,
+        repository: AgentChangesRepository
+    ) {
+        let repo = try makeGitFixture(committing: [
+            "file.txt": indexDriftContents(firstChanged: false, secondChanged: false),
+            "holder.txt": "holder\n"
+        ])
+        try write(
+            indexDriftContents(firstChanged: true, secondChanged: false),
+            to: "file.txt",
+            in: repo
+        )
+        try runGit(["add", "--", "file.txt"], cwd: repo)
+        try write(
+            indexDriftContents(firstChanged: true, secondChanged: true),
+            to: "file.txt",
+            in: repo
+        )
+
+        let gitService = GitService()
+        let repository = makeLiveRepository(gitService: gitService)
+        await repository.setTarget(makeCheckout(url: repo), mode: .workingTree)
+        await repository.waitUntilIdle()
+        return (repo, gitService, repository)
+    }
+
+    private func indexDriftContents(
+        firstChanged: Bool,
+        secondChanged: Bool
+    ) -> String {
+        var lines = (1 ... 14).map { "line \($0)" }
+        if firstChanged {
+            lines[1] = "reviewed staged hunk"
+        }
+        if secondChanged {
+            lines[10] = "additional index hunk"
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     private func makeLiveRepository() -> AgentChangesRepository {
         AgentChangesRepository(
             indexBackend: AgentChangesLiveIndexBackend(vcsService: VCSService()),
@@ -1668,6 +2747,27 @@ final class AgentChangesRepositoryTests: XCTestCase {
             contentDeltaWindow: .zero,
             makeTriggerFeed: { _ in InertTriggerFeed() }
         )
+    }
+
+    private func makeLiveRepository(gitService: GitService) -> AgentChangesRepository {
+        let vcsService = VCSService()
+        return AgentChangesRepository(
+            indexBackend: LiveRepositoryIndexBackend(
+                backend: GitBackend(gitService: gitService)
+            ),
+            diffSource: AgentChangesLiveDiffSource(
+                engine: GitDiffEngine(vcsService: vcsService, gitService: gitService),
+                gitService: gitService
+            ),
+            invalidationPublisher: FakeInvalidationPublisher(),
+            scheduler: ImmediateScheduler(),
+            contentDeltaWindow: .zero,
+            makeTriggerFeed: { _ in InertTriggerFeed() }
+        )
+    }
+
+    private func indexData(in repo: URL) throws -> Data {
+        try Data(contentsOf: repo.appendingPathComponent(".git/index"))
     }
 
     private func makeCheckout(
@@ -1754,6 +2854,14 @@ final class AgentChangesRepositoryTests: XCTestCase {
         try body.write(to: destination, atomically: true, encoding: .utf8)
     }
 
+    private func gitOutput(_ arguments: [String], cwd: URL) throws -> String {
+        try TestGitCommandRunner.run(
+            arguments,
+            cwd: cwd,
+            failureDomain: "AgentChangesRepositoryTests.git"
+        )
+    }
+
     private func runGit(_ arguments: [String], cwd: URL) throws {
         try TestGitCommandRunner.run(
             arguments,
@@ -1788,6 +2896,67 @@ private final class SnapshotRecorder: @unchecked Sendable {
         lock.withLock {
             snapshots.count(where: { $0.target?.id == id && $0.loadState == .ready })
         }
+    }
+}
+
+private struct LiveRepositoryIndexBackend: AgentChangesIndexBackend {
+    let backend: GitBackend
+
+    func capabilities(at _: URL) async -> VCSCapabilities {
+        .git
+    }
+
+    func hasHeadCommit(at checkout: URL) async throws -> Bool {
+        try await backend.hasHeadCommit(at: checkout)
+    }
+
+    func loadIndexStatus(at checkout: URL) async throws -> [VCSIndexStatusEntry] {
+        try await backend.loadIndexStatus(at: checkout)
+    }
+
+    func loadIndexStatus(
+        at checkout: URL,
+        paths: [String]
+    ) async throws -> [VCSIndexStatusEntry] {
+        try await backend.loadIndexStatus(at: checkout, paths: paths)
+    }
+
+    func stage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await backend.stage(identities, at: checkout, authorize: authorize)
+    }
+
+    func unstage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await backend.unstage(identities, at: checkout, authorize: authorize)
+    }
+
+    func applyCachedPatch(
+        _ data: Data,
+        reverse: Bool,
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await backend.applyCachedPatch(
+            data,
+            reverse: reverse,
+            at: checkout,
+            authorize: authorize
+        )
+    }
+
+    func markResolved(
+        _ identity: VCSIndexPathIdentity,
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await backend.markResolved(identity, at: checkout, authorize: authorize)
     }
 }
 
@@ -1852,6 +3021,20 @@ private final class CompletionFlag: @unchecked Sendable {
     }
 }
 
+private final class FeedCreationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var targets: [String] = []
+
+    var creationCount: Int {
+        lock.withLock { targets.count }
+    }
+
+    func makeFeed(for target: AgentPanelResolvedCheckout) -> InertTriggerFeed {
+        lock.withLock { targets.append(target.targetKey) }
+        return InertTriggerFeed()
+    }
+}
+
 private struct InertTriggerFeed: AgentChangesTriggerFeed {
     func events() -> AsyncStream<AgentChangesRefreshTrigger> {
         AsyncStream { $0.finish() }
@@ -1901,6 +3084,10 @@ private final class FakeIndexBackend: AgentChangesIndexBackend, @unchecked Senda
     private var resolvedBatches: [[String]] = []
     private var isHolding = false
     private var held: [CheckedContinuation<Void, Never>] = []
+    private var isHoldingMutations = false
+    private var heldMutations: [CheckedContinuation<Void, Never>] = []
+    private var mutationWaiterObservers: [CheckedContinuation<Void, Never>] = []
+    private var refusedMutations = 0
 
     init(entriesByCheckout: [String: [VCSIndexStatusEntry]], capabilities: VCSCapabilities = .git) {
         self.entriesByCheckout = entriesByCheckout
@@ -1929,6 +3116,63 @@ private final class FakeIndexBackend: AgentChangesIndexBackend, @unchecked Senda
 
     var capabilityCallPaths: [String] {
         lock.withLock { capabilityCalls }
+    }
+
+    /// How many mutations were refused by the caller's final-authority hook.
+    var refusedMutationCount: Int {
+        lock.withLock { refusedMutations }
+    }
+
+    /// Parks every mutation where the real backend parks one: after it has claimed the serialized
+    /// index slot and before the hook that decides whether the command may run.
+    func holdMutationsBeforeAuthorization() {
+        lock.withLock { isHoldingMutations = true }
+    }
+
+    func releaseHeldMutations() {
+        let waiters: [CheckedContinuation<Void, Never>] = lock.withLock {
+            isHoldingMutations = false
+            let pending = heldMutations
+            heldMutations = []
+            return pending
+        }
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    /// Resumes once a mutation is parked, so a test can revoke authority at exactly that point.
+    func waitForParkedMutation() async {
+        await withCheckedContinuation { continuation in
+            let resumeNow: Bool = lock.withLock {
+                guard heldMutations.isEmpty else { return true }
+                mutationWaiterObservers.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    /// Mirrors the real backend's order: wait for the serialized index slot, then evaluate the
+    /// caller's hook, then run. Refusals never reach the log, so "no mutation ran" is assertable.
+    private func beginMutation(authorize: VCSIndexMutationAuthorization) async throws {
+        await withCheckedContinuation { continuation in
+            let (resumeNow, observers): (Bool, [CheckedContinuation<Void, Never>]) = lock.withLock {
+                guard isHoldingMutations else { return (true, []) }
+                heldMutations.append(continuation)
+                let pending = mutationWaiterObservers
+                mutationWaiterObservers = []
+                return (false, pending)
+            }
+            for observer in observers {
+                observer.resume()
+            }
+            if resumeNow { continuation.resume() }
+        }
+        guard await authorize() else {
+            lock.withLock { refusedMutations += 1 }
+            throw GitIndexMutationError.authorizationRevoked
+        }
     }
 
     func setEntries(_ entries: [VCSIndexStatusEntry], at checkout: URL) {
@@ -2034,7 +3278,12 @@ private final class FakeIndexBackend: AgentChangesIndexBackend, @unchecked Senda
         return lock.withLock { entriesByCheckout[checkout.standardizedFileURL.path] ?? [] }
     }
 
-    func stage(_ identities: [VCSIndexPathIdentity], at checkout: URL) async throws {
+    func stage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await beginMutation(authorize: authorize)
         let failure: (any Error)? = lock.withLock {
             log.append(.stage(identities.map(\.path)))
             stagedBatches.append(identities.map(\.path))
@@ -2057,7 +3306,12 @@ private final class FakeIndexBackend: AgentChangesIndexBackend, @unchecked Senda
         }
     }
 
-    func unstage(_ identities: [VCSIndexPathIdentity], at checkout: URL) async throws {
+    func unstage(
+        _ identities: [VCSIndexPathIdentity],
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await beginMutation(authorize: authorize)
         lock.withLock {
             log.append(.unstage(identities.map(\.path)))
             unstagedBatches.append(identities.map(\.path))
@@ -2074,7 +3328,12 @@ private final class FakeIndexBackend: AgentChangesIndexBackend, @unchecked Senda
         }
     }
 
-    func markResolved(_ identity: VCSIndexPathIdentity, at checkout: URL) async throws {
+    func markResolved(
+        _ identity: VCSIndexPathIdentity,
+        at checkout: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        try await beginMutation(authorize: authorize)
         lock.withLock {
             log.append(.markResolved(identity.path))
             resolvedBatches.append([identity.path])

@@ -109,6 +109,7 @@ actor GitService {
     /// pathspec list, which has no argument-length or quoting limits.
     private static let indexMutationPathspecByteLimit = 128 * 1024
     private static let indexMutationArgumentPathLimit = 3000
+    private static let indexPatchByteLimit = 2 * 1024 * 1024
     /// Root/search startup snapshots and receipts are process-local. A process-local salt
     /// provides one path-free repository namespace shared by all GitService instances while
     /// intentionally making restart/receipt loss fall back to the full crawler.
@@ -2092,7 +2093,8 @@ actor GitService {
     func getStatusPorcelainZ(at repoURL: URL) async throws -> Data {
         let (stdout, stderr, exitCode) = try await runGit(
             ["status", "--porcelain", "-z", "--untracked-files=all"],
-            at: repoURL
+            at: repoURL,
+            env: ["GIT_OPTIONAL_LOCKS": "0"]
         )
         guard exitCode == 0 else {
             throw GitError(message: "git status --porcelain -z failed: \(stderr)")
@@ -2212,7 +2214,12 @@ actor GitService {
             do {
                 let stdin = makePathspecStdinData(files)
                 let args = ["diff", "--pathspec-from-file=-", "--pathspec-file-nul", branch]
-                let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL, stdin: stdin)
+                let (stdout, stderr, exitCode) = try await runGit(
+                    args,
+                    at: repoURL,
+                    env: ["GIT_LITERAL_PATHSPECS": "1"],
+                    stdin: stdin
+                )
                 guard exitCode == 0 || exitCode == 1 else {
                     throw GitError(message: "git diff failed: \(stderr)")
                 }
@@ -2227,7 +2234,11 @@ actor GitService {
         if files.count <= maxChunk {
             var args = ["diff", branch, "--"]
             args.append(contentsOf: files)
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGit(
+                args,
+                at: repoURL,
+                env: ["GIT_LITERAL_PATHSPECS": "1"]
+            )
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(stderr)")
             }
@@ -2238,7 +2249,11 @@ actor GitService {
         for chunk in files.chunked(into: maxChunk) {
             var args = ["diff", branch, "--"]
             args.append(contentsOf: chunk)
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGit(
+                args,
+                at: repoURL,
+                env: ["GIT_LITERAL_PATHSPECS": "1"]
+            )
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(stderr)")
             }
@@ -2253,36 +2268,15 @@ actor GitService {
     /// Split a unified diff output into per-file diff strings.
     static func splitUnifiedDiffByFile(_ diff: String) -> [String: String] {
         guard !diff.isEmpty else { return [:] }
-        let endsWithNewline = diff.hasSuffix("\n")
-        let lines = diff.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var result: [String: String] = [:]
-        var currentBlock: [String] = []
 
-        for line in lines {
-            if line.hasPrefix("diff --git ") {
-                finalizeUnifiedDiffBlock(currentBlock, endsWithNewline: endsWithNewline, into: &result)
-                currentBlock = [line]
-                continue
-            }
-            guard !currentBlock.isEmpty else { continue }
-            currentBlock.append(line)
+        for rawBlock in GitRawDiffFileSplitter.split(Data(diff.utf8)) {
+            let text = String(decoding: rawBlock, as: UTF8.self)
+            let block = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard let path = canonicalPath(forUnifiedDiffBlock: block) else { continue }
+            result[path] = text
         }
-
-        finalizeUnifiedDiffBlock(currentBlock, endsWithNewline: endsWithNewline, into: &result)
         return result
-    }
-
-    private static func finalizeUnifiedDiffBlock(
-        _ block: [String],
-        endsWithNewline: Bool,
-        into result: inout [String: String]
-    ) {
-        guard !block.isEmpty, let path = canonicalPath(forUnifiedDiffBlock: block) else { return }
-        var text = block.joined(separator: "\n")
-        if endsWithNewline, !text.hasSuffix("\n") {
-            text += "\n"
-        }
-        result[path] = text
     }
 
     private struct PatchHeaderPaths {
@@ -2557,7 +2551,11 @@ actor GitService {
             if files.count <= maxChunk {
                 var args = ["diff", "--unified=3", "HEAD", "--"]
                 args.append(contentsOf: files)
-                let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+                let (stdout, stderr, exitCode) = try await runGit(
+                    args,
+                    at: repoURL,
+                    env: ["GIT_LITERAL_PATHSPECS": "1"]
+                )
                 guard exitCode == 0 || exitCode == 1 else {
                     throw GitError(message: "git diff failed: \(stderr)")
                 }
@@ -2566,7 +2564,11 @@ actor GitService {
             for chunk in files.chunked(into: maxChunk) {
                 var args = ["diff", "--unified=3", "HEAD", "--"]
                 args.append(contentsOf: chunk)
-                let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+                let (stdout, stderr, exitCode) = try await runGit(
+                    args,
+                    at: repoURL,
+                    env: ["GIT_LITERAL_PATHSPECS": "1"]
+                )
                 guard exitCode == 0 || exitCode == 1 else {
                     throw GitError(message: "git diff failed: \(stderr)")
                 }
@@ -2578,7 +2580,11 @@ actor GitService {
             return combined
         } else {
             let args = ["diff", "--unified=3", "HEAD"]
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGit(
+                args,
+                at: repoURL,
+                env: ["GIT_LITERAL_PATHSPECS": "1"]
+            )
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(stderr)")
             }
@@ -2601,7 +2607,7 @@ actor GitService {
         let usePathspec = !cleanedPaths.isEmpty && pathspecBytes >= pathspecByteLimit
 
         func baseArgs() -> [String] {
-            var args = argsPrefix
+            var args = ["--no-optional-locks"] + argsPrefix
             if let contextLines {
                 args.append("--unified=\(contextLines)")
             }
@@ -2621,7 +2627,12 @@ actor GitService {
                     args.append(refArg)
                 }
                 let stdin = makePathspecStdinData(cleanedPaths)
-                let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL, stdin: stdin)
+                let (stdout, stderr, exitCode) = try await runGit(
+                    args,
+                    at: repoURL,
+                    env: ["GIT_LITERAL_PATHSPECS": "1"],
+                    stdin: stdin
+                )
                 guard exitCode == 0 || exitCode == 1 else {
                     throw GitError(message: "git diff failed: \(stderr)")
                 }
@@ -2638,7 +2649,11 @@ actor GitService {
             if let refArg, !refArg.isEmpty {
                 args.append(refArg)
             }
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGit(
+                args,
+                at: repoURL,
+                env: ["GIT_LITERAL_PATHSPECS": "1"]
+            )
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(stderr)")
             }
@@ -2652,7 +2667,11 @@ actor GitService {
             }
             args.append("--")
             args.append(contentsOf: cleanedPaths)
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGit(
+                args,
+                at: repoURL,
+                env: ["GIT_LITERAL_PATHSPECS": "1"]
+            )
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(stderr)")
             }
@@ -2667,7 +2686,11 @@ actor GitService {
             }
             args.append("--")
             args.append(contentsOf: chunk)
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+            let (stdout, stderr, exitCode) = try await runGit(
+                args,
+                at: repoURL,
+                env: ["GIT_LITERAL_PATHSPECS": "1"]
+            )
             guard exitCode == 0 || exitCode == 1 else {
                 throw GitError(message: "git diff failed: \(stderr)")
             }
@@ -2778,6 +2801,166 @@ actor GitService {
             paths: paths,
             at: repoURL
         )
+    }
+
+    /// Reads Git diff stdout without a String round-trip.
+    ///
+    /// Partial staging binds review tokens to these bytes. The existing text APIs remain the
+    /// rendering surface, but they cannot prove that CRLF or other byte-level syntax survived.
+    func getDiffData(
+        compare: GitDiffCompareSpec,
+        paths: [String]?,
+        contextLines: Int,
+        detectRenames: Bool,
+        at repoURL: URL
+    ) async throws -> Data {
+        switch compare {
+        case let .uncommitted(base):
+            try await runDiffData(
+                argsPrefix: ["diff"],
+                contextLines: contextLines,
+                detectRenames: detectRenames,
+                refArg: base,
+                paths: paths,
+                at: repoURL
+            )
+        case let .uncommittedMergeBase(base):
+            try await runDiffData(
+                argsPrefix: ["diff", "--merge-base"],
+                contextLines: contextLines,
+                detectRenames: detectRenames,
+                refArg: base,
+                paths: paths,
+                at: repoURL
+            )
+        case let .staged(base):
+            try await runDiffData(
+                argsPrefix: ["diff", "--cached"],
+                contextLines: contextLines,
+                detectRenames: detectRenames,
+                refArg: base,
+                paths: paths,
+                at: repoURL
+            )
+        case let .stagedMergeBase(base):
+            try await runDiffData(
+                argsPrefix: ["diff", "--cached", "--merge-base"],
+                contextLines: contextLines,
+                detectRenames: detectRenames,
+                refArg: base,
+                paths: paths,
+                at: repoURL
+            )
+        case .unstaged:
+            try await runDiffData(
+                argsPrefix: ["diff"],
+                contextLines: contextLines,
+                detectRenames: detectRenames,
+                refArg: nil,
+                paths: paths,
+                at: repoURL
+            )
+        case let .revspec(revspec):
+            try await runDiffData(
+                argsPrefix: ["diff"],
+                contextLines: contextLines,
+                detectRenames: detectRenames,
+                refArg: revspec,
+                paths: paths,
+                at: repoURL
+            )
+        }
+    }
+
+    private func runDiffData(
+        argsPrefix: [String],
+        contextLines: Int?,
+        detectRenames: Bool,
+        refArg: String?,
+        paths: [String]?,
+        at repoURL: URL
+    ) async throws -> Data {
+        let maxChunk = 3000
+        let pathspecByteLimit = 128 * 1024
+        let cleanedPaths = (paths ?? []).filter { !$0.isEmpty }
+        let pathspecBytes = cleanedPaths.reduce(0) { $0 + $1.lengthOfBytes(using: .utf8) + 1 }
+        let usePathspec = !cleanedPaths.isEmpty && pathspecBytes >= pathspecByteLimit
+
+        func baseArgs() -> [String] {
+            var args = ["--no-optional-locks"] + argsPrefix
+            if let contextLines {
+                args.append("--unified=\(contextLines)")
+            }
+            if detectRenames {
+                args.append("-M")
+            }
+            args.append("--no-ext-diff")
+            args.append("--color=never")
+            return args
+        }
+
+        func execute(_ args: [String], stdin: Data? = nil) async throws -> Data {
+            let (stdout, stderr, exitCode) = try await runGitData(
+                args,
+                at: repoURL,
+                env: ["GIT_LITERAL_PATHSPECS": "1"],
+                stdin: stdin
+            )
+            guard exitCode == 0 || exitCode == 1 else {
+                throw GitError(message: "git diff failed: \(String(decoding: stderr, as: UTF8.self))")
+            }
+            return stdout
+        }
+
+        if usePathspec {
+            do {
+                var args = baseArgs()
+                args.append(contentsOf: ["--pathspec-from-file=-", "--pathspec-file-nul"])
+                if let refArg, !refArg.isEmpty {
+                    args.append(refArg)
+                }
+                return try await execute(args, stdin: makePathspecStdinData(cleanedPaths))
+            } catch {
+                if !shouldFallbackFromPathspecError(error) {
+                    throw error
+                }
+            }
+        }
+
+        guard !cleanedPaths.isEmpty else {
+            var args = baseArgs()
+            if let refArg, !refArg.isEmpty {
+                args.append(refArg)
+            }
+            return try await execute(args)
+        }
+
+        if cleanedPaths.count <= maxChunk {
+            var args = baseArgs()
+            if let refArg, !refArg.isEmpty {
+                args.append(refArg)
+            }
+            args.append("--")
+            args.append(contentsOf: cleanedPaths)
+            return try await execute(args)
+        }
+
+        var combined = Data()
+        for chunk in cleanedPaths.chunked(into: maxChunk) {
+            var args = baseArgs()
+            if let refArg, !refArg.isEmpty {
+                args.append(refArg)
+            }
+            args.append("--")
+            args.append(contentsOf: chunk)
+            let stdout = try await execute(args)
+            guard !stdout.isEmpty else { continue }
+            combined.append(stdout)
+            if combined.last != 0x0A {
+                combined.append(0x0A)
+            }
+        }
+        return combined
     }
 
     /// Reads one bounded file version from the index or an object-tree reference.
@@ -3506,7 +3689,11 @@ actor GitService {
     /// Read branch metadata and working-tree state from one porcelain-v2 snapshot.
     func getRepositoryStatus(at repoURL: URL) async throws -> RepositoryStatus {
         let args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
-        let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
+        let (stdout, stderr, exitCode) = try await runGit(
+            args,
+            at: repoURL,
+            env: ["GIT_OPTIONAL_LOCKS": "0"]
+        )
         guard exitCode == 0 else {
             throw GitError(message: "git status --porcelain=v2 failed: \(stderr)")
         }
@@ -3539,8 +3726,12 @@ actor GitService {
     /// The projection reuses the shared parser rather than reading status a second
     /// time, so section membership and staging always agree on one observation.
     func loadIndexStatusEntries(at repoURL: URL) async throws -> [VCSIndexStatusEntry] {
-        let args = ["status", "--porcelain=v2", "-z", "--untracked-files=all"]
-        let (stdoutData, stderrData, exitCode) = try await runGitData(args, at: repoURL)
+        let args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
+        let (stdoutData, stderrData, exitCode) = try await runGitData(
+            args,
+            at: repoURL,
+            env: ["GIT_OPTIONAL_LOCKS": "0"]
+        )
         let stderr = String(decoding: stderrData, as: UTF8.self)
         guard exitCode == 0 else {
             throw GitIndexMutationError.gitRefused("git status --porcelain=v2 failed: \(stderr)")
@@ -3549,7 +3740,54 @@ actor GitService {
         let parsed = try MCPToolWorkCountDiagnostics.measureGitParse {
             try GitStatusPorcelainV2Parser.parse(stdout)
         }
-        return VCSIndexStatusEntry.project(parsed.pathRecords)
+        return VCSIndexStatusEntry.project(parsed)
+    }
+
+    /// Read the same porcelain-v2 projection, scoped to the reviewed mutation paths.
+    func loadIndexStatusEntries(
+        at repoURL: URL,
+        paths: [String]
+    ) async throws -> [VCSIndexStatusEntry] {
+        var seen = Set<String>()
+        let normalizedPaths = try paths.compactMap { rawPath -> String? in
+            let path = try Self.normalizedIndexMutationPath(rawPath)
+            return seen.insert(path).inserted ? path : nil
+        }
+        guard !normalizedPaths.isEmpty else { return [] }
+
+        let pathspecBytes = normalizedPaths.reduce(0) {
+            $0 + $1.lengthOfBytes(using: .utf8) + 1
+        }
+        var args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
+        var stdin: Data?
+        if pathspecBytes >= Self.indexMutationPathspecByteLimit
+            || normalizedPaths.count > Self.indexMutationArgumentPathLimit
+        {
+            args.append(contentsOf: ["--pathspec-from-file=-", "--pathspec-file-nul"])
+            stdin = makePathspecStdinData(normalizedPaths)
+        } else {
+            args.append("--")
+            args.append(contentsOf: normalizedPaths)
+        }
+
+        let (stdoutData, stderrData, exitCode) = try await runGitData(
+            args,
+            at: repoURL,
+            env: [
+                "GIT_LITERAL_PATHSPECS": "1",
+                "GIT_OPTIONAL_LOCKS": "0"
+            ],
+            stdin: stdin
+        )
+        let stderr = String(decoding: stderrData, as: UTF8.self)
+        guard exitCode == 0 else {
+            throw GitIndexMutationError.gitRefused("git status --porcelain=v2 failed: \(stderr)")
+        }
+        let stdout = try Self.decodeIndexStatusOutput(stdoutData)
+        let parsed = try MCPToolWorkCountDiagnostics.measureGitParse {
+            try GitStatusPorcelainV2Parser.parse(stdout)
+        }
+        return VCSIndexStatusEntry.project(parsed)
     }
 
     nonisolated static func decodeIndexStatusOutput(_ data: Data) throws -> String {
@@ -3579,13 +3817,18 @@ actor GitService {
     /// `git add -A` covers modifications, deletions, and untracked files in one
     /// command, and rename origins are staged alongside their current path so the
     /// index never records half a rename.
-    func stageIndexPaths(_ identities: [VCSIndexPathIdentity], at repoURL: URL) async throws {
+    func stageIndexPaths(
+        _ identities: [VCSIndexPathIdentity],
+        at repoURL: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
         let paths = try Self.normalizedIndexMutationPaths(identities)
         guard !paths.isEmpty else { return }
         try await withIndexMutationLock(at: repoURL) { [weak self] in
             guard let self else {
                 throw GitIndexMutationError.unavailable("git service was released before index mutation")
             }
+            try await Self.requireIndexMutationAuthorization(authorize)
             try await runIndexMutationCommandOnce(
                 command: ["add", "-A"],
                 label: "git add",
@@ -3595,11 +3838,65 @@ actor GitService {
         }
     }
 
+    /// Applies one caller-supplied patch to the index without reading or changing worktree files.
+    ///
+    /// One `git apply` process preserves all-or-nothing behavior. Options that synthesize conflict
+    /// state, write rejects, widen paths, or reinterpret ranges are deliberately absent.
+    func applyIndexPatch(
+        data: Data,
+        reverse: Bool,
+        repoURL: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        guard !data.isEmpty else {
+            throw GitIndexMutationError.invalidPatch("the patch is empty")
+        }
+        guard data.count <= Self.indexPatchByteLimit else {
+            throw GitIndexMutationError.patchTooLarge(limit: Self.indexPatchByteLimit)
+        }
+
+        try await withIndexMutationLock(at: repoURL) { [weak self] in
+            guard let self else {
+                throw GitIndexMutationError.unavailable("git service was released before index mutation")
+            }
+
+            var arguments = ["apply", "--cached"]
+            if reverse {
+                arguments.append("--reverse")
+            }
+            arguments.append("--whitespace=nowarn")
+
+            try await Self.requireIndexMutationAuthorization(authorize)
+            let (_, stderr, exitCode) = try await runGit(
+                arguments,
+                at: repoURL,
+                stdin: data
+            )
+            guard exitCode == 0 else {
+                let message = stderr.isEmpty ? "git apply exited with status \(exitCode)" : stderr
+                if Self.isIndexLockContention(message) {
+                    throw GitIndexMutationError.indexLocked
+                }
+                if Self.isInvalidApplyPatch(message) {
+                    throw GitIndexMutationError.invalidPatch(message)
+                }
+                if Self.isApplyMismatch(message) {
+                    throw GitIndexMutationError.patchDoesNotApply(message)
+                }
+                throw GitIndexMutationError.gitRefused("git apply --cached failed: \(message)")
+            }
+        }
+    }
+
     /// Mark one conflicted path resolved by recording its current contents.
     ///
     /// Deliberately uses plain `git add -- <path>` rather than the broader ordinary-staging `-A`
     /// command. The row action names one conflict and must not acquire any neighboring changes.
-    func markIndexPathResolved(_ identity: VCSIndexPathIdentity, at repoURL: URL) async throws {
+    func markIndexPathResolved(
+        _ identity: VCSIndexPathIdentity,
+        at repoURL: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
         let paths = try Self.normalizedIndexMutationPaths([
             VCSIndexPathIdentity(path: identity.path)
         ])
@@ -3608,6 +3905,7 @@ actor GitService {
             guard let self else {
                 throw GitIndexMutationError.unavailable("git service was released before index mutation")
             }
+            try await Self.requireIndexMutationAuthorization(authorize)
             try await runIndexMutationCommandOnce(
                 command: ["add"],
                 label: "git add",
@@ -3623,7 +3921,11 @@ actor GitService {
     /// there is nothing to restore from, so the entries are removed from the index
     /// only; `--ignore-unmatch` keeps the request idempotent when a path was never
     /// staged.
-    func unstageIndexPaths(_ identities: [VCSIndexPathIdentity], at repoURL: URL) async throws {
+    func unstageIndexPaths(
+        _ identities: [VCSIndexPathIdentity],
+        at repoURL: URL,
+        authorize: VCSIndexMutationAuthorization
+    ) async throws {
         let paths = try Self.normalizedIndexMutationPaths(identities)
         guard !paths.isEmpty else { return }
         try await withIndexMutationLock(at: repoURL) { [weak self] in
@@ -3633,7 +3935,11 @@ actor GitService {
             // Probed inside the lock: a first commit landing through this service
             // between the probe and the mutation would otherwise turn an unstage
             // into a staged deletion.
-            if try await hasHeadCommit(at: repoURL) {
+            let hasHeadCommit = try await hasHeadCommit(at: repoURL)
+            // Authorized after the probe rather than before it, so the check stays the last thing
+            // that happens before the mutating command.
+            try await Self.requireIndexMutationAuthorization(authorize)
+            if hasHeadCommit {
                 try await runIndexMutationCommandOnce(
                     command: ["restore", "--staged"],
                     label: "git restore --staged",
@@ -3648,6 +3954,20 @@ actor GitService {
                     at: repoURL
                 )
             }
+        }
+    }
+
+    /// Evaluates the caller's final-authority hook inside the index-mutation lock.
+    ///
+    /// Every repository-side fence is checked before the mutation is handed over, but a queued
+    /// mutation can wait here while another mutation of the same checkout runs, and the panel can
+    /// retarget or shut down during that wait. This is the last point at which refusing means no
+    /// Git process ever started.
+    private static func requireIndexMutationAuthorization(
+        _ authorize: VCSIndexMutationAuthorization
+    ) async throws {
+        guard await authorize() else {
+            throw GitIndexMutationError.authorizationRevoked
         }
     }
 
@@ -3761,6 +4081,24 @@ actor GitService {
         let message = stderr.lowercased()
         guard message.contains("index.lock") else { return false }
         return message.contains("file exists") || message.contains("another git process")
+    }
+
+    private nonisolated static func isInvalidApplyPatch(_ stderr: String) -> Bool {
+        let message = stderr.lowercased()
+        return message.contains("corrupt patch")
+            || message.contains("no valid patches in input")
+            || message.contains("unrecognized input")
+            || message.contains("patch fragment without header")
+            || message.contains("git diff header lacks filename")
+            || message.contains("invalid path")
+    }
+
+    private nonisolated static func isApplyMismatch(_ stderr: String) -> Bool {
+        let message = stderr.lowercased()
+        return message.contains("patch does not apply")
+            || message.contains("does not match index")
+            || message.contains("while searching for")
+            || message.contains("patch failed")
     }
 
     // MARK: - Git Blob Identity Shadow Plumbing

@@ -182,10 +182,18 @@ struct AgentChangesSectionPresentation: Equatable {
 enum AgentChangesFooterPresentation {
     /// `"4 files · +120 −34"`, counting each file once even when it sits in two sections.
     static func totals(for snapshot: AgentChangesSnapshot) -> String {
-        let count = snapshot.totalFileCount
-        let files = count == 1 ? "1 file" : "\(count) files"
-        guard snapshot.additions > 0 || snapshot.deletions > 0 else { return files }
-        return "\(files) · +\(snapshot.additions) \u{2212}\(snapshot.deletions)"
+        totals(
+            fileCount: snapshot.totalFileCount,
+            additions: snapshot.additions,
+            deletions: snapshot.deletions
+        )
+    }
+
+    /// Aggregate footer copy for independently refreshing repository groups.
+    static func totals(fileCount: Int, additions: Int, deletions: Int) -> String {
+        let files = fileCount == 1 ? "1 file" : "\(fileCount) files"
+        guard additions > 0 || deletions > 0 else { return files }
+        return "\(files) · +\(additions) \u{2212}\(deletions)"
     }
 
     /// Relative last-refresh text, coarse on purpose: a diff panel that ticks every second reads as
@@ -198,6 +206,245 @@ enum AgentChangesFooterPresentation {
         case ..<60: return "Updated \(Int(elapsed))s ago"
         case ..<3600: return "Updated \(Int(elapsed / 60))m ago"
         default: return "Updated \(Int(elapsed / 3600))h ago"
+        }
+    }
+}
+
+// MARK: - Group and search presentation
+
+/// Stable copy for one repository header, kept pure so collapsed roots and worktrees cannot drift
+/// between the visual label, tooltip, and accessibility value.
+struct AgentChangesGroupHeaderPresentation: Equatable {
+    let title: String
+    let checkoutIdentity: String
+    let checkoutTooltip: String
+
+    init(target: AgentPanelResolvedCheckout) {
+        title = target.displayName
+        if let worktree = target.worktree, !target.substitutesUnavailableWorktree {
+            checkoutIdentity = worktree.branch ?? worktree.label
+            checkoutTooltip = "Agent worktree at \(worktree.worktreeRootPath)"
+        } else {
+            checkoutIdentity = target.checkoutURL.lastPathComponent
+            checkoutTooltip = "Workspace checkout at \(target.checkoutURL.path)"
+        }
+    }
+}
+
+/// Compact result and budget copy for the fixed search bar.
+struct AgentChangesSearchBarPresentation: Equatable {
+    let resultText: String
+    let limitText: String?
+
+    init(state: AgentChangesSearchState) {
+        let total = state.matches.count
+        if let selected = state.selectedMatchIndex, total > 0 {
+            resultText = "\(selected + 1) of \(total)"
+        } else if state.phase == .ready {
+            resultText = "No matches"
+        } else if state.phase == .loading || state.phase == .debouncing {
+            resultText = "Searching\u{2026}"
+        } else {
+            resultText = ""
+        }
+
+        var limits: [String] = []
+        if state.skippedFileCount > 0 {
+            let noun = state.skippedFileCount == 1 ? "file" : "files"
+            limits.append("\(state.skippedFileCount) \(noun) skipped")
+        }
+        if state.isTruncated {
+            limits.append("results limited")
+        }
+        limitText = limits.isEmpty ? nil : limits.joined(separator: " · ")
+    }
+}
+
+/// Copy for the one patch-level partial-staging notice and the quiet hunk/line actions.
+enum AgentChangesPartialStagingPresentation {
+    static func actionTitle(_ action: AgentChangesPartialAction, noun: String) -> String {
+        switch action {
+        case .stage: "Stage \(noun)"
+        case .unstage: "Unstage \(noun)"
+        }
+    }
+
+    static func selectedLinesTitle(_ action: AgentChangesPartialAction, count: Int) -> String {
+        actionTitle(action, noun: count == 1 ? "1 line" : "\(count) lines")
+    }
+
+    static func unavailableMessage(
+        for reason: AgentChangesPartialStagingUnavailableReason
+    ) -> String? {
+        switch reason {
+        case .untrackedRequiresWholeFile:
+            "Stage the whole file before staging individual lines."
+        case .addedOrDeletedFile, .structuralChange, .binaryOrSubmodule:
+            "Partial staging is unavailable for structural file changes."
+        case .truncatedProjection:
+            "Partial staging is disabled because not all changed lines are shown."
+        case .rawPatchUnavailable, .malformedPatch:
+            "Partial staging is unavailable for this patch."
+        case .readOnlyCompare, .backendHasNoIndex, .unsafeScope, .conflicted:
+            nil
+        }
+    }
+}
+
+/// One background span after intraline and search ranges have been composed.
+struct AgentChangesTextHighlightSpan: Equatable {
+    enum Kind: Equatable {
+        case intraline
+        case search
+        case currentSearch
+    }
+
+    let utf16Range: Range<Int>
+    let kind: Kind
+}
+
+struct AgentChangesSearchHighlight: Equatable {
+    let utf16Range: Range<Int>
+    let isCurrent: Bool
+}
+
+/// Search takes precedence only where it overlaps an intraline range; current search takes the
+/// strongest background. Splitting at every endpoint preserves intraline emphasis everywhere else.
+enum AgentChangesHighlightComposition {
+    static func spans(
+        utf16Length: Int,
+        intralineRanges: [Range<Int>],
+        searchHighlights: [AgentChangesSearchHighlight]
+    ) -> [AgentChangesTextHighlightSpan] {
+        let intraline = intralineRanges.filter { valid($0, length: utf16Length) }
+        let search = searchHighlights.filter { valid($0.utf16Range, length: utf16Length) }
+        let rangeBoundaries = intraline.flatMap { [$0.lowerBound, $0.upperBound] }
+        let searchBoundaries = search.flatMap {
+            [$0.utf16Range.lowerBound, $0.utf16Range.upperBound]
+        }
+        let boundaries = Set([0, utf16Length] + rangeBoundaries + searchBoundaries).sorted()
+
+        var result: [AgentChangesTextHighlightSpan] = []
+        for pair in zip(boundaries, boundaries.dropFirst()) where pair.0 < pair.1 {
+            let range = pair.0 ..< pair.1
+            let kind: AgentChangesTextHighlightSpan.Kind? = if search.contains(
+                where: { $0.isCurrent && $0.utf16Range.contains(range) }
+            ) {
+                .currentSearch
+            } else if search.contains(where: { $0.utf16Range.contains(range) }) {
+                .search
+            } else if intraline.contains(where: { $0.contains(range) }) {
+                .intraline
+            } else {
+                nil
+            }
+            guard let kind else { continue }
+
+            if let last = result.last,
+               last.kind == kind,
+               last.utf16Range.upperBound == range.lowerBound
+            {
+                result[result.count - 1] = AgentChangesTextHighlightSpan(
+                    utf16Range: last.utf16Range.lowerBound ..< range.upperBound,
+                    kind: kind
+                )
+            } else {
+                result.append(AgentChangesTextHighlightSpan(utf16Range: range, kind: kind))
+            }
+        }
+        return result
+    }
+
+    private static func valid(_ range: Range<Int>, length: Int) -> Bool {
+        range.lowerBound >= 0 && range.upperBound <= length && !range.isEmpty
+    }
+}
+
+private extension Range where Bound == Int {
+    func contains(_ other: Range<Int>) -> Bool {
+        lowerBound <= other.lowerBound && upperBound >= other.upperBound
+    }
+}
+
+/// Builds one attributed string from the composed spans. Applying the already-prioritized spans
+/// once avoids relying on modifier order for overlap semantics.
+enum AgentChangesHighlightedText {
+    static func make(
+        _ text: String,
+        intralineRanges: [Range<Int>] = [],
+        searchHighlights: [AgentChangesSearchHighlight] = [],
+        intralineBackground: Color? = nil,
+        searchBackground: Color,
+        currentSearchBackground: Color
+    ) -> AttributedString {
+        var attributed = AttributedString(text)
+        let spans = AgentChangesHighlightComposition.spans(
+            utf16Length: text.utf16.count,
+            intralineRanges: intralineRanges,
+            searchHighlights: searchHighlights
+        )
+        for span in spans {
+            guard let range = attributedRange(span.utf16Range, text: text, attributed: attributed) else {
+                continue
+            }
+            switch span.kind {
+            case .intraline:
+                attributed[range].backgroundColor = intralineBackground
+            case .search:
+                attributed[range].backgroundColor = searchBackground
+            case .currentSearch:
+                attributed[range].backgroundColor = currentSearchBackground
+            }
+        }
+        return attributed
+    }
+
+    static func attributedRange(
+        _ utf16Range: Range<Int>,
+        text: String,
+        attributed: AttributedString
+    ) -> Range<AttributedString.Index>? {
+        guard utf16Range.lowerBound >= 0,
+              utf16Range.upperBound <= text.utf16.count,
+              !utf16Range.isEmpty
+        else { return nil }
+        let lower = String.Index(utf16Offset: utf16Range.lowerBound, in: text)
+        let upper = String.Index(utf16Offset: utf16Range.upperBound, in: text)
+        guard let attributedLower = AttributedString.Index(lower, within: attributed),
+              let attributedUpper = AttributedString.Index(upper, within: attributed)
+        else { return nil }
+        return attributedLower ..< attributedUpper
+    }
+}
+
+/// Pure keyboard-routing decision. The AppKit bridge supplies the explicit ancestry result; no
+/// command is produced when the first responder belongs to the transcript or another surface.
+enum AgentChangesPanelKeyCommand: Equatable {
+    case focusSearch
+    case nextMatch
+    case previousMatch
+    case clearAndResign
+}
+
+enum AgentChangesPanelKeyCommandRouting {
+    static func command(
+        character: String?,
+        keyCode: UInt16,
+        isCommandPressed: Bool,
+        isShiftPressed: Bool,
+        hasOtherModifiers: Bool,
+        isFirstResponderInsidePanel: Bool,
+        isSearchActive: Bool
+    ) -> AgentChangesPanelKeyCommand? {
+        guard isFirstResponderInsidePanel, !hasOtherModifiers else { return nil }
+        switch (character?.lowercased(), isCommandPressed, isShiftPressed) {
+        case ("f", true, false): return .focusSearch
+        case ("g", true, false): return .nextMatch
+        case ("g", true, true): return .previousMatch
+        default:
+            return keyCode == 53 && !isCommandPressed && !isShiftPressed && isSearchActive
+                ? .clearAndResign
+                : nil
         }
     }
 }
@@ -403,6 +650,15 @@ enum AgentChangesDiffPalette {
 
     static func hunkHeaderBackground(colorScheme: ColorScheme) -> Color {
         Color(nsColor: UnifiedDiffDocument.Line.Kind.gap.nsBackgroundColor(colorScheme: colorScheme) ?? .clear)
+    }
+
+    static func searchBackgroundColor(current: Bool, colorScheme: ColorScheme) -> Color {
+        let opacity: Double = if current {
+            colorScheme == .dark ? 0.52 : 0.36
+        } else {
+            colorScheme == .dark ? 0.3 : 0.2
+        }
+        return Color.accentColor.opacity(opacity)
     }
 
     /// A quieter second layer over the full-line tint, deliberately well below selection contrast.

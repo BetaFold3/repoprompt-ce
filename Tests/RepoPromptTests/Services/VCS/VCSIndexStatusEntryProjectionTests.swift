@@ -62,6 +62,6 @@ final class VCSIndexStatusEntryProjectionTests: XCTestCase {
     private func project(_ records: [String]) throws -> [VCSIndexStatusEntry] {
         let output = records.joined(separator: "\0") + "\0"
         let snapshot = try GitStatusPorcelainV2Parser.parse(output)
-        return VCSIndexStatusEntry.project(snapshot.pathRecords)
+        return VCSIndexStatusEntry.project(snapshot)
     }
 }

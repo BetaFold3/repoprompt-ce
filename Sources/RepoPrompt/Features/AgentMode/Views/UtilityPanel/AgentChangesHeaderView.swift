@@ -1,38 +1,16 @@
 import SwiftUI
 
-/// The Changes segment's targeting header: what is being compared, and against what.
-///
-/// Everything here answers "which checkout am I looking at" — compare mode, base branch, root, and
-/// the worktree the session is bound to. It is chrome rather than content: it stays put while the
-/// file list scrolls, because a diff you can scroll without seeing what it is comparing is a diff
-/// you can misread.
+/// Fixed Changes chrome. Repository identity and base selection belong to each ordered group;
+/// keeping only the two global choices here prevents one checkout's state from speaking for all.
 struct AgentChangesHeaderView: View {
     let compareSelection: AgentChangesCompareSelection
-    let baseBranch: String?
-    let baseBranchCandidates: [String]
-    let targets: [AgentPanelResolvedCheckout]
-    let activeTarget: AgentPanelResolvedCheckout?
     let diffViewMode: AgentChangesDiffViewMode
     let isSplitViewAvailable: Bool
-    let customRevisionEditor: AgentChangesPanelViewModel.CustomRevisionEditor?
     let onSelectCompare: (AgentChangesCompareSelection) -> Void
     let onSelectDiffViewMode: (AgentChangesDiffViewMode) -> Void
-    let onSelectBaseBranch: (String) -> Void
-    let onBeginCustomRevision: () -> Void
-    let onUpdateCustomRevision: (String) -> Void
-    let onSubmitCustomRevision: () -> Void
-    let onCancelCustomRevision: () -> Void
-    let onSelectRoot: (AgentPanelResolvedCheckout) -> Void
-
-    @ObservedObject private var fontScale = FontScaleManager.shared
 
     private enum Layout {
-        static let rowSpacing: CGFloat = 6
-        static let chipSpacing: CGFloat = 6
-    }
-
-    private var preset: FontScalePreset {
-        fontScale.preset
+        static let spacing: CGFloat = 6
     }
 
     private var compareBinding: Binding<AgentChangesCompareSelection> {
@@ -43,62 +21,10 @@ struct AgentChangesHeaderView: View {
         Binding(get: { diffViewMode }, set: onSelectDiffViewMode)
     }
 
-    private var showsRootPicker: Bool {
-        targets.count > 1
-    }
-
-    private var worktree: AgentPanelWorktreeIdentity? {
-        activeTarget?.worktree
-    }
-
     var body: some View {
-        VStack(alignment: .leading, spacing: Layout.rowSpacing) {
-            HStack(spacing: Layout.chipSpacing) {
-                comparePicker
-                diffViewPicker
-            }
-
-            if showsRootPicker || compareSelection == .vsBase {
-                HStack(spacing: Layout.chipSpacing) {
-                    if showsRootPicker {
-                        AgentChangesRootMenu(
-                            targets: targets,
-                            activeTarget: activeTarget,
-                            onSelect: onSelectRoot
-                        )
-                    }
-                    if compareSelection == .vsBase {
-                        AgentChangesBaseBranchMenu(
-                            selectedBranch: baseBranch,
-                            candidates: baseBranchCandidates,
-                            onSelect: onSelectBaseBranch,
-                            onSelectCustom: onBeginCustomRevision
-                        )
-                    }
-                    Spacer(minLength: 0)
-                }
-            }
-
-            if let customRevisionEditor, compareSelection == .vsBase {
-                AgentChangesCustomRevisionEditorView(
-                    editor: customRevisionEditor,
-                    onUpdate: onUpdateCustomRevision,
-                    onSubmit: onSubmitCustomRevision,
-                    onCancel: onCancelCustomRevision
-                )
-            }
-
-            if worktree != nil || activeTarget?.substitutesUnavailableWorktree == true {
-                HStack(spacing: Layout.chipSpacing) {
-                    if let worktree, activeTarget?.substitutesUnavailableWorktree != true {
-                        AgentChangesWorktreeChip(worktree: worktree)
-                    }
-                    if activeTarget?.substitutesUnavailableWorktree == true {
-                        AgentChangesSubstitutionWarningChip(worktree: worktree)
-                    }
-                    Spacer(minLength: 0)
-                }
-            }
+        HStack(spacing: Layout.spacing) {
+            comparePicker
+            diffViewPicker
         }
         .agentSidebarCard()
         .accessibilityElement(children: .contain)
@@ -114,6 +40,7 @@ struct AgentChangesHeaderView: View {
         .pickerStyle(.segmented)
         .labelsHidden()
         .controlSize(.small)
+        .hoverTooltip("Choose Working Tree or a repository-local base comparison")
         .accessibilityLabel("Comparison")
         .accessibilityValue(compareSelection.title)
     }
@@ -205,8 +132,8 @@ struct AgentChangesChipLabel: View {
 /// The empty label is "Choose base…" rather than a pre-filled default on purpose: decision row 1
 /// forbids inferring or fetching a default branch, because a comparison against the wrong base
 /// looks exactly like a comparison against the right one.
-struct AgentChangesBaseBranchMenu: View {
-    let selectedBranch: String?
+struct AgentChangesBaseRevisionMenu: View {
+    let selectedRevision: String?
     let candidates: [String]
     let onSelect: (String) -> Void
     let onSelectCustom: () -> Void
@@ -220,7 +147,7 @@ struct AgentChangesBaseBranchMenu: View {
                     Button {
                         onSelect(branch)
                     } label: {
-                        if branch == selectedBranch {
+                        if branch == selectedRevision {
                             Label(branch, systemImage: "checkmark")
                         } else {
                             Text(branch)
@@ -233,8 +160,8 @@ struct AgentChangesBaseBranchMenu: View {
         } label: {
             AgentChangesChipLabel(
                 symbolName: "arrow.triangle.pull",
-                text: selectedBranch ?? "Choose base\u{2026}",
-                tint: selectedBranch == nil ? .accentColor : .secondary,
+                text: selectedRevision ?? "Choose base\u{2026}",
+                tint: selectedRevision == nil ? .accentColor : .secondary,
                 showsMenuIndicator: true
             )
         }
@@ -242,10 +169,10 @@ struct AgentChangesBaseBranchMenu: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .hoverTooltip(
-            selectedBranch.map { "Comparing against \($0)" } ?? "Choose the branch to compare against"
+            selectedRevision.map { "Comparing against \($0)" } ?? "Choose the revision to compare against"
         )
-        .accessibilityLabel("Base branch")
-        .accessibilityValue(selectedBranch ?? "not chosen")
+        .accessibilityLabel("Base revision")
+        .accessibilityValue(selectedRevision ?? "not chosen")
     }
 }
 
@@ -285,7 +212,9 @@ struct AgentChangesCustomRevisionEditorView: View {
                     ))
                     .disabled(editor.isValidating)
                     .onSubmit(onSubmit)
+                    .hoverTooltip("Enter a tag, commit, or other Git revision")
                     .accessibilityLabel("Custom base revision")
+                    .accessibilityValue(editor.text.isEmpty ? "empty" : editor.text)
 
                 if editor.isValidating {
                     ProgressView()
@@ -296,11 +225,21 @@ struct AgentChangesCustomRevisionEditorView: View {
                     Button("Compare", action: onSubmit)
                         .controlSize(.small)
                         .disabled(editor.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .hoverTooltip("Validate and compare against this revision")
+                        .accessibilityLabel("Compare against custom revision")
+                        .accessibilityValue(
+                            editor.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ? "unavailable"
+                                : "available"
+                        )
                 }
 
                 Button("Cancel", action: onCancel)
                     .buttonStyle(.link)
                     .font(preset.swiftUIFont(sizeAtNormal: Layout.textSizeAtNormal))
+                    .hoverTooltip("Cancel custom revision entry")
+                    .accessibilityLabel("Cancel custom revision entry")
+                    .accessibilityValue(editor.isValidating ? "validation in progress" : "available")
             }
 
             if let error = editor.errorMessage {
@@ -311,43 +250,6 @@ struct AgentChangesCustomRevisionEditorView: View {
                     .accessibilityLabel("Revision error: \(error)")
             }
         }
-    }
-}
-
-// MARK: - Root picker
-
-/// Repository chooser, shown only when the workspace resolves to more than one checkout.
-struct AgentChangesRootMenu: View {
-    let targets: [AgentPanelResolvedCheckout]
-    let activeTarget: AgentPanelResolvedCheckout?
-    let onSelect: (AgentPanelResolvedCheckout) -> Void
-
-    var body: some View {
-        Menu {
-            ForEach(targets) { target in
-                Button {
-                    onSelect(target)
-                } label: {
-                    if target.id == activeTarget?.id {
-                        Label(target.displayName, systemImage: "checkmark")
-                    } else {
-                        Text(target.displayName)
-                    }
-                }
-            }
-        } label: {
-            AgentChangesChipLabel(
-                symbolName: "folder",
-                text: activeTarget?.displayName ?? "Choose folder\u{2026}",
-                showsMenuIndicator: true
-            )
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .hoverTooltip(activeTarget.map { "Reading \($0.checkoutURL.path)" } ?? "Choose which repository to read")
-        .accessibilityLabel("Repository")
-        .accessibilityValue(activeTarget?.displayName ?? "none")
     }
 }
 
@@ -437,7 +339,7 @@ struct AgentChangesBlockedCheckoutCard: View {
                         .font(.system(size: preset.scaledMetric(Layout.symbolSizeAtNormal)))
                         .foregroundStyle(.orange)
                 }
-                Text(AgentChangesBlockedPresentation.title(for: blocked.reason))
+                Text("\(blocked.logicalRoot.displayName) · \(AgentChangesBlockedPresentation.title(for: blocked.reason))")
                     .font(preset.swiftUIFont(sizeAtNormal: Layout.titleSizeAtNormal, weight: .semibold))
                     .foregroundStyle(.primary)
                 Spacer(minLength: 0)
@@ -453,13 +355,18 @@ struct AgentChangesBlockedCheckoutCard: View {
                     .buttonStyle(.link)
                     .font(preset.swiftUIFont(sizeAtNormal: Layout.messageSizeAtNormal, weight: .medium))
                     .padding(.top, Layout.actionTopPadding)
+                    .hoverTooltip("Show \(blocked.logicalRoot.displayName) from the workspace checkout")
+                    .accessibilityLabel("Show \(blocked.logicalRoot.displayName) workspace checkout instead")
+                    .accessibilityValue("available")
                     .accessibilityHint("Reads \(blocked.logicalRoot.displayName) from the workspace folder instead of the agent worktree")
             }
         }
         .agentSidebarCard(highlight: isPreparing ? nil : .orange)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
-            "\(AgentChangesBlockedPresentation.title(for: blocked.reason)). \(AgentChangesBlockedPresentation.message(for: blocked.reason))"
+            "\(blocked.logicalRoot.displayName). "
+                + "\(AgentChangesBlockedPresentation.title(for: blocked.reason)). "
+                + AgentChangesBlockedPresentation.message(for: blocked.reason)
         )
     }
 }

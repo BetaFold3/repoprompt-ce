@@ -26,10 +26,6 @@ extension AgentModeViewModel {
 
     // MARK: - Changes target
 
-    func selectUtilityPanelRootOverride(_ rootID: UUID?, tabID: UUID? = nil) {
-        mutateUtilityPanelState(tabID: tabID) { $0.selectRootOverride(rootID) }
-    }
-
     func setUtilityPanelCompareSelection(_ selection: AgentChangesCompareSelection, tabID: UUID? = nil) {
         mutateUtilityPanelState(tabID: tabID) { $0.setCompareSelection(selection) }
     }
@@ -42,12 +38,17 @@ extension AgentModeViewModel {
         mutateUtilityPanelState(tabID: tabID) { $0.setChangesFilter(filter) }
     }
 
-    func selectUtilityPanelBaseBranch(
-        _ branch: String?,
+    func selectUtilityPanelBaseRevision(
+        _ revision: String?,
         forRepoRoot repoRoot: String,
         tabID: UUID? = nil
     ) {
-        mutateUtilityPanelState(tabID: tabID) { $0.selectBaseBranch(branch, forRepoRoot: repoRoot) }
+        mutateUtilityPanelState(tabID: tabID) {
+            // The qualified call owns the explicit map. The scalar call only mirrors the value into
+            // the tab-global echo and its per-repository picker memory.
+            $0.selectBaseRevision(revision, forRepoRoot: repoRoot)
+            $0.selectBaseBranch(revision, forRepoRoot: repoRoot)
+        }
     }
 
     /// The base branch this tab last used for a repository, for pre-selecting a base the user
@@ -58,40 +59,52 @@ extension AgentModeViewModel {
 
     // MARK: - File expansion and context
 
-    /// Toggles a file's expansion and reports whether it is now expanded, so the caller can start a
-    /// lazy patch load only when the file actually opened.
     @discardableResult
-    func toggleUtilityPanelFileExpansion(filePath: String, tabID: UUID? = nil) -> Bool {
+    func toggleUtilityPanelFileExpansion(
+        file: AgentChangesFileStateKey,
+        tabID: UUID? = nil
+    ) -> Bool {
         var isExpanded = false
-        mutateUtilityPanelState(tabID: tabID) { isExpanded = $0.toggleExpansion(ofFilePath: filePath) }
+        mutateUtilityPanelState(tabID: tabID) {
+            isExpanded = $0.toggleExpansion(ofFile: file)
+        }
         return isExpanded
     }
 
-    func setUtilityPanelFileExpansion(_ isExpanded: Bool, filePath: String, tabID: UUID? = nil) {
-        mutateUtilityPanelState(tabID: tabID) { $0.setExpansion(isExpanded, ofFilePath: filePath) }
+    func setUtilityPanelFileExpansion(
+        _ isExpanded: Bool,
+        file: AgentChangesFileStateKey,
+        tabID: UUID? = nil
+    ) {
+        mutateUtilityPanelState(tabID: tabID) {
+            $0.setExpansion(isExpanded, ofFile: file)
+        }
     }
 
     func setUtilityPanelFileViewed(
         _ viewed: Bool,
         revision: AgentChangesViewedRevision,
         compareTargetKey: String,
-        collapseFilePath: String?,
+        collapseFile: AgentChangesFileStateKey?,
         tabID: UUID? = nil
     ) {
         mutateUtilityPanelState(tabID: tabID) { state in
             state.setViewed(viewed, revision: revision, compareTargetKey: compareTargetKey)
-            if let collapseFilePath {
-                state.setExpansion(false, ofFilePath: collapseFilePath)
+            if let collapseFile {
+                state.setExpansion(false, ofFile: collapseFile)
             }
         }
     }
 
-    /// Raises a file's diff context by one step and reports the new level, which the caller passes
-    /// to the diff engine as its context-line request.
     @discardableResult
-    func escalateUtilityPanelContext(filePath: String, tabID: UUID? = nil) -> AgentChangesContextLevel {
+    func escalateUtilityPanelContext(
+        file: AgentChangesFileStateKey,
+        tabID: UUID? = nil
+    ) -> AgentChangesContextLevel {
         var level = AgentChangesContextLevel.standard
-        mutateUtilityPanelState(tabID: tabID) { level = $0.escalateContext(forFilePath: filePath) }
+        mutateUtilityPanelState(tabID: tabID) {
+            level = $0.escalateContext(forFile: file)
+        }
         return level
     }
 

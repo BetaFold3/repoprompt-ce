@@ -144,14 +144,11 @@ struct AgentUtilityPanelTabState: Equatable {
     /// Which segment this tab shows.
     var segment: AgentUtilityPanelSegment = .changes
 
-    /// Logical root the Changes segment targets, or `nil` to follow the session's default root.
-    /// A root ID rather than a path for the same reason `PreviewDocumentReference` uses one.
-    var rootOverride: UUID?
-
-    /// Base branch chosen for `.vsBase`, or `nil` when the user has not picked one.
+    /// Tab-global echo of the most recently chosen base revision.
     ///
-    /// Never inferred: the design forbids silently guessing or fetching a default branch, so an
-    /// absent value means the panel must ask rather than assume.
+    /// `baseRevisionByRepoRoot` is authoritative for what a repository actually compares against.
+    /// No caller may infer a missing group base from this scalar; it carries only the last value
+    /// the user named, for tab-global presentation.
     var baseBranchOverride: String?
 
     var compareSelection: AgentChangesCompareSelection = .workingTree
@@ -163,10 +160,11 @@ struct AgentUtilityPanelTabState: Equatable {
     /// in memory only; the layout gate may move it back to unified when the panel narrows.
     var diffViewMode: AgentChangesDiffViewMode = .unified
 
-    /// The selection projected into the repository layer's compare type.
+    /// Tab-global projection of the legacy scalar base echo.
     ///
-    /// `nil` means the panel cannot build a compare yet — vs-Base is selected but no base has been
-    /// chosen — and the caller must ask rather than substitute a guess.
+    /// Grouped orchestration resolves compare modes per repository from `baseRevisionByRepoRoot`
+    /// through ``resolvedCompareMode(for:)``. `nil` still means a caller must ask rather than
+    /// substitute a guess.
     var resolvedCompareMode: AgentChangesCompareMode? {
         switch compareSelection {
         case .workingTree:
@@ -177,15 +175,19 @@ struct AgentUtilityPanelTabState: Equatable {
         }
     }
 
-    /// Root-relative paths whose hunks are expanded.
-    var expandedFilePaths: Set<String> = []
+    /// Qualified files whose hunks are expanded.
+    ///
+    /// The checkout identity is required even though staged and unstaged counterparts intentionally
+    /// share a key. Without it, `README.md` in two visible repositories would open and close as if
+    /// it were one file.
+    var expandedFiles: Set<AgentChangesFileStateKey> = []
 
-    /// Context escalation per file. Absent keys read as `.standard`, so the map only carries files
-    /// the user actually escalated.
+    /// Context escalation per qualified file. Absent keys read as `.standard`, so the map only
+    /// carries files the user actually escalated.
     ///
     /// Escalation is one-way per file and per tab: starting every file at full context would make a
     /// large changeset pull the whole repository into the panel.
-    var contextLevelsByFilePath: [String: AgentChangesContextLevel] = [:]
+    var contextLevelsByFile: [AgentChangesFileStateKey: AgentChangesContextLevel] = [:]
 
     /// Last reviewed content revision per row, partitioned by checkout + compare target.
     ///
@@ -211,13 +213,19 @@ struct AgentUtilityPanelTabState: Equatable {
     /// Dismissal is per tab because the banner reports what *this* session's agent wrote.
     var dismissedBannerArtifactIDs: Set<String> = []
 
-    /// Repo-scoped memory of the last base branch chosen in this tab, keyed by repository root
-    /// path.
+    /// Last non-empty base the user named for each repository.
     ///
-    /// Per tab and in-memory for Phase 1. It exists so switching roots inside one session re-offers
-    /// the base the user already picked for that repository instead of asking again, without ever
-    /// promoting a guess into `baseBranchOverride`.
-    private(set) var lastUsedBaseBranchByRepoRoot: [String: String] = [:]
+    /// This is presentation memory only. It may preselect a candidate, but it never supplies a
+    /// grouped compare target and clearing the picker deliberately preserves the remembered value.
+    private var lastUsedBaseBranchByRepoRoot: [String: String] = [:]
+
+    /// Explicit base revision selected independently for each repository shown by this tab.
+    ///
+    /// This map is the grouped-mode choice and memory in one place: a missing or empty entry means
+    /// that repository must show "Choose base…". It is never populated from branch candidates,
+    /// worktree metadata, or the legacy single-root base fields. Keeping it on this non-`Codable`
+    /// value preserves the panel's no-persistence contract.
+    private(set) var baseRevisionByRepoRoot: [String: String] = [:]
 
     init() {}
 
@@ -228,20 +236,6 @@ struct AgentUtilityPanelTabState: Equatable {
     }
 
     // MARK: - Changes target
-
-    /// Retargets the Changes segment at a different logical root.
-    ///
-    /// Expansion and context escalation are keyed by root-relative path, so they are cleared here:
-    /// the same path in a different repository is a different file, and carrying the entries over
-    /// would expand unrelated files and leak keys for checkouts this tab no longer shows.
-    /// The compare selection and the base override survive, because those are how the user wants to
-    /// *read* a repository rather than facts about one file list.
-    mutating func selectRootOverride(_ rootID: UUID?) {
-        guard rootOverride != rootID else { return }
-        rootOverride = rootID
-        expandedFilePaths.removeAll()
-        contextLevelsByFilePath.removeAll()
-    }
 
     mutating func setCompareSelection(_ selection: AgentChangesCompareSelection) {
         compareSelection = selection
@@ -255,47 +249,102 @@ struct AgentUtilityPanelTabState: Equatable {
         changesFilter = filter
     }
 
-    /// Records an explicit base-branch choice and remembers it for that repository.
+    /// Records a named base in the tab-global echo and this repository's picker memory.
+    ///
+    /// It updates presentation state only. The explicit grouped base map remains separate, so this
+    /// API can never infer a compare target on a repository's behalf.
     mutating func selectBaseBranch(_ branch: String?, forRepoRoot repoRoot: String) {
         baseBranchOverride = branch
-        if let branch, !branch.isEmpty {
-            lastUsedBaseBranchByRepoRoot[repoRoot] = branch
-        }
+        guard let branch, !branch.isEmpty else { return }
+        lastUsedBaseBranchByRepoRoot[repoRoot] = branch
     }
 
-    /// The base this tab last used for a repository, for offering a default the user already chose.
+    /// Returns picker presentation memory for a repository, never an explicit grouped base.
     func lastUsedBaseBranch(forRepoRoot repoRoot: String) -> String? {
         lastUsedBaseBranchByRepoRoot[repoRoot]
     }
 
-    // MARK: - File expansion
-
-    func isExpanded(filePath: String) -> Bool {
-        expandedFilePaths.contains(filePath)
+    /// Returns only the revision explicitly selected for this repository.
+    ///
+    /// Candidate lists are presentation data and never participate in this lookup.
+    func selectedBaseRevision(forRepoRoot repoRoot: String) -> String? {
+        baseRevisionByRepoRoot[repoRoot]
     }
 
-    /// Toggles one file's expansion and reports the resulting state, so callers can trigger the
-    /// lazy patch load only when a file actually opened.
+    /// Selects or clears the explicit base revision for one repository.
+    ///
+    /// Clearing removes the entry rather than retaining a hidden fallback. The next vs-Base
+    /// resolution therefore returns `nil` and asks again, as required by the design.
+    mutating func selectBaseRevision(_ revision: String?, forRepoRoot repoRoot: String) {
+        guard let revision, !revision.isEmpty else {
+            baseRevisionByRepoRoot.removeValue(forKey: repoRoot)
+            return
+        }
+        baseRevisionByRepoRoot[repoRoot] = revision
+    }
+
+    /// Stable viewed-partition key for one resolved checkout and its explicit compare.
+    ///
+    /// Centralizing this spelling prevents expansion/view code from accidentally falling back to a
+    /// path-only or global compare key when several repositories are visible.
+    static func viewedCompareTargetKey(
+        for target: AgentPanelResolvedCheckout,
+        mode: AgentChangesCompareMode
+    ) -> String {
+        let compare = switch mode {
+        case .workingTree:
+            "workingTree"
+        case let .vsBase(base):
+            "vsBase:\(base)"
+        }
+        return "\(target.targetKey)\u{1F}\(compare)"
+    }
+
+    /// Projects the tab's global compare selection for one resolved checkout.
+    ///
+    /// Working Tree is complete without repository-specific input. vs-Base resolves only from this
+    /// target's explicit map entry; neither the legacy single-root override nor candidates can fill
+    /// the gap.
+    func resolvedCompareMode(for target: AgentPanelResolvedCheckout) -> AgentChangesCompareMode? {
+        switch compareSelection {
+        case .workingTree:
+            return .workingTree
+        case .vsBase:
+            guard let base = selectedBaseRevision(forRepoRoot: target.repoRootURL.path) else {
+                return nil
+            }
+            return .vsBase(base: base)
+        }
+    }
+
+    // MARK: - File expansion
+
+    func isExpanded(file key: AgentChangesFileStateKey) -> Bool {
+        expandedFiles.contains(key)
+    }
+
+    /// Toggles one qualified file's expansion and reports the resulting state, so callers can
+    /// trigger the lazy patch load only when a file actually opened.
     @discardableResult
-    mutating func toggleExpansion(ofFilePath path: String) -> Bool {
-        if expandedFilePaths.contains(path) {
-            expandedFilePaths.remove(path)
+    mutating func toggleExpansion(ofFile key: AgentChangesFileStateKey) -> Bool {
+        if expandedFiles.contains(key) {
+            expandedFiles.remove(key)
             return false
         }
-        expandedFilePaths.insert(path)
+        expandedFiles.insert(key)
         return true
     }
 
-    mutating func setExpansion(_ isExpanded: Bool, ofFilePath path: String) {
+    mutating func setExpansion(_ isExpanded: Bool, ofFile key: AgentChangesFileStateKey) {
         if isExpanded {
-            expandedFilePaths.insert(path)
+            expandedFiles.insert(key)
         } else {
-            expandedFilePaths.remove(path)
+            expandedFiles.remove(key)
         }
     }
 
     mutating func collapseAllFiles() {
-        expandedFilePaths.removeAll()
+        expandedFiles.removeAll()
     }
 
     // MARK: - Viewed
@@ -330,19 +379,19 @@ struct AgentUtilityPanelTabState: Equatable {
 
     // MARK: - Context escalation
 
-    func contextLevel(forFilePath path: String) -> AgentChangesContextLevel {
-        contextLevelsByFilePath[path] ?? .standard
+    func contextLevel(forFile key: AgentChangesFileStateKey) -> AgentChangesContextLevel {
+        contextLevelsByFile[key] ?? .standard
     }
 
-    /// Raises one file's context level by a step and reports the new level.
+    /// Raises one qualified file's context level by a step and reports the new level.
     ///
     /// Saturates at the top rung, so a repeated tap on an already-full-file diff is a no-op rather
     /// than a wrap back to three lines.
     @discardableResult
-    mutating func escalateContext(forFilePath path: String) -> AgentChangesContextLevel {
-        let current = contextLevel(forFilePath: path)
+    mutating func escalateContext(forFile key: AgentChangesFileStateKey) -> AgentChangesContextLevel {
+        let current = contextLevel(forFile: key)
         let escalated = current.escalated ?? current
-        contextLevelsByFilePath[path] = escalated
+        contextLevelsByFile[key] = escalated
         return escalated
     }
 
