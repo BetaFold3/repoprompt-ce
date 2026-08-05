@@ -1,0 +1,1012 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Human-friendly technical implementation report for Oracle duel hardening, handoff continuity, context budgeting, response controls, and transcript quality-of-life improvements in RepoPrompt CE.">
+  <title>Oracle Duel Hardening & Transcript QoL — Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f4f1eb;
+      --surface: #fffdf8;
+      --surface-2: #f8f4ed;
+      --surface-3: #efe9df;
+      --ink: #1f2832;
+      --muted: #66727e;
+      --line: #ddd5ca;
+      --blue: #315fc7;
+      --blue-soft: #e9efff;
+      --green: #18734d;
+      --green-soft: #e7f6ee;
+      --amber: #936200;
+      --amber-soft: #fff1cd;
+      --red: #aa4148;
+      --red-soft: #ffeaec;
+      --purple: #704bb0;
+      --purple-soft: #f0e9ff;
+      --cyan: #126f83;
+      --cyan-soft: #e4f4f7;
+      --shadow: 0 18px 50px rgba(42, 37, 29, .08);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0e141b;
+        --surface: #171e27;
+        --surface-2: #202936;
+        --surface-3: #283341;
+        --ink: #edf2f7;
+        --muted: #b4bfca;
+        --line: #35414e;
+        --blue: #94adff;
+        --blue-soft: #27345c;
+        --green: #79d5aa;
+        --green-soft: #173d2d;
+        --amber: #e9c16c;
+        --amber-soft: #4c3818;
+        --red: #ff9da6;
+        --red-soft: #4b282e;
+        --purple: #c8b0ff;
+        --purple-soft: #392d55;
+        --cyan: #79d0de;
+        --cyan-soft: #173c45;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 92% -8%, color-mix(in srgb, var(--blue) 13%, transparent), transparent 32rem),
+        radial-gradient(circle at -8% 28%, color-mix(in srgb, var(--purple) 8%, transparent), transparent 28rem),
+        var(--bg);
+      color: var(--ink);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    }
+    a { color: var(--blue); text-underline-offset: 3px; }
+    code, pre, kbd { font-family: var(--mono); }
+    code {
+      padding: .08rem .34rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-2);
+      font-size: .9em;
+    }
+    pre {
+      overflow-x: auto;
+      padding: 1rem 1.1rem;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: #121a24;
+      color: #eff5fb;
+      font-size: .84rem;
+      line-height: 1.55;
+      white-space: pre-wrap;
+    }
+    kbd {
+      padding: .08rem .35rem;
+      border: 1px solid var(--line);
+      border-bottom-width: 2px;
+      border-radius: 5px;
+      background: var(--surface-2);
+      font-size: .82em;
+    }
+    .skip-link {
+      position: fixed;
+      left: 12px;
+      top: -60px;
+      z-index: 100;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+    }
+    .skip-link:focus { top: 12px; }
+    .page { width: min(1200px, calc(100% - 30px)); margin: 0 auto; padding: 26px 0 72px; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(28px, 5vw, 52px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: linear-gradient(135deg, var(--surface) 0%, color-mix(in srgb, var(--blue-soft) 72%, var(--surface)) 100%);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 390px;
+      height: 390px;
+      right: -160px;
+      top: -230px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--blue) 13%, transparent);
+    }
+    .eyebrow {
+      position: relative;
+      z-index: 1;
+      margin: 0 0 8px;
+      color: var(--blue);
+      font-size: .77rem;
+      font-weight: 850;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 930px;
+      margin: 0;
+      font-size: clamp(2.2rem, 5.3vw, 4.45rem);
+      line-height: 1.02;
+      letter-spacing: -.05em;
+    }
+    .subtitle {
+      position: relative;
+      z-index: 1;
+      max-width: 900px;
+      margin: 20px 0 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.18rem);
+    }
+    .badges { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .badge, .evidence {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-weight: 750;
+    }
+    .badge { padding: 6px 10px; background: var(--surface); color: var(--muted); font-size: .8rem; }
+    .badge.good, .evidence.test { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); background: var(--green-soft); color: var(--green); }
+    .badge.info, .evidence.code { border-color: color-mix(in srgb, var(--blue) 45%, var(--line)); background: var(--blue-soft); color: var(--blue); }
+    .badge.warn, .evidence.session { border-color: color-mix(in srgb, var(--amber) 45%, var(--line)); background: var(--amber-soft); color: var(--amber); }
+    .evidence.inferred { border-color: color-mix(in srgb, var(--purple) 45%, var(--line)); background: var(--purple-soft); color: var(--purple); }
+    .evidence { padding: 3px 7px; font-size: .68rem; letter-spacing: .02em; vertical-align: middle; }
+    .toc {
+      position: sticky;
+      top: 10px;
+      z-index: 20;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin: 18px 0 28px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--surface) 91%, transparent);
+      box-shadow: 0 7px 24px rgba(26, 31, 38, .07);
+      backdrop-filter: blur(16px);
+    }
+    .toc a {
+      padding: 5px 8px;
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: .81rem;
+      font-weight: 720;
+      text-decoration: none;
+    }
+    .toc a:hover { background: var(--blue-soft); color: var(--blue); }
+    section {
+      margin-top: 24px;
+      padding: clamp(20px, 3vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    h2 { margin: 0 0 15px; font-size: clamp(1.5rem, 3vw, 2.2rem); letter-spacing: -.025em; }
+    h3 { margin: 26px 0 10px; font-size: 1.16rem; }
+    h4 { margin: 17px 0 7px; font-size: 1rem; }
+    p { margin: 9px 0; }
+    ul, ol { padding-left: 1.35rem; }
+    li + li { margin-top: .38rem; }
+    .lead { max-width: 940px; color: var(--muted); font-size: 1.03rem; }
+    .grid { display: grid; gap: 14px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-2);
+    }
+    .card h3, .card h4 { margin-top: 0; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .label { color: var(--muted); font-size: .75rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .value { margin-top: 4px; font-size: 1.55rem; font-weight: 850; letter-spacing: -.03em; }
+    .callout {
+      margin: 15px 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--blue);
+      border-radius: 0 12px 12px 0;
+      background: var(--blue-soft);
+    }
+    .callout.good { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.danger { border-left-color: var(--red); background: var(--red-soft); }
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+    .flow .node {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface-2);
+    }
+    .flow .arrow { align-self: center; color: var(--blue); font-size: 1.45rem; font-weight: 900; }
+    .before-after {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 14px;
+    }
+    .before, .after { padding: 17px; border: 1px solid var(--line); border-radius: 14px; }
+    .before { background: var(--red-soft); }
+    .after { background: var(--green-soft); }
+    .before h3, .after h3 { margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: .91rem; }
+    th, td { padding: 10px 11px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-2); font-size: .77rem; letter-spacing: .04em; text-transform: uppercase; }
+    tr:nth-child(even) td { background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
+    .steps { counter-reset: step; list-style: none; padding: 0; }
+    .steps > li {
+      position: relative;
+      margin: 14px 0;
+      padding: 16px 17px 16px 58px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-2);
+    }
+    .steps > li::before {
+      counter-increment: step;
+      content: counter(step);
+      position: absolute;
+      left: 16px;
+      top: 16px;
+      display: grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--blue);
+      color: white;
+      font-size: .82rem;
+      font-weight: 850;
+    }
+    .expected {
+      display: block;
+      margin-top: 7px;
+      color: var(--green);
+      font-weight: 720;
+    }
+    .timeline { position: relative; margin: 16px 0 0 10px; padding-left: 25px; border-left: 2px solid var(--line); }
+    .turn { position: relative; padding: 0 0 19px 3px; }
+    .turn::before {
+      content: "";
+      position: absolute;
+      left: -33px;
+      top: 7px;
+      width: 13px;
+      height: 13px;
+      border: 3px solid var(--surface);
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 0 0 1px var(--line);
+    }
+    .turn:last-child { padding-bottom: 0; }
+    .turn strong { display: block; margin-bottom: 3px; }
+    details { margin: 10px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); }
+    summary { cursor: pointer; padding: 12px 14px; font-weight: 780; }
+    details > div { padding: 0 14px 14px; }
+    .status-pass { color: var(--green); font-weight: 800; }
+    .status-open { color: var(--amber); font-weight: 800; }
+    .nowrap { white-space: nowrap; }
+    footer { padding: 26px 4px 4px; color: var(--muted); font-size: .83rem; text-align: center; }
+    @media (max-width: 900px) {
+      .grid.three, .grid.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: 1fr; }
+      .flow .arrow { transform: rotate(90deg); justify-self: center; }
+    }
+    @media (max-width: 680px) {
+      .page { width: min(100% - 18px, 1200px); }
+      .grid.two, .grid.three, .grid.four, .before-after { grid-template-columns: 1fr; }
+      .toc { position: static; }
+      section { padding: 18px; }
+      table { display: block; overflow-x: auto; }
+    }
+    @media print {
+      body { background: white; color: #111; }
+      .toc { position: static; }
+      section, .hero { box-shadow: none; break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to report</a>
+  <main id="main" class="page">
+    <header class="hero">
+      <p class="eyebrow">RepoPrompt CE · Technical implementation report · 2026-08-05</p>
+      <h1>Oracle duels are safer, cheaper to consume, and continuous across handoff.</h1>
+      <p class="subtitle">
+        This implementation hardens the full Oracle workflow—from concurrent dual-lane consultations
+        and blinded model identity, through context-budget controls and handoff continuity—while adding
+        assistant-transcript search, on-demand expansion, diff wrapping, and a selectable transcript code font.
+      </p>
+      <div class="badges">
+        <span class="badge good">Implemented</span>
+        <span class="badge warn">Uncommitted &amp; unstaged</span>
+        <span class="badge info">61 implementation files</span>
+        <span class="badge info">Dual-Oracle reviewed</span>
+        <span class="badge">Live app not relaunched</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Report navigation">
+      <a href="#summary">Summary</a>
+      <a href="#expect">What to expect</a>
+      <a href="#changes">What changed</a>
+      <a href="#decisions">Major decisions</a>
+      <a href="#turns">Major turns</a>
+      <a href="#testing">Test it</a>
+      <a href="#validation">Validation</a>
+      <a href="#inventory">Inventory</a>
+      <a href="#risks">Risks</a>
+      <a href="#actions">Your actions</a>
+      <a href="#evidence">Evidence</a>
+    </nav>
+
+    <section id="summary">
+      <h2>Executive summary</h2>
+      <p class="lead">
+        The work resolves two correctness/usability failures and adds four supporting improvements.
+        Oracle chats cloned into a handoff now belong to the destination session and carry usable replacement
+        IDs. App-owned Agent Mode connections may once again overlap two Oracle calls under a harness that
+        previously serialized them. Preset-backed Oracle results no longer hand the judging agent the resolved
+        provider/model identity, while the human-facing popover and tool-card UI remain unblinded.
+      </p>
+      <div class="grid four">
+        <article class="card">
+          <div class="label">Implementation delta</div>
+          <div class="value">61 files</div>
+          <p>45 production files, 15 test files, and the XCTest contract ledger.</p>
+        </article>
+        <article class="card">
+          <div class="label">Line delta</div>
+          <div class="value">+7,614</div>
+          <p>346 lines removed. This includes 19 untracked implementation files.</p>
+        </article>
+        <article class="card">
+          <div class="label">Recorded focused tests</div>
+          <div class="value">78 passed</div>
+          <p>Five final touched suites in the implementation-session summary.</p>
+        </article>
+        <article class="card">
+          <div class="label">Integration state</div>
+          <div class="value">0 staged</div>
+          <p>All source, tests, and ledger changes remain local.</p>
+        </article>
+      </div>
+      <div class="callout warn">
+        <strong>Important:</strong> the currently running app was reported to be an older build.
+        None of the behavior below is visible until the debug app is rebuilt and relaunched.
+      </div>
+    </section>
+
+    <section id="expect">
+      <h2>What you can expect from the change</h2>
+      <div class="before-after">
+        <div class="before">
+          <h3>Before</h3>
+          <ul>
+            <li>A Claude Code–driven main agent could serialize two Oracle calls, so the pill never reached <strong>Oracle · 2</strong>.</li>
+            <li>A handed-off session retained dead Oracle IDs and could not continue the cloned chats.</li>
+            <li>The judging agent was directly told the resolved model identity for preset-backed lanes.</li>
+            <li>Long Oracle turns could hit context limits without an honest preflight or useful usage breakdown.</li>
+            <li>Large Oracle replies consumed the main agent's context unless manually exported.</li>
+            <li>Old assistant replies were collapsed with no transcript search; diffs were horizontally clipped/scrolled and used only the system mono font.</li>
+          </ul>
+        </div>
+        <div class="after">
+          <h3>After</h3>
+          <ul>
+            <li>Two app-owned Agent Mode Oracle sends can overlap, and a batch consultation API gives a durable two-lane path.</li>
+            <li>Handoff clones are owned by the destination, mapped to new IDs, and old IDs produce a corrective hint during the live destination tab.</li>
+            <li>Agents receive preset alias/UUID, while you retain resolved model attribution in the Oracle UI.</li>
+            <li>Known exact context windows get a fail-fast budget check; every result exposes honest usage/reserve metadata.</li>
+            <li><code>response_mode</code> and paged chat-log controls let the main agent consume only the tail—or no inline reply—without losing the full export.</li>
+            <li>Assistant-only search expands and navigates matches; expansion is available on demand; diff wrap and transcript code font are configurable.</li>
+          </ul>
+        </div>
+      </div>
+      <div class="callout">
+        <strong>The model footer remains visible to you.</strong>
+        Human UI attribution still comes from chat-session and assistant-message metadata
+        (<code>lastSendModelDisplayName</code>, <code>lastResponseModelDisplayName</code>, and message
+        <code>modelName</code>). The blinding projector applies only to agent-facing MCP serialization
+        for preset-backed results. <span class="evidence code">Observed in code</span>
+      </div>
+    </section>
+
+    <section id="changes">
+      <h2>What changed, in easy-to-understand terms</h2>
+
+      <h3>1. Oracle chats survive handoff as real, owned conversations</h3>
+      <div class="flow" aria-label="Handoff flow">
+        <div class="node"><strong>Source session</strong><br>Only chats owned by this agent session are eligible.</div>
+        <div class="arrow">→</div>
+        <div class="node"><strong>Atomic clone</strong><br>New chat IDs are created and stamped with the destination owner.</div>
+        <div class="arrow">→</div>
+        <div class="node"><strong>Destination handoff</strong><br>Payload IDs are rewritten and an old→new mapping table is appended.</div>
+      </div>
+      <ul>
+        <li>The destination Agent Mode session identity is allocated <em>before</em> Oracle cloning.</li>
+        <li>Only source-owned chats are cloned, and ownership is rechecked after loading the full chat.</li>
+        <li>If any clone cannot load or persist, all clones are rolled back and the handoff fails loudly instead of producing a partial destination.</li>
+        <li>Structured references use the new chat IDs; surrounding prose gets a mapping table with short and full UUID forms.</li>
+        <li>An old ID is not silently redirected. During the live destination tab it returns an error that points to the replacement ID.</li>
+      </ul>
+      <p><span class="evidence code">Observed in code</span> Key paths: <code>AgentModeViewModel.swift</code> and <code>OracleViewModel.swift</code>.</p>
+
+      <h3>2. Dual-lane concurrency works without lying to external MCP clients</h3>
+      <p>
+        The canonical <code>ask_oracle</code> tool is still non-read-only because it spends money,
+        creates state, and is non-idempotent. Only app-owned Agent Mode connections—classified from
+        server-established run purpose—receive a connection-specific <code>readOnlyHint: true</code>.
+        This allows Claude Code's scheduler to overlap two calls without advertising the same claim to
+        external clients. <span class="evidence code">Observed in code</span>
+      </p>
+      <ul>
+        <li>The app still enforces at most two concurrent Oracle streams per tab.</li>
+        <li>A single <code>consultations</code> request can fan out independent new chats and returns results in input order.</li>
+        <li><code>require_distinct:true</code> can reject a batch before launch when two lanes resolve to the same preset/model.</li>
+        <li>Additional consultations queue behind the two-stream limit; no detach/polling job abstraction was added.</li>
+      </ul>
+
+      <h3>3. Preset-backed Oracle lanes are blinded to the judge, not to the operator</h3>
+      <p>
+        Agent-facing result serialization recursively removes both the new UI identity keys and legacy
+        <code>model_id</code>/<code>model_name</code> fields whenever a result is preset-backed—including
+        nested batch and legacy shapes. The app captures an internal UI sidecar first, so Oracle tool cards,
+        the sidebar, and the popover can still show resolved identity to you.
+      </p>
+      <div class="grid two">
+        <article class="card">
+          <h4>Main agent receives</h4>
+          <ul>
+            <li>Preset alias and preset UUID</li>
+            <li>Neutral capability/usage information</li>
+            <li>Response text or export metadata</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h4>You still receive in the UI</h4>
+          <ul>
+            <li>Resolved model attribution in message footers</li>
+            <li>Lane/session identity in Oracle popover and sidebar</li>
+            <li>Human-readable Oracle tool-card attribution</li>
+          </ul>
+        </article>
+      </div>
+
+      <h3>4. Oracle context and response size are now controllable</h3>
+      <div class="grid three">
+        <article class="card">
+          <h4>Request budget</h4>
+          <p>The exact immutable packaged request is estimated before mutation/provider work, including history, selection, frozen diffs, system/preset text, output reserve, and tokenizer margin.</p>
+        </article>
+        <article class="card">
+          <h4>Selection control</h4>
+          <p>Continuation sends support <code>current</code>, <code>none</code>, or send-local <code>explicit_slices</code>. Send-local slices never mutate the shared selection.</p>
+        </article>
+        <article class="card">
+          <h4>Response control</h4>
+          <p><code>full</code> returns everything; <code>tail</code> returns about 2,000 final characters; <code>none</code> returns metadata only. Trimmed replies are always auto-exported.</p>
+        </article>
+      </div>
+      <ul>
+        <li>Only an <strong>exact</strong> known context window may trigger <code>oracle_context_overflow</code>; provider fallback estimates do not pretend to be authoritative.</li>
+        <li>The preflight uses a conversation revision fence so a chat that advances between packaging and reservation fails retryably before mutation.</li>
+        <li>Busy implicit candidates fail before creating a new chat, avoiding orphan chats or active-pointer changes.</li>
+        <li>Usage echoes include input tokens and output reserve; context window/percentage appear only when exact metadata exists.</li>
+        <li><code>oracle_chat_log</code> accepts <code>part: head|tail|both</code>, per-message <code>max_chars</code>, and a total ceiling, with self-describing truncation.</li>
+      </ul>
+
+      <h3>5. Assistant transcript review is faster without hydrating tool output</h3>
+      <ul>
+        <li>A floating magnifying-glass control searches completed assistant messages in the transcript model.</li>
+        <li>Results have a counter and previous/next controls. Navigating to a result expands the row, waits for layout, scrolls it to center, and flashes it.</li>
+        <li>The adjacent ellipsis menu offers <strong>Expand All Assistant Replies</strong> and <strong>Restore Automatic Collapsing</strong>.</li>
+        <li>Expansion state is ephemeral and resets when leaving the session. Tool/activity output remains out of scope.</li>
+      </ul>
+
+      <h3>6. Transcript diffs can wrap and use a chosen fixed-pitch font</h3>
+      <ul>
+        <li>Diff cards have a local <strong>Wrap</strong> checkbox, and Settings → Appearance has a persistent <strong>Wrap Diff Lines</strong> toggle. The default remains off.</li>
+        <li>Wrapped height is measured with width-aware TextKit logic and cached by content, width bucket, wrap mode, and resolved-font fingerprint.</li>
+        <li>Copying still preserves the original unwrapped source text.</li>
+        <li>Settings → Appearance → <strong>Transcript Code Font</strong> offers system monospaced plus installed fixed-pitch faces.</li>
+        <li>Uninstalled or invalid faces fall back silently; render and syntax-highlight caches incorporate the resolved font fingerprint.</li>
+      </ul>
+    </section>
+
+    <section id="decisions">
+      <h2>Major technical decisions and why they matter</h2>
+      <table>
+        <thead>
+          <tr><th>Decision</th><th>Reasoning</th><th>Consequence</th><th>Evidence</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Transfer Oracle ownership during handoff; never relax ownership checks.</td>
+            <td>The regression came from destination clones being unowned/dead to the new agent. Making clones destination-owned fixes continuity while preserving fail-closed isolation.</td>
+            <td>Handoff can fail if cloning is incomplete, but it cannot quietly produce a partially usable destination.</td>
+            <td><span class="evidence code">Code</span> <span class="evidence session">Session</span></td>
+          </tr>
+          <tr>
+            <td>Project <code>readOnlyHint</code> per trusted app connection.</td>
+            <td>The scheduler used this hint as a concurrency gate, yet globally labeling a costly stateful tool read-only would be dishonest.</td>
+            <td>App-owned Agent Mode gets overlap; external MCP clients keep canonical non-read-only semantics. Claude plan mode can invoke the projected tool.</td>
+            <td><span class="evidence code">Code</span></td>
+          </tr>
+          <tr>
+            <td>Add a batch API and defer detach/polling.</td>
+            <td>The existing chat session is already the durable object, and the observed need is two independent consultations—not background job management.</td>
+            <td>One call can reliably launch two lanes; no second lifecycle surface to maintain.</td>
+            <td><span class="evidence session">Session</span> <span class="evidence code">Code</span></td>
+          </tr>
+          <tr>
+            <td>Remove the obvious identity leak; do not add fingerprint attestation yet.</td>
+            <td>Preset resolution already fails closed. The goal is bias control, not a security boundary, and the user explicitly challenged the earlier attestation design as over-engineering.</td>
+            <td>The judge is not handed raw identity by default; operators still see configuration and human UI attribution. Silent same-resolution incidents would justify revisiting attestation.</td>
+            <td><span class="evidence session">Session</span> <span class="evidence code">Code</span></td>
+          </tr>
+          <tr>
+            <td>Use exact-window-only overflow enforcement.</td>
+            <td>A provider fallback window is useful as an internal estimate but not authoritative enough to reject work.</td>
+            <td>Unknown/fallback windows skip fail-fast overflow; exact windows provide a trustworthy preflight.</td>
+            <td><span class="evidence code">Code</span></td>
+          </tr>
+          <tr>
+            <td>No automatic history compaction and no selection dedup.</td>
+            <td>Investigation showed each request adds the current selection once; previous history does not embed old packaged selection. Fresh-chat-with-summary is safer than invisible compaction.</td>
+            <td>Growth remains legible and caller-controlled through selection modes and usage metadata.</td>
+            <td><span class="evidence session">Session</span></td>
+          </tr>
+          <tr>
+            <td>Assistant-only search, ephemeral expansion, no hydration infrastructure.</td>
+            <td>Assistant text is already resident; only collapsed tool/activity blocks use cold-load degradation. Building hydration for excluded tool output would be speculative.</td>
+            <td>Search is small and responsive, while tool-output search remains a future feature if requested.</td>
+            <td><span class="evidence session">Session</span> <span class="evidence code">Code</span></td>
+          </tr>
+          <tr>
+            <td>Wrap off by default; font picker limited to fixed-pitch faces.</td>
+            <td>This preserves existing layout/copy behavior and prevents unsuitable proportional fonts from entering code render paths.</td>
+            <td>Users opt in, with safe fallback and cache-correct rendering.</td>
+            <td><span class="evidence code">Code</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="turns">
+      <h2>Major turns in the session</h2>
+      <p class="lead">These turns materially changed the design or caught defects that would otherwise have shipped.</p>
+      <div class="timeline">
+        <div class="turn">
+          <strong>The missing “Oracle · 2” indicator became a diagnostic clue.</strong>
+          The app already supported two streams; the indicator disappeared because one main-agent harness serialized
+          tool calls before they reached the app. This shifted the fix from Oracle streaming internals to per-connection tool metadata.
+        </div>
+        <div class="turn">
+          <strong>Prior handoff work was recognized as restart-only, not handoff continuity.</strong>
+          Earlier preset inheritance preserved a lane across restart in the same durable agent session. Handoff creates a new
+          agent session, so cloned Oracle ownership and ID rewriting required a separate correctness fix.
+        </div>
+        <div class="turn">
+          <strong>Identity attestation was deliberately simplified after user pushback.</strong>
+          An initial proposal used server-side fingerprints to prove distinct hidden resolutions. The user correctly questioned
+          whether that over-engineered a bias-control feature. The final design removes the obvious result leak and defers attestation
+          until a real silent-resolution incident exists.
+        </div>
+        <div class="turn">
+          <strong>Cross-examined Oracle lanes converged on a smaller response API.</strong>
+          They rejected permanent cursor paging for exported immutable replies, kept export-as-retrieval, and selected simple
+          <code>head</code>/<code>tail</code>/<code>both</code> chat-log controls plus source-side response trimming.
+        </div>
+        <div class="turn">
+          <strong>The transcript scope was narrowed to the high-value resident data.</strong>
+          Once code inspection proved assistant text was never stripped, “always expanded” and hydration infrastructure were dropped.
+          Search plus on-demand expansion became the first QoL slice.
+        </div>
+        <div class="turn">
+          <strong>The first post-implementation review found two ship-blocking defects.</strong>
+          UI-only identity keys still leaked through some agent-facing serializations, and the default unwrapped diff-height path
+          contained a deterministic floating-point-to-integer crash. Both were fixed and regression-tested.
+        </div>
+        <div class="turn">
+          <strong>A re-review exposed five residual correctness/details issues.</strong>
+          Legacy preset identity fields, dishonest fallback-window usage, reservation staleness/orphan behavior, incomplete full-UUID
+          mapping prose, and TextKit wrap-style refresh were corrected in a final remediation pass.
+        </div>
+        <div class="turn">
+          <strong>The review itself hit a context-input ceiling.</strong>
+          Shared selection had ballooned from implementation activity. The reviewer was retried with only the fresh diff artifacts.
+          This was an operational demonstration of why response/selection budgeting matters.
+        </div>
+      </div>
+    </section>
+
+    <section id="testing">
+      <h2>How to test and see the effect, step by step</h2>
+      <div class="callout warn">
+        <strong>Prerequisite:</strong> rebuild the debug app, then relaunch it. The repository requires coordinated
+        <code>make dev-*</code> commands. A visible app launch/relaunch requires explicit user approval immediately
+        before the action, so it was not performed during this report-only pass.
+      </div>
+
+      <h3>A. See two Oracle lanes overlap</h3>
+      <ol class="steps">
+        <li>Open an app-owned Agent Mode session with two enabled Oracle presets.</li>
+        <li>Ask the main agent: <em>“In one turn, consult OracleA and OracleB concurrently as two new chats. Give each a detailed independent question and wait for both.”</em></li>
+        <li>Open the Oracle popover while both are running.
+          <span class="expected">Expected: the pill briefly reads “Oracle · 2”, and two rows show simultaneous streaming. Very short replies may finish too quickly to observe.</span>
+        </li>
+        <li>Repeat using one batch consultation with two entries and <code>require_distinct:true</code>.
+          <span class="expected">Expected: ordered lane results, no more than two active streams, and early rejection if both entries resolve to the same lane.</span>
+        </li>
+      </ol>
+
+      <h3>B. Confirm handoff continuity</h3>
+      <ol class="steps">
+        <li>In a source Agent Mode session, start a named Oracle chat and ask at least one follow-up. Record the MCP-facing chat ID.</li>
+        <li>Handoff the agent session to a new destination tab/provider.</li>
+        <li>Inspect the handoff payload or ask the destination agent to identify the old→new Oracle chat mapping.
+          <span class="expected">Expected: both readable short-ID and full-UUID mapping rows are present.</span>
+        </li>
+        <li>Ask the destination agent to run <code>oracle_chat_log</code> on the <strong>new</strong> ID, then continue that chat.
+          <span class="expected">Expected: history loads and the continuation succeeds under the destination owner.</span>
+        </li>
+        <li>Try the old ID in the same live destination tab.
+          <span class="expected">Expected: no silent redirect; the error names the replacement ID.</span>
+        </li>
+      </ol>
+
+      <h3>C. Verify “blind to the agent, visible to me”</h3>
+      <ol class="steps">
+        <li>Ask a preset-backed Oracle question and inspect what the main agent reports from the tool result.
+          <span class="expected">Expected: preset alias/UUID are available; resolved provider/model ID and name are absent from the agent-facing result.</span>
+        </li>
+        <li>Open the Oracle popover and inspect the assistant message footer.
+          <span class="expected">Expected: you still see the resolved model name.</span>
+        </li>
+        <li>Inspect the corresponding Oracle tool card in the transcript.
+          <span class="expected">Expected: human-facing attribution remains available because the app captured it before wire redaction.</span>
+        </li>
+      </ol>
+
+      <h3>D. Exercise request and response budget controls</h3>
+      <ol class="steps">
+        <li>Continue an existing Oracle chat with <code>selection_mode:"none"</code>.
+          <span class="expected">Expected: no current workspace selection or review diff is attached for this turn; shared selection is unchanged.</span>
+        </li>
+        <li>Continue again with <code>selection_mode:"explicit_slices"</code> and one small file/range.
+          <span class="expected">Expected: only that send-local slice is packaged; the shared selection still does not change.</span>
+        </li>
+        <li>Ask for a long response with <code>response_mode:"tail"</code>.
+          <span class="expected">Expected: about the final 2,000 characters return inline, plus line/character counts and a full-response export path.</span>
+        </li>
+        <li>Repeat with <code>response_mode:"none"</code>.
+          <span class="expected">Expected: no response body inline, but export and size metadata remain retrievable.</span>
+        </li>
+        <li>Read the same chat using <code>oracle_chat_log</code> with <code>part:"head"</code>, then <code>"tail"</code>, then <code>"both"</code>, using a small <code>max_chars</code>.
+          <span class="expected">Expected: deterministic excerpts and a truncation marker explaining what was omitted and how to retrieve more.</span>
+        </li>
+        <li>Use an intentionally oversized selection against a lane with exact capability metadata.
+          <span class="expected">Expected: <code>oracle_context_overflow</code> occurs before a chat turn/provider call, with major contributors and remedies. Lanes without exact metadata intentionally skip this rejection.</span>
+        </li>
+      </ol>
+
+      <h3>E. Search and expand assistant transcript replies</h3>
+      <ol class="steps">
+        <li>Open a long Agent Mode transcript containing several completed assistant replies, including older collapsed ones.</li>
+        <li>Click the floating magnifying-glass button labeled <strong>Search assistant replies</strong>.</li>
+        <li>Type a phrase found in an older assistant reply; use Return or the up/down buttons.
+          <span class="expected">Expected: a match counter updates, the matched reply expands, scrolls into view, and flashes. Tool-call output is not searched.</span>
+        </li>
+        <li>Open the adjacent ellipsis menu and choose <strong>Expand All Assistant Replies</strong>, then <strong>Restore Automatic Collapsing</strong>.
+          <span class="expected">Expected: bulk expansion is immediate and non-animated; leaving the session resets this ephemeral state.</span>
+        </li>
+      </ol>
+
+      <h3>F. Toggle diff wrapping and change the code font</h3>
+      <ol class="steps">
+        <li>Open a transcript tool card containing a unified diff with a very long line.</li>
+        <li>Toggle the card's <strong>Wrap</strong> checkbox.
+          <span class="expected">Expected: long lines soft-wrap, horizontal scrolling is removed, height updates after layout, and copied text remains unwrapped.</span>
+        </li>
+        <li>Go to Settings → Appearance → Display Options and toggle <strong>Wrap Diff Lines</strong>.
+          <span class="expected">Expected: this persisted setting controls transcript diffs and tool code-block fallbacks; default is off.</span>
+        </li>
+        <li>Go to Settings → Appearance → <strong>Transcript Code Font</strong> and choose another installed fixed-pitch face.
+          <span class="expected">Expected: Agent Mode/chat code blocks and diffs update using the selected face. “System Monospaced” restores the current default.</span>
+        </li>
+      </ol>
+    </section>
+
+    <section id="validation">
+      <h2>Validation and review evidence</h2>
+      <p class="lead">
+        Results below are recorded from the implementation and review session. They were not rerun during
+        this report-only pass.
+      </p>
+      <table>
+        <thead><tr><th>Check</th><th>Recorded result</th><th>Scope / limitation</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>make dev-lint</code></td>
+            <td class="status-pass">Passed / clean</td>
+            <td>Final implementation-session summary.</td>
+          </tr>
+          <tr>
+            <td><code>make dev-swift-build PRODUCT=RepoPrompt</code></td>
+            <td class="status-pass">Passed</td>
+            <td>Build evidence from the implementation session; no live relaunch.</td>
+          </tr>
+          <tr>
+            <td><code>make dev-test FILTER=AgentOraclePillRoutingTests</code></td>
+            <td class="status-pass">18 passed</td>
+            <td>Oracle routing, handoff, and concurrency-related coverage.</td>
+          </tr>
+          <tr>
+            <td><code>make dev-test FILTER=MCPAskOracleWorktreeTests</code></td>
+            <td class="status-pass">34 passed</td>
+            <td>MCP Oracle contracts, blinding, budgeting, batch, and reservation paths.</td>
+          </tr>
+          <tr>
+            <td><code>make dev-test FILTER=OracleOperationToolCardRoutingTests</code></td>
+            <td class="status-pass">10 passed</td>
+            <td>Human tool-card routing and Oracle presentation paths.</td>
+          </tr>
+          <tr>
+            <td><code>make dev-test FILTER=AgentModeChatSwitchActivationTests</code></td>
+            <td class="status-pass">8 passed</td>
+            <td>Session switching and transcript UI state.</td>
+          </tr>
+          <tr>
+            <td><code>make dev-test FILTER=TranscriptCodeFontResolverTests</code></td>
+            <td class="status-pass">8 passed</td>
+            <td>Fixed-pitch resolution and fallback behavior.</td>
+          </tr>
+          <tr>
+            <td>Additional focused <code>make dev-test FILTER=…</code> phases</td>
+            <td class="status-pass">Recorded as passing</td>
+            <td>The plan states each workstream and final residual fix was focus-validated, but this continuation snapshot does not expose every command/count.</td>
+          </tr>
+          <tr>
+            <td>Independent blinded dual-Oracle review</td>
+            <td class="status-pass">Completed; findings remediated</td>
+            <td>Lane 1 moved from “needs rework” to “ship after fixes”; five final residuals were then fixed and focus-validated.</td>
+          </tr>
+          <tr>
+            <td>Full <code>make dev-test</code></td>
+            <td class="status-open">Not recorded</td>
+            <td>Should be considered before integration because the change crosses MCP, chat ownership, settings, and transcript rendering.</td>
+          </tr>
+          <tr>
+            <td>Live visual/manual smoke test</td>
+            <td class="status-open">Not performed</td>
+            <td>The running app remained on the old build; the manual steps above are still needed.</td>
+          </tr>
+          <tr>
+            <td>Commit preflight</td>
+            <td class="status-open">Not performed</td>
+            <td>Nothing is staged and no commit/push was requested.</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout good">
+        The review materially improved the patch: it caught a recursive serialization leak, a deterministic
+        unwrapped-width crash, legacy identity leakage, fallback-window overclaiming, a stale reservation/orphan
+        path, incomplete mapping prose, and a TextKit refresh defect.
+      </div>
+    </section>
+
+    <section id="inventory">
+      <h2>Change inventory</h2>
+      <p>
+        Current Git state before this report: <strong>42 modified</strong>, <strong>19 untracked</strong>,
+        <strong>0 staged</strong>. The 61-file implementation delta is <strong>+7,614 / −346</strong>.
+      </p>
+      <table>
+        <thead><tr><th>Git / worktree state</th><th>File group</th><th>Role</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>Modified + untracked; unstaged</td>
+            <td><code>Sources/RepoPrompt/Features/Chat/ViewModels/Oracle/**</code><br><code>Sources/RepoPrompt/Infrastructure/AI/**</code></td>
+            <td>Production source</td>
+            <td>Destination-owned handoff clones, immutable packaging, context capability metadata, request-budget estimation, revision-safe reservation, usage echo.</td>
+          </tr>
+          <tr>
+            <td>Modified + untracked; unstaged</td>
+            <td><code>Sources/RepoPrompt/Infrastructure/MCP/**</code></td>
+            <td>Production source / public tool contract</td>
+            <td>Per-connection concurrency annotation, batch consultations, selection/response modes, chat-log excerpts, recursive agent-facing identity projection, UI sidecar capture, formatting and error contracts.</td>
+          </tr>
+          <tr>
+            <td>Modified + untracked; unstaged</td>
+            <td><code>Sources/RepoPrompt/Features/AgentMode/Runtime/**</code><br><code>ViewModels/**</code></td>
+            <td>Production source</td>
+            <td>Handoff ordering and mapping, transcript persistence redaction, assistant search state, expansion store, tab/session integration.</td>
+          </tr>
+          <tr>
+            <td>Modified + untracked; unstaged</td>
+            <td><code>Sources/RepoPrompt/Features/AgentMode/Views/**</code></td>
+            <td>Production UI source</td>
+            <td>Assistant search chrome, bulk expansion, expand-on-match navigation, width-aware diff measurement, wrap control, font-aware render signatures.</td>
+          </tr>
+          <tr>
+            <td>Modified + untracked; unstaged</td>
+            <td><code>Sources/RepoPrompt/Features/Settings/**</code><br><code>Sources/RepoPrompt/Infrastructure/UI/**</code></td>
+            <td>Production settings/rendering source</td>
+            <td>Persisted wrap preference, curated code-font picker, resolver/fallback/fingerprint, Markdown/TextKit/cache propagation.</td>
+          </tr>
+          <tr>
+            <td>Modified; unstaged</td>
+            <td><code>Sources/RepoPrompt/Infrastructure/AI/Prompts/**</code></td>
+            <td>Prompt contract</td>
+            <td>Lane-alias guidance and reminders that selection/history are repackaged each send.</td>
+          </tr>
+          <tr>
+            <td>Modified + untracked; unstaged</td>
+            <td><code>Tests/RepoPromptTests/**</code> (15 files)</td>
+            <td>Tests</td>
+            <td>Regression coverage for handoff ownership/mapping, concurrency annotations, blinding and DTO boundaries, batch and response presentation, request reservation, search/expansion, wrap measurement, font resolution, settings persistence, and catalog snapshots.</td>
+          </tr>
+          <tr>
+            <td>Modified; unstaged</td>
+            <td><code>Scripts/Fixtures/test-suite-contract-ledger.tsv</code></td>
+            <td>Test inventory</td>
+            <td>Updates the curated XCTest contract ledger for new/changed surgical tests.</td>
+          </tr>
+          <tr>
+            <td>Ignored by Git</td>
+            <td><code>docs/plans/oracle-duel-hardening-and-transcript-qol-2026-08-04.md</code></td>
+            <td>Local implementation plan</td>
+            <td>Preserves investigation, decisions, review history, ship order, deferrals, and open questions in this checkout only.</td>
+          </tr>
+        </tbody>
+      </table>
+      <details>
+        <summary>Key files and mechanisms</summary>
+        <div>
+          <ul>
+            <li><code>AgentModeViewModel.swift</code> — destination session allocation, clone-before-payload handoff order.</li>
+            <li><code>OracleViewModel.swift</code> — source-owner filtering, rollback-safe clone, old→new ID mapping.</li>
+            <li><code>AgentModeAskOracleAnnotationProjection.swift</code> — trusted per-connection concurrency hint.</li>
+            <li><code>MCPOracleToolService.swift</code> — batch sends, chat-log paging, response modes, final agent-facing identity projection.</li>
+            <li><code>OracleRequestBudgetEstimator.swift</code> — request contributors, output reserve, margin, saturation-safe arithmetic.</li>
+            <li><code>OracleResponsePresentation.swift</code> — tail/no-inline results and head/tail/both log excerpts.</li>
+            <li><code>AgentAssistantTranscriptSearch*.swift</code> — assistant-only search engine/view model/bar.</li>
+            <li><code>AssistantTranscriptExpansionStore.swift</code> — id-keyed and bulk expansion state.</li>
+            <li><code>UnifiedDiffHeightMeasurement.swift</code> — width/font/wrap-aware height cache.</li>
+            <li><code>TranscriptCodeFontResolver.swift</code> — fixed-pitch options, fallback, metrics, and fingerprint.</li>
+          </ul>
+        </div>
+      </details>
+    </section>
+
+    <section id="risks">
+      <h2>Risks, limitations, and deliberate deferrals</h2>
+      <div class="grid two">
+        <article class="card">
+          <h3>Observed limitations</h3>
+          <ul>
+            <li>The implementation is not committed, staged, or running in the current app build.</li>
+            <li>No full-suite test run or live visual smoke test is recorded.</li>
+            <li>The old→new handoff error-enrichment mapping is in memory. After app relaunch, an old ID degrades to a normal not-found error; the new ID remains the correct continuation ID.</li>
+            <li>Agent-facing identity blinding is bias control, not a security boundary. An agent with filesystem/shell access may still discover configuration.</li>
+            <li>Unknown or fallback-only model context windows do not trigger pre-send overflow rejection.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Deliberately deferred</h3>
+          <ul>
+            <li>Persisting handoff ID mappings across app relaunch.</li>
+            <li>A shared cross-batch per-tab scheduler beyond the existing two-stream cap and per-item concurrency errors.</li>
+            <li>Detach/poll/await Oracle job surfaces.</li>
+            <li>Identity fingerprints or server-side resolution attestation.</li>
+            <li>Automatic history compaction.</li>
+            <li>Cursor-based Oracle message paging.</li>
+            <li>Tool/activity transcript search and hydration.</li>
+            <li>Diacritic-insensitive assistant search.</li>
+            <li>Perfect line-height handling for exotic fallback glyphs.</li>
+          </ul>
+        </article>
+      </div>
+      <h3>Open questions preserved from the plan</h3>
+      <ul>
+        <li>Whether the Claude Code tool queue is process-global or per sub-agent.</li>
+        <li>Retention and access boundaries for exports if export-as-paging becomes the canonical workflow.</li>
+        <li>Whether CLI-backed Oracle providers preserve any provider-side session state that changes the stateless packaging assumptions.</li>
+      </ul>
+    </section>
+
+    <section id="actions">
+      <h2>Action items for you</h2>
+      <ol class="steps">
+        <li>
+          <strong>Decide whether to rebuild and visibly relaunch the debug app now.</strong>
+          The next useful action is a coordinated build, followed by the manual smoke tests above. Visible launch/relaunch
+          requires your explicit approval at that action boundary.
+        </li>
+        <li>
+          <strong>Run the human smoke path before integrating.</strong>
+          Prioritize the six checks that tests cannot fully demonstrate: “Oracle · 2”, popover model footers,
+          destination handoff continuation, transcript search navigation, wrap layout, and live font switching.
+        </li>
+        <li>
+          <strong>Consider broader validation.</strong>
+          Because the change crosses chat ownership, MCP wire contracts, settings persistence, and TextKit rendering,
+          run at least the repository-selected broader validation before commit; a full <code>make dev-test</code> was not recorded.
+        </li>
+        <li>
+          <strong>Decide whether the local plan should become tracked durable documentation.</strong>
+          The plan is ignored by <code>docs/plans/*</code>. If future maintainers need its contracts, distill durable facts into
+          the single owning routed document and run <code>Scripts/check-agent-context</code>; do not simply force-add a local plan
+          without a maintainer decision.
+        </li>
+        <li>
+          <strong>At the commit boundary, use the repository contribution workflow.</strong>
+          Read <code>.agents/skills/rpce-contribution-check/SKILL.md</code>, stage only intended files (including this report only if desired),
+          and run <code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code>. Rerun preflight after every staging change.
+        </li>
+      </ol>
+      <div class="callout">
+        <strong>No action is required on Oracle model visibility.</strong>
+        The final split intentionally keeps the model name visible to you in the Oracle popover/message footer while omitting
+        it from preset-backed agent-facing results.
+      </div>
+    </section>
+
+    <section id="evidence">
+      <h2>Evidence, provenance, and limitations of this report</h2>
+      <ul>
+        <li><strong>Session context:</strong> available through the supplied continuation transcript, including investigation, user steering, implementation waves, review findings, fixes, and recorded validation.</li>
+        <li><strong>Repository state:</strong> inspected on 2026-08-05. The implementation is the current uncommitted delta against <code>HEAD</code>; no session-specific commit was created.</li>
+        <li><strong>Code inspection:</strong> handoff ordering/clone ownership, concurrency projection, identity serialization, response controls, budget estimator, transcript search, diff wrap, and font settings were spot-checked in current source.</li>
+        <li><strong>Validation provenance:</strong> command and suite results are quoted from the implementation-session record and persisted plan. This report-only pass did not rerun builds or tests.</li>
+        <li><strong>Git metrics:</strong> RepoPrompt's diff inventory reported 61 files and +7,614/−346 including untracked files. Native Git reported 42 tracked modifications and 19 untracked files; the tracked-only diff was +5,121/−346.</li>
+        <li><strong>Baseline limitation:</strong> <code>HEAD</code> is used as the observable implementation baseline because the supplied session states the feature remained uncommitted. No separate session-start tag was available.</li>
+        <li><strong>Unknown:</strong> total elapsed implementation time, measured runtime performance, and final live visual quality.</li>
+        <li><strong>Expectation wording:</strong> product outcomes in “What to expect” follow from observed mechanisms and recorded tests; they are not production telemetry.</li>
+      </ul>
+      <h3>Evidence labels</h3>
+      <p>
+        <span class="evidence code">Observed in code</span>
+        means directly visible in current files or diff.
+        <span class="evidence test">Observed in tests</span>
+        means supported by recorded test output.
+        <span class="evidence session">Observed in session</span>
+        means supported by the supplied transcript/plan.
+        <span class="evidence inferred">Inferred</span>
+        would identify a reasoned but unmeasured conclusion.
+      </p>
+    </section>
+
+    <footer>
+      Generated from repository state and AI-agent coding-session evidence on 2026-08-05.
+      This self-contained report loads no external assets and contains no executable scripts.
+    </footer>
+  </main>
+</body>
+</html>
