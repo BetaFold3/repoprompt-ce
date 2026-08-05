@@ -2872,6 +2872,343 @@ import XCTest
             }
         }
 
+        func testAskOracleSelectionModesPackageSendLocalContextWithoutMutatingSharedSelection() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let capture = OracleSelectionPackagingCapture()
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let selectedFile = fixture.contextA.fileURL
+                    try write(
+                        "let first = \"slice_first\"\nlet middle = \"slice_middle\"\nlet last = \"slice_last\"\n",
+                        to: selectedFile
+                    )
+                    let sharedSelection = StoredSelection(
+                        selectedPaths: [selectedFile.path],
+                        codemapAutoEnabled: false
+                    )
+                    _ = await fixture.contextA.window.selectionCoordinator.persistActiveSelection(
+                        sharedSelection,
+                        source: .runtimeMutation,
+                        mirrorToUI: true
+                    )
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: sharedSelection,
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    let continuationChat = ChatSession(
+                        workspaceID: fixture.contextA.window.workspaceManager
+                            .activeWorkspace?.id,
+                        composeTabID: fixture.contextA.tabID,
+                        name: "Selection mode continuation",
+                        messages: [
+                            StoredMessage(
+                                isUser: false,
+                                rawText: "existing response",
+                                sequenceIndex: 0
+                            )
+                        ]
+                    )
+                    fixture.contextA.window.oracleViewModel.sessions.append(
+                        continuationChat
+                    )
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting {
+                        args, promptVM, tabContext in
+                        let context = try XCTUnwrap(tabContext)
+                        let config = PromptContextResolved(
+                            includeFiles: true,
+                            includeUserPrompt: true,
+                            includeMetaPrompts: false,
+                            includeFileTree: true,
+                            fileTreeMode: .auto,
+                            codeMapUsage: .none,
+                            gitInclusion: .complete,
+                            storedPromptIds: []
+                        )
+                        let message = await promptVM.packagePrompt(
+                            conversation: [ConversationEntry(
+                                role: .user,
+                                content: args["message"]?.stringValue ?? ""
+                            )],
+                            overridePromptConfig: config,
+                            overrideMode: .review,
+                            gitInclusionOverride: context.packaging.gitInclusionOverride,
+                            selectionOverride: context.packaging.selection,
+                            lookupContextOverride: context.packaging.lookupContext,
+                            reviewGitContextOverride: context.packaging.reviewGitContext
+                        )
+                        capture.record(context: context, message: message)
+                        return [
+                            "chat_id": .string(UUID().uuidString),
+                            "short_id": .string("selection-mode-capture"),
+                            "mode": .string("review"),
+                            "response": .string("captured")
+                        ]
+                    }
+
+                    let connectionID = endpoint.connectionID
+                    func ask(_ extra: [String: Value] = [:]) async throws {
+                        var args: [String: Value] = [
+                            "message": .string("Review this exact send-local context."),
+                            "mode": .string("review")
+                        ]
+                        args.merge(extra) { _, new in new }
+                        _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: args)
+                        }
+                    }
+
+                    try await ask()
+                    try await ask(["selection_mode": .string("current")])
+                    try await ask([
+                        "chat_id": .string(continuationChat.shortID),
+                        "selection_mode": .string("none")
+                    ])
+                    try await ask([
+                        "chat_id": .string(continuationChat.shortID),
+                        "selection_mode": .string("explicit_slices"),
+                        "slices": .array([.object([
+                            "path": .string(selectedFile.path),
+                            "ranges": .array([.object([
+                                "start_line": .int(2),
+                                "end_line": .int(2)
+                            ])])
+                        ])])
+                    ])
+
+                    let turns = capture.turns
+                    XCTAssertEqual(turns.count, 4)
+                    XCTAssertEqual(turns[0].message.systemPrompt, turns[1].message.systemPrompt)
+                    XCTAssertEqual(
+                        turns[0].message.buildTail(embedSystemPrompt: false),
+                        turns[1].message.buildTail(embedSystemPrompt: false),
+                        "Omitted selection_mode must remain byte-identical to explicit current"
+                    )
+                    XCTAssertEqual(
+                        turns[0].message.conversationMessages.map(\.content),
+                        turns[1].message.conversationMessages.map(\.content)
+                    )
+
+                    XCTAssertTrue(turns[2].context.packaging.selection.selectedPaths.isEmpty)
+                    XCTAssertTrue(turns[2].context.packaging.selection.slices.isEmpty)
+                    XCTAssertEqual(
+                        turns[2].context.packaging.gitInclusionOverride,
+                        GitInclusion.none
+                    )
+                    XCTAssertTrue(turns[2].message.fileBlocks.isEmpty)
+                    XCTAssertNil(turns[2].message.gitDiff)
+
+                    let sliced = turns[3].message.fileBlocks.joined(separator: "\n")
+                    XCTAssertTrue(sliced.contains("slice_middle"), sliced)
+                    XCTAssertFalse(sliced.contains("slice_first"), sliced)
+                    XCTAssertFalse(sliced.contains("slice_last"), sliced)
+                    XCTAssertEqual(
+                        turns[3].context.packaging.selection.slices[selectedFile.path],
+                        [LineRange(start: 2, end: 2)]
+                    )
+                    XCTAssertEqual(
+                        turns[3].context.packaging.gitInclusionOverride,
+                        GitInclusion.none
+                    )
+                    XCTAssertNil(turns[3].message.gitDiff)
+
+                    let persisted = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
+                    ).selection
+                    XCTAssertEqual(persisted, sharedSelection)
+
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                } catch {
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleBudgetPreflightRejectsBeforeChatMutationAndUnknownWindowSkipsCheck() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                let apiSettings = try XCTUnwrap(fixture.contextA.window.promptManager.apiSettingsViewModel)
+                let previousClaudeCodeConnected = apiSettings.isClaudeCodeConnected
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+                    apiSettings.isClaudeCodeConnected = previousClaudeCodeConnected
+                    fixture.contextA.window.mcpServer.setOracleContextWindowOverrideForTesting(nil)
+                    fixture.contextA.window.mcpServer.setOraclePostPackagingTransportOverrideForTesting(nil)
+                }
+
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(codemapAutoEnabled: false),
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    let preset = ModelPreset(
+                        name: "BudgetPreflightOracle",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    presetsManager.presets = [preset]
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+                    apiSettings.isClaudeCodeConnected = true
+
+                    let transport = OracleTransportInvocationCapture()
+                    fixture.contextA.window.mcpServer.setOraclePostPackagingTransportOverrideForTesting {
+                        _, _ in
+                        transport.recordInvocation()
+                        let stream = AsyncThrowingStream<ChatStreamOutput, Error> { continuation in
+                            continuation.yield(ChatStreamOutput(
+                                text: "budget transport response",
+                                reasoning: nil,
+                                tokens: ChatTokenInfo(),
+                                isFinal: true
+                            ))
+                            continuation.finish()
+                        }
+                        return (UUID(), stream)
+                    }
+
+                    let oracle = fixture.contextA.window.oracleViewModel
+                    let beforeSessions = Dictionary(uniqueKeysWithValues: oracle.sessions.map {
+                        ($0.id, $0.effectiveMessageCount)
+                    })
+                    let beforeMessages = Dictionary(uniqueKeysWithValues: oracle.sessions.map {
+                        ($0.id, oracle.messagesSnapshot(for: $0.id))
+                    })
+                    fixture.contextA.window.mcpServer.setOracleContextWindowOverrideForTesting { _ in 128 }
+
+                    do {
+                        _ = try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
+                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                                "message": .string("Reject this request before mutating the chat."),
+                                "mode": .string("review"),
+                                "model": .string(preset.id.uuidString),
+                                "new_chat": .bool(true),
+                                "max_output_tokens": .int(64)
+                            ])
+                        }
+                        XCTFail("Expected context-budget overflow")
+                    } catch let error as ChatToolError {
+                        XCTAssertEqual(error.code, .oracleContextOverflow)
+                        XCTAssertNotNil(error.details?["largest_contributors"])
+                        XCTAssertTrue(error.details?["remedies"]?.contains("selection_mode:none") == true)
+                        XCTAssertTrue(error.message.contains("context window is 128"), error.message)
+                    }
+                    XCTAssertEqual(transport.invocationCount, 0)
+                    XCTAssertEqual(
+                        Dictionary(uniqueKeysWithValues: oracle.sessions.map {
+                            ($0.id, $0.effectiveMessageCount)
+                        }),
+                        beforeSessions
+                    )
+                    for (sessionID, messages) in beforeMessages {
+                        XCTAssertEqual(oracle.messagesSnapshot(for: sessionID), messages)
+                        XCTAssertFalse(oracle.isSessionStreaming(sessionID))
+                    }
+
+                    XCTAssertEqual(
+                        AIModelCapabilityMetadata.resolve(for: .claudeCodeSonnet)
+                            .windowSource,
+                        .providerFallback
+                    )
+                    XCTAssertEqual(
+                        AIModelCapabilityMetadata.resolve(for: .claude5Opus)
+                            .windowSource,
+                        .exact
+                    )
+                    XCTAssertEqual(
+                        AIModelCapabilityMetadata.safeUsagePercentage(
+                            inputTokens: Int.max,
+                            contextWindowTokens: 1
+                        ),
+                        Int.max
+                    )
+
+                    fixture.contextA.window.mcpServer
+                        .setOracleContextWindowOverrideForTesting(
+                            { _ in 128 },
+                            source: .providerFallback
+                        )
+                    let fallbackAccepted = try await ServerNetworkManager
+                        .withConnectionID(endpoint.connectionID) {
+                            try await fixture.contextA.window.mcpServer
+                                .executeAskOracleForTesting(args: [
+                                    "message": .string(
+                                        "Fallback windows must not hard reject this request."
+                                    ),
+                                    "mode": .string("review"),
+                                    "model": .string(preset.id.uuidString),
+                                    "new_chat": .bool(true),
+                                    "max_output_tokens": .int(64)
+                                ])
+                        }
+                    XCTAssertEqual(
+                        fallbackAccepted.objectValue?["response"]?.stringValue,
+                        "budget transport response"
+                    )
+                    let fallbackUsage = try XCTUnwrap(
+                        fallbackAccepted.objectValue?["usage"]?.objectValue
+                    )
+                    XCTAssertNil(fallbackUsage["context_window"])
+                    XCTAssertNil(fallbackUsage["pct"])
+                    XCTAssertEqual(
+                        fallbackUsage["output_reserve_tokens"]?.intValue,
+                        64
+                    )
+                    XCTAssertEqual(transport.invocationCount, 1)
+
+                    fixture.contextA.window.mcpServer
+                        .setOracleContextWindowOverrideForTesting { _ in nil }
+                    let accepted = try await ServerNetworkManager.withConnectionID(
+                        endpoint.connectionID
+                    ) {
+                        try await fixture.contextA.window.mcpServer
+                            .executeAskOracleForTesting(args: [
+                                "message": .string(
+                                    "Unknown context windows skip only the overflow gate."
+                                ),
+                                "mode": .string("review"),
+                                "model": .string(preset.id.uuidString),
+                                "new_chat": .bool(true),
+                                "max_output_tokens": .int(64)
+                            ])
+                    }
+                    XCTAssertEqual(
+                        accepted.objectValue?["response"]?.stringValue,
+                        "budget transport response"
+                    )
+                    XCTAssertEqual(transport.invocationCount, 2)
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAskOracleValidatesAndForwardsParallelSessionArgumentsAtServiceBoundary() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -2898,18 +3235,24 @@ import XCTest
                         ),
                         fixture: fixture
                     )
+                    let singleModel = AIModel.claudeCodeSonnet
                     fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting { args, _, _ in
                         capture.record(args)
                         return [
                             "chat_id": .string(UUID().uuidString),
                             "short_id": .string("argument-capture"),
                             "mode": .string("review"),
-                            "response": .string("captured")
+                            "response": .string("captured"),
+                            "model_source": .string("preset"),
+                            "model_id": .string(singleModel.rawValue),
+                            "model_name": .string(singleModel.displayName),
+                            "ui_model_id": .string(singleModel.rawValue),
+                            "ui_model_name": .string(singleModel.displayName)
                         ]
                     }
 
                     let connectionID = endpoint.connectionID
-                    _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                    let singleValue = try await ServerNetworkManager.withConnectionID(connectionID) {
                         try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
                             "message": .string("Review independently"),
                             "mode": .string("review"),
@@ -2918,19 +3261,39 @@ import XCTest
                             "new_chat": .bool(true)
                         ])
                     }
+                    let singleWireJSON = ToolOutputFormatter.rawJSONString(singleValue)
+                    XCTAssertFalse(singleWireJSON.contains(singleModel.rawValue), singleWireJSON)
+                    XCTAssertFalse(singleWireJSON.contains(singleModel.displayName), singleWireJSON)
+                    XCTAssertNil(singleValue.objectValue?["model_id"])
+                    XCTAssertNil(singleValue.objectValue?["model_name"])
+                    XCTAssertNil(singleValue.objectValue?["ui_model_id"])
+                    XCTAssertNil(singleValue.objectValue?["ui_model_name"])
                     XCTAssertEqual(capture.args?["model"]?.stringValue, "GPT_5_6_Sol_xhigh")
                     XCTAssertEqual(capture.args?["chat_name"]?.stringValue, "Sol review lane")
                     XCTAssertEqual(capture.args?["new_chat"]?.boolValue, true)
                     XCTAssertEqual(capture.callCount, 1)
 
+                    do {
+                        _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                            try await fixture.contextA.window.mcpServer
+                                .executeOracleChatLogForTesting(args: ["part": .int(7)])
+                        }
+                        XCTFail("Expected a non-string chat-log part to fail")
+                    } catch {
+                        XCTAssertTrue(
+                            error.localizedDescription.contains("part must be a string"),
+                            error.localizedDescription
+                        )
+                    }
+
                     let firstPreset = ModelPreset(
                         name: "KnowledgeDuelA",
-                        model: .customProviderUser(name: "knowledge-duel-a"),
+                        model: .claude4Sonnet,
                         supportedModes: SupportedModes(chat: true, plan: true, review: true)
                     )
                     let secondPreset = ModelPreset(
                         name: "KnowledgeDuelB",
-                        model: .customProviderUser(name: "knowledge-duel-b"),
+                        model: .geminiFlash25,
                         supportedModes: SupportedModes(chat: true, plan: true, review: true)
                     )
                     presetsManager.presets = [firstPreset, secondPreset]
@@ -2945,6 +3308,12 @@ import XCTest
                     XCTAssertFalse(modelsResponse.rawJSON.contains("\"isError\":true"), modelsResponse.rawJSON)
                     XCTAssertTrue(modelsResponse.rawJSON.contains(firstPreset.name), modelsResponse.rawJSON)
                     XCTAssertTrue(modelsResponse.rawJSON.contains(secondPreset.name), modelsResponse.rawJSON)
+                    XCTAssertTrue(modelsResponse.rawJSON.contains("context_window: 200000"), modelsResponse.rawJSON)
+                    XCTAssertTrue(modelsResponse.rawJSON.contains("context_window: 1000000"), modelsResponse.rawJSON)
+                    XCTAssertFalse(modelsResponse.rawJSON.contains(firstPreset.model.rawValue), modelsResponse.rawJSON)
+                    XCTAssertFalse(modelsResponse.rawJSON.contains(firstPreset.model.displayName), modelsResponse.rawJSON)
+                    XCTAssertFalse(modelsResponse.rawJSON.contains(secondPreset.model.rawValue), modelsResponse.rawJSON)
+                    XCTAssertFalse(modelsResponse.rawJSON.contains(secondPreset.model.displayName), modelsResponse.rawJSON)
 
                     let disabledModelsResponse = MCPOracleToolService.modelPresetDiagnosticLines(
                         usageState: .disabledByToggle,
@@ -3039,9 +3408,21 @@ import XCTest
                     XCTAssertEqual(capture.callCount, 1, "Ambiguous named lanes must fail before sendChat")
 
                     let invalidCases: [([String: Value], String)] = [
+                        (["message": .string("x"), "mode": .int(7)], "mode must be a string"),
+                        (["message": .string("x"), "response_mode": .int(7)], "response_mode must be a string"),
                         (["message": .string("x"), "chat_id": .int(7)], "chat_id must be a string"),
                         (["message": .string("x"), "model": .string("  ")], "model cannot be empty"),
                         (["message": .string("x"), "chat_name": .string("Lane")], "chat_name is only valid"),
+                        (["message": .string("x"), "selection_mode": .int(1)], "selection_mode must be a string"),
+                        (["message": .string("x"), "selection_mode": .string("explicit_slices")], "requires an explicit chat_id"),
+                        (["message": .string("x"), "selection_mode": .string("none")], "requires an explicit chat_id"),
+                        (["message": .string("x"), "slices": .array([])], "slices is only valid"),
+                        (["message": .string("x"), "max_output_tokens": .int(0)], "must be a positive integer"),
+                        ([
+                            "message": .string("x"),
+                            "selection_mode": .string("none"),
+                            "new_chat": .bool(true)
+                        ], "only valid for continuation sends"),
                         ([
                             "message": .string("x"),
                             "chat_id": .string("abc123"),
@@ -3063,6 +3444,607 @@ import XCTest
                     await fixture.cleanup()
                 } catch {
                     fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleBatchConsultationsPreserveOrderAndBlinding() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(codemapAutoEnabled: false),
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    let first = ModelPreset(
+                        name: "BatchOracleA",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    let second = ModelPreset(
+                        name: "BatchOracleB",
+                        model: .claudeCodeOpus,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    presetsManager.presets = [first, second]
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+
+                    var seenModels: [String] = []
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting { args, _, _ in
+                        let model = args["model"]?.stringValue ?? ""
+                        let selectedPreset = model == first.name ? first : second
+                        seenModels.append(model)
+                        let rawResult: [String: Value] = [
+                            "chat_id": .string("chat-\(model)"),
+                            "short_id": .string("short-\(model)"),
+                            "mode": .string("chat"),
+                            "response": .string("answer for \(model)"),
+                            "model_source": .string("preset"),
+                            "model_preset_id": .string(model == first.name ? first.id.uuidString : second.id.uuidString),
+                            "model_preset_name": .string(model),
+                            "model_selection": .string("explicit"),
+                            "model_id": .string(selectedPreset.model.rawValue),
+                            "model_name": .string(selectedPreset.model.displayName),
+                            "ui_model_id": .string(selectedPreset.model.rawValue),
+                            "ui_model_name": .string(selectedPreset.model.displayName),
+                            "legacy_shape": .object([
+                                "model_id": .string(selectedPreset.model.rawValue),
+                                "model_name": .string(selectedPreset.model.displayName),
+                                "ui_model_id": .string(selectedPreset.model.rawValue),
+                                "ui_model_name": .string(selectedPreset.model.displayName)
+                            ]),
+                            "usage": .object([
+                                "input_tokens": .int(12),
+                                "source": .string("app_estimate")
+                            ])
+                        ]
+                        return rawResult
+                    }
+
+                    let value = try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
+                        try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                            "consultations": .array([
+                                .object([
+                                    "message": .string("Lane A"),
+                                    "model": .string(first.name),
+                                    "chat_name": .string("A")
+                                ]),
+                                .object([
+                                    "message": .string("Lane B"),
+                                    "model": .string(second.id.uuidString),
+                                    "chat_name": .string("B")
+                                ])
+                            ])
+                        ])
+                    }
+                    let results = try XCTUnwrap(value.objectValue?["results"]?.arrayValue)
+                    XCTAssertEqual(results.count, 2)
+                    XCTAssertEqual(results[0].objectValue?["ok"]?.boolValue, true)
+                    XCTAssertEqual(results[1].objectValue?["ok"]?.boolValue, true)
+                    XCTAssertEqual(results[0].objectValue?["chat_id"]?.stringValue, "chat-\(first.name)")
+                    XCTAssertEqual(results[1].objectValue?["chat_id"]?.stringValue, "chat-\(second.id.uuidString)")
+                    XCTAssertEqual(results[0].objectValue?["model_preset_name"]?.stringValue, first.name)
+                    XCTAssertEqual(results[1].objectValue?["model_preset_id"]?.stringValue, second.id.uuidString)
+                    XCTAssertNil(results[0].objectValue?["model_id"])
+                    XCTAssertNil(results[0].objectValue?["model_name"])
+                    XCTAssertNil(results[0].objectValue?["ui_model_id"])
+                    XCTAssertNil(results[0].objectValue?["ui_model_name"])
+                    let nestedLegacy = results[0].objectValue?["legacy_shape"]?.objectValue
+                    XCTAssertNil(nestedLegacy?["model_id"])
+                    XCTAssertNil(nestedLegacy?["model_name"])
+                    XCTAssertNil(nestedLegacy?["ui_model_id"])
+                    XCTAssertNil(nestedLegacy?["ui_model_name"])
+                    XCTAssertEqual(Set(seenModels), Set([first.name, second.id.uuidString]))
+                    let agentSession = fixture.contextA.window.agentModeViewModel.session(
+                        for: fixture.contextA.tabID
+                    )
+                    let capturedUISidecars = Array(
+                        agentSession.oracleUIIdentitySidecarByChatID.values
+                    )
+                    XCTAssertEqual(capturedUISidecars.count, 2)
+                    let wireJSON = ToolOutputFormatter.rawJSONString(value)
+                    for preset in [first, second] {
+                        XCTAssertTrue(capturedUISidecars.contains {
+                            $0.contains(preset.model.rawValue)
+                                && $0.contains(preset.model.displayName)
+                        })
+                        XCTAssertFalse(wireJSON.contains(preset.model.rawValue), wireJSON)
+                        XCTAssertFalse(wireJSON.contains(preset.model.displayName), wireJSON)
+                    }
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleBatchValidationRejectsMixedParamsAndRequireDistinct() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                var sendCount = 0
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(codemapAutoEnabled: false),
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    let preset = ModelPreset(
+                        name: "DistinctOracle",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    presetsManager.presets = [preset]
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting { _, _, _ in
+                        sendCount += 1
+                        return [
+                            "chat_id": .string("should-not-run"),
+                            "mode": .string("chat"),
+                            "response": .string("nope")
+                        ]
+                    }
+
+                    do {
+                        _ = try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
+                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                                "message": .string("single"),
+                                "consultations": .array([
+                                    .object([
+                                        "message": .string("batch"),
+                                        "model": .string(preset.name)
+                                    ])
+                                ])
+                            ])
+                        }
+                        XCTFail("Expected mixed params rejection")
+                    } catch {
+                        XCTAssertTrue(
+                            error.localizedDescription.contains("mutually exclusive"),
+                            error.localizedDescription
+                        )
+                    }
+
+                    do {
+                        _ = try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
+                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                                "require_distinct": .bool(true),
+                                "consultations": .array([
+                                    .object([
+                                        "message": .string("one"),
+                                        "model": .string(preset.name)
+                                    ]),
+                                    .object([
+                                        "message": .string("two"),
+                                        "model": .string(preset.id.uuidString)
+                                    ])
+                                ])
+                            ])
+                        }
+                        XCTFail("Expected require_distinct rejection")
+                    } catch {
+                        XCTAssertTrue(
+                            error.localizedDescription.contains("require_distinct"),
+                            error.localizedDescription
+                        )
+                        XCTAssertTrue(
+                            error.localizedDescription.contains("No lanes were started"),
+                            error.localizedDescription
+                        )
+                    }
+                    for (field, value) in [
+                        ("mode", Value.int(7)),
+                        ("response_mode", Value.bool(true))
+                    ] {
+                        do {
+                            _ = try await ServerNetworkManager.withConnectionID(
+                                endpoint.connectionID
+                            ) {
+                                try await fixture.contextA.window.mcpServer
+                                    .executeAskOracleForTesting(args: [
+                                        "consultations": .array([
+                                            .object([
+                                                "message": .string("invalid type"),
+                                                "model": .string(preset.name),
+                                                field: value
+                                            ])
+                                        ])
+                                    ])
+                            }
+                            XCTFail("Expected consultations[0].\(field) type rejection")
+                        } catch {
+                            XCTAssertTrue(
+                                error.localizedDescription.contains(
+                                    "consultations[0].\(field) must be a string"
+                                ),
+                                error.localizedDescription
+                            )
+                        }
+                    }
+                    XCTAssertEqual(sendCount, 0)
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleTrimmedExportFailureReturnsPaidResponseInline() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(
+                        previousTemporaryDisable,
+                        commit: false
+                    )
+                    fixture.contextA.window.mcpServer
+                        .setOracleChatSendOverrideForTesting(nil)
+                    fixture.contextA.window.mcpServer
+                        .setOracleExportOverrideForTesting(nil)
+                }
+
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(codemapAutoEnabled: false),
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    let preset = ModelPreset(
+                        name: "ExportFailureOracle",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(
+                            chat: true,
+                            plan: true,
+                            review: true
+                        )
+                    )
+                    presetsManager.presets = [preset]
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+
+                    fixture.contextA.window.mcpServer
+                        .setOracleChatSendOverrideForTesting { _, _, _ in
+                            [
+                                "chat_id": .string("paid-chat"),
+                                "mode": .string("chat"),
+                                "response": .string("paid response must survive")
+                            ]
+                        }
+                    fixture.contextA.window.mcpServer
+                        .setOracleExportOverrideForTesting { _ in
+                            throw NSError(
+                                domain: "OracleExportFailure",
+                                code: 91,
+                                userInfo: [
+                                    NSLocalizedDescriptionKey: "disk unavailable"
+                                ]
+                            )
+                        }
+
+                    let value = try await ServerNetworkManager.withConnectionID(
+                        endpoint.connectionID
+                    ) {
+                        try await fixture.contextA.window.mcpServer
+                            .executeAskOracleForTesting(args: [
+                                "consultations": .array([
+                                    .object([
+                                        "message": .string("Return the paid answer"),
+                                        "model": .string(preset.id.uuidString),
+                                        "response_mode": .string("tail")
+                                    ])
+                                ])
+                            ])
+                    }
+
+                    let item = try XCTUnwrap(
+                        value.objectValue?["results"]?.arrayValue?.first?
+                            .objectValue
+                    )
+                    XCTAssertEqual(item["ok"]?.boolValue, true)
+                    XCTAssertEqual(
+                        item["response"]?.stringValue,
+                        "paid response must survive"
+                    )
+                    XCTAssertEqual(item["chat_id"]?.stringValue, "paid-chat")
+                    XCTAssertEqual(item["response_mode"]?.stringValue, "full")
+                    XCTAssertTrue(
+                        item["export_failed_warning"]?.stringValue?
+                            .contains("returning the full response inline") == true
+                    )
+                    XCTAssertNil(item["excerpt"])
+                    XCTAssertNil(item["export_path"])
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleBatchQueuesBeyondTwoCap() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(codemapAutoEnabled: false),
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    let presets = (0 ..< 3).map { index in
+                        ModelPreset(
+                            name: "QueueOracle\(index)",
+                            model: .customProviderUser(name: "queue-\(index)"),
+                            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                        )
+                    }
+                    presetsManager.presets = presets
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+
+                    final class QueueGate: @unchecked Sendable {
+                        private let lock = NSLock()
+                        private var continuations: [CheckedContinuation<Void, Never>] = []
+                        private var opened = false
+                        private(set) var inFlight = 0
+                        private(set) var peak = 0
+                        private(set) var started: [String] = []
+
+                        func enter(_ model: String) {
+                            lock.lock()
+                            inFlight += 1
+                            peak = max(peak, inFlight)
+                            started.append(model)
+                            lock.unlock()
+                        }
+
+                        func leave() {
+                            lock.lock()
+                            inFlight -= 1
+                            lock.unlock()
+                        }
+
+                        func waitIfNeeded() async {
+                            await withCheckedContinuation { cont in
+                                lock.lock()
+                                if opened {
+                                    lock.unlock()
+                                    cont.resume()
+                                } else {
+                                    continuations.append(cont)
+                                    lock.unlock()
+                                }
+                            }
+                        }
+
+                        func open() {
+                            lock.lock()
+                            opened = true
+                            let waiting = continuations
+                            continuations.removeAll()
+                            lock.unlock()
+                            for cont in waiting {
+                                cont.resume()
+                            }
+                        }
+
+                        func snapshot() -> (peak: Int, started: [String], inFlight: Int) {
+                            lock.lock()
+                            defer { lock.unlock() }
+                            return (peak, started, inFlight)
+                        }
+                    }
+
+                    let gate = QueueGate()
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting { args, _, _ in
+                        let model = args["model"]?.stringValue ?? ""
+                        gate.enter(model)
+                        defer { gate.leave() }
+                        // Hold every lane until open — with max concurrency 2, the third
+                        // waits in the batch queue and never enters send until a slot frees.
+                        await gate.waitIfNeeded()
+                        return [
+                            "chat_id": .string("chat-\(model)"),
+                            "mode": .string("chat"),
+                            "response": .string("ok"),
+                            "model_source": .string("preset"),
+                            "model_preset_name": .string(model),
+                            "model_selection": .string("explicit")
+                        ]
+                    }
+
+                    let task = Task { @MainActor in
+                        try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
+                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                                "consultations": .array(presets.map { preset in
+                                    .object([
+                                        "message": .string("queue \(preset.name)"),
+                                        "model": .string(preset.name)
+                                    ])
+                                })
+                            ])
+                        }
+                    }
+                    // Wait until two lanes are in-flight inside sendChat.
+                    for _ in 0 ..< 50 {
+                        let snap = gate.snapshot()
+                        if snap.inFlight == 2 { break }
+                        try await Task.sleep(nanoseconds: 20_000_000)
+                    }
+                    let before = gate.snapshot()
+                    XCTAssertEqual(before.inFlight, 2)
+                    XCTAssertEqual(before.started.count, 2)
+                    XCTAssertEqual(before.peak, 2)
+                    gate.open()
+                    let value = try await task.value
+                    let results = try XCTUnwrap(value.objectValue?["results"]?.arrayValue)
+                    XCTAssertEqual(results.count, 3)
+                    XCTAssertTrue(results.allSatisfy { $0.objectValue?["ok"]?.boolValue == true })
+                    XCTAssertEqual(gate.snapshot().peak, 2)
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleResponseModeTailAndNoneAutoExport() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                }
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: makeFrozenContext(
+                            fixture: fixture,
+                            selection: StoredSelection(codemapAutoEnabled: false),
+                            bindings: []
+                        ),
+                        fixture: fixture
+                    )
+                    let preset = ModelPreset(
+                        name: "ResponseModeOracle",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    presetsManager.presets = [preset]
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+
+                    let body = String(repeating: "x", count: 2100) + "\n## Recommendations\n- keep going"
+                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting { _, _, _ in
+                        [
+                            "chat_id": .string("response-mode-chat"),
+                            "mode": .string("chat"),
+                            "response": .string(body),
+                            "model_source": .string("preset"),
+                            "model_preset_name": .string(preset.name),
+                            "model_preset_id": .string(preset.id.uuidString),
+                            "model_selection": .string("explicit")
+                        ]
+                    }
+
+                    let tail = try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
+                        try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                            "message": .string("trim me"),
+                            "model": .string(preset.name),
+                            "new_chat": .bool(true),
+                            "response_mode": .string("tail")
+                        ])
+                    }.objectValue
+                    XCTAssertNil(tail?["response"])
+                    let excerpt = try XCTUnwrap(tail?["excerpt"]?.stringValue)
+                    XCTAssertEqual(excerpt.count, OracleResponseMode.tailExcerptCharacterBudget)
+                    XCTAssertTrue(excerpt.contains("## Recommendations"))
+                    let exportPath = try XCTUnwrap(tail?["export_path"]?.stringValue)
+                    XCTAssertEqual(tail?["oracle_export_path"]?.stringValue, exportPath)
+                    XCTAssertEqual(tail?["char_count"]?.intValue, body.count)
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: exportPath))
+                    let exported = try String(contentsOfFile: exportPath, encoding: .utf8)
+                    XCTAssertTrue(exported.contains(body))
+
+                    let none = try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
+                        try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                            "message": .string("hide me"),
+                            "model": .string(preset.name),
+                            "new_chat": .bool(true),
+                            "response_mode": .string("none")
+                        ])
+                    }.objectValue
+                    XCTAssertNil(none?["response"])
+                    XCTAssertNil(none?["excerpt"])
+                    XCTAssertEqual(none?["excerpt_lines"]?.intValue, 0)
+                    let nonePath = try XCTUnwrap(none?["export_path"]?.stringValue)
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: nonePath))
+
+                    await fixture.cleanup()
+                } catch {
                     await fixture.cleanup()
                     throw error
                 }
@@ -3581,6 +4563,29 @@ import XCTest
 
         func snapshot() -> [MCPExplicitWindowRoutingHint?] {
             hints
+        }
+    }
+
+    @MainActor
+    private final class OracleSelectionPackagingCapture {
+        struct Turn {
+            let context: OracleViewModel.OracleSendTabContext
+            let message: AIMessage
+        }
+
+        private(set) var turns: [Turn] = []
+
+        func record(context: OracleViewModel.OracleSendTabContext, message: AIMessage) {
+            turns.append(Turn(context: context, message: message))
+        }
+    }
+
+    @MainActor
+    private final class OracleTransportInvocationCapture {
+        private(set) var invocationCount = 0
+
+        func recordInvocation() {
+            invocationCount += 1
         }
     }
 

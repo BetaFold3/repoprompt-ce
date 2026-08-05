@@ -63,6 +63,10 @@ struct UnifiedDiffTextView: NSViewRepresentable {
     let fontSize: CGFloat
     let fontPreset: FontScalePreset
     let colorScheme: ColorScheme
+    /// When false (default), preserves today's infinite-width + `.byClipping` + h-scroll path.
+    var wrapLines: Bool = false
+    /// Optional PostScript preference; nil uses system monospaced.
+    var preferredPostScriptName: String?
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -71,7 +75,7 @@ struct UnifiedDiffTextView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = EdgeForwardingScrollView()
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
+        scrollView.hasHorizontalScroller = !wrapLines
         scrollView.scrollerStyle = .overlay
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
@@ -79,7 +83,10 @@ struct UnifiedDiffTextView: NSViewRepresentable {
 
         let textStorage = NSTextStorage()
         let layoutManager = UnifiedDiffLayoutManager()
-        let textContainer = NSTextContainer(size: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude))
+        let textContainer = NSTextContainer(size: NSSize(
+            width: wrapLines ? 0 : CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        ))
         layoutManager.addTextContainer(textContainer)
         textStorage.addLayoutManager(layoutManager)
 
@@ -96,12 +103,18 @@ struct UnifiedDiffTextView: NSViewRepresentable {
         textView.isGrammarCheckingEnabled = false
         textView.isAutomaticLinkDetectionEnabled = false
         textView.isAutomaticDataDetectionEnabled = false
-        textView.isHorizontallyResizable = true
+        textView.isHorizontallyResizable = !wrapLines
         textView.isVerticallyResizable = true
         textView.textContainerInset = NSSize(width: 0, height: UnifiedDiffCardRendering.appKitVerticalTextInset(for: fontPreset))
         textView.textContainer?.lineFragmentPadding = UnifiedDiffCardRendering.appKitHorizontalTextPadding(for: fontPreset)
-        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.textContainer?.widthTracksTextView = false
+        if wrapLines {
+            textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+            textView.textContainer?.widthTracksTextView = true
+            textView.autoresizingMask = [.width]
+        } else {
+            textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            textView.textContainer?.widthTracksTextView = false
+        }
         textView.textContainer?.heightTracksTextView = false
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         textView.minSize = .zero
@@ -116,19 +129,28 @@ struct UnifiedDiffTextView: NSViewRepresentable {
 
     func updateNSView(_ scrollView: NSScrollView, context: Context) {
         guard let textView = scrollView.documentView as? NSTextView else { return }
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        let resolved = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: preferredPostScriptName,
+            pointSize: fontSize
+        )
+        let fontFingerprint = resolved.fingerprint
+        let font = resolved.font
         let horizontalPadding = UnifiedDiffCardRendering.appKitHorizontalTextPadding(for: fontPreset)
         let verticalInset = UnifiedDiffCardRendering.appKitVerticalTextInset(for: fontPreset)
         let lineSpacing = UnifiedDiffCardRendering.appKitLineSpacing(for: fontPreset)
         textView.textContainerInset = NSSize(width: 0, height: verticalInset)
         textView.textContainer?.lineFragmentPadding = horizontalPadding
+
+        applyWrapConfiguration(to: textView, scrollView: scrollView)
+
         let signature = RenderSignature(
             renderID: document.renderID,
-            fontSize: font.pointSize,
+            fontFingerprint: fontFingerprint,
             colorScheme: colorScheme,
             lineSpacing: lineSpacing,
             horizontalPadding: horizontalPadding,
-            verticalInset: verticalInset
+            verticalInset: verticalInset,
+            wrapLines: wrapLines
         )
 
         guard context.coordinator.lastRenderSignature != signature else { return }
@@ -136,10 +158,46 @@ struct UnifiedDiffTextView: NSViewRepresentable {
             document: document,
             font: font,
             colorScheme: colorScheme,
-            lineSpacing: lineSpacing
+            lineSpacing: lineSpacing,
+            wrapLines: wrapLines,
+            resolvedFontMetrics: resolved,
+            preferredPostScriptName: preferredPostScriptName
         ).build()
         textView.textStorage?.setAttributedString(attributedString)
         context.coordinator.lastRenderSignature = signature
+    }
+
+    private func applyWrapConfiguration(to textView: NSTextView, scrollView: NSScrollView) {
+        let shouldHaveHScroller = !wrapLines
+        if scrollView.hasHorizontalScroller != shouldHaveHScroller {
+            scrollView.hasHorizontalScroller = shouldHaveHScroller
+        }
+        if wrapLines {
+            if textView.isHorizontallyResizable {
+                textView.isHorizontallyResizable = false
+            }
+            textView.autoresizingMask = [.width]
+            if let container = textView.textContainer {
+                if container.widthTracksTextView == false {
+                    container.widthTracksTextView = true
+                }
+                container.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+            }
+        } else {
+            if !textView.isHorizontallyResizable {
+                textView.isHorizontallyResizable = true
+            }
+            textView.autoresizingMask = []
+            if let container = textView.textContainer {
+                if container.widthTracksTextView {
+                    container.widthTracksTextView = false
+                }
+                container.containerSize = NSSize(
+                    width: CGFloat.greatestFiniteMagnitude,
+                    height: CGFloat.greatestFiniteMagnitude
+                )
+            }
+        }
     }
 
     static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
@@ -152,17 +210,18 @@ struct UnifiedDiffTextView: NSViewRepresentable {
         fileprivate var lastRenderSignature: RenderSignature?
     }
 
+    /// Includes font fingerprint so Workstream 5.3 custom faces invalidate renders.
     fileprivate struct RenderSignature: Equatable {
         let renderID: Int
-        let fontSize: CGFloat
+        let fontFingerprint: TranscriptCodeFontFingerprint
         let colorScheme: ColorScheme
         let lineSpacing: CGFloat
         let horizontalPadding: CGFloat
         let verticalInset: CGFloat
+        let wrapLines: Bool
     }
 }
 
-@MainActor
 struct UnifiedDiffAttributedStringBuilder {
     private struct LineAttributeSet {
         let prefix: [NSAttributedString.Key: Any]
@@ -173,6 +232,12 @@ struct UnifiedDiffAttributedStringBuilder {
     let font: NSFont
     let colorScheme: ColorScheme
     let lineSpacing: CGFloat
+    /// When true, soft-wraps via paragraph style; source string stays unwrapped so copy is exact.
+    var wrapLines: Bool = false
+    /// Optional resolver metrics for pinned line height + tab stops; derived from `font` when nil.
+    var resolvedFontMetrics: TranscriptCodeFontResolver.Resolved?
+    /// Nil/empty identifies the legacy system-font default path, which keeps AppKit tab defaults.
+    var preferredPostScriptName: String?
 
     func build() -> NSAttributedString {
         EditFlowPerf.measure(
@@ -202,13 +267,55 @@ struct UnifiedDiffAttributedStringBuilder {
         }
     }
 
+    /// Plain source text with hard newlines only — what copy/select must preserve when wrapped.
+    func plainSourceText() -> String {
+        let blankNumber = String(repeating: " ", count: document.maxLineNumberDigits)
+        var lines: [String] = []
+        lines.reserveCapacity(document.lines.count)
+        for line in document.lines {
+            lines.append(numberPrefix(for: line, blankNumber: blankNumber) + line.text)
+        }
+        return lines.joined(separator: "\n")
+    }
+
     private func makeParagraphStyle() -> NSParagraphStyle {
-        let paragraphStyle = NSMutableParagraphStyle()
-        paragraphStyle.lineBreakMode = .byClipping
-        paragraphStyle.lineSpacing = lineSpacing
-        paragraphStyle.minimumLineHeight = ceil(font.ascender - font.descender + font.leading)
-        paragraphStyle.maximumLineHeight = paragraphStyle.minimumLineHeight
+        let normalizedPreference = preferredPostScriptName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !wrapLines, normalizedPreference?.isEmpty != false {
+            let paragraphStyle = NSMutableParagraphStyle()
+            paragraphStyle.lineBreakMode = .byClipping
+            paragraphStyle.lineSpacing = lineSpacing
+            paragraphStyle.minimumLineHeight = ceil(font.ascender - font.descender + font.leading)
+            paragraphStyle.maximumLineHeight = paragraphStyle.minimumLineHeight
+            return paragraphStyle
+        }
+
+        let metrics = resolvedFontMetrics ?? TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: font.fontName,
+            pointSize: font.pointSize
+        )
+        let paragraphStyle = metrics.makeCodeParagraphStyle(
+            lineSpacing: lineSpacing,
+            lineBreakMode: wrapLines ? .byWordWrapping : .byClipping
+        )
+        if wrapLines {
+            // Blank gutter on visual continuation lines: indent wrapped fragments past the
+            // monospace line-number prefix so numbers appear only on the first fragment.
+            let gutterWidth = Self.gutterWidth(
+                maxLineNumberDigits: document.maxLineNumberDigits,
+                font: font
+            )
+            paragraphStyle.firstLineHeadIndent = 0
+            paragraphStyle.headIndent = gutterWidth
+        }
         return paragraphStyle
+    }
+
+    static func gutterWidth(maxLineNumberDigits: Int, font: NSFont) -> CGFloat {
+        let blankNumber = String(repeating: "0", count: max(maxLineNumberDigits, 1))
+        // Matches `numberPrefix`: "\(old) \(new)  "
+        let sample = "\(blankNumber) \(blankNumber)  "
+        return ceil((sample as NSString).size(withAttributes: [.font: font]).width)
     }
 
     private func makeAttributesByKind(

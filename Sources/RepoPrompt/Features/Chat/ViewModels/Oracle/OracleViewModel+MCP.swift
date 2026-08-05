@@ -4,6 +4,12 @@ import MCP // <- required for `Value`
 // MARK: - MCP Tool helpers (moved from MCPServerViewModel)
 
 extension OracleViewModel {
+    enum OracleSelectionMode: String, Equatable {
+        case current
+        case none
+        case explicitSlices = "explicit_slices"
+    }
+
     private static let iso8601Formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -55,18 +61,14 @@ extension OracleViewModel {
     /// Durable lane attribution read from an explicitly continued chat.
     ///
     /// Used to keep a `chat_id` continuation on the model the conversation was opened with.
-    /// `modelDisplayName` is for error text only — it is never used to match a preset, because
-    /// display names are not stable identifiers.
     private struct OracleLaneAttribution {
         let modelPresetID: UUID?
         let modelRawValue: String?
-        let modelDisplayName: String?
         let hasMessages: Bool
 
         init(session: ChatSession) {
             modelPresetID = session.lastSendModelPresetID
             modelRawValue = session.lastSendModelID
-            modelDisplayName = session.lastSendModelDisplayName
             hasMessages = session.hasMessages
         }
     }
@@ -93,6 +95,7 @@ extension OracleViewModel {
         let selection: StoredSelection
         let lookupContext: WorkspaceLookupContext?
         let reviewGitContext: FrozenPromptGitReviewContext
+        let gitInclusionOverride: GitInclusion?
         let provenance: OracleSendPackagingProvenance
 
         init(
@@ -105,6 +108,7 @@ extension OracleViewModel {
             selection: StoredSelection,
             lookupContext: WorkspaceLookupContext?,
             reviewGitContext: FrozenPromptGitReviewContext,
+            gitInclusionOverride: GitInclusion? = nil,
             provenance: OracleSendPackagingProvenance
         ) {
             self.sourceTabID = sourceTabID
@@ -116,7 +120,46 @@ extension OracleViewModel {
             self.selection = selection
             self.lookupContext = lookupContext
             self.reviewGitContext = reviewGitContext
+            self.gitInclusionOverride = gitInclusionOverride
             self.provenance = provenance
+        }
+
+        func applying(
+            selectionMode: OracleSelectionMode,
+            explicitSelection: StoredSelection? = nil
+        ) -> OracleSendPackagingContext {
+            switch selectionMode {
+            case .current:
+                self
+            case .none:
+                OracleSendPackagingContext(
+                    sourceTabID: sourceTabID,
+                    sourceWorkspaceID: sourceWorkspaceID,
+                    sourceSelectionRevision: sourceSelectionRevision,
+                    sourceAgentSessionID: sourceAgentSessionID,
+                    sourceAgentRunID: sourceAgentRunID,
+                    promptText: promptText,
+                    selection: StoredSelection(codemapAutoEnabled: false),
+                    lookupContext: lookupContext,
+                    reviewGitContext: .automaticOnly(),
+                    gitInclusionOverride: GitInclusion.none,
+                    provenance: provenance
+                )
+            case .explicitSlices:
+                OracleSendPackagingContext(
+                    sourceTabID: sourceTabID,
+                    sourceWorkspaceID: sourceWorkspaceID,
+                    sourceSelectionRevision: sourceSelectionRevision,
+                    sourceAgentSessionID: sourceAgentSessionID,
+                    sourceAgentRunID: sourceAgentRunID,
+                    promptText: promptText,
+                    selection: explicitSelection ?? StoredSelection(codemapAutoEnabled: false),
+                    lookupContext: lookupContext,
+                    reviewGitContext: .automaticOnly(),
+                    gitInclusionOverride: GitInclusion.none,
+                    provenance: provenance
+                )
+            }
         }
 
         init(delegated context: DelegatedAgentRunOracleReviewContext) throws {
@@ -204,13 +247,6 @@ extension OracleViewModel {
         default:
             return "Please check that the \(model.providerType.displayName) API key is configured in Settings."
         }
-    }
-
-    private func oracleModelAvailabilityGuidance(for presets: [ModelPreset]) -> String {
-        if let claudeFamilyModel = presets.map(\.model).first(where: { $0.providerType == .claudeCode }) {
-            return oracleModelAvailabilityGuidance(for: claudeFamilyModel)
-        }
-        return "Please check that the required API keys are configured in Settings."
     }
 
     /// 1) Presets OFF: use the configured MCP Oracle planning model.
@@ -398,8 +434,7 @@ extension OracleViewModel {
                 // Check if the preset's model is available (model presets are sacred)
                 if !promptVM.isModelAvailable(preset.model) {
                     throw ChatToolError.invalidParams(
-                        "Model preset '\(preset.name)' uses model '\(preset.model.displayName)' which is not available. " +
-                            oracleModelAvailabilityGuidance(for: preset.model)
+                        "Model preset '\(preset.name)' is not available. Check its provider and model configuration in Settings."
                     )
                 }
 
@@ -492,8 +527,7 @@ extension OracleViewModel {
         let presetNames = supporting.map(\.name).joined(separator: ", ")
         throw ChatToolError.invalidParams(
             "None of your model presets for '\(mode)' mode are available. " +
-                "Configured presets: \(presetNames). " +
-                oracleModelAvailabilityGuidance(for: supporting)
+                "Configured presets: \(presetNames). Check their provider and model configurations in Settings."
         )
     }
 
@@ -630,16 +664,13 @@ extension OracleViewModel {
             // `ModelPreset.model` silently falls back to a default model when its stored model
             // string no longer resolves, so inheriting it unchecked would be a wrong-model send.
             guard preset.isModelResolvable else {
-                throw inheritedFailure("Its configured model '\(preset.modelString)' can no longer be resolved.")
+                throw inheritedFailure("Its configured model can no longer be resolved.")
             }
             guard preset.supports(mode: mode) else {
                 throw inheritedFailure("It does not support '\(mode)' mode.")
             }
             guard promptVM.isModelAvailable(preset.model) else {
-                throw inheritedFailure(
-                    "Its model '\(preset.model.displayName)' is not available. " +
-                        oracleModelAvailabilityGuidance(for: preset.model)
-                )
+                throw inheritedFailure("Its configured model is not available. Check the preset configuration in Settings.")
             }
             return preset
         }
@@ -659,15 +690,14 @@ extension OracleViewModel {
             if matches.count == 1 {
                 return matches[0]
             }
-            let laneModelLabel = laneAttribution.modelDisplayName ?? recordedModelRawValue
             if matches.isEmpty {
                 throw ChatToolError.invalidParams(
-                    "This chat's last send used model '\(laneModelLabel)', and no available model preset for '\(mode)' mode uses that model. " +
+                    "This chat has a recorded legacy model identity, and no available model preset for '\(mode)' mode uses it. " +
                         "A different preset was not substituted. " + remediation
                 )
             }
             throw ChatToolError.invalidParams(
-                "This chat's last send used model '\(laneModelLabel)', which is shared by \(matches.count) available presets for '\(mode)' mode (\(matches.map(\.name).joined(separator: ", "))). " +
+                "This chat has a recorded legacy model identity shared by \(matches.count) available presets for '\(mode)' mode (\(matches.map(\.name).joined(separator: ", "))). " +
                     "Which preset owns this chat is ambiguous, so none was chosen. " + remediation
             )
         }
@@ -1072,6 +1102,31 @@ extension OracleViewModel {
         return "Chat with ID '\(chatID)' belongs to a different Agent Mode owner (\(detail))"
     }
 
+    /// Returns a handoff-specific hint only when the caller already owns the mapped
+    /// destination clone. The old ID remains invalid and is never resolved as an alias.
+    @MainActor
+    private func clonedHandoffContinuationRejection(
+        chatID: String,
+        tabID: UUID?,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?
+    ) -> String? {
+        let lookupID = UUID(uuidString: chatID)?.uuidString ?? chatID
+        guard let tabID,
+              agentModeSessionID != nil || agentModeRunID != nil,
+              let replacementID = handoffChatIDReplacementsByTabID[tabID]?[lookupID],
+              let clone = resolveSession(id: replacementID),
+              clone.composeTabID == tabID,
+              Self.sessionMatchesOracleOwnerForExplicitContinuation(
+                  clone,
+                  agentModeSessionID: agentModeSessionID,
+                  agentModeRunID: agentModeRunID
+              )
+        else { return nil }
+
+        return "Chat with ID '\(chatID)' was cloned during handoff; use '\(replacementID)'"
+    }
+
     /// Owner-scoped candidate tiers:
     /// - `0`: exact current-run match (session-owned lane stamped with the caller's run, or a
     ///   run-owned lane on its exact run).
@@ -1314,7 +1369,8 @@ extension OracleViewModel {
         tabID: UUID? = nil,
         activateInUI: Bool = true,
         agentModeSessionID: UUID? = nil,
-        agentModeRunID: UUID? = nil
+        agentModeRunID: UUID? = nil,
+        deferContinuationMutation: Bool = false
     ) async throws -> UUID {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
@@ -1332,6 +1388,14 @@ extension OracleViewModel {
         }
 
         if let idString = idString?.trimmingCharacters(in: .whitespacesAndNewlines), !idString.isEmpty {
+            if let rejection = clonedHandoffContinuationRejection(
+                chatID: idString,
+                tabID: resolvedTabID,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID
+            ) {
+                throw ChatToolError.invalidParams(rejection)
+            }
             guard let existing = try await resolveSessionForExplicitContinuation(
                 id: idString,
                 tabID: resolvedTabID
@@ -1348,6 +1412,16 @@ extension OracleViewModel {
                 agentModeRunID: agentModeRunID
             ) {
                 throw ChatToolError.invalidParams(rejection)
+            }
+
+            // Preflight callers load conversation state without changing activation,
+            // ownership, or the chat name. Those mutations are committed only after a
+            // reservation succeeds.
+            if deferContinuationMutation {
+                guard await ensureSessionLoadedForBackground(existing) != nil else {
+                    throw ChatToolError.internalError("Failed to load the requested chat")
+                }
+                return existing.id
             }
 
             // Activate/load first, then stamp: background activation replaces the
@@ -1402,9 +1476,177 @@ extension OracleViewModel {
             activateInUI: activateInUI,
             setActiveForTab: true,
             agentModeSessionID: agentModeSessionID,
-            agentModeRunID: agentModeRunID
+            agentModeRunID: agentModeRunID,
+            // Parallel MCP implicits must not collide on the same blank "New Chat".
+            reuseBlankSession: false
         )
         return new.id
+    }
+
+    /// Synchronous chat choice for MCP force-new / implicit sends.
+    /// Skips streaming candidates so a concurrent peer that already reserved forks a new chat.
+    @MainActor
+    private func chooseMCPChatForSendSync(
+        desiredName: String?,
+        forceNew: Bool,
+        tabID: UUID?,
+        activateInUI: Bool,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?,
+        expectedImplicitCandidateID: UUID?,
+        enforceExpectedImplicitCandidate: Bool
+    ) throws -> (chatID: UUID, createdFresh: Bool) {
+        let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
+        let safeName = ChatSession.validatedName(desiredName ?? (forceNew ? "" : "New Chat"))
+
+        if forceNew {
+            guard let id = startNewChatSessionSync(
+                name: safeName,
+                tabID: resolvedTabID,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID,
+                activateInUI: activateInUI,
+                setActiveForTab: true,
+                reuseBlankSession: false
+            ) else {
+                throw ChatToolError.internalError("Failed to create chat session")
+            }
+            return (id, true)
+        }
+
+        let candidate = implicitContinuationCandidate(
+            tabID: resolvedTabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
+            activateInUI: activateInUI
+        )
+        let reservableCandidate = candidate.flatMap {
+            isSessionStreaming($0.id) ? nil : $0
+        }
+        if enforceExpectedImplicitCandidate,
+           reservableCandidate?.id != expectedImplicitCandidateID
+        {
+            throw ChatToolError.internalError(
+                "The continuation chat changed after request preflight. Retry the call."
+            )
+        }
+
+        if let candidate = reservableCandidate {
+            if let desiredName,
+               !desiredName.isEmpty,
+               desiredName != candidate.name
+            {
+                renameSession(id: candidate.id, newName: ChatSession.validatedName(desiredName))
+            }
+            return (candidate.id, false)
+        }
+
+        guard let id = startNewChatSessionSync(
+            name: safeName.isEmpty ? "New Chat" : safeName,
+            tabID: resolvedTabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
+            activateInUI: activateInUI,
+            setActiveForTab: true,
+            reuseBlankSession: false
+        ) else {
+            throw ChatToolError.internalError("Failed to create chat session")
+        }
+        return (id, true)
+    }
+
+    struct OraclePreparedRequestSnapshot {
+        let message: AIMessage
+        let budget: OracleRequestBudgetEstimate
+        let conversationRevision: Int?
+    }
+
+    /// Packages and budgets one prospective Oracle turn without mutating chat state. The returned
+    /// `AIMessage` is the same value later handed to the provider after reservation.
+    @MainActor
+    private func prepareOracleRequestSnapshot(
+        userMessage: String,
+        conversationSessionID: UUID?,
+        model: AIModel,
+        chatPresetID: UUID?,
+        mode: PromptViewModel.PlanActMode,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext?,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        gitInclusionOverride: GitInclusion?,
+        requestedMaxOutputTokens: Int?,
+        promptVM: PromptViewModel
+    ) async throws -> OraclePreparedRequestSnapshot {
+        var conversation = conversationSessionID.map {
+            buildConversationEntries(for: $0)
+        } ?? []
+        let conversationRevision = conversationSessionID.map {
+            self.conversationRevision(for: $0)
+        }
+        conversation.append(ConversationEntry(role: .user, content: userMessage))
+
+        let chatPreset: ChatPreset = if let chatPresetID,
+                                        let resolved = ChatPresetManager.shared.preset(with: chatPresetID)
+        {
+            resolved
+        } else {
+            promptVM.currentChatPreset()
+        }
+        let promptContext = promptVM.resolvedPromptContext(from: chatPreset)
+        let packagedMessage = await promptVM.packagePrompt(
+            conversation: conversation,
+            overrideModel: model,
+            overridePromptConfig: promptContext,
+            overrideChatPreset: chatPreset,
+            overrideMode: mode,
+            gitInclusionOverride: gitInclusionOverride,
+            gitBaseOverride: nil,
+            selectionOverride: selection,
+            lookupContextOverride: lookupContext,
+            reviewGitContextOverride: reviewGitContext
+        )
+
+        let capabilities = AIModelCapabilityMetadata.resolve(for: model)
+        let contextWindow: Int?
+        #if DEBUG
+            if let override = oracleContextWindowOverrideForTesting {
+                contextWindow = override(model)
+            } else {
+                contextWindow = capabilities.contextWindowTokens
+            }
+        #else
+            contextWindow = capabilities.contextWindowTokens
+        #endif
+        let budget = OracleRequestBudgetEstimator.estimate(
+            message: packagedMessage,
+            contextWindowTokens: contextWindow,
+            requestedMaxOutputTokens: requestedMaxOutputTokens,
+            modelMaxOutputTokens: capabilities.maxOutputTokens
+        )
+        let hardLimitIsExact: Bool
+        #if DEBUG
+            hardLimitIsExact = oracleContextWindowOverrideForTesting != nil
+                ? contextWindow != nil
+                && oracleContextWindowSourceOverrideForTesting != .providerFallback
+                : capabilities.windowSource == .exact
+        #else
+            hardLimitIsExact = capabilities.windowSource == .exact
+        #endif
+        guard !hardLimitIsExact || !budget.exceedsKnownContextWindow else {
+            throw ChatToolError.oracleContextOverflow(budget)
+        }
+        #if DEBUG
+            if let conversationSessionID {
+                await oraclePreflightPreparedObserverForTesting?(
+                    conversationSessionID
+                )
+            }
+        #endif
+        return OraclePreparedRequestSnapshot(
+            message: packagedMessage,
+            budget: budget,
+            conversationRevision: conversationRevision
+        )
     }
 
     /// Full implementation of the shared oracle send backend.
@@ -1461,6 +1703,9 @@ extension OracleViewModel {
         let selectionOverride = tabContext?.packaging.selection
         let lookupContextOverride = tabContext?.packaging.lookupContext
         let reviewGitContextOverride = tabContext?.packaging.reviewGitContext
+        let gitInclusionOverride = tabContext?.packaging.gitInclusionOverride
+        let requestedMaxOutputTokens = args["max_output_tokens"]?.intValue
+        let requiresAskOraclePreflight = tabContext?.origin == .askOracle
 
         // ────────── 2. Handle model selection ──────────
         let presetsManager = ModelPresetsManager.shared
@@ -1570,59 +1815,222 @@ extension OracleViewModel {
         let previousActiveChatSessionID = tabID.flatMap {
             workspaceManager.activeChatSessionID(forTabID: $0)
         }
-        let chatID = try await locateOrCreateChat(
-            chatIdIn,
-            desiredName: chatName,
-            forceNew: newChat,
-            tabID: tabID,
-            activateInUI: shouldActivate,
-            agentModeSessionID: tabContext?.agentModeSessionID,
-            agentModeRunID: tabContext?.agentModeRunID
-        )
-        // The inherited preset came from one specific session. If the authoritative resolution
-        // landed on a different one, the model no longer belongs to this lane, so fail instead of
-        // sending an inherited identity into the wrong conversation.
-        if let continuationLane, continuationLane.sessionID != chatID {
-            throw ChatToolError.internalError(
-                "This chat was re-resolved to a different session while its model was being selected. Retry the call."
-            )
-        }
+        let requestedChatID = chatIdIn?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let usesExplicitChatID = !requestedChatID.isEmpty
 
-        pinSession(chatID)
-        defer { unpinSession(chatID) }
-
-        // ────────── 4. Determine mode ──────────
-        let effectiveMode = PromptViewModel.PlanActMode(rawValue: mode.capitalized) ?? .chat
-
-        // ────────── 5. Send user message & wait for completion ──────────
-        // Pass the selected model, chat preset, and mode to sendMessage without affecting global state.
-        let send = {
-            await self.sendMessage(
-                message,
-                sessionID: chatID,
-                overrideModel: selectedModel,
-                overrideModelPresetID: modelSelection.modelPresetID,
-                overrideChatPresetID: modelSelection.chatPresetID,
-                overrideMode: effectiveMode,
-                gitInclusionOverride: nil,
-                gitBaseOverride: nil,
-                selectionOverride: selectionOverride,
-                lookupContextOverride: lookupContextOverride,
-                reviewGitContextOverride: reviewGitContextOverride,
-                overlapPolicy: .rejectIfBusy,
-                origin: .mcp
-            )
-        }
+        // Explicit chat_id keeps the async locate path (ownership / disk hydrate / busy).
+        // Force-new and true-implicit sends choose+reserve in one synchronous MainActor
+        // turn so concurrent peers cannot both latch onto the same non-streaming chat.
+        let chatID: UUID
+        let createdFreshChat: Bool
         let sendStart: SendStart
+        let outputReserveTokens: Int?
+        let effectiveMode = PromptViewModel.PlanActMode(rawValue: mode.capitalized) ?? .chat
         #if DEBUG
-            let trace = OracleReviewPackagingDiagnostics.makeTraceContext(
+            let packagingTrace = OracleReviewPackagingDiagnostics.makeTraceContext(
                 tabContext: tabContext,
                 observer: oracleReviewPackagingTraceObserverForTesting
             )
-            sendStart = await OracleReviewPackagingDiagnostics.withTrace(trace, operation: send)
-        #else
-            sendStart = await send()
         #endif
+
+        if usesExplicitChatID {
+            chatID = try await locateOrCreateChat(
+                chatIdIn,
+                desiredName: chatName,
+                forceNew: false,
+                tabID: tabID,
+                activateInUI: shouldActivate,
+                agentModeSessionID: tabContext?.agentModeSessionID,
+                agentModeRunID: tabContext?.agentModeRunID,
+                deferContinuationMutation: true
+            )
+            createdFreshChat = false
+            if let continuationLane, continuationLane.sessionID != chatID {
+                throw ChatToolError.internalError(
+                    "This chat was re-resolved to a different session while its model was being selected. Retry the call."
+                )
+            }
+            let preparedRequest: OraclePreparedRequestSnapshot?
+            if requiresAskOraclePreflight {
+                guard let selectionOverride, let reviewGitContextOverride else {
+                    throw ChatToolError.internalError(
+                        "ask_oracle preflight is missing its immutable packaging context"
+                    )
+                }
+                let prepare = {
+                    try await self.prepareOracleRequestSnapshot(
+                        userMessage: message,
+                        conversationSessionID: chatID,
+                        model: selectedModel,
+                        chatPresetID: modelSelection.chatPresetID,
+                        mode: effectiveMode,
+                        selection: selectionOverride,
+                        lookupContext: lookupContextOverride,
+                        reviewGitContext: reviewGitContextOverride,
+                        gitInclusionOverride: gitInclusionOverride,
+                        requestedMaxOutputTokens: requestedMaxOutputTokens,
+                        promptVM: promptVM
+                    )
+                }
+                #if DEBUG
+                    preparedRequest = try await OracleReviewPackagingDiagnostics.withTrace(
+                        packagingTrace,
+                        operation: prepare
+                    )
+                #else
+                    preparedRequest = try await prepare()
+                #endif
+            } else {
+                preparedRequest = nil
+            }
+            outputReserveTokens = preparedRequest?.budget.outputReserveTokens
+            pinSession(chatID)
+            let send = {
+                await self.sendMessage(
+                    message,
+                    sessionID: chatID,
+                    overrideModel: selectedModel,
+                    overrideModelPresetID: modelSelection.modelPresetID,
+                    overrideChatPresetID: modelSelection.chatPresetID,
+                    overrideMode: effectiveMode,
+                    gitInclusionOverride: gitInclusionOverride,
+                    gitBaseOverride: nil,
+                    selectionOverride: selectionOverride,
+                    lookupContextOverride: lookupContextOverride,
+                    reviewGitContextOverride: reviewGitContextOverride,
+                    overrideAIMessage: preparedRequest?.message,
+                    expectedConversationRevision: preparedRequest?
+                        .conversationRevision,
+                    overlapPolicy: .rejectIfBusy,
+                    origin: .mcp
+                )
+            }
+            #if DEBUG
+                sendStart = await OracleReviewPackagingDiagnostics.withTrace(
+                    packagingTrace,
+                    operation: send
+                )
+            #else
+                sendStart = await send()
+            #endif
+        } else {
+            var preparedContinuationSessionID: UUID?
+            if !newChat,
+               let candidate = implicitContinuationCandidate(
+                   tabID: tabID,
+                   agentModeSessionID: tabContext?.agentModeSessionID,
+                   agentModeRunID: tabContext?.agentModeRunID,
+                   activateInUI: shouldActivate
+               ),
+               !isSessionStreaming(candidate.id)
+            {
+                // Load only the conversation needed for packaging. Activation and
+                // ownership remain unchanged until the atomic reservation succeeds.
+                guard await ensureSessionLoadedForBackground(candidate) != nil else {
+                    throw ChatToolError.internalError(
+                        "Failed to load the continuation chat"
+                    )
+                }
+                preparedContinuationSessionID = candidate.id
+            }
+
+            let preparedRequest: OraclePreparedRequestSnapshot?
+            if requiresAskOraclePreflight {
+                guard let selectionOverride, let reviewGitContextOverride else {
+                    throw ChatToolError.internalError(
+                        "ask_oracle preflight is missing its immutable packaging context"
+                    )
+                }
+                let prepare = {
+                    try await self.prepareOracleRequestSnapshot(
+                        userMessage: message,
+                        conversationSessionID: newChat ? nil : preparedContinuationSessionID,
+                        model: selectedModel,
+                        chatPresetID: modelSelection.chatPresetID,
+                        mode: effectiveMode,
+                        selection: selectionOverride,
+                        lookupContext: lookupContextOverride,
+                        reviewGitContext: reviewGitContextOverride,
+                        gitInclusionOverride: gitInclusionOverride,
+                        requestedMaxOutputTokens: requestedMaxOutputTokens,
+                        promptVM: promptVM
+                    )
+                }
+                #if DEBUG
+                    preparedRequest = try await OracleReviewPackagingDiagnostics.withTrace(
+                        packagingTrace,
+                        operation: prepare
+                    )
+                #else
+                    preparedRequest = try await prepare()
+                #endif
+            } else {
+                preparedRequest = nil
+            }
+            outputReserveTokens = preparedRequest?.budget.outputReserveTokens
+
+            // Choose and reserve must share one sync turn — no await between them.
+            let performAtomicChooseAndReserve: () throws -> (UUID, Bool, SendStart) = {
+                let choice = try self.chooseMCPChatForSendSync(
+                    desiredName: chatName,
+                    forceNew: newChat,
+                    tabID: tabID,
+                    activateInUI: shouldActivate,
+                    agentModeSessionID: tabContext?.agentModeSessionID,
+                    agentModeRunID: tabContext?.agentModeRunID,
+                    expectedImplicitCandidateID: preparedContinuationSessionID,
+                    enforceExpectedImplicitCandidate: !newChat
+                )
+                if let continuationLane, continuationLane.sessionID != choice.chatID {
+                    throw ChatToolError.internalError(
+                        "This chat was re-resolved to a different session while its model was being selected. Retry the call."
+                    )
+                }
+                if requiresAskOraclePreflight, !newChat {
+                    if let preparedContinuationSessionID {
+                        guard preparedContinuationSessionID == choice.chatID else {
+                            throw ChatToolError.internalError(
+                                "The continuation chat changed after request preflight. Retry the call."
+                            )
+                        }
+                    } else if !choice.createdFresh {
+                        throw ChatToolError.internalError(
+                            "A continuation chat appeared after request preflight. Retry the call."
+                        )
+                    }
+                }
+                self.pinSession(choice.chatID)
+                let started = self.beginSendMessageReservation(
+                    message,
+                    targetSessionID: choice.chatID,
+                    overrideModel: selectedModel,
+                    overrideModelPresetID: modelSelection.modelPresetID,
+                    overrideChatPresetID: modelSelection.chatPresetID,
+                    overrideMode: effectiveMode,
+                    gitInclusionOverride: gitInclusionOverride,
+                    gitBaseOverride: nil,
+                    selectionOverride: selectionOverride,
+                    lookupContextOverride: lookupContextOverride,
+                    reviewGitContextOverride: reviewGitContextOverride,
+                    overrideAIMessage: preparedRequest?.message,
+                    expectedConversationRevision: preparedRequest?
+                        .conversationRevision,
+                    origin: .mcp
+                )
+                return (choice.chatID, choice.createdFresh, started)
+            }
+            #if DEBUG
+                let atomic = try await OracleReviewPackagingDiagnostics.withTrace(packagingTrace) {
+                    try performAtomicChooseAndReserve()
+                }
+            #else
+                let atomic = try performAtomicChooseAndReserve()
+            #endif
+            chatID = atomic.0
+            createdFreshChat = atomic.1
+            sendStart = atomic.2
+        }
+        defer { unpinSession(chatID) }
 
         let queryId: UUID
         switch sendStart {
@@ -1633,15 +2041,14 @@ extension OracleViewModel {
                 "This chat is still streaming. Pass new_chat:true or a different chat_id, or wait. In Agent Mode, use oracle_chat_log with the explicit chat_id to inspect the lane."
             )
         case .rejectedTabConcurrencyLimit:
-            // A force-new request creates its target before the atomic reservation.
-            // Remove that still-blank target so a rejected third lane does not leave
-            // an invisible orphan or steal the tab's active-chat pointer.
+            // A freshly created target that never reserved must not linger as an orphan
+            // or steal the tab's active-chat pointer.
             #if DEBUG
                 if let observer = oracleRejectedNewSessionCleanupObserverForTesting {
                     await observer(chatID, tabID)
                 }
             #endif
-            if newChat,
+            if createdFreshChat,
                let rejectedSession = sessions.first(where: { $0.id == chatID }),
                rejectedSession.effectiveMessageCount == 0
             {
@@ -1660,6 +2067,33 @@ extension OracleViewModel {
             )
         case let .failed(reason):
             throw ChatToolError.invalidParams(reason)
+        }
+
+        // Continuation activation, ownership, and naming are committed only after
+        // overflow validation and the atomic reservation both succeed.
+        if !createdFreshChat,
+           let continuationSession = sessions.first(where: { $0.id == chatID })
+        {
+            await activateResolvedChatSession(
+                continuationSession,
+                resolvedTabID: tabID,
+                activateInUI: shouldActivate
+            )
+            await applyOracleOwnerIfNeeded(
+                sessionID: chatID,
+                tabID: tabID,
+                agentModeSessionID: tabContext?.agentModeSessionID,
+                agentModeRunID: tabContext?.agentModeRunID
+            )
+            if let chatName,
+               !chatName.isEmpty,
+               chatName != continuationSession.name
+            {
+                renameSession(
+                    id: chatID,
+                    newName: ChatSession.validatedName(chatName)
+                )
+            }
         }
 
         // Publish ephemeral UI state only after this send owns the session.
@@ -1703,8 +2137,15 @@ extension OracleViewModel {
         if let agentModeRunID = tabContext?.agentModeRunID {
             dict["agent_run_id"] = .string(agentModeRunID.uuidString)
         }
-        dict["model_id"] = .string(selectedModel.rawValue)
-        dict["model_name"] = .string(selectedModel.displayName)
+        if modelSelection.modelSource == "preset" {
+            // Internal UI-only fields are captured by Agent Mode tool cards and are never
+            // formatted into MCP output or retained in agent-facing transcript summaries.
+            dict["ui_model_id"] = .string(selectedModel.rawValue)
+            dict["ui_model_name"] = .string(selectedModel.displayName)
+        } else {
+            dict["model_id"] = .string(selectedModel.rawValue)
+            dict["model_name"] = .string(selectedModel.displayName)
+        }
         dict["model_selection"] = .string(modelSelection.selectionKind.rawValue)
         dict["model_source"] = .string(modelSelection.modelSource)
         if let modelPresetID = modelSelection.modelPresetID {
@@ -1713,7 +2154,58 @@ extension OracleViewModel {
         if let modelPresetName = modelSelection.modelPresetName {
             dict["model_preset_name"] = .string(modelPresetName)
         }
+        if let usage = buildOracleUsageEcho(
+            assistantMessageID: queryId,
+            model: selectedModel,
+            outputReserveTokens: outputReserveTokens
+        ) {
+            dict["usage"] = .object(usage)
+        }
         return dict
+    }
+
+    /// Neutral usage echo for ask_oracle / oracle_send results.
+    /// Prefers provider-reported prompt tokens; otherwise estimates the packaged request.
+    @MainActor
+    func buildOracleUsageEcho(
+        assistantMessageID: UUID,
+        model: AIModel,
+        outputReserveTokens: Int? = nil
+    ) -> [String: Value]? {
+        let capabilities = AIModelCapabilityMetadata.resolve(for: model)
+        let assistant = getChatMessage(withId: assistantMessageID).flatMap { $0.isUser ? nil : $0 }
+        let source: String
+        let inputTokens: Int
+        if let providerTokens = assistant?.promptTokens {
+            inputTokens = max(0, providerTokens)
+            source = "provider_reported"
+        } else if let estimate = oracleRequestInputTokenEstimate(for: assistantMessageID) {
+            inputTokens = estimate
+            source = "app_estimate"
+        } else {
+            return nil
+        }
+
+        var usage: [String: Value] = [
+            "input_tokens": .int(inputTokens),
+            "source": .string(source)
+        ]
+        if let window = capabilities.exactContextWindowTokens,
+           let pct = AIModelCapabilityMetadata.safeUsagePercentage(
+               inputTokens: inputTokens,
+               contextWindowTokens: window
+           )
+        {
+            usage["context_window"] = .int(window)
+            usage["pct"] = .int(pct)
+        }
+        if let maxOutput = capabilities.maxOutputTokens {
+            usage["max_output_tokens"] = .int(maxOutput)
+        }
+        if let outputReserveTokens {
+            usage["output_reserve_tokens"] = .int(outputReserveTokens)
+        }
+        return usage
     }
 
     /// Legacy entry point kept for compatibility with `MCPServerViewModel`.
@@ -1849,6 +2341,14 @@ extension OracleViewModel {
 
         let resolvedSession: ChatSession
         if let normalizedChatID {
+            if let rejection = clonedHandoffContinuationRejection(
+                chatID: normalizedChatID,
+                tabID: tabID,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID
+            ) {
+                throw ChatToolError.invalidParams(rejection)
+            }
             guard let found = resolveSession(id: normalizedChatID) else {
                 throw ChatToolError.invalidParams("Chat with ID '\(normalizedChatID)' not found")
             }
@@ -1885,29 +2385,56 @@ extension OracleViewModel {
             resolvedSession = loaded
         }
 
-        let maxCharsPerMessage = 8000
-        func compactOracleLogText(_ text: String) -> String {
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard trimmed.count > maxCharsPerMessage else { return trimmed }
-            let endIndex = trimmed.index(trimmed.startIndex, offsetBy: maxCharsPerMessage)
-            return String(trimmed[..<endIndex]) + "\n… [truncated]"
-        }
+        let maxCharsPerMessage: Int = {
+            if let raw = args["max_chars"]?.intValue {
+                return max(1, raw)
+            }
+            return OracleResponsePresentation.defaultChatLogMaxCharsPerMessage
+        }()
+        let maxTotalChars: Int? = {
+            guard let raw = args["max_total_chars"]?.intValue else { return nil }
+            return max(1, raw)
+        }()
+        let part: OracleChatLogPart = {
+            if let raw = args["part"]?.stringValue {
+                return (try? OracleChatLogPart.parse(raw)) ?? .default
+            }
+            return .default
+        }()
 
         let filteredMessages = resolvedSession.messages.filter { includeUser || !$0.isUser }
         let trimmedMessages = Array(filteredMessages.suffix(limit))
-        let msgArray: [Value] = trimmedMessages.map { msg in
-            .object([
+        var messageObjects: [[String: Value]] = trimmedMessages.map { msg in
+            [
                 "role": .string(msg.isUser ? "user" : "assistant"),
-                "text": .string(compactOracleLogText(msg.rawText))
-            ])
+                "text": .string(
+                    OracleResponsePresentation.compactChatLogText(
+                        msg.rawText,
+                        maxChars: maxCharsPerMessage,
+                        part: part
+                    )
+                )
+            ]
         }
+        if let maxTotalChars {
+            OracleResponsePresentation.enforceTotalCharCeiling(
+                messages: &messageObjects,
+                maxTotalChars: maxTotalChars
+            )
+        }
+        let msgArray: [Value] = messageObjects.map { .object($0) }
 
         var result: [String: Value] = [
             "action": .string("log"),
             "chat_id": .string(resolvedSession.shortID),
             "messages": .array(msgArray),
-            "context_id": .string(tabID.uuidString)
+            "context_id": .string(tabID.uuidString),
+            "max_chars": .int(maxCharsPerMessage),
+            "part": .string(part.rawValue)
         ]
+        if let maxTotalChars {
+            result["max_total_chars"] = .int(maxTotalChars)
+        }
         if let agentModeSessionID = resolvedSession.agentModeSessionID ?? agentModeSessionID {
             result["agent_session_id"] = .string(agentModeSessionID.uuidString)
         }

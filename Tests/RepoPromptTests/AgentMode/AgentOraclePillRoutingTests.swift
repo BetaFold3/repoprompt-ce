@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPromptApp
 import XCTest
 
@@ -689,18 +690,27 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             gitDiffs[model.rawValue] ?? nil
         }
 
-        func yield(model: AIModel, text: String, isFinal: Bool = false) {
+        func yield(
+            model: AIModel,
+            text: String,
+            tokens: ChatTokenInfo = ChatTokenInfo(),
+            isFinal: Bool = false
+        ) {
             guard let continuation = continuations[model.rawValue] else { return }
             continuation.yield(ChatStreamOutput(
                 text: text,
                 reasoning: nil,
-                tokens: ChatTokenInfo(),
+                tokens: tokens,
                 isFinal: isFinal
             ))
         }
 
-        func finish(model: AIModel, text: String) {
-            yield(model: model, text: text, isFinal: true)
+        func finish(
+            model: AIModel,
+            text: String,
+            tokens: ChatTokenInfo = ChatTokenInfo()
+        ) {
+            yield(model: model, text: text, tokens: tokens, isFinal: true)
             continuations[model.rawValue]?.finish()
         }
 
@@ -719,6 +729,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let previousPresets = presetsManager.presets
         let previousShowPresets = settings.mcpShowModelPresets()
         let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousPlanningModelRaw = settings.planningModelRaw()
         let previousCustomProviderValidity = apiSettings.isCustomProviderValid
         let harness = ParallelOracleTransportHarness()
 
@@ -730,6 +741,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             presetsManager.presets = previousPresets
             settings.setMCPShowModelPresets(previousShowPresets, commit: false)
             settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            settings.setPlanningModelRaw(previousPlanningModelRaw, commit: false)
             apiSettings.isCustomProviderValid = previousCustomProviderValidity
             fixture.cleanup()
         }
@@ -1052,24 +1064,50 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         presetsManager.presets = [fablePreset, solPreset, otherTabPreset]
 
         harness.finish(model: solModel, text: "Sol independent response")
-        harness.finish(model: fableModel, text: "Fable independent response")
+        harness.finish(
+            model: fableModel,
+            text: "Fable independent response",
+            tokens: ChatTokenInfo(promptTokens: 12345)
+        )
         let secondResult = try await secondTask.value
         let firstResult = try await firstTask.value
 
         XCTAssertEqual(firstResult["response"]?.stringValue, "Fable independent response")
-        XCTAssertEqual(firstResult["model_id"]?.stringValue, fableModel.rawValue)
-        XCTAssertEqual(firstResult["model_name"]?.stringValue, fableModel.displayName)
+        XCTAssertNil(firstResult["model_id"])
+        XCTAssertNil(firstResult["model_name"])
+        XCTAssertEqual(firstResult["ui_model_id"]?.stringValue, fableModel.rawValue)
+        XCTAssertEqual(firstResult["ui_model_name"]?.stringValue, fableModel.displayName)
         XCTAssertEqual(firstResult["model_selection"]?.stringValue, "explicit")
         XCTAssertEqual(firstResult["model_source"]?.stringValue, "preset")
         XCTAssertEqual(firstResult["model_preset_id"]?.stringValue, fablePreset.id.uuidString)
         XCTAssertEqual(firstResult["model_preset_name"]?.stringValue, fablePreset.name)
         XCTAssertEqual(secondResult["response"]?.stringValue, "Sol independent response")
-        XCTAssertEqual(secondResult["model_id"]?.stringValue, solModel.rawValue)
-        XCTAssertEqual(secondResult["model_name"]?.stringValue, solModel.displayName)
+        XCTAssertNil(secondResult["model_id"])
+        XCTAssertNil(secondResult["model_name"])
+        XCTAssertEqual(secondResult["ui_model_id"]?.stringValue, solModel.rawValue)
+        XCTAssertEqual(secondResult["ui_model_name"]?.stringValue, solModel.displayName)
         XCTAssertEqual(secondResult["model_selection"]?.stringValue, "explicit")
         XCTAssertEqual(secondResult["model_source"]?.stringValue, "preset")
         XCTAssertEqual(secondResult["model_preset_id"]?.stringValue, solPreset.id.uuidString)
         XCTAssertEqual(secondResult["model_preset_name"]?.stringValue, solPreset.name)
+
+        let providerUsage = try XCTUnwrap(firstResult["usage"]?.objectValue)
+        XCTAssertEqual(providerUsage["input_tokens"]?.intValue, 12345)
+        XCTAssertEqual(providerUsage["source"]?.stringValue, "provider_reported")
+
+        let estimatedUsage = try XCTUnwrap(secondResult["usage"]?.objectValue)
+        XCTAssertGreaterThan(try XCTUnwrap(estimatedUsage["input_tokens"]?.intValue), 0)
+        XCTAssertEqual(estimatedUsage["source"]?.stringValue, "app_estimate")
+
+        for (usage, resolvedModel) in [(providerUsage, fableModel), (estimatedUsage, solModel)] {
+            XCTAssertNil(usage["context_window"], "Unknown custom models must not receive a fabricated window")
+            XCTAssertNil(usage["pct"])
+            XCTAssertNil(usage["model_id"])
+            XCTAssertNil(usage["model_name"])
+            let serializedUsage = ToolOutputFormatter.rawJSONString(.object(usage))
+            XCTAssertFalse(serializedUsage.contains(resolvedModel.rawValue), serializedUsage)
+            XCTAssertFalse(serializedUsage.contains(resolvedModel.displayName), serializedUsage)
+        }
         XCTAssertTrue(oracle.streamingSessions.isEmpty)
 
         let namedTask = Task { @MainActor in
@@ -1141,21 +1179,171 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         try await oracle.waitUntilMessageFinalised(uiOverrideQueryID)
         XCTAssertFalse(oracle.streamingSessions.contains(cancellableSession.id))
 
+        settings.setPlanningModelRaw(fableModel.rawValue, commit: false)
+        settings.setMCPShowModelPresets(false, commit: false)
+        let nonPresetTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Use the configured planning model"),
+                    "mode": .string("chat"),
+                    "model": .string("current_chat_model"),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 8)
+        harness.finish(model: fableModel, text: "Planning model response")
+        let nonPresetResult = try await nonPresetTask.value
+        XCTAssertEqual(nonPresetResult["model_source"]?.stringValue, "planning_model")
+        XCTAssertEqual(nonPresetResult["model_id"]?.stringValue, fableModel.rawValue)
+        XCTAssertEqual(nonPresetResult["model_name"]?.stringValue, fableModel.displayName)
+        XCTAssertNil(nonPresetResult["ui_model_id"])
+        XCTAssertNil(nonPresetResult["ui_model_name"])
+        XCTAssertNil(nonPresetResult["model_preset_id"])
+        XCTAssertNil(nonPresetResult["model_preset_name"])
+        settings.setMCPShowModelPresets(true, commit: false)
+
+        let sourceAgentModeSessionID = UUID()
+        let destinationAgentModeSessionID = UUID()
+        let firstSessionIndex = try XCTUnwrap(
+            oracle.sessions.firstIndex(where: { $0.id == firstSession.id })
+        )
+        oracle.sessions[firstSessionIndex].agentModeSessionID =
+            sourceAgentModeSessionID
         let persistedURL = try await oracle.autosaveSession(
             XCTUnwrap(oracle.sessions.first(where: { $0.id == firstSession.id }))
         )
         let persisted = try await oracle.chatData.loadChatSession(from: persistedURL)
         XCTAssertEqual(persisted.lastSendModelID, fableModel.rawValue)
         XCTAssertEqual(persisted.lastSendModelDisplayName, fableModel.displayName)
+        XCTAssertEqual(persisted.agentModeSessionID, sourceAgentModeSessionID)
 
         let clonedIDs = try await oracle.cloneChatSessions(
             fromTabID: fixture.tabID,
-            toTabID: fixture.otherTabID
+            toTabID: fixture.otherTabID,
+            sourceAgentModeSessionID: sourceAgentModeSessionID,
+            destinationAgentModeSessionID: destinationAgentModeSessionID
         )
         let clonedID = try XCTUnwrap(clonedIDs[firstSession.id])
         let clone = try XCTUnwrap(oracle.sessions.first(where: { $0.id == clonedID }))
+        XCTAssertEqual(clone.agentModeSessionID, destinationAgentModeSessionID)
+        XCTAssertNil(clone.agentModeRunID)
         XCTAssertEqual(clone.lastSendModelID, fableModel.rawValue)
         XCTAssertEqual(clone.lastSendModelDisplayName, fableModel.displayName)
+    }
+
+    /// Gates the agent-mode `ask_oracle` readOnlyHint flip: once the harness overlaps two
+    /// tools, true-implicit sends (no chat_id, no new_chat) with different presets must not
+    /// collapse onto one shared chat between choose and reserve.
+    func testConcurrentImplicitAskOracleSendsWithDistinctPresetsYieldDistinctChats() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let settings = GlobalSettingsStore.shared
+        let presetsManager = ModelPresetsManager.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let harness = ParallelOracleTransportHarness()
+
+        defer {
+            harness.finishAll()
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            fixture.cleanup()
+        }
+
+        let fableModel = AIModel.customProviderUser(name: "implicit-race-fable")
+        let solModel = AIModel.customProviderUser(name: "implicit-race-sol")
+        let fablePreset = ModelPreset(
+            name: "Implicit_Race_Fable",
+            model: fableModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        let solPreset = ModelPreset(
+            name: "Implicit_Race_Sol",
+            model: solModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [fablePreset, solPreset]
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, model in
+            harness.makeStream(message: message, for: model)
+        }
+
+        let packaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: fixture.tabID,
+            sourceWorkspaceID: fixture.workspace.id,
+            sourceSelectionRevision: 0,
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            promptText: "",
+            selection: StoredSelection(selectedPaths: [], codemapAutoEnabled: false),
+            lookupContext: nil,
+            reviewGitContext: FrozenPromptGitReviewContext(
+                artifactCapability: nil,
+                compareIntent: .uncommittedHEAD,
+                displayContext: ReviewGitDisplayContext(roots: [])
+            ),
+            provenance: .direct
+        )
+        let tabContext = OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspace.id,
+            origin: .askOracle,
+            packaging: packaging
+        )
+
+        let firstTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Implicit lane A"),
+                    "mode": .string("chat"),
+                    "model": .string(fablePreset.name)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        let secondTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Implicit lane B"),
+                    "mode": .string("chat"),
+                    "model": .string(solPreset.name)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+
+        try await harness.waitUntilOpen(count: 2)
+
+        let streamingSessions = oracle.sessions.filter { oracle.streamingSessions.contains($0.id) }
+        XCTAssertEqual(streamingSessions.count, 2, "Concurrent implicits must open two streams")
+        XCTAssertEqual(Set(streamingSessions.map(\.id)).count, 2, "Streams must not share one chat")
+        XCTAssertEqual(
+            Set(streamingSessions.compactMap(\.lastSendModelID)),
+            [fableModel.rawValue, solModel.rawValue]
+        )
+
+        harness.finish(model: fableModel, text: "A done")
+        harness.finish(model: solModel, text: "B done")
+        let first = try await firstTask.value
+        let second = try await secondTask.value
+        let firstChatID = try XCTUnwrap(first["chat_id"]?.stringValue)
+        let secondChatID = try XCTUnwrap(second["chat_id"]?.stringValue)
+        XCTAssertNotEqual(firstChatID, secondChatID)
     }
 
     func testUICancelExistingDoesNotCancelConcurrentMCPSuccessor() async throws {
@@ -1647,7 +1835,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             solPreset.id.uuidString,
             "Resolving Fable here would reproduce the pre-fix wrong-lane available.first defect"
         )
-        XCTAssertEqual(inheritSolResult["model_id"]?.stringValue, solModel.rawValue)
+        XCTAssertNil(inheritSolResult["model_id"])
+        XCTAssertEqual(inheritSolResult["ui_model_id"]?.stringValue, solModel.rawValue)
         XCTAssertEqual(inheritSolResult["model_selection"]?.stringValue, "inherited")
 
         presetsManager.presets = [solPreset, fablePreset]
@@ -1666,7 +1855,8 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         harness.finish(model: fableModel, text: "Fable continued")
         let inheritFableResult = try await inheritFableTask.value
         XCTAssertEqual(inheritFableResult["model_preset_id"]?.stringValue, fablePreset.id.uuidString)
-        XCTAssertEqual(inheritFableResult["model_id"]?.stringValue, fableModel.rawValue)
+        XCTAssertNil(inheritFableResult["model_id"])
+        XCTAssertEqual(inheritFableResult["ui_model_id"]?.stringValue, fableModel.rawValue)
         XCTAssertEqual(inheritFableResult["model_selection"]?.stringValue, "inherited")
 
         let migrateSolTask = Task { @MainActor in
@@ -2087,6 +2277,205 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         let neverSentResult = try await neverSentTask.value
         XCTAssertEqual(neverSentResult["model_selection"]?.stringValue, "automatic")
         XCTAssertEqual(neverSentResult["model_preset_id"]?.stringValue, firstPreset.id.uuidString)
+    }
+
+    func testAskOraclePreflightFenceRejectsAdvancedExplicitAndImplicitChats() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let presetsManager = ModelPresetsManager.shared
+        let settings = GlobalSettingsStore.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let model = AIModel.customProviderUser(name: "preflight-fence-model")
+        let preset = ModelPreset(
+            name: "PreflightFenceOracle",
+            model: model,
+            supportedModes: SupportedModes(
+                chat: true,
+                plan: true,
+                review: true
+            )
+        )
+        defer {
+            oracle.setOraclePreflightPreparedObserverForTesting(nil)
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(
+                previousTemporaryDisable,
+                commit: false
+            )
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            try? FileManager.default.removeItem(at: fixture.storageRoot)
+        }
+
+        presetsManager.presets = [preset]
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+        XCTAssertNil(
+            oracle.buildOracleUsageEcho(
+                assistantMessageID: UUID(),
+                model: model
+            ),
+            "A missing provider report and app estimate must omit usage"
+        )
+
+        var transportInvocationCount = 0
+        oracle.setOraclePostPackagingTransportOverrideForTesting { _, _ in
+            transportInvocationCount += 1
+            let stream = AsyncThrowingStream<ChatStreamOutput, Error> {
+                continuation in
+                continuation.yield(ChatStreamOutput(
+                    text: "competing response",
+                    reasoning: nil,
+                    tokens: ChatTokenInfo(),
+                    isFinal: true
+                ))
+                continuation.finish()
+            }
+            return (UUID(), stream)
+        }
+
+        let tabContext = OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspace.id,
+            origin: .askOracle,
+            packaging: OracleViewModel.OracleSendPackagingContext(
+                sourceTabID: fixture.tabID,
+                sourceWorkspaceID: fixture.workspace.id,
+                sourceSelectionRevision: 0,
+                sourceAgentSessionID: nil,
+                sourceAgentRunID: nil,
+                promptText: "",
+                selection: StoredSelection(codemapAutoEnabled: false),
+                lookupContext: nil,
+                reviewGitContext: .automaticOnly(),
+                provenance: .direct
+            )
+        )
+
+        for explicit in [true, false] {
+            let createdSessionID = await oracle.startNewChatSession(
+                name: explicit ? "Explicit fence" : "Implicit fence",
+                tabID: fixture.tabID,
+                activateInUI: false,
+                reuseBlankSession: false
+            )
+            let sessionID = try XCTUnwrap(createdSessionID)
+            let sessionIDsBeforeAttempt = Set(oracle.sessions.map(\.id))
+            let activeSessionBeforeAttempt = oracle.workspaceManager
+                .activeChatSessionID(forTabID: fixture.tabID)
+            var competingStarted = false
+            oracle.setOraclePreflightPreparedObserverForTesting {
+                preparedSessionID in
+                oracle.setOraclePreflightPreparedObserverForTesting(nil)
+                let start = await oracle.sendMessage(
+                    "competing turn",
+                    sessionID: preparedSessionID,
+                    overrideModel: model,
+                    overlapPolicy: .rejectIfBusy,
+                    origin: .ui
+                )
+                if case let .started(queryID) = start {
+                    competingStarted = true
+                    try? await oracle.waitUntilMessageFinalised(queryID)
+                }
+            }
+
+            var args: [String: Value] = [
+                "message": .string("stale preflight must not send"),
+                "mode": .string("chat"),
+                "model": .string(preset.id.uuidString)
+            ]
+            if explicit {
+                let explicitSession = try XCTUnwrap(
+                    oracle.sessions.first(where: { $0.id == sessionID })
+                )
+                args["chat_id"] = .string(explicitSession.shortID)
+            }
+
+            do {
+                _ = try await oracle.tool_chatSend(
+                    args: args,
+                    promptVM: promptViewModel,
+                    tabContext: tabContext
+                )
+                XCTFail("Expected the preflight fence to reject")
+            } catch let error as ChatToolError {
+                XCTAssertEqual(error.code, .invalidParams)
+                XCTAssertTrue(
+                    error.message.contains("chat advanced after request preflight"),
+                    error.message
+                )
+            }
+
+            XCTAssertEqual(
+                Set(oracle.sessions.map(\.id)),
+                sessionIDsBeforeAttempt,
+                "A failed implicit send must not create an orphan chat"
+            )
+            XCTAssertEqual(
+                oracle.workspaceManager.activeChatSessionID(
+                    forTabID: fixture.tabID
+                ),
+                activeSessionBeforeAttempt,
+                "A failed implicit send must preserve the active-chat pointer"
+            )
+            guard competingStarted else {
+                XCTFail("Expected the competing turn to complete")
+                continue
+            }
+            let reloaded = await oracle.ensureSessionMessagesLoaded(sessionID)
+            XCTAssertTrue(reloaded)
+            let messages = oracle.messagesSnapshot(for: sessionID)
+            XCTAssertEqual(messages.count, 2)
+            XCTAssertEqual(messages.first?.content, "competing turn")
+            XCTAssertEqual(messages.last?.content, "competing response")
+            XCTAssertFalse(
+                messages.contains {
+                    $0.content.contains("stale preflight must not send")
+                }
+            )
+            XCTAssertFalse(oracle.isSessionStreaming(sessionID))
+            if explicit {
+                let expectedRevision = oracle.conversationRevision(for: sessionID)
+                let editedMessageID = try XCTUnwrap(messages.first?.id)
+                oracle.updateMessage(withId: editedMessageID) {
+                    $0.updateContent("same-count content edit")
+                }
+                let sameCountStart = oracle.beginSendMessageReservation(
+                    "stale packaged turn",
+                    targetSessionID: sessionID,
+                    overrideModel: model,
+                    expectedConversationRevision: expectedRevision,
+                    origin: .mcp
+                )
+                if case let .failed(reason) = sameCountStart {
+                    XCTAssertTrue(
+                        reason.contains("chat advanced after request preflight"),
+                        reason
+                    )
+                } else {
+                    XCTFail(
+                        "Expected same-count content mutation to fail the revision fence"
+                    )
+                }
+                XCTAssertEqual(
+                    oracle.messagesSnapshot(for: sessionID).count,
+                    messages.count
+                )
+            }
+            let finishedSession = try XCTUnwrap(
+                oracle.sessions.first(where: { $0.id == sessionID })
+            )
+            await oracle.deleteSession(finishedSession)
+        }
+        XCTAssertEqual(transportInvocationCount, 2)
     }
 
     private static var nextFixtureWindowID = -1200

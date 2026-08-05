@@ -10,6 +10,7 @@ enum ChatToolErrorCode: String, Codable {
     case permissionDenied = "permission_denied"
     case oracleSessionBusy = "oracle_session_busy"
     case oracleConcurrencyLimit = "oracle_concurrency_limit"
+    case oracleContextOverflow = "oracle_context_overflow"
 }
 
 struct ChatToolError: LocalizedError, Codable {
@@ -43,6 +44,27 @@ struct ChatToolError: LocalizedError, Codable {
 
     static func oracleConcurrencyLimit(_ msg: String) -> Self {
         .init(code: .oracleConcurrencyLimit, message: "oracle_concurrency_limit: \(msg)", details: nil)
+    }
+
+    static func oracleContextOverflow(_ estimate: OracleRequestBudgetEstimate) -> Self {
+        let largest = estimate.contributors.prefix(4)
+            .map { "\($0.name)=\($0.tokens)" }
+            .joined(separator: ", ")
+        let remedies = "Prune the workspace selection; retry the continuation with selection_mode:none; or start a fresh chat with a concise summary."
+        let window = estimate.contextWindowTokens ?? 0
+        return .init(
+            code: .oracleContextOverflow,
+            message: "oracle_context_overflow: packaged request requires \(estimate.requiredTokens) tokens but the context window is \(window). Largest contributors: \(largest). Remedies: \(remedies)",
+            details: [
+                "context_window_tokens": String(window),
+                "required_tokens": String(estimate.requiredTokens),
+                "input_tokens": String(estimate.inputTokens),
+                "output_reserve_tokens": String(estimate.outputReserveTokens),
+                "tokenizer_margin_tokens": String(estimate.tokenizerMarginTokens),
+                "largest_contributors": largest,
+                "remedies": remedies
+            ]
+        )
     }
 
     /// Serialise into the canonical MCP Value wrapper

@@ -4478,6 +4478,30 @@ final class AgentModeViewModel: ObservableObject {
         session.pendingRemoteOptimisticProviderTextByItemID.removeAll()
     }
 
+    static func mergeUIToolResultPayloads(
+        live: [UUID: String],
+        persisted: [UUID: String]
+    ) -> [UUID: String] {
+        var merged = live
+        merged.merge(persisted) { live, _ in live }
+        return merged
+    }
+
+    func captureOracleUIToolResultIdentity(
+        toolName: String,
+        result: [String: Value],
+        tabID: UUID
+    ) {
+        guard let session = session(for: tabID, createIfNeeded: false) else { return }
+        let rawResultJSON = ToolOutputFormatter.rawJSONString(.object(result))
+        session.captureOracleUIIdentitySidecars(
+            AgentToolResultPersistencePolicy.uiFacingOracleIdentityJSONByChatID(
+                toolName: toolName,
+                rawResultJSON: rawResultJSON
+            )
+        )
+    }
+
     @discardableResult
     private func applyPersistedHydration(
         _ payload: AgentSessionHydrationPayload,
@@ -4520,6 +4544,21 @@ final class AgentModeViewModel: ObservableObject {
             isColdLoad: true,
             builtPresentation: payload.builtPresentation
         )
+        let persistedUIToolResultPayloads: [UUID: String] = Dictionary(
+            uniqueKeysWithValues: agentSession.uiToolResultPayloadsByItemID.compactMap { itemID, payload in
+                guard let itemID = UUID(uuidString: itemID) else { return nil }
+                return (itemID, payload)
+            }
+        )
+        if !persistedUIToolResultPayloads.isEmpty {
+            session.replaceEphemeralToolResultPayloadMap(
+                Self.mergeUIToolResultPayloads(
+                    live: session.ephemeralToolResultPayloadByItemID,
+                    persisted: persistedUIToolResultPayloads
+                ),
+                liveItemIDs: session.liveItemIDs
+            )
+        }
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.origin = agentSession.origin
@@ -11729,12 +11768,29 @@ final class AgentModeViewModel: ObservableObject {
                 )
             }
         )
+        let toolNameByItemID: [UUID: String] = Dictionary(
+            uniqueKeysWithValues: session.items.compactMap { item in
+                item.toolName.map { (item.id, $0) }
+            }
+        )
+        let uiToolResultPayloadsByItemID: [String: String] = Dictionary(
+            uniqueKeysWithValues: session.ephemeralToolResultPayloadByItemID.compactMap { itemID, rawPayload in
+                guard let uiPayload = AgentToolResultPersistencePolicy.uiFacingOracleIdentityJSON(
+                    toolName: toolNameByItemID[itemID],
+                    rawResultJSON: rawPayload
+                ) else {
+                    return nil
+                }
+                return (itemID.uuidString, uiPayload)
+            }
+        )
         var agentSession = AgentSession(
             id: sessionID,
             workspaceID: workspace.id,
             composeTabID: tabID,
             name: sessionName,
             items: [],
+            uiToolResultPayloadsByItemID: uiToolResultPayloadsByItemID,
             transcript: persistableSnapshot.transcript,
             itemCount: canonicalItemCount,
             transcriptProjectionCounts: persistableSnapshot.projectionCounts,
@@ -16761,7 +16817,8 @@ final class AgentModeViewModel: ObservableObject {
         sourceModelName: String,
         fileContentsBlock: String?,
         transcriptXML: String,
-        deliveryID: String
+        deliveryID: String,
+        oracleChatIDMappingRows: [(oldID: String, newID: String)] = []
     ) -> String {
         let trimmedFileContentsBlock = fileContentsBlock?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -16775,6 +16832,22 @@ final class AgentModeViewModel: ObservableObject {
         }
         if !trimmedTranscriptXML.isEmpty {
             payloadSections.append(trimmedTranscriptXML)
+        }
+        if !oracleChatIDMappingRows.isEmpty {
+            let rows = oracleChatIDMappingRows
+                .map { "| \($0.oldID) | \($0.newID) |" }
+                .joined(separator: "\n")
+            payloadSections.append(
+                """
+                <oracle_chat_id_mapping>
+                Oracle chats were cloned during handoff. For any old chat ID quoted in surrounding prose, use its destination ID instead.
+
+                | old_chat_id | new_chat_id |
+                | --- | --- |
+                \(rows)
+                </oracle_chat_id_mapping>
+                """
+            )
         }
 
         let payloadBody = payloadSections.joined(separator: "\n\n")
@@ -17476,7 +17549,8 @@ final class AgentModeViewModel: ObservableObject {
         sourceTabID: UUID,
         sourceSession: TabSession,
         sourceTranscript: AgentTranscript,
-        upToItemID: UUID?
+        upToItemID: UUID?,
+        oracleChatIDMapping: OracleViewModel.HandoffChatIDMapping = .empty
     ) async -> String {
         guard let workspaceManager else { return "" }
 
@@ -17490,7 +17564,11 @@ final class AgentModeViewModel: ObservableObject {
             rawModel: sourceSession.selectedModelRaw,
             agentKind: sourceSession.selectedAgent
         )
-        let transcriptXML = buildForkTranscriptXML(from: sourceTranscript, upToItemID: upToItemID)
+        let payloadTranscript = Self.rewritingStructuredHandoffChatIDs(
+            in: sourceTranscript,
+            replacements: oracleChatIDMapping.replacements
+        )
+        let transcriptXML = buildForkTranscriptXML(from: payloadTranscript, upToItemID: upToItemID)
         let lookupContext = await agentWorkspaceLookupContext(tabID: sourceTabID, session: sourceSession)
         let fileContentsBlock = await buildForkFileContentsBlock(
             selection: sourceSelection,
@@ -17506,8 +17584,96 @@ final class AgentModeViewModel: ObservableObject {
             sourceModelName: sourceModelName,
             fileContentsBlock: fileContentsBlock,
             transcriptXML: transcriptXML,
-            deliveryID: deliveryID
+            deliveryID: deliveryID,
+            oracleChatIDMappingRows: oracleChatIDMapping.rows
         )
+    }
+
+    private static func rewritingStructuredHandoffChatIDs(
+        in source: AgentTranscript,
+        replacements: [String: String]
+    ) -> AgentTranscript {
+        guard !replacements.isEmpty else { return source }
+
+        var transcript = source
+        for turnIndex in transcript.turns.indices {
+            for spanIndex in transcript.turns[turnIndex].responseSpans.indices {
+                for activityIndex in transcript.turns[turnIndex].responseSpans[spanIndex].activities.indices {
+                    guard var execution = transcript.turns[turnIndex]
+                        .responseSpans[spanIndex]
+                        .activities[activityIndex]
+                        .toolExecution
+                    else { continue }
+
+                    execution.argsJSON = rewritingStructuredHandoffChatIDs(
+                        in: execution.argsJSON,
+                        replacements: replacements
+                    )
+                    execution.resultJSON = rewritingStructuredHandoffChatIDs(
+                        in: execution.resultJSON,
+                        replacements: replacements
+                    )
+                    transcript.turns[turnIndex]
+                        .responseSpans[spanIndex]
+                        .activities[activityIndex]
+                        .toolExecution = execution
+                }
+            }
+        }
+        return transcript
+    }
+
+    private static func rewritingStructuredHandoffChatIDs(
+        in rawJSON: String?,
+        replacements: [String: String]
+    ) -> String? {
+        guard let rawJSON,
+              let data = rawJSON.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed)
+        else { return rawJSON }
+
+        func rewrite(_ value: Any) -> (value: Any, changed: Bool) {
+            if let string = value as? String {
+                if let replacement = replacements[string] {
+                    return (replacement, true)
+                }
+                if let uuid = UUID(uuidString: string),
+                   let replacement = replacements[uuid.uuidString]
+                {
+                    return (replacement, true)
+                }
+                return (string, false)
+            }
+            if let array = value as? [Any] {
+                var changed = false
+                let rewritten = array.map { element -> Any in
+                    let result = rewrite(element)
+                    changed = changed || result.changed
+                    return result.value
+                }
+                return (rewritten, changed)
+            }
+            if let dictionary = value as? [String: Any] {
+                var changed = false
+                var rewritten: [String: Any] = [:]
+                for (key, element) in dictionary {
+                    let result = rewrite(element)
+                    changed = changed || result.changed
+                    rewritten[key] = result.value
+                }
+                return (rewritten, changed)
+            }
+            return (value, false)
+        }
+
+        let rewritten = rewrite(object)
+        guard rewritten.changed,
+              let output = try? JSONSerialization.data(
+                  withJSONObject: rewritten.value,
+                  options: [.fragmentsAllowed, .sortedKeys, .withoutEscapingSlashes]
+              )
+        else { return rawJSON }
+        return String(data: output, encoding: .utf8) ?? rawJSON
     }
 
     /// Build the file-contents block used by handoff payload export for the current active tab.
@@ -17616,6 +17782,11 @@ final class AgentModeViewModel: ObservableObject {
         guard let sourceSession = sessions[sourceTabID] else {
             throw AgentSessionError.emptySession
         }
+        guard let sourceAgentModeSessionID = sourceSession.activeAgentSessionID else {
+            throw MCPError.invalidParams(
+                "Handoff requires a durable source Agent Mode session identity"
+            )
+        }
 
         if let remoteReason = localSessionMutationDisabledReason(for: sourceSession) {
             throw AgentSessionError.remoteManaged(remoteReason)
@@ -17635,22 +17806,14 @@ final class AgentModeViewModel: ObservableObject {
             )
         }
 
-        // 1) Build the handoff payload from the same transcript universe used for migration.
-        let payload = await buildHandoffPayload(
-            sourceTabID: sourceTabID,
-            sourceSession: sourceSession,
-            sourceTranscript: sourceTranscript,
-            upToItemID: upToItemID
-        )
+        // 1) Resolve the transcript copy once, before any destination-side mutation.
         let sourceTabName = workspaceManager.composeTabName(with: sourceTabID) ?? "Session"
-
-        // 2) Build migrated transcript items (prefix or full copy, no thinking, no streaming).
         let migratedItems = buildHandoffTranscriptItems(
             sourceTranscript: sourceTranscript,
             upToItemID: upToItemID
         )
 
-        // 3) Create a fork-duplicate tab in the background (copies selection, prompt,
+        // 2) Create a fork-duplicate tab in the background (copies selection, prompt,
         //    expansions, overrides, discover config, etc. but clears session bindings).
         guard let destTab = await promptManager.createBackgroundForkComposeTab(
             sourceTabID: sourceTabID,
@@ -17660,16 +17823,8 @@ final class AgentModeViewModel: ObservableObject {
         }
         let destTabID = destTab.id
 
-        // 4) Clone Oracle/chat sessions without focusing the destination.
-        if let oracleViewModel {
-            do {
-                _ = try await oracleViewModel.cloneChatSessions(fromTabID: sourceTabID, toTabID: destTabID)
-            } catch {
-                print("[AgentVM] Warning: failed to clone chat sessions for handoff: \(error)")
-            }
-        }
-
-        // 5) Create destination agent session with migrated transcript + pending payload.
+        // 3) Pre-allocate the durable destination Agent Mode identity before any Oracle
+        //    clone can be persisted or published.
         let destSession = session(for: destTabID)
         guard destSession.adoptSessionProfile(sourceSession.profile) else {
             await promptManager.closeComposeTab(destTabID)
@@ -17679,6 +17834,43 @@ final class AgentModeViewModel: ObservableObject {
         destSession.selectedModelRaw = destinationModelRaw
         destSession.selectedReasoningEffortRaw = destinationReasoningEffortRaw
         destSession.autoEditEnabled = sourceSession.autoEditEnabled
+        guard let destinationAgentModeSessionID = ensureSessionBoundToTab(destSession) else {
+            await promptManager.closeComposeTab(destTabID)
+            throw PersistentBindingMutationError.staleTransition
+        }
+
+        // 4) Clone only Oracle/chat sessions owned by the source Agent Mode session.
+        //    The run ID stays nil until the destination's first explicit continuation.
+        var oracleChatIDMapping = OracleViewModel.HandoffChatIDMapping.empty
+        if let oracleViewModel {
+            do {
+                let idMapping = try await oracleViewModel.cloneChatSessions(
+                    fromTabID: sourceTabID,
+                    toTabID: destTabID,
+                    sourceAgentModeSessionID: sourceAgentModeSessionID,
+                    destinationAgentModeSessionID: destinationAgentModeSessionID
+                )
+                oracleChatIDMapping = oracleViewModel.handoffChatIDMapping(
+                    for: idMapping,
+                    destinationTabID: destTabID
+                )
+            } catch {
+                await promptManager.closeComposeTab(destTabID)
+                throw error
+            }
+        }
+
+        // 5) Build the payload only after cloning so structured chat IDs can point at the
+        //    destination clones and prose can carry an explicit old → new table.
+        let payload = await buildHandoffPayload(
+            sourceTabID: sourceTabID,
+            sourceSession: sourceSession,
+            sourceTranscript: sourceTranscript,
+            upToItemID: upToItemID,
+            oracleChatIDMapping: oracleChatIDMapping
+        )
+
+        // 6) Install the migrated transcript and deferred payload, then persist the mapping.
         destSession.replaceItems(migratedItems)
         refreshDerivedTranscriptState(for: destSession)
         destSession.hasSentFirstMessage = migratedItems.contains { $0.kind == .user }
@@ -17689,12 +17881,6 @@ final class AgentModeViewModel: ObservableObject {
             defersProviderLockUntilSend: true,
             isStagedForSend: false
         )
-        guard ensureSessionBoundToTab(destSession) != nil else {
-            await promptManager.closeComposeTab(destTabID)
-            throw PersistentBindingMutationError.staleTransition
-        }
-
-        // 6) Persist destination session/tab mapping.
         scheduleSave(for: destTabID)
         return destTabID
     }

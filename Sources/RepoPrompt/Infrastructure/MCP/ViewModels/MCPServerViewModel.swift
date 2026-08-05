@@ -411,6 +411,8 @@ final class MCPServerViewModel: ObservableObject {
 
     #if DEBUG
         private var oracleChatSendOverrideForTesting: MCPOracleToolService.SendChat?
+        private var oracleExportOverrideForTesting:
+            MCPOracleToolService.ExportOracleResponse?
         var requestMetadataOverrideForTesting: RequestMetadata?
         var agentRunDispatchOverrideForTesting: AgentExternalMCPRunStarter.DispatchInstruction?
         private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
@@ -426,6 +428,12 @@ final class MCPServerViewModel: ObservableObject {
 
         func setOracleChatSendOverrideForTesting(_ override: MCPOracleToolService.SendChat?) {
             oracleChatSendOverrideForTesting = override
+        }
+
+        func setOracleExportOverrideForTesting(
+            _ override: MCPOracleToolService.ExportOracleResponse?
+        ) {
+            oracleExportOverrideForTesting = override
         }
 
         func setRequestMetadataOverrideForTesting(_ metadata: RequestMetadata?) {
@@ -446,6 +454,10 @@ final class MCPServerViewModel: ObservableObject {
             try await oracleToolService.executeAskOracle(args: args)
         }
 
+        func executeOracleChatLogForTesting(args: [String: Value]) async throws -> Value {
+            try await oracleToolService.executeOracleChatLog(args: args)
+        }
+
         func setOracleReviewPackagingTraceObserverForTesting(
             _ observer: OracleReviewPackagingTraceContext.Observer?
         ) {
@@ -456,6 +468,16 @@ final class MCPServerViewModel: ObservableObject {
             _ override: OracleViewModel.OraclePostPackagingTransportOverride?
         ) {
             oracleVM.setOraclePostPackagingTransportOverrideForTesting(override)
+        }
+
+        func setOracleContextWindowOverrideForTesting(
+            _ override: ((AIModel) -> Int?)?,
+            source: AIModelCapabilityMetadata.WindowSource? = nil
+        ) {
+            oracleVM.setOracleContextWindowOverrideForTesting(
+                override,
+                source: source
+            )
         }
 
         func setContextBuilderFollowUpOverrideForTesting(
@@ -518,6 +540,29 @@ final class MCPServerViewModel: ObservableObject {
                 }
                 return try OracleViewModel.OracleSendPackagingContext(delegated: context)
             },
+            resolveExplicitSliceSelection: { [self] slices, lookupContext in
+                let parsed = parseManageSelectionInputs(rawPaths: [], slicesValue: slices)
+                guard parsed.sliceErrors.isEmpty else {
+                    throw MCPError.invalidParams(parsed.sliceErrors.joined(separator: "; "))
+                }
+                let built = await buildStoredSelection(
+                    from: parsed,
+                    mode: "slices",
+                    existing: StoredSelection(codemapAutoEnabled: false),
+                    lookupRootScope: lookupContext.rootScope
+                )
+                guard built.invalidPaths.isEmpty else {
+                    throw MCPError.invalidParams(
+                        "Invalid explicit Oracle slices: \(built.invalidPaths.joined(separator: "; "))"
+                    )
+                }
+                guard !built.selection.slices.isEmpty else {
+                    throw MCPError.invalidParams(
+                        "selection_mode:explicit_slices did not resolve any file ranges"
+                    )
+                }
+                return built.selection
+            },
             rebindChatSessionIfNeeded: { [self] metadata, chatIDString in
                 try rebindOracleChatSessionIfNeeded(metadata: metadata, chatIDString: chatIDString)
             },
@@ -539,19 +584,48 @@ final class MCPServerViewModel: ObservableObject {
                 )
             },
             sendChat: { [self] args, promptVM, tabContext in
+                let result: [String: Value]
                 #if DEBUG
                     if let override = oracleChatSendOverrideForTesting {
-                        return try await override(args, promptVM, tabContext)
+                        result = try await override(args, promptVM, tabContext)
+                    } else {
+                        result = try await oracleVM.tool_chatSend(
+                            args: args,
+                            promptVM: promptVM,
+                            tabContext: tabContext
+                        )
                     }
+                #else
+                    result = try await oracleVM.tool_chatSend(
+                        args: args,
+                        promptVM: promptVM,
+                        tabContext: tabContext
+                    )
                 #endif
-                return try await oracleVM.tool_chatSend(
-                    args: args,
-                    promptVM: promptVM,
-                    tabContext: tabContext
-                )
+                if let tabContext,
+                   let targetWindow = try? requireTargetWindow()
+                {
+                    let toolName = switch tabContext.origin {
+                    case .askOracle:
+                        "ask_oracle"
+                    case .oracleSend, .compatibility:
+                        "oracle_send"
+                    }
+                    targetWindow.agentModeViewModel.captureOracleUIToolResultIdentity(
+                        toolName: toolName,
+                        result: result,
+                        tabID: tabContext.tabID
+                    )
+                }
+                return result
             },
             exportOracleResponse: { [self] request in
-                try await exportOracleResponse(request)
+                #if DEBUG
+                    if let override = oracleExportOverrideForTesting {
+                        return try await override(request)
+                    }
+                #endif
+                return try await exportOracleResponse(request)
             }
         )
     }

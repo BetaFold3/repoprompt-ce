@@ -69,6 +69,7 @@ extension AgentModeViewModel {
         var transcriptPerformanceSnapshot: AgentTranscriptPerformanceSnapshot = .empty
         var ephemeralToolResultPayloadByItemID: [UUID: String] = [:]
         var ephemeralToolResultPayloadRevisionByItemID: [UUID: Int] = [:]
+        private(set) var oracleUIIdentitySidecarByChatID: [String: String] = [:]
         private(set) var liveItemIDs: Set<UUID> = []
         private var toolCorrelationIndexes = ToolCorrelationIndexes()
         private var nextEphemeralToolResultPayloadRevision: Int = 1
@@ -1356,9 +1357,21 @@ extension AgentModeViewModel {
 
         private func refreshEphemeralPayload(for item: AgentChatItem) {
             if let retainedPayload = AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: item) {
-                setEphemeralToolResultPayload(retainedPayload, for: item.id)
+                let uiPayload = AgentToolResultPersistencePolicy.mergingOracleUIIdentitySidecars(
+                    into: retainedPayload,
+                    sidecarsByChatID: oracleUIIdentitySidecarByChatID
+                )
+                setEphemeralToolResultPayload(uiPayload, for: item.id)
             } else {
                 setEphemeralToolResultPayload(nil, for: item.id)
+            }
+        }
+
+        func captureOracleUIIdentitySidecars(_ sidecarsByChatID: [String: String]) {
+            guard !sidecarsByChatID.isEmpty else { return }
+            oracleUIIdentitySidecarByChatID.merge(sidecarsByChatID) { _, latest in latest }
+            for item in items {
+                refreshEphemeralPayload(for: item)
             }
         }
 

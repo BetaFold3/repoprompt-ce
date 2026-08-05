@@ -99,16 +99,35 @@ enum UnifiedDiffCardRendering {
         for document: UnifiedDiffDocument,
         fontSize: CGFloat,
         fontPreset: FontScalePreset,
-        maxHeight: CGFloat
+        maxHeight: CGFloat,
+        availableWidth: CGFloat = .greatestFiniteMagnitude,
+        wrapLines: Bool = false,
+        preferredPostScriptName: String? = nil
     ) -> CGFloat {
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
-        let baseLineHeight = ceil(font.ascender - font.descender + font.leading)
-        let spacingCount = max(document.lines.count - 1, 0)
-        let contentHeight =
-            (CGFloat(max(document.lines.count, 1)) * baseLineHeight) +
-            (CGFloat(spacingCount) * appKitLineSpacing(for: fontPreset)) +
-            (appKitVerticalTextInset(for: fontPreset) * 2)
-        return min(max(contentHeight, appKitMinimumBodyHeight(for: fontPreset)), maxHeight)
+        let normalizedPreference = preferredPostScriptName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !wrapLines, normalizedPreference?.isEmpty != false {
+            // Preserve the pre-wrap/default-font arithmetic exactly. TextKit measurement can
+            // differ by fractional rounding even when every source line remains unwrapped.
+            let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+            let baseLineHeight = ceil(font.ascender - font.descender + font.leading)
+            let spacingCount = max(document.lines.count - 1, 0)
+            let contentHeight =
+                (CGFloat(max(document.lines.count, 1)) * baseLineHeight) +
+                (CGFloat(spacingCount) * appKitLineSpacing(for: fontPreset)) +
+                (appKitVerticalTextInset(for: fontPreset) * 2)
+            return min(max(contentHeight, appKitMinimumBodyHeight(for: fontPreset)), maxHeight)
+        }
+
+        let metrics = UnifiedDiffHeightMeasurement.measure(
+            document: document,
+            availableWidth: availableWidth,
+            wrapLines: wrapLines,
+            fontPreset: fontPreset,
+            fontSize: fontSize,
+            preferredPostScriptName: preferredPostScriptName
+        )
+        return min(max(metrics.height, appKitMinimumBodyHeight(for: fontPreset)), maxHeight)
     }
 
     static func parse(_ diff: String) -> UnifiedDiffDocument {

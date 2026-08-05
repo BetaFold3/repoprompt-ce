@@ -697,9 +697,22 @@ struct EnhancedCodeBlock: View {
     @State private var isCopyHovering = false
 
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     private var scaledCodeFontSize: CGFloat {
         let baseFontSize: CGFloat = 12.0
         return baseFontSize * fontScale.preset.scaleFactor
+    }
+
+    private var preferredCodeFontPostScriptName: String? {
+        globalSettings.transcriptCodeFontPostScriptName()
+    }
+
+    private var codeFontFingerprint: TranscriptCodeFontFingerprint? {
+        guard let preferredCodeFontPostScriptName else { return nil }
+        return TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: preferredCodeFontPostScriptName,
+            pointSize: scaledCodeFontSize
+        ).fingerprint
     }
 
     // NEW: extract the copy button so it can be reused in overlay
@@ -741,6 +754,9 @@ struct EnhancedCodeBlock: View {
             .onChange(of: fontScale.preset) { _, _ in
                 if isFinalized { generateHighlightedCode() }
             }
+            .onChange(of: globalSettings.transcriptCodeFontPostScriptName()) { _, _ in
+                if isFinalized { generateHighlightedCode() }
+            }
     }
 
     // MARK: UI -----------------------------------------------------
@@ -769,14 +785,17 @@ struct EnhancedCodeBlock: View {
     /// Lightweight monospaced rendering used while the block is still streaming
     /// or before the async highlighter finishes.
     private var plainAttributedCode: NSAttributedString {
-        let font = NSFont.monospacedSystemFont(
-            ofSize: scaledCodeFontSize,
-            weight: .regular
+        let resolved = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: preferredCodeFontPostScriptName,
+            pointSize: scaledCodeFontSize
         )
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
+        var attrs: [NSAttributedString.Key: Any] = [
+            .font: resolved.font,
             .foregroundColor: NSColor.textColor
         ]
+        if preferredCodeFontPostScriptName != nil {
+            attrs[.paragraphStyle] = resolved.makeCodeParagraphStyle()
+        }
         return NSAttributedString(string: code, attributes: attrs)
     }
 
@@ -791,6 +810,12 @@ struct EnhancedCodeBlock: View {
 
     private func applySyntaxHighlighting(to code: String, language: String?) -> NSAttributedString {
         // Use the shared cache for better performance
-        CodeHighlightCache.shared.highlighted(code, language: language, fontPointSize: scaledCodeFontSize)
+        CodeHighlightCache.shared.highlighted(
+            code,
+            language: language,
+            fontPointSize: scaledCodeFontSize,
+            fontFingerprint: codeFontFingerprint,
+            wrapLines: true
+        )
     }
 }

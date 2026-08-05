@@ -628,6 +628,33 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setShowTooltips(requiredBool(from: $1)) }
         ),
         boolSetting(
+            key: "ui.wrap_transcript_diff_lines",
+            group: "ui",
+            label: "Wrap Transcript Diff Lines",
+            description: "Whether transcript unified diffs and tool code-block fallbacks wrap long lines instead of scrolling horizontally. Default off preserves today's clipping path.",
+            read: { .bool($0.wrapTranscriptDiffLines()) },
+            write: { try $0.setWrapTranscriptDiffLines(requiredBool(from: $1)) }
+        ),
+        AppSettingDefinition(
+            key: "ui.transcript_code_font",
+            group: "ui",
+            valueType: .optionalString,
+            label: "Transcript Code Font",
+            description: "Optional PostScript face name for transcript code and diff rendering. Null/empty uses the system monospaced face. Invalid or non-fixed-pitch faces fall back silently at resolve time.",
+            allowedValues: nil,
+            read: { stringOrNull($0.transcriptCodeFontPostScriptName()) },
+            validate: { value in
+                try validateOptionalTrimmedString(value, key: "ui.transcript_code_font", maxLength: 256)
+            },
+            write: { store, value in
+                try store.setTranscriptCodeFontPostScriptName(optionalString(from: value))
+            },
+            afterWrite: { _, _, _ in
+                CodeHighlightCache.shared.clear()
+            },
+            candidateProvider: transcriptCodeFontCandidates
+        ),
+        boolSetting(
             key: "ui.enable_keyboard_shortcuts",
             group: "ui",
             description: "Whether global keyboard shortcuts are enabled. New/changed shortcuts may only take effect after reopening a window.",
@@ -1487,6 +1514,45 @@ private enum AppSettingsMCPRegistry {
         return AppSettingCandidatesResult(
             source: "font_scale_presets",
             exhaustive: true,
+            totalCount: totalCount,
+            options: options,
+            truncated: truncated,
+            notes: []
+        )
+    }
+
+    @MainActor
+    static func transcriptCodeFontCandidates(
+        request: AppSettingCandidateRequest
+    ) throws -> AppSettingCandidatesResult {
+        var allCandidates: [AppSettingCandidate] = [
+            AppSettingCandidate(
+                value: .null,
+                label: "System Monospaced",
+                description: "Default AppKit monospaced system font.",
+                group: "system",
+                groupLabel: "System",
+                attributes: [:]
+            )
+        ]
+        let faces = TranscriptCodeFontResolver.availableFixedPitchFaces()
+        allCandidates.append(contentsOf: faces.map { face in
+            AppSettingCandidate(
+                value: .string(face.postScriptName),
+                label: face.displayName,
+                description: face.postScriptName,
+                group: "fixed_pitch",
+                groupLabel: "Fixed Pitch",
+                attributes: [:]
+            )
+        })
+        let totalCount = allCandidates.count
+        let clampedLimit = max(1, request.limit)
+        let truncated = totalCount > clampedLimit
+        let options = truncated ? Array(allCandidates.prefix(clampedLimit)) : allCandidates
+        return AppSettingCandidatesResult(
+            source: "fixed_pitch_fonts",
+            exhaustive: !truncated,
             totalCount: totalCount,
             options: options,
             truncated: truncated,

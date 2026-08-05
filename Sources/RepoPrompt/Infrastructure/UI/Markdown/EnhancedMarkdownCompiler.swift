@@ -40,6 +40,8 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     var forceTextColor: Color?
     var fontSize: CGFloat = 16.0
     var useMonospaced: Bool = false
+    /// Optional resolved transcript code face. When nil, uses system monospaced at `fontSize`.
+    var codeFont: NSFont?
     /// `nil` everywhere except the utility-panel Preview's rendered Markdown path.
     var imageProvider: EnhancedMarkdownImageProvider?
     /// Width available to the attachment, excluding the reading surface's horizontal padding.
@@ -55,6 +57,19 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     private var currentListTracker: OrderedListMarkerGenerator? // For ordered lists
     private var nextNavigationHeadingIndex = 0
 
+    private var resolvedCodeFont: NSFont {
+        codeFont ?? NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+    }
+
+    private func codeFont(sizeDelta: CGFloat) -> NSFont {
+        let base = resolvedCodeFont
+        let size = max(base.pointSize + sizeDelta, 8)
+        return TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: base.fontName,
+            pointSize: size
+        ).font
+    }
+
     mutating func attributedString(from markup: Markdown.Markup) -> NSAttributedString {
         nextNavigationHeadingIndex = 0
         let result = visit(markup).mutableCopy() as! NSMutableAttributedString
@@ -62,7 +77,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
             return result
         }
 
-        let baseFont = NSFont.monospacedSystemFont(ofSize: max(fontSize, 10), weight: .regular)
+        let baseFont = resolvedCodeFont
         return makeMonospaced(result, baseFont: baseFont)
     }
 
@@ -89,7 +104,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     ) -> [NSAttributedString.Key: Any] {
         var attrs: [NSAttributedString.Key: Any] = additional
         let baseFont = useMonospaced ?
-            NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular) :
+            resolvedCodeFont :
             NSFont.systemFont(ofSize: fontSize, weight: .regular).rounded()
         attrs[.font] = font ?? baseFont
 
@@ -150,7 +165,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     }
 
     mutating func visitInlineCode(_ inlineCode: Markdown.InlineCode) -> NSAttributedString {
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize - 1, weight: .regular)
+        let font = codeFont(sizeDelta: -1)
         return NSAttributedString(string: inlineCode.code, attributes: [
             .font: font,
             .foregroundColor: NSColor.textColor
@@ -166,13 +181,12 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
             : codeBlock.code
 
         // ⓶  Base attributes & paragraph style
-        let font = NSFont.monospacedSystemFont(
-            ofSize: fontSize - 1,
-            weight: .regular
+        let font = codeFont(sizeDelta: -1)
+        let resolved = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: font.fontName,
+            pointSize: font.pointSize
         )
-        let paragraphStyle = NSMutableParagraphStyle()
-        paragraphStyle.paragraphSpacing = 0
-        paragraphStyle.lineSpacing = 2
+        let paragraphStyle = resolved.makeCodeParagraphStyle(lineSpacing: 2)
         // Horizontal insets so text isn't glued to the rounded border
         let horizontalInset: CGFloat = 8
         paragraphStyle.headIndent = horizontalInset
@@ -371,7 +385,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
     mutating func visitHTMLBlock(_ html: Markdown.HTMLBlock) -> NSAttributedString {
         // HTML rendering is not supported, display as plain text or skip
-        NSAttributedString(string: html.rawHTML, attributes: attributes(font: NSFont.monospacedSystemFont(ofSize: fontSize - 2, weight: .regular)))
+        NSAttributedString(string: html.rawHTML, attributes: attributes(font: codeFont(sizeDelta: -2)))
     }
 
     // MARK: - List Items ----------------------------------------------------
@@ -575,7 +589,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     }
 
     mutating func visitInlineHTML(_ inlineHTML: Markdown.InlineHTML) -> NSAttributedString {
-        NSAttributedString(string: inlineHTML.rawHTML, attributes: attributes(font: NSFont.monospacedSystemFont(ofSize: fontSize - 2, weight: .regular)))
+        NSAttributedString(string: inlineHTML.rawHTML, attributes: attributes(font: codeFont(sizeDelta: -2)))
     }
 
     mutating func visitLineBreak(_ lineBreak: Markdown.LineBreak) -> NSAttributedString {
@@ -1081,7 +1095,13 @@ private func makeMonospaced(_ src: NSAttributedString, baseFont mono: NSFont) ->
         let traits = original.fontDescriptor.symbolicTraits
         let weight: NSFont.Weight = traits.contains(.bold) ? .bold : .regular
 
-        var monoSizedFont = NSFont.monospacedSystemFont(ofSize: mono.pointSize, weight: weight)
+        var monoSizedFont = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: mono.fontName,
+            pointSize: mono.pointSize
+        ).font
+        if weight == .bold {
+            monoSizedFont = NSFontManager.shared.convert(monoSizedFont, toHaveTrait: .boldFontMask)
+        }
 
         if traits.contains(.italic) {
             monoSizedFont = NSFontManager.shared.convert(monoSizedFont, toHaveTrait: .italicFontMask)

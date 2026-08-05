@@ -10684,9 +10684,11 @@ actor ServerNetworkManager {
                                 name: tool.name,
                                 description: description,
                                 inputSchema: schemaValue,
-                                annotations: CodexMCPToolAnnotationProjection.project(
+                                annotations: MCPToolListAnnotationProjection.project(
                                     tool.annotations,
-                                    clientIdentifier: clientIdentifier
+                                    toolName: tool.name,
+                                    clientIdentifier: clientIdentifier,
+                                    runPurpose: policy.purpose
                                 )
                             )
                         )

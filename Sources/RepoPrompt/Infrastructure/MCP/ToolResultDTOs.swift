@@ -983,6 +983,25 @@ enum ToolResultDTOs {
             let patch: String
         }
 
+        /// Neutral request-budget echo for Oracle sends.
+        struct Usage: Codable, Equatable {
+            let inputTokens: Int
+            let contextWindow: Int?
+            let pct: Int?
+            let source: String?
+            let maxOutputTokens: Int?
+            let outputReserveTokens: Int?
+
+            private enum CodingKeys: String, CodingKey {
+                case inputTokens = "input_tokens"
+                case contextWindow = "context_window"
+                case pct
+                case source
+                case maxOutputTokens = "max_output_tokens"
+                case outputReserveTokens = "output_reserve_tokens"
+            }
+        }
+
         let chatID: String?
         let mode: String?
         let response: String?
@@ -990,10 +1009,15 @@ enum ToolResultDTOs {
         let errors: [String]?
         let modelID: String?
         let modelName: String?
+        /// App-only identity decoded from UI sidecars; never encoded onto the wire.
+        let uiModelID: String?
+        /// App-only display identity decoded from UI sidecars; never encoded onto the wire.
+        let uiModelName: String?
         let modelSelection: String?
         let modelSource: String?
         let modelPresetID: String?
         let modelPresetName: String?
+        let usage: Usage?
 
         private enum CodingKeys: String, CodingKey {
             case chatID = "chat_id"
@@ -1004,10 +1028,13 @@ enum ToolResultDTOs {
             case errors
             case modelID = "model_id"
             case modelName = "model_name"
+            case uiModelID = "ui_model_id"
+            case uiModelName = "ui_model_name"
             case modelSelection = "model_selection"
             case modelSource = "model_source"
             case modelPresetID = "model_preset_id"
             case modelPresetName = "model_preset_name"
+            case usage
         }
 
         init(
@@ -1018,10 +1045,13 @@ enum ToolResultDTOs {
             errors: [String]?,
             modelID: String? = nil,
             modelName: String? = nil,
+            uiModelID: String? = nil,
+            uiModelName: String? = nil,
             modelSelection: String? = nil,
             modelSource: String? = nil,
             modelPresetID: String? = nil,
-            modelPresetName: String? = nil
+            modelPresetName: String? = nil,
+            usage: Usage? = nil
         ) {
             self.chatID = chatID
             self.mode = mode
@@ -1030,10 +1060,13 @@ enum ToolResultDTOs {
             self.errors = errors
             self.modelID = modelID
             self.modelName = modelName
+            self.uiModelID = uiModelID
+            self.uiModelName = uiModelName
             self.modelSelection = modelSelection
             self.modelSource = modelSource
             self.modelPresetID = modelPresetID
             self.modelPresetName = modelPresetName
+            self.usage = usage
         }
 
         init(from decoder: Decoder) throws {
@@ -1049,10 +1082,13 @@ enum ToolResultDTOs {
             errors = try container.decodeIfPresent([String].self, forKey: .errors)
             modelID = try container.decodeIfPresent(String.self, forKey: .modelID)
             modelName = try container.decodeIfPresent(String.self, forKey: .modelName)
+            uiModelID = try container.decodeIfPresent(String.self, forKey: .uiModelID)
+            uiModelName = try container.decodeIfPresent(String.self, forKey: .uiModelName)
             modelSelection = try container.decodeIfPresent(String.self, forKey: .modelSelection)
             modelSource = try container.decodeIfPresent(String.self, forKey: .modelSource)
             modelPresetID = try container.decodeIfPresent(String.self, forKey: .modelPresetID)
             modelPresetName = try container.decodeIfPresent(String.self, forKey: .modelPresetName)
+            usage = try container.decodeIfPresent(Usage.self, forKey: .usage)
         }
 
         func encode(to encoder: Encoder) throws {
@@ -1062,12 +1098,15 @@ enum ToolResultDTOs {
             try container.encodeIfPresent(response, forKey: .response)
             try container.encodeIfPresent(diffs, forKey: .diffs)
             try container.encodeIfPresent(errors, forKey: .errors)
-            try container.encodeIfPresent(modelID, forKey: .modelID)
-            try container.encodeIfPresent(modelName, forKey: .modelName)
+            if modelSource != "preset" {
+                try container.encodeIfPresent(modelID, forKey: .modelID)
+                try container.encodeIfPresent(modelName, forKey: .modelName)
+            }
             try container.encodeIfPresent(modelSelection, forKey: .modelSelection)
             try container.encodeIfPresent(modelSource, forKey: .modelSource)
             try container.encodeIfPresent(modelPresetID, forKey: .modelPresetID)
             try container.encodeIfPresent(modelPresetName, forKey: .modelPresetName)
+            try container.encodeIfPresent(usage, forKey: .usage)
         }
     }
 
@@ -1139,18 +1178,47 @@ enum ToolResultDTOs {
         let name: String
         let description: String?
         let supportedModes: SupportedModesInfo?
+        /// Neutral capability number; omit when unknown. Never paired with raw model identity for presets.
+        let contextWindow: Int?
+        /// Neutral max-output number when readily available.
+        let maxOutputTokens: Int?
+
+        init(
+            id: String,
+            name: String,
+            description: String? = nil,
+            supportedModes: SupportedModesInfo? = nil,
+            contextWindow: Int? = nil,
+            maxOutputTokens: Int? = nil
+        ) {
+            self.id = id
+            self.name = name
+            self.description = description
+            self.supportedModes = supportedModes
+            self.contextWindow = contextWindow
+            self.maxOutputTokens = maxOutputTokens
+        }
 
         private enum CodingKeys: String, CodingKey {
             case id
             case name
             case description
             case supportedModes = "supported_modes"
+            case contextWindow = "context_window"
+            case maxOutputTokens = "max_output_tokens"
         }
     }
 
     struct ListModelsReply: Codable, Equatable {
         let models: [ModelInfo]
         let total: Int
+        let notes: [String]?
+
+        init(models: [ModelInfo], total: Int, notes: [String]? = nil) {
+            self.models = models
+            self.total = total
+            self.notes = notes
+        }
     }
 
     // MARK: - File Actions

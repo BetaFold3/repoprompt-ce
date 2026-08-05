@@ -180,7 +180,11 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let setStatus = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.setStatus })
 
         let askOracleProperties = try Self.schemaProperties(for: askOracle)
-        for field in ["mode", "new_chat", "chat_id", "model", "chat_name", "export_response"] {
+        for field in [
+            "mode", "new_chat", "chat_id", "model", "chat_name", "export_response",
+            "selection_mode", "slices", "max_output_tokens", "response_mode",
+            "consultations", "require_distinct"
+        ] {
             XCTAssertNotNil(askOracleProperties[field], "ask_oracle schema should advertise property \(field)")
         }
         let oracleModes = askOracleProperties["mode"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -199,6 +203,9 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
         let oracleChatLogProperties = try Self.schemaProperties(for: oracleChatLog)
         XCTAssertNotNil(oracleChatLogProperties["limit"])
+        XCTAssertNotNil(oracleChatLogProperties["max_chars"])
+        XCTAssertNotNil(oracleChatLogProperties["part"])
+        XCTAssertNotNil(oracleChatLogProperties["max_total_chars"])
 
         let agentRunProperties = try Self.schemaProperties(for: agentRun)
         for field in [
@@ -232,15 +239,35 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let properties = try Self.schemaProperties(for: askOracle)
         let modelDescription = try XCTUnwrap(properties["model"]?.objectValue?["description"]?.stringValue)
         let chatNameDescription = try XCTUnwrap(properties["chat_name"]?.objectValue?["description"]?.stringValue)
+        let selectionModeDescription = try XCTUnwrap(
+            properties["selection_mode"]?.objectValue?["description"]?.stringValue
+        )
+        let maxOutputDescription = try XCTUnwrap(
+            properties["max_output_tokens"]?.objectValue?["description"]?.stringValue
+        )
 
         XCTAssertTrue(askOracle.description.contains("model-preset selectors"))
         XCTAssertTrue(askOracle.description.contains("oracle_utils op=models"))
-        XCTAssertTrue(askOracle.description.contains("one tool-call batch"))
+        XCTAssertTrue(askOracle.description.contains("one tool-call batch") || askOracle.description.contains("consultations"))
         XCTAssertTrue(askOracle.description.contains("do not synthesize"))
+        XCTAssertTrue(askOracle.description.contains("re-packages the current workspace selection"))
+        XCTAssertTrue(askOracle.description.contains("fresh chat with a concise summary"))
+        XCTAssertTrue(askOracle.description.contains("Unknown context windows skip"))
+        XCTAssertTrue(askOracle.description.contains("response_mode"))
+        XCTAssertTrue(askOracle.description.contains("## Recommendations"))
+        XCTAssertTrue(askOracle.description.contains("require_distinct"))
+        XCTAssertTrue(selectionModeDescription.contains("without mutating shared selection"))
+        XCTAssertTrue(selectionModeDescription.contains("no review diff"))
+        XCTAssertTrue(maxOutputDescription.contains("pre-send context-budget check"))
         XCTAssertTrue(modelDescription.contains("Exact model preset UUID (preferred)"))
         XCTAssertTrue(modelDescription.contains("Required when the user requests a named Oracle"))
         XCTAssertTrue(chatNameDescription.contains("display-only"))
         XCTAssertTrue(chatNameDescription.contains("never selects the model"))
+        let responseModeDescription = try XCTUnwrap(
+            properties["response_mode"]?.objectValue?["description"]?.stringValue
+        )
+        XCTAssertTrue(responseModeDescription.contains("2000"))
+        XCTAssertTrue(responseModeDescription.contains("auto-export"))
     }
 
     func testLifecycleSchemasAdvertiseConfigurableDefaultsWithoutMaximumClamp() async throws {
@@ -395,6 +422,60 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                 )
             }
         }
+    }
+
+    func testAskOracleReadOnlyHintProjectionUsesServerEstablishedAgentModePurpose() {
+        let canonical = MCP.Tool.Annotations(
+            readOnlyHint: false,
+            destructiveHint: false,
+            openWorldHint: false
+        )
+
+        let agentModeProjected = MCPToolListAnnotationProjection.project(
+            canonical,
+            toolName: MCPWindowToolName.askOracle,
+            clientIdentifier: "claude-code",
+            runPurpose: .agentModeRun
+        )
+        XCTAssertEqual(agentModeProjected.readOnlyHint, true)
+        XCTAssertEqual(agentModeProjected.destructiveHint, false)
+        XCTAssertEqual(agentModeProjected.openWorldHint, false)
+
+        let externalProjected = MCPToolListAnnotationProjection.project(
+            canonical,
+            toolName: MCPWindowToolName.askOracle,
+            clientIdentifier: "claude-code",
+            runPurpose: .unknown
+        )
+        XCTAssertEqual(externalProjected.readOnlyHint, false)
+
+        let discoverProjected = MCPToolListAnnotationProjection.project(
+            canonical,
+            toolName: MCPWindowToolName.askOracle,
+            clientIdentifier: "claude-code",
+            runPurpose: .discoverRun
+        )
+        XCTAssertEqual(discoverProjected.readOnlyHint, false)
+
+        let otherToolProjected = MCPToolListAnnotationProjection.project(
+            canonical,
+            toolName: MCPWindowToolName.oracleSend,
+            clientIdentifier: "claude-code",
+            runPurpose: .agentModeRun
+        )
+        XCTAssertEqual(otherToolProjected.readOnlyHint, false)
+
+        // Spoofable client names must not flip ask_oracle; only server purpose does.
+        let spoofedExternal = MCPToolListAnnotationProjection.project(
+            canonical,
+            toolName: MCPWindowToolName.askOracle,
+            clientIdentifier: "repoprompt-agent-mode",
+            runPurpose: .unknown
+        )
+        XCTAssertEqual(spoofedExternal.readOnlyHint, false)
+
+        // Canonical catalog metadata remains non-read-only (external honesty).
+        XCTAssertEqual(canonical.readOnlyHint, false)
     }
 
     func testProductionRegistrationUsesCatalogServiceNotViewModel() async throws {
@@ -681,9 +762,9 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "7|prompt|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=e1377f12a6495829c0ade3e37b9325f7a07dc2065288b16bb810d01a4df9e55d|schema=8c8ea22a39bbb9e10c364ad483527faf109a52e1eb9c45c0c939f569ecf144d1",
         "8|apply_edits|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=d33efa75e3e29e1e4e1cfe90d0e9d621337c397e5329aee02f4a261726d790fa|schema=e1ad464843910182006a484b0545305f8d53821a795cd8e116c07a01eededed8",
         "9|oracle_utils|enabled=true|ann=title=nil,readOnly=nil,destructive=nil,idempotent=nil,openWorld=nil|desc=27f95db5e0be6c58c0ce9ee266dd398fd3c40218b1cd575cb6770c81a8fc63e7|schema=7d3c55c22f02f8825008521e4c20cd304a7c12f3679743b34f5a2bf315d19d7b",
-        "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=fb668e358567d9f190722d9edb8451d84bc0c912069616661ba9cbdf7b22971d|schema=57cfb3efa989cf3bff210bcfa65bb8d17184fb8622025b3c27bd9ec67c594a20",
+        "10|ask_oracle|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=c4a66485b2bb30ae851e9d5e448dd02d4e839e7c0f401eb2d71fc5368115e358|schema=841c868cfe3c93af4f8bc7a53a504b96867ea50a655d366fde48c91ee9e2e6f0",
         "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=788f198c056f825fccbbb4b47d7ac73fd966720a5b25bd2ad4a4a59a88d25646|schema=fe707d3b115d3a22103ad81b217af7025030616179849ad4d326db4597c14b78",
-        "12|oracle_chat_log|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=5acbb74a0fcf76bd3717faac8fc355f582f13523685d3bfebf11fda7241958b1|schema=50db94327abe785e20d3628135efa29cf184d18272d5af5b94a43d7246a4a201",
+        "12|oracle_chat_log|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=48e4697cb8489f95351b4cbb2b6b38ef2d842527b23e6a4ce5fd4cd67cdd5320|schema=94345e29237a1bf1d5fbba4e28cd618ecbbd9505ff3cacad657fa6bff202dfc8",
         "13|git|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=1a9ff83872cf8842146dd84563dd880f7d9b8f6190cc6e9204a0ea82fc8feca6|schema=51bd804997d6acfaa17d529867f6188b969282a4db95956e859a74ab07de626a",
         "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",

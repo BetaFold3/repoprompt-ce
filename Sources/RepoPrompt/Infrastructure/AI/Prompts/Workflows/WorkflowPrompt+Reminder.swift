@@ -44,8 +44,10 @@ Continue your current workflow using \(toolDesc) instead of built-in alternative
 When the user asks for one or more named Oracles, treat each name as a model-preset selector:
 
 1. Call `oracle_utils op=models` and resolve every requested name against the authoritative list. Prefer the returned exact preset UUID; do not guess when a name is missing or ambiguous.
-2. For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and an explicit `model`. `chat_name` is display-only and never selects a model.
+2. For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and an explicit `model`. `chat_name` is display-only and never selects a model. Refer to lanes by preset alias only, and never relay one lane's metadata to another.
 3. Before comparing or synthesizing, verify every result's returned `model_preset_id` and `model_preset_name` match the requested preset. If identity is missing, mismatched, or a lane fails, report the failure and do not synthesize.
+
+Every Oracle send re-packages the current workspace selection and the full chat history. Prune the selection before another turn, or continue a long lane in a fresh chat with a concise summary.
 
 ## Agent Delegation — `agent_run` / `agent_manage`
 

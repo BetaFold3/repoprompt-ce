@@ -381,6 +381,12 @@ struct GlobalScalarPreferences: Codable, Equatable {
         /// Preferred width of the Agent Mode right utility panel, stored unscaled (at the
         /// `.normal` font preset) so the value stays stable across font-scale changes.
         var agentUtilityPanelWidth: Double?
+        /// When true, transcript unified-diff and tool code-block fallbacks wrap lines instead of
+        /// scrolling horizontally. Defaults off so today's clipping + h-scroll path stays unchanged.
+        var wrapTranscriptDiffLines: Bool?
+        /// Optional PostScript face name for transcript code/diff rendering. `nil` keeps today's
+        /// system monospaced behavior; invalid/uninstalled faces fall back silently at resolve time.
+        var transcriptCodeFontPostScriptName: String?
 
         init(
             appearanceMode: String? = nil,
@@ -392,7 +398,9 @@ struct GlobalScalarPreferences: Codable, Equatable {
             enableKeyboardShortcuts: Bool? = nil,
             fontScaleBodySize: Double? = nil,
             showDatesInMessageTimestamps: Bool? = nil,
-            agentUtilityPanelWidth: Double? = nil
+            agentUtilityPanelWidth: Double? = nil,
+            wrapTranscriptDiffLines: Bool? = nil,
+            transcriptCodeFontPostScriptName: String? = nil
         ) {
             self.appearanceMode = appearanceMode
             self.useTransparency = useTransparency
@@ -404,6 +412,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.fontScaleBodySize = fontScaleBodySize
             self.showDatesInMessageTimestamps = showDatesInMessageTimestamps
             self.agentUtilityPanelWidth = agentUtilityPanelWidth
+            self.wrapTranscriptDiffLines = wrapTranscriptDiffLines
+            self.transcriptCodeFontPostScriptName = transcriptCodeFontPostScriptName
         }
     }
 

@@ -14,11 +14,14 @@ struct MarkdownRenderSignature: Equatable {
     let fontSize: CGFloat
     let forceTextColor: Color?
     let useMonospaced: Bool
+    /// Resolved transcript code-font face identity (system or custom).
+    let codeFontFaceIdentity: String
 
     func hasSameRenderingConfiguration(as other: Self) -> Bool {
         fontSize == other.fontSize &&
             forceTextColor == other.forceTextColor &&
-            useMonospaced == other.useMonospaced
+            useMonospaced == other.useMonospaced &&
+            codeFontFaceIdentity == other.codeFontFaceIdentity
     }
 
     func isAppendOnlyRelative(to other: Self) -> Bool {
@@ -435,8 +438,16 @@ struct MarkdownTextView: View, Equatable {
     private let allowsStreamingSegmentation: Bool
     @Environment(\.markdownFileLinkOpener) private var markdownFileLinkOpener
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
+    }
+
+    private var resolvedCodeFont: TranscriptCodeFontResolver.Resolved {
+        TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: globalSettings.transcriptCodeFontPostScriptName(),
+            pointSize: CGFloat(fontPreset.rawValue)
+        )
     }
 
     @State private var attributedText: NSAttributedString?
@@ -472,7 +483,9 @@ struct MarkdownTextView: View, Equatable {
             lhs.useMonospaced == rhs.useMonospaced &&
             lhs.renderCadence == rhs.renderCadence &&
             lhs.allowsStreamingSegmentation == rhs.allowsStreamingSegmentation &&
-            lhs.fontScale.preset.scaleFactor == rhs.fontScale.preset.scaleFactor
+            lhs.fontScale.preset.scaleFactor == rhs.fontScale.preset.scaleFactor &&
+            lhs.globalSettings.transcriptCodeFontPostScriptName()
+            == rhs.globalSettings.transcriptCodeFontPostScriptName()
     }
 
     var body: some View {
@@ -526,7 +539,8 @@ struct MarkdownTextView: View, Equatable {
                 text: text,
                 fontSize: CGFloat(fontPreset.rawValue),
                 forceTextColor: forceTextColor,
-                useMonospaced: useMonospaced
+                useMonospaced: useMonospaced,
+                codeFontFaceIdentity: resolvedCodeFont.fingerprint.faceIdentity
             ),
             cadence: renderCadence
         )
@@ -550,9 +564,11 @@ struct MarkdownTextView: View, Equatable {
         if let compiled = attributedText {
             return compiled
         }
-        let font = useMonospaced ?
-            NSFont.monospacedSystemFont(ofSize: CGFloat(fontPreset.rawValue), weight: .regular) :
+        let font: NSFont = if useMonospaced {
+            resolvedCodeFont.font
+        } else {
             NSFont.systemFont(ofSize: CGFloat(fontPreset.rawValue))
+        }
         let color = forceTextColor.map { NSColor($0) } ?? NSColor.textColor
         return NSAttributedString(string: text, attributes: [
             .font: font,
@@ -645,6 +661,10 @@ struct MarkdownTextView: View, Equatable {
         compiler.fontSize = signature.fontSize
         compiler.forceTextColor = signature.forceTextColor
         compiler.useMonospaced = signature.useMonospaced
+        compiler.codeFont = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: signature.codeFontFaceIdentity,
+            pointSize: signature.fontSize
+        ).font
         var compiled = compiler.attributedString(from: document)
         if let forceTextColor = signature.forceTextColor {
             compiled = applyTextColor(compiled, color: forceTextColor)

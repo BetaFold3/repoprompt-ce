@@ -22,6 +22,10 @@ struct MCPOracleToolService {
         _ conversationAgentSessionID: UUID?,
         _ conversationAgentRunID: UUID?
     ) async throws -> OracleViewModel.OracleSendPackagingContext?
+    typealias ResolveExplicitSliceSelection = @MainActor @Sendable (
+        _ slices: Value,
+        _ lookupContext: WorkspaceLookupContext
+    ) async throws -> StoredSelection
 
     let askOracleToolName: String
     let oracleSendToolName: String
@@ -33,6 +37,7 @@ struct MCPOracleToolService {
     let requireCurrentTabContext: (String) async throws -> TabScopedContext
     let stabilizedVirtualContext: StabilizedVirtualContext
     let resolveDelegatedReviewPackaging: ResolveDelegatedReviewPackaging
+    let resolveExplicitSliceSelection: ResolveExplicitSliceSelection
     let rebindChatSessionIfNeeded: (_ metadata: RequestMetadata, _ chatIDString: String) throws -> Void
     let resolveTabIDForAgentMode: (_ args: [String: Value], _ connectionID: UUID?) async throws -> UUID
     let requireTargetWindow: () throws -> WindowState
@@ -74,13 +79,13 @@ struct MCPOracleToolService {
             throw MCPError.invalidParams("oracle_chat_log requires an active MCP connection")
         }
 
-        let allowedArgs: Set = ["chat_id", "limit", "include_user"]
+        let allowedArgs: Set = ["chat_id", "limit", "include_user", "max_chars", "part", "max_total_chars"]
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "oracle_chat_log only accepts: chat_id, limit, include_user. Unsupported args: \(unsupported.joined(separator: ", "))"
+                "oracle_chat_log only accepts: chat_id, limit, include_user, max_chars, part, max_total_chars. Unsupported args: \(unsupported.joined(separator: ", "))"
             )
         }
 
@@ -89,6 +94,22 @@ struct MCPOracleToolService {
         }
         if let includeUserValue = args["include_user"], includeUserValue.boolValue == nil {
             throw MCPError.invalidParams("include_user must be a boolean")
+        }
+        if let maxCharsValue = args["max_chars"] {
+            guard let maxChars = maxCharsValue.intValue, maxChars > 0 else {
+                throw MCPError.invalidParams("max_chars must be a positive integer")
+            }
+        }
+        if let maxTotalCharsValue = args["max_total_chars"] {
+            guard let maxTotalChars = maxTotalCharsValue.intValue, maxTotalChars > 0 else {
+                throw MCPError.invalidParams("max_total_chars must be a positive integer")
+            }
+        }
+        if let partValue = args["part"] {
+            guard let partRaw = partValue.stringValue else {
+                throw MCPError.invalidParams("part must be a string")
+            }
+            _ = try OracleChatLogPart.parse(partRaw)
         }
         if let chatIDValue = args["chat_id"] {
             guard let chatIDRaw = chatIDValue.stringValue else {
@@ -125,27 +146,399 @@ struct MCPOracleToolService {
 
     // MARK: - ask_oracle (agent-mode only)
 
+    /// Matches `OracleViewModel.maxConcurrentMCPOracleStreamsPerTab`.
+    private static let batchMaxConcurrentStreams = 2
+
+    private static let singleAskOracleArgs: Set<String> = [
+        "message", "mode", "chat_id", "new_chat", "model", "chat_name",
+        "export_response", "selection_mode", "slices", "max_output_tokens", "response_mode"
+    ]
+
+    private static let batchAskOracleArgs: Set<String> = [
+        "consultations", "require_distinct"
+    ]
+
     func executeAskOracle(args: [String: Value]) async throws -> Value {
-        let allowedArgs: Set = ["message", "mode", "chat_id", "new_chat", "model", "chat_name", "export_response"]
+        let hasConsultations = args["consultations"] != nil
+        if hasConsultations {
+            return try await executeAskOracleBatch(args: args)
+        }
+        return try await executeAskOracleSingle(args: args)
+    }
+
+    private func executeAskOracleSingle(args: [String: Value]) async throws -> Value {
         let unsupported = args.keys
-            .filter { !$0.hasPrefix("_") && !allowedArgs.contains($0) }
+            .filter { !$0.hasPrefix("_") && !Self.singleAskOracleArgs.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, chat_name, export_response. Unsupported args: \(unsupported.joined(separator: ", "))"
+                "ask_oracle only accepts: message, mode, chat_id, new_chat, model, chat_name, export_response, selection_mode, slices, max_output_tokens, response_mode. Unsupported args: \(unsupported.joined(separator: ", ")). For multiple independent lanes use consultations."
             )
         }
 
         try validateCommonOracleArgs(args)
+        if let responseModeValue = args["response_mode"], responseModeValue.stringValue == nil {
+            throw MCPError.invalidParams("response_mode must be a string")
+        }
+        let responseMode = try OracleResponseMode.parse(args["response_mode"]?.stringValue)
 
         guard let connectionID = ServerNetworkManager.currentConnectionID else {
             throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
         }
 
+        await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
+        var result = try await withHeartbeat(
+            connectionID,
+            askOracleToolName,
+            "waiting",
+            "Waiting for Oracle response..."
+        ) {
+            try await performAskOracleSend(args: args, connectionID: connectionID)
+        }
+
+        try await finalizeAskOracleResult(
+            &result,
+            args: args,
+            responseMode: responseMode,
+            exportResponse: parseExportResponseFlag(args)
+        )
+
+        await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle complete")
+        return Self.agentFacingOracleResult(.object(result))
+    }
+
+    private func executeAskOracleBatch(args: [String: Value]) async throws -> Value {
+        let unsupported = args.keys
+            .filter { !$0.hasPrefix("_") && !Self.batchAskOracleArgs.contains($0) }
+            .sorted()
+        if !unsupported.isEmpty {
+            throw MCPError.invalidParams(
+                "ask_oracle consultations is mutually exclusive with single-send parameters. Unsupported args with consultations: \(unsupported.joined(separator: ", ")). Allowed batch args: consultations, require_distinct."
+            )
+        }
+
+        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+            throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
+        }
+
+        guard let consultationsValue = args["consultations"],
+              let consultationItems = consultationsValue.arrayValue
+        else {
+            throw MCPError.invalidParams("consultations must be a non-empty array")
+        }
+        guard !consultationItems.isEmpty else {
+            throw MCPError.invalidParams("consultations must be a non-empty array")
+        }
+
+        let requireDistinct: Bool
+        if let requireDistinctValue = args["require_distinct"] {
+            guard let boolValue = requireDistinctValue.boolValue else {
+                throw MCPError.invalidParams("require_distinct must be a boolean")
+            }
+            requireDistinct = boolValue
+        } else {
+            requireDistinct = false
+        }
+
+        var parsedItems: [AskOracleConsultationItem] = []
+        parsedItems.reserveCapacity(consultationItems.count)
+        for (index, itemValue) in consultationItems.enumerated() {
+            guard let object = itemValue.objectValue else {
+                throw MCPError.invalidParams("consultations[\(index)] must be an object")
+            }
+            try parsedItems.append(parseConsultationItem(object, index: index))
+        }
+
+        // Fail closed before any lane spends money or creates chats.
+        if requireDistinct {
+            try validateDistinctConsultationPresets(parsedItems)
+        }
+
+        await sendStageProgress(
+            connectionID,
+            askOracleToolName,
+            "starting",
+            "Starting \(parsedItems.count) Oracle consultations..."
+        )
+
+        let capturedItems = parsedItems
+        let maxConcurrent = Self.batchMaxConcurrentStreams
+        let envelope = try await withHeartbeat(
+            connectionID,
+            askOracleToolName,
+            "waiting",
+            "Waiting for Oracle consultations..."
+        ) {
+            let collected = try await withThrowingTaskGroup(of: (Int, Value).self) { group in
+                var nextIndex = 0
+                var inFlight = 0
+                var collected = Array(repeating: Value.null, count: capturedItems.count)
+
+                func startNextIfPossible() {
+                    while inFlight < maxConcurrent, nextIndex < capturedItems.count {
+                        let index = nextIndex
+                        let item = capturedItems[index]
+                        nextIndex += 1
+                        inFlight += 1
+                        group.addTask { @MainActor in
+                            let value = await executeConsultationItem(
+                                item,
+                                index: index,
+                                connectionID: connectionID
+                            )
+                            return (index, value)
+                        }
+                    }
+                }
+
+                startNextIfPossible()
+                while inFlight > 0 {
+                    let (index, value) = try await group.next()!
+                    collected[index] = value
+                    inFlight -= 1
+                    startNextIfPossible()
+                }
+                return collected
+            }
+            return ["results": .array(collected)]
+        }
+
+        await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle consultations complete")
+        return Self.agentFacingOracleResult(.object(envelope))
+    }
+
+    private struct AskOracleConsultationItem {
+        let message: String
+        let model: String
+        let mode: String
+        let chatName: String?
+        let responseMode: OracleResponseMode
+    }
+
+    private func parseConsultationItem(
+        _ object: [String: Value],
+        index: Int
+    ) throws -> AskOracleConsultationItem {
+        let allowed: Set = ["message", "model", "mode", "chat_name", "response_mode"]
+        let unsupported = object.keys.filter { !allowed.contains($0) }.sorted()
+        if !unsupported.isEmpty {
+            throw MCPError.invalidParams(
+                "consultations[\(index)] only accepts: message, model, mode, chat_name, response_mode. Unsupported: \(unsupported.joined(separator: ", "))"
+            )
+        }
+
+        let message = (object["message"]?.stringValue ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else {
+            throw MCPError.invalidParams("consultations[\(index)].message cannot be empty")
+        }
+
+        guard let modelRaw = object["model"]?.stringValue else {
+            throw MCPError.invalidParams(
+                "consultations[\(index)].model is required (exact preset UUID or name)"
+            )
+        }
+        let model = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty else {
+            throw MCPError.invalidParams("consultations[\(index)].model cannot be empty")
+        }
+
+        if let modeValue = object["mode"], modeValue.stringValue == nil {
+            throw MCPError.invalidParams("consultations[\(index)].mode must be a string")
+        }
+        let modeRaw = object["mode"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? "chat"
+        guard ["chat", "plan", "review"].contains(modeRaw) else {
+            throw MCPError.invalidParams(
+                "consultations[\(index)].mode must be one of: chat, plan, review"
+            )
+        }
+
+        let chatName: String?
+        if let chatNameValue = object["chat_name"] {
+            guard let raw = chatNameValue.stringValue else {
+                throw MCPError.invalidParams("consultations[\(index)].chat_name must be a string")
+            }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw MCPError.invalidParams(
+                    "consultations[\(index)].chat_name cannot be empty when provided"
+                )
+            }
+            chatName = trimmed
+        } else {
+            chatName = nil
+        }
+
+        if let responseModeValue = object["response_mode"],
+           responseModeValue.stringValue == nil
+        {
+            throw MCPError.invalidParams(
+                "consultations[\(index)].response_mode must be a string"
+            )
+        }
+        let responseMode = try OracleResponseMode.parse(object["response_mode"]?.stringValue)
+        try validateNewChatModelSelection(newChat: true, model: model, mode: modeRaw)
+
+        return AskOracleConsultationItem(
+            message: message,
+            model: model,
+            mode: modeRaw,
+            chatName: chatName,
+            responseMode: responseMode
+        )
+    }
+
+    private func validateDistinctConsultationPresets(
+        _ items: [AskOracleConsultationItem]
+    ) throws {
+        let configuredPresets = ModelPresetsManager.shared.allPresets()
+        var seen: [String: Int] = [:]
+        for (index, item) in items.enumerated() {
+            let key = if let preset = Self.exactModelPresetMatch(item.model, in: configuredPresets) {
+                "preset:\(preset.id.uuidString)"
+            } else {
+                "raw:\(item.model.lowercased())"
+            }
+            if let prior = seen[key] {
+                throw MCPError.invalidParams(
+                    "require_distinct:true rejected consultations[\(prior)] and consultations[\(index)] because they resolve to the same preset/model. No lanes were started."
+                )
+            }
+            seen[key] = index
+        }
+    }
+
+    private func executeConsultationItem(
+        _ item: AskOracleConsultationItem,
+        index: Int,
+        connectionID: UUID
+    ) async -> Value {
+        var itemArgs: [String: Value] = [
+            "message": .string(item.message),
+            "mode": .string(item.mode),
+            "new_chat": .bool(true),
+            "model": .string(item.model),
+            "response_mode": .string(item.responseMode.rawValue)
+        ]
+        if let chatName = item.chatName {
+            itemArgs["chat_name"] = .string(chatName)
+        }
+
+        do {
+            var result = try await performAskOracleSend(args: itemArgs, connectionID: connectionID)
+            try await finalizeAskOracleResult(
+                &result,
+                args: itemArgs,
+                responseMode: item.responseMode,
+                exportResponse: false
+            )
+            result["ok"] = .bool(true)
+            result["index"] = .int(index)
+            return .object(result)
+        } catch let error as ChatToolError {
+            var payload = error.toMCPValue().objectValue ?? [:]
+            payload["ok"] = .bool(false)
+            payload["index"] = .int(index)
+            return .object(payload)
+        } catch {
+            return .object([
+                "ok": .bool(false),
+                "index": .int(index),
+                "error": .object([
+                    "code": .string(ChatToolErrorCode.invalidParams.rawValue),
+                    "message": .string(error.localizedDescription)
+                ])
+            ])
+        }
+    }
+
+    private func finalizeAskOracleResult(
+        _ result: inout [String: Value],
+        args: [String: Value],
+        responseMode: OracleResponseMode,
+        exportResponse: Bool
+    ) async throws {
+        let modeRaw = args["mode"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? "chat"
+        let message = (args["message"]?.stringValue ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let chatID = result["chat_id"]?.stringValue
+            ?? args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        do {
+            let needsExport = exportResponse || responseMode != .full
+            let exportDestination: OracleExportDestination?
+            if needsExport {
+                let targetWindow = try requireTargetWindow()
+                let tabID = try await resolveTabIDForAgentMode(
+                    args,
+                    ServerNetworkManager.currentConnectionID
+                )
+                let requestContext = try? await requireCurrentTabContext(askOracleToolName)
+                let owner = await resolveAgentOracleOwner(
+                    tabID: tabID,
+                    targetWindow: targetWindow,
+                    tabContext: (requestContext?.tabID == tabID) ? requestContext : nil
+                )
+                let lookupContext = await (try? oraclePackagingLookupContext(owner: owner))
+                    ?? .visibleWorkspace
+                exportDestination = try MCPServerViewModel.makeOracleExportDestination(
+                    workspace: targetWindow.workspaceManager.activeWorkspace,
+                    windowID: targetWindow.windowID,
+                    tabID: tabID,
+                    lookupContext: lookupContext
+                )
+            } else {
+                exportDestination = nil
+            }
+
+            try await OracleResponsePresentation.applyResponseMode(
+                to: &result,
+                mode: responseMode
+            ) { response in
+                try await exportOracleResponse(OracleExportRequest(
+                    sourceTool: askOracleToolName,
+                    mode: modeRaw,
+                    message: message,
+                    chatID: chatID,
+                    response: response,
+                    destination: exportDestination
+                ))
+            }
+
+            if exportResponse, responseMode == .full, let exportDestination {
+                let export = try await exportOracleResponse(OracleExportRequest(
+                    sourceTool: askOracleToolName,
+                    mode: modeRaw,
+                    message: message,
+                    chatID: chatID,
+                    response: result["response"]?.stringValue,
+                    destination: exportDestination
+                ))
+                result["oracle_export_path"] = .string(export.path)
+                result["oracle_export_instruction"] = .string(export.instruction)
+            }
+        } catch {
+            guard responseMode != .full else { throw error }
+            result["response_mode"] = .string(OracleResponseMode.full.rawValue)
+            result["export_failed_warning"] = .string(
+                "Oracle export failed after the response completed; returning the full response inline. \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func performAskOracleSend(
+        args: [String: Value],
+        connectionID: UUID
+    ) async throws -> [String: Value] {
         let message = (args["message"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let modeRaw = args["mode"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "chat"
-        let exportResponse = try parseExportResponseFlag(args)
         let newChat = args["new_chat"]?.boolValue ?? false
+        let selectionMode = try parseSelectionMode(args, newChat: newChat)
+        let maxOutputTokens = try parseMaxOutputTokens(args)
         let chatID = args["chat_id"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedChatID = (chatID?.isEmpty == false) ? chatID : nil
         let model = args["model"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -177,7 +570,7 @@ struct MCPOracleToolService {
         }
 
         let owner = await resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: virtualContext)
-        let tabContext: OracleViewModel.OracleSendTabContext
+        var tabContext: OracleViewModel.OracleSendTabContext
         if let virtualContext, virtualContext.tabID == tabID {
             tabContext = try await oracleSendTabContext(
                 from: virtualContext,
@@ -232,16 +625,34 @@ struct MCPOracleToolService {
             )
         }
 
-        let exportDestination: OracleExportDestination? = if exportResponse {
-            try MCPServerViewModel.makeOracleExportDestination(
-                workspace: targetWindow.workspaceManager.activeWorkspace,
-                windowID: targetWindow.windowID,
-                tabID: tabID,
-                lookupContext: tabContext.packaging.lookupContext ?? .visibleWorkspace
-            )
+        let explicitSelection: StoredSelection?
+        if selectionMode == .explicitSlices {
+            guard let slices = args["slices"] else {
+                throw MCPError.invalidParams(
+                    "selection_mode:explicit_slices requires a non-empty slices array"
+                )
+            }
+            guard let lookupContext = tabContext.packaging.lookupContext else {
+                throw MCPError.invalidParams(
+                    "selection_mode:explicit_slices requires an available workspace lookup context"
+                )
+            }
+            explicitSelection = try await resolveExplicitSliceSelection(slices, lookupContext)
         } else {
-            nil
+            explicitSelection = nil
         }
+        let sendPackaging = tabContext.packaging.applying(
+            selectionMode: selectionMode,
+            explicitSelection: explicitSelection
+        )
+        tabContext = OracleViewModel.OracleSendTabContext(
+            tabID: tabContext.tabID,
+            workspaceID: tabContext.workspaceID,
+            origin: tabContext.origin,
+            agentModeSessionID: tabContext.agentModeSessionID,
+            agentModeRunID: tabContext.agentModeRunID,
+            packaging: sendPackaging
+        )
 
         var chatArgs: [String: Value] = [
             "message": .string(message),
@@ -257,34 +668,12 @@ struct MCPOracleToolService {
         if let chatName {
             chatArgs["chat_name"] = .string(chatName)
         }
-
-        await sendStageProgress(connectionID, askOracleToolName, "starting", "Starting Oracle...")
-
-        let capturedChatArgs = chatArgs
-        var result = try await withHeartbeat(
-            connectionID,
-            askOracleToolName,
-            "waiting",
-            "Waiting for Oracle response..."
-        ) {
-            try await sendChat(capturedChatArgs, promptVM, tabContext)
+        chatArgs["selection_mode"] = .string(selectionMode.rawValue)
+        if let maxOutputTokens {
+            chatArgs["max_output_tokens"] = .int(maxOutputTokens)
         }
 
-        if exportResponse {
-            let export = try await exportOracleResponse(OracleExportRequest(
-                sourceTool: askOracleToolName,
-                mode: modeRaw,
-                message: message,
-                chatID: result["chat_id"]?.stringValue ?? normalizedChatID,
-                response: result["response"]?.stringValue,
-                destination: exportDestination
-            ))
-            result["oracle_export_path"] = .string(export.path)
-            result["oracle_export_instruction"] = .string(export.instruction)
-        }
-
-        await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle complete")
-        return .object(result)
+        return try await sendChat(chatArgs, promptVM, tabContext)
     }
 
     // MARK: - oracle_send
@@ -388,7 +777,39 @@ struct MCPOracleToolService {
         }
 
         await sendStageProgress(connectionID, oracleSendToolName, "complete", "Oracle complete")
-        return .object(result)
+        return Self.agentFacingOracleResult(.object(result))
+    }
+
+    /// Removes app-only Oracle identity fields at the final MCP serialization boundary.
+    /// Preset-backed results also hide legacy provider identity throughout their nested shape.
+    /// Tool-card sidecars consume the internal result before this projection.
+    private static func agentFacingOracleResult(
+        _ value: Value,
+        insidePresetResult: Bool = false
+    ) -> Value {
+        if var object = value.objectValue {
+            let hidesProviderIdentity = insidePresetResult
+                || object["model_source"]?.stringValue == "preset"
+            object.removeValue(forKey: "ui_model_id")
+            object.removeValue(forKey: "ui_model_name")
+            if hidesProviderIdentity {
+                object.removeValue(forKey: "model_id")
+                object.removeValue(forKey: "model_name")
+            }
+            for (key, child) in object {
+                object[key] = agentFacingOracleResult(
+                    child,
+                    insidePresetResult: hidesProviderIdentity
+                )
+            }
+            return .object(object)
+        }
+        if let array = value.arrayValue {
+            return .array(array.map {
+                agentFacingOracleResult($0, insidePresetResult: insidePresetResult)
+            })
+        }
+        return value
     }
 
     // MARK: - Shared helpers
@@ -401,6 +822,55 @@ struct MCPOracleToolService {
         return boolValue
     }
 
+    private func parseSelectionMode(
+        _ args: [String: Value],
+        newChat: Bool
+    ) throws -> OracleViewModel.OracleSelectionMode {
+        if let value = args["selection_mode"], value.stringValue == nil {
+            throw MCPError.invalidParams("selection_mode must be a string")
+        }
+        let raw = args["selection_mode"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? OracleViewModel.OracleSelectionMode.current.rawValue
+        guard let mode = OracleViewModel.OracleSelectionMode(rawValue: raw) else {
+            throw MCPError.invalidParams(
+                "selection_mode must be one of: current, none, explicit_slices"
+            )
+        }
+        let chatID = args["chat_id"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if newChat, mode != .current {
+            throw MCPError.invalidParams(
+                "selection_mode is only valid for continuation sends with an explicit chat_id"
+            )
+        }
+        if mode != .current, chatID?.isEmpty != false {
+            throw MCPError.invalidParams(
+                "selection_mode:\(mode.rawValue) requires an explicit chat_id for a continuation send"
+            )
+        }
+        if mode == .explicitSlices {
+            guard let slices = args["slices"], let array = slices.arrayValue, !array.isEmpty else {
+                throw MCPError.invalidParams(
+                    "selection_mode:explicit_slices requires a non-empty slices array"
+                )
+            }
+        } else if args["slices"] != nil {
+            throw MCPError.invalidParams(
+                "slices is only valid with selection_mode:explicit_slices"
+            )
+        }
+        return mode
+    }
+
+    private func parseMaxOutputTokens(_ args: [String: Value]) throws -> Int? {
+        guard let value = args["max_output_tokens"] else { return nil }
+        guard let tokens = value.intValue, tokens > 0 else {
+            throw MCPError.invalidParams("max_output_tokens must be a positive integer")
+        }
+        return tokens
+    }
+
     private func validateCommonOracleArgs(_ args: [String: Value]) throws {
         let message = (args["message"]?.stringValue ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -408,6 +878,9 @@ struct MCPOracleToolService {
             throw MCPError.invalidParams("message cannot be empty")
         }
 
+        if let modeValue = args["mode"], modeValue.stringValue == nil {
+            throw MCPError.invalidParams("mode must be a string")
+        }
         let modeRaw = args["mode"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? "chat"
@@ -538,38 +1011,29 @@ struct MCPOracleToolService {
 
         if usageState.allowsConfiguredPresets {
             for preset in configuredPresets {
+                let capabilities = preset.optionalModel.map(AIModelCapabilityMetadata.resolve) ?? .empty
                 models.append(ToolResultDTOs.ModelInfo(
                     id: preset.id.uuidString,
                     name: preset.name,
-                    description: preset.description,
-                    supportedModes: supportedModes(for: preset)
+                    description: nil,
+                    supportedModes: supportedModes(for: preset),
+                    contextWindow: capabilities.contextWindowTokens,
+                    maxOutputTokens: capabilities.maxOutputTokens
                 ))
             }
         } else {
             try models.append(defaultCurrentChatModelInfo())
         }
 
-        func bracketedModes(_ supportedModes: ToolResultDTOs.SupportedModesInfo?) -> String {
-            let modes = supportedModes ?? ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
-            var items: [String] = []
-            if modes.chat { items.append("Chat") }
-            if modes.plan { items.append("Plan") }
-            if modes.review { items.append("Review") }
-            return "[\(items.joined(separator: ", "))]"
-        }
-
-        var lines = ["Available models:"]
-        for model in models {
-            let modesText = bracketedModes(model.supportedModes)
-            let descText = (model.description?.isEmpty == false) ? " — \(model.description!)" : ""
-            lines.append("- \(model.id): \(model.name) — modes: \(modesText)\(descText)")
-        }
-
-        lines.append(contentsOf: Self.modelPresetDiagnosticLines(
+        let notes = Self.modelPresetDiagnosticLines(
             usageState: usageState,
             configuredPresets: configuredPresets
+        )
+        return try Value(ToolResultDTOs.ListModelsReply(
+            models: models,
+            total: models.count,
+            notes: notes.isEmpty ? nil : notes
         ))
-        return .string(lines.joined(separator: "\n"))
     }
 
     static func modelPresetDiagnosticLines(
@@ -624,7 +1088,9 @@ struct MCPOracleToolService {
             id: "current_chat_model",
             name: effectiveModel.displayName,
             description: "MCP Oracle Model",
-            supportedModes: ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true)
+            supportedModes: ToolResultDTOs.SupportedModesInfo(chat: true, plan: true, review: true),
+            contextWindow: AIModelCapabilityMetadata.contextWindowTokens(for: effectiveModel),
+            maxOutputTokens: effectiveModel.maxTokens
         )
     }
 

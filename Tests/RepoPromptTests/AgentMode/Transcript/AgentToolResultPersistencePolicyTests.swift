@@ -17,8 +17,8 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                 "status": "success",
                 "chat_id": "chat-123",
                 "mode": "review",
-                "model_id": "provider-model-id",
-                "model_name": "Fable",
+                "ui_model_id": "provider-model-id",
+                "ui_model_name": "Resolved Provider Model",
                 "model_selection": "explicit",
                 "model_source": "preset",
                 "model_preset_id": "11111111-2222-3333-4444-555555555555",
@@ -37,8 +37,8 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             if row.receivesOracleMetadata {
                 XCTAssertEqual(object["chat_id"] as? String, "chat-123", row.toolName)
                 XCTAssertEqual(object["mode"] as? String, "review", row.toolName)
-                XCTAssertEqual(object["model_id"] as? String, "provider-model-id", row.toolName)
-                XCTAssertEqual(object["model_name"] as? String, "Fable", row.toolName)
+                XCTAssertNil(object["model_id"], row.toolName)
+                XCTAssertNil(object["model_name"], row.toolName)
                 XCTAssertEqual(object["model_selection"] as? String, "explicit", row.toolName)
                 XCTAssertEqual(object["model_source"] as? String, "preset", row.toolName)
                 XCTAssertEqual(
@@ -55,6 +55,53 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                     "review • Claude_Fable_xhigh • 1 diff",
                     row.toolName
                 )
+
+                let uiIdentityJSON = try XCTUnwrap(
+                    AgentToolResultPersistencePolicy.uiFacingOracleIdentityJSON(
+                        toolName: row.toolName,
+                        rawResultJSON: raw
+                    )
+                )
+                let uiIdentity = try decodedObject(uiIdentityJSON)
+                XCTAssertEqual(uiIdentity["ui_model_id"] as? String, "provider-model-id", row.toolName)
+                XCTAssertEqual(uiIdentity["ui_model_name"] as? String, "Resolved Provider Model", row.toolName)
+                XCTAssertNil(uiIdentity["model_id"], row.toolName)
+                XCTAssertNil(uiIdentity["model_name"], row.toolName)
+
+                if row.toolName == "ask_oracle" {
+                    let item = AgentChatItem.toolResult(
+                        name: row.toolName,
+                        resultJSON: raw,
+                        isError: false
+                    )
+                    let transcript = AgentTranscriptIO.buildTranscript(
+                        from: [item],
+                        nextSequenceIndex: 1,
+                        policy: .canonical
+                    )
+                    let compactTranscript = AgentToolResultPersistencePolicy
+                        .sanitizeTranscriptForPersistence(transcript)
+                    let compactData = try JSONEncoder().encode(compactTranscript)
+                    let compactJSON = String(decoding: compactData, as: UTF8.self)
+                    XCTAssertFalse(compactJSON.contains("provider-model-id"), compactJSON)
+                    XCTAssertFalse(compactJSON.contains("Resolved Provider Model"), compactJSON)
+
+                    let handoff = AgentTranscriptIO.buildForkTranscriptXML(from: compactTranscript)
+                    XCTAssertFalse(handoff.contains("provider-model-id"), handoff)
+                    XCTAssertFalse(handoff.contains("Resolved Provider Model"), handoff)
+
+                    let persistedSession = AgentSession(
+                        items: [],
+                        uiToolResultPayloadsByItemID: [item.id.uuidString: uiIdentityJSON],
+                        transcript: compactTranscript
+                    )
+                    let persistedData = try JSONEncoder().encode(persistedSession)
+                    let restoredSession = try JSONDecoder().decode(AgentSession.self, from: persistedData)
+                    XCTAssertEqual(
+                        restoredSession.uiToolResultPayloadsByItemID[item.id.uuidString],
+                        uiIdentityJSON
+                    )
+                }
             } else {
                 XCTAssertNil(object["chat_id"], row.toolName)
                 XCTAssertNil(object["mode"], row.toolName)
@@ -77,6 +124,29 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             XCTAssertFalse(summary.resultJSON.contains(rawError), row.toolName)
             XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes, row.toolName)
         }
+
+        let nonPresetRaw = jsonString([
+            "status": "success",
+            "chat_id": "planning-chat",
+            "mode": "plan",
+            "model_id": "planning-model-id",
+            "model_name": "Planning Model",
+            "model_selection": "explicit",
+            "model_source": "planning_model",
+            "response": "done"
+        ])
+        let nonPresetSummary = try XCTUnwrap(
+            persistedSummary(toolName: "ask_oracle", rawResultJSON: nonPresetRaw)
+        )
+        let nonPresetObject = try decodedObject(nonPresetSummary.resultJSON)
+        XCTAssertEqual(nonPresetObject["model_id"] as? String, "planning-model-id")
+        XCTAssertEqual(nonPresetObject["model_name"] as? String, "Planning Model")
+        XCTAssertNil(
+            AgentToolResultPersistencePolicy.uiFacingOracleIdentityJSON(
+                toolName: "ask_oracle",
+                rawResultJSON: nonPresetRaw
+            )
+        )
     }
 
     func testContextBuilderPersistsOnlySelectedBoundedFollowUpRoutingMetadata() throws {

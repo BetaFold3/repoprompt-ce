@@ -223,6 +223,15 @@ struct AgentModeChatDetailView: View {
     @State private var isTranscriptWindowExpanded = false
     @StateObject private var viewportRegistry = AgentTranscriptViewportRegistry()
 
+    // MARK: - Assistant transcript search & ephemeral expansion (Workstream 5 item 1)
+
+    /// Ephemeral, id-keyed assistant collapse state. Owned per displayed session; reset in the
+    /// `currentTabID` change handler alongside `transcriptBlockExpansion`.
+    @StateObject private var assistantExpansionStore = AssistantTranscriptExpansionStore()
+    @StateObject private var assistantSearchVM = AgentAssistantTranscriptSearchViewModel()
+    @State private var isAssistantSearchActive = false
+    @State private var assistantSearchQuery = ""
+
     // MARK: - Computed Shims (bridge existing references to struct members)
 
     // These shims bridge existing references to struct members without renaming
@@ -1968,6 +1977,13 @@ struct AgentModeChatDetailView: View {
                     .padding(.bottom, 32 + composerBottomInset)
                 }
                 .animation(.easeInOut, value: shouldShowScrollToBottomButton)
+                .overlay(alignment: .top) { assistantSearchOverlay }
+                .onChange(of: assistantSearchQuery) { _, newValue in
+                    assistantSearchVM.updateQuery(newValue, blocks: visibleTranscriptBlocks)
+                }
+                .onChange(of: visibleTranscriptBlocks) { _, newBlocks in
+                    assistantSearchVM.updateSearchableBlocks(newBlocks)
+                }
                 .onAppear {
                     if let currentTabID {
                         agentModeVM.setCompressedHistoryVisibility(tabID: currentTabID, isRevealed: showCompressedHistory)
@@ -2126,6 +2142,10 @@ struct AgentModeChatDetailView: View {
                         pendingCompressionRestoreStrategy = nil
                         transcriptBlockExpansion.removeAll()
                         transcriptBlockDefaultExpansion.removeAll()
+                        assistantExpansionStore.reset()
+                        assistantSearchVM.clear()
+                        isAssistantSearchActive = false
+                        assistantSearchQuery = ""
                         hasUserInteractedWithScroll = false
                         isUserInteractingWithScroll = false
                         repinGraceState = nil
@@ -2179,6 +2199,10 @@ struct AgentModeChatDetailView: View {
                             agentModeVM.setCompressedHistoryVisibility(tabID: currentTabID, isRevealed: isRevealed)
                         }
                         applyPendingCompressionStrategy(proxy: proxy)
+                    }
+                    .onChange(of: assistantSearchVM.navigationEvent) { _, event in
+                        guard let event else { return }
+                        handleAssistantSearchNavigation(to: event.match, proxy: proxy)
                     }
             }
         }
@@ -2552,6 +2576,101 @@ struct AgentModeChatDetailView: View {
         versionedBottomSentinel
     }
 
+    // MARK: - Assistant Transcript Search (Workstream 5 item 1)
+
+    /// Floating chrome pinned to the top of the transcript: the always-available bulk-expansion
+    /// menu, the search toggle/close control, and — while active — the search bar itself.
+    private var assistantSearchOverlay: some View {
+        VStack(alignment: .trailing, spacing: 6) {
+            HStack(spacing: 6) {
+                Spacer(minLength: 0)
+                assistantBulkActionsMenu
+                if !isAssistantSearchActive {
+                    searchToggleButton
+                }
+            }
+            if isAssistantSearchActive {
+                AgentAssistantTranscriptSearchBarView(
+                    query: $assistantSearchQuery,
+                    counterText: assistantSearchVM.state.counterText,
+                    hasMatches: !assistantSearchVM.state.matches.isEmpty,
+                    onNext: { assistantSearchVM.selectNext() },
+                    onPrevious: { assistantSearchVM.selectPrevious() },
+                    onClose: closeAssistantSearch
+                )
+                .frame(maxWidth: 340)
+            }
+        }
+        .padding(.top, 10)
+        .padding(.trailing, 14)
+    }
+
+    private var searchToggleButton: some View {
+        Button {
+            isAssistantSearchActive = true
+        } label: {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(.regularMaterial))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .hoverTooltip("Search assistant replies")
+        .accessibilityLabel("Search assistant replies")
+        .accessibilityIdentifier("agentTranscript.assistantSearch.toggle")
+    }
+
+    /// Always available (independent of search being open) so the ephemeral bulk actions stay
+    /// reachable without requiring the search bar to be open first.
+    private var assistantBulkActionsMenu: some View {
+        Menu {
+            Button("Expand All Assistant Replies", action: expandAllAssistantReplies)
+                .disabled(assistantExpansionStore.expandAllAssistants)
+            Button("Restore Automatic Collapsing", action: assistantExpansionStore.restoreAutomaticCollapsing)
+                .disabled(!assistantExpansionStore.expandAllAssistants)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(.regularMaterial))
+                .contentShape(Circle())
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .hoverTooltip("Assistant reply bulk actions")
+        .accessibilityLabel("Assistant reply bulk actions")
+        .accessibilityIdentifier("agentTranscript.assistantSearch.bulkActions")
+    }
+
+    private func closeAssistantSearch() {
+        isAssistantSearchActive = false
+        assistantSearchQuery = ""
+        assistantSearchVM.clear()
+    }
+
+    /// Batches the state change and disables per-row animation so expanding hundreds of
+    /// assistant replies at once does not animate (and does not beachball).
+    private func expandAllAssistantReplies() {
+        performAgentToolCardExpansionStateUpdateWithoutAnimation {
+            assistantExpansionStore.expandAll()
+        }
+    }
+
+    /// Expand-on-match: force the matched row open, wait a layout pass (mirrors the
+    /// `DispatchQueue.main.async` idiom `ToolResultBashCard` already uses for expand-then-scroll,
+    /// since scrolling before the newly expanded content lays out drifts the anchor), then scroll
+    /// to it and flash it.
+    private func handleAssistantSearchNavigation(to match: AgentAssistantTranscriptSearchMatch, proxy: ScrollViewProxy) {
+        assistantExpansionStore.expand(match.id)
+        DispatchQueue.main.async {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                proxy.scrollTo(match.id, anchor: .center)
+            }
+            assistantSearchVM.flash(match.id)
+        }
+    }
+
     // MARK: - Structured Transcript Rows
 
     private struct TranscriptRenderContext {
@@ -2802,6 +2921,8 @@ struct AgentModeChatDetailView: View {
         .environment(\.agentLiveBashExecutionByItemID, transcriptSnapshot.activeBashLiveExecutionByItemID)
         .environment(\.agentRecentAssistantItemIDs, renderContext.recentAssistantItemIDs)
         .environment(\.agentApprovalVisible, renderContext.interactionBlockerVisible)
+        .environment(\.agentAssistantExpansionStore, assistantExpansionStore)
+        .environment(\.agentAssistantSearchFlashedItemID, assistantSearchVM.flashedItemID)
     }
 
     private func toolCardAutoExpandEnabled(for block: AgentTranscriptRenderBlock) -> Bool {

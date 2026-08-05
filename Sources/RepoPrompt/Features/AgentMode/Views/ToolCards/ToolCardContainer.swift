@@ -18,6 +18,14 @@ extension EnvironmentValues {
     @Entry var agentMessageRuntimeFooterByItemID: [UUID: AgentMessageRuntimeFooter] = [:]
 
     @Entry var agentApprovalVisible: Bool = false
+
+    /// Ephemeral, id-keyed collapse state for assistant transcript messages (Workstream 5 item 1).
+    /// Nil avoids constructing a main-actor store as a nonisolated EnvironmentValues default.
+    @Entry var agentAssistantExpansionStore: AssistantTranscriptExpansionStore?
+
+    /// The assistant message ID transcript search just navigated to, so its row can briefly
+    /// flash. Cleared automatically by `AgentAssistantTranscriptSearchViewModel`.
+    @Entry var agentAssistantSearchFlashedItemID: UUID?
 }
 
 enum AgentToolCardRenderedBashPhase: String, Equatable {

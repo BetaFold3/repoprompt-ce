@@ -105,6 +105,396 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     }
 
+    func testHandoffClonesOracleChatsIntoDestinationOwnershipAndPreservesFailClosedBoundaries() async throws {
+        try await withFixture { fixture in
+            let workspaceID = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace?.id)
+            let oracle = fixture.window.oracleViewModel
+            let sourceRunID = UUID()
+            let thirdPartySessionID = UUID()
+            let primarySourceChat = ChatSession(
+                workspaceID: workspaceID,
+                composeTabID: fixture.tabAID,
+                agentModeSessionID: fixture.sessionAID,
+                agentModeRunID: sourceRunID,
+                name: "Primary Handoff Oracle",
+                messages: [
+                    StoredMessage(isUser: true, rawText: "source question", sequenceIndex: 0),
+                    StoredMessage(isUser: false, rawText: "source answer", sequenceIndex: 1)
+                ]
+            )
+            let otherSourceChat = ChatSession(
+                workspaceID: workspaceID,
+                composeTabID: fixture.tabAID,
+                agentModeSessionID: fixture.sessionAID,
+                agentModeRunID: sourceRunID,
+                name: "Other Source Oracle",
+                messages: [StoredMessage(isUser: false, rawText: "other source answer", sequenceIndex: 0)]
+            )
+            let unownedSourceChat = ChatSession(
+                workspaceID: workspaceID,
+                composeTabID: fixture.tabAID,
+                name: "Unowned Source Oracle",
+                messages: [
+                    StoredMessage(
+                        isUser: false,
+                        rawText: "unowned source answer",
+                        sequenceIndex: 0
+                    )
+                ]
+            )
+            let foreignSourceChat = ChatSession(
+                workspaceID: workspaceID,
+                composeTabID: fixture.tabAID,
+                agentModeSessionID: thirdPartySessionID,
+                agentModeRunID: UUID(),
+                name: "Foreign Source Oracle",
+                messages: [
+                    StoredMessage(
+                        isUser: false,
+                        rawText: "foreign source answer",
+                        sequenceIndex: 0
+                    )
+                ]
+            )
+            let thirdPartyChat = ChatSession(
+                workspaceID: workspaceID,
+                composeTabID: fixture.tabBID,
+                agentModeSessionID: thirdPartySessionID,
+                agentModeRunID: UUID(),
+                name: "Third Party Oracle",
+                messages: [StoredMessage(isUser: false, rawText: "third party answer", sequenceIndex: 0)]
+            )
+            oracle.sessions = [
+                primarySourceChat,
+                otherSourceChat,
+                unownedSourceChat,
+                foreignSourceChat,
+                thirdPartyChat
+            ]
+            fixture.window.workspaceManager.setActiveChatSessionID(
+                primarySourceChat.id,
+                forTabID: fixture.tabAID
+            )
+
+            let invocationID = UUID()
+            let handoffModel = AIModel.claudeCodeSonnet
+            let oracleArgs = #"{"chat_id":"\#(primarySourceChat.shortID)"}"#
+            fixture.sessionA.setItemsSilently(
+                [
+                    .user("A user", sequenceIndex: 0),
+                    .toolCall(
+                        name: "ask_oracle",
+                        invocationID: invocationID,
+                        argsJSON: oracleArgs,
+                        sequenceIndex: 1
+                    ),
+                    .toolResult(
+                        name: "ask_oracle",
+                        invocationID: invocationID,
+                        argsJSON: oracleArgs,
+                        resultJSON: #"{"chat_id":"\#(primarySourceChat.shortID)","model_source":"preset","ui_model_id":"\#(handoffModel.rawValue)","ui_model_name":"\#(handoffModel.displayName)","response":"source answer"}"#,
+                        isError: false,
+                        sequenceIndex: 2
+                    ),
+                    .assistant(
+                        "Continue Oracle chat \(primarySourceChat.id.uuidString) from the surrounding prose.",
+                        sequenceIndex: 3
+                    )
+                ],
+                reason: .testOverride
+            )
+            fixture.viewModel.refreshDerivedTranscriptState(for: fixture.sessionA)
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffHeadless(
+                sourceTabID: fixture.tabAID,
+                upToItemID: nil,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+            let destinationSession = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            let destinationSessionID = try XCTUnwrap(destinationSession.activeAgentSessionID)
+            XCTAssertNotEqual(destinationSessionID, fixture.sessionAID)
+
+            let primaryClone = try XCTUnwrap(
+                oracle.sessions.first {
+                    $0.composeTabID == destinationTabID && $0.name == primarySourceChat.name
+                }
+            )
+            let otherClone = try XCTUnwrap(
+                oracle.sessions.first {
+                    $0.composeTabID == destinationTabID && $0.name == otherSourceChat.name
+                }
+            )
+            for clone in [primaryClone, otherClone] {
+                XCTAssertEqual(clone.agentModeSessionID, destinationSessionID)
+                XCTAssertNil(clone.agentModeRunID)
+            }
+
+            let payload = try XCTUnwrap(destinationSession.pendingHandoff.payload)
+            XCTAssertTrue(
+                payload.contains(
+                    #"<tool_call name="ask_oracle">{"chat_id":"\#(primaryClone.shortID)"}"#
+                )
+            )
+            XCTAssertTrue(
+                payload.contains(
+                    "Continue Oracle chat \(primarySourceChat.id.uuidString) from the surrounding prose."
+                )
+            )
+            XCTAssertTrue(payload.contains("<oracle_chat_id_mapping>"))
+            XCTAssertFalse(payload.contains(handoffModel.rawValue), payload)
+            XCTAssertFalse(payload.contains(handoffModel.displayName), payload)
+            XCTAssertNil(
+                oracle.sessions.first {
+                    $0.composeTabID == destinationTabID
+                        && $0.name == unownedSourceChat.name
+                }
+            )
+            XCTAssertNil(
+                oracle.sessions.first {
+                    $0.composeTabID == destinationTabID
+                        && $0.name == foreignSourceChat.name
+                }
+            )
+            XCTAssertTrue(
+                payload.contains(
+                    "| \(primarySourceChat.id.uuidString) | \(primaryClone.shortID) |"
+                )
+            )
+            XCTAssertTrue(
+                payload.contains(
+                    "| \(primarySourceChat.shortID) | \(primaryClone.shortID) |"
+                )
+            )
+            XCTAssertTrue(
+                payload.contains(
+                    "| \(otherSourceChat.id.uuidString) | \(otherClone.shortID) |"
+                )
+            )
+            XCTAssertTrue(
+                payload.contains(
+                    "| \(otherSourceChat.shortID) | \(otherClone.shortID) |"
+                )
+            )
+
+            let destinationRunID = UUID()
+            let continuedID = try await oracle.locateOrCreateChat(
+                primaryClone.shortID,
+                tabID: destinationTabID,
+                activateInUI: false,
+                agentModeSessionID: destinationSessionID,
+                agentModeRunID: destinationRunID
+            )
+            XCTAssertEqual(continuedID, primaryClone.id)
+            let continuedClone = try XCTUnwrap(
+                oracle.sessions.first(where: { $0.id == primaryClone.id })
+            )
+            XCTAssertEqual(continuedClone.agentModeSessionID, destinationSessionID)
+            XCTAssertEqual(continuedClone.agentModeRunID, destinationRunID)
+
+            let log = try await oracle.tool_oracleChatLog(
+                args: [
+                    "chat_id": .string(primaryClone.shortID),
+                    "include_user": .bool(true)
+                ],
+                tabID: destinationTabID,
+                agentModeSessionID: destinationSessionID,
+                agentModeRunID: destinationRunID
+            )
+            XCTAssertEqual(log["chat_id"]?.stringValue, primaryClone.shortID)
+            let loggedTexts = log["messages"]?.arrayValue?.compactMap {
+                $0.objectValue?["text"]?.stringValue
+            }
+            XCTAssertEqual(loggedTexts, ["source question", "source answer"])
+
+            do {
+                _ = try await oracle.locateOrCreateChat(
+                    primarySourceChat.shortID,
+                    tabID: destinationTabID,
+                    activateInUI: false,
+                    agentModeSessionID: destinationSessionID,
+                    agentModeRunID: destinationRunID
+                )
+                XCTFail("Expected the old chat ID to remain invalid")
+            } catch let error as ChatToolError {
+                XCTAssertEqual(error.code, .invalidParams)
+                XCTAssertTrue(error.message.contains("was cloned during handoff"))
+                XCTAssertTrue(error.message.contains(primaryClone.shortID))
+            }
+
+            do {
+                _ = try await oracle.tool_oracleChatLog(
+                    args: ["chat_id": .string(primarySourceChat.shortID)],
+                    tabID: destinationTabID,
+                    agentModeSessionID: destinationSessionID,
+                    agentModeRunID: destinationRunID
+                )
+                XCTFail("Expected oracle_chat_log to reject the old chat ID")
+            } catch let error as ChatToolError {
+                XCTAssertTrue(error.message.contains("was cloned during handoff"))
+                XCTAssertTrue(error.message.contains(primaryClone.shortID))
+            }
+
+            do {
+                _ = try await oracle.locateOrCreateChat(
+                    otherSourceChat.shortID,
+                    tabID: destinationTabID,
+                    activateInUI: false,
+                    agentModeSessionID: destinationSessionID,
+                    agentModeRunID: destinationRunID
+                )
+                XCTFail("Expected the source session's other old chat ID to remain invalid")
+            } catch let error as ChatToolError {
+                XCTAssertTrue(error.message.contains("was cloned during handoff"))
+                XCTAssertTrue(error.message.contains(otherClone.shortID))
+            }
+
+            for foreignSessionID in [fixture.sessionAID, thirdPartySessionID] {
+                do {
+                    _ = try await oracle.locateOrCreateChat(
+                        otherClone.shortID,
+                        tabID: destinationTabID,
+                        activateInUI: false,
+                        agentModeSessionID: foreignSessionID,
+                        agentModeRunID: UUID()
+                    )
+                    XCTFail("Expected a foreign Agent Mode session to remain fail closed")
+                } catch let error as ChatToolError {
+                    XCTAssertTrue(error.message.contains("different Agent Mode owner"))
+                    XCTAssertFalse(error.message.contains("was cloned during handoff"))
+                }
+            }
+
+            for skippedSourceChat in [
+                unownedSourceChat,
+                foreignSourceChat
+            ] {
+                do {
+                    _ = try await oracle.tool_oracleChatLog(
+                        args: [
+                            "chat_id": .string(skippedSourceChat.shortID),
+                            "include_user": .bool(true)
+                        ],
+                        tabID: destinationTabID,
+                        agentModeSessionID: destinationSessionID,
+                        agentModeRunID: destinationRunID
+                    )
+                    XCTFail("Expected skipped source chat to remain unreadable")
+                } catch let error as ChatToolError {
+                    XCTAssertEqual(error.code, .invalidParams)
+                    XCTAssertFalse(
+                        error.message.contains("was cloned during handoff")
+                    )
+                }
+            }
+
+            do {
+                _ = try await oracle.locateOrCreateChat(
+                    thirdPartyChat.shortID,
+                    tabID: destinationTabID,
+                    activateInUI: false,
+                    agentModeSessionID: destinationSessionID,
+                    agentModeRunID: destinationRunID
+                )
+                XCTFail("Expected a third-party tab chat to remain fail closed")
+            } catch let error as ChatToolError {
+                XCTAssertEqual(error.code, .invalidParams)
+                XCTAssertFalse(error.message.contains("was cloned during handoff"))
+            }
+        }
+    }
+
+    func testHandoffFailsAndRollsBackWhenAnyOwnedOracleCloneCannotPersist() async throws {
+        try await withFixture { fixture in
+            let workspaceID = try XCTUnwrap(
+                fixture.window.workspaceManager.activeWorkspace?.id
+            )
+            let oracle = fixture.window.oracleViewModel
+            let chats = ["First owned", "Second owned"].map { name in
+                ChatSession(
+                    workspaceID: workspaceID,
+                    composeTabID: fixture.tabAID,
+                    agentModeSessionID: fixture.sessionAID,
+                    agentModeRunID: UUID(),
+                    name: name,
+                    messages: [
+                        StoredMessage(
+                            isUser: false,
+                            rawText: "\(name) response",
+                            sequenceIndex: 0
+                        )
+                    ]
+                )
+            }
+            var persistedChats: [ChatSession] = []
+            for var chat in chats {
+                let url = try await oracle.autosaveSession(chat)
+                chat.fileURL = url
+                persistedChats.append(chat)
+            }
+            oracle.sessions = persistedChats
+            var persistAttempts = 0
+            oracle.setOracleCloneWillPersistObserverForTesting { _, _ in
+                persistAttempts += 1
+                if persistAttempts == 2 {
+                    throw NSError(
+                        domain: "OracleCloneFailure",
+                        code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "injected clone failure"
+                        ]
+                    )
+                }
+            }
+            defer {
+                oracle.setOracleCloneWillPersistObserverForTesting(nil)
+            }
+
+            do {
+                _ = try await fixture.viewModel.prepareHandoffHeadless(
+                    sourceTabID: fixture.tabAID,
+                    upToItemID: nil,
+                    destinationAgent: fixture.sessionA.selectedAgent,
+                    destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                    destinationReasoningEffortRaw: fixture.sessionA
+                        .selectedReasoningEffortRaw
+                )
+                XCTFail("Expected handoff preparation to fail")
+            } catch {
+                XCTAssertTrue(
+                    error.localizedDescription.contains(
+                        "no chats were cloned"
+                    ),
+                    error.localizedDescription
+                )
+            }
+
+            XCTAssertEqual(persistAttempts, 2)
+            XCTAssertEqual(Set(oracle.sessions.map(\.id)), Set(chats.map(\.id)))
+            XCTAssertFalse(
+                oracle.sessions.contains {
+                    $0.agentModeSessionID != fixture.sessionAID
+                }
+            )
+        }
+    }
+
+    func testColdLoadUIToolResultMergePrefersLivePayload() {
+        let sharedID = UUID()
+        let persistedOnlyID = UUID()
+        let merged = AgentModeViewModel.mergeUIToolResultPayloads(
+            live: [sharedID: "live identity"],
+            persisted: [
+                sharedID: "stale persisted identity",
+                persistedOnlyID: "persisted identity"
+            ]
+        )
+
+        XCTAssertEqual(merged[sharedID], "live identity")
+        XCTAssertEqual(merged[persistedOnlyID], "persisted identity")
+    }
+
     func testWarmSwitchPublishesDestinationTranscriptBeforeSwitchReturns() async throws {
         try await withFixture { fixture in
             assertPresentation(

@@ -384,6 +384,7 @@ class OracleViewModel: ObservableObject {
 
     /// Per-session messages
     private var messageStore: [UUID: [AIChatMessage]] = [:]
+    private var conversationRevisionBySession: [UUID: Int] = [:]
 
     private struct SessionSaveTicket {
         let generation: UInt64
@@ -408,10 +409,19 @@ class OracleViewModel: ObservableObject {
     /// Maps AI message/query IDs to the underlying AIQueriesService stream IDs for targeted cancellation.
     private var streamIDsByQueryId: [UUID: ChatStreamID] = [:]
 
+    /// App-side estimates captured from the exact packaged request for Oracle usage echoes.
+    private var oracleRequestInputTokenEstimatesByMessageID: [UUID: Int] = [:]
+
     /// Active headless (plan/question) streams keyed by tab ID.
     /// Used by Discover to cancel background plan generation.
     /// Note: Internal (not private) to allow access from OracleViewModel+MCP.swift extension.
     var headlessStreamsByTabID: [UUID: ChatStreamID] = [:]
+
+    /// Destination-tab-scoped old → new chat IDs created by Agent Mode handoff.
+    /// This is diagnostic metadata only: explicit continuation and log lookup never resolve
+    /// through it, and the MCP extension consults it only after verifying destination ownership.
+    var handoffChatIDReplacementsByTabID: [UUID: [String: String]] = [:]
+    var handoffChatIDMappingRowsByTabID: [UUID: [(oldID: String, newID: String)]] = [:]
 
     /// Stores ephemeral message state that persists even when messages array is cleared
     let ephemeralState = EphemeralMessageState()
@@ -764,6 +774,16 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
+    func conversationRevision(for sessionID: UUID) -> Int {
+        conversationRevisionBySession[sessionID] ?? 0
+    }
+
+    @MainActor
+    private func bumpConversationRevision(for sessionID: UUID) {
+        conversationRevisionBySession[sessionID, default: 0] &+= 1
+    }
+
+    @MainActor
     @discardableResult
     func ensureSessionMessagesLoaded(_ sessionID: UUID) async -> Bool {
         guard let session = sessions.first(where: { $0.id == sessionID }) else { return false }
@@ -828,6 +848,7 @@ class OracleViewModel: ObservableObject {
         mutate(&arr)
         messageStore[sessionID] = arr
         messageStoreRevision &+= 1
+        bumpConversationRevision(for: sessionID)
 
         if currentSessionID == sessionID {
             messages = arr
@@ -943,6 +964,7 @@ class OracleViewModel: ObservableObject {
         // Message-scoped cleanup only; does not cancel live streams or touch session-level state.
         sessionIDByMessageId.removeValue(forKey: messageId)
         streamIDsByQueryId.removeValue(forKey: messageId)
+        oracleRequestInputTokenEstimatesByMessageID.removeValue(forKey: messageId)
         cancelFinalizationWatchdog(for: messageId)
         clearStreamActivityTracking(for: messageId)
         ephemeralState.clear(for: messageId)
@@ -953,7 +975,9 @@ class OracleViewModel: ObservableObject {
         sessionSwitchGeneration += 1
         messageStore.removeAll(keepingCapacity: false)
         messageStoreRevision &+= 1
+        conversationRevisionBySession.removeAll(keepingCapacity: false)
         sessionIDByMessageId.removeAll(keepingCapacity: false)
+        oracleRequestInputTokenEstimatesByMessageID.removeAll(keepingCapacity: false)
         runStateBySession.removeAll(keepingCapacity: false)
         nextSequenceIndexBySession.removeAll(keepingCapacity: false)
         streamingSessions.removeAll()
@@ -1071,11 +1095,21 @@ class OracleViewModel: ObservableObject {
             _ rejectedSessionID: UUID,
             _ tabID: UUID?
         ) async -> Void
+        typealias OracleCloneWillPersistObserver = @MainActor @Sendable (
+            _ sourceSessionID: UUID,
+            _ clonedSessionID: UUID
+        ) async throws -> Void
+        typealias OraclePreflightPreparedObserver = @MainActor @Sendable (
+            _ conversationSessionID: UUID
+        ) async -> Void
 
         var oracleReviewPackagingTraceObserverForTesting:
             OracleReviewPackagingTraceContext.Observer?
         private var oraclePostPackagingTransportOverrideForTesting:
             OraclePostPackagingTransportOverride?
+        var oracleContextWindowOverrideForTesting: ((AIModel) -> Int?)?
+        var oracleContextWindowSourceOverrideForTesting:
+            AIModelCapabilityMetadata.WindowSource?
         private var oracleSessionSaveWillPersistObserverForTesting:
             OracleSessionSaveWillPersistObserver?
         private var oracleFinalizationBeforeOwnershipCommitObserverForTesting:
@@ -1084,6 +1118,10 @@ class OracleViewModel: ObservableObject {
             OracleCancellationAfterOwnershipClearObserver?
         var oracleRejectedNewSessionCleanupObserverForTesting:
             OracleRejectedNewSessionCleanupObserver?
+        var oracleCloneWillPersistObserverForTesting:
+            OracleCloneWillPersistObserver?
+        var oraclePreflightPreparedObserverForTesting:
+            OraclePreflightPreparedObserver?
 
         func setOracleReviewPackagingTraceObserverForTesting(
             _ observer: OracleReviewPackagingTraceContext.Observer?
@@ -1095,6 +1133,14 @@ class OracleViewModel: ObservableObject {
             _ override: OraclePostPackagingTransportOverride?
         ) {
             oraclePostPackagingTransportOverrideForTesting = override
+        }
+
+        func setOracleContextWindowOverrideForTesting(
+            _ override: ((AIModel) -> Int?)?,
+            source: AIModelCapabilityMetadata.WindowSource? = nil
+        ) {
+            oracleContextWindowOverrideForTesting = override
+            oracleContextWindowSourceOverrideForTesting = source
         }
 
         func setOracleSessionSaveWillPersistObserverForTesting(
@@ -1119,6 +1165,18 @@ class OracleViewModel: ObservableObject {
             _ observer: OracleRejectedNewSessionCleanupObserver?
         ) {
             oracleRejectedNewSessionCleanupObserverForTesting = observer
+        }
+
+        func setOracleCloneWillPersistObserverForTesting(
+            _ observer: OracleCloneWillPersistObserver?
+        ) {
+            oracleCloneWillPersistObserverForTesting = observer
+        }
+
+        func setOraclePreflightPreparedObserverForTesting(
+            _ observer: OraclePreflightPreparedObserver?
+        ) {
+            oraclePreflightPreparedObserverForTesting = observer
         }
 
         func waitForSessionSavesForTesting(_ sessionID: UUID) async {
@@ -2029,10 +2087,34 @@ class OracleViewModel: ObservableObject {
         setActiveForTab: Bool = true,
         reuseBlankSession: Bool = true
     ) async -> UUID? {
+        startNewChatSessionSync(
+            name: name,
+            tabID: tabID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
+            activateInUI: activateInUI,
+            setActiveForTab: setActiveForTab,
+            reuseBlankSession: reuseBlankSession
+        )
+    }
+
+    /// Synchronous create used by MCP choose-and-reserve so chat selection and stream
+    /// reservation stay in one MainActor turn with no `await` between them.
+    @MainActor
+    @discardableResult
+    func startNewChatSessionSync(
+        name: String = "New Chat",
+        tabID: UUID? = nil,
+        agentModeSessionID: UUID? = nil,
+        agentModeRunID: UUID? = nil,
+        activateInUI: Bool = true,
+        setActiveForTab: Bool = true,
+        reuseBlankSession: Bool = true
+    ) -> UUID? {
         let resolvedTabID = tabID ?? promptViewModel.activeComposeTabID
 
         // If there's already a blank session with that name, just switch to it.
-        // MCP force-new sends disable this reuse so parallel lanes cannot collide.
+        // MCP force-new / atomic implicit creates disable this reuse so parallel lanes cannot collide.
         if reuseBlankSession,
            let existingIndex = sessions.firstIndex(where: {
                $0.name == name &&
@@ -2129,19 +2211,48 @@ class OracleViewModel: ObservableObject {
     func cloneChatSessions(
         fromTabID sourceTabID: UUID,
         toTabID destTabID: UUID,
+        sourceAgentModeSessionID: UUID,
+        destinationAgentModeSessionID: UUID,
         setActiveSessionToClonedSourceActive: Bool = true
     ) async throws -> [UUID: UUID] {
         let sourceSessions = sessions(forTabID: sourceTabID)
-        guard !sourceSessions.isEmpty else { return [:] }
+        let ownedSourceSessions = sourceSessions.filter {
+            Self.sessionMatchesOracleOwnerForExplicitContinuation(
+                $0,
+                agentModeSessionID: sourceAgentModeSessionID,
+                agentModeRunID: nil
+            )
+        }
+        guard !ownedSourceSessions.isEmpty else { return [:] }
 
         let sourceActiveID = workspaceManager.activeChatSessionID(forTabID: sourceTabID)
         var idMapping: [UUID: UUID] = [:]
+        var handoffReplacements: [String: String] = [:]
 
-        for sourceSession in sourceSessions {
-            // Force-load the full session to avoid copying empty stubs
-            guard let fullSession = await ensureSessionLoadedForBackground(sourceSession) else {
-                print("[OracleVM] Warning: skipping session \(sourceSession.id) (\(sourceSession.name)) during fork clone — could not load")
-                continue
+        func rollbackClones() async {
+            let clonedIDs = Set(idMapping.values)
+            for clonedID in clonedIDs {
+                if let clone = sessions.first(where: { $0.id == clonedID }) {
+                    await deleteSession(clone)
+                }
+            }
+            handoffChatIDReplacementsByTabID.removeValue(forKey: destTabID)
+            handoffChatIDMappingRowsByTabID.removeValue(forKey: destTabID)
+        }
+
+        for sourceSession in ownedSourceSessions {
+            // Force-load the full session to avoid copying empty stubs.
+            guard let fullSession = await ensureSessionLoadedForBackground(sourceSession),
+                  Self.sessionMatchesOracleOwnerForExplicitContinuation(
+                      fullSession,
+                      agentModeSessionID: sourceAgentModeSessionID,
+                      agentModeRunID: nil
+                  )
+            else {
+                await rollbackClones()
+                throw ChatToolError.internalError(
+                    "Failed to load an owned Oracle chat during handoff; no chats were cloned"
+                )
             }
 
             let clonedID = UUID()
@@ -2153,9 +2264,9 @@ class OracleViewModel: ObservableObject {
                 id: clonedID,
                 workspaceID: fullSession.workspaceID,
                 composeTabID: destTabID,
-                // Handoff clones become destination-tab legacy history. Keeping source
-                // Agent Mode ownership would hide them from the destination owner-filtered UI.
-                agentModeSessionID: nil,
+                // Handoff is an ownership transfer. The clone must be born with its durable
+                // destination owner; the first destination-side touch stamps the run ID.
+                agentModeSessionID: destinationAgentModeSessionID,
                 agentModeRunID: nil,
                 name: fullSession.name,
                 savedAt: Date(),
@@ -2170,18 +2281,28 @@ class OracleViewModel: ObservableObject {
                 lastSendModelPresetID: fullSession.lastSendModelPresetID
             )
 
-            // Persist the clone and capture the file URL so the stub can resolve it later
+            // Persist the clone and capture the file URL so the stub can resolve it later.
             do {
+                #if DEBUG
+                    try await oracleCloneWillPersistObserverForTesting?(
+                        fullSession.id,
+                        clonedID
+                    )
+                #endif
                 let url = try await autosaveSession(cloned)
                 cloned.fileURL = url
             } catch {
-                print("[OracleVM] Warning: failed to persist cloned session \(clonedID): \(error)")
-                continue
+                await rollbackClones()
+                throw ChatToolError.internalError(
+                    "Failed to persist an owned Oracle chat during handoff; no chats were cloned. \(error.localizedDescription)"
+                )
             }
 
             // Register as a list stub in memory (lazy-loaded when activated)
             sessions.append(cloned.listStub())
             idMapping[fullSession.id] = clonedID
+            handoffReplacements[fullSession.id.uuidString] = cloned.shortID
+            handoffReplacements[fullSession.shortID] = cloned.shortID
         }
 
         // Set destination tab's active chat session to the clone of the source active.
@@ -2192,13 +2313,70 @@ class OracleViewModel: ObservableObject {
                 mapped
             } else {
                 // Deterministic fallback: use the clone of the first source session
-                idMapping[sourceSessions.first!.id] ?? idMapping.values.first!
+                idMapping[ownedSourceSessions.first!.id] ?? idMapping.values.first!
             }
             workspaceManager.setActiveChatSessionID(clonedActive, forTabID: destTabID)
         }
 
+        let handoffMapping = HandoffChatIDMapping(
+            replacements: handoffReplacements,
+            rows: handoffReplacements
+                .map { (oldID: $0.key, newID: $0.value) }
+                .sorted { $0.oldID < $1.oldID }
+        )
+        if handoffMapping.replacements.isEmpty {
+            handoffChatIDReplacementsByTabID.removeValue(forKey: destTabID)
+            handoffChatIDMappingRowsByTabID.removeValue(forKey: destTabID)
+        } else {
+            handoffChatIDReplacementsByTabID[destTabID] = handoffMapping.replacements
+            handoffChatIDMappingRowsByTabID[destTabID] = handoffMapping.rows
+        }
+
         refreshSessionLists()
         return idMapping
+    }
+
+    struct HandoffChatIDMapping {
+        let replacements: [String: String]
+        let rows: [(oldID: String, newID: String)]
+
+        static let empty = HandoffChatIDMapping(replacements: [:], rows: [])
+    }
+
+    /// Converts the clone UUID mapping into every explicit ID form an agent may have seen.
+    /// Replacement values are destination short IDs because those are the canonical MCP-facing IDs.
+    @MainActor
+    func handoffChatIDMapping(
+        for idMapping: [UUID: UUID],
+        destinationTabID: UUID? = nil
+    ) -> HandoffChatIDMapping {
+        guard !idMapping.isEmpty else { return .empty }
+        if let destinationTabID,
+           let replacements = handoffChatIDReplacementsByTabID[destinationTabID],
+           let rows = handoffChatIDMappingRowsByTabID[destinationTabID]
+        {
+            return HandoffChatIDMapping(replacements: replacements, rows: rows)
+        }
+
+        let sessionsByID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        var replacements: [String: String] = [:]
+
+        for sourceID in idMapping.keys.sorted(by: { $0.uuidString < $1.uuidString }) {
+            guard let clonedID = idMapping[sourceID],
+                  let source = sessionsByID[sourceID],
+                  let clone = sessionsByID[clonedID]
+            else { continue }
+
+            replacements[sourceID.uuidString] = clone.shortID
+            replacements[source.shortID] = clone.shortID
+        }
+
+        return HandoffChatIDMapping(
+            replacements: replacements,
+            rows: replacements
+                .map { (oldID: $0.key, newID: $0.value) }
+                .sorted { $0.oldID < $1.oldID }
+        )
     }
 
     /// Forks the current chat session from the specified message ID.
@@ -2556,6 +2734,7 @@ class OracleViewModel: ObservableObject {
         }
         messageStore[session.id] = newSortedMessages
         messageStoreRevision &+= 1
+        bumpConversationRevision(for: session.id)
         for msg in newSortedMessages {
             registerMessage(msg.id, sessionID: session.id)
         }
@@ -3035,6 +3214,26 @@ class OracleViewModel: ObservableObject {
         sessions[sessionIndex].lastSendModelPresetID = modelPresetID
     }
 
+    @MainActor
+    private func recordOracleRequestInputTokenEstimate(
+        for message: AIMessage,
+        assistantMessageID: UUID
+    ) {
+        var estimatedTokens = TokenCalculationService.estimateTokens(for: message.systemPrompt)
+        estimatedTokens += TokenCalculationService.estimateTokens(
+            for: message.buildTail(embedSystemPrompt: false)
+        )
+        estimatedTokens += message.conversationMessages.reduce(0) {
+            $0 + TokenCalculationService.estimateTokens(for: $1.content)
+        }
+        oracleRequestInputTokenEstimatesByMessageID[assistantMessageID] = max(0, estimatedTokens)
+    }
+
+    @MainActor
+    func oracleRequestInputTokenEstimate(for assistantMessageID: UUID) -> Int? {
+        oracleRequestInputTokenEstimatesByMessageID[assistantMessageID]
+    }
+
     // MARK: - Main Send/Receive Flow
 
     @MainActor
@@ -3052,6 +3251,7 @@ class OracleViewModel: ObservableObject {
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
+        expectedConversationRevision: Int? = nil,
         overlapPolicy: SendOverlapPolicy = .cancelExisting,
         origin: SendOrigin = .ui,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
@@ -3087,6 +3287,56 @@ class OracleViewModel: ObservableObject {
                 // reservation check below retains the UI message with a retry error.
                 await cancelAIResponse(in: targetSessionID, skipPartialParseAndSave: false)
             }
+        }
+
+        return beginSendMessageReservation(
+            newUserMessage,
+            targetSessionID: targetSessionID,
+            overrideModel: overrideModel,
+            overrideModelPresetID: overrideModelPresetID,
+            overrideChatPresetID: overrideChatPresetID,
+            overrideMode: overrideMode,
+            gitInclusionOverride: gitInclusionOverride,
+            gitBaseOverride: gitBaseOverride,
+            selectionOverride: selectionOverride,
+            lookupContextOverride: lookupContextOverride,
+            reviewGitContextOverride: reviewGitContextOverride,
+            overrideAIMessage: overrideAIMessage,
+            expectedConversationRevision: expectedConversationRevision,
+            origin: origin,
+            onProgress: onProgress
+        )
+    }
+
+    /// Synchronous busy/cap checks through placeholder registration + background stream Task.
+    /// MCP choose-and-reserve calls this in the same MainActor turn as chat selection so
+    /// concurrent implicit sends cannot share a chat between choose and reserve.
+    @MainActor
+    @discardableResult
+    func beginSendMessageReservation(
+        _ newUserMessage: String,
+        targetSessionID: UUID,
+        overrideModel: AIModel? = nil,
+        overrideModelPresetID: UUID? = nil,
+        overrideChatPresetID: UUID? = nil,
+        overrideMode: PromptViewModel.PlanActMode? = nil,
+        gitInclusionOverride: GitInclusion? = nil,
+        gitBaseOverride: String? = nil,
+        selectionOverride: StoredSelection? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
+        overrideAIMessage: AIMessage? = nil,
+        expectedConversationRevision: Int? = nil,
+        origin: SendOrigin = .ui,
+        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
+    ) -> SendStart {
+        if let expectedConversationRevision,
+           conversationRevision(for: targetSessionID)
+           != expectedConversationRevision
+        {
+            return .failed(
+                reason: "The Oracle chat advanced after request preflight; retry the send."
+            )
         }
 
         ensureSessionStorage(targetSessionID)
@@ -3261,6 +3511,10 @@ class OracleViewModel: ObservableObject {
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
                 }
+                recordOracleRequestInputTokenEstimate(
+                    for: aiMessage,
+                    assistantMessageID: aiResponseId
+                )
                 #if DEBUG
                     OracleReviewPackagingDiagnostics.recordSubmission(aiMessage)
                     let (streamID, stream) = if let transportOverride =
@@ -3565,7 +3819,7 @@ class OracleViewModel: ObservableObject {
 
     /// Builds conversation entries from raw user and assistant text.
     @MainActor
-    private func buildConversationEntries(for sessionID: UUID) -> [ConversationEntry] {
+    func buildConversationEntries(for sessionID: UUID) -> [ConversationEntry] {
         guard let sessionMessages = messageStore[sessionID] else { return [] }
         return sessionMessages.map { msg in
             let role: ConversationEntry.Role = msg.isUser ? .user : .assistant
@@ -3705,8 +3959,10 @@ class OracleViewModel: ObservableObject {
                 }
             }
 
-            // 3. Clear ephemeral drafts for this tab
+            // 3. Clear ephemeral drafts and handoff-only diagnostics for this tab
             ephemeralDrafts.removeValue(forKey: tabID)
+            handoffChatIDReplacementsByTabID.removeValue(forKey: tabID)
+            handoffChatIDMappingRowsByTabID.removeValue(forKey: tabID)
         }
     }
 

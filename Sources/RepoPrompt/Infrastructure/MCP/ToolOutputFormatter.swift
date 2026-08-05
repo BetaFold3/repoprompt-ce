@@ -582,6 +582,7 @@ enum ToolOutputFormatter {
         modelSource: String? = nil,
         modelPresetID: String? = nil,
         modelPresetName: String? = nil,
+        usage: ToolResultDTOs.ChatSendDTO.Usage? = nil,
         response: String?,
         diffs: [(path: String, patch: String)]
     ) -> String {
@@ -589,15 +590,17 @@ enum ToolOutputFormatter {
         out.reserveCapacity(7 + diffs.count * 2)
         out.append("## Ask Oracle \(statusIcon(success: true))")
         if let id = chatId, let m = mode { out.append("- **Chat**: `\(id)` | **Mode**: \(m)") }
+        let hidesResolvedModelIdentity = modelSource?.lowercased() == "preset"
         appendOracleModelIdentity(
-            modelName: modelName,
-            modelID: modelID,
+            modelName: hidesResolvedModelIdentity ? nil : modelName,
+            modelID: hidesResolvedModelIdentity ? nil : modelID,
             modelSelection: modelSelection,
             modelSource: modelSource,
             modelPresetID: modelPresetID,
             modelPresetName: modelPresetName,
             to: &out
         )
+        appendOracleUsage(usage, to: &out)
         if let resp = response, !resp.isEmpty {
             out.append("")
             out.append("### Response")
@@ -614,6 +617,46 @@ enum ToolOutputFormatter {
             }
         }
         return out.joined(separator: "\n")
+    }
+
+    private static func appendOracleUsage(
+        _ usage: ToolResultDTOs.ChatSendDTO.Usage?,
+        to output: inout [String]
+    ) {
+        guard let usage else { return }
+        var bits = ["input_tokens: \(usage.inputTokens)"]
+        if let window = usage.contextWindow {
+            bits.append("context_window: \(window)")
+        }
+        if let pct = usage.pct {
+            bits.append("pct: \(pct)")
+        }
+        if let source = usage.source, !source.isEmpty {
+            bits.append("source: \(source)")
+        }
+        if let maxOutput = usage.maxOutputTokens {
+            bits.append("max_output_tokens: \(maxOutput)")
+        }
+        if let outputReserve = usage.outputReserveTokens {
+            bits.append("output_reserve_tokens: \(outputReserve)")
+        }
+        output.append("- **Usage**: \(bits.joined(separator: ", "))")
+    }
+
+    private static func parseOracleUsage(from value: Value?) -> ToolResultDTOs.ChatSendDTO.Usage? {
+        guard let obj = value?.objectValue,
+              let inputTokens = obj["input_tokens"]?.intValue
+        else {
+            return nil
+        }
+        return ToolResultDTOs.ChatSendDTO.Usage(
+            inputTokens: inputTokens,
+            contextWindow: obj["context_window"]?.intValue,
+            pct: obj["pct"]?.intValue,
+            source: obj["source"]?.stringValue,
+            maxOutputTokens: obj["max_output_tokens"]?.intValue,
+            outputReserveTokens: obj["output_reserve_tokens"]?.intValue
+        )
     }
 
     private static func appendOracleModelIdentity(
@@ -2539,6 +2582,32 @@ extension ToolOutputFormatter {
     }
 
     static func formatAskOracle(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
+        if let results = value.objectValue?["results"]?.arrayValue {
+            var blocks: [MCP.Tool.Content] = [
+                .text("## Ask Oracle Batch \(statusIcon(success: true))\n- **Results**: \(results.count)")
+            ]
+            for (index, item) in results.enumerated() {
+                let itemBlocks = formatAskOracle(
+                    args: args,
+                    value: item,
+                    emitResources: emitResources
+                )
+                if let first = itemBlocks.first,
+                   case let .text(text: text, annotations: _, _meta: _) = first
+                {
+                    let rewritten = text.replacingOccurrences(
+                        of: "## Ask Oracle",
+                        with: "## Lane"
+                    )
+                    blocks.append(.text("### Consultation \(index)\n" + rewritten))
+                    blocks.append(contentsOf: itemBlocks.dropFirst())
+                } else {
+                    blocks.append(contentsOf: itemBlocks)
+                }
+            }
+            return blocks
+        }
+
         var shortId: String? = args["chat_id"]?.stringValue
         var mode = args["mode"]?.stringValue
         var response: String?
@@ -2552,6 +2621,14 @@ extension ToolOutputFormatter {
         var modelSource: String?
         var modelPresetID: String?
         var modelPresetName: String?
+        var usage: ToolResultDTOs.ChatSendDTO.Usage?
+        var responseMode: String?
+        var excerpt: String?
+        var excerptLines: Int?
+        var exportPath: String?
+        var lineCount: Int?
+        var charCount: Int?
+        var ok: Bool?
 
         switch value {
         case let .string(s):
@@ -2566,6 +2643,11 @@ extension ToolOutputFormatter {
             if let errArr = obj["errors"]?.arrayValue {
                 errors = errArr.compactMap(\.stringValue)
             }
+            if let errorObj = obj["error"]?.objectValue,
+               let message = errorObj["message"]?.stringValue
+            {
+                errors.append(message)
+            }
             oracleExportPath = obj["oracle_export_path"]?.stringValue
             oracleExportInstruction = obj["oracle_export_instruction"]?.stringValue
             resolvedModelID = obj["model_id"]?.stringValue
@@ -2574,6 +2656,14 @@ extension ToolOutputFormatter {
             modelSource = obj["model_source"]?.stringValue
             modelPresetID = obj["model_preset_id"]?.stringValue
             modelPresetName = obj["model_preset_name"]?.stringValue
+            usage = parseOracleUsage(from: obj["usage"])
+            responseMode = obj["response_mode"]?.stringValue
+            excerpt = obj["excerpt"]?.stringValue
+            excerptLines = obj["excerpt_lines"]?.intValue
+            exportPath = obj["export_path"]?.stringValue
+            lineCount = obj["line_count"]?.intValue
+            charCount = obj["char_count"]?.intValue
+            ok = obj["ok"]?.boolValue
             if response == nil, let res = obj["result"] {
                 if let s = res.stringValue { response = s }
                 else if let arr = res.objectValue?["diffs"]?.arrayValue { diffs = parseDiffArray(arr) }
@@ -2584,7 +2674,7 @@ extension ToolOutputFormatter {
             break
         }
 
-        let text = askOracle(
+        var text = askOracle(
             chatId: shortId,
             mode: mode,
             modelName: resolvedModelName,
@@ -2593,11 +2683,33 @@ extension ToolOutputFormatter {
             modelSource: modelSource,
             modelPresetID: modelPresetID,
             modelPresetName: modelPresetName,
+            usage: usage,
             response: response,
             diffs: diffs
         )
+        if let ok {
+            text += "\n- **ok**: \(ok)"
+        }
+        if let responseMode, !responseMode.isEmpty {
+            text += "\n- **response_mode**: \(responseMode)"
+        }
+        if let charCount {
+            text += "\n- **char_count**: \(charCount)"
+        }
+        if let lineCount {
+            text += "\n- **line_count**: \(lineCount)"
+        }
+        if let excerptLines {
+            text += "\n- **excerpt_lines**: \(excerptLines)"
+        }
+        if let excerpt, !excerpt.isEmpty {
+            text += "\n\n### Excerpt\n\(excerpt)"
+        }
+        if let exportPath, !exportPath.isEmpty, exportPath != oracleExportPath {
+            text += "\n- **export_path**: `\(exportPath)`"
+        }
         var blocks: [MCP.Tool.Content] = [.text(text)]
-        if let handoffBlock = oracleExportBlock(path: oracleExportPath, instruction: oracleExportInstruction) {
+        if let handoffBlock = oracleExportBlock(path: oracleExportPath ?? exportPath, instruction: oracleExportInstruction) {
             blocks.append(.text(handoffBlock))
         }
         if !errors.isEmpty {
@@ -3065,8 +3177,22 @@ extension ToolOutputFormatter {
                         modesText = "unknown"
                     }
                     let descText = (m.description?.isEmpty == false) ? " — \(m.description!)" : ""
-                    out.append("- `\(m.id)`: \(m.name) — modes: \(modesText)\(descText)")
+                    var capabilityBits: [String] = []
+                    if let contextWindow = m.contextWindow {
+                        capabilityBits.append("context_window: \(contextWindow)")
+                    }
+                    if let maxOutput = m.maxOutputTokens {
+                        capabilityBits.append("max_output_tokens: \(maxOutput)")
+                    }
+                    let capabilityText = capabilityBits.isEmpty
+                        ? ""
+                        : " — " + capabilityBits.joined(separator: ", ")
+                    out.append("- `\(m.id)`: \(m.name) — modes: \(modesText)\(capabilityText)\(descText)")
                 }
+            }
+            if let notes = dto.notes?.filter({ !$0.isEmpty }), !notes.isEmpty {
+                out.append("")
+                out.append(contentsOf: notes)
             }
             return [.text(out.joined(separator: "\n"))]
         }

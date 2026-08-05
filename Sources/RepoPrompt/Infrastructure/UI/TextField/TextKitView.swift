@@ -11,6 +11,11 @@ struct TextKitView: NSViewRepresentable {
     var isSpellCheckEnabled: Bool = false
     var fontSize: Double?
     var useMonospacedFont: Bool = false // Use monospaced font
+    /// When true with `useMonospacedFont`, resolve via `TranscriptCodeFontResolver`
+    /// (transcript tool cards). Leave false for composers / editors.
+    var useTranscriptCodeFont: Bool = false
+    /// Optional PostScript preference when `useTranscriptCodeFont` is true.
+    var preferredTranscriptCodeFontPostScriptName: String?
     var wrapLines: Bool = true // New: toggle line-wrapping / horizontal scroll
     var externalUpdateTick: Int = 0
     /// When true, allows non-contiguous layout (incremental layout). Default is false
@@ -35,9 +40,30 @@ struct TextKitView: NSViewRepresentable {
     }
 
     private var resolvedFont: NSFont {
-        useMonospacedFont
+        if useMonospacedFont, useTranscriptCodeFont {
+            return TranscriptCodeFontResolver.resolve(
+                preferredPostScriptName: preferredTranscriptCodeFontPostScriptName,
+                pointSize: resolvedFontSize
+            ).font
+        }
+        return useMonospacedFont
             ? NSFont.monospacedSystemFont(ofSize: resolvedFontSize, weight: .regular)
             : NSFont.systemFont(ofSize: resolvedFontSize)
+    }
+
+    struct ParagraphStyleSignature: Equatable {
+        let fontFingerprint: TranscriptCodeFontFingerprint
+        let wrapLines: Bool
+    }
+
+    static func paragraphStyleSignature(
+        font: NSFont,
+        wrapLines: Bool
+    ) -> ParagraphStyleSignature {
+        ParagraphStyleSignature(
+            fontFingerprint: .fingerprint(of: font),
+            wrapLines: wrapLines
+        )
     }
 
     // MARK: - Coordinator
@@ -54,6 +80,7 @@ struct TextKitView: NSViewRepresentable {
         var wasEmpty: Bool = true
         var pendingLayoutTask: Task<Void, Never>?
         var layoutGeneration: UInt64 = 0
+        var paragraphStyleSignature: ParagraphStyleSignature?
 
         fileprivate enum LayoutStabilizationReason {
             case emptyTransition
@@ -194,6 +221,11 @@ struct TextKitView: NSViewRepresentable {
         textView.backgroundColor = .clear
         // Conditionally set font
         textView.font = resolvedFont
+        refreshDefaultParagraphStyle(
+            in: textView,
+            coordinator: coordinator,
+            font: resolvedFont
+        )
 
         textView.textContainerInset = NSSize(width: 8, height: 8)
         textView.delegate = coordinator
@@ -293,14 +325,19 @@ struct TextKitView: NSViewRepresentable {
         // Only touch the font when size/mono actually changed to avoid reflow on every update
         let requiredFont = resolvedFont
         if let currentFont = textView.font {
-            let currentSize = currentFont.pointSize
-            let isMono = currentFont.fontName.lowercased().contains("mono")
-            if currentSize != requiredFont.pointSize || isMono != useMonospacedFont {
+            let faceChanged = currentFont.fontName != requiredFont.fontName
+            let sizeChanged = abs(currentFont.pointSize - requiredFont.pointSize) > 0.01
+            if faceChanged || sizeChanged {
                 textView.font = requiredFont
             }
         } else {
             textView.font = requiredFont
         }
+        refreshDefaultParagraphStyle(
+            in: textView,
+            coordinator: context.coordinator,
+            font: requiredFont
+        )
 
         // Determine if user is actively editing in this text view
         let wasFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
@@ -354,6 +391,35 @@ struct TextKitView: NSViewRepresentable {
                 )
             }
         }
+    }
+
+    private func refreshDefaultParagraphStyle(
+        in textView: NSTextView,
+        coordinator: Coordinator,
+        font: NSFont
+    ) {
+        guard useMonospacedFont, useTranscriptCodeFont else {
+            if coordinator.paragraphStyleSignature != nil {
+                textView.defaultParagraphStyle = nil
+                coordinator.paragraphStyleSignature = nil
+            }
+            return
+        }
+
+        let signature = Self.paragraphStyleSignature(
+            font: font,
+            wrapLines: wrapLines
+        )
+        guard coordinator.paragraphStyleSignature != signature else { return }
+
+        let metrics = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: signature.fontFingerprint.faceIdentity,
+            pointSize: signature.fontFingerprint.pointSize
+        )
+        textView.defaultParagraphStyle = metrics.makeCodeParagraphStyle(
+            lineBreakMode: signature.wrapLines ? .byWordWrapping : .byClipping
+        )
+        coordinator.paragraphStyleSignature = signature
     }
 
     /// Ensure AppKit resources are released when SwiftUI detaches the view

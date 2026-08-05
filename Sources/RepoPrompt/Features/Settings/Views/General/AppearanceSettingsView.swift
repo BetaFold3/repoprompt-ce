@@ -50,6 +50,28 @@ struct AppearanceSettingsView: View {
         )
     }
 
+    private var wrapTranscriptDiffLinesBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.wrapTranscriptDiffLines() },
+            set: { globalSettings.setWrapTranscriptDiffLines($0) }
+        )
+    }
+
+    private var transcriptCodeFontBinding: Binding<String> {
+        Binding(
+            get: {
+                globalSettings.transcriptCodeFontPostScriptName()
+                    ?? TranscriptCodeFontResolver.systemMonospacedPreferenceValue
+            },
+            set: { newValue in
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                globalSettings.setTranscriptCodeFontPostScriptName(
+                    trimmed.isEmpty ? nil : trimmed
+                )
+            }
+        )
+    }
+
     private var experimentalAttributedTextEditorBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.experimentalAttributedTextEditor() },
@@ -115,6 +137,18 @@ struct AppearanceSettingsView: View {
                 Divider()
                     .padding(.vertical, fontPreset.scaledClamped(16, max: 24))
 
+                // Transcript Code Font (after Text Size)
+                SettingSection(
+                    title: "Transcript Code Font",
+                    description: "Monospaced face for Agent Mode and chat code blocks and diffs"
+                ) {
+                    TranscriptCodeFontPicker(selection: transcriptCodeFontBinding)
+                }
+                .padding(.horizontal, fontPreset.scaledClamped(16, max: 24))
+
+                Divider()
+                    .padding(.vertical, fontPreset.scaledClamped(16, max: 24))
+
                 // Display Options Section
                 SettingSection(
                     title: "Display Options",
@@ -137,6 +171,12 @@ struct AppearanceSettingsView: View {
                             title: "Show dates in message timestamps",
                             description: "Add Yesterday, weekday, or date labels to message and tool timestamps.",
                             isOn: showDatesInMessageTimestampsBinding
+                        )
+
+                        SettingToggle(
+                            title: "Wrap Diff Lines",
+                            description: "Wrap long lines in transcript diffs and tool code blocks instead of scrolling horizontally. Off by default.",
+                            isOn: wrapTranscriptDiffLinesBinding
                         )
                     }
                 }

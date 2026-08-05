@@ -3,7 +3,7 @@ import Foundation
 
 /// Caches pre-highlighted code blocks as attributed strings.
 /// - Uses NSCache for automatic eviction.
-/// - Cache key format: "language|hash|fontSize".
+/// - Cache key includes language, content, font identity, legacy/custom mode, and wrap mode.
 @MainActor
 class CodeHighlightCache {
     static let shared = CodeHighlightCache()
@@ -15,18 +15,38 @@ class CodeHighlightCache {
     ///   - code: Raw code text.
     ///   - language: Optional language hint.
     ///   - fontPointSize: Monospaced font size to render with.
-    func highlighted(_ code: String, language: String? = nil, fontPointSize: CGFloat) -> NSAttributedString {
-        let key = "\(language ?? "plain")|\(code.hashValue)|\(Int(fontPointSize))" as NSString
+    ///   - fontFingerprint: Optional transcript code-font identity. When nil, uses
+    ///     system monospaced (composer / non-transcript callers). Transcript paths
+    ///     pass the resolver fingerprint so face changes invalidate cache entries.
+    func highlighted(
+        _ code: String,
+        language: String? = nil,
+        fontPointSize: CGFloat,
+        fontFingerprint: TranscriptCodeFontFingerprint? = nil,
+        wrapLines: Bool = false
+    ) -> NSAttributedString {
+        let fingerprint = fontFingerprint
+            ?? TranscriptCodeFontFingerprint.systemMonospaced(pointSize: fontPointSize)
+        let attributeMode = fontFingerprint == nil ? "legacy" : "resolved"
+        let key = "\(language ?? "plain")|\(code.hashValue)|\(fingerprint.pointSize)|\(fingerprint.faceIdentity)|\(attributeMode)|\(wrapLines)" as NSString
         if let cached = cache.object(forKey: key) {
             return cached
         }
 
-        // Build base attributes and highlight synchronously
-        let font = NSFont.monospacedSystemFont(ofSize: fontPointSize, weight: .regular)
-        let attrs: [NSAttributedString.Key: Any] = [
+        let resolved = TranscriptCodeFontResolver.resolve(
+            preferredPostScriptName: fingerprint.faceIdentity,
+            pointSize: fingerprint.pointSize
+        )
+        let font = resolved.font
+        var attrs: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: NSColor.textColor
         ]
+        if fontFingerprint != nil {
+            attrs[.paragraphStyle] = resolved.makeCodeParagraphStyle(
+                lineBreakMode: wrapLines ? .byWordWrapping : .byClipping
+            )
+        }
         let mutable = NSMutableAttributedString(string: code, attributes: attrs)
 
         // Reuse the app's highlighter

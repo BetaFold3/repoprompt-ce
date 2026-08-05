@@ -738,6 +738,39 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    /// Word-wrap for transcript unified diffs and tool code-block fallbacks. Default off
+    /// preserves today's clipping + horizontal-scroll rendering path.
+    func wrapTranscriptDiffLines() -> Bool {
+        scalarPreferences.ui?.wrapTranscriptDiffLines ?? false
+    }
+
+    func setWrapTranscriptDiffLines(_ enabled: Bool, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.wrapTranscriptDiffLines = enabled
+        }
+    }
+
+    /// Optional PostScript face for transcript code/diff rendering. `nil` = system monospaced.
+    func transcriptCodeFontPostScriptName() -> String? {
+        let raw = scalarPreferences.ui?.transcriptCodeFontPostScriptName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let raw, !raw.isEmpty else { return nil }
+        return raw
+    }
+
+    func setTranscriptCodeFontPostScriptName(_ postScriptName: String?, commit: Bool = true) {
+        let trimmed = postScriptName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized: String? = {
+            guard let trimmed, !trimmed.isEmpty else { return nil }
+            return trimmed
+        }()
+        updateUIScalar(commit: commit) { settings in
+            settings.transcriptCodeFontPostScriptName = normalized
+        }
+        CodeHighlightCache.shared.clear()
+    }
+
     func experimentalAttributedTextEditor() -> Bool {
         scalarPreferences.ui?.experimentalAttributedTextEditor ?? false
     }

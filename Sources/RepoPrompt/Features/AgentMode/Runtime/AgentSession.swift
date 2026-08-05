@@ -229,6 +229,10 @@ struct AgentSession: Codable, Identifiable {
     /// Newly persisted sessions store this empty and rebuild it from the transcript when needed.
     var items: [AgentChatItemPersist]
 
+    /// Bounded, UI-only Oracle identity payloads keyed by tool-result row ID.
+    /// These are never embedded in the agent-facing transcript or handoff serialization.
+    var uiToolResultPayloadsByItemID: [String: String]
+
     /// Structured transcript source of truth. Compacted turns may retain only summary shells.
     var transcript: AgentTranscript?
 
@@ -321,6 +325,7 @@ struct AgentSession: Codable, Identifiable {
         savedAt: Date = Date(),
         fileURL: URL? = nil,
         items: [AgentChatItemPersist] = [],
+        uiToolResultPayloadsByItemID: [String: String] = [:],
         transcript: AgentTranscript? = nil,
         itemCount: Int? = nil,
         transcriptProjectionCounts: AgentTranscriptProjectionCounts? = nil,
@@ -362,6 +367,7 @@ struct AgentSession: Codable, Identifiable {
         self.savedAt = savedAt
         self.fileURL = fileURL
         self.items = items
+        self.uiToolResultPayloadsByItemID = uiToolResultPayloadsByItemID
         self.transcript = transcript
         self.itemCount = itemCount
         self.transcriptProjectionCounts = transcriptProjectionCounts
@@ -406,6 +412,7 @@ struct AgentSession: Codable, Identifiable {
         case savedAt
         case fileURL
         case items
+        case uiToolResultPayloadsByItemID
         case transcript
         case itemCount
         case transcriptProjectionCounts
@@ -452,6 +459,10 @@ struct AgentSession: Codable, Identifiable {
         savedAt = try container.decode(Date.self, forKey: .savedAt)
         fileURL = try container.decodeIfPresent(URL.self, forKey: .fileURL)
         items = try container.decodeIfPresent([AgentChatItemPersist].self, forKey: .items) ?? []
+        uiToolResultPayloadsByItemID = try container.decodeIfPresent(
+            [String: String].self,
+            forKey: .uiToolResultPayloadsByItemID
+        ) ?? [:]
         transcript = try container.decodeIfPresent(AgentTranscript.self, forKey: .transcript)
         itemCount = try container.decodeIfPresent(Int.self, forKey: .itemCount)
         transcriptProjectionCounts = try container.decodeIfPresent(AgentTranscriptProjectionCounts.self, forKey: .transcriptProjectionCounts)

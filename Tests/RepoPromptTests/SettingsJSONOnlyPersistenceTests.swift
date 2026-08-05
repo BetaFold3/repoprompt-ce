@@ -694,6 +694,82 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(reloaded.showDatesInMessageTimestamps())
     }
 
+    func testWrapTranscriptDiffLinesDefaultsFalseWithoutPersisting() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(ui: .init(showTooltips: false))
+        ))
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        let before = try String(contentsOf: fileURL, encoding: .utf8)
+
+        XCTAssertFalse(store.wrapTranscriptDiffLines())
+        XCTAssertNil(try fileStore.load().scalarPreferences?.ui?.wrapTranscriptDiffLines)
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), before)
+    }
+
+    func testWrapTranscriptDiffLinesSavesAndLoadsTrue() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        store.setWrapTranscriptDiffLines(true)
+
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.ui?.wrapTranscriptDiffLines, true)
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertTrue(reloaded.wrapTranscriptDiffLines())
+    }
+
+    func testTranscriptCodeFontPostScriptNameDefaultsNilWithoutPersisting() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        try fileStore.save(GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(ui: .init(showTooltips: false))
+        ))
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        let before = try String(contentsOf: fileURL, encoding: .utf8)
+
+        XCTAssertNil(store.transcriptCodeFontPostScriptName())
+        XCTAssertNil(try fileStore.load().scalarPreferences?.ui?.transcriptCodeFontPostScriptName)
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), before)
+    }
+
+    func testTranscriptCodeFontPostScriptNameSavesLoadsAndClears() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        store.setTranscriptCodeFontPostScriptName("Menlo-Regular")
+        XCTAssertEqual(try fileStore.load().scalarPreferences?.ui?.transcriptCodeFontPostScriptName, "Menlo-Regular")
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertEqual(reloaded.transcriptCodeFontPostScriptName(), "Menlo-Regular")
+
+        reloaded.setTranscriptCodeFontPostScriptName(nil)
+        XCTAssertNil(try fileStore.load().scalarPreferences?.ui?.transcriptCodeFontPostScriptName)
+        let cleared = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertNil(cleared.transcriptCodeFontPostScriptName())
+    }
+
     // MARK: - Cross-window observability & persistence-block recovery
 
     private func makeStore(at fileURL: URL) throws -> GlobalSettingsStore {

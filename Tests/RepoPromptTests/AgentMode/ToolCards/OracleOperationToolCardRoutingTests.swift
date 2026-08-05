@@ -280,8 +280,10 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             from: jsonString([
                 "chat_id": "resolved-chat",
                 "mode": "review",
-                "model_id": "codex_custom_gpt-5.6-sol-xhigh",
-                "model_name": "CLI·GPT-5.6 Sol XHigh",
+                "model_id": "legacy-provider-model-id",
+                "model_name": "Legacy Provider Model",
+                "ui_model_id": "codex_custom_gpt-5.6-sol-xhigh",
+                "ui_model_name": "CLI·GPT-5.6 Sol XHigh",
                 "model_selection": "explicit",
                 "model_source": "preset",
                 "model_preset_id": "DA2C9FCE-1D37-453F-8E15-DAD11E5EBD46",
@@ -293,12 +295,32 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertEqual(resolvedDTO.modelSource, "preset")
         XCTAssertEqual(resolvedDTO.modelPresetID, "DA2C9FCE-1D37-453F-8E15-DAD11E5EBD46")
         XCTAssertEqual(resolvedDTO.modelPresetName, "GPT_5_6_Sol_xhigh")
-        XCTAssertEqual(resolvedDTO.modelID, "codex_custom_gpt-5.6-sol-xhigh")
-        XCTAssertEqual(resolvedDTO.modelName, "CLI·GPT-5.6 Sol XHigh")
+        XCTAssertEqual(resolvedDTO.modelID, "legacy-provider-model-id")
+        XCTAssertEqual(resolvedDTO.modelName, "Legacy Provider Model")
+        XCTAssertEqual(
+            resolvedDTO.uiModelID,
+            "codex_custom_gpt-5.6-sol-xhigh"
+        )
+        XCTAssertEqual(resolvedDTO.uiModelName, "CLI·GPT-5.6 Sol XHigh")
         XCTAssertEqual(
             chatSendResultSummary(resolvedDTO),
             "review • GPT_5_6_Sol_xhigh • resolved-chat"
         )
+
+        let roundTrippedData = try JSONEncoder().encode(resolvedDTO)
+        let roundTrippedJSON = String(decoding: roundTrippedData, as: UTF8.self)
+        XCTAssertFalse(
+            roundTrippedJSON.contains("codex_custom_gpt-5.6-sol-xhigh"),
+            roundTrippedJSON
+        )
+        XCTAssertFalse(
+            roundTrippedJSON.contains("CLI·GPT-5.6 Sol XHigh"),
+            roundTrippedJSON
+        )
+        XCTAssertFalse(roundTrippedJSON.contains("model_id"), roundTrippedJSON)
+        XCTAssertFalse(roundTrippedJSON.contains("model_name"), roundTrippedJSON)
+        XCTAssertFalse(roundTrippedJSON.contains("ui_model_id"), roundTrippedJSON)
+        XCTAssertFalse(roundTrippedJSON.contains("ui_model_name"), roundTrippedJSON)
 
         let formatted = try onlyText(ToolOutputFormatter.formatAskOracle(
             args: [:],
@@ -311,14 +333,44 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
                 "model_source": .string("preset"),
                 "model_preset_id": .string("DA2C9FCE-1D37-453F-8E15-DAD11E5EBD46"),
                 "model_preset_name": .string("GPT_5_6_Sol_xhigh"),
+                "usage": .object([
+                    "input_tokens": .int(24000),
+                    "context_window": .int(200_000),
+                    "pct": .int(12),
+                    "source": .string("app_estimate")
+                ]),
                 "response": .string("done")
             ]),
             emitResources: false
         ))
         XCTAssertTrue(formatted.contains("**Model selection**: explicit"), formatted)
         XCTAssertTrue(formatted.contains("`GPT_5_6_Sol_xhigh` (`DA2C9FCE-1D37-453F-8E15-DAD11E5EBD46`)"), formatted)
-        XCTAssertTrue(formatted.contains("CLI·GPT-5.6 Sol XHigh (`codex_custom_gpt-5.6-sol-xhigh`)"), formatted)
+        XCTAssertFalse(formatted.contains("CLI·GPT-5.6 Sol XHigh"), formatted)
+        XCTAssertFalse(formatted.contains("codex_custom_gpt-5.6-sol-xhigh"), formatted)
+        XCTAssertFalse(formatted.contains("**Resolved model"), formatted)
         XCTAssertTrue(formatted.contains("**Model source**: `preset`"), formatted)
+        XCTAssertTrue(
+            formatted.contains("input_tokens: 24000, context_window: 200000, pct: 12, source: app_estimate"),
+            formatted
+        )
+
+        let nonPresetFormatted = try onlyText(ToolOutputFormatter.formatAskOracle(
+            args: [:],
+            value: .object([
+                "chat_id": .string("planning-chat"),
+                "mode": .string("plan"),
+                "model_id": .string("planning-model-id"),
+                "model_name": .string("Planning Model"),
+                "model_selection": .string("explicit"),
+                "model_source": .string("planning_model"),
+                "response": .string("done")
+            ]),
+            emitResources: false
+        ))
+        XCTAssertTrue(
+            nonPresetFormatted.contains("Planning Model (`planning-model-id`)"),
+            nonPresetFormatted
+        )
     }
 
     func testOracleToolCallRoutingRequiresExactArgumentChatID() throws {

@@ -255,7 +255,7 @@ enum AgentModePrompts {
         **Named Oracle consultations**
         - When the user asks for an opinion from a named Oracle (for example, "ask Knowledge Duel A and Knowledge Duel B Oracles"), treat each name as a model-preset selector, not merely as a chat title.
         - First call `oracle_utils` with `op:"models"` and resolve each requested name against the authoritative preset list. Prefer the returned exact preset UUID in every `ask_oracle` call; do not guess when a name is missing or ambiguous.
-        - For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and its own explicit `model`; `chat_name` is optional display text only and never selects a model.
+        - For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and its own explicit `model`; `chat_name` is optional display text only and never selects a model. Refer to lanes by preset alias only, and never relay one lane's metadata to another.
         - Continue each lane with its own returned `chat_id`. The lane stays on its own preset, so `model` can be omitted on continuation; passing a different `model` switches that lane deliberately. Each result reports how the model was chosen through `model_selection` (`explicit`, `inherited`, or `automatic`).
         - Before comparing or synthesizing answers, verify every result's returned `model_preset_id` and `model_preset_name` match the requested preset. If identity is missing, mismatched, or any lane fails, report that failure and do not synthesize the answers.
         """

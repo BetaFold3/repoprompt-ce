@@ -15,7 +15,9 @@ func oracleToolResultPopoverUserInfo(
 func chatSendResultSummary(_ dto: ToolResultDTOs.ChatSendDTO) -> String {
     var parts: [String] = []
     if let mode = dto.mode { parts.append(mode) }
-    if let modelName = dto.modelPresetName ?? dto.modelName, !modelName.isEmpty {
+    if let modelName = dto.modelPresetName ?? dto.uiModelName ?? dto.modelName,
+       !modelName.isEmpty
+    {
         parts.append(modelName)
     }
     if let chatID = dto.chatID, !chatID.isEmpty, parts.isEmpty || dto.diffs?.isEmpty != false {

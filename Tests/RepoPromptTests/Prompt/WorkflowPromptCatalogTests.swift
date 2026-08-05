@@ -78,6 +78,8 @@ final class WorkflowPromptCatalogTests: XCTestCase {
             XCTAssertTrue(prompt.contains("`model_preset_id`"), label)
             XCTAssertTrue(prompt.contains("do not synthesize"), label)
         }
+        XCTAssertTrue(reminder.contains("re-packages the current workspace selection"))
+        XCTAssertTrue(reminder.contains("fresh chat with a concise summary"))
     }
 
     func testAgentWorkflowTemplatesRenderFromProviderNeutralCatalog() {

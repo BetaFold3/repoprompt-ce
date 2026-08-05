@@ -1769,23 +1769,26 @@ enum AgentToolResultPersistencePolicy {
             if let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"]) {
                 object["chat_id"] = chatID
             }
-            if let modelName = smallStringValue(rawObject, keys: ["model_name", "modelName"]) {
-                object["model_name"] = modelName
-            }
             if let modelPresetName = smallStringValue(rawObject, keys: ["model_preset_name", "modelPresetName"]) {
                 object["model_preset_name"] = modelPresetName
             }
             if let modelSelection = smallStringValue(rawObject, keys: ["model_selection", "modelSelection"]) {
                 object["model_selection"] = modelSelection
             }
-            if let modelSource = smallStringValue(rawObject, keys: ["model_source", "modelSource"]) {
+            let modelSource = smallStringValue(rawObject, keys: ["model_source", "modelSource"])
+            if let modelSource {
                 object["model_source"] = modelSource
             }
             if let modelPresetID = smallStringValue(rawObject, keys: ["model_preset_id", "modelPresetID"]) {
                 object["model_preset_id"] = modelPresetID
             }
-            if let modelID = smallStringValue(rawObject, keys: ["model_id", "modelID"]) {
-                object["model_id"] = modelID
+            if modelSource?.lowercased() != "preset" {
+                if let modelName = smallStringValue(rawObject, keys: ["model_name", "modelName"]) {
+                    object["model_name"] = modelName
+                }
+                if let modelID = smallStringValue(rawObject, keys: ["model_id", "modelID"]) {
+                    object["model_id"] = modelID
+                }
             }
         }
         return object
@@ -2244,23 +2247,26 @@ enum AgentToolResultPersistencePolicy {
         if let mode = smallStringValue(rawObject, keys: ["mode"]) {
             object["mode"] = mode
         }
-        if let modelName = smallStringValue(rawObject, keys: ["model_name", "modelName"]) {
-            object["model_name"] = modelName
-        }
         if let modelPresetName = smallStringValue(rawObject, keys: ["model_preset_name", "modelPresetName"]) {
             object["model_preset_name"] = modelPresetName
         }
         if let modelSelection = smallStringValue(rawObject, keys: ["model_selection", "modelSelection"]) {
             object["model_selection"] = modelSelection
         }
-        if let modelSource = smallStringValue(rawObject, keys: ["model_source", "modelSource"]) {
+        let modelSource = smallStringValue(rawObject, keys: ["model_source", "modelSource"])
+        if let modelSource {
             object["model_source"] = modelSource
         }
         if let modelPresetID = smallStringValue(rawObject, keys: ["model_preset_id", "modelPresetID"]) {
             object["model_preset_id"] = modelPresetID
         }
-        if let modelID = smallStringValue(rawObject, keys: ["model_id", "modelID"]) {
-            object["model_id"] = modelID
+        if modelSource?.lowercased() != "preset" {
+            if let modelName = smallStringValue(rawObject, keys: ["model_name", "modelName"]) {
+                object["model_name"] = modelName
+            }
+            if let modelID = smallStringValue(rawObject, keys: ["model_id", "modelID"]) {
+                object["model_id"] = modelID
+            }
         }
         let diffCount = intValue(rawObject, keys: ["diff_count", "diffCount"])
             ?? (rawObject["diffs"] as? [Any])?.count
@@ -2292,6 +2298,137 @@ enum AgentToolResultPersistencePolicy {
             normalizedToolName: normalizedToolName,
             summaryText: object["summary_text"] as? String
         )
+    }
+
+    static func uiFacingOracleIdentityJSON(
+        toolName: String?,
+        rawResultJSON: String
+    ) -> String? {
+        let normalizedToolName = normalizedToolName(toolName)
+        guard normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send",
+              let rawObject = jsonObject(from: rawResultJSON, context: nil)
+        else {
+            return nil
+        }
+        let rawOutput = rawObject["rawOutput"] as? [String: Any]
+        let identityObject: [String: Any] = {
+            if smallStringValue(rawObject, keys: ["model_source", "modelSource"]) != nil {
+                return rawObject
+            }
+            return rawOutput ?? rawObject
+        }()
+        guard smallStringValue(identityObject, keys: ["model_source", "modelSource"])?.lowercased() == "preset"
+        else {
+            return nil
+        }
+
+        let modelID = smallStringValue(identityObject, keys: ["ui_model_id", "model_id", "modelID"])
+        let modelName = smallStringValue(identityObject, keys: ["ui_model_name", "model_name", "modelName"])
+        guard modelID != nil || modelName != nil else { return nil }
+
+        var object: [String: Any] = ["model_source": "preset"]
+        if let chatID = smallStringValue(identityObject, keys: ["chat_id", "chatID"]) {
+            object["chat_id"] = chatID
+        }
+        if let mode = smallStringValue(identityObject, keys: ["mode"]) {
+            object["mode"] = mode
+        }
+        if let modelSelection = smallStringValue(identityObject, keys: ["model_selection", "modelSelection"]) {
+            object["model_selection"] = modelSelection
+        }
+        if let modelPresetID = smallStringValue(identityObject, keys: ["model_preset_id", "modelPresetID"]) {
+            object["model_preset_id"] = modelPresetID
+        }
+        if let modelPresetName = smallStringValue(identityObject, keys: ["model_preset_name", "modelPresetName"]) {
+            object["model_preset_name"] = modelPresetName
+        }
+        if let modelID {
+            object["ui_model_id"] = modelID
+        }
+        if let modelName {
+            object["ui_model_name"] = modelName
+        }
+        guard let json = jsonString(from: object),
+              !exceedsPersistedToolSummaryBudget(json)
+        else {
+            return nil
+        }
+        return json
+    }
+
+    static func uiFacingOracleIdentityJSONByChatID(
+        toolName: String?,
+        rawResultJSON: String
+    ) -> [String: String] {
+        let normalizedToolName = normalizedToolName(toolName)
+        guard normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send",
+              let root = jsonObject(from: rawResultJSON, context: nil)
+        else {
+            return [:]
+        }
+
+        var sidecars: [String: String] = [:]
+        func visit(_ value: Any) {
+            if let object = value as? [String: Any] {
+                if let raw = jsonString(from: object),
+                   let sidecar = uiFacingOracleIdentityJSON(
+                       toolName: normalizedToolName,
+                       rawResultJSON: raw
+                   ),
+                   let sidecarObject = jsonObject(from: sidecar, context: nil),
+                   let chatID = smallStringValue(sidecarObject, keys: ["chat_id", "chatID"])
+                {
+                    sidecars[chatID] = sidecar
+                }
+                object.values.forEach(visit)
+            } else if let array = value as? [Any] {
+                array.forEach(visit)
+            }
+        }
+        visit(root)
+        return sidecars
+    }
+
+    static func mergingOracleUIIdentitySidecars(
+        into rawResultJSON: String,
+        sidecarsByChatID: [String: String]
+    ) -> String {
+        guard !sidecarsByChatID.isEmpty,
+              let root = jsonObject(from: rawResultJSON, context: nil)
+        else {
+            return rawResultJSON
+        }
+
+        func merge(_ value: Any) -> Any {
+            if var object = value as? [String: Any] {
+                if let chatID = smallStringValue(object, keys: ["chat_id", "chatID"]),
+                   let sidecar = sidecarsByChatID[chatID],
+                   let identity = jsonObject(from: sidecar, context: nil)
+                {
+                    if let modelID = smallStringValue(identity, keys: ["ui_model_id"]) {
+                        object["ui_model_id"] = modelID
+                    }
+                    if let modelName = smallStringValue(identity, keys: ["ui_model_name"]) {
+                        object["ui_model_name"] = modelName
+                    }
+                }
+                for (key, child) in object {
+                    object[key] = merge(child)
+                }
+                return object
+            }
+            if let array = value as? [Any] {
+                return array.map(merge)
+            }
+            return value
+        }
+
+        guard let merged = merge(root) as? [String: Any],
+              let json = jsonString(from: merged)
+        else {
+            return rawResultJSON
+        }
+        return json
     }
 
     private static func oracleChatSummaryText(from object: [String: Any]) -> String? {

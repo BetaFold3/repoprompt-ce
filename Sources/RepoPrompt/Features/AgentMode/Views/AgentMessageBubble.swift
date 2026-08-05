@@ -187,6 +187,9 @@ struct AgentMessageBubble: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
+    @Environment(\.agentAssistantExpansionStore) private var assistantExpansionStore
+    @Environment(\.agentAssistantSearchFlashedItemID) private var flashedAssistantItemID
+    @StateObject private var fallbackAssistantExpansionStore = AssistantTranscriptExpansionStore()
     @ObservedObject private var fontScale = FontScaleManager.shared
     @State private var isStartingCodexManagedLogin = false
     @State private var codexManagedLoginFeedback: String?
@@ -432,6 +435,7 @@ struct AgentMessageBubble: View {
             VStack(alignment: .leading, spacing: 4) {
                 assistantContent
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(assistantSearchFlashBackground)
 
                 MessageFooterStrip(
                     text: item.text,
@@ -454,6 +458,7 @@ struct AgentMessageBubble: View {
             VStack(alignment: .leading, spacing: 4) {
                 assistantContent
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(assistantSearchFlashBackground)
 
                 MessageFooterStrip(
                     text: item.text,
@@ -468,10 +473,22 @@ struct AgentMessageBubble: View {
         }
     }
 
+    /// Brief highlight applied to the row transcript search just navigated to. No intra-text
+    /// highlighting in v1 — see `AgentAssistantTranscriptSearchMatch`.
+    private var assistantSearchFlashBackground: some View {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(Color.accentColor.opacity(flashedAssistantItemID == item.id ? 0.14 : 0))
+            .animation(.easeOut(duration: 0.5), value: flashedAssistantItemID)
+    }
+
     @ViewBuilder
     private var assistantContent: some View {
         if shouldShowCollapsedAssistantView {
-            CollapsibleAssistantTranscriptContent(text: item.text)
+            CollapsibleAssistantTranscriptContent(
+                text: item.text,
+                itemID: item.id,
+                expansionStore: assistantExpansionStore ?? fallbackAssistantExpansionStore
+            )
         } else {
             MarkdownTextView(
                 text: item.text,
@@ -1459,12 +1476,21 @@ enum AgentAssistantLineDerivation {
 
 private struct CollapsibleAssistantTranscriptContent: View {
     let text: String
+    /// Stable message ID this row's expansion state is keyed by in `expansionStore`.
+    let itemID: UUID
+    /// Owned by `AgentModeChatDetailView` for the displayed session; injected via
+    /// `agentAssistantExpansionStore` so a manual chevron toggle here and a transcript-search
+    /// expand-on-match both route through the same ephemeral, id-keyed store (Workstream 5 item 1).
+    @ObservedObject var expansionStore: AssistantTranscriptExpansionStore
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
 
-    @State private var isExpanded = false
+    private var isExpanded: Bool {
+        expansionStore.isExpanded(itemID)
+    }
+
     private let previewLineCount = 10
 
     private var lineSummary: AgentAssistantLineDerivation.PreviewSummary {
@@ -1509,10 +1535,10 @@ private struct CollapsibleAssistantTranscriptContent: View {
                 Button {
                     if isExpanded {
                         withAnimation(.easeInOut(duration: 0.2)) {
-                            isExpanded = false
+                            expansionStore.toggle(itemID)
                         }
                     } else {
-                        isExpanded = true
+                        expansionStore.toggle(itemID)
                     }
                 } label: {
                     HStack(spacing: 4) {

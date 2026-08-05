@@ -39,10 +39,15 @@ struct ToolScrollableMarkdownTextView: View {
     let text: String
     let maxHeight: CGFloat
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
 
     /// Use the codeFont size (rawValue - 2) for a tighter fit in tool cards
     private var fontSize: Double {
         max(Double(fontScale.preset.rawValue) - 2, 9)
+    }
+
+    private var wrapLines: Bool {
+        globalSettings.wrapTranscriptDiffLines()
     }
 
     var body: some View {
@@ -52,7 +57,9 @@ struct ToolScrollableMarkdownTextView: View {
             isSpellCheckEnabled: false,
             fontSize: fontSize,
             useMonospacedFont: true,
-            wrapLines: false,
+            useTranscriptCodeFont: true,
+            preferredTranscriptCodeFontPostScriptName: globalSettings.transcriptCodeFontPostScriptName(),
+            wrapLines: wrapLines,
             autohidesScrollers: true,
             scrollerStyle: .overlay
         )
