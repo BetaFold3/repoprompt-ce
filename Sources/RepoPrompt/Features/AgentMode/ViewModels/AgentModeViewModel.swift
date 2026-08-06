@@ -14695,19 +14695,33 @@ final class AgentModeViewModel: ObservableObject {
     // conversational context after a forced fresh session start.
     @MainActor
     func stageResumeRecoveryHandoffIfNeeded(for session: TabSession) async {
+        _ = await stageResumeRecoveryHandoffIfNeeded(
+            for: session,
+            ifStillOwned: { true },
+            beforeCommit: nil
+        )
+    }
+
+    @MainActor
+    private func stageResumeRecoveryHandoffIfNeeded(
+        for session: TabSession,
+        ifStillOwned: @escaping @MainActor () -> Bool,
+        beforeCommit: (@MainActor () async -> Void)?
+    ) async -> Bool {
+        guard ifStillOwned() else { return false }
         // Don't overwrite an existing staged payload.
         if let existingPayload = session.pendingHandoff.payload,
            !existingPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         {
-            return
+            return true
         }
         let cutoffItemID = session.items.last(where: { $0.kind != .thinking })?.id
         let sourceTabName = normalizedSessionTitle(workspaceManager?.composeTabName(with: session.tabID))
         let escapedSourceTabName = sourceTabName
-            .replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "\"", with: "&quot;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\u{26}", with: "\u{26}amp;")
+            .replacingOccurrences(of: "\u{22}", with: "\u{26}quot;")
+            .replacingOccurrences(of: "<", with: "\u{26}lt;")
+            .replacingOccurrences(of: ">", with: "\u{26}gt;")
         let sourceAgentName = session.selectedAgent.displayName
         let transcriptXML = buildForkTranscriptXML(from: session, upToItemID: cutoffItemID)
         // delivery_id makes crash/restart retries best-effort idempotent at the prompt level.
@@ -14720,7 +14734,14 @@ final class AgentModeViewModel: ObservableObject {
             deliveryID: deliveryID
         )
         guard !payload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
+            return ifStillOwned()
+        }
+        await beforeCommit?()
+        guard ifStillOwned() else { return false }
+        if let existingPayload = session.pendingHandoff.payload,
+           !existingPayload.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return true
         }
         session.pendingHandoff = PendingHandoffState(
             payload: payload,
@@ -14730,11 +14751,20 @@ final class AgentModeViewModel: ObservableObject {
             isStagedForSend: false
         )
         session.isDirty = true
+        return true
     }
 
     @MainActor
-    func stageClaudeResumeRecoveryHandoffIfNeeded(for session: TabSession) async {
-        await stageResumeRecoveryHandoffIfNeeded(for: session)
+    func stageClaudeResumeRecoveryHandoffIfNeeded(
+        for session: TabSession,
+        ifStillOwned: @escaping @MainActor () -> Bool,
+        beforeCommit: (@MainActor () async -> Void)?
+    ) async -> Bool {
+        await stageResumeRecoveryHandoffIfNeeded(
+            for: session,
+            ifStillOwned: ifStillOwned,
+            beforeCommit: beforeCommit
+        )
     }
 
     @MainActor
@@ -16798,9 +16828,14 @@ final class AgentModeViewModel: ObservableObject {
                 """
             )
         }
-        if !trimmedTranscriptXML.isEmpty {
+        let trimmedTranscriptBody = trimmedTranscriptXML
+            .replacingOccurrences(of: "<transcript>", with: "")
+            .replacingOccurrences(of: "</transcript>", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedTranscriptBody.isEmpty {
             payloadSections.append(trimmedTranscriptXML)
         }
+        guard !payloadSections.isEmpty else { return "" }
 
         let payloadBody = payloadSections.joined(separator: "\n\n")
         return """

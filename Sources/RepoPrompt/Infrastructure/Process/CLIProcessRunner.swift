@@ -26,29 +26,51 @@ private actor GateReleaseCoordinator {
 /// successfully launched it at least once. This avoids repeating
 /// interactive-shell lookups (which are relatively expensive).
 private actor ResolvedCommandCache {
-    static let shared = ResolvedCommandCache()
-    private var map: [String: String] = [:] // command -> absolute path
-    private var generation: UInt64 = 0
-
-    func lookup(for command: String) -> (path: String?, generation: UInt64) {
-        (map[command], generation)
+    struct Generation: Equatable {
+        let invalidateAll: UInt64
+        let command: UInt64
     }
 
-    func put(_ path: String, for command: String, observedGeneration: UInt64) {
-        guard generation == observedGeneration else { return }
+    static let shared = ResolvedCommandCache()
+    private var map: [String: String] = [:] // command -> absolute path
+    private var invalidateAllGeneration: UInt64 = 0
+    private var commandGenerations: [String: UInt64] = [:]
+
+    func lookup(for command: String) -> (path: String?, generation: Generation) {
+        (
+            map[command],
+            Generation(
+                invalidateAll: invalidateAllGeneration,
+                command: commandGenerations[command, default: 0]
+            )
+        )
+    }
+
+    func put(_ path: String, for command: String, observedGeneration: Generation) {
+        let currentGeneration = Generation(
+            invalidateAll: invalidateAllGeneration,
+            command: commandGenerations[command, default: 0]
+        )
+        guard currentGeneration == observedGeneration else { return }
         map[command] = path
     }
 
     func invalidate(_ command: String? = nil) {
-        generation &+= 1
-        if let command { map.removeValue(forKey: command) } else { map.removeAll() }
+        if let command {
+            commandGenerations[command, default: 0] &+= 1
+            map.removeValue(forKey: command)
+        } else {
+            invalidateAllGeneration &+= 1
+            commandGenerations.removeAll()
+            map.removeAll()
+        }
     }
 }
 
 private struct ResolvedAutomaticCommand {
     let command: String
     let cacheKey: String
-    let cacheGeneration: UInt64
+    let cacheGeneration: ResolvedCommandCache.Generation
 }
 
 /// Diagnostics logger for lifecycle gate operations
@@ -72,7 +94,7 @@ enum CLIProcessRunnerError: Error, LocalizedError {
     var errorDescription: String? {
         switch self {
         case let .explicitCommandNotLaunchable(path, reason):
-            "Configured CLI executable is not launchable at \(path): \(reason.localizedDescription)"
+            "\(reason.localizedDescription) Configured path: \(path)."
         case let .commandNotFound(command):
             "Command not found: \(command)"
         case let .spawnFailed(message):
@@ -111,11 +133,29 @@ final class CLIProcessRunner {
     let config: CLIProcessConfiguration
     private let registry = ProcessRegistry()
     private let gate: TaskSemaphore
+    #if DEBUG
+        private let beforeResolvedCommandCachePut: (@Sendable (String) async -> Void)?
+    #endif
 
     init(config: CLIProcessConfiguration, concurrencyLimit: Int = 1) {
         self.config = config
         gate = TaskSemaphore(max(concurrencyLimit, 1))
+        #if DEBUG
+            beforeResolvedCommandCachePut = nil
+        #endif
     }
+
+    #if DEBUG
+        init(
+            config: CLIProcessConfiguration,
+            concurrencyLimit: Int = 1,
+            beforeResolvedCommandCachePut: @escaping @Sendable (String) async -> Void
+        ) {
+            self.config = config
+            gate = TaskSemaphore(max(concurrencyLimit, 1))
+            self.beforeResolvedCommandCachePut = beforeResolvedCommandCachePut
+        }
+    #endif
 
     static func invalidateResolvedCommandCache(command: String) async {
         await ResolvedCommandCache.shared.invalidate(command)
@@ -414,6 +454,9 @@ final class CLIProcessRunner {
                 if let automaticResolution, status == 0, !timedOut, resolvedCommand.contains("/"),
                    Self.isRunnableExecutable(resolvedCommand)
                 {
+                    #if DEBUG
+                        await beforeResolvedCommandCachePut?(automaticResolution.cacheKey)
+                    #endif
                     await ResolvedCommandCache.shared.put(
                         resolvedCommand,
                         for: automaticResolution.cacheKey,
@@ -672,6 +715,9 @@ final class CLIProcessRunner {
                     if let automaticResolution, status == 0, !timedOut, resolvedCommand.contains("/"),
                        Self.isRunnableExecutable(resolvedCommand)
                     {
+                        #if DEBUG
+                            await beforeResolvedCommandCachePut?(automaticResolution.cacheKey)
+                        #endif
                         await ResolvedCommandCache.shared.put(
                             resolvedCommand,
                             for: automaticResolution.cacheKey,

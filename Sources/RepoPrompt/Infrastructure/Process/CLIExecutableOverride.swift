@@ -50,6 +50,11 @@ enum CLIExecutableOverrideError: LocalizedError {
 }
 
 enum CLIExecutableOverrideStore {
+    struct ValidatedApply {
+        fileprivate let selection: CLICommandSelection
+        fileprivate let storageKey: String
+    }
+
     private static let keyPrefix = "cliExecutableOverride."
 
     static func key(for profile: CLILaunchProfile) -> String {
@@ -75,20 +80,49 @@ enum CLIExecutableOverrideStore {
         return .configuredExactPath(storedPath)
     }
 
+    static func validateForApply(
+        _ input: String,
+        for profile: CLILaunchProfile
+    ) throws -> ValidatedApply {
+        let storageKey = key(for: profile)
+        guard let normalizedPath = try normalizeForApply(input) else {
+            return ValidatedApply(
+                selection: .automatic(command: profile.commandName),
+                storageKey: storageKey
+            )
+        }
+
+        try validateForLaunch(normalizedPath, commandName: profile.commandName)
+        return ValidatedApply(
+            selection: .configuredExactPath(normalizedPath),
+            storageKey: storageKey
+        )
+    }
+
+    @discardableResult
+    static func persist(
+        _ validatedApply: ValidatedApply,
+        defaults: UserDefaults = .standard
+    ) -> CLICommandSelection {
+        switch validatedApply.selection {
+        case .automatic:
+            defaults.removeObject(forKey: validatedApply.storageKey)
+        case let .configuredExactPath(path):
+            defaults.set(path, forKey: validatedApply.storageKey)
+        case .programmaticOverride:
+            assertionFailure("Validated user apply cannot be programmatic")
+        }
+        return validatedApply.selection
+    }
+
     @discardableResult
     static func apply(
         _ input: String,
         for profile: CLILaunchProfile,
         defaults: UserDefaults = .standard
     ) throws -> CLICommandSelection {
-        guard let normalizedPath = try normalizeForApply(input) else {
-            defaults.removeObject(forKey: key(for: profile))
-            return .automatic(command: profile.commandName)
-        }
-
-        try validateForLaunch(normalizedPath, commandName: profile.commandName)
-        defaults.set(normalizedPath, forKey: key(for: profile))
-        return .configuredExactPath(normalizedPath)
+        let validatedApply = try validateForApply(input, for: profile)
+        return persist(validatedApply, defaults: defaults)
     }
 
     static func reset(
@@ -138,8 +172,9 @@ enum CLIExecutableOverrideStore {
     @discardableResult
     static func validateForLaunch(
         _ path: String,
-        commandName: String = CLILaunchProfiles.claudeCode.commandName
+        commandName: String
     ) throws -> String {
+        try rejectUnsupportedCharacters(in: path)
         guard (path as NSString).isAbsolutePath else {
             throw CLIExecutableOverrideError.notAbsolute
         }

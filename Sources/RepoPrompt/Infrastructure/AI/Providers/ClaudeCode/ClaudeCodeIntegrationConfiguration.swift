@@ -310,8 +310,8 @@ enum ClaudeCodeIntegrationConfiguration {
             print("ClaudeCodeIntegrationConfiguration – Claude Code install error: \(error)")
             let message = if let runnerError = error as? CLIProcessRunnerError {
                 switch runnerError {
-                case let .explicitCommandNotLaunchable(path, reason):
-                    "\(reason.localizedDescription) Configured path: \(path)."
+                case .explicitCommandNotLaunchable:
+                    runnerError.localizedDescription
                 case .commandNotFound:
                     "Claude Code CLI not found. Install it from claude.ai/download"
                 default:

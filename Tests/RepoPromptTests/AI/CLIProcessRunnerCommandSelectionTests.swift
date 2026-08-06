@@ -244,8 +244,28 @@ final class CLIProcessRunnerCommandSelectionTests: XCTestCase {
         try writeExecutable(secondDirectory.appendingPathComponent("tailscale"), contents: "#!/bin/sh\nprintf tailscale-second\n")
 
         _ = try await runAutomatic(command: "claude", path: firstDirectory.path, fixture: fixture)
-        _ = try await runAutomatic(command: "tailscale", path: firstDirectory.path, fixture: fixture)
+        let cachePutGate = ResolvedCommandCachePutGate(blockedCommand: "tailscale")
+        let tailscaleRunner = CLIProcessRunner(
+            config: CLIProcessConfiguration(
+                command: "tailscale",
+                environment: ["SHELL": fixture.fakeShell.path, "PATH": ""],
+                additionalPaths: [firstDirectory.path],
+                enableDebugLogging: false,
+                shellLookupMode: .disabled
+            ),
+            beforeResolvedCommandCachePut: { command in
+                await cachePutGate.pauseBeforePut(for: command)
+            }
+        )
+        let inFlightTailscale = Task {
+            try await tailscaleRunner.run(args: [], stdin: nil, outputMode: .none, timeout: 5)
+        }
+        await cachePutGate.waitUntilBlockedPutStarted()
+
         await CLIProcessRunner.invalidateResolvedCommandCache(command: "claude")
+        await cachePutGate.finishBlockedPut()
+        let firstTailscale = try await inFlightTailscale.value
+        XCTAssertEqual(firstTailscale.stdout, Data("tailscale-first".utf8))
 
         let claude = try await runAutomatic(command: "claude", path: secondDirectory.path, fixture: fixture)
         let tailscale = try await runAutomatic(command: "tailscale", path: secondDirectory.path, fixture: fixture)
@@ -375,5 +395,41 @@ final class CLIProcessRunnerCommandSelectionTests: XCTestCase {
         let root: URL
         let fakeShell: URL
         let shellRecorder: URL
+    }
+}
+
+private actor ResolvedCommandCachePutGate {
+    private let blockedCommand: String
+    private var blockedPutContinuation: CheckedContinuation<Void, Never>?
+    private var blockedPutStarted = false
+    private var blockedPutStartWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(blockedCommand: String) {
+        self.blockedCommand = blockedCommand
+    }
+
+    func pauseBeforePut(for command: String) async {
+        guard command == blockedCommand else { return }
+        await withCheckedContinuation { continuation in
+            blockedPutContinuation = continuation
+            blockedPutStarted = true
+            let waiters = blockedPutStartWaiters
+            blockedPutStartWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+    }
+
+    func waitUntilBlockedPutStarted() async {
+        guard !blockedPutStarted else { return }
+        await withCheckedContinuation { continuation in
+            blockedPutStartWaiters.append(continuation)
+        }
+    }
+
+    func finishBlockedPut() {
+        blockedPutContinuation?.resume()
+        blockedPutContinuation = nil
     }
 }

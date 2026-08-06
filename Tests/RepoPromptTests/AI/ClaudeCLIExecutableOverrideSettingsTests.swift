@@ -80,10 +80,56 @@ final class ClaudeCLIExecutableOverrideSettingsTests: XCTestCase {
             executable.path,
             forKey: CLIExecutableOverrideStore.key(for: CLILaunchProfiles.claudeCode)
         )
-        let gate = SameSelectionClaudeProbeGate()
+        let probeSequence = SameSelectionClaudeProbeSequence()
+        let refreshGate = ClaudeFamilyModelAvailabilityRefreshGate()
         let viewModel = makeSettingsViewModel(
             probe: { config, _ in
-                await gate.run(command: config.command)
+                await probeSequence.run(command: config.command)
+            },
+            invalidator: {},
+            modelAvailabilityRefreshBoundary: {
+                await refreshGate.pauseFirstRefresh()
+            }
+        )
+
+        let olderProbe = Task {
+            await viewModel.refreshClaudeCodeBinaryStatus(timeout: 2, forceProbe: true)
+        }
+        await refreshGate.waitUntilFirstRefreshStarted()
+
+        let newerProbeSucceeded = await viewModel.refreshClaudeCodeBinaryStatus(
+            timeout: 2,
+            forceProbe: true
+        )
+        XCTAssertFalse(newerProbeSucceeded)
+        XCTAssertEqual(
+            viewModel.displayedClaudeExecutableProbeStatus,
+            .failed(message: "newer failure")
+        )
+
+        await refreshGate.finishFirstRefresh()
+        let olderProbeSucceeded = await olderProbe.value
+        XCTAssertFalse(olderProbeSucceeded)
+        XCTAssertEqual(
+            viewModel.claudeCodeCLIStatus,
+            .binaryMissing(message: "newer failure")
+        )
+        XCTAssertEqual(
+            viewModel.displayedClaudeExecutableProbeStatus,
+            .failed(message: "newer failure")
+        )
+    }
+
+    func testLateOlderSameSelectionProbeOutcomeIsRejectedBeforePublication() async throws {
+        let executable = try makeExecutable(named: "configured-claude")
+        defaults.set(
+            executable.path,
+            forKey: CLIExecutableOverrideStore.key(for: CLILaunchProfiles.claudeCode)
+        )
+        let probeGate = SameSelectionClaudeProbeOperationGate()
+        let viewModel = makeSettingsViewModel(
+            probe: { config, _ in
+                await probeGate.run(command: config.command)
             },
             invalidator: {}
         )
@@ -91,7 +137,7 @@ final class ClaudeCLIExecutableOverrideSettingsTests: XCTestCase {
         let olderProbe = Task {
             await viewModel.refreshClaudeCodeBinaryStatus(timeout: 2, forceProbe: true)
         }
-        await gate.waitUntilFirstProbeStarted()
+        await probeGate.waitUntilFirstProbeStarted()
 
         let newerProbeSucceeded = await viewModel.refreshClaudeCodeBinaryStatus(
             timeout: 2,
@@ -103,11 +149,9 @@ final class ClaudeCLIExecutableOverrideSettingsTests: XCTestCase {
             .succeeded(resolvedCommand: executable.path, version: "newer success")
         )
 
-        await gate.finishFirstProbe(
-            with: .failed(message: "older failure")
-        )
+        await probeGate.finishFirstProbe(with: .failed(message: "older failure"))
         let olderProbeSucceeded = await olderProbe.value
-        XCTAssertFalse(olderProbeSucceeded)
+        XCTAssertTrue(olderProbeSucceeded)
         XCTAssertEqual(viewModel.claudeCodeCLIStatus, .binaryPresent)
         XCTAssertEqual(
             viewModel.displayedClaudeExecutableProbeStatus,
@@ -267,7 +311,8 @@ final class ClaudeCLIExecutableOverrideSettingsTests: XCTestCase {
         draftValidator: ((String) async -> ClaudeExecutableDraftAssessment)? = nil,
         probe: ((CLIProcessConfiguration, TimeInterval) async -> ClaudeExecutableProbeOutcome)? = nil,
         invalidator: (() async -> Void)? = nil,
-        pipelineObserver: ((ClaudeExecutableOverridePipelineStage) -> Void)? = nil
+        pipelineObserver: ((ClaudeExecutableOverridePipelineStage) -> Void)? = nil,
+        modelAvailabilityRefreshBoundary: (@MainActor @Sendable () async -> Void)? = nil
     ) -> APISettingsViewModel {
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
@@ -280,7 +325,8 @@ final class ClaudeCLIExecutableOverrideSettingsTests: XCTestCase {
             claudeExecutableDraftValidator: draftValidator,
             claudeExecutableProbeOperation: probe,
             cliResolvedCommandCacheInvalidator: invalidator,
-            claudeExecutableOverridePipelineObserver: pipelineObserver
+            claudeExecutableOverridePipelineObserver: pipelineObserver,
+            claudeFamilyModelAvailabilityRefreshBoundary: modelAvailabilityRefreshBoundary
         )
     }
 
@@ -307,7 +353,10 @@ final class ClaudeCLIExecutableOverrideSettingsTests: XCTestCase {
                     isQuarantined: false
                 )
             }
-            try CLIExecutableOverrideStore.validateForLaunch(normalized)
+            try CLIExecutableOverrideStore.validateForLaunch(
+                normalized,
+                commandName: CLILaunchProfiles.claudeCode.commandName
+            )
             return ClaudeExecutableDraftAssessment(
                 validation: .valid,
                 normalizedPath: normalized,
@@ -362,7 +411,19 @@ private actor ClaudeProbeGate {
     }
 }
 
-private actor SameSelectionClaudeProbeGate {
+private actor SameSelectionClaudeProbeSequence {
+    private var invocationCount = 0
+
+    func run(command: String) -> ClaudeExecutableProbeOutcome {
+        invocationCount += 1
+        if invocationCount == 1 {
+            return .succeeded(resolvedCommand: command, version: "older success")
+        }
+        return .failed(message: "newer failure")
+    }
+}
+
+private actor SameSelectionClaudeProbeOperationGate {
     private var invocationCount = 0
     private var firstProbeContinuation: CheckedContinuation<ClaudeExecutableProbeOutcome, Never>?
     private var firstProbeStarted = false
@@ -395,6 +456,39 @@ private actor SameSelectionClaudeProbeGate {
     func finishFirstProbe(with outcome: ClaudeExecutableProbeOutcome) {
         firstProbeContinuation?.resume(returning: outcome)
         firstProbeContinuation = nil
+    }
+}
+
+private actor ClaudeFamilyModelAvailabilityRefreshGate {
+    private var invocationCount = 0
+    private var firstRefreshContinuation: CheckedContinuation<Void, Never>?
+    private var firstRefreshStarted = false
+    private var firstRefreshStartWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pauseFirstRefresh() async {
+        invocationCount += 1
+        guard invocationCount == 1 else { return }
+        await withCheckedContinuation { continuation in
+            firstRefreshContinuation = continuation
+            firstRefreshStarted = true
+            let waiters = firstRefreshStartWaiters
+            firstRefreshStartWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+    }
+
+    func waitUntilFirstRefreshStarted() async {
+        guard !firstRefreshStarted else { return }
+        await withCheckedContinuation { continuation in
+            firstRefreshStartWaiters.append(continuation)
+        }
+    }
+
+    func finishFirstRefresh() {
+        firstRefreshContinuation?.resume()
+        firstRefreshContinuation = nil
     }
 }
 

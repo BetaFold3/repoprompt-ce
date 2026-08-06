@@ -28,8 +28,20 @@ final class ClaudeAgentModeCoordinator {
         )
     }
 
+    private struct FallbackReplacementClaim: Equatable {
+        let id: UUID
+        let runID: UUID
+        let runAttemptID: UUID?
+    }
+
+    private struct TrackedPrivateFallbackController {
+        let claim: FallbackReplacementClaim
+        let controller: any NativeAgentRuntimeControlling
+    }
+
     private enum ControllerLifecycleError: Error {
         case superseded
+        case claimedStartupFailure(Error, FallbackReplacementClaim)
     }
 
     struct DetachedClaudeController {
@@ -65,6 +77,12 @@ final class ClaudeAgentModeCoordinator {
     private var toolHandlerByTabID: [UUID: ClaudeAgentToolTrackingHandler] = [:]
     private var controllerLaunchSettingsByTabID: [UUID: ControllerLaunchSettings] = [:]
     private var controllerRetirementGenerationByTabID: [UUID: UUID] = [:]
+    private var fallbackReplacementClaimByTabID: [UUID: FallbackReplacementClaim] = [:]
+    private var privateFallbackControllerByTabID: [UUID: TrackedPrivateFallbackController] = [:]
+    #if DEBUG
+        private var testStopToolTrackingGate: (() async -> Void)?
+        private var testResumeRecoveryHandoffBeforeCommitGate: (@MainActor () async -> Void)?
+    #endif
     private var pendingResumeTransferTasksByTabID: [UUID: Task<NativeAgentRuntimeSessionRef, Never>] = [:]
     private var pendingResumeTransferGenerationByTabID: [UUID: UUID] = [:]
     private var retiredResumeTransferTasksByTabID: [UUID: [Task<NativeAgentRuntimeSessionRef, Never>]] = [:]
@@ -153,6 +171,12 @@ final class ClaudeAgentModeCoordinator {
     func stop() {
         controllerLaunchSettingsByTabID.removeAll()
         controllerRetirementGenerationByTabID.removeAll()
+        fallbackReplacementClaimByTabID.removeAll()
+        let privateFallbackControllers = privateFallbackControllerByTabID.values.map(\.controller)
+        privateFallbackControllerByTabID.removeAll()
+        for controller in privateFallbackControllers {
+            Task { await controller.shutdown() }
+        }
         let resumeTransferTasks = Array(pendingResumeTransferTasksByTabID.values)
             + retiredResumeTransferTasksByTabID.values.flatMap(\.self)
         resumeTransferTasks.forEach { $0.cancel() }
@@ -264,8 +288,20 @@ final class ClaudeAgentModeCoordinator {
         guard session.selectedAgent.usesClaudeNativeRuntime else { return }
         await awaitPendingClaudeResumeTransferIfNeeded(for: session)
 
+        if let controller = session.claudeController,
+           let replacementClaim = fallbackReplacementClaimByTabID[session.tabID],
+           sessionOwnsInstalledFallbackReplacementClaim(
+               replacementClaim,
+               controller: controller,
+               for: session
+           )
+        {
+            return
+        }
+
         let runID = session.runID ?? UUID()
         session.runID = runID
+        let runAttemptID = session.activeRunAttemptID
         let launchModelRaw = session.selectedModelRaw
         let launchKey = viewModel?.provisionalClaudeContextWindowKey(for: session)
         let runtimeVariant = session.selectedAgent.claudeRuntimeVariant ?? .standard
@@ -359,6 +395,7 @@ final class ClaudeAgentModeCoordinator {
                 return
             }
             invalidateControllerRetirement(for: session)
+            invalidateFallbackReplacementClaim(for: session)
             session.claudeController = createdController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
             await createdController.ensureEventsStreamReady()
@@ -392,20 +429,59 @@ final class ClaudeAgentModeCoordinator {
             updateProviderSessionIDIfNeeded(sessionRef.sessionID, for: session)
         } catch ControllerLifecycleError.superseded {
             return
+        } catch let ControllerLifecycleError.claimedStartupFailure(error, claim) {
+            guard sessionOwnsDetachedFallbackReplacementClaim(claim, for: session) else {
+                invalidateFallbackReplacementClaim(claim, for: session)
+                return
+            }
+            invalidateFallbackReplacementClaim(claim, for: session)
+            let errorItem = AgentChatItem.error(
+                "Claude native start failed: \(error.localizedDescription)",
+                sequenceIndex: session.nextSequenceIndex
+            )
+            session.appendItem(errorItem)
+            finalizeSession(session, state: .failed, save: true)
         } catch {
-            if await controller.requiresReplacementAfterTerminalStartupFailure,
-               let detached = detachClaudeController(
-                   controller,
-                   from: session,
-                   removeToolTracking: true
-               )
-            {
-                _ = await retireClaudeController(
+            guard session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID,
+                  session.runState.isActive,
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return
+            }
+
+            let requiresReplacement = await controller.requiresReplacementAfterTerminalStartupFailure
+            guard session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID,
+                  session.runState.isActive,
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                return
+            }
+
+            if requiresReplacement {
+                guard let detached = detachClaudeController(
+                    controller,
+                    from: session,
+                    removeToolTracking: true
+                ) else {
+                    return
+                }
+                let retired = await retireClaudeController(
                     detached,
                     for: session,
                     captureProviderSessionID: false
                 )
+                guard retired,
+                      session.runID == runID,
+                      session.activeRunAttemptID == runAttemptID,
+                      session.runState.isActive,
+                      session.claudeController == nil
+                else {
+                    return
+                }
             }
+
             let errorItem = AgentChatItem.error(
                 "Claude native start failed: \(error.localizedDescription)",
                 sequenceIndex: session.nextSequenceIndex
@@ -481,25 +557,38 @@ final class ClaudeAgentModeCoordinator {
     private func detachClaudeController(
         _ controller: any NativeAgentRuntimeControlling,
         from session: AgentModeViewModel.TabSession,
-        removeToolTracking: Bool
+        removeToolTracking: Bool,
+        preserveFallbackReplacementClaim: Bool = false
     ) -> DetachedClaudeController? {
         guard sessionOwnsClaudeController(controller, for: session) else { return nil }
         let toolHandler = removeToolTracking ? toolHandlerByTabID.removeValue(forKey: session.tabID) : nil
-        clearClaudeControllerLaunchMetadata(for: session)
+        clearClaudeControllerLaunchMetadata(
+            for: session,
+            preserveFallbackReplacementClaim: preserveFallbackReplacementClaim
+        )
         return DetachedClaudeController(controller: controller, toolHandler: toolHandler)
     }
 
     private func clearClaudeControllerLaunchMetadata(
-        for session: AgentModeViewModel.TabSession
+        for session: AgentModeViewModel.TabSession,
+        preserveFallbackReplacementClaim: Bool = false
     ) {
         session.claudeController = nil
         controllerLaunchSettingsByTabID.removeValue(forKey: session.tabID)
+        if !preserveFallbackReplacementClaim {
+            invalidateFallbackReplacementClaim(for: session)
+        }
     }
 
     private func stopToolTracking(
         _ detached: DetachedClaudeController,
         for session: AgentModeViewModel.TabSession
     ) async {
+        #if DEBUG
+            if let testStopToolTrackingGate {
+                await testStopToolTrackingGate()
+            }
+        #endif
         await detached.toolHandler?.stopTracking(for: session)
     }
 
@@ -537,11 +626,113 @@ final class ClaudeAgentModeCoordinator {
         controllerRetirementGenerationByTabID.removeValue(forKey: session.tabID)
     }
 
+    private func beginFallbackReplacementClaim(
+        for session: AgentModeViewModel.TabSession,
+        runID: UUID,
+        runAttemptID: UUID?
+    ) -> FallbackReplacementClaim {
+        invalidateFallbackReplacementClaim(for: session)
+        let claim = FallbackReplacementClaim(
+            id: UUID(),
+            runID: runID,
+            runAttemptID: runAttemptID
+        )
+        fallbackReplacementClaimByTabID[session.tabID] = claim
+        return claim
+    }
+
+    private func sessionOwnsDetachedFallbackReplacementClaim(
+        _ claim: FallbackReplacementClaim,
+        for session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        fallbackReplacementClaimByTabID[session.tabID] == claim
+            && session.runID == claim.runID
+            && session.activeRunAttemptID == claim.runAttemptID
+            && session.runState.isActive
+            && session.claudeController == nil
+    }
+
+    private func sessionOwnsInstalledFallbackReplacementClaim(
+        _ claim: FallbackReplacementClaim,
+        controller: any NativeAgentRuntimeControlling,
+        for session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        fallbackReplacementClaimByTabID[session.tabID] == claim
+            && session.runID == claim.runID
+            && session.activeRunAttemptID == claim.runAttemptID
+            && session.runState.isActive
+            && sessionOwnsClaudeController(controller, for: session)
+    }
+
+    private func trackPrivateFallbackController(
+        _ controller: any NativeAgentRuntimeControlling,
+        for session: AgentModeViewModel.TabSession,
+        claim: FallbackReplacementClaim
+    ) -> Bool {
+        guard sessionOwnsDetachedFallbackReplacementClaim(claim, for: session),
+              privateFallbackControllerByTabID[session.tabID] == nil
+        else {
+            return false
+        }
+        privateFallbackControllerByTabID[session.tabID] = TrackedPrivateFallbackController(
+            claim: claim,
+            controller: controller
+        )
+        return true
+    }
+
+    private func removeTrackedPrivateFallbackController(
+        for tabID: UUID,
+        claim: FallbackReplacementClaim,
+        controller: (any NativeAgentRuntimeControlling)? = nil
+    ) -> (any NativeAgentRuntimeControlling)? {
+        guard let tracked = privateFallbackControllerByTabID[tabID],
+              tracked.claim == claim,
+              controller.map({ controllersAreIdentical($0, tracked.controller) }) ?? true
+        else {
+            return nil
+        }
+        privateFallbackControllerByTabID.removeValue(forKey: tabID)
+        return tracked.controller
+    }
+
+    private func scheduleShutdownTrackedPrivateFallbackController(
+        for session: AgentModeViewModel.TabSession,
+        claim: FallbackReplacementClaim
+    ) {
+        guard let controller = removeTrackedPrivateFallbackController(
+            for: session.tabID,
+            claim: claim
+        ) else {
+            return
+        }
+        guard !sessionOwnsClaudeController(controller, for: session) else { return }
+        Task { await controller.shutdown() }
+    }
+
+    private func invalidateFallbackReplacementClaim(for session: AgentModeViewModel.TabSession) {
+        guard let claim = fallbackReplacementClaimByTabID.removeValue(forKey: session.tabID) else {
+            return
+        }
+        scheduleShutdownTrackedPrivateFallbackController(for: session, claim: claim)
+    }
+
+    private func invalidateFallbackReplacementClaim(
+        _ claim: FallbackReplacementClaim,
+        for session: AgentModeViewModel.TabSession
+    ) {
+        if fallbackReplacementClaimByTabID[session.tabID] == claim {
+            fallbackReplacementClaimByTabID.removeValue(forKey: session.tabID)
+        }
+        scheduleShutdownTrackedPrivateFallbackController(for: session, claim: claim)
+    }
+
     #if DEBUG
         func test_discardRuntimeState(for session: AgentModeViewModel.TabSession) {
             session.claudeController = nil
             controllerLaunchSettingsByTabID.removeValue(forKey: session.tabID)
             controllerRetirementGenerationByTabID.removeValue(forKey: session.tabID)
+            invalidateFallbackReplacementClaim(for: session)
             pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)?.cancel()
             pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
             let retiredTasks = retiredResumeTransferTasksByTabID.removeValue(forKey: session.tabID) ?? []
@@ -557,6 +748,7 @@ final class ClaudeAgentModeCoordinator {
         ) {
             if session.claudeController != nil {
                 invalidateControllerRetirement(for: session)
+                invalidateFallbackReplacementClaim(for: session)
             }
             controllerLaunchSettingsByTabID[session.tabID] = settings
         }
@@ -567,6 +759,32 @@ final class ClaudeAgentModeCoordinator {
             controllerLaunchSettingsByTabID[session.tabID]
         }
 
+        func test_trackedClaudeRunID(
+            for session: AgentModeViewModel.TabSession
+        ) -> UUID? {
+            toolHandlerByTabID[session.tabID]?.currentTrackedRunID
+        }
+
+        func test_setStopToolTrackingGate(_ gate: (() async -> Void)?) {
+            testStopToolTrackingGate = gate
+        }
+
+        func test_setResumeRecoveryHandoffBeforeCommitGate(_ gate: (@MainActor () async -> Void)?) {
+            testResumeRecoveryHandoffBeforeCommitGate = gate
+        }
+
+        func test_hasFallbackReplacementClaim(
+            for session: AgentModeViewModel.TabSession
+        ) -> Bool {
+            fallbackReplacementClaimByTabID[session.tabID] != nil
+        }
+
+        func test_hasTrackedPrivateFallbackController(
+            for session: AgentModeViewModel.TabSession
+        ) -> Bool {
+            privateFallbackControllerByTabID[session.tabID] != nil
+        }
+
         func test_hasPendingOrRetiredResumeTransfers(
             for session: AgentModeViewModel.TabSession
         ) -> Bool {
@@ -575,12 +793,27 @@ final class ClaudeAgentModeCoordinator {
         }
     #endif
 
+    private func controllersAreIdentical(
+        _ lhs: any NativeAgentRuntimeControlling,
+        _ rhs: any NativeAgentRuntimeControlling
+    ) -> Bool {
+        ObjectIdentifier(lhs as AnyObject) == ObjectIdentifier(rhs as AnyObject)
+    }
+
     private func sessionOwnsClaudeController(
         _ controller: any NativeAgentRuntimeControlling,
         for session: AgentModeViewModel.TabSession
     ) -> Bool {
         guard let currentController = session.claudeController else { return false }
-        return ObjectIdentifier(currentController as AnyObject) == ObjectIdentifier(controller as AnyObject)
+        return controllersAreIdentical(currentController, controller)
+    }
+
+    private func shutdownClaudeControllerIfUnowned(
+        _ controller: any NativeAgentRuntimeControlling,
+        by session: AgentModeViewModel.TabSession
+    ) async {
+        guard !sessionOwnsClaudeController(controller, for: session) else { return }
+        await controller.shutdown()
     }
 
     private func startOrResumeWithFallback(
@@ -595,6 +828,7 @@ final class ClaudeAgentModeCoordinator {
         effectiveToolSearchEnabled: Bool?
     ) async throws -> NativeAgentRuntimeSessionRef {
         let existingSessionID = session.providerSessionID
+        let runAttemptID = session.activeRunAttemptID
         let systemPromptOverride = agentModeSystemPromptOverride(for: session)
         let effortLevel = currentClaudeEffortLevel(for: session)
         do {
@@ -604,72 +838,190 @@ final class ClaudeAgentModeCoordinator {
                 effortLevel: effortLevel,
                 systemPromptOverride: systemPromptOverride
             )
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                await controller.shutdown()
+            guard session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID,
+                  session.runState.isActive,
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                await shutdownClaudeControllerIfUnowned(controller, by: session)
                 throw ControllerLifecycleError.superseded
             }
             return sessionRef
         } catch ControllerLifecycleError.superseded {
             throw ControllerLifecycleError.superseded
         } catch {
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                await controller.shutdown()
+            guard session.runID == runID,
+                  session.activeRunAttemptID == runAttemptID,
+                  session.runState.isActive,
+                  sessionOwnsClaudeController(controller, for: session)
+            else {
+                await shutdownClaudeControllerIfUnowned(controller, by: session)
                 throw ControllerLifecycleError.superseded
             }
             guard shouldRetryFreshStartWithoutResume(after: error, existingSessionID: existingSessionID) else {
                 throw error
             }
 
-            await viewModel?.stageClaudeResumeRecoveryHandoffIfNeeded(for: session)
-            guard sessionOwnsClaudeController(controller, for: session) else {
-                await controller.shutdown()
-                throw ControllerLifecycleError.superseded
-            }
-            await controller.shutdown()
+            let replacementClaim = beginFallbackReplacementClaim(
+                for: session,
+                runID: runID,
+                runAttemptID: runAttemptID
+            )
             guard let detached = detachClaudeController(
                 controller,
                 from: session,
-                removeToolTracking: true
+                removeToolTracking: true,
+                preserveFallbackReplacementClaim: true
             ) else {
+                invalidateFallbackReplacementClaim(replacementClaim, for: session)
                 throw ControllerLifecycleError.superseded
             }
-            await stopToolTracking(detached, for: session)
-            session.runID = nil
-            session.providerSessionID = nil
-            session.isDirty = true
-            viewModel?.scheduleSave(for: session.tabID)
+            let shouldResumeToolTracking = detached.toolHandler != nil
+            let retired = await retireClaudeController(
+                detached,
+                for: session,
+                captureProviderSessionID: false
+            )
+            guard retired,
+                  sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session)
+            else {
+                invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                throw ControllerLifecycleError.superseded
+            }
 
-            let freshRunID = UUID()
-            session.runID = freshRunID
-            let retryWorkspacePath = try workspacePathProvider(session)
-            let launchSettings = ControllerLaunchSettings(
-                runtimeVariant: runtimeVariant,
-                workspacePath: retryWorkspacePath,
-                permissionMode: effectivePermissionMode,
-                allowNativeBashTool: effectiveAllowNativeBashTool,
-                mcpStrictMode: effectiveMCPStrictMode,
-                sessionProfile: session.profile,
-                toolSearchEnabled: effectiveToolSearchEnabled
-            )
-            let freshController = try claudeControllerFactory(
-                freshRunID,
-                session.tabID,
-                windowID,
-                launchSettings
-            )
+            let launchSettings: ControllerLaunchSettings
+            let freshController: any NativeAgentRuntimeControlling
+            do {
+                let retryWorkspacePath = try workspacePathProvider(session)
+                launchSettings = ControllerLaunchSettings(
+                    runtimeVariant: runtimeVariant,
+                    workspacePath: retryWorkspacePath,
+                    permissionMode: effectivePermissionMode,
+                    allowNativeBashTool: effectiveAllowNativeBashTool,
+                    mcpStrictMode: effectiveMCPStrictMode,
+                    sessionProfile: session.profile,
+                    toolSearchEnabled: effectiveToolSearchEnabled
+                )
+                freshController = try claudeControllerFactory(
+                    runID,
+                    session.tabID,
+                    windowID,
+                    launchSettings
+                )
+            } catch {
+                guard sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session) else {
+                    invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                    throw ControllerLifecycleError.superseded
+                }
+                throw ControllerLifecycleError.claimedStartupFailure(error, replacementClaim)
+            }
+
+            guard sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session),
+                  trackPrivateFallbackController(
+                      freshController,
+                      for: session,
+                      claim: replacementClaim
+                  )
+            else {
+                invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                await shutdownClaudeControllerIfUnowned(freshController, by: session)
+                throw ControllerLifecycleError.superseded
+            }
+
+            let sessionRef: NativeAgentRuntimeSessionRef
+            do {
+                sessionRef = try await freshController.startOrResume(
+                    existingSessionID: nil,
+                    model: model,
+                    effortLevel: effortLevel,
+                    systemPromptOverride: systemPromptOverride
+                )
+            } catch {
+                guard sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session),
+                      let failedPrivateController = removeTrackedPrivateFallbackController(
+                          for: session.tabID,
+                          claim: replacementClaim,
+                          controller: freshController
+                      )
+                else {
+                    invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                    throw ControllerLifecycleError.superseded
+                }
+                await failedPrivateController.shutdown()
+                guard sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session) else {
+                    invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                    throw ControllerLifecycleError.superseded
+                }
+                throw ControllerLifecycleError.claimedStartupFailure(error, replacementClaim)
+            }
+            guard sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session) else {
+                invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                throw ControllerLifecycleError.superseded
+            }
+
+            let handoffOwnershipMaintained: Bool
+            if let viewModel {
+                #if DEBUG
+                    let beforeCommit = testResumeRecoveryHandoffBeforeCommitGate
+                #else
+                    let beforeCommit: (@MainActor () async -> Void)? = nil
+                #endif
+                handoffOwnershipMaintained = await viewModel.stageClaudeResumeRecoveryHandoffIfNeeded(
+                    for: session,
+                    ifStillOwned: { [weak self, weak session] in
+                        guard let self, let session else { return false }
+                        return sessionOwnsDetachedFallbackReplacementClaim(
+                            replacementClaim,
+                            for: session
+                        )
+                    },
+                    beforeCommit: beforeCommit
+                )
+            } else {
+                handoffOwnershipMaintained = sessionOwnsDetachedFallbackReplacementClaim(
+                    replacementClaim,
+                    for: session
+                )
+            }
+            guard handoffOwnershipMaintained,
+                  sessionOwnsDetachedFallbackReplacementClaim(replacementClaim, for: session)
+            else {
+                invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                throw ControllerLifecycleError.superseded
+            }
+
+            let trimmedFreshSessionID = sessionRef.sessionID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let freshSessionID = trimmedFreshSessionID.flatMap { $0.isEmpty ? nil : $0 }
+            guard removeTrackedPrivateFallbackController(
+                for: session.tabID,
+                claim: replacementClaim,
+                controller: freshController
+            ) != nil else {
+                invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                throw ControllerLifecycleError.superseded
+            }
             invalidateControllerRetirement(for: session)
             session.claudeController = freshController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
-            let sessionRef = try await freshController.startOrResume(
-                existingSessionID: nil,
-                model: model,
-                effortLevel: effortLevel,
-                systemPromptOverride: systemPromptOverride
-            )
-            guard sessionOwnsClaudeController(freshController, for: session) else {
-                await freshController.shutdown()
-                throw ControllerLifecycleError.superseded
+            if session.providerSessionID != freshSessionID {
+                session.providerSessionID = freshSessionID
+                session.isDirty = true
+                viewModel?.scheduleSave(for: session.tabID)
             }
+            if shouldResumeToolTracking {
+                await ensureClaudeToolTrackingIfNeeded(for: session, runID: runID)
+                guard sessionOwnsInstalledFallbackReplacementClaim(
+                    replacementClaim,
+                    controller: freshController,
+                    for: session
+                ) else {
+                    invalidateFallbackReplacementClaim(replacementClaim, for: session)
+                    await shutdownClaudeControllerIfUnowned(freshController, by: session)
+                    throw ControllerLifecycleError.superseded
+                }
+            }
+            invalidateFallbackReplacementClaim(replacementClaim, for: session)
             return sessionRef
         }
     }
@@ -947,14 +1299,14 @@ final class ClaudeAgentModeCoordinator {
                 let providerBoundText = providerBoundUserMessage(outboundText, instructions: instructions)
                 let turnID = try await controller.sendUserMessage(providerBoundText)
                 guard sessionOwnsClaudeController(controller, for: session) else {
-                    await controller.shutdown()
+                    await shutdownClaudeControllerIfUnowned(controller, by: session)
                     return false
                 }
                 session.claudeExpectedTurnIDs.insert(turnID)
                 return true
             } catch {
                 guard sessionOwnsClaudeController(controller, for: session) else {
-                    await controller.shutdown()
+                    await shutdownClaudeControllerIfUnowned(controller, by: session)
                     return false
                 }
                 let errorItem = AgentChatItem.error(

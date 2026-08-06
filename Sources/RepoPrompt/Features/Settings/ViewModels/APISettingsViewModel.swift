@@ -754,18 +754,16 @@ public class APISettingsViewModel: ObservableObject {
             }
         }
 
+        let persistedSelection: CLICommandSelection
         do {
-            if let normalizedPath = try CLIExecutableOverrideStore.normalizeForApply(capturedDraft) {
-                try CLIExecutableOverrideStore.validateForLaunch(
-                    normalizedPath,
-                    commandName: CLILaunchProfiles.claudeCode.commandName
-                )
-            }
+            let validatedApply = try CLIExecutableOverrideStore.validateForApply(
+                capturedDraft,
+                for: CLILaunchProfiles.claudeCode
+            )
             claudeExecutableOverridePipelineObserver(.validate)
 
-            _ = try CLIExecutableOverrideStore.apply(
-                capturedDraft,
-                for: CLILaunchProfiles.claudeCode,
+            persistedSelection = CLIExecutableOverrideStore.persist(
+                validatedApply,
                 defaults: cliExecutableOverrideDefaults
             )
             claudeExecutableOverridePipelineObserver(.persist)
@@ -778,7 +776,8 @@ public class APISettingsViewModel: ObservableObject {
         }
 
         synchronizeClaudeExecutableOverrideAppliedState(
-            updateDraft: claudeExecutableOverrideDraft == capturedDraft
+            updateDraft: claudeExecutableOverrideDraft == capturedDraft,
+            validatedSelection: persistedSelection
         )
         await cliResolvedCommandCacheInvalidator()
         guard claudeExecutableOverrideMutationGeneration == generation else { return true }
@@ -834,7 +833,10 @@ public class APISettingsViewModel: ObservableObject {
         let candidate = selectedURL
             .appendingPathComponent(CLILaunchProfiles.claudeCode.commandName, isDirectory: false)
             .path
-        guard (try? CLIExecutableOverrideStore.validateForLaunch(candidate)) != nil else {
+        guard (try? CLIExecutableOverrideStore.validateForLaunch(
+            candidate,
+            commandName: CLILaunchProfiles.claudeCode.commandName
+        )) != nil else {
             return selectedURL.path
         }
         return candidate
@@ -880,14 +882,13 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             collector.append("Claude Code binary probe configuration failed: \(error.localizedDescription)")
             let outcome = ClaudeExecutableProbeOutcome.failed(message: error.localizedDescription)
-            await publishClaudeExecutableProbeOutcome(
+            return await publishClaudeExecutableProbeOutcome(
                 outcome,
                 fingerprint: fingerprint,
                 probeGeneration: probeGeneration,
                 previousStatus: previousStatus,
                 previousAvailability: previousAvailability
             )
-            return false
         }
 
         await CLIEnvironmentCache.shared.invalidate()
@@ -901,14 +902,13 @@ public class APISettingsViewModel: ObservableObject {
             )
         }
 
-        await publishClaudeExecutableProbeOutcome(
+        return await publishClaudeExecutableProbeOutcome(
             outcome,
             fingerprint: fingerprint,
             probeGeneration: probeGeneration,
             previousStatus: previousStatus,
             previousAvailability: previousAvailability
         )
-        return outcome.succeeded
     }
 
     private func publishClaudeExecutableProbeOutcome(
@@ -917,11 +917,11 @@ public class APISettingsViewModel: ObservableObject {
         probeGeneration: UInt64,
         previousStatus: ClaudeCodeCLIStatus,
         previousAvailability: Bool
-    ) async {
+    ) async -> Bool {
         guard probeGeneration == claudeExecutableProbeGeneration,
               fingerprint == claudeExecutableOverrideAppliedState.fingerprint
         else {
-            return
+            return claudeCodeCLIStatus.binaryPresent
         }
 
         switch outcome {
@@ -940,6 +940,12 @@ public class APISettingsViewModel: ObservableObject {
         }
         notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
         await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
+        guard probeGeneration == claudeExecutableProbeGeneration,
+              fingerprint == claudeExecutableOverrideAppliedState.fingerprint
+        else {
+            return claudeCodeCLIStatus.binaryPresent
+        }
+        return outcome.succeeded
     }
 
     private static func executeClaudeExecutableProbe(
@@ -977,12 +983,19 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
-    private func synchronizeClaudeExecutableOverrideAppliedState(updateDraft: Bool) {
+    private func synchronizeClaudeExecutableOverrideAppliedState(
+        updateDraft: Bool,
+        validatedSelection: CLICommandSelection? = nil
+    ) {
         do {
-            let selection = try CLIExecutableOverrideStore.effectiveCommand(
-                for: CLILaunchProfiles.claudeCode,
-                defaults: cliExecutableOverrideDefaults
-            )
+            let selection = if let validatedSelection {
+                validatedSelection
+            } else {
+                try CLIExecutableOverrideStore.effectiveCommand(
+                    for: CLILaunchProfiles.claudeCode,
+                    defaults: cliExecutableOverrideDefaults
+                )
+            }
             switch selection {
             case .automatic:
                 claudeExecutableOverrideAppliedState = .automatic
@@ -993,11 +1006,18 @@ public class APISettingsViewModel: ObservableObject {
                 }
             case let .configuredExactPath(path):
                 let validation: ClaudeExecutableOverrideValidation
-                do {
-                    try CLIExecutableOverrideStore.validateForLaunch(path)
+                if validatedSelection != nil {
                     validation = .valid
-                } catch {
-                    validation = .invalid(message: error.localizedDescription)
+                } else {
+                    do {
+                        try CLIExecutableOverrideStore.validateForLaunch(
+                            path,
+                            commandName: CLILaunchProfiles.claudeCode.commandName
+                        )
+                        validation = .valid
+                    } catch {
+                        validation = .invalid(message: error.localizedDescription)
+                    }
                 }
                 let isQuarantined = Self.hasQuarantineAttribute(atPath: path)
                 claudeExecutableOverrideAppliedState = .configured(
@@ -1034,7 +1054,10 @@ public class APISettingsViewModel: ObservableObject {
                     isQuarantined: false
                 )
             }
-            try CLIExecutableOverrideStore.validateForLaunch(normalizedPath)
+            try CLIExecutableOverrideStore.validateForLaunch(
+                normalizedPath,
+                commandName: CLILaunchProfiles.claudeCode.commandName
+            )
             return ClaudeExecutableDraftAssessment(
                 validation: .valid,
                 normalizedPath: normalizedPath,
@@ -1162,8 +1185,8 @@ public class APISettingsViewModel: ObservableObject {
     private static func claudeCodeBinaryUnavailableMessage(from error: Error) -> String {
         if let runnerError = error as? CLIProcessRunnerError {
             switch runnerError {
-            case let .explicitCommandNotLaunchable(path, reason):
-                return "\(reason.localizedDescription) Configured path: \(path)."
+            case .explicitCommandNotLaunchable:
+                return runnerError.localizedDescription
             case .commandNotFound:
                 return "Claude Code CLI isn't installed or isn't on PATH."
             case let .spawnFailed(message):
@@ -1362,6 +1385,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: Bool) async {
+        await claudeFamilyModelAvailabilityRefreshBoundary?()
         guard previousAvailability != isClaudeFamilyModelProviderAvailable else { return }
         await updateAvailableModels()
     }
@@ -1373,6 +1397,7 @@ public class APISettingsViewModel: ObservableObject {
     private let claudeExecutableProbeOperation: ((CLIProcessConfiguration, TimeInterval) async -> ClaudeExecutableProbeOutcome)?
     private let cliResolvedCommandCacheInvalidator: () async -> Void
     private let claudeExecutableOverridePipelineObserver: (ClaudeExecutableOverridePipelineStage) -> Void
+    private let claudeFamilyModelAvailabilityRefreshBoundary: (@MainActor @Sendable () async -> Void)?
     private let codexModelPollingService: CodexModelPollingService
     private let apiModelCatalog: APIModelCatalog
     private let anthropicModelsLoader: @Sendable (String) async throws -> [String]
@@ -1393,6 +1418,7 @@ public class APISettingsViewModel: ObservableObject {
         claudeExecutableProbeOperation: ((CLIProcessConfiguration, TimeInterval) async -> ClaudeExecutableProbeOutcome)? = nil,
         cliResolvedCommandCacheInvalidator: (() async -> Void)? = nil,
         claudeExecutableOverridePipelineObserver: ((ClaudeExecutableOverridePipelineStage) -> Void)? = nil,
+        claudeFamilyModelAvailabilityRefreshBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         anthropicModelsLoader: (@Sendable (String) async throws -> [String])? = nil,
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil
@@ -1410,6 +1436,7 @@ public class APISettingsViewModel: ObservableObject {
             )
         }
         self.claudeExecutableOverridePipelineObserver = claudeExecutableOverridePipelineObserver ?? { _ in }
+        self.claudeFamilyModelAvailabilityRefreshBoundary = claudeFamilyModelAvailabilityRefreshBoundary
         self.codexModelPollingService = codexModelPollingService
         self.apiModelCatalog = apiModelCatalog ?? Self.makeDefaultAPIModelCatalog()
         self.anthropicModelsLoader = anthropicModelsLoader ?? { apiKey in

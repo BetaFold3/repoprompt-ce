@@ -101,6 +101,48 @@ final class CLIExecutableOverrideStoreTests: XCTestCase {
         }
     }
 
+    func testValidateForLaunchRejectsNULAndNewlineBeforeFilesystemLookup() {
+        for path in ["/tmp/claude\0suffix", "/tmp/claude\nother"] {
+            XCTAssertThrowsError(
+                try CLIExecutableOverrideStore.validateForLaunch(
+                    path,
+                    commandName: CLILaunchProfiles.claudeCode.commandName
+                )
+            ) { error in
+                guard case CLIExecutableOverrideError.notAbsolute = error else {
+                    return XCTFail("Expected notAbsolute for \(path.debugDescription), got \(error)")
+                }
+            }
+        }
+    }
+
+    func testSeededMalformedStoredValuesRemainStrictAndFailValidation() throws {
+        let executable = root.appendingPathComponent("claude")
+        let newlineExecutable = root.appendingPathComponent("claude\nother")
+        try writeFile(executable, permissions: 0o755)
+        try writeFile(newlineExecutable, permissions: 0o755)
+        let key = CLIExecutableOverrideStore.key(for: CLILaunchProfiles.claudeCode)
+
+        for storedPath in [executable.path + "\0suffix", newlineExecutable.path] {
+            defaults.set(storedPath, forKey: key)
+            let selection = try CLIExecutableOverrideStore.effectiveCommand(
+                for: CLILaunchProfiles.claudeCode,
+                defaults: defaults
+            )
+            XCTAssertEqual(selection, .configuredExactPath(storedPath))
+            XCTAssertThrowsError(
+                try CLIExecutableOverrideStore.validateForLaunch(
+                    selection.command,
+                    commandName: CLILaunchProfiles.claudeCode.commandName
+                )
+            ) { error in
+                guard case CLIExecutableOverrideError.notAbsolute = error else {
+                    return XCTFail("Expected notAbsolute for \(storedPath.debugDescription), got \(error)")
+                }
+            }
+        }
+    }
+
     func testApplyRejectsMissingFile() {
         assertOverrideError(input: root.appendingPathComponent("missing-claude").path) { error in
             guard case .missing = error else {
@@ -177,7 +219,10 @@ final class CLIExecutableOverrideStoreTests: XCTestCase {
 
         XCTAssertEqual(selection, .configuredExactPath(link.path))
         XCTAssertEqual(
-            try CLIExecutableOverrideStore.validateForLaunch(link.path),
+            try CLIExecutableOverrideStore.validateForLaunch(
+                link.path,
+                commandName: CLILaunchProfiles.claudeCode.commandName
+            ),
             link.path
         )
         XCTAssertEqual(
