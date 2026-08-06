@@ -544,8 +544,7 @@ final class ACPIntegratedAgentModeRunner {
                 attachments: attachments,
                 controller: controller,
                 runRequest: runRequest,
-                attachmentReservationID: attachmentReservationID,
-                prepareControllerForNextTurn: false
+                attachmentReservationID: attachmentReservationID
             )
         } catch is CancellationError {
             if !providerInitializationCompleted {
@@ -612,6 +611,22 @@ final class ACPIntegratedAgentModeRunner {
                 return
             }
 
+            let prepared = await controller.prepareForNextTurn()
+            guard prepared else {
+                await finalize(
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    controller: controller,
+                    attachmentReservationID: attachmentReservationID,
+                    terminalState: .failed,
+                    errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.",
+                    notifyTurnComplete: false,
+                    shouldShutdownController: true
+                )
+                return
+            }
+
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
             await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
             try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
@@ -644,8 +659,7 @@ final class ACPIntegratedAgentModeRunner {
                 attachments: attachments,
                 controller: controller,
                 runRequest: runRequest,
-                attachmentReservationID: attachmentReservationID,
-                prepareControllerForNextTurn: true
+                attachmentReservationID: attachmentReservationID
             )
         } catch is CancellationError {
             await finalize(
@@ -685,10 +699,9 @@ final class ACPIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
-        attachmentReservationID: UUID?,
-        prepareControllerForNextTurn: Bool
+        attachmentReservationID: UUID?
     ) async {
-        log("prompt turn begin prepare=\(prepareControllerForNextTurn)", runID: runID)
+        log("prompt turn begin", runID: runID)
         setRunningStatus("Thinking…", source: .transport, session: session, urgent: true)
         let agentMessage = hooks.buildHeadlessAgentMessage(
             session,
@@ -700,23 +713,6 @@ final class ACPIntegratedAgentModeRunner {
         hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
         hooks.markAttachmentsConsumed(session, attachmentReservationID)
 
-        if prepareControllerForNextTurn {
-            let prepared = await controller.prepareForNextTurn()
-            guard prepared else {
-                await finalize(
-                    session: session,
-                    runID: runID,
-                    runAttemptID: runAttemptID,
-                    controller: controller,
-                    attachmentReservationID: attachmentReservationID,
-                    terminalState: .failed,
-                    errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.",
-                    notifyTurnComplete: false,
-                    shouldShutdownController: true
-                )
-                return
-            }
-        }
         let events = await controller.events
         let consumeTask = Task { @MainActor [weak self, weak session] in
             guard let self, let session else {
@@ -823,13 +819,20 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
         if runRequest.agentKind == .cursor,
-           model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) != .orderedSame,
-           AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.contains(rawModel: model) != true
+           let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
+           !Self.cursorRegistryAllowsSelectedModel(model, snapshot: snapshot)
         {
             return
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
         try await controller.setSessionModel(model)
+    }
+
+    static func cursorRegistryAllowsSelectedModel(
+        _ model: String,
+        snapshot: ACPDiscoveredSessionModels?
+    ) -> Bool {
+        CursorModelRegistryGate.allows(model, in: snapshot)
     }
 
     private func promptFailureErrorText(

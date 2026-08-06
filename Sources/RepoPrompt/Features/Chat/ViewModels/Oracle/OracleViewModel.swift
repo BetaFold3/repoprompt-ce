@@ -4089,6 +4089,8 @@ class OracleViewModel: ObservableObject {
         sessionID: UUID
     ) async {
         var mutableContent = finalContent
+        // Terminal-content invariant: malformed marker recovery is unsafe on partial buffers.
+        // Keep extraction here after final accumulation; never move it into the streaming loop.
         let extractedName = ChatNameExtractor
             .extractAndRemove(from: &mutableContent)?
             .trimmingCharacters(in: .whitespacesAndNewlines)

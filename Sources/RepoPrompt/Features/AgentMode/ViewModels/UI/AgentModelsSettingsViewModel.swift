@@ -168,14 +168,14 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var currentOracleModelName: String {
-        displayName(forChatModelRaw: profileSnapshot.planningModelRaw, fallback: "Select an Oracle model")
+        Self.displayName(forChatModelRaw: profileSnapshot.planningModelRaw, fallback: "Select an Oracle model")
     }
 
     var currentBuiltinChatModelName: String {
         let raw = profileSnapshot.syncChatModelWithOracle
             ? profileSnapshot.planningModelRaw
             : profileSnapshot.preferredComposeModelRaw
-        return displayName(
+        return Self.displayName(
             forChatModelRaw: raw,
             fallback: "Select a Built-in Chat model"
         )
@@ -675,10 +675,19 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         refresh()
     }
 
-    private func displayName(forChatModelRaw raw: String?, fallback: String) -> String {
+    static func displayName(forChatModelRaw raw: String?, fallback: String) -> String {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             return fallback
         }
-        return AIModel.fromModelName(raw)?.displayName ?? raw
+        guard let model = AIModel.fromModelName(raw) else { return raw }
+        if case let .cursorCustom(modelRaw) = model {
+            return AgentModelCatalog.displayName(
+                for: modelRaw,
+                agentKind: .cursor,
+                availability: .init(cursorAvailable: true),
+                includeCursorParameterSuffix: true
+            )
+        }
+        return model.displayName
     }
 }

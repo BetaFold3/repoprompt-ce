@@ -403,7 +403,8 @@ enum AgentModelCatalog {
         availability: AvailabilityContext = .current,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
         defaults: UserDefaults = .standard,
-        includeEffortSuffix: Bool = true
+        includeEffortSuffix: Bool = true,
+        includeCursorParameterSuffix: Bool = true
     ) -> String {
         let normalized = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveRaw = normalized.isEmpty
@@ -455,6 +456,20 @@ enum AgentModelCatalog {
                 return "\(baseName) \(storedEffort.displayName)"
             }
             return baseName
+        }
+
+        if agentKind == .cursor {
+            let providerRaw = CursorBracketModelID.strippingCursorPrefix(effectiveRaw)
+            guard let parsed = CursorBracketModelID.parse(providerRaw) else {
+                return baseDisplayName(for: providerRaw)
+            }
+            let baseName = baseDisplayName(for: parsed.base)
+            guard includeCursorParameterSuffix,
+                  let suffix = CursorModelMenuBuilder.displaySuffix(forRaw: effectiveRaw)
+            else {
+                return baseName
+            }
+            return "\(baseName) · \(suffix)"
         }
 
         if agentKind == .codexExec {
@@ -855,6 +870,20 @@ enum AgentModelCatalog {
         let option = optionRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         let selected = selectedRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !option.isEmpty, !selected.isEmpty else { return false }
+
+        if agentKind == .cursor {
+            let optionIsParseable = CursorBracketModelID.parse(
+                CursorBracketModelID.strippingCursorPrefix(option)
+            ) != nil
+            let selectedIsParseable = CursorBracketModelID.parse(
+                CursorBracketModelID.strippingCursorPrefix(selected)
+            ) != nil
+            if !optionIsParseable || !selectedIsParseable {
+                return option.caseInsensitiveCompare(selected) == .orderedSame
+            }
+            return cursorModelSelectionsAreEqual(option, selected)
+        }
+
         if option.caseInsensitiveCompare(selected) == .orderedSame {
             return true
         }
@@ -899,6 +928,35 @@ enum AgentModelCatalog {
             agentKind: agentKind,
             defaults: defaults
         )
+    }
+
+    private static func cursorModelSelectionsAreEqual(
+        _ lhsRaw: String,
+        _ rhsRaw: String
+    ) -> Bool {
+        guard let lhs = CursorBracketModelID.parse(
+            CursorBracketModelID.strippingCursorPrefix(lhsRaw)
+        ) else {
+            return false
+        }
+        guard let rhs = CursorBracketModelID.parse(
+            CursorBracketModelID.strippingCursorPrefix(rhsRaw)
+        ) else {
+            return false
+        }
+        guard CursorModelRegistryGate.normalizedAlias(lhs.base)
+            == CursorModelRegistryGate.normalizedAlias(rhs.base),
+            lhs.hasBracket == rhs.hasBracket
+        else {
+            return false
+        }
+
+        func parameters(_ parsed: CursorBracketModelID.Parsed) -> [String: String] {
+            parsed.params.reduce(into: [:]) {
+                $0[$1.key.lowercased()] = $1.value
+            }
+        }
+        return parameters(lhs) == parameters(rhs)
     }
 
     @discardableResult

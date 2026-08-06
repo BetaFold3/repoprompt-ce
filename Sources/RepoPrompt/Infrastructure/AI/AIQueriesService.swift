@@ -293,6 +293,10 @@ public class AIQueriesService {
         return trimmed.hasPrefix("**") || trimmed.contains("****")
     }
 
+    static func visibleTextForBuffering(from result: AIStreamResult) -> String? {
+        result.type == "status" ? nil : result.text
+    }
+
     /// Cancel only the specified stream.
     func cancelStream(id: ChatStreamID) async {
         await taskManager.cancelTask(for: id)
@@ -350,7 +354,7 @@ public class AIQueriesService {
 
                             var shouldYield = false
 
-                            if let text = result.text, !text.isEmpty {
+                            if let text = Self.visibleTextForBuffering(from: result), !text.isEmpty {
                                 let yieldText = await self.taskManager.bufferChunk(
                                     text,
                                     for: taskId,

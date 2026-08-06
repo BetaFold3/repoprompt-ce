@@ -727,6 +727,29 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(detail, rawDetail)
     }
 
+    func testParameterizedModelErrorNormalizationPreservesRawDetail() {
+        let provider = makeProviderForNormalization()
+        for rawDetail in [
+            "Unknown model config option: thinking",
+            "Invalid value 'bogus' for Cursor parameter 'reasoning'. Valid values: low, high.",
+            "Cursor model 'gpt-5.6-sol' does not advertise parameter selector 'context'."
+        ] {
+            let rawError = NSError(
+                domain: "CursorACP",
+                code: -32602,
+                userInfo: [NSLocalizedDescriptionKey: rawDetail]
+            )
+
+            let normalized = provider.normalizeError(rawError)
+
+            guard case let AIProviderError.invalidConfiguration(detail) = normalized else {
+                XCTFail("Unexpected normalized error: \(normalized)")
+                continue
+            }
+            XCTAssertEqual(detail, rawDetail)
+        }
+    }
+
     func testUnclassifiedProviderErrorRetainsUnderlyingError() {
         let provider = makeProviderForNormalization()
         let rawError = NSError(

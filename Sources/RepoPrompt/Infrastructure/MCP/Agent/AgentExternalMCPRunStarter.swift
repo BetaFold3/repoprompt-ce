@@ -31,6 +31,98 @@ enum AgentExternalMCPRunStarter {
         return (modelRaw, nil)
     }
 
+    static func resolvedModelAndEffort(
+        agentRaw: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        cursorParameterizedModelsEnabled: Bool = CursorParameterizedModels.isEnabled
+    ) throws -> (model: String?, effort: String?) {
+        if let reasoningEffortRaw {
+            if agentRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare(AgentProviderKind.cursor.rawValue) == .orderedSame
+            {
+                guard cursorParameterizedModelsEnabled else {
+                    return (modelRaw, nil)
+                }
+                return try (
+                    cursorModelByOverlayingReasoningEffort(
+                        modelRaw: modelRaw,
+                        reasoningEffortRaw: reasoningEffortRaw
+                    ),
+                    nil
+                )
+            }
+            return (modelRaw, reasoningEffortRaw)
+        }
+        if agentRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare(AgentProviderKind.cursor.rawValue) == .orderedSame
+        {
+            return (modelRaw, nil)
+        }
+        return extractReasoningEffort(from: modelRaw)
+    }
+
+    private static func cursorModelByOverlayingReasoningEffort(
+        modelRaw: String?,
+        reasoningEffortRaw: String
+    ) throws -> String {
+        guard let modelRaw,
+              !modelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            throw MCPError.invalidParams(
+                "reasoning_effort for Cursor requires a model_id. Use the bracket grammar cursor:<base>[k=v,…]."
+            )
+        }
+        guard let parameterSpec = CursorModelParameterCatalog.shared
+            .uniqueThoughtLevelParameterSpec(forModel: modelRaw)
+        else {
+            throw MCPError.invalidParams(
+                "Cursor parameter metadata is unavailable for model_id '\(modelRaw)'. Use the bracket grammar cursor:<base>[k=v,…]."
+            )
+        }
+        let suppliedEffort = reasoningEffortRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let canonicalEffort = parameterSpec.options.first(where: {
+            $0.value.caseInsensitiveCompare(suppliedEffort) == .orderedSame
+        })?.value
+        else {
+            throw MCPError.invalidParams(
+                "Unsupported reasoning_effort '\(reasoningEffortRaw)' for Cursor model_id '\(modelRaw)'. Valid values: \(parameterSpec.options.map(\.value).joined(separator: ", "))."
+            )
+        }
+        let parameterID = parameterSpec.id
+
+        let trimmed = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasCursorPrefix = trimmed.lowercased().hasPrefix("cursor:")
+        let stripped = CursorBracketModelID.strippingCursorPrefix(trimmed)
+        guard let parsed = CursorBracketModelID.parse(stripped) else {
+            throw MCPError.invalidParams(
+                "Invalid Cursor model_id '\(modelRaw)'. Use the bracket grammar cursor:<base>[k=v,…]."
+            )
+        }
+
+        var parameters = parsed.params
+        if let existingIndex = parameters.firstIndex(where: {
+            $0.key.caseInsensitiveCompare(parameterID) == .orderedSame
+        }) {
+            let existing = parameters[existingIndex]
+            guard existing.value.caseInsensitiveCompare(canonicalEffort) == .orderedSame else {
+                throw MCPError.invalidParams(
+                    "reasoning_effort '\(reasoningEffortRaw)' conflicts with the explicit Cursor parameter '\(parameterID)=\(existing.value)'."
+                )
+            }
+            parameters[existingIndex] = .init(key: existing.key, value: canonicalEffort)
+        } else {
+            parameters.append(.init(key: parameterID, value: canonicalEffort))
+        }
+
+        guard let composed = CursorBracketModelID.compose(base: parsed.base, params: parameters) else {
+            throw MCPError.invalidParams(
+                "Invalid Cursor model parameters. Use the bracket grammar cursor:<base>[k=v,…]."
+            )
+        }
+        return hasCursorPrefix ? "cursor:\(composed)" : composed
+    }
+
     static func start(
         target: AgentModeViewModel.MCPSessionTarget,
         message: String,
@@ -46,16 +138,13 @@ enum AgentExternalMCPRunStarter {
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
         dispatchInstruction: DispatchInstruction? = nil
     ) async throws -> StartOutcome {
-        let resolvedModel: String?
-        let resolvedEffort: String?
-        if let reasoningEffortRaw {
-            resolvedModel = modelRaw
-            resolvedEffort = reasoningEffortRaw
-        } else {
-            let extracted = extractReasoningEffort(from: modelRaw)
-            resolvedModel = extracted.model
-            resolvedEffort = extracted.effort
-        }
+        let resolved = try resolvedModelAndEffort(
+            agentRaw: agentRaw,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw
+        )
+        let resolvedModel = resolved.model
+        let resolvedEffort = resolved.effort
         guard let sessionID = target.sessionID else {
             throw MCPError.internalError("Failed to resolve target agent session ID.")
         }

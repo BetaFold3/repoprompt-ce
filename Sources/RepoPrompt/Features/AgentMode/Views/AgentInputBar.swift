@@ -7,6 +7,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -34,6 +35,23 @@ struct AgentComposerActions {
     let applyClaudeToolSettingMutation: (_ mutation: ClaudeToolSettingMutation) -> Void
     let setClaudeEffortLevel: (_ level: ClaudeCodeEffortLevel) -> Void
     let openCLIProvidersSettings: () -> Void
+}
+
+enum CursorModelProviderChipDisplay {
+    static func name(
+        rawModel: String,
+        fallbackDisplayName: String,
+        parameterLauncherAvailable: Bool
+    ) -> String {
+        guard parameterLauncherAvailable else { return fallbackDisplayName }
+        return AgentModelCatalog.displayName(
+            for: rawModel,
+            agentKind: .cursor,
+            availability: .init(cursorAvailable: true),
+            includeEffortSuffix: false,
+            includeCursorParameterSuffix: false
+        )
+    }
 }
 
 struct AgentInputBar: View {
@@ -263,6 +281,11 @@ struct AgentComposerView: View, Equatable {
     @State private var isSyncingDraftFromSession: Bool = false
     @State private var isImageDropTargeted: Bool = false
     @State private var showCodexToolsPopover: Bool = false
+    @State private var showCursorModelParametersPopover: Bool = false
+    @State private var cursorPopoverOriginTabID: UUID?
+    @State private var cursorPopoverOriginAgent: AgentProviderKind?
+    @State private var cursorLastSelfCommittedRaw: String?
+    @State private var cursorParameterCatalogRevision: UInt = 0
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
     @State private var steeringUnsupportedMessage: String? = nil
@@ -484,6 +507,7 @@ struct AgentComposerView: View, Equatable {
             modelMenuSnapshotReleaseTask?.cancel()
             modelMenuSnapshotReleaseTask = nil
             modelMenuSnapshotByAgent = nil
+            dismissCursorModelParametersPopover()
         }
         .onChange(of: currentTabID) { oldTabID, newTabID in
             // Switch drafts when tab changes
@@ -492,6 +516,42 @@ struct AgentComposerView: View, Equatable {
             }
             if let newTabID {
                 loadDraftFromSession(for: newTabID)
+            }
+            dismissCursorModelParametersPopover()
+        }
+        .onChange(of: props.selectedAgent) { _, selectedAgent in
+            if selectedAgent != .cursor {
+                dismissCursorModelParametersPopover()
+            }
+        }
+        .onChange(of: modelControlsDisabled) { _, isDisabled in
+            if isDisabled {
+                dismissCursorModelParametersPopover()
+            }
+        }
+        .onChange(of: props.selectedModelRaw) { _, selectedModelRaw in
+            guard showCursorModelParametersPopover else { return }
+            if selectedModelRaw != cursorLastSelfCommittedRaw {
+                dismissCursorModelParametersPopover()
+            }
+        }
+        .onChange(of: cursorParameterPickerIsAvailable) { _, isAvailable in
+            if !isAvailable {
+                dismissCursorModelParametersPopover()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .cursorModelParameterCatalogDidChange)
+                .receive(on: DispatchQueue.main)
+        ) { _ in
+            cursorParameterCatalogRevision &+= 1
+            if !cursorParameterPickerIsAvailable {
+                dismissCursorModelParametersPopover()
+            }
+        }
+        .onChange(of: showCursorModelParametersPopover) { _, isPresented in
+            if !isPresented {
+                clearCursorModelParametersPopoverIdentity()
             }
         }
         .onChange(of: localInputText) { _, newValue in
@@ -632,6 +692,7 @@ struct AgentComposerView: View, Equatable {
                     }
                     if props.hasAvailableAgentProviders {
                         agentProviderModelPicker
+                        cursorModelParameterLauncher
                         remoteReasoningEffortPicker
                         reasoningEffortPicker
                         claudeEffortPicker
@@ -725,6 +786,10 @@ struct AgentComposerView: View, Equatable {
         fontPreset.scaledClamped(300, max: 400)
     }
 
+    private var cursorParametersPopoverWidth: CGFloat {
+        fontPreset.scaledClamped(340, max: 440)
+    }
+
     private var claudeToolsPopoverWidth: CGFloat {
         fontPreset.scaledClamped(280, max: 380)
     }
@@ -746,7 +811,7 @@ struct AgentComposerView: View, Equatable {
         return "\(props.selectedAgent.displayName) · \(truncatedModelName)"
     }
 
-    private var isSelectedCodexFastModel: Bool {
+    private var selectedModelShowsFastWarning: Bool {
         guard props.remoteHostCatalog == nil else { return false }
         return AgentModelSelectionWarningVisuals.showsWarning(
             agent: props.selectedAgent,
@@ -762,12 +827,16 @@ struct AgentComposerView: View, Equatable {
         } else {
             "Choose agent and model"
         }
-        guard isSelectedCodexFastModel else { return baseTooltip }
-        return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.warningTooltip)"
+        guard selectedModelShowsFastWarning else { return baseTooltip }
+        return "\(baseTooltip)\n\(AgentModelSelectionWarningVisuals.warningTooltip(for: props.selectedAgent))"
     }
 
     private var inputBarSelectedModelDisplayName: String {
-        props.selectedModelDisplayName
+        CursorModelProviderChipDisplay.name(
+            rawModel: props.selectedModelRaw,
+            fallbackDisplayName: props.selectedModelDisplayName,
+            parameterLauncherAvailable: cursorParameterPickerIsAvailable
+        )
     }
 
     private var connectAgentProvidersButton: some View {
@@ -805,7 +874,7 @@ struct AgentComposerView: View, Equatable {
             HStack(spacing: 4) {
                 Image(systemName: providerChipIconName)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                if isSelectedCodexFastModel {
+                if selectedModelShowsFastWarning {
                     Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
                         .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
@@ -823,7 +892,7 @@ struct AgentComposerView: View, Equatable {
                     .foregroundColor(.secondary)
             }
             .frame(maxWidth: providerChipMaxWidth, alignment: .leading)
-            .foregroundColor(isSelectedCodexFastModel ? .orange : .primary)
+            .foregroundColor(selectedModelShowsFastWarning ? .orange : .primary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }
@@ -952,6 +1021,15 @@ struct AgentComposerView: View, Equatable {
 
     private func inputBarModelMenuItems(for agent: AgentProviderKind) -> [StableMenuItem] {
         let options = inputBarModelOptions(for: agent)
+        if agent == .cursor {
+            return AgentModelStableMenuItems.cursorModelItems(
+                options: options,
+                selectedAgent: props.selectedAgent,
+                selectedModelRaw: props.selectedModelRaw
+            ) { selectedAgent, model in
+                actions.selectAgentModel(selectedAgent, model.rawValue)
+            }
+        }
         guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
         }
@@ -1024,6 +1102,244 @@ struct AgentComposerView: View, Equatable {
             modelMenuSnapshotByAgent = nil
             modelMenuSnapshotReleaseTask = nil
         }
+    }
+
+    private var cursorParameterPickerIsAvailable: Bool {
+        cursorModelParameterPicker(selectedModelRaw: props.selectedModelRaw) != nil
+    }
+
+    private func cursorModelParameterPicker(
+        selectedModelRaw: String
+    ) -> CursorModelParameterPickerViewModel? {
+        guard props.remoteHostCatalog == nil, props.selectedAgent == .cursor else {
+            return nil
+        }
+        _ = cursorParameterCatalogRevision
+        return CursorModelParameterPickerViewModel(
+            modelRaw: selectedModelRaw,
+            selectedModelRaw: selectedModelRaw,
+            specs: CursorModelParameterCatalog.shared.parameterSpecs(forModel: selectedModelRaw),
+            isEnabled: CursorParameterizedModels.isEnabled
+        )
+    }
+
+    private var cursorPopoverPicker: CursorModelParameterPickerViewModel? {
+        cursorModelParameterPicker(
+            selectedModelRaw: cursorLastSelfCommittedRaw ?? props.selectedModelRaw
+        )
+    }
+
+    @ViewBuilder
+    private var cursorModelParameterLauncher: some View {
+        if let picker = cursorModelParameterPicker(selectedModelRaw: props.selectedModelRaw) {
+            let showsWarning = picker.summaryShowsFastWarning
+            Button {
+                presentCursorModelParametersPopover()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    if showsWarning {
+                        Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                    }
+                    Text(picker.summaryLabel)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
+                }
+                .foregroundColor(showsWarning ? .orange : .secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(pickerChipColor)
+                .cornerRadius(4)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(modelControlsDisabled)
+            .opacity(modelControlsDisabled ? 0.55 : 1.0)
+            .hoverTooltip(
+                modelControlsDisabled
+                    ? modelControlsDisabledTooltip
+                    : picker.detailTooltip
+            )
+            .popover(isPresented: $showCursorModelParametersPopover, arrowEdge: .bottom) {
+                cursorModelParametersPopoverContent
+            }
+            .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    @ViewBuilder
+    private var cursorModelParametersPopoverContent: some View {
+        if let picker = cursorPopoverPicker {
+            Form {
+                switch picker.selectionState {
+                case .inheritedBareBase:
+                    Section {
+                        cursorParameterNotice(
+                            "Inherited from Cursor's global settings. Choosing an option will enforce a complete model configuration."
+                        )
+                    }
+                case .partialOrUnsupportedBracket:
+                    Section {
+                        cursorParameterNotice(
+                            "This selection has missing, invalid, or unsupported settings. Valid values are preserved; missing values use catalog defaults."
+                        )
+                    }
+                case .notSelected, .fullyEnforced:
+                    EmptyView()
+                }
+
+                ForEach(picker.parameters, id: \.id) { parameter in
+                    Section {
+                        cursorParameterControl(parameter, picker: picker)
+                        if let description = parameter.description {
+                            Text(description)
+                                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                                .foregroundStyle(
+                                    cursorParameterIsFastEnabled(parameter, picker: picker)
+                                        ? Color.orange
+                                        : Color.secondary
+                                )
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } header: {
+                        Text(parameter.label)
+                    }
+                }
+
+                Section {
+                    Button("Reset to Default Settings") {
+                        commitCursorModelParameterSelection(picker.defaultSelectionRaw())
+                    }
+                }
+            }
+            .formStyle(.grouped)
+            .scrollContentBackground(.hidden)
+            .frame(width: cursorParametersPopoverWidth)
+        } else {
+            Text("Cursor model settings are unavailable.")
+                .font(fontPreset.captionFont)
+                .foregroundStyle(.secondary)
+                .padding(14)
+                .frame(width: cursorParametersPopoverWidth)
+        }
+    }
+
+    @ViewBuilder
+    private func cursorParameterControl(
+        _ parameter: CursorModelParameterPickerViewModel.Parameter,
+        picker: CursorModelParameterPickerViewModel
+    ) -> some View {
+        if CursorModelParameterPickerViewModel.isFastParameter(parameter.id),
+           let onOption = parameter.options.first(where: {
+               $0.value.caseInsensitiveCompare("true") == .orderedSame
+           }),
+           let offOption = parameter.options.first(where: {
+               $0.value.caseInsensitiveCompare("false") == .orderedSame
+           })
+        {
+            let isOn = cursorParameterIsFastEnabled(parameter, picker: picker)
+            Toggle(isOn: Binding(
+                get: { isOn },
+                set: { enabled in
+                    commitCursorModelParameterSelection(
+                        picker.selectionRaw(
+                            setting: parameter.id,
+                            to: enabled ? onOption.value : offOption.value
+                        )
+                    )
+                }
+            )) {
+                HStack(spacing: 5) {
+                    Text(isOn ? onOption.displayName : offOption.displayName)
+                    if isOn {
+                        Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+                            .foregroundStyle(Color.orange)
+                    }
+                }
+                .foregroundStyle(isOn ? Color.orange : Color.primary)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+        } else {
+            Picker(
+                "Value",
+                selection: Binding(
+                    get: { picker.value(for: parameter.id) ?? parameter.defaultValue },
+                    set: { value in
+                        commitCursorModelParameterSelection(
+                            picker.selectionRaw(setting: parameter.id, to: value)
+                        )
+                    }
+                )
+            ) {
+                ForEach(parameter.options, id: \.value) { option in
+                    Text(option.displayName).tag(option.value)
+                }
+            }
+            .labelsHidden()
+        }
+    }
+
+    private func cursorParameterNotice(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "info.circle")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(message)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func cursorParameterIsFastEnabled(
+        _ parameter: CursorModelParameterPickerViewModel.Parameter,
+        picker: CursorModelParameterPickerViewModel
+    ) -> Bool {
+        CursorModelParameterPickerViewModel.isFastParameter(parameter.id)
+            && picker.value(for: parameter.id)?.caseInsensitiveCompare("true") == .orderedSame
+    }
+
+    private func presentCursorModelParametersPopover() {
+        guard !modelControlsDisabled,
+              cursorModelParameterPicker(selectedModelRaw: props.selectedModelRaw) != nil
+        else {
+            return
+        }
+        cursorPopoverOriginTabID = currentTabID
+        cursorPopoverOriginAgent = props.selectedAgent
+        cursorLastSelfCommittedRaw = props.selectedModelRaw
+        showCursorModelParametersPopover = true
+    }
+
+    private func commitCursorModelParameterSelection(_ selectionRaw: String?) {
+        guard let selectionRaw,
+              showCursorModelParametersPopover,
+              !modelControlsDisabled,
+              currentTabID == cursorPopoverOriginTabID,
+              props.selectedAgent == .cursor,
+              props.selectedAgent == cursorPopoverOriginAgent
+        else {
+            return
+        }
+        cursorLastSelfCommittedRaw = selectionRaw
+        actions.selectAgentModel(.cursor, selectionRaw)
+    }
+
+    private func dismissCursorModelParametersPopover() {
+        showCursorModelParametersPopover = false
+        clearCursorModelParametersPopoverIdentity()
+    }
+
+    private func clearCursorModelParametersPopoverIdentity() {
+        cursorPopoverOriginTabID = nil
+        cursorPopoverOriginAgent = nil
+        cursorLastSelfCommittedRaw = nil
     }
 
     @ViewBuilder

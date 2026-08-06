@@ -594,6 +594,83 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(Set(policyEvents).count, 1)
     }
 
+    func testCursorACPReusedSessionSurfacesFastWarningAfterNilRegistryBracketSelection() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .cursor) }
+
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let recordURL = workspace.appendingPathComponent("cursor-fast-follow-up.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: scriptURL.path,
+            environment: [
+                "ACP_RECORD_PATH": recordURL.path,
+                "ACP_CURSOR_PARAMETERIZED": "1"
+            ],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .cursor)
+                return provider
+            },
+            handleHeadlessStreamResult: { result in
+                if result.type == "system", let text = result.text {
+                    recorder.record("system:\(text)")
+                }
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        session.selectedModelRaw = "model-b[fast=true]"
+
+        let firstOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Cursor parameterized turn",
+            initialMessageForRun: "Cursor parameterized turn",
+            attachments: []
+        )
+        XCTAssertNil(firstOutcome)
+        try await withLifecycleTimeout("Cursor parameterized first turn") {
+            await session.agentTask?.value
+        }
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertTrue(recordedOpenCodeFlowRequests(at: recordURL).contains { request in
+            request.method == "session/set_config_option"
+                && request.params["configId"] as? String == "fast"
+                && request.params["value"] as? String == "true"
+        })
+        XCTAssertFalse(recorder.events.contains { $0.contains("Cursor Fast mode is enabled") })
+
+        session.selectedModelRaw = "model-b"
+        let secondOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Cursor bare follow-up",
+            initialMessageForRun: "Cursor bare follow-up",
+            attachments: []
+        )
+        XCTAssertNil(secondOutcome)
+        try await withLifecycleTimeout("Cursor bare follow-up turn") {
+            await session.agentTask?.value
+        }
+
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(
+            recorder.events.count(where: { $0.contains("Cursor Fast mode is enabled") }),
+            1
+        )
+        XCTAssertEqual(
+            recordedOpenCodeFlowRequests(at: recordURL).count(where: { $0.method == "session/prompt" }),
+            2
+        )
+    }
+
     func testLifecycleCleanupReapsCompletedReusableOpenCodeProcess() async throws {
         let recorder = LifecycleRecorder()
         let workspace = try makeTemporaryDirectory()
@@ -1511,6 +1588,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil,
         flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
         publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
+        handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
         autoSignalACPRouting: Bool = false
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
@@ -1581,7 +1659,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 hooks: makeHooks(
                     recorder: recorder,
                     flushPendingAssistantDelta: flushPendingAssistantDelta,
-                    publishTerminalCommit: publishTerminalCommit
+                    publishTerminalCommit: publishTerminalCommit,
+                    handleHeadlessStreamResult: handleHeadlessStreamResult
                 ),
                 toolTrackingHooks: .noOp
             ),
@@ -1604,7 +1683,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             AgentSessionRunState,
             UUID?
         ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
-        startFollowUpRun: ((UUID, String) -> Void)? = nil
+        startFollowUpRun: ((UUID, String) -> Void)? = nil,
+        handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
         let flushPendingAssistantDelta = flushPendingAssistantDelta ?? { _ in
             recorder.record("assistant-flush")
@@ -1626,7 +1706,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             requestUIRefresh: { _, _ in },
             scheduleSave: { _ in recorder.record("save") },
             notifyAgentTurnComplete: { _ in },
-            handleHeadlessStreamResult: { _, _, _, _ in },
+            handleHeadlessStreamResult: { result, _, _, _ in
+                await handleHeadlessStreamResult?(result)
+            },
             buildHeadlessAgentMessage: { _, text, _, _ in AgentMessage(userMessage: text) },
             finalizeStreamingItems: { _ in },
             finalizePendingToolCalls: { _, _ in },
@@ -1810,6 +1892,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         pid_path = os.environ.get("ACP_PID_PATH")
         current_model = "model-a"
         current_mode = "ask"
+        current_fast = "false"
 
         if pid_path:
             with open(pid_path, "w", encoding="utf-8") as handle:
@@ -1822,7 +1905,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 handle.write(json.dumps({"method": method, "params": params}) + "\n")
 
         def config_options():
-            return [
+            options = [
                 {
                     "id": "model",
                     "name": "Model",
@@ -1847,6 +1930,19 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     ]
                 }
             ]
+            if os.environ.get("ACP_CURSOR_PARAMETERIZED") == "1":
+                options.append({
+                    "id": "fast",
+                    "name": "Fast Mode",
+                    "category": "model_config",
+                    "type": "select",
+                    "currentValue": current_fast,
+                    "options": [
+                        {"value": "false", "name": "Off"},
+                        {"value": "true", "name": "On"}
+                    ]
+                })
+            return options
 
         def respond(request_id, result=None):
             print(json.dumps({
@@ -1875,6 +1971,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     current_model = params.get("value")
                 elif params.get("configId") == "mode":
                     current_mode = params.get("value")
+                elif params.get("configId") == "fast":
+                    current_fast = params.get("value")
                 respond(request.get("id"), {"configOptions": config_options()})
             elif method == "session/prompt":
                 respond(request.get("id"), {

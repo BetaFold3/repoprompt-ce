@@ -1,0 +1,967 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Human-friendly technical implementation report for Cursor parameterized model selection in RepoPrompt CE.">
+  <title>Cursor Parameterized Model Picker — Technical Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f3f6f8;
+      --surface: #ffffff;
+      --surface-2: #f7f9fb;
+      --ink: #17212b;
+      --muted: #5d6b78;
+      --line: #d9e1e8;
+      --blue: #245cc5;
+      --blue-soft: #eaf1ff;
+      --green: #17754c;
+      --green-soft: #e7f7ef;
+      --amber: #946200;
+      --amber-soft: #fff3d5;
+      --red: #ad3f49;
+      --red-soft: #ffeaed;
+      --purple: #6d48ad;
+      --purple-soft: #f0eaff;
+      --cyan: #087286;
+      --cyan-soft: #e5f6f8;
+      --shadow: 0 16px 44px rgba(30, 52, 70, .08);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d141b;
+        --surface: #171f28;
+        --surface-2: #202a35;
+        --ink: #edf3f7;
+        --muted: #b2bec8;
+        --line: #35424f;
+        --blue: #91b0ff;
+        --blue-soft: #27365c;
+        --green: #78d6aa;
+        --green-soft: #173d2d;
+        --amber: #ebc46d;
+        --amber-soft: #4b391a;
+        --red: #ff9da7;
+        --red-soft: #4c292e;
+        --purple: #c9b1ff;
+        --purple-soft: #392d55;
+        --cyan: #75d1df;
+        --cyan-soft: #173d45;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 94% -5%, color-mix(in srgb, var(--blue) 13%, transparent), transparent 34rem),
+        radial-gradient(circle at -8% 34%, color-mix(in srgb, var(--cyan) 8%, transparent), transparent 28rem),
+        var(--bg);
+      color: var(--ink);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    }
+    a { color: var(--blue); text-underline-offset: 3px; }
+    code, pre { font-family: var(--mono); }
+    code {
+      padding: .08rem .34rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-2);
+      font-size: .9em;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 12px 0;
+      overflow-x: auto;
+      padding: 15px 17px;
+      border: 1px solid #2d3a48;
+      border-radius: 13px;
+      background: #111923;
+      color: #edf5fb;
+      font-size: .82rem;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .skip-link {
+      position: fixed;
+      left: 12px;
+      top: -60px;
+      z-index: 100;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+    }
+    .skip-link:focus { top: 12px; }
+    .page { width: min(1180px, calc(100% - 28px)); margin: 0 auto; padding: 26px 0 72px; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(28px, 5vw, 54px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: linear-gradient(135deg, var(--surface) 0%, color-mix(in srgb, var(--blue-soft) 72%, var(--surface)) 100%);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 420px;
+      height: 420px;
+      right: -170px;
+      top: -250px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--blue) 13%, transparent);
+    }
+    .eyebrow {
+      position: relative;
+      z-index: 1;
+      margin: 0 0 9px;
+      color: var(--blue);
+      font-size: .76rem;
+      font-weight: 850;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 920px;
+      margin: 0;
+      font-size: clamp(2.2rem, 5.2vw, 4.35rem);
+      line-height: 1.03;
+      letter-spacing: -.05em;
+    }
+    .subtitle {
+      position: relative;
+      z-index: 1;
+      max-width: 930px;
+      margin: 20px 0 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.18rem);
+    }
+    .badges { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .badge, .evidence {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-weight: 760;
+    }
+    .badge { padding: 6px 10px; background: var(--surface); color: var(--muted); font-size: .8rem; }
+    .badge.good, .evidence.test { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); background: var(--green-soft); color: var(--green); }
+    .badge.info, .evidence.code { border-color: color-mix(in srgb, var(--blue) 45%, var(--line)); background: var(--blue-soft); color: var(--blue); }
+    .badge.warn, .evidence.session { border-color: color-mix(in srgb, var(--amber) 45%, var(--line)); background: var(--amber-soft); color: var(--amber); }
+    .badge.review, .evidence.inferred { border-color: color-mix(in srgb, var(--purple) 45%, var(--line)); background: var(--purple-soft); color: var(--purple); }
+    .evidence { padding: 2px 7px; margin-left: 3px; font-size: .67rem; letter-spacing: .02em; vertical-align: middle; }
+    .toc {
+      position: sticky;
+      top: 10px;
+      z-index: 20;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin: 18px 0 28px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--surface) 91%, transparent);
+      box-shadow: 0 7px 24px rgba(26, 31, 38, .07);
+      backdrop-filter: blur(16px);
+    }
+    .toc a {
+      padding: 5px 8px;
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: .8rem;
+      font-weight: 720;
+      text-decoration: none;
+    }
+    .toc a:hover { background: var(--blue-soft); color: var(--blue); }
+    section {
+      margin-top: 24px;
+      padding: clamp(20px, 3vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    h2 { margin: 0 0 15px; font-size: clamp(1.5rem, 3vw, 2.15rem); letter-spacing: -.025em; }
+    h3 { margin: 25px 0 10px; font-size: 1.16rem; }
+    h4 { margin: 16px 0 7px; font-size: 1rem; }
+    p { margin: 9px 0; }
+    ul, ol { padding-left: 1.35rem; }
+    li + li { margin-top: .38rem; }
+    .lead { max-width: 950px; color: var(--muted); font-size: 1.03rem; }
+    .grid { display: grid; gap: 14px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-2);
+    }
+    .card h3, .card h4 { margin-top: 0; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .label { color: var(--muted); font-size: .74rem; font-weight: 820; letter-spacing: .08em; text-transform: uppercase; }
+    .value { margin-top: 4px; font-size: 1.48rem; font-weight: 850; letter-spacing: -.03em; }
+    .callout {
+      margin: 15px 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--blue);
+      border-radius: 0 12px 12px 0;
+      background: var(--blue-soft);
+    }
+    .callout.good { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.danger { border-left-color: var(--red); background: var(--red-soft); }
+    .callout.review { border-left-color: var(--purple); background: var(--purple-soft); }
+    .before-after { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+    .before, .after { padding: 17px; border: 1px solid var(--line); border-radius: 14px; }
+    .before { background: var(--red-soft); }
+    .after { background: var(--green-soft); }
+    .before h3, .after h3 { margin-top: 0; }
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+    .flow .node {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface-2);
+    }
+    .flow .arrow { align-self: center; color: var(--blue); font-size: 1.45rem; font-weight: 900; }
+    .timeline { position: relative; margin: 18px 0 0 10px; padding-left: 24px; border-left: 2px solid var(--line); }
+    .turn { position: relative; margin: 0 0 22px; }
+    .turn::before {
+      content: "";
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      left: -31px;
+      top: 6px;
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 0 0 5px var(--blue-soft);
+    }
+    .turn h3 { margin: 0 0 5px; }
+    .step {
+      display: grid;
+      grid-template-columns: 38px 1fr;
+      gap: 12px;
+      margin: 13px 0;
+      align-items: start;
+    }
+    .step-num {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      border-radius: 50%;
+      background: var(--blue);
+      color: white;
+      font-weight: 850;
+    }
+    .step-body { padding: 3px 0 14px; border-bottom: 1px solid var(--line); }
+    .step:last-child .step-body { border-bottom: 0; }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: .9rem; }
+    th, td { padding: 10px 11px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-2); font-size: .76rem; letter-spacing: .04em; text-transform: uppercase; }
+    tr:nth-child(even) td { background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
+    .table-wrap { overflow-x: auto; }
+    details {
+      margin: 11px 0;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface-2);
+    }
+    summary { cursor: pointer; padding: 12px 14px; font-weight: 780; }
+    details > div { padding: 0 14px 14px; }
+    .checklist { list-style: none; padding-left: 0; }
+    .checklist li { position: relative; padding-left: 29px; }
+    .checklist li::before {
+      content: "□";
+      position: absolute;
+      left: 2px;
+      color: var(--blue);
+      font-weight: 900;
+    }
+    .priority {
+      display: inline-flex;
+      min-width: 30px;
+      justify-content: center;
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: .72rem;
+      font-weight: 850;
+    }
+    .p0 { background: var(--red-soft); color: var(--red); }
+    .p1 { background: var(--amber-soft); color: var(--amber); }
+    .p2 { background: var(--blue-soft); color: var(--blue); }
+    .muted { color: var(--muted); }
+    .small { font-size: .86rem; }
+    footer { padding: 28px 5px 0; color: var(--muted); font-size: .84rem; text-align: center; }
+    @media (max-width: 850px) {
+      .grid.three, .grid.four { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .flow { grid-template-columns: 1fr; }
+      .flow .arrow { transform: rotate(90deg); justify-self: center; }
+    }
+    @media (max-width: 620px) {
+      .page { width: min(100% - 18px, 1180px); padding-top: 10px; }
+      .hero { border-radius: 20px; }
+      .grid.two, .grid.three, .grid.four, .before-after { grid-template-columns: 1fr; }
+      .toc { position: static; }
+      section { padding: 19px; }
+    }
+    @media print {
+      body { background: white; color: black; }
+      .page { width: 100%; }
+      .toc { display: none; }
+      .hero, section { box-shadow: none; break-inside: avoid; }
+      a { color: black; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to report</a>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Technical implementation report · 5 August 2026</p>
+      <h1>Cursor models now have real Reasoning, Context, and Fast controls.</h1>
+      <p class="subtitle">
+        RepoPrompt CE now opts into Cursor’s parameterized ACP model protocol, discovers each model’s supported settings, presents them as compact submenus, and applies them as a verified transaction rather than silently collapsing every choice to the default.
+      </p>
+      <div class="badges">
+        <span class="badge good">Implementation complete</span>
+        <span class="badge info">29 implementation files</span>
+        <span class="badge info">+5,901 / −82 lines</span>
+        <span class="badge good">8 focused suites passed</span>
+        <span class="badge review">Dual-Oracle reviewed</span>
+        <span class="badge warn">Uncommitted · manual UI smoke pending</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Report sections">
+      <a href="#summary">Summary</a>
+      <a href="#expect">What to expect</a>
+      <a href="#architecture">How it works</a>
+      <a href="#turns">Major turns</a>
+      <a href="#decisions">Decisions</a>
+      <a href="#review">Oracle review</a>
+      <a href="#test">Test it</a>
+      <a href="#validation">Validation</a>
+      <a href="#inventory">Inventory</a>
+      <a href="#risks">Risks</a>
+      <a href="#actions">Your actions</a>
+      <a href="#evidence">Evidence</a>
+    </nav>
+
+    <main id="main">
+      <section id="summary">
+        <h2>Executive summary</h2>
+        <p class="lead">
+          The original symptom was that Cursor exposed GPT‑5.6 Sol only as a single default entry—medium reasoning, 272k context, Fast off—even though Cursor itself supports more choices. The implementation fixes that limitation end to end while preserving the existing external model ID grammar.
+        </p>
+
+        <div class="before-after">
+          <div class="before">
+            <h3>Before</h3>
+            <ul>
+              <li>RepoPrompt did not send Cursor’s opt-in capability flag.</li>
+              <li>The model registry saw one bracketed default per model, such as <code>gpt-5.6-sol[context=272k,reasoning=medium,fast=false]</code>.</li>
+              <li>A caller requesting a non-default bracket could be silently mapped back to the default.</li>
+              <li>No UI controls existed for model-specific reasoning, context, or Fast mode.</li>
+            </ul>
+          </div>
+          <div class="after">
+            <h3>After</h3>
+            <ul>
+              <li>Cursor sessions advertise <code>_meta.parameterizedModelPicker: true</code>.</li>
+              <li>The registry receives clean base IDs such as <code>gpt-5.6-sol</code>.</li>
+              <li>The UI discovers and shows each model’s actual parameter domains.</li>
+              <li>Selections are applied and echo-verified one setting at a time, with rollback on failure.</li>
+              <li>Malformed, unsupported, or conflicting choices fail loudly instead of being coerced.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout good">
+          <strong>Practical outcome:</strong> a user can select GPT‑5.6 Sol, choose 272k or 1M context, choose the advertised reasoning level, and explicitly keep Fast off or turn it on. RepoPrompt enforces the full selected state before sending the prompt.
+          <span class="evidence code">Observed in code</span>
+        </div>
+      </section>
+
+      <section id="expect">
+        <h2>What can we expect from this change?</h2>
+        <div class="grid three">
+          <article class="card">
+            <div class="label">Model list</div>
+            <div class="value">Clean IDs</div>
+            <p><code>agent_manage list_agents</code> should show <code>cursor:gpt-5.6-sol</code>, not one bracketed medium/Fast-off default.</p>
+          </article>
+          <article class="card">
+            <div class="label">Picker behavior</div>
+            <div class="value">Nested settings</div>
+            <p>Supported Cursor models gain submenus such as Context, Reasoning, and Fast. Unsupported models simply have no extra submenu.</p>
+          </article>
+          <article class="card">
+            <div class="label">Selected identity</div>
+            <div class="value">Full bracket</div>
+            <p>RepoPrompt continues to persist and accept <code>cursor:&lt;base&gt;[k=v,…]</code>, so existing external contracts need no migration.</p>
+          </article>
+          <article class="card">
+            <div class="label">Failure behavior</div>
+            <div class="value">Loud + safe</div>
+            <p>Unknown keys, invalid values, protocol mismatches, and unsupported legacy parameter requests stop before a prompt is sent.</p>
+          </article>
+          <article class="card">
+            <div class="label">Catalog outage</div>
+            <div class="value">Graceful</div>
+            <p>If Cursor’s private catalog extension is missing, slow, or malformed, parameter pickers disappear while ordinary runs continue.</p>
+          </article>
+          <article class="card">
+            <div class="label">Older Cursor CLI</div>
+            <div class="value">Defaults only</div>
+            <p>Legacy agents retain their advertised default models. Non-default parameters now report that the version does not support them.</p>
+          </article>
+        </div>
+
+        <h3>Example: GPT‑5.6 Sol</h3>
+        <pre>cursor:gpt-5.6-sol[context=1m,reasoning=high,fast=false]</pre>
+        <p>
+          This string is RepoPrompt’s durable selection identity. In capability mode, RepoPrompt does <em>not</em> send the bracketed string to Cursor. It selects the clean model first, then sets <code>context</code>, <code>reasoning</code>, and <code>fast</code> through Cursor’s ordinary session configuration API.
+          <span class="evidence code">Observed in code</span>
+        </p>
+
+        <div class="callout warn">
+          <strong>No combinatorial model explosion:</strong> the implementation intentionally does not add every reasoning × context × Fast combination to <code>agent_manage list_agents</code>. The base model remains one catalog row; parameters live in the UI and in explicit bracket model IDs. Catalog enrichment in <code>agent_manage</code> remains deferred.
+          <span class="evidence session">Observed in plan/session</span>
+        </div>
+
+        <div class="callout danger">
+          <strong>Fast mode has cost impact:</strong> Cursor describes Fast as roughly 2× more expensive. Parameter values are persisted by <code>cursor-agent</code> globally, so they can affect later Cursor sessions outside RepoPrompt. The implementation orders Fast last, rolls back partial changes, and emits a visible warning when a bare-base selection inherits <code>fast=true</code>.
+          <span class="evidence session">Live probe</span>
+          <span class="evidence code">Observed in code</span>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <h2>How it works, in human terms</h2>
+        <p class="lead">The feature separates three concerns: discovery for the picker, a stable model identity for RepoPrompt, and verified runtime application to Cursor.</p>
+
+        <div class="flow" aria-label="Parameterized model flow">
+          <div class="node">
+            <h3>1. Discover</h3>
+            <p>A background Cursor polling session calls <code>cursor/list_available_models</code> with a 10-second timeout and stores parameter metadata in memory.</p>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <h3>2. Compose</h3>
+            <p>The UI converts a user’s submenu choices into one full identity, such as <code>gpt-5.6-sol[context=1m,reasoning=high,fast=false]</code>.</p>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <h3>3. Enforce</h3>
+            <p>The run selects <code>gpt-5.6-sol</code>, validates Cursor’s live selectors, applies each value, and checks the echoed snapshot before prompting.</p>
+          </div>
+        </div>
+
+        <h3>The safety transaction</h3>
+        <ol>
+          <li><strong>Parse:</strong> reject malformed brackets, duplicates, empty components, or unrepresentable values.</li>
+          <li><strong>Select the base model:</strong> use the clean model ID that Cursor advertised.</li>
+          <li><strong>Read live selectors:</strong> parameters appear dynamically after model selection; the controller treats the latest complete snapshot as authoritative.</li>
+          <li><strong>Pre-validate:</strong> every requested key and value must exist in Cursor’s post-selection selectors.</li>
+          <li><strong>Apply:</strong> set only values that differ; apply <code>fast</code> last.</li>
+          <li><strong>Verify:</strong> require each response to echo the exact requested value, then perform a final state check.</li>
+          <li><strong>Rollback on error:</strong> restore changed parameters in reverse order and restore the previous model if the model was switched. If rollback itself fails, the error explicitly warns that Cursor may retain a partial global configuration.</li>
+        </ol>
+
+        <details>
+          <summary>Key implementation seams</summary>
+          <div>
+            <ul>
+              <li><code>ACPAgentProvider.initializeClientCapabilityMetadata</code> is a default-empty provider hook; only Cursor supplies the capability metadata.</li>
+              <li><code>CursorBracketModelID</code> owns the parse/compose grammar and forces Fast to the end.</li>
+              <li><code>CursorModelParameterCatalog</code> parses the proprietary catalog into a thread-safe, in-memory snapshot and notifies the UI.</li>
+              <li><code>ACPAgentSessionController.setCursorSessionModelSerialized</code> owns the runtime transaction.</li>
+              <li><code>CursorModelParameterPickerViewModel</code> maps catalog categories to user labels and composes complete bracket selections.</li>
+              <li><code>AgentExternalMCPRunStarter</code> treats Cursor model strings separately from Codex model suffixes and can overlay a validated Cursor thought-level value.</li>
+            </ul>
+          </div>
+        </details>
+
+        <div class="callout">
+          <strong>OpenCode compatibility:</strong> shared ACP machinery was extended through a default-empty hook and provider-gated branches. OpenCode does not receive the Cursor capability metadata, and dedicated regression tests pin its behavior.
+          <span class="evidence code">Observed in code</span>
+          <span class="evidence test">Observed in tests</span>
+        </div>
+      </section>
+
+      <section id="turns">
+        <h2>Major turns in the investigation and implementation</h2>
+        <p class="lead">The strongest design choices came from protocol evidence that invalidated plausible—but wrong—first approaches.</p>
+
+        <div class="timeline">
+          <article class="turn">
+            <h3>Turn 1 — The initial diagnosis changed</h3>
+            <p>The first report suggested Cursor exploded configurations into IDs such as <code>gpt-5.6-sol-high-fast</code>. A live probe of <code>cursor-agent 2026.07.23-e383d2b</code> showed the real legacy shape: one bracket-serialized default per model. This explained why RepoPrompt only saw medium reasoning and Fast off.</p>
+          </article>
+          <article class="turn">
+            <h3>Turn 2 — Both initial Oracle mutation plans were disproved</h3>
+            <p>Legacy mode rejected synthesized bracket variants and clean IDs. Capability mode rejected all bracketed IDs. Therefore neither “synthesize a better bracket ID” nor “send a composite bracket in capability mode” could work.</p>
+          </article>
+          <article class="turn">
+            <h3>Turn 3 — The actual protocol appeared after selecting a model</h3>
+            <p>In capability mode, selecting a clean base model caused the session’s <code>configOptions</code> to grow model-specific selectors. GPT‑5.6 Sol exposed <code>context</code>, <code>reasoning</code>, and <code>fast</code>; GPT‑5.2 exposed <code>reasoning</code> and <code>fast</code>. This became the runtime source of truth.</p>
+          </article>
+          <article class="turn">
+            <h3>Turn 4 — Global persistence raised the safety bar</h3>
+            <p>Live probes showed that Cursor remembers model parameters across sessions. Because Fast has a price consequence, the implementation moved from ordinary sequential writes to an abort-and-rollback transaction with Fast last.</p>
+          </article>
+          <article class="turn">
+            <h3>Turn 5 — Post-implementation duel found nine hardening gaps</h3>
+            <p>Two independent Oracle reviews returned “do not ship” and “ship with fixes.” Their converged findings exposed stream timing, incomplete rollback, kill-switch gaps, stale catalog behavior, timeout coverage, selection bleed, and other edge cases. All nine were fixed and given regression tests.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="decisions">
+        <h2>Major decisions and why they were chosen</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Decision</th><th>Chosen behavior</th><th>Reasoning</th><th>Consequence</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Capability injection</td>
+                <td>A defaulted provider hook; Cursor returns <code>parameterizedModelPicker=true</code>.</td>
+                <td>Keeps Cursor-specific knowledge out of shared controller branching and leaves other providers empty by default.</td>
+                <td>Small, testable seam; OpenCode’s initialize payload stays unchanged.</td>
+              </tr>
+              <tr>
+                <td>Durable model identity</td>
+                <td>Keep <code>cursor:&lt;base&gt;[k=v,…]</code>.</td>
+                <td>Existing persistence and external callers already understand a base plus parameters.</td>
+                <td>No data migration or public wire-schema change.</td>
+              </tr>
+              <tr>
+                <td>Catalog placement</td>
+                <td>Discovery/polling only, never required by normal run bootstrap.</td>
+                <td>The proprietary extension is needed to build the picker, not to apply a selected model.</td>
+                <td>Catalog failure hides pickers without breaking runs.</td>
+              </tr>
+              <tr>
+                <td>Runtime authority</td>
+                <td>Use live post-selection session selectors.</td>
+                <td>The catalog’s <code>currentValue</code> is metadata/default data, not the session’s live state.</td>
+                <td>Every run validates against what Cursor actually advertises at that moment.</td>
+              </tr>
+              <tr>
+                <td>Bare-base selection</td>
+                <td>Inherit Cursor’s remembered settings and surface them.</td>
+                <td>Resetting to catalog defaults would make the proprietary extension a run dependency and fight Cursor’s own preference ownership.</td>
+                <td>Diagnostics show effective values; inherited Fast produces a visible system warning.</td>
+              </tr>
+              <tr>
+                <td>Preference ownership</td>
+                <td>No duplicate RepoPrompt per-model preference store in v1.</td>
+                <td>Two persistent owners would drift. The full bracket is already the desired state when users choose explicit settings.</td>
+                <td>Cursor remains the remembered-state owner; RepoPrompt enforces explicit bracket selections.</td>
+              </tr>
+              <tr>
+                <td>Invalid input</td>
+                <td>Fail loudly.</td>
+                <td>Lenient fallback would recreate the original silent-coercion bug.</td>
+                <td>Malformed brackets, unknown keys, invalid values, and effort conflicts are user-visible errors.</td>
+              </tr>
+              <tr>
+                <td>Emergency fallback</td>
+                <td>UserDefaults-backed kill switch, default on.</td>
+                <td>The Cursor extension is proprietary and version drift is plausible.</td>
+                <td>Capability injection, catalog fetch, and Cursor effort overlay can all be disabled together without rebuilding.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="review">
+        <h2>Dual-Oracle post-implementation review</h2>
+        <p>
+          Two independent reviewers examined the completed feature concurrently in fresh chats. Oracle A returned <strong>DO-NOT-SHIP</strong>; Oracle B returned <strong>SHIP-WITH-FIXES</strong>. Their model identities were checked before synthesis, and every converged finding was assigned to a fix worker and covered by tests.
+          <span class="evidence session">Observed in session</span>
+        </p>
+        <div class="callout review">
+          Review sessions preserved in the handed-off workspace: <code>oraclea-post-impl-review-54FFE0</code> and <code>oracleb-post-impl-review-DE8A8F</code>.
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Finding</th><th>Why it mattered</th><th>Resolution</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>F1 · Follow-up stream reset</td><td>A bare-base <code>fast=true</code> warning could be emitted into the previous turn’s discarded stream.</td><td>Prepare the reused controller’s next-turn stream before applying the new model; added a two-turn warning regression.</td></tr>
+              <tr><td>F2 · Model rollback</td><td>A parameter failure after a model switch could leave Cursor’s global selected model changed.</td><td>Restore both changed parameters and the previous model; include rollback failures in the thrown error.</td></tr>
+              <tr><td>F3 · Kill-switch completeness</td><td>The catalog and MCP effort overlay could remain active even when capability injection was disabled.</td><td>Gate all three surfaces: initialize metadata, discovery extension fetch, and Cursor effort overlay.</td></tr>
+              <tr><td>F4 · Effort domain validation</td><td>External <code>reasoning_effort</code> could be overlaid without validating Cursor’s advertised values.</td><td>Canonicalize against the unique <code>thought_level</code> parameter domain; reject missing metadata, invalid values, and conflicts.</td></tr>
+              <tr><td>F5 · Cross-provider checkmarks</td><td>A model string shared by two providers could display selection state in the inactive provider’s menu.</td><td>Only compare selection values when the relevant provider is active.</td></tr>
+              <tr><td>F6 · Default Settings</td><td>Resetting from a non-default bracket could accidentally preserve <code>fast=true</code>.</td><td>Compose every catalog default explicitly when “Default Settings” is chosen.</td></tr>
+              <tr><td>F7 · Mutation timeout/state</td><td><code>session/set_config_option</code> could wait indefinitely or continue after terminal state.</td><td>Apply a bounded 30-second timeout and terminal-state fast-fail to configuration mutations.</td></tr>
+              <tr><td>F8 · Nil-registry headless path</td><td>An explicit Cursor bracket could be silently skipped when no registry snapshot existed.</td><td>Pass explicit selections through when the registry is absent; validate once live session data is available.</td></tr>
+              <tr><td>F9 · Malformed catalog response</td><td>Malformed “successful” extension responses could leave stale picker values visible.</td><td>Use tri-state parsing: valid updates replace data, malformed success clears it, transient transport failure may retain the last valid catalog.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="test">
+        <h2>How to test and see the effect</h2>
+        <p class="lead">Start with Fast off. The first lane is visual and cost-safe; the second proves the explicit external model contract.</p>
+
+        <h3>Lane A — Manual UI smoke</h3>
+        <div class="callout warn">
+          This report did not launch or relaunch the visible app because repository policy requires approval at that action boundary. Run these steps yourself when convenient.
+        </div>
+
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-body">
+            <strong>Check prerequisites.</strong>
+            <p>Confirm Python 3 is available and Cursor Agent CLI is installed and authenticated. From the repository root, run:</p>
+            <pre>make doctor</pre>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-body">
+            <strong>Build and launch the CE debug app.</strong>
+            <pre>make dev-build
+make dev-run</pre>
+            <p class="small muted">Use the coordinated <code>make dev-*</code> flow. If the conductor returns <code>global-wait</code>, wait for its ticket instead of starting a duplicate build.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-body">
+            <strong>Open Agent Mode and select Cursor.</strong>
+            <p>Open the provider/model picker. Allow the initial polling refresh to finish. Find GPT‑5.6 Sol.</p>
+            <p><strong>Expected:</strong> the model has parameter submenus sourced from Cursor. For the probed CLI version, expect Context, Reasoning, and Fast; Auto should not expose parameter controls.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">4</div>
+          <div class="step-body">
+            <strong>Choose an explicit safe configuration.</strong>
+            <p>Select Context <strong>272k</strong>, Reasoning <strong>High</strong>, and Fast <strong>Off</strong>.</p>
+            <p><strong>Expected:</strong> the model remains a single entry; the submenu checkmarks reflect the complete bracket selection. “Default Settings” should reset all three values to Cursor’s catalog defaults, not retain a previously enabled Fast value.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">5</div>
+          <div class="step-body">
+            <strong>Send a tiny prompt.</strong>
+            <pre>Reply exactly with CURSOR_PARAMETER_PICKER_OK and stop.</pre>
+            <p><strong>Expected:</strong> the prompt runs normally. No Fast billing warning appears because Fast was explicitly set to false.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">6</div>
+          <div class="step-body">
+            <strong>Exercise a parameters-only update.</strong>
+            <p>Keep GPT‑5.6 Sol selected, change only Reasoning from High to Low, then run the same tiny prompt.</p>
+            <p><strong>Expected:</strong> the change is honored even though the base model did not change. This specifically verifies the former early-return bug is fixed.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">7</div>
+          <div class="step-body">
+            <strong>Optional billing-warning smoke.</strong>
+            <p>Only if you intentionally accept Cursor’s increased Fast cost: enable Fast, run one tiny prompt, then immediately choose “Default Settings” or Fast Off.</p>
+            <p><strong>Expected:</strong> explicit Fast works. A bare-base selection that inherits Fast from Cursor shows a system transcript warning: <code>Cursor Fast mode is enabled…</code></p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">8</div>
+          <div class="step-body">
+            <strong>Check persistence and resume.</strong>
+            <p>Switch tabs and return, then send a follow-up in the same Cursor session.</p>
+            <p><strong>Expected:</strong> the explicit full configuration remains selected; a reused session preserves the correct second-turn warning behavior if bare-base Fast is active.</p>
+          </div>
+        </div>
+
+        <h3>Lane B — Explicit CLI contract</h3>
+        <p>First confirm that discovery now uses a clean base identity:</p>
+        <pre>rpce-cli-debug -w "1" -c agent_manage \
+  -j '{"op":"list_agents"}' \
+  | grep 'cursor:gpt-5.6-sol'</pre>
+        <p><strong>Expected:</strong> a clean <code>cursor:gpt-5.6-sol</code> entry. Do not expect one list row for every parameter combination.</p>
+
+        <p>Then start one explicit, Fast-off run:</p>
+        <pre>rpce-cli-debug -w 1 -c agent_run -j '{
+  "op":"start",
+  "model_id":"cursor:gpt-5.6-sol[context=272k,reasoning=high,fast=false]",
+  "session_name":"Cursor parameterized model smoke",
+  "message":"Reply exactly with CURSOR_PARAMETER_PICKER_OK and stop.",
+  "detach":true
+}'</pre>
+        <p>Copy the returned <code>session_id</code>, then wait for completion:</p>
+        <pre>rpce-cli-debug -w 1 -c agent_run -j '{
+  "op":"wait",
+  "session_id":"&lt;session_id&gt;",
+  "timeout":120
+}'</pre>
+        <p><strong>Expected:</strong> the run completes with the requested response. If the model or a parameter is no longer advertised by the installed Cursor version, the run should fail with an explicit configuration error rather than silently using medium/Fast-off defaults.</p>
+
+        <h3>Lane C — Focused automated checks</h3>
+        <pre>make dev-lint
+make dev-format-check
+make dev-test FILTER=CursorBracketModelIDTests
+make dev-test FILTER=CursorParameterizedModelControllerTests
+make dev-test FILTER=CursorModelParameterCatalogTests
+make dev-test FILTER=CursorModelParameterPickerViewModelTests
+make dev-test FILTER=AgentModeRunServiceLifecycleTests
+make dev-test FILTER=ACPAgentSessionControllerModeConfigTests
+make dev-test FILTER=AgentRunWorktreeStartTests
+make dev-test FILTER=CursorACPLaunchResolverTests</pre>
+      </section>
+
+      <section id="validation">
+        <h2>Validation evidence</h2>
+        <p>
+          The implementation session recorded passing focused tests and style checks. The report uses the exact per-suite results from the handoff rather than its separate “150 tests” headline, because the listed suite counts sum differently. Feature suites were not rerun while authoring this page; the HTML structure check and repository guardrail were run during report generation.
+          <span class="evidence session">Observed in session</span>
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Check</th><th>Recorded result</th><th>Coverage purpose</th></tr></thead>
+            <tbody>
+              <tr><td><code>CursorBracketModelIDTests</code></td><td>6 / 6 passed</td><td>Grammar, malformed values, round trips, Fast ordering, prefix stripping, kill switch.</td></tr>
+              <tr><td><code>CursorParameterizedModelControllerTests</code></td><td>19 / 19 passed</td><td>Capability shape, transaction order, idempotency, rollback, extension timeout, catalog degradation, external effort, legacy behavior.</td></tr>
+              <tr><td><code>CursorModelParameterCatalogTests</code></td><td>5 / 5 passed</td><td>Fixture parsing, malformed data, stale clearing, method-not-found behavior, notifications.</td></tr>
+              <tr><td><code>CursorModelParameterPickerViewModelTests</code></td><td>5 / 5 passed</td><td>Full-bracket composition, labels, cross-provider selection state, defaults reset, hiding rules.</td></tr>
+              <tr><td><code>AgentModeRunServiceLifecycleTests</code></td><td>35 / 35 passed</td><td>Initial/follow-up Cursor runs and second-turn Fast-warning stream visibility, plus lifecycle regressions.</td></tr>
+              <tr><td><code>ACPAgentSessionControllerModeConfigTests</code></td><td>27 / 27 passed</td><td>Shared ACP configuration behavior and provider compatibility.</td></tr>
+              <tr><td><code>AgentRunWorktreeStartTests</code></td><td>38 / 38 passed</td><td>External <code>agent_run</code> model routing and start behavior.</td></tr>
+              <tr><td><code>CursorACPLaunchResolverTests</code></td><td>27 / 27 passed</td><td>Cursor launch/security behavior and parameterized-error normalization.</td></tr>
+              <tr><td><code>make dev-format-check</code></td><td>Passed</td><td>Non-mutating Swift format check.</td></tr>
+              <tr><td><code>make dev-lint</code></td><td>Passed</td><td>Swift/style diagnostics.</td></tr>
+              <tr><td><code>make dev-test-list</code></td><td>Passed</td><td>Test inventory command completed.</td></tr>
+              <tr><td>Timing deflake</td><td>10 consecutive runs passed</td><td>Fake ACP server ordering race was repaired in the test harness; product ordering guard remained unchanged.</td></tr>
+              <tr><td>HTML report structure check</td><td>Passed during report generation</td><td>Parsed successfully; 13 internal links resolve; no external assets; 54,339 bytes before this final evidence update.</td></tr>
+              <tr><td><code>make guardrails</code></td><td>Failed during report generation · exit 2</td><td>Reported only three pre-existing tracked HTML reports: 2026-08-02 right utility panel, 2026-08-04 right utility panel complete, and 2026-08-05 Oracle duel hardening. The new untracked report was not listed.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="grid two">
+          <div class="card">
+            <h3>Not run</h3>
+            <ul>
+              <li>Full repository-wide <code>make dev-test</code>.</li>
+              <li>Manual visible-app picker smoke.</li>
+              <li>Manual persistence round-trip and session-resume checklist.</li>
+              <li>Live Fast-on smoke after the final review fixes.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Known unrelated repository state</h3>
+            <ul>
+              <li>The handoff recorded—and this report-generation run reconfirmed—a guardrails failure involving three pre-existing tracked technical-report HTML files.</li>
+              <li>The handoff also recorded pre-existing XCTest ledger drift: 273 missing and 3 stale IDs.</li>
+              <li>These were not changed to force the feature through validation.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="inventory">
+        <h2>Change inventory</h2>
+        <p class="lead">At report start, the implementation was entirely uncommitted: 13 modified files, 16 untracked files, and no staged changes.</p>
+
+        <div class="grid four">
+          <div class="card"><div class="label">Implementation files</div><div class="value">29</div><p>Excludes this report.</p></div>
+          <div class="card"><div class="label">Production source</div><div class="value">13</div><p>+1,189 / −78 lines.</p></div>
+          <div class="card"><div class="label">Tests &amp; fixtures</div><div class="value">16</div><p>+4,712 / −4 lines.</p></div>
+          <div class="card"><div class="label">Index state</div><div class="value">0 staged</div><p>Everything remains local.</p></div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Git state</th><th>Files / group</th><th>Role</th><th>Purpose</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>Modified · unstaged</td>
+                <td><code>ACPAgentProvider.swift</code>, <code>CursorACPAgentProvider.swift</code>, <code>CursorAgentConfig.swift</code></td>
+                <td>Provider/config source</td>
+                <td>Default-empty capability hook, Cursor opt-in metadata, and injectable/default-on kill-switch state.</td>
+              </tr>
+              <tr>
+                <td>Modified · unstaged</td>
+                <td><code>ACPAgentSessionController.swift</code></td>
+                <td>Core ACP runtime source</td>
+                <td>Dynamic selector state, parameter transaction, echo verification, rollback, timeouts, extension requests, diagnostics, and bare-base Fast warning.</td>
+              </tr>
+              <tr>
+                <td>Untracked</td>
+                <td><code>CursorBracketModelID.swift</code>, <code>CursorModelParameterCatalog.swift</code></td>
+                <td>New Cursor infrastructure source</td>
+                <td>Strict bracket codec, registry alias gate, kill switch, and thread-safe structured parameter catalog.</td>
+              </tr>
+              <tr>
+                <td>Modified · unstaged</td>
+                <td><code>CursorACPModelPollingService.swift</code></td>
+                <td>Discovery source</td>
+                <td>Best-effort catalog extension fetch; discovery no longer mutates the throwaway session model.</td>
+              </tr>
+              <tr>
+                <td>Modified · unstaged</td>
+                <td><code>CursorACPHeadlessAgentProvider.swift</code>, <code>ACPIntegratedAgentModeRunner.swift</code></td>
+                <td>Run-path source</td>
+                <td>Bracket/clean registry compatibility, nil-registry pass-through, parameters on reused sessions, and correct stream preparation.</td>
+              </tr>
+              <tr>
+                <td>Untracked / modified · unstaged</td>
+                <td><code>CursorModelParameterPickerViewModel.swift</code>, <code>AgentInputBar.swift</code>, <code>StableMenuButton.swift</code></td>
+                <td>UI source</td>
+                <td>Parameter submenus, defaults reset, labels/tooltips, checkmark correctness, and stable nested AppKit menus.</td>
+              </tr>
+              <tr>
+                <td>Modified · unstaged</td>
+                <td><code>AgentExternalMCPRunStarter.swift</code></td>
+                <td>MCP boundary source</td>
+                <td>Preserve Cursor bracket IDs, avoid Codex suffix parsing, validate/overlay Cursor thought-level effort.</td>
+              </tr>
+              <tr>
+                <td>Untracked</td>
+                <td>4 new focused test source files</td>
+                <td>Tests</td>
+                <td>Codec, controller, catalog, and picker view-model coverage.</td>
+              </tr>
+              <tr>
+                <td>Modified · unstaged</td>
+                <td><code>AgentModeRunServiceLifecycleTests.swift</code>, <code>CursorACPLaunchResolverTests.swift</code></td>
+                <td>Tests</td>
+                <td>Follow-up warning visibility, run lifecycle behavior, and parameterized error normalization.</td>
+              </tr>
+              <tr>
+                <td>Untracked</td>
+                <td>8 Cursor ACP JSON fixtures + fixture README</td>
+                <td>Protocol evidence / tests</td>
+                <td>Captured legacy and capability session shapes, selector growth/shrink, mutations, errors, and the 33-model catalog.</td>
+              </tr>
+              <tr>
+                <td>Modified · unstaged</td>
+                <td><code>Scripts/Fixtures/test-suite-contract-ledger.tsv</code></td>
+                <td>Test inventory</td>
+                <td>Surgically registers the new test methods in the curated XCTest ledger.</td>
+              </tr>
+              <tr>
+                <td>Created by this report session</td>
+                <td><code>docs/technical_implementation_reports/2026-08-05-cursor-parameterized-model-picker.html</code></td>
+                <td>Documentation</td>
+                <td>Human-readable implementation, validation, risk, and test handoff. Not included in the 29-file implementation metric.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="risks">
+        <h2>Risks, limitations, and compatibility notes</h2>
+        <div class="grid two">
+          <article class="card">
+            <h3>Observed risks</h3>
+            <ul>
+              <li><strong>Global Cursor state:</strong> model parameter writes can persist beyond RepoPrompt and affect terminal Cursor sessions.</li>
+              <li><strong>Private extension:</strong> <code>cursor/list_available_models</code> is not advertised by ACP initialize and may drift across Cursor releases.</li>
+              <li><strong>Registry generation flip:</strong> upgrading produces clean IDs; downgrading may temporarily pair older bracketed state with newer persisted registry state until polling self-heals.</li>
+              <li><strong>Legacy behavior changed intentionally:</strong> non-default parameter requests that were silently coerced now fail explicitly on an old agent.</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Scope intentionally deferred</h3>
+            <ul>
+              <li>No <code>agent_manage</code> expansion or parameter metadata enrichment.</li>
+              <li>No persisted structured catalog; pickers appear after live discovery.</li>
+              <li>No generic second-provider parameter metadata abstraction.</li>
+              <li>No schema changes to <code>AgentModelOption</code>, the dynamic model store, or the public <code>agent_run</code>/<code>agent_manage</code> payloads.</li>
+            </ul>
+          </article>
+        </div>
+
+        <h3>Graceful-degradation matrix</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Condition</th><th>Expected result</th></tr></thead>
+            <tbody>
+              <tr><td>Modern Cursor agent supports capability + extension</td><td>Clean model list, parameter submenus, full transactional application.</td></tr>
+              <tr><td>Agent accepts capability but catalog extension fails</td><td>Runs still work; picker parameters are hidden until valid discovery returns.</td></tr>
+              <tr><td>Agent ignores capability</td><td>Legacy advertised defaults continue to work; non-default brackets receive an unsupported-parameter error.</td></tr>
+              <tr><td>Kill switch disabled</td><td>No capability metadata, no catalog fetch, no Cursor effort overlay; behavior falls back to legacy/defaults-only mode.</td></tr>
+              <tr><td>Parameter write fails</td><td>Prompt is not sent; applied settings and prior model are restored best-effort; rollback problems are explicit.</td></tr>
+              <tr><td>Bare base inherits <code>fast=true</code></td><td>Run may proceed using Cursor’s remembered state, with diagnostics and a visible system billing warning.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="actions">
+        <h2>Action items for you</h2>
+        <p class="lead">The code implementation is complete; the remaining work is release confidence and Git hygiene.</p>
+        <ul class="checklist">
+          <li><span class="priority p0">P0</span> Run the manual UI smoke in Lane A, especially Default Settings, parameter persistence, same-session follow-up, and Fast-off behavior.</li>
+          <li><span class="priority p0">P0</span> Run the full repository test suite before merge: <code>make dev-test</code>. Focused suites passed, but the full suite was not run.</li>
+          <li><span class="priority p1">P1</span> Add release notes for three intentional behavior changes: non-default brackets are now honored; malformed/unsupported inputs now error; Cursor parameter changes can affect global <code>cursor-agent</code> state.</li>
+          <li><span class="priority p1">P1</span> Review and stage only the intended implementation paths, then run <code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code> immediately before committing. Keep this report local by default; guardrails require agent-authored working reports to remain untracked unless a maintainer explicitly allowlists them as durable documentation.</li>
+          <li><span class="priority p2">P2</span> Consider future <code>agent_manage</code> parameter enrichment only if operators need catalog-visible domains outside the UI. It is not required for correct explicit <code>model_id</code> runs.</li>
+          <li><span class="priority p2">P2</span> Consider catalog persistence only if delayed picker appearance becomes a real UX problem; avoiding a second durable state owner was deliberate in v1.</li>
+        </ul>
+
+        <div class="callout good">
+          <strong>No immediate code blocker is known.</strong> The dual-review findings were fixed and the focused validation is green. The remaining P0 items are manual/full-suite confidence gates, not known functional defects.
+        </div>
+      </section>
+
+      <section id="evidence">
+        <h2>Evidence and limitations</h2>
+        <div class="table-wrap">
+          <table>
+            <tbody>
+              <tr><th>Session context</th><td>Available through the full forked handoff: initial investigation, two-round planning duel, approved plan, delegated implementation, dual post-implementation review, fixes, and validation summary.</td></tr>
+              <tr><th>Git baseline</th><td>No separate session-start commit was provided. The report covers the observable uncommitted working tree on <code>dev/v1.0.29-remote-client-models</code>.</td></tr>
+              <tr><th>Git state at report start</th><td>13 modified + 16 untracked implementation files; 0 staged; 29 files total; +5,901 / −82.</td></tr>
+              <tr><th>Protocol evidence</th><td>Eight checked-in JSON fixtures and P1 findings captured from <code>cursor-agent 2026.07.23-e383d2b</code> on 2026-08-05.</td></tr>
+              <tr><th>Code evidence</th><td>Current source inspection of provider capability injection, bracket codec, catalog, controller transaction, runner, headless path, MCP boundary, picker view model, and menu UI.</td></tr>
+              <tr><th>Validation evidence</th><td>Focused suite counts and style results are observed in the handed-off session and were not rerun here. During report generation, the HTML structure check passed and <code>make guardrails</code> reconfirmed the pre-existing three-file tracked-report failure.</td></tr>
+              <tr><th>Duration</th><td>Unknown; no reliable start/end timestamps were provided.</td></tr>
+              <tr><th>Manual behavior</th><td>Not yet verified in a visible app after final review fixes. UI expectations are grounded in code/tests and clearly presented as a checklist.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="small muted">
+          Provenance labels in this report distinguish code inspection, test/session evidence, live probe evidence, and inference where that distinction materially affects confidence. No performance improvement, production deployment, commit, or full-suite pass is claimed.
+        </p>
+      </section>
+    </main>
+
+    <footer>
+      Generated from AI-agent coding session evidence on 2026-08-05. This is a local, self-contained report with no external assets.
+    </footer>
+  </div>
+</body>
+</html>

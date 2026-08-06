@@ -10,6 +10,8 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
 
     private let providerFactory: ProviderFactory
     private let controllerFactory: ControllerFactory
+    private let parameterizedModelsEnabled: @Sendable () -> Bool
+    private let extensionTimeoutSeconds: TimeInterval
 
     init(
         providerFactory: @escaping ProviderFactory = { agent, modelString in
@@ -27,10 +29,16 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
         },
         controllerFactory: @escaping ControllerFactory = { provider, runRequest in
             try ACPAgentSessionController(provider: provider, runRequest: runRequest)
-        }
+        },
+        parameterizedModelsEnabled: @escaping @Sendable () -> Bool = {
+            CursorParameterizedModels.isEnabled
+        },
+        extensionTimeoutSeconds: TimeInterval = 10
     ) {
         self.providerFactory = providerFactory
         self.controllerFactory = controllerFactory
+        self.parameterizedModelsEnabled = parameterizedModelsEnabled
+        self.extensionTimeoutSeconds = extensionTimeoutSeconds
     }
 
     func discoverModels(workspacePath: String?) async throws -> ACPDiscoveredSessionModels? {
@@ -54,8 +62,21 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
         let controller = try controllerFactory(provider, request)
         do {
             _ = try await controller.bootstrap()
-            try? await controller.setSessionModel(preferredModel)
-            let snapshot = AgentACPModelRegistry.shared.currentSnapshot(for: .cursor)
+            if parameterizedModelsEnabled() {
+                do {
+                    let response = try await controller.sendProviderExtensionRequest(
+                        method: "cursor/list_available_models",
+                        params: [:],
+                        timeoutSeconds: extensionTimeoutSeconds
+                    )
+                    CursorModelParameterCatalog.shared.apply(response: response)
+                } catch {
+                    if ACPAgentSessionController.isProviderExtensionMethodNotFoundError(error) {
+                        CursorModelParameterCatalog.shared.clearForMethodNotFound()
+                    }
+                }
+            }
+            let snapshot = await controller.currentDiscoveredSessionModels()
             await controller.shutdown()
             return snapshot
         } catch {

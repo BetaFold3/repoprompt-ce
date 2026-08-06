@@ -179,6 +179,7 @@ enum NormalizedAgentRuntimeEvent {
 
 protocol ACPAgentProvider: Sendable {
     var providerID: ACPProviderID { get }
+    var initializeClientCapabilityMetadata: [String: Bool] { get }
 
     func support(for request: ACPRunRequest) async throws -> ACPSupportResult
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration
@@ -200,6 +201,10 @@ protocol ACPAgentProvider: Sendable {
 }
 
 extension ACPAgentProvider {
+    var initializeClientCapabilityMetadata: [String: Bool] {
+        [:]
+    }
+
     func preferredAuthMethodID(context _: ACPAuthenticationContext) -> String? {
         nil
     }

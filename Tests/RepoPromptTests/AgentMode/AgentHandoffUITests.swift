@@ -1,8 +1,22 @@
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 @MainActor
 final class AgentHandoffUITests: XCTestCase {
+    private var cursorCatalogSnapshot: [String: [CursorModelParameterCatalog.ParameterSpec]] = [:]
+
+    override func setUp() {
+        super.setUp()
+        cursorCatalogSnapshot = CursorModelParameterCatalog.shared.currentSnapshot()
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+    }
+
+    override func tearDown() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
+        CursorModelParameterCatalog.shared.test_restoreSnapshot(cursorCatalogSnapshot)
+        super.tearDown()
+    }
+
     func testDestinationSourceRequiresMappedRemoteRowsAndKeepsLocalRowsEligible() {
         XCTAssertEqual(
             AgentHandoffConfig.destinationSource(remoteHostID: nil, resolvedHostRowID: nil),
@@ -83,6 +97,318 @@ final class AgentHandoffUITests: XCTestCase {
         XCTAssertFalse(copyMessage.contains("created the fork"), copyMessage)
     }
 
+    func testCursorHandoffPreservesBracketedSelectionReconcilesAndRendersMenu() throws {
+        installCursorModel()
+        XCTAssertTrue(CursorModelParameterCatalog.shared.apply(response: cursorParameterResponse()))
+
+        let baseOption = AgentModelOption(
+            rawValue: "gpt-5.6-sol",
+            displayName: "GPT 5.6 Sol",
+            description: nil,
+            isDefault: true
+        )
+        let preferredRaw = "gpt-5.6-sol[context=1m,thinking_mode=high,fast=false]"
+        let config = localCursorConfig(defaultModelRaw: preferredRaw, options: [baseOption])
+
+        XCTAssertEqual(AgentHandoffPopover.initialSelection(for: config).modelRaw, preferredRaw)
+        XCTAssertEqual(
+            AgentHandoffPopover.initialModelRaw(
+                for: .cursor,
+                preferredModelRaw: preferredRaw,
+                config: config
+            ),
+            preferredRaw
+        )
+        XCTAssertEqual(
+            AgentHandoffPopover.reconciledModelRaw(
+                preferredRaw,
+                for: .cursor,
+                in: [baseOption],
+                fallbackModelRaw: baseOption.rawValue
+            ),
+            preferredRaw
+        )
+
+        let replacementOption = AgentModelOption(
+            rawValue: "composer-2",
+            displayName: "Composer 2",
+            description: nil,
+            isDefault: true
+        )
+        XCTAssertEqual(
+            AgentHandoffPopover.reconciledModelRaw(
+                preferredRaw,
+                for: .cursor,
+                in: [replacementOption],
+                fallbackModelRaw: replacementOption.rawValue
+            ),
+            replacementOption.rawValue
+        )
+
+        let malformedRaw = "gpt-5.6-sol[fast=true"
+        XCTAssertNil(AgentHandoffPopover.option(
+            matching: malformedRaw,
+            for: .cursor,
+            in: [baseOption]
+        ))
+        XCTAssertEqual(
+            AgentHandoffPopover.reconciledModelRaw(
+                malformedRaw,
+                for: .cursor,
+                in: [baseOption],
+                fallbackModelRaw: baseOption.rawValue
+            ),
+            baseOption.rawValue
+        )
+
+        let leaves = try XCTUnwrap(AgentModelOptionsMenuContent.cursorSubmenuLeaves(
+            for: baseOption,
+            selectedModelRaw: preferredRaw,
+            catalog: .shared,
+            isEnabled: true
+        ))
+        XCTAssertEqual(leaves.map(\.title), [
+            "Default", "None", "Low", "High", "None", "Low", "High"
+        ])
+        XCTAssertEqual(
+            CursorModelMenuBuilder.sections(from: leaves).map(\.title),
+            [nil, nil, "Fast (2×)"]
+        )
+        XCTAssertEqual(
+            AgentHandoffPopover.selectedModelDisplayName(
+                agent: .cursor,
+                modelRaw: preferredRaw,
+                option: baseOption
+            ),
+            "GPT 5.6 Sol · High · 1M"
+        )
+    }
+
+    func testHandoffCodexEffortLeavesPairSelectionAndKeepSharedMenuCollapsed() throws {
+        let option = AgentModelOption(
+            rawValue: "gpt-5.6-sol",
+            displayName: "GPT-5.6 Sol",
+            description: nil,
+            isDefault: true,
+            supportedReasoningEfforts: [.low, .high],
+            defaultReasoningEffort: .high
+        )
+
+        let content = AgentHandoffCodexEffortMenu.content(
+            options: [option],
+            selectedModelRaw: option.rawValue,
+            selectedReasoningEffortRaw: CodexReasoningEffort.low.rawValue
+        )
+        let group = try XCTUnwrap(content.groups.first)
+        XCTAssertNil(content.defaultLeaf)
+        XCTAssertEqual(content.groups.count, 1)
+        XCTAssertEqual(group.displayName, "GPT-5.6 Sol")
+        XCTAssertEqual(group.leaves.map(\.title), ["Low", "High (Default)"])
+        XCTAssertEqual(group.leaves.map(\.isDefault), [false, true])
+        XCTAssertEqual(group.leaves.map(\.isSelected), [true, false])
+        XCTAssertFalse(group.showsWarning)
+        XCTAssertTrue(group.leaves.allSatisfy { !$0.showsWarning })
+
+        let highLeaf = try XCTUnwrap(group.leaves.first { $0.effort == .high })
+        XCTAssertEqual(
+            AgentHandoffCodexEffortMenu.selection(for: highLeaf),
+            AgentHandoffSelection(
+                agent: .codexExec,
+                modelRaw: option.rawValue,
+                reasoningEffortRaw: CodexReasoningEffort.high.rawValue
+            )
+        )
+
+        let encoded = AgentModelOption(
+            rawValue: "gpt-5.6-sol-high",
+            displayName: "GPT-5.6 Sol High",
+            description: nil,
+            isDefault: true,
+            supportedReasoningEfforts: [.low, .high],
+            defaultReasoningEffort: .high
+        )
+        let encodedGroup = try XCTUnwrap(AgentHandoffCodexEffortMenu.groups(
+            options: [encoded],
+            selectedModelRaw: encoded.rawValue,
+            selectedReasoningEffortRaw: CodexReasoningEffort.high.rawValue
+        ).first)
+        let encodedLeaf = try XCTUnwrap(encodedGroup.leaves.first)
+        XCTAssertEqual(encodedGroup.leaves.count, 1)
+        XCTAssertEqual(encodedLeaf.effort, .high)
+        XCTAssertEqual(encodedLeaf.title, "High (Default)")
+        XCTAssertTrue(encodedLeaf.isSelected)
+        XCTAssertFalse(AgentHandoffPopover.shouldShowReasoningEffortPicker(
+            agent: .codexExec,
+            modelRaw: encoded.rawValue,
+            option: encoded
+        ))
+        XCTAssertEqual(
+            AgentHandoffPopover.codexReasoningEffortRaw(
+                modelRaw: encoded.rawValue,
+                preferredReasoningEffortRaw: CodexReasoningEffort.low.rawValue,
+                option: encoded
+            ),
+            CodexReasoningEffort.high.rawValue
+        )
+        XCTAssertEqual(
+            AgentHandoffCodexEffortMenu.selection(for: encodedLeaf),
+            AgentHandoffSelection(
+                agent: .codexExec,
+                modelRaw: encoded.rawValue,
+                reasoningEffortRaw: CodexReasoningEffort.high.rawValue
+            )
+        )
+
+        let effortlessEncoded = AgentModelOption(
+            rawValue: "gpt-5.6-sol-high",
+            displayName: "GPT-5.6 Sol High",
+            description: nil,
+            isDefault: true
+        )
+        let effortlessLeaf = try XCTUnwrap(AgentHandoffCodexEffortMenu.groups(
+            options: [effortlessEncoded],
+            selectedModelRaw: effortlessEncoded.rawValue,
+            selectedReasoningEffortRaw: CodexReasoningEffort.high.rawValue
+        ).first?.leaves.first)
+        XCTAssertEqual(effortlessLeaf.effort, .high)
+        XCTAssertEqual(effortlessLeaf.title, "High (Default)")
+        XCTAssertTrue(effortlessLeaf.isSelected)
+
+        let placeholder = AgentModelOption(
+            rawValue: AgentModel.defaultModel.rawValue,
+            displayName: "Default",
+            description: nil,
+            isPlaceholderDefault: true,
+            isProviderDefault: true
+        )
+        let placeholderContent = AgentHandoffCodexEffortMenu.content(
+            options: [placeholder],
+            selectedModelRaw: placeholder.rawValue,
+            selectedReasoningEffortRaw: nil
+        )
+        XCTAssertEqual(placeholderContent.defaultLeaf?.title, "Default")
+        XCTAssertTrue(placeholderContent.defaultLeaf?.isSelected == true)
+        XCTAssertTrue(placeholderContent.groups.isEmpty)
+
+        let fast = AgentModelOption(
+            rawValue: "gpt-5.6-sol-fast-high",
+            displayName: "GPT-5.6 Sol Fast High",
+            description: nil,
+            isDefault: false
+        )
+        let fastGroup = try XCTUnwrap(AgentHandoffCodexEffortMenu.groups(
+            options: [fast],
+            selectedModelRaw: fast.rawValue,
+            selectedReasoningEffortRaw: CodexReasoningEffort.high.rawValue
+        ).first)
+        XCTAssertTrue(fastGroup.showsWarning)
+        XCTAssertTrue(fastGroup.leaves.allSatisfy(\.showsWarning))
+
+        let sharedMenu = AgentModelCatalog.codexMenu(for: [option])
+        XCTAssertNil(sharedMenu.defaultOption)
+        XCTAssertEqual(sharedMenu.groups.count, 1)
+        XCTAssertEqual(sharedMenu.groups.first?.options, [option])
+    }
+
+    func testMixedEncodedCodexPreferenceCommitsOnlyAfterSuccessfulHandoff() async throws {
+        let suiteName = "AgentHandoffUITests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let option = AgentModelOption(
+            rawValue: "gpt-5.6-sol-high",
+            displayName: "GPT-5.6 Sol High",
+            description: nil,
+            isDefault: true,
+            supportedReasoningEfforts: [.low, .high],
+            defaultReasoningEffort: .high
+        )
+        let leaf = try XCTUnwrap(AgentHandoffCodexEffortMenu.groups(
+            options: [option],
+            selectedModelRaw: option.rawValue,
+            selectedReasoningEffortRaw: CodexReasoningEffort.high.rawValue
+        ).first?.leaves.first)
+
+        CodexAgentToolPreferences.setLastUsedReasoningEffort(
+            .medium,
+            forModelRaw: option.rawValue,
+            defaults: defaults
+        )
+        let selection = AgentHandoffCodexEffortMenu.selection(for: leaf)
+        XCTAssertEqual(
+            CodexAgentToolPreferences.lastUsedReasoningEffort(
+                forModelRaw: option.rawValue,
+                defaults: defaults
+            ),
+            .medium,
+            "Provisional leaf selection must not mutate the last-used preference"
+        )
+
+        let contradictorySelection = AgentHandoffSelection(
+            agent: selection.agent,
+            modelRaw: selection.modelRaw,
+            reasoningEffortRaw: CodexReasoningEffort.low.rawValue
+        )
+        let destination = AgentHandoffDestination.local(contradictorySelection)
+        do {
+            try await AgentHandoffPopover.performCommittedHandoff(
+                destination,
+                defaults: defaults
+            ) { _ in
+                throw HandoffUITestError.extractionFailed
+            }
+            XCTFail("Expected the failed handoff to throw")
+        } catch HandoffUITestError.extractionFailed {}
+        XCTAssertEqual(
+            CodexAgentToolPreferences.lastUsedReasoningEffort(
+                forModelRaw: option.rawValue,
+                defaults: defaults
+            ),
+            .medium,
+            "A failed handoff must leave the provisional preference uncommitted"
+        )
+
+        var performedDestination: AgentHandoffDestination?
+        try await AgentHandoffPopover.performCommittedHandoff(
+            destination,
+            defaults: defaults
+        ) {
+            performedDestination = $0
+        }
+        XCTAssertEqual(
+            performedDestination,
+            .local(AgentHandoffSelection(
+                agent: .codexExec,
+                modelRaw: option.rawValue,
+                reasoningEffortRaw: CodexReasoningEffort.high.rawValue
+            ))
+        )
+        XCTAssertEqual(
+            CodexAgentToolPreferences.lastUsedReasoningEffort(
+                forModelRaw: option.rawValue,
+                defaults: defaults
+            ),
+            .high,
+            "A successful handoff commits the encoded effort"
+        )
+    }
+
+    func testAgentModelsSettingsRoutesBracketedCursorLabels() {
+        installCursorModel()
+        XCTAssertTrue(CursorModelParameterCatalog.shared.apply(response: cursorParameterResponse()))
+        let raw = AIModel.cursorCustom(
+            name: "gpt-5.6-sol[context=1m,thinking_mode=high,fast=false]"
+        ).rawValue
+
+        XCTAssertEqual(
+            AgentModelsSettingsViewModel.displayName(
+                forChatModelRaw: raw,
+                fallback: "Select a model"
+            ),
+            "GPT 5.6 Sol · High · 1M"
+        )
+    }
+
     private func structuredCatalogFixture() -> RemoteHostAgentCatalog {
         RemoteHostAgentCatalog(agents: [
             RemoteHostAgent(
@@ -111,6 +437,85 @@ final class AgentHandoffUITests: XCTestCase {
                 ]
             )
         ])
+    }
+
+    private func localCursorConfig(
+        defaultModelRaw: String,
+        options: [AgentModelOption]
+    ) -> AgentHandoffConfig {
+        AgentHandoffConfig(
+            itemID: UUID(),
+            destinationSource: .localProviders,
+            defaultDestinationAgent: .cursor,
+            defaultModelRaw: defaultModelRaw,
+            defaultReasoningEffortRaw: nil,
+            availableAgentsProvider: { [.cursor] },
+            modelOptionsProvider: { agent in
+                agent == .cursor ? options : []
+            },
+            remoteCatalogSnapshot: nil,
+            windowID: -1,
+            buildPayloadForClipboard: { "" },
+            performHandoff: { _ in }
+        )
+    }
+
+    private func installCursorModel() {
+        _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: "gpt-5.6-sol",
+                        displayName: "GPT 5.6 Sol",
+                        description: nil,
+                        isDefault: true
+                    )
+                ],
+                currentModelRaw: "gpt-5.6-sol"
+            ),
+            for: .cursor
+        )
+    }
+
+    private func cursorParameterResponse() -> [String: Any] {
+        [
+            "models": [[
+                "value": "gpt-5.6-sol",
+                "configOptions": [
+                    [
+                        "id": "context",
+                        "category": "context_window",
+                        "type": "select",
+                        "currentValue": "272k",
+                        "options": [
+                            ["value": "272k", "name": "272k"],
+                            ["value": "1m", "name": "1m"]
+                        ]
+                    ],
+                    [
+                        "id": "thinking_mode",
+                        "category": "thought_level",
+                        "type": "select",
+                        "currentValue": "low",
+                        "options": [
+                            ["value": "none", "name": "None"],
+                            ["value": "low", "name": "Low"],
+                            ["value": "high", "name": "High"]
+                        ]
+                    ],
+                    [
+                        "id": "fast",
+                        "category": "speed",
+                        "type": "select",
+                        "currentValue": "false",
+                        "options": [
+                            ["value": "false", "name": "Off"],
+                            ["value": "true", "name": "On"]
+                        ]
+                    ]
+                ]
+            ]]
+        ]
     }
 
     private func remoteConfig(

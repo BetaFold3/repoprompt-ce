@@ -1,6 +1,140 @@
 import AppKit
 import SwiftUI
 
+enum AgentHandoffCodexEffortMenu {
+    struct Leaf: Identifiable, Hashable {
+        let option: AgentModelOption
+        let effort: CodexReasoningEffort?
+        let title: String
+        let isDefault: Bool
+        let isSelected: Bool
+        let showsWarning: Bool
+
+        var id: String {
+            "\(option.rawValue):\(effort?.rawValue ?? "_model")"
+        }
+    }
+
+    struct Group: Identifiable, Hashable {
+        let id: String
+        let displayName: String
+        let leaves: [Leaf]
+        let showsWarning: Bool
+    }
+
+    struct Content: Hashable {
+        let defaultLeaf: Leaf?
+        let groups: [Group]
+    }
+
+    static func content(
+        options: [AgentModelOption],
+        selectedModelRaw: String,
+        selectedReasoningEffortRaw: String?
+    ) -> Content {
+        let menu = AgentModelCatalog.codexMenu(for: options)
+        let defaultLeaf = menu.defaultOption.map {
+            leaf(
+                option: $0,
+                effort: CodexModelSpecifier(raw: $0.rawValue).reasoningEffort,
+                isDefault: true,
+                selectedModelRaw: selectedModelRaw,
+                selectedReasoningEffortRaw: selectedReasoningEffortRaw
+            )
+        }
+        let groups = menu.groups.map { group in
+            let leaves = group.options.flatMap { option -> [Leaf] in
+                let encodedEffort = CodexModelSpecifier(raw: option.rawValue).reasoningEffort
+                guard encodedEffort == nil, !option.supportedReasoningEfforts.isEmpty else {
+                    return [leaf(
+                        option: option,
+                        effort: encodedEffort,
+                        isDefault: option.isProviderDefault
+                            || (encodedEffort != nil && option.defaultReasoningEffort == encodedEffort),
+                        selectedModelRaw: selectedModelRaw,
+                        selectedReasoningEffortRaw: selectedReasoningEffortRaw
+                    )]
+                }
+                return option.supportedReasoningEfforts.map { effort in
+                    leaf(
+                        option: option,
+                        effort: effort,
+                        isDefault: option.defaultReasoningEffort == effort,
+                        selectedModelRaw: selectedModelRaw,
+                        selectedReasoningEffortRaw: selectedReasoningEffortRaw
+                    )
+                }
+            }
+            return Group(
+                id: group.id,
+                displayName: group.displayName,
+                leaves: leaves,
+                showsWarning: AgentModelSelectionWarningVisuals.codexGroupShowsWarning(group)
+            )
+        }
+        return Content(defaultLeaf: defaultLeaf, groups: groups)
+    }
+
+    static func groups(
+        options: [AgentModelOption],
+        selectedModelRaw: String,
+        selectedReasoningEffortRaw: String?
+    ) -> [Group] {
+        content(
+            options: options,
+            selectedModelRaw: selectedModelRaw,
+            selectedReasoningEffortRaw: selectedReasoningEffortRaw
+        ).groups
+    }
+
+    static func selection(for leaf: Leaf) -> AgentHandoffSelection {
+        AgentHandoffSelection(
+            agent: .codexExec,
+            modelRaw: leaf.option.rawValue,
+            reasoningEffortRaw: leaf.effort?.rawValue
+        )
+    }
+
+    private static func leaf(
+        option: AgentModelOption,
+        effort: CodexReasoningEffort?,
+        isDefault: Bool,
+        selectedModelRaw: String,
+        selectedReasoningEffortRaw: String?
+    ) -> Leaf {
+        let encodedEffort = CodexModelSpecifier(raw: option.rawValue).reasoningEffort
+        let selectedEffort = CodexReasoningEffort.parse(selectedReasoningEffortRaw)
+        let effortMatches = if let encodedEffort {
+            encodedEffort == selectedEffort && (effort == nil || effort == encodedEffort)
+        } else if let effort {
+            effort == selectedEffort
+        } else {
+            true
+        }
+        let modelMatches = AgentModelCatalog.modelOptionIsSelected(
+            optionRaw: option.rawValue,
+            selectedRaw: selectedModelRaw,
+            agentKind: .codexExec
+        )
+        let title = if let effort {
+            isDefault ? "\(effort.displayName) (Default)" : effort.displayName
+        } else {
+            option.displayName
+        }
+        return Leaf(
+            option: option,
+            effort: effort,
+            title: title,
+            isDefault: isDefault,
+            isSelected: modelMatches && effortMatches,
+            showsWarning: AgentModelSelectionWarningVisuals.showsWarning(
+                agent: .codexExec,
+                rawModel: option.rawValue
+            )
+        )
+    }
+}
+
 /// Popover content for agent handoff configuration.
 /// Lets the user pick destination agent/model, copy the handoff payload, or execute handoff.
 struct AgentHandoffPopover: View {
@@ -53,7 +187,7 @@ struct AgentHandoffPopover: View {
     }
 
     private var selectedModelOption: AgentModelOption? {
-        Self.option(matching: selectedModelRaw, in: allCurrentOptions)
+        Self.option(matching: selectedModelRaw, for: selectedAgent, in: allCurrentOptions)
     }
 
     private var reasoningEffortOptions: [CodexReasoningEffort] {
@@ -61,7 +195,21 @@ struct AgentHandoffPopover: View {
     }
 
     private var showReasoningEffort: Bool {
-        selectedAgent == .codexExec && !reasoningEffortOptions.isEmpty
+        Self.shouldShowReasoningEffortPicker(
+            agent: selectedAgent,
+            modelRaw: selectedModelRaw,
+            option: selectedModelOption
+        )
+    }
+
+    static func shouldShowReasoningEffortPicker(
+        agent: AgentProviderKind,
+        modelRaw: String,
+        option: AgentModelOption?
+    ) -> Bool {
+        agent == .codexExec
+            && CodexModelSpecifier(raw: modelRaw).reasoningEffort == nil
+            && !(option?.supportedReasoningEfforts.isEmpty ?? true)
     }
 
     private var chipColor: Color {
@@ -69,7 +217,27 @@ struct AgentHandoffPopover: View {
     }
 
     private var selectedModelDisplayName: String {
-        selectedModelOption?.displayName ?? selectedModelRaw
+        Self.selectedModelDisplayName(
+            agent: selectedAgent,
+            modelRaw: selectedModelRaw,
+            option: selectedModelOption
+        )
+    }
+
+    static func selectedModelDisplayName(
+        agent: AgentProviderKind,
+        modelRaw: String,
+        option: AgentModelOption?
+    ) -> String {
+        guard agent == .cursor else {
+            return option?.displayName ?? modelRaw
+        }
+        return AgentModelCatalog.displayName(
+            for: modelRaw,
+            agentKind: agent,
+            availability: .init(cursorAvailable: true),
+            includeCursorParameterSuffix: true
+        )
     }
 
     private var canCopyPayload: Bool {
@@ -88,11 +256,11 @@ struct AgentHandoffPopover: View {
             return remoteDestinationState.destination
         }
         guard canPerformHandoff else { return nil }
-        return .local(AgentHandoffSelection(
+        return .local(Self.canonicalizedSelection(AgentHandoffSelection(
             agent: selectedAgent,
             modelRaw: selectedModelRaw,
             reasoningEffortRaw: showReasoningEffort ? selectedReasoningEffortRaw : nil
-        ))
+        )))
     }
 
     private var providerChipTitle: String {
@@ -102,7 +270,7 @@ struct AgentHandoffPopover: View {
         return "\(selectedAgent.displayName) \u{00B7} \(selectedModelDisplayName)"
     }
 
-    private var isSelectedCodexFastModel: Bool {
+    private var selectedModelShowsFastWarning: Bool {
         AgentModelSelectionWarningVisuals.showsWarning(agent: selectedAgent, rawModel: selectedModelRaw)
     }
 
@@ -194,7 +362,10 @@ struct AgentHandoffPopover: View {
                         isLoading = true
                         errorMessage = nil
                         do {
-                            try await config.performHandoff(destination)
+                            try await Self.performCommittedHandoff(
+                                destination,
+                                perform: config.performHandoff
+                            )
                             dismiss()
                         } catch {
                             errorMessage = Self.errorMessage(for: .handoff, error: error)
@@ -263,7 +434,7 @@ struct AgentHandoffPopover: View {
                     HStack(spacing: 4) {
                         Image(systemName: selectedAgent.iconName)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                        if isSelectedCodexFastModel {
+                        if selectedModelShowsFastWarning {
                             Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
                                 .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
@@ -276,7 +447,7 @@ struct AgentHandoffPopover: View {
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .semibold))
                             .foregroundColor(.secondary)
                     }
-                    .foregroundColor(isSelectedCodexFastModel ? .orange : .secondary)
+                    .foregroundColor(selectedModelShowsFastWarning ? .orange : .secondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                     .background(chipColor)
@@ -440,6 +611,27 @@ struct AgentHandoffPopover: View {
         if options.isEmpty {
             Button("No models available") {}
                 .disabled(true)
+        } else if agent == .codexExec {
+            let content = AgentHandoffCodexEffortMenu.content(
+                options: options,
+                selectedModelRaw: selectedAgent == agent ? selectedModelRaw : "",
+                selectedReasoningEffortRaw: selectedAgent == agent ? selectedReasoningEffortRaw : nil
+            )
+            if let defaultLeaf = content.defaultLeaf {
+                handoffCodexLeafButton(defaultLeaf)
+            }
+            ForEach(content.groups) { group in
+                Menu {
+                    ForEach(group.leaves) { leaf in
+                        handoffCodexLeafButton(leaf)
+                    }
+                } label: {
+                    handoffCodexWarningLabel(
+                        title: group.displayName,
+                        showsWarning: group.showsWarning
+                    )
+                }
+            }
         } else {
             AgentModelOptionsMenuContent(
                 agentKind: agent,
@@ -450,6 +642,38 @@ struct AgentHandoffPopover: View {
                 selectHandoffModel(model, for: agent)
             }
         }
+    }
+
+    private func handoffCodexLeafButton(_ leaf: AgentHandoffCodexEffortMenu.Leaf) -> some View {
+        Button {
+            selectHandoffCodexLeaf(leaf)
+        } label: {
+            HStack {
+                handoffCodexWarningLabel(title: leaf.title, showsWarning: leaf.showsWarning)
+                if leaf.isSelected {
+                    Spacer()
+                    Image(systemName: "checkmark")
+                }
+            }
+        }
+    }
+
+    private func handoffCodexWarningLabel(title: String, showsWarning: Bool) -> some View {
+        HStack(spacing: 4) {
+            if showsWarning {
+                Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+                    .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+            }
+            Text(title)
+                .foregroundStyle(showsWarning ? AgentModelSelectionWarningVisuals.warningColor : .primary)
+        }
+    }
+
+    private func selectHandoffCodexLeaf(_ leaf: AgentHandoffCodexEffortMenu.Leaf) {
+        let selection = AgentHandoffCodexEffortMenu.selection(for: leaf)
+        selectedAgent = selection.agent
+        selectedModelRaw = selection.modelRaw
+        selectedReasoningEffortRaw = selection.reasoningEffortRaw
     }
 
     private func selectHandoffModel(_ model: AgentModelOption, for agent: AgentProviderKind) {
@@ -473,17 +697,23 @@ struct AgentHandoffPopover: View {
 
         let options = config.modelOptionsProvider(agent)
         guard !options.isEmpty else { return }
-        guard Self.option(matching: selectedModelRaw, in: options) == nil else { return }
 
         let fallbackModelRaw = Self.initialModelRaw(
             for: agent,
             preferredModelRaw: agent == config.defaultDestinationAgent ? config.defaultModelRaw : nil,
             config: config
         )
-        selectedModelRaw = fallbackModelRaw
+        let reconciledModelRaw = Self.reconciledModelRaw(
+            selectedModelRaw,
+            for: agent,
+            in: options,
+            fallbackModelRaw: fallbackModelRaw
+        )
+        guard reconciledModelRaw != selectedModelRaw else { return }
+        selectedModelRaw = reconciledModelRaw
         selectedReasoningEffortRaw = Self.initialReasoningEffortRaw(
             for: agent,
-            modelRaw: fallbackModelRaw,
+            modelRaw: reconciledModelRaw,
             preferredReasoningEffortRaw: agent == config.defaultDestinationAgent ? config.defaultReasoningEffortRaw : nil,
             config: config
         )
@@ -508,6 +738,51 @@ struct AgentHandoffPopover: View {
         }
     }
 
+    @MainActor
+    static func performCommittedHandoff(
+        _ destination: AgentHandoffDestination,
+        defaults: UserDefaults = .standard,
+        perform: @MainActor (AgentHandoffDestination) async throws -> Void
+    ) async throws {
+        let canonicalDestination = canonicalizedDestination(destination)
+        try await perform(canonicalDestination)
+        guard case let .local(selection) = canonicalDestination,
+              selection.agent == .codexExec
+        else {
+            return
+        }
+
+        if let effort = CodexReasoningEffort.parse(selection.reasoningEffortRaw) {
+            CodexAgentToolPreferences.setLastUsedReasoningEffort(
+                effort,
+                forModelRaw: selection.modelRaw,
+                defaults: defaults
+            )
+        }
+    }
+
+    private static func canonicalizedDestination(
+        _ destination: AgentHandoffDestination
+    ) -> AgentHandoffDestination {
+        guard case let .local(selection) = destination else { return destination }
+        return .local(canonicalizedSelection(selection))
+    }
+
+    private static func canonicalizedSelection(
+        _ selection: AgentHandoffSelection
+    ) -> AgentHandoffSelection {
+        guard selection.agent == .codexExec,
+              let encodedEffort = CodexModelSpecifier(raw: selection.modelRaw).reasoningEffort
+        else {
+            return selection
+        }
+        return AgentHandoffSelection(
+            agent: selection.agent,
+            modelRaw: selection.modelRaw,
+            reasoningEffortRaw: encodedEffort.rawValue
+        )
+    }
+
     static func errorMessage(for action: Action, error: Error) -> String {
         if let remoteError = error as? RemoteClientError,
            case let .inDoubt(commandError) = remoteError
@@ -526,7 +801,7 @@ struct AgentHandoffPopover: View {
         return "\(prefix): \(error.localizedDescription)"
     }
 
-    private static func initialSelection(for config: AgentHandoffConfig) -> AgentHandoffSelection {
+    static func initialSelection(for config: AgentHandoffConfig) -> AgentHandoffSelection {
         let agents = config.availableAgentsProvider()
         let agent = agents.contains(config.defaultDestinationAgent)
             ? config.defaultDestinationAgent
@@ -545,16 +820,16 @@ struct AgentHandoffPopover: View {
         return AgentHandoffSelection(agent: agent, modelRaw: modelRaw, reasoningEffortRaw: reasoningEffortRaw)
     }
 
-    private static func initialModelRaw(
+    static func initialModelRaw(
         for agent: AgentProviderKind,
         preferredModelRaw: String?,
         config: AgentHandoffConfig
     ) -> String {
         let options = config.modelOptionsProvider(agent)
         if let preferredModelRaw,
-           let option = option(matching: preferredModelRaw, in: options)
+           let option = option(matching: preferredModelRaw, for: agent, in: options)
         {
-            return option.rawValue
+            return agent == .cursor ? preferredModelRaw : option.rawValue
         }
         return visibleModelOptions(options).first?.rawValue
             ?? options.first?.rawValue
@@ -569,7 +844,7 @@ struct AgentHandoffPopover: View {
         config: AgentHandoffConfig
     ) -> String? {
         guard agent == .codexExec else { return nil }
-        let option = option(matching: modelRaw, in: config.modelOptionsProvider(agent))
+        let option = option(matching: modelRaw, for: agent, in: config.modelOptionsProvider(agent))
         return codexReasoningEffortRaw(
             modelRaw: modelRaw,
             preferredReasoningEffortRaw: preferredReasoningEffortRaw,
@@ -577,11 +852,14 @@ struct AgentHandoffPopover: View {
         )
     }
 
-    private static func codexReasoningEffortRaw(
+    static func codexReasoningEffortRaw(
         modelRaw: String,
         preferredReasoningEffortRaw: String?,
         option: AgentModelOption?
     ) -> String {
+        if let encodedEffort = CodexModelSpecifier(raw: modelRaw).reasoningEffort {
+            return encodedEffort.rawValue
+        }
         let supportedEfforts = option?.supportedReasoningEfforts ?? []
         func acceptedRaw(_ effort: CodexReasoningEffort?) -> String? {
             guard let effort else { return nil }
@@ -602,7 +880,44 @@ struct AgentHandoffPopover: View {
         return filtered.isEmpty ? options : filtered
     }
 
-    private static func option(matching rawValue: String, in options: [AgentModelOption]) -> AgentModelOption? {
-        options.first { $0.rawValue.caseInsensitiveCompare(rawValue) == .orderedSame }
+    static func reconciledModelRaw(
+        _ currentRaw: String,
+        for agent: AgentProviderKind,
+        in options: [AgentModelOption],
+        fallbackModelRaw: String
+    ) -> String {
+        option(matching: currentRaw, for: agent, in: options) == nil
+            ? fallbackModelRaw
+            : currentRaw
+    }
+
+    static func option(
+        matching rawValue: String,
+        for agent: AgentProviderKind,
+        in options: [AgentModelOption]
+    ) -> AgentModelOption? {
+        guard agent == .cursor else {
+            return options.first {
+                $0.rawValue.caseInsensitiveCompare(rawValue) == .orderedSame
+            }
+        }
+        if let exact = options.first(where: { $0.rawValue == rawValue }) {
+            return exact
+        }
+        guard let selection = CursorBracketModelID.parse(
+            CursorBracketModelID.strippingCursorPrefix(rawValue)
+        )
+        else {
+            return nil
+        }
+        let normalizedBase = CursorModelRegistryGate.normalizedAlias(selection.base)
+        return options.first { option in
+            guard let parsedOption = CursorBracketModelID.parse(
+                CursorBracketModelID.strippingCursorPrefix(option.rawValue)
+            ) else {
+                return false
+            }
+            return CursorModelRegistryGate.normalizedAlias(parsedOption.base) == normalizedBase
+        }
     }
 }

@@ -83,7 +83,7 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
         return mode
     }
 
-    private static func selectedModelToApply(config: CursorAgentConfig) -> String? {
+    static func selectedModelToApply(config: CursorAgentConfig) -> String? {
         guard let model = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
@@ -93,9 +93,18 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
         if model.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) == .orderedSame {
             return model
         }
-        guard AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.contains(rawModel: model) == true else {
+        if let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
+           !registryAllowsSelectedModel(model, snapshot: snapshot)
+        {
             return nil
         }
         return model
+    }
+
+    static func registryAllowsSelectedModel(
+        _ model: String,
+        snapshot: ACPDiscoveredSessionModels?
+    ) -> Bool {
+        CursorModelRegistryGate.allows(model, in: snapshot)
     }
 }

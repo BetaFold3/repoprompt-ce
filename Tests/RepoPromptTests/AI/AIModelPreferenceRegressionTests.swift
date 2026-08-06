@@ -38,6 +38,191 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
         XCTAssertEqual(displayName, availableModels[0].displayName)
     }
 
+    func testEmptyCursorCustomDisplayNameFallsBackToCursorDefault() {
+        XCTAssertEqual(AIModel.cursorCustom(name: "").displayName, "Auto")
+    }
+
+    @MainActor
+    func testOptimizedPickerStableMenuTreeRoutesProviderSelections() throws {
+        let cursorSnapshot = CursorModelParameterCatalog.shared.currentSnapshot()
+        defer { CursorModelParameterCatalog.shared.test_restoreSnapshot(cursorSnapshot) }
+        XCTAssertTrue(CursorModelParameterCatalog.shared.apply(response: optimizedPickerCursorParameterResponse()))
+
+        let codexLow = AIModel.codexCustom(name: "gpt-5.6-sol-low")
+        let codexHigh = AIModel.codexCustom(name: "gpt-5.6-sol-high")
+        let compatibleClaude = AIModel.claudeCodeModel(specifier: "compatible:glmzai:glm-4.7")
+        let openCode = AIModel.openCodeCustom(name: "openai/gpt-oss")
+        let cursor = AIModel.cursorCustom(name: "gpt-5.6-sol")
+        let flat = AIModel.geminiCustom(name: "gemini-test")
+        let models = [codexLow, codexHigh, compatibleClaude, openCode, cursor, flat]
+
+        let codexGroup = try XCTUnwrap(OptimizedModelPicker.codexMenuGroups(for: [codexLow, codexHigh]).first)
+        XCTAssertEqual(codexGroup.baseModelID, "gpt-5.6-sol")
+        XCTAssertEqual(codexGroup.models.map(\.modelName), ["gpt-5.6-sol-low", "gpt-5.6-sol-high"])
+        let compatibleDescriptor = try XCTUnwrap(
+            ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: compatibleClaude)
+        )
+        let openCodeMenu = AIModel.openCodeMenu(for: [openCode])
+        let openCodeProvider = try XCTUnwrap(openCodeMenu.providerGroups.first)
+        let openCodeGroup = try XCTUnwrap(openCodeProvider.groups.first)
+        let openCodeOption = try XCTUnwrap(openCodeGroup.options.first)
+
+        var openCodePath = [AIProviderType.displayName(for: .openCode)]
+        if openCodeProvider.rendersAsSubmenu {
+            openCodePath.append(openCodeProvider.displayName)
+        }
+        if openCodeGroup.rendersAsSubmenu {
+            openCodePath.append(openCodeGroup.modelDisplayName)
+        }
+        openCodePath.append(openCodeOption.displayName)
+
+        let structureTree = OptimizedModelPicker.stableMenuItemsForTesting(
+            availableModels: models,
+            selectedRawValue: compatibleClaude.rawValue,
+            onSelect: { _ in }
+        )
+        let compatibleTop = try stableMenuItem(
+            at: [compatibleDescriptor.groupDisplayName],
+            in: structureTree
+        )
+        let compatibleLeafTitle = try XCTUnwrap(compatibleTop.submenuItems?.first?.title)
+        let cursorTop = try stableMenuItem(
+            at: [AIProviderType.displayName(for: .cursor)],
+            in: structureTree
+        )
+        let cursorModelTitle = try XCTUnwrap(cursorTop.submenuItems?.first?.title)
+        let cursorModelItem = try stableMenuItem(
+            at: [AIProviderType.displayName(for: .cursor), cursorModelTitle],
+            in: structureTree
+        )
+        let cursorDefaultTitle = try XCTUnwrap(cursorModelItem.submenuItems?.first?.title)
+        let codexTop = try stableMenuItem(
+            at: [AIProviderType.displayName(for: .codex)],
+            in: structureTree
+        )
+        let codexGroupTitle = try XCTUnwrap(codexTop.submenuItems?.first?.title)
+        let codexGroupItem = try stableMenuItem(
+            at: [AIProviderType.displayName(for: .codex), codexGroupTitle],
+            in: structureTree
+        )
+        let codexLeafItems = try XCTUnwrap(codexGroupItem.submenuItems)
+        XCTAssertEqual(codexLeafItems.count, 2)
+        let codexHighTitle = codexLeafItems[1].title
+
+        let scenarios: [(name: String, model: AIModel, path: [String])] = [
+            (
+                "Codex grouped effort",
+                codexHigh,
+                [AIProviderType.displayName(for: .codex), codexGroupTitle, codexHighTitle]
+            ),
+            (
+                "Claude-compatible provider",
+                compatibleClaude,
+                [compatibleDescriptor.groupDisplayName, compatibleLeafTitle]
+            ),
+            ("OpenCode grouping", openCode, openCodePath),
+            (
+                "Cursor preset submenu",
+                cursor,
+                [AIProviderType.displayName(for: .cursor), cursorModelTitle, cursorDefaultTitle]
+            ),
+            (
+                "ordinary flat provider",
+                flat,
+                [AIProviderType.displayName(for: .gemini), flat.displayName]
+            )
+        ]
+
+        for scenario in scenarios {
+            try XCTContext.runActivity(named: scenario.name) { _ in
+                var emittedRaw: String?
+                let tree = OptimizedModelPicker.stableMenuItemsForTesting(
+                    availableModels: models,
+                    selectedRawValue: scenario.model.rawValue,
+                    onSelect: { emittedRaw = $0 }
+                )
+                let leaf = try stableMenuItem(at: scenario.path, in: tree, context: scenario.name)
+                XCTAssertTrue(leaf.isSelected, scenario.path.joined(separator: " > "))
+                XCTAssertTrue(leaf.performActionForTesting())
+                XCTAssertEqual(emittedRaw, scenario.model.rawValue)
+            }
+        }
+
+        let codexTree = OptimizedModelPicker.stableMenuItemsForTesting(
+            availableModels: models,
+            selectedRawValue: codexHigh.rawValue,
+            onSelect: { _ in }
+        )
+        let codexItems = try stableMenuItem(
+            at: [AIProviderType.displayName(for: .codex), codexGroupTitle],
+            in: codexTree
+        ).submenuItems
+        XCTAssertEqual(codexItems?.count, 2)
+        XCTAssertEqual(codexItems?.map(\.isSelected), [false, true])
+        var emittedLowRaw: String?
+        let lowTree = OptimizedModelPicker.stableMenuItemsForTesting(
+            availableModels: models,
+            selectedRawValue: codexHigh.rawValue,
+            onSelect: { emittedLowRaw = $0 }
+        )
+        let lowGroup = try stableMenuItem(
+            at: [AIProviderType.displayName(for: .codex), codexGroupTitle],
+            in: lowTree
+        )
+        let lowLeaf = try XCTUnwrap(lowGroup.submenuItems?.first)
+        XCTAssertTrue(lowLeaf.performActionForTesting())
+        XCTAssertEqual(emittedLowRaw, codexLow.rawValue)
+    }
+
+    private func stableMenuItem(
+        at path: [String],
+        in items: [StableMenuItem],
+        context: String = ""
+    ) throws -> StableMenuItem {
+        var currentItems = items
+        var currentItem: StableMenuItem?
+        for title in path {
+            currentItem = currentItems.first { $0.title == title }
+            let item = try XCTUnwrap(
+                currentItem,
+                "\(context) missing menu path component: \(title); available: \(currentItems.map(\.title))"
+            )
+            currentItems = item.submenuItems ?? []
+        }
+        return try XCTUnwrap(currentItem)
+    }
+
+    private func optimizedPickerCursorParameterResponse() -> [String: Any] {
+        [
+            "models": [[
+                "value": "gpt-5.6-sol",
+                "configOptions": [
+                    [
+                        "id": "thinking_mode",
+                        "category": "thought_level",
+                        "type": "select",
+                        "currentValue": "low",
+                        "options": [
+                            ["value": "none", "name": "None"],
+                            ["value": "low", "name": "Low"],
+                            ["value": "high", "name": "High"]
+                        ]
+                    ],
+                    [
+                        "id": "fast",
+                        "category": "speed",
+                        "type": "select",
+                        "currentValue": "false",
+                        "options": [
+                            ["value": "false", "name": "Off"],
+                            ["value": "true", "name": "On"]
+                        ]
+                    ]
+                ]
+            ]]
+        ]
+    }
+
     @MainActor
     func testSettingsSyncClearsStaleModelRawWhenPersistedValueIsEmptyOrMissing() {
         XCTAssertEqual(

@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 8,
+  "error": {
+    "code": -32602,
+    "message": "Invalid params",
+    "data": {
+      "message": "Invalid value for reasoning: bogus"
+    }
+  }
+}

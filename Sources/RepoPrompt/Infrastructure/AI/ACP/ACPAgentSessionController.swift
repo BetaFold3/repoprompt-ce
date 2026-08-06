@@ -4,6 +4,15 @@ import Foundation
 actor ACPAgentSessionController {
     struct RequestTimeouts {
         let bootstrapSeconds: TimeInterval
+        let setConfigOptionSeconds: TimeInterval
+
+        init(
+            bootstrapSeconds: TimeInterval,
+            setConfigOptionSeconds: TimeInterval? = nil
+        ) {
+            self.bootstrapSeconds = bootstrapSeconds
+            self.setConfigOptionSeconds = setConfigOptionSeconds ?? bootstrapSeconds
+        }
 
         static let `default` = RequestTimeouts(
             bootstrapSeconds: 30
@@ -136,9 +145,23 @@ actor ACPAgentSessionController {
         let inboundSequence: UInt64
     }
 
+    private enum PendingRequestContinuation {
+        case object(CheckedContinuation<RequestResponse, Error>)
+        case raw(CheckedContinuation<Any, Error>)
+
+        func resume(throwing error: Error) {
+            switch self {
+            case let .object(continuation):
+                continuation.resume(throwing: error)
+            case let .raw(continuation):
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
     private struct PendingRequest {
         let method: String
-        let continuation: CheckedContinuation<RequestResponse, Error>
+        let continuation: PendingRequestContinuation
         var timeoutTask: Task<Void, Never>?
     }
 
@@ -170,6 +193,12 @@ actor ACPAgentSessionController {
         case absent
         case valid(configID: String, models: ACPDiscoveredSessionModels)
         case malformed(String)
+    }
+
+    private struct CursorParameterRollback {
+        let configID: String
+        let previousValue: String
+        let requestedValue: String
     }
 
     private struct BufferedConfigOptionUpdate {
@@ -212,6 +241,10 @@ actor ACPAgentSessionController {
 
     func currentEventsStream() -> AsyncStream<NormalizedAgentRuntimeEvent> {
         eventsStream
+    }
+
+    func currentDiscoveredSessionModels() -> ACPDiscoveredSessionModels? {
+        discoveredSessionModels
     }
 
     private let provider: any ACPAgentProvider
@@ -272,6 +305,7 @@ actor ACPAgentSessionController {
     private var sessionModelFailureReason: String?
     private var sessionModeSnapshot: SessionModeSnapshot?
     private var sessionModeFailureReason: String?
+    private var cursorParameterSelectors: [String: (currentValue: String, values: [String])] = [:]
     private var lastAppliedConfigurationSequence: UInt64 = 0
     private var bufferedConfigOptionUpdates: [BufferedConfigOptionUpdate] = []
     private var suppressSessionLoadReplayUpdates = false
@@ -452,6 +486,17 @@ actor ACPAgentSessionController {
 
         log("ACP initialize")
         diagnose(.phaseStarted("initialize"))
+        var clientCapabilities: [String: Any] = [
+            "fs": [
+                "readTextFile": false,
+                "writeTextFile": false
+            ],
+            "terminal": false
+        ]
+        let capabilityMetadata = provider.initializeClientCapabilityMetadata
+        if !capabilityMetadata.isEmpty {
+            clientCapabilities["_meta"] = capabilityMetadata
+        }
         let initializeResponse = try await sendRequest(
             method: "initialize",
             params: [
@@ -460,13 +505,7 @@ actor ACPAgentSessionController {
                     "name": "RepoPrompt",
                     "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
                 ],
-                "clientCapabilities": [
-                    "fs": [
-                        "readTextFile": false,
-                        "writeTextFile": false
-                    ],
-                    "terminal": false
-                ]
+                "clientCapabilities": clientCapabilities
             ]
         )
         diagnose(.phaseCompleted("initialize"))
@@ -655,15 +694,9 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
-            }
-            if provider.providerID == .cursor,
-               normalizedCursorModelAlias(model) == AgentModel.cursorAuto.rawValue,
-               sessionModelConfigOptionID == nil
-            {
-                return
             }
             guard let sessionModelConfigOptionID else {
                 throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
@@ -691,6 +724,230 @@ actor ACPAgentSessionController {
                 requiredModeValue: nil,
                 requiredModelValue: configValue
             )
+
+        case .cursor:
+            if let sessionModelFailureReason {
+                throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+            }
+            if normalizedCursorModelAlias(model) == AgentModel.cursorAuto.rawValue,
+               sessionModelConfigOptionID == nil
+            {
+                return
+            }
+            guard let sessionModelConfigOptionID else {
+                throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
+            }
+            try await setCursorSessionModelSerialized(
+                model,
+                sessionID: sessionID,
+                modelConfigID: sessionModelConfigOptionID
+            )
+        }
+    }
+
+    private func setCursorSessionModelSerialized(
+        _ model: String,
+        sessionID: String,
+        modelConfigID: String
+    ) async throws {
+        let availableValues = discoveredSessionModels?.options.map(\.rawValue) ?? []
+        guard !availableValues.isEmpty else {
+            throw ControllerError.protocolViolation("modern model selector has no advertised values")
+        }
+
+        if let advertisedValue = canonicalAdvertisedValue(model, in: availableValues) {
+            try await applyCursorModelValueIfNeeded(
+                advertisedValue,
+                sessionID: sessionID,
+                modelConfigID: modelConfigID
+            )
+            if CursorBracketModelID.parse(model)?.hasBracket == false {
+                surfaceCursorEffectiveParametersForBareSelection()
+            }
+            return
+        }
+
+        guard let parsed = CursorBracketModelID.parse(model) else {
+            throw ControllerError.requestFailed("Malformed Cursor model selection '\(model)'.")
+        }
+
+        guard parsed.hasBracket else {
+            guard let mappedConfigValue = sessionModelConfigValue(forSelectedModel: parsed.base) else {
+                throw ControllerError.requestFailed("ACP runtime does not advertise a safe config value for selected model '\(model)'.")
+            }
+            let configValue = try canonicalSessionModelValue(mappedConfigValue)
+            if configValue != model {
+                log("Mapping selected model \(model) to ACP config value \(configValue)")
+            }
+            try await applyCursorModelValueIfNeeded(
+                configValue,
+                sessionID: sessionID,
+                modelConfigID: modelConfigID
+            )
+            surfaceCursorEffectiveParametersForBareSelection()
+            return
+        }
+
+        guard let mappedBaseValue = sessionModelConfigValue(forSelectedModel: parsed.base) else {
+            throw ControllerError.requestFailed("ACP runtime does not advertise a safe config value for selected Cursor model base '\(parsed.base)'.")
+        }
+        let cleanModelValue = try canonicalSessionModelValue(mappedBaseValue)
+        if CursorBracketModelID.parse(cleanModelValue)?.hasBracket == true {
+            throw ControllerError.requestFailed("This cursor-agent version does not support parameter selection; only its advertised default model configurations can be used.")
+        }
+        if cleanModelValue != parsed.base {
+            log("Mapping selected Cursor model base \(parsed.base) to ACP config value \(cleanModelValue)")
+        }
+
+        let previousModelValue = discoveredSessionModels?.currentModelRaw
+        let shouldRestoreModel = previousModelValue != nil && previousModelValue != cleanModelValue
+        try await applyCursorModelValueIfNeeded(
+            cleanModelValue,
+            sessionID: sessionID,
+            modelConfigID: modelConfigID
+        )
+
+        var rollbacks: [CursorParameterRollback] = []
+        do {
+            let orderedParameters = parsed.params.filter { $0.key.lowercased() != "fast" }
+                + parsed.params.filter { $0.key.lowercased() == "fast" }
+            for parameter in orderedParameters {
+                guard let selector = cursorParameterSelectors[parameter.key] else {
+                    throw ControllerError.requestFailed("Cursor model '\(cleanModelValue)' does not advertise parameter selector '\(parameter.key)'.")
+                }
+                guard selector.values.contains(parameter.value) else {
+                    throw ControllerError.requestFailed("Invalid value '\(parameter.value)' for Cursor parameter '\(parameter.key)'. Valid values: \(selector.values.joined(separator: ", ")).")
+                }
+            }
+
+            for parameter in orderedParameters {
+                guard let selector = cursorParameterSelectors[parameter.key] else {
+                    throw ControllerError.protocolViolation("Cursor parameter selector '\(parameter.key)' disappeared during model configuration")
+                }
+                if selector.currentValue == parameter.value {
+                    continue
+                }
+                let rollback = CursorParameterRollback(
+                    configID: parameter.key,
+                    previousValue: selector.currentValue,
+                    requestedValue: parameter.value
+                )
+                rollbacks.append(rollback)
+                do {
+                    let response = try await sendRequestResponse(
+                        method: "session/set_config_option",
+                        params: [
+                            "sessionId": sessionID,
+                            "configId": parameter.key,
+                            "value": parameter.value
+                        ]
+                    )
+                    try await applyVerifiedConfigOptionsMutationResponse(
+                        response,
+                        requiredModeValue: nil,
+                        requiredModelValue: nil,
+                        requiredSelectValue: (configID: parameter.key, value: parameter.value)
+                    )
+                } catch let controllerError as ControllerError {
+                    if case .requestFailed = controllerError {
+                        rollbacks.removeLast()
+                    }
+                    throw controllerError
+                }
+            }
+
+            guard discoveredSessionModels?.currentModelRaw == cleanModelValue else {
+                throw ControllerError.protocolViolation("final Cursor configuration no longer confirms requested model '\(cleanModelValue)'")
+            }
+            for parameter in orderedParameters {
+                guard cursorParameterSelectors[parameter.key]?.currentValue == parameter.value else {
+                    throw ControllerError.protocolViolation("final Cursor configuration does not confirm requested value '\(parameter.value)' for selector '\(parameter.key)'")
+                }
+            }
+        } catch {
+            let originalError = error
+            var rollbackFailures: [String] = []
+            for rollback in rollbacks.reversed() {
+                do {
+                    let response = try await sendRequestResponse(
+                        method: "session/set_config_option",
+                        params: [
+                            "sessionId": sessionID,
+                            "configId": rollback.configID,
+                            "value": rollback.previousValue
+                        ]
+                    )
+                    try await applyVerifiedConfigOptionsMutationResponse(
+                        response,
+                        requiredModeValue: nil,
+                        requiredModelValue: nil,
+                        requiredSelectValue: (configID: rollback.configID, value: rollback.previousValue)
+                    )
+                } catch {
+                    rollbackFailures.append(
+                        "\(rollback.configID)=\(rollback.requestedValue) (restore to \(rollback.previousValue) failed: \(error.localizedDescription))"
+                    )
+                }
+            }
+            if shouldRestoreModel, let previousModelValue {
+                do {
+                    try await applyCursorModelValueIfNeeded(
+                        previousModelValue,
+                        sessionID: sessionID,
+                        modelConfigID: modelConfigID
+                    )
+                } catch {
+                    rollbackFailures.append(
+                        "model=\(cleanModelValue) (restore to \(previousModelValue) failed: \(error.localizedDescription))"
+                    )
+                }
+            }
+            guard !rollbackFailures.isEmpty else {
+                throw originalError
+            }
+            throw ControllerError.requestFailed(
+                "\(originalError.localizedDescription); cursor-agent may retain partial model configuration: \(rollbackFailures.joined(separator: "; "))"
+            )
+        }
+    }
+
+    private func applyCursorModelValueIfNeeded(
+        _ configValue: String,
+        sessionID: String,
+        modelConfigID: String
+    ) async throws {
+        if discoveredSessionModels?.currentModelRaw == configValue {
+            return
+        }
+        let response = try await sendRequestResponse(
+            method: "session/set_config_option",
+            params: [
+                "sessionId": sessionID,
+                "configId": modelConfigID,
+                "value": configValue
+            ]
+        )
+        try await applyVerifiedConfigOptionsMutationResponse(
+            response,
+            requiredModeValue: nil,
+            requiredModelValue: configValue
+        )
+    }
+
+    private func surfaceCursorEffectiveParametersForBareSelection() {
+        guard !cursorParameterSelectors.isEmpty else { return }
+        let orderedIDs = cursorParameterSelectors.keys.filter { $0.lowercased() != "fast" }.sorted()
+            + cursorParameterSelectors.keys.filter { $0.lowercased() == "fast" }.sorted()
+        let effective = orderedIDs.compactMap { configID -> String? in
+            guard let selector = cursorParameterSelectors[configID] else { return nil }
+            return "\(configID)=\(selector.currentValue)"
+        }
+        diagnose(.info("Cursor bare-base model selection inherited effective parameters: \(effective.joined(separator: ", "))."))
+        if cursorParameterSelectors["fast"]?.currentValue == "true" {
+            emit(.stream(AIStreamResult(
+                type: "system",
+                text: "Cursor Fast mode is enabled for this bare-base model selection (effective fast=true)."
+            )))
         }
     }
 
@@ -1014,6 +1271,7 @@ actor ACPAgentSessionController {
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
+        cursorParameterSelectors.removeAll()
         lastAppliedConfigurationSequence = 0
         bufferedConfigOptionUpdates.removeAll()
         sessionID = nil
@@ -1136,11 +1394,20 @@ actor ACPAgentSessionController {
             for storageKey in candidateStorageKeys(for: id) {
                 guard let pendingRequest = pendingRequests.removeValue(forKey: storageKey) else { continue }
                 pendingRequest.timeoutTask?.cancel()
-                if let result = json["result"] as? [String: Any] {
-                    pendingRequest.continuation.resume(returning: RequestResponse(
-                        result: result,
-                        inboundSequence: messageSequence
-                    ))
+                if let result = json["result"] {
+                    switch pendingRequest.continuation {
+                    case let .object(continuation):
+                        guard let objectResult = result as? [String: Any] else {
+                            continuation.resume(throwing: ControllerError.protocolViolation("Missing result/error for request \(id.displayValue)"))
+                            return
+                        }
+                        continuation.resume(returning: RequestResponse(
+                            result: objectResult,
+                            inboundSequence: messageSequence
+                        ))
+                    case let .raw(continuation):
+                        continuation.resume(returning: result)
+                    }
                 } else if let error = json["error"] as? [String: Any] {
                     let message = Self.responseErrorMessage(from: error)
                     let code = Self.responseErrorCode(from: error)
@@ -1486,20 +1753,75 @@ actor ACPAgentSessionController {
         try await sendRequestResponse(method: method, params: params).result
     }
 
-    private func sendRequestResponse(
+    func sendProviderExtensionRequest(
         method: String,
-        params: [String: Any]
-    ) async throws -> RequestResponse {
+        params: [String: Any],
+        timeoutSeconds: TimeInterval
+    ) async throws -> Any {
+        guard state == .sessionOpen || state == .promptRunning else {
+            throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
+        }
         guard process != nil else { throw ControllerError.processNotRunning }
 
         let requestID = JSONRPCID.int(nextRequestID)
         nextRequestID += 1
 
         return try await withCheckedThrowingContinuation { continuation in
-            let timeoutTask = makeRequestTimeoutTaskIfNeeded(for: requestID, method: method)
+            let timeoutTask = makeRequestTimeoutTaskIfNeeded(
+                for: requestID,
+                method: method,
+                explicitInterval: timeoutSeconds
+            )
             pendingRequests[requestID.storageKey] = PendingRequest(
                 method: method,
-                continuation: continuation,
+                continuation: .raw(continuation),
+                timeoutTask: timeoutTask
+            )
+            do {
+                try sendJSONLine([
+                    "jsonrpc": "2.0",
+                    "id": requestID.jsonValue,
+                    "method": method,
+                    "params": params
+                ])
+            } catch {
+                let pendingRequest = pendingRequests.removeValue(forKey: requestID.storageKey)
+                pendingRequest?.timeoutTask?.cancel()
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    static func isProviderExtensionMethodNotFoundError(_ error: Error) -> Bool {
+        guard case ControllerError.requestFailed(_, code: -32601) = error else { return false }
+        return true
+    }
+
+    private func sendRequestResponse(
+        method: String,
+        params: [String: Any],
+        explicitTimeoutInterval: TimeInterval? = nil
+    ) async throws -> RequestResponse {
+        switch state {
+        case .closing, .closed, .failed:
+            throw ControllerError.transportClosed
+        default:
+            break
+        }
+        guard process != nil else { throw ControllerError.processNotRunning }
+
+        let requestID = JSONRPCID.int(nextRequestID)
+        nextRequestID += 1
+
+        return try await withCheckedThrowingContinuation { continuation in
+            let timeoutTask = makeRequestTimeoutTaskIfNeeded(
+                for: requestID,
+                method: method,
+                explicitInterval: explicitTimeoutInterval
+            )
+            pendingRequests[requestID.storageKey] = PendingRequest(
+                method: method,
+                continuation: .object(continuation),
                 timeoutTask: timeoutTask
             )
             do {
@@ -1557,6 +1879,8 @@ actor ACPAgentSessionController {
         switch method {
         case "initialize", "authenticate", "session/new", "session/load":
             requestTimeouts.bootstrapSeconds
+        case "session/set_config_option":
+            requestTimeouts.setConfigOptionSeconds
         default:
             nil
         }
@@ -1564,9 +1888,12 @@ actor ACPAgentSessionController {
 
     private func makeRequestTimeoutTaskIfNeeded(
         for requestID: JSONRPCID,
-        method: String
+        method: String,
+        explicitInterval: TimeInterval? = nil
     ) -> Task<Void, Never>? {
-        guard let timeoutSeconds = requestTimeoutInterval(for: method), timeoutSeconds > 0 else {
+        guard let timeoutSeconds = explicitInterval ?? requestTimeoutInterval(for: method),
+              timeoutSeconds > 0
+        else {
             return nil
         }
         return Task { [weak self] in
@@ -1924,6 +2251,7 @@ actor ACPAgentSessionController {
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
+        cursorParameterSelectors.removeAll()
         lastAppliedConfigurationSequence = 0
         bufferedConfigOptionUpdates.removeAll()
     }
@@ -1963,6 +2291,7 @@ actor ACPAgentSessionController {
             diagnose(.info("ACP session advertised a malformed modern mode config option: \(reason)"))
         }
         applyDiscoveredSessionModels(from: response)
+        rebuildCursorParameterSelectors(from: response["configOptions"] as? [[String: Any]] ?? [])
         lastAppliedConfigurationSequence = inboundSequence
     }
 
@@ -2042,6 +2371,34 @@ actor ACPAgentSessionController {
             return .malformed("\(category) config option '\(id)' has malformed or empty options")
         }
         return .valid(ParsedSelectConfigOption(id: id, currentValue: currentValue, choices: choices))
+    }
+
+    private func parseSelectConfigOptionByID(
+        _ configID: String,
+        from configOptions: [[String: Any]]
+    ) -> ParsedSelectConfigOptionResult {
+        guard let normalizedID = normalizedConfigValue(configID) else { return .absent }
+        let candidates = configOptions.filter { option in
+            normalizedConfigValue(option["id"] as? String) == normalizedID
+        }
+        guard !candidates.isEmpty else { return .absent }
+        guard candidates.count == 1, let candidate = candidates.first else {
+            return .malformed("multiple select config options with id '\(normalizedID)' were advertised")
+        }
+        guard normalizedConfigValue(candidate["type"] as? String)?.lowercased() == "select" else {
+            return .malformed("config option '\(normalizedID)' is not a select option")
+        }
+        guard let currentValue = normalizedConfigValue(candidate["currentValue"] as? String) else {
+            return .malformed("config option '\(normalizedID)' is missing currentValue")
+        }
+        guard let choices = flattenedConfigOptionChoices(from: candidate["options"]), !choices.isEmpty else {
+            return .malformed("config option '\(normalizedID)' has malformed or empty options")
+        }
+        return .valid(ParsedSelectConfigOption(
+            id: normalizedID,
+            currentValue: currentValue,
+            choices: choices
+        ))
     }
 
     private func flattenedConfigOptionChoices(from rawValue: Any?) -> [[String: Any]]? {
@@ -2152,7 +2509,8 @@ actor ACPAgentSessionController {
     private func applyVerifiedConfigOptionsMutationResponse(
         _ response: RequestResponse,
         requiredModeValue: String?,
-        requiredModelValue: String?
+        requiredModelValue: String?,
+        requiredSelectValue: (configID: String, value: String)? = nil
     ) async throws {
         guard let configOptions = response.result["configOptions"] as? [[String: Any]] else {
             throw ControllerError.protocolViolation("session/set_config_option response missing complete configOptions snapshot")
@@ -2167,6 +2525,19 @@ actor ACPAgentSessionController {
             }
         } else if case let .malformed(reason) = parsedMode {
             throw ControllerError.protocolViolation("session/set_config_option response contained malformed mode metadata: \(reason)")
+        }
+
+        if let requiredSelectValue {
+            switch parseSelectConfigOptionByID(requiredSelectValue.configID, from: configOptions) {
+            case let .valid(option):
+                guard option.currentValue == requiredSelectValue.value else {
+                    throw ControllerError.protocolViolation("session/set_config_option response did not confirm requested value '\(requiredSelectValue.value)' for selector '\(requiredSelectValue.configID)'")
+                }
+            case .absent:
+                throw ControllerError.protocolViolation("session/set_config_option response missing selector '\(requiredSelectValue.configID)'")
+            case let .malformed(reason):
+                throw ControllerError.protocolViolation("session/set_config_option response contained malformed selector '\(requiredSelectValue.configID)': \(reason)")
+            }
         }
 
         let parsedModel = parseModernModelSnapshot(fromConfigOptions: configOptions)
@@ -2202,6 +2573,11 @@ actor ACPAgentSessionController {
            discoveredSessionModels?.currentModelRaw != requiredModelValue
         {
             throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(requiredModelValue)'")
+        }
+        if let requiredSelectValue,
+           cursorParameterSelectors[requiredSelectValue.configID]?.currentValue != requiredSelectValue.value
+        {
+            throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested value '\(requiredSelectValue.value)' for selector '\(requiredSelectValue.configID)'")
         }
     }
 
@@ -2275,7 +2651,31 @@ actor ACPAgentSessionController {
         }
         let response: [String: Any] = ["configOptions": configOptions]
         applyDiscoveredSessionModels(from: response)
+        rebuildCursorParameterSelectors(from: configOptions)
         lastAppliedConfigurationSequence = inboundSequence
+    }
+
+    private func rebuildCursorParameterSelectors(from configOptions: [[String: Any]]) {
+        let excludedIDs = Set([sessionModeSnapshot?.configID, sessionModelConfigOptionID].compactMap(\.self))
+        var selectors: [String: (currentValue: String, values: [String])] = [:]
+        var visitedIDs = Set<String>()
+        for option in configOptions {
+            guard let configID = normalizedConfigValue(option["id"] as? String),
+                  visitedIDs.insert(configID).inserted,
+                  !excludedIDs.contains(configID)
+            else {
+                continue
+            }
+            guard case let .valid(parsed) = parseSelectConfigOptionByID(configID, from: configOptions) else {
+                continue
+            }
+            let values = deduplicatedExactValues(parsed.choices.compactMap {
+                normalizedConfigValue($0["value"] as? String)
+            })
+            guard !values.isEmpty, values.contains(parsed.currentValue) else { continue }
+            selectors[configID] = (currentValue: parsed.currentValue, values: values)
+        }
+        cursorParameterSelectors = selectors
     }
 
     private func applyDiscoveredSessionModels(from response: [String: Any]) {
@@ -2408,11 +2808,7 @@ actor ACPAgentSessionController {
     }
 
     private func normalizedCursorModelAlias(_ value: String) -> String {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard let bracketIndex = trimmed.firstIndex(of: "[") else {
-            return trimmed.replacingOccurrences(of: " ", with: "-")
-        }
-        return String(trimmed[..<bracketIndex]).replacingOccurrences(of: " ", with: "-")
+        CursorModelRegistryGate.normalizedAlias(value)
     }
 
     private static func responseErrorMessage(from error: [String: Any]) -> String {

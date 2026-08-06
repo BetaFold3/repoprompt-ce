@@ -1,7 +1,8 @@
+import Combine
 import SwiftUI
 
-/// An optimized model picker that caches grouped models and only updates when the model list changes.
-/// Uses a nested Menu structure: Provider → Models for better navigation with large model lists.
+/// AppKit-backed model picker that snapshots models at open and renders Provider → Models nesting.
+/// AppKit owns tracking so catalog notifications cannot invalidate and dismiss an open menu.
 struct OptimizedModelPicker: View {
     /// The destination where model selection is applied
     let destination: ModelDestination
@@ -9,9 +10,9 @@ struct OptimizedModelPicker: View {
     let font: Font
     let widthStyle: WidthStyle
 
-    @State private var cachedGroups: [AIProviderType: [AIModel]] = [:]
-    @State private var cachedProviders: [AIProviderType] = []
-    @State private var lastModelsSignature: Int = 0
+    @State private var cursorCatalogRevision: Int = 0
+    @State private var menuModelSnapshot: [AIModel]? = nil
+    @State private var menuSnapshotReleaseTask: Task<Void, Never>? = nil
 
     private struct ClaudeCodeTopLevelMenu: Identifiable {
         let id: String
@@ -32,14 +33,14 @@ struct OptimizedModelPicker: View {
             if let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: match) {
                 return compatibleClaudeBackendOptionDisplayName(for: descriptor)
             }
-            return match.displayName
+            return cursorDisplayName(match) ?? match.displayName
         }
         // 2. Try parsing (handles tier variants not in current list)
         if let parsed = AIModel.fromModelName(currentValue) {
             if let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: parsed) {
                 return compatibleClaudeBackendOptionDisplayName(for: descriptor)
             }
-            return parsed.displayName
+            return cursorDisplayName(parsed) ?? parsed.displayName
         }
         // 3. Fallback
         return currentValue.isEmpty ? "Select a model" : currentValue
@@ -64,44 +65,228 @@ struct OptimizedModelPicker: View {
     }
 
     var body: some View {
-        Menu {
-            ForEach(cachedProviders, id: \.self) { provider in
-                if provider == .claudeCode,
-                   let models = cachedGroups[provider]
-                {
-                    ForEach(claudeCodeTopLevelMenus(for: models)) { section in
-                        Menu(section.displayName) {
-                            if section.isCompatibleBackend {
-                                compatibleClaudeBackendMenuContent(section.models)
-                            } else {
-                                providerModelMenuContent(provider: provider, models: section.models)
-                            }
-                        }
-                    }
-                } else {
-                    Menu(AIProviderType.displayName(for: provider)) {
-                        if let models = cachedGroups[provider] {
-                            providerModelMenuContent(provider: provider, models: models)
-                        }
-                    }
-                }
-            }
-        } label: {
+        // Never attach state-mutating hover or overlay modifiers to views inside menu
+        // content. Hover-driven invalidation dismisses SwiftUI tracking menus; AppKit
+        // tooltips belong on StableMenuItem instead.
+        StableMenuButton(
+            items: stableMenuItems,
+            onOpen: beginMenuPresentationSnapshot
+        ) {
             HStack(spacing: 6) {
-                Text(selectedLabel)
-                    .font(font)
-                    .lineLimit(1)
-                    .truncationMode(.head)
+                if selectedModelShowsFastWarning {
+                    cursorWarningLabel(selectedLabel)
+                        .font(font)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                } else {
+                    Text(selectedLabel)
+                        .font(font)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }
         .modifier(ControlWidthModifier(style: widthStyle))
-        .onAppear {
-            updateCacheIfNeeded()
+        .onReceive(
+            NotificationCenter.default.publisher(for: .cursorModelParameterCatalogDidChange)
+                .receive(on: RunLoop.main)
+        ) { _ in
+            cursorCatalogRevision &+= 1
         }
-        .onChange(of: modelsSignature) { _, _ in
-            updateCacheIfNeeded()
+        .onDisappear {
+            menuSnapshotReleaseTask?.cancel()
+            menuSnapshotReleaseTask = nil
+            menuModelSnapshot = nil
+        }
+    }
+
+    static func codexMenuGroups(for models: [AIModel]) -> [AIModel.CodexPickerMenuGroup] {
+        AIModel.codexMenuGroups(for: models)
+    }
+
+    #if DEBUG
+        @MainActor
+        static func stableMenuItemsForTesting(
+            availableModels: [AIModel],
+            selectedRawValue: String,
+            onSelect: @escaping @MainActor (String) -> Void
+        ) -> [StableMenuItem] {
+            let destination = ModelDestination(
+                id: "optimizedModelPickerTest",
+                getter: { selectedRawValue },
+                applier: onSelect
+            )
+            return OptimizedModelPicker(
+                destination: destination,
+                availableModels: availableModels,
+                font: .body
+            ).stableMenuItems(for: availableModels)
+        }
+    #endif
+
+    private func stableMenuItems() -> [StableMenuItem] {
+        _ = cursorCatalogRevision
+        let allModels = menuModelSnapshot ?? availableModels
+        return stableMenuItems(for: allModels)
+    }
+
+    private func stableMenuItems(for allModels: [AIModel]) -> [StableMenuItem] {
+        let grouped = Dictionary(grouping: allModels, by: { $0.providerType })
+        let providers = grouped.keys.sorted {
+            AIProviderType.displayName(for: $0) < AIProviderType.displayName(for: $1)
+        }
+
+        return providers.flatMap { provider -> [StableMenuItem] in
+            let models = AIModel.sortedForPicker(grouped[provider] ?? [])
+            if provider == .claudeCode {
+                return claudeCodeTopLevelMenus(for: models).map { section in
+                    .submenu(
+                        section.displayName,
+                        items: section.isCompatibleBackend
+                            ? section.models.compactMap(stableCompatibleClaudeItem)
+                            : stableProviderItems(provider: provider, models: section.models)
+                    )
+                }
+            }
+            return [
+                .submenu(
+                    AIProviderType.displayName(for: provider),
+                    items: stableProviderItems(provider: provider, models: models)
+                )
+            ]
+        }
+    }
+
+    private func stableProviderItems(
+        provider: AIProviderType,
+        models: [AIModel]
+    ) -> [StableMenuItem] {
+        if provider == .claudeCode {
+            return AIModel.claudeCodeMenu(for: models).groups.compactMap { group in
+                if group.rendersAsSubmenu {
+                    return .submenu(
+                        group.displayName,
+                        items: group.options.map {
+                            stableModelItem($0.model, title: $0.displayName)
+                        }
+                    )
+                }
+                guard let option = group.options.first else { return nil }
+                return stableModelItem(option.model, title: option.displayName)
+            }
+        }
+        if provider == .codex {
+            return Self.codexMenuGroups(for: models).map { group in
+                let showsWarning = group.models.contains(where: modelShowsFastWarning)
+                return .submenu(
+                    group.displayName,
+                    imageSystemName: showsWarning ? AgentModelSelectionWarningVisuals.iconSystemName : nil,
+                    style: showsWarning ? .warning : .normal,
+                    toolTip: showsWarning
+                        ? AgentModelSelectionWarningVisuals.warningTooltip(for: .codexExec)
+                        : nil,
+                    items: group.models.map { stableModelItem($0) }
+                )
+            }
+        }
+        if provider == .openAI {
+            return models.map(stableOpenAIItem)
+        }
+        if provider == .cursor {
+            return models.map { model in
+                guard case let .cursorCustom(modelRaw) = model,
+                      let item = AIModelDropdown.cursorPresetMenuItem(
+                          modelRaw: modelRaw,
+                          displayName: model.displayName,
+                          selectedRawValue: destination.currentRawValue,
+                          onSelect: { raw in
+                              destination.apply(AIModel.cursorCustom(name: raw).rawValue)
+                          }
+                      )
+                else {
+                    return stableModelItem(model)
+                }
+                return item
+            }
+        }
+        if provider == .openCode {
+            return AIModel.openCodeMenu(for: models).providerGroups.flatMap { providerGroup in
+                let items = providerGroup.groups.compactMap(stableOpenCodeItem)
+                return providerGroup.rendersAsSubmenu
+                    ? [.submenu(providerGroup.displayName, items: items)]
+                    : items
+            }
+        }
+        return models.map { stableModelItem($0) }
+    }
+
+    private func stableOpenAIItem(_ model: AIModel) -> StableMenuItem {
+        guard model.openAIServiceTierBase == .gpt56Sol else {
+            return stableModelItem(model)
+        }
+        return .submenu(
+            model.displayName,
+            items: OpenAIReasoningMode.allCases.map { mode in
+                .submenu(
+                    mode.displayName,
+                    items: OpenAIConfiguredModelSelection.supportedEfforts.compactMap { effort in
+                        guard let selection = OpenAIConfiguredModelSelection(
+                            modelID: AIModel.gpt56Sol.modelName,
+                            reasoningMode: mode,
+                            reasoningEffort: effort
+                        ) else { return nil }
+                        let configured = AIModel.openAIConfigured(selection: selection)
+                        let selectedModel = model.openAIServiceTierOverride.map {
+                            AIModel.openAIServiceTierVariant(base: configured, tier: $0)
+                        } ?? configured
+                        return stableModelItem(selectedModel, title: effort.displayName)
+                    }
+                )
+            }
+        )
+    }
+
+    private func stableOpenCodeItem(_ group: AIModel.OpenCodePickerMenuGroup) -> StableMenuItem? {
+        if group.rendersAsSubmenu {
+            return .submenu(
+                group.modelDisplayName,
+                items: group.options.map {
+                    stableModelItem($0.model, title: $0.displayName)
+                }
+            )
+        }
+        guard let option = group.options.first else { return nil }
+        return stableModelItem(option.model, title: option.displayName)
+    }
+
+    private func stableCompatibleClaudeItem(_ model: AIModel) -> StableMenuItem? {
+        guard let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) else {
+            return nil
+        }
+        return stableModelItem(
+            model,
+            title: compatibleClaudeBackendOptionDisplayName(for: descriptor)
+        )
+    }
+
+    private func stableModelItem(_ model: AIModel, title: String? = nil) -> StableMenuItem {
+        let showsWarning = modelShowsFastWarning(model)
+        let warningAgent: AgentProviderKind = model.providerType == .cursor ? .cursor : .codexExec
+        return .action(
+            title ?? model.displayName,
+            isSelected: modelIsSelected(model),
+            imageSystemName: showsWarning ? AgentModelSelectionWarningVisuals.iconSystemName : nil,
+            style: showsWarning ? .warning : .normal,
+            toolTip: showsWarning
+                ? AgentModelSelectionWarningVisuals.warningTooltip(for: warningAgent)
+                : nil
+        ) {
+            destination.apply(model.rawValue)
         }
     }
 
@@ -147,73 +332,12 @@ struct OptimizedModelPicker: View {
         return sections
     }
 
-    @ViewBuilder
-    private func providerModelMenuContent(provider: AIProviderType, models: [AIModel]) -> some View {
-        if provider == .claudeCode {
-            let menu = AIModel.claudeCodeMenu(for: models)
-            ForEach(menu.groups) { group in
-                if group.rendersAsSubmenu {
-                    Menu(group.displayName) {
-                        ForEach(group.options) { option in
-                            modelButton(option.model, title: option.displayName)
-                        }
-                    }
-                } else if let option = group.options.first {
-                    modelButton(option.model, title: option.displayName)
-                }
-            }
-        } else if provider == .openAI {
-            ForEach(models, id: \.rawValue) { model in
-                if model.openAIServiceTierBase == .gpt56Sol {
-                    openAIGPT56SolMenu(model)
-                } else {
-                    modelButton(model)
-                }
-            }
-        } else if provider == .openCode {
-            ForEach(AIModel.openCodeMenu(for: models).providerGroups) { providerGroup in
-                if providerGroup.rendersAsSubmenu {
-                    Menu(providerGroup.displayName) {
-                        openCodeModelGroupContent(providerGroup.groups)
-                    }
-                } else {
-                    openCodeModelGroupContent(providerGroup.groups)
-                }
-            }
-        } else {
-            ForEach(models, id: \.rawValue) { model in
-                modelButton(model)
-            }
-        }
-    }
-
-    private func openAIGPT56SolMenu(_ model: AIModel) -> some View {
-        Menu(model.displayName) {
-            ForEach(OpenAIReasoningMode.allCases, id: \.rawValue) { mode in
-                Menu(mode.displayName) {
-                    ForEach(OpenAIConfiguredModelSelection.supportedEfforts, id: \.rawValue) { effort in
-                        if let selection = OpenAIConfiguredModelSelection(
-                            modelID: AIModel.gpt56Sol.modelName,
-                            reasoningMode: mode,
-                            reasoningEffort: effort
-                        ) {
-                            let configured = AIModel.openAIConfigured(selection: selection)
-                            let selectedModel = model.openAIServiceTierOverride.map {
-                                AIModel.openAIServiceTierVariant(base: configured, tier: $0)
-                            } ?? configured
-                            modelButton(selectedModel, title: effort.displayName)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func compatibleClaudeBackendMenuContent(_ models: [AIModel]) -> some View {
-        ForEach(models, id: \.rawValue) { model in
-            if let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) {
-                modelButton(model, title: compatibleClaudeBackendOptionDisplayName(for: descriptor))
-            }
+    private func cursorWarningLabel(_ title: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+                .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+            Text(title)
+                .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
         }
     }
 
@@ -254,42 +378,50 @@ struct OptimizedModelPicker: View {
         }
     }
 
-    private func openCodeModelGroupContent(_ groups: [AIModel.OpenCodePickerMenuGroup]) -> some View {
-        ForEach(groups) { group in
-            if group.rendersAsSubmenu {
-                Menu(group.modelDisplayName) {
-                    ForEach(group.options) { option in
-                        modelButton(option.model, title: option.displayName)
-                    }
-                }
-            } else if let option = group.options.first {
-                modelButton(option.model, title: option.displayName)
-            }
+    private func modelIsSelected(_ model: AIModel) -> Bool {
+        guard case let .cursorCustom(optionRaw) = model,
+              case let .cursorCustom(selectedRaw) = AIModel.fromModelName(destination.currentRawValue)
+        else {
+            return destination.currentRawValue == model.rawValue
         }
+        return AgentModelCatalog.modelOptionIsSelected(
+            optionRaw: optionRaw,
+            selectedRaw: selectedRaw,
+            agentKind: .cursor
+        )
     }
 
-    private func modelButton(_ model: AIModel, title: String? = nil) -> some View {
-        Button {
-            destination.apply(model.rawValue)
-        } label: {
-            HStack {
-                Text(title ?? model.displayName)
-                    .font(font)
-                Spacer()
-                if destination.currentRawValue == model.rawValue {
-                    Image(systemName: "checkmark")
-                }
-            }
+    private var selectedModelShowsFastWarning: Bool {
+        guard let model = AIModel.fromModelName(destination.currentRawValue) else {
+            return false
         }
+        return modelShowsFastWarning(model)
     }
 
-    /// Lightweight signature to detect model list changes (not just count)
-    private var modelsSignature: Int {
-        var hasher = Hasher()
-        for model in availableModels {
-            hasher.combine(model.rawValue)
+    private func cursorDisplayName(_ model: AIModel) -> String? {
+        guard case let .cursorCustom(modelRaw) = model else { return nil }
+        return AgentModelCatalog.displayName(
+            for: modelRaw,
+            agentKind: .cursor,
+            availability: .init(cursorAvailable: true),
+            includeCursorParameterSuffix: true
+        )
+    }
+
+    private func cursorModelShowsFastWarning(_ model: AIModel) -> Bool {
+        guard case let .cursorCustom(modelRaw) = model else { return false }
+        return CursorModelMenuBuilder.hasFastEnabled(modelRaw)
+    }
+
+    private func modelShowsFastWarning(_ model: AIModel) -> Bool {
+        if cursorModelShowsFastWarning(model) {
+            return true
         }
-        return hasher.finalize()
+        guard model.providerType == .codex else { return false }
+        return AgentModelSelectionWarningVisuals.showsWarning(
+            agent: .codexExec,
+            rawModel: model.modelName
+        )
     }
 
     private struct ControlWidthModifier: ViewModifier {
@@ -305,27 +437,14 @@ struct OptimizedModelPicker: View {
         }
     }
 
-    private func updateCacheIfNeeded() {
-        let currentSignature = modelsSignature
-        guard currentSignature != lastModelsSignature else { return }
-
-        lastModelsSignature = currentSignature
-
-        // Group models by provider
-        let grouped = Dictionary(grouping: availableModels, by: { $0.providerType })
-
-        // Sort providers alphabetically
-        let sortedProviders = grouped.keys.sorted {
-            AIProviderType.displayName(for: $0) < AIProviderType.displayName(for: $1)
+    @MainActor
+    private func beginMenuPresentationSnapshot() {
+        menuSnapshotReleaseTask?.cancel()
+        menuModelSnapshot = availableModels
+        menuSnapshotReleaseTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            menuModelSnapshot = nil
+            menuSnapshotReleaseTask = nil
         }
-
-        // Sort models within each provider
-        var sortedGroups: [AIProviderType: [AIModel]] = [:]
-        for (provider, models) in grouped {
-            sortedGroups[provider] = AIModel.sortedForPicker(models)
-        }
-
-        cachedGroups = sortedGroups
-        cachedProviders = sortedProviders
     }
 }

@@ -2,11 +2,27 @@ import SwiftUI
 
 enum AgentModelSelectionWarningVisuals {
     static let iconSystemName = "bolt.fill"
-    static let warningTooltip = "Fast Codex model selected: uses your usage limits about 2× faster."
     static let warningColor = Color.orange
 
+    static func warningTooltip(for agent: AgentProviderKind) -> String {
+        switch agent {
+        case .cursor:
+            "Fast enabled: 2× more expensive, but faster speeds."
+        default:
+            "Fast Codex model selected: uses your usage limits about 2× faster."
+        }
+    }
+
     static func showsWarning(agent: AgentProviderKind, rawModel: String?) -> Bool {
-        agent == .codexExec && CodexServiceTierVariantCatalog.isFastVariant(rawModel: rawModel)
+        guard let rawModel else { return false }
+        return switch agent {
+        case .codexExec:
+            CodexServiceTierVariantCatalog.isFastVariant(rawModel: rawModel)
+        case .cursor:
+            CursorModelMenuBuilder.hasFastEnabled(rawModel)
+        default:
+            false
+        }
     }
 
     static func stableMenuImageSystemName(agent: AgentProviderKind, rawModel: String?) -> String? {
@@ -31,7 +47,7 @@ struct AgentModelSelectionSummaryLabel: View {
 
     var body: some View {
         let showsWarning = AgentModelSelectionWarningVisuals.showsWarning(agent: agentKind, rawModel: rawModel)
-        HStack(spacing: 4) {
+        let label = HStack(spacing: 4) {
             if showsWarning {
                 Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
                     .font(iconFont)
@@ -44,11 +60,20 @@ struct AgentModelSelectionSummaryLabel: View {
                 Text(title)
             }
         }
+        if agentKind == .cursor, showsWarning {
+            label.hoverTooltip(AgentModelSelectionWarningVisuals.warningTooltip(for: agentKind))
+        } else {
+            label
+        }
     }
 }
 
 /// Reusable menu content for agent model selection.
 /// For Codex and OpenCode, renders nested groups: base model -> variant/reasoning level.
+///
+/// Never attach state-mutating hover or overlay modifiers to views inside Menu content.
+/// Hover-driven invalidation dismisses the tracking menu; use StableMenuItem.toolTip
+/// for AppKit-backed in-menu tooltips.
 struct AgentModelOptionsMenuContent: View {
     let agentKind: AgentProviderKind
     let options: [AgentModelOption]
@@ -90,6 +115,63 @@ struct AgentModelOptionsMenuContent: View {
                     modelOptionButton(option)
                 }
             }
+        } else if agentKind == .cursor {
+            ForEach(options, id: \.rawValue) { option in
+                if let leaves = Self.cursorSubmenuLeaves(
+                    for: option,
+                    selectedModelRaw: selectedAgent == agentKind ? selectedModelRaw : ""
+                ) {
+                    let sections = CursorModelMenuBuilder.sections(from: leaves)
+                    let defaultLeaves = sections.first(where: { $0.section == .defaultSelection })?.leaves ?? []
+                    let nondefaultSections = sections.filter { $0.section != .defaultSelection }
+                    let parentShowsWarning = defaultLeaves.contains(where: \.showsFastWarning)
+                        || nondefaultSections
+                        .filter { $0.section != .fast }
+                        .contains(where: \.showsFastWarning)
+                    Menu {
+                        ForEach(defaultLeaves, id: \.rawValue) { leaf in
+                            cursorLeafButton(source: option, leaf: leaf, leaves: leaves)
+                        }
+                        if !defaultLeaves.isEmpty, !nondefaultSections.isEmpty {
+                            Divider()
+                        }
+                        ForEach(Array(nondefaultSections.enumerated()), id: \.offset) { _, section in
+                            switch section.section {
+                            case .reasoning:
+                                ForEach(section.leaves, id: \.rawValue) { leaf in
+                                    cursorLeafButton(source: option, leaf: leaf, leaves: leaves)
+                                }
+                            case .context:
+                                Menu(section.title ?? "") {
+                                    ForEach(section.leaves, id: \.rawValue) { leaf in
+                                        cursorLeafButton(source: option, leaf: leaf, leaves: leaves)
+                                    }
+                                }
+                            case .fast:
+                                Menu {
+                                    ForEach(section.leaves, id: \.rawValue) { leaf in
+                                        cursorLeafButton(source: option, leaf: leaf, leaves: leaves)
+                                    }
+                                } label: {
+                                    warningAwareMenuLabel(
+                                        title: section.title ?? "",
+                                        showsWarning: true
+                                    )
+                                }
+                            case .defaultSelection:
+                                EmptyView()
+                            }
+                        }
+                    } label: {
+                        warningAwareMenuLabel(
+                            title: option.displayName,
+                            showsWarning: parentShowsWarning
+                        )
+                    }
+                } else {
+                    modelOptionButton(option)
+                }
+            }
         } else if agentKind == .openCode {
             ForEach(AgentModelCatalog.openCodeMenu(for: options).providerGroups) { providerGroup in
                 if providerGroup.rendersAsSubmenu {
@@ -107,6 +189,21 @@ struct AgentModelOptionsMenuContent: View {
         }
     }
 
+    static func cursorSubmenuLeaves(
+        for option: AgentModelOption,
+        selectedModelRaw: String,
+        catalog: CursorModelParameterCatalog = .shared,
+        isEnabled: Bool = CursorParameterizedModels.isEnabled
+    ) -> [CursorModelMenuBuilder.Leaf]? {
+        CursorModelMenuBuilder.leaves(
+            forModelRaw: option.rawValue,
+            dimensionSet: .agentReasoning,
+            selectedModelRaw: selectedModelRaw,
+            catalog: catalog,
+            isEnabled: isEnabled
+        )
+    }
+
     private func openCodeModelGroupContent(_ groups: [AgentModelCatalog.OpenCodeMenuGroup]) -> some View {
         ForEach(groups) { group in
             if group.rendersAsSubmenu {
@@ -121,7 +218,16 @@ struct AgentModelOptionsMenuContent: View {
         }
     }
 
-    private func modelOptionButton(_ option: AgentModelOption, title: String? = nil) -> some View {
+    @ViewBuilder
+    private func modelOptionButton(
+        _ option: AgentModelOption,
+        title: String? = nil,
+        isSelected: Bool? = nil
+    ) -> some View {
+        let showsWarning = AgentModelSelectionWarningVisuals.showsWarning(
+            agent: agentKind,
+            rawModel: option.rawValue
+        )
         Button {
             AgentModelCatalog.updateLastUsedEffortIfEncoded(
                 agentKind: agentKind,
@@ -129,19 +235,37 @@ struct AgentModelOptionsMenuContent: View {
             )
             onSelect(agentKind, option)
         } label: {
-            let showsWarning = AgentModelSelectionWarningVisuals.showsWarning(agent: agentKind, rawModel: option.rawValue)
             HStack {
                 warningAwareMenuLabel(title: title ?? option.displayName, showsWarning: showsWarning)
-                if selectedAgent == agentKind, AgentModelCatalog.modelOptionIsSelected(
-                    optionRaw: option.rawValue,
-                    selectedRaw: selectedModelRaw,
-                    agentKind: agentKind
-                ) {
+                let optionIsSelected = isSelected ?? (
+                    selectedAgent == agentKind && AgentModelCatalog.modelOptionIsSelected(
+                        optionRaw: option.rawValue,
+                        selectedRaw: selectedModelRaw,
+                        agentKind: agentKind
+                    )
+                )
+                if optionIsSelected {
                     Spacer()
                     Image(systemName: "checkmark")
                 }
             }
         }
+    }
+
+    private func cursorLeafButton(
+        source: AgentModelOption,
+        leaf: CursorModelMenuBuilder.Leaf,
+        leaves: [CursorModelMenuBuilder.Leaf]
+    ) -> some View {
+        modelOptionButton(
+            CursorModelMenuOptionAdapter.option(source: source, leaf: leaf),
+            title: leaf.title,
+            isSelected: CursorModelMenuBuilder.leafIsSelected(
+                leaf,
+                among: leaves,
+                selectedModelRaw: selectedAgent == agentKind ? selectedModelRaw : ""
+            )
+        )
     }
 
     private func claudeEffortMenuTitle(for option: AgentModelOption) -> String {
@@ -161,6 +285,21 @@ struct AgentModelOptionsMenuContent: View {
                 Text(title)
             }
         }
+    }
+}
+
+private enum CursorModelMenuOptionAdapter {
+    static func option(
+        source: AgentModelOption,
+        leaf: CursorModelMenuBuilder.Leaf
+    ) -> AgentModelOption {
+        AgentModelOption(
+            rawValue: leaf.rawValue,
+            displayName: source.displayName,
+            description: source.description,
+            isPlaceholderDefault: false,
+            isProviderDefault: leaf.isDefaultLeaf && source.isProviderDefault
+        )
     }
 }
 
@@ -216,6 +355,14 @@ enum AgentModelStableMenuItems {
         }
 
         let visibleOptions = visibleOptions(options, includePlaceholderDefault: includePlaceholderDefault)
+        if agentKind == .cursor {
+            return cursorModelItems(
+                options: visibleOptions,
+                selectedAgent: selectedAgent,
+                selectedModelRaw: selectedModelRaw,
+                onSelect: onSelect
+            )
+        }
         if agentKind.usesClaudeTooling {
             return claudeModelItems(
                 agentKind: agentKind,
@@ -248,6 +395,100 @@ enum AgentModelStableMenuItems {
                 selectedAgent: selectedAgent,
                 selectedModelRaw: selectedModelRaw,
                 onSelect: onSelect
+            )
+        }
+    }
+
+    static func cursorModelItems(
+        options: [AgentModelOption],
+        selectedAgent: AgentProviderKind,
+        selectedModelRaw: String,
+        onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
+    ) -> [StableMenuItem] {
+        options.map { option in
+            guard let leaves = CursorModelMenuBuilder.leaves(
+                forModelRaw: option.rawValue,
+                dimensionSet: .agentReasoning,
+                selectedModelRaw: selectedAgent == .cursor ? selectedModelRaw : ""
+            ) else {
+                return modelItem(
+                    option,
+                    agentKind: .cursor,
+                    selectedAgent: selectedAgent,
+                    selectedModelRaw: selectedModelRaw,
+                    onSelect: onSelect
+                )
+            }
+
+            let sections = CursorModelMenuBuilder.sections(from: leaves)
+            let defaultLeaves = sections.first(where: { $0.section == .defaultSelection })?.leaves ?? []
+            let nondefaultSections = sections.filter { $0.section != .defaultSelection }
+            let parentShowsWarning = defaultLeaves.contains(where: \.showsFastWarning)
+                || nondefaultSections
+                .filter { $0.section != .fast }
+                .contains(where: \.showsFastWarning)
+            var items = defaultLeaves.map { leaf in
+                modelItem(
+                    CursorModelMenuOptionAdapter.option(source: option, leaf: leaf),
+                    title: leaf.title,
+                    agentKind: .cursor,
+                    selectedAgent: selectedAgent,
+                    selectedModelRaw: selectedModelRaw,
+                    isSelected: CursorModelMenuBuilder.leafIsSelected(
+                        leaf,
+                        among: leaves,
+                        selectedModelRaw: selectedAgent == .cursor ? selectedModelRaw : ""
+                    ),
+                    onSelect: onSelect
+                )
+            }
+            if !defaultLeaves.isEmpty, !nondefaultSections.isEmpty {
+                items.append(.separator)
+            }
+            items.append(contentsOf: nondefaultSections.flatMap { section -> [StableMenuItem] in
+                let leafItems = section.leaves.map { leaf in
+                    modelItem(
+                        CursorModelMenuOptionAdapter.option(source: option, leaf: leaf),
+                        title: leaf.title,
+                        agentKind: .cursor,
+                        selectedAgent: selectedAgent,
+                        selectedModelRaw: selectedModelRaw,
+                        isSelected: CursorModelMenuBuilder.leafIsSelected(
+                            leaf,
+                            among: leaves,
+                            selectedModelRaw: selectedAgent == .cursor ? selectedModelRaw : ""
+                        ),
+                        onSelect: onSelect
+                    )
+                }
+                switch section.section {
+                case .reasoning:
+                    return leafItems
+                case .context:
+                    return [.submenu(section.title ?? "", items: leafItems)]
+                case .fast:
+                    return [.submenu(
+                        section.title ?? "",
+                        imageSystemName: AgentModelSelectionWarningVisuals.iconSystemName,
+                        style: .warning,
+                        toolTip: AgentModelSelectionWarningVisuals.warningTooltip(for: .cursor),
+                        items: leafItems
+                    )]
+                case .defaultSelection:
+                    return []
+                }
+            })
+            return .submenu(
+                option.displayName,
+                isSelected: selectedAgent == .cursor
+                    && CursorModelRegistryGate.normalizedAlias(option.rawValue)
+                    == CursorModelRegistryGate.normalizedAlias(selectedModelRaw),
+                imageSystemName: parentShowsWarning ? AgentModelSelectionWarningVisuals.iconSystemName : nil,
+                style: parentShowsWarning ? .warning : .normal,
+                toolTip: parentShowsWarning
+                    ? AgentModelSelectionWarningVisuals.warningTooltip(for: .cursor)
+                    : option.description,
+                items: items
             )
         }
     }
@@ -394,17 +635,22 @@ enum AgentModelStableMenuItems {
         agentKind: AgentProviderKind,
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String,
+        isSelected: Bool? = nil,
         onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
     ) -> StableMenuItem {
         StableMenuItem.action(
             title ?? option.displayName,
-            isSelected: selectedAgent == agentKind && AgentModelCatalog.modelOptionIsSelected(
+            isSelected: isSelected ?? (selectedAgent == agentKind && AgentModelCatalog.modelOptionIsSelected(
                 optionRaw: option.rawValue,
                 selectedRaw: selectedModelRaw,
                 agentKind: agentKind
-            ),
+            )),
             imageSystemName: AgentModelSelectionWarningVisuals.stableMenuImageSystemName(agent: agentKind, rawModel: option.rawValue),
-            style: AgentModelSelectionWarningVisuals.stableMenuStyle(agent: agentKind, rawModel: option.rawValue)
+            style: AgentModelSelectionWarningVisuals.stableMenuStyle(agent: agentKind, rawModel: option.rawValue),
+            toolTip: agentKind == .cursor
+                && AgentModelSelectionWarningVisuals.showsWarning(agent: agentKind, rawModel: option.rawValue)
+                ? AgentModelSelectionWarningVisuals.warningTooltip(for: agentKind)
+                : nil
         ) {
             AgentModelCatalog.updateLastUsedEffortIfEncoded(
                 agentKind: agentKind,

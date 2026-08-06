@@ -20,6 +20,7 @@ struct AIModelDropdown: View {
 
     @State private var menuModelSnapshot: [AIModel]? = nil
     @State private var menuSnapshotReleaseTask: Task<Void, Never>? = nil
+    @State private var cursorCatalogRevision: Int = 0
 
     private struct ClaudeCodeTopLevelMenu {
         let displayName: String
@@ -64,6 +65,7 @@ struct AIModelDropdown: View {
 
     var body: some View {
         Group {
+            let _ = cursorCatalogRevision
             if useBorderlessStyle {
                 borderlessStyleMenu
             } else {
@@ -74,6 +76,12 @@ struct AIModelDropdown: View {
             menuSnapshotReleaseTask?.cancel()
             menuSnapshotReleaseTask = nil
             menuModelSnapshot = nil
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .cursorModelParameterCatalogDidChange)
+                .receive(on: RunLoop.main)
+        ) { _ in
+            cursorCatalogRevision &+= 1
         }
     }
 
@@ -86,8 +94,16 @@ struct AIModelDropdown: View {
             onOpen: beginMenuPresentationSnapshot
         ) {
             HStack(spacing: 5) {
-                Text(truncateHeadIfNeeded(displayedModelName))
-                    .truncationMode(.head)
+                if selectedModelShowsFastWarning {
+                    Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+                        .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                    Text(truncateHeadIfNeeded(displayedModelName))
+                        .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                        .truncationMode(.head)
+                } else {
+                    Text(truncateHeadIfNeeded(displayedModelName))
+                        .truncationMode(.head)
+                }
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .semibold))
                     .foregroundColor(.secondary)
@@ -112,7 +128,14 @@ struct AIModelDropdown: View {
             onOpen: beginMenuPresentationSnapshot
         ) {
             HStack(spacing: 5) {
-                Text(truncateHeadIfNeeded(displayedModelName))
+                if selectedModelShowsFastWarning {
+                    Image(systemName: AgentModelSelectionWarningVisuals.iconSystemName)
+                        .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                    Text(truncateHeadIfNeeded(displayedModelName))
+                        .foregroundStyle(AgentModelSelectionWarningVisuals.warningColor)
+                } else {
+                    Text(truncateHeadIfNeeded(displayedModelName))
+                }
                 Image(systemName: "chevron.down")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(.secondary)
@@ -148,6 +171,8 @@ struct AIModelDropdown: View {
                 }
             } else if provider == .openAI {
                 models.map(aiModelOpenAIMenuItem)
+            } else if provider == .cursor {
+                models.map(aiModelCursorMenuItem)
             } else if provider == .openCode {
                 AIModel.openCodeMenu(for: models).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
                     let modelItems = providerGroup.groups.map(aiModelOpenCodeMenuItem)
@@ -299,6 +324,107 @@ struct AIModelDropdown: View {
         return .submenu(model.displayName, items: modeItems)
     }
 
+    private func aiModelCursorMenuItem(_ model: AIModel) -> StableMenuItem {
+        guard case let .cursorCustom(modelRaw) = model,
+              let item = Self.cursorPresetMenuItem(
+                  modelRaw: modelRaw,
+                  displayName: model.displayName,
+                  selectedRawValue: destination.currentRawValue,
+                  onSelect: { selectedRaw in
+                      destination.apply(AIModel.cursorCustom(name: selectedRaw).rawValue)
+                  }
+              )
+        else {
+            return aiModelMenuItem(model)
+        }
+        return item
+    }
+
+    static func cursorPresetMenuItem(
+        modelRaw: String,
+        displayName: String,
+        selectedRawValue: String,
+        catalog: CursorModelParameterCatalog = .shared,
+        isEnabled: Bool = CursorParameterizedModels.isEnabled,
+        onSelect: @escaping (String) -> Void = { _ in }
+    ) -> StableMenuItem? {
+        guard let leaves = CursorModelMenuBuilder.leaves(
+            forModelRaw: modelRaw,
+            dimensionSet: .preset,
+            selectedModelRaw: "",
+            catalog: catalog,
+            isEnabled: isEnabled
+        ) else {
+            return nil
+        }
+
+        let selectedProviderRaw: String? = if case let .cursorCustom(raw) = AIModel.fromModelName(selectedRawValue) {
+            raw
+        } else {
+            nil
+        }
+        func leafItem(_ leaf: CursorModelMenuBuilder.Leaf) -> StableMenuItem {
+            let showsWarning = leaf.showsFastWarning
+            return .action(
+                leaf.title,
+                isSelected: selectedProviderRaw.map {
+                    AgentModelCatalog.modelOptionIsSelected(
+                        optionRaw: leaf.rawValue,
+                        selectedRaw: $0,
+                        agentKind: .cursor
+                    )
+                } ?? false,
+                imageSystemName: showsWarning ? AgentModelSelectionWarningVisuals.iconSystemName : nil,
+                style: showsWarning ? .warning : .normal,
+                toolTip: showsWarning
+                    ? AgentModelSelectionWarningVisuals.warningTooltip(for: .cursor)
+                    : nil
+            ) {
+                onSelect(leaf.rawValue)
+            }
+        }
+
+        let sections = CursorModelMenuBuilder.sections(from: leaves)
+        var items: [StableMenuItem] = []
+        if let defaultSection = sections.first(where: { $0.section == .defaultSelection }) {
+            items.append(contentsOf: defaultSection.leaves.map(leafItem))
+        }
+        let nondefaultSections = sections.filter { $0.section != .defaultSelection }
+        if !items.isEmpty, !nondefaultSections.isEmpty {
+            items.append(.separator)
+        }
+        for section in nondefaultSections {
+            switch section.section {
+            case .reasoning:
+                items.append(contentsOf: section.leaves.map(leafItem))
+            case .context:
+                items.append(.submenu(
+                    section.title ?? "",
+                    items: section.leaves.map(leafItem)
+                ))
+            case .fast:
+                items.append(.submenu(
+                    section.title ?? "",
+                    imageSystemName: AgentModelSelectionWarningVisuals.iconSystemName,
+                    style: .warning,
+                    toolTip: AgentModelSelectionWarningVisuals.warningTooltip(for: .cursor),
+                    items: section.leaves.map(leafItem)
+                ))
+            case .defaultSelection:
+                break
+            }
+        }
+
+        return .submenu(
+            displayName,
+            isSelected: selectedProviderRaw.map {
+                CursorModelRegistryGate.normalizedAlias(modelRaw)
+                    == CursorModelRegistryGate.normalizedAlias($0)
+            } ?? false,
+            items: items
+        )
+    }
+
     private func aiModelOpenCodeMenuItem(_ group: AIModel.OpenCodePickerMenuGroup) -> StableMenuItem {
         if group.rendersAsSubmenu {
             return StableMenuItem.submenu(
@@ -316,10 +442,20 @@ struct AIModelDropdown: View {
         aiModelMenuItem(model, title: model.displayName)
     }
 
-    private func aiModelMenuItem(_ model: AIModel, title: String) -> StableMenuItem {
-        StableMenuItem.action(
+    private func aiModelMenuItem(
+        _ model: AIModel,
+        title: String,
+        isSelected: Bool? = nil
+    ) -> StableMenuItem {
+        let showsWarning = Self.cursorModelShowsFastWarning(model)
+        return StableMenuItem.action(
             truncateHeadIfNeeded(title),
-            isSelected: model.rawValue == destination.currentRawValue
+            isSelected: isSelected ?? (model.rawValue == destination.currentRawValue),
+            imageSystemName: showsWarning ? AgentModelSelectionWarningVisuals.iconSystemName : nil,
+            style: showsWarning ? .warning : .normal,
+            toolTip: showsWarning
+                ? AgentModelSelectionWarningVisuals.warningTooltip(for: .cursor)
+                : nil
         ) {
             destination.apply(model.rawValue)
         }
@@ -377,12 +513,16 @@ struct AIModelDropdown: View {
 
         // Check available models
         if let selectedModel = availableModels.first(where: { $0.rawValue == currentModel }) {
-            return compatibleClaudeBackendDisplayName(selectedModel) ?? selectedModel.displayName
+            return cursorDisplayName(selectedModel)
+                ?? compatibleClaudeBackendDisplayName(selectedModel)
+                ?? selectedModel.displayName
         }
 
         // Try parsing (handles tier variants not in current list)
         if let parsed = AIModel.fromModelName(currentModel) {
-            return compatibleClaudeBackendDisplayName(parsed) ?? parsed.displayName
+            return cursorDisplayName(parsed)
+                ?? compatibleClaudeBackendDisplayName(parsed)
+                ?? parsed.displayName
         }
 
         if destinationID == "planningModel" {
@@ -392,6 +532,28 @@ struct AIModelDropdown: View {
 
         // Fallback to first available for non-Oracle destinations.
         return availableModels.first?.displayName ?? "Select a model"
+    }
+
+    private var selectedModelShowsFastWarning: Bool {
+        guard let model = AIModel.fromModelName(destination.currentRawValue) else {
+            return false
+        }
+        return Self.cursorModelShowsFastWarning(model)
+    }
+
+    private static func cursorDisplayName(_ model: AIModel) -> String? {
+        guard case let .cursorCustom(modelRaw) = model else { return nil }
+        return AgentModelCatalog.displayName(
+            for: modelRaw,
+            agentKind: .cursor,
+            availability: .init(cursorAvailable: true),
+            includeCursorParameterSuffix: true
+        )
+    }
+
+    private static func cursorModelShowsFastWarning(_ model: AIModel) -> Bool {
+        guard case let .cursorCustom(modelRaw) = model else { return false }
+        return CursorModelMenuBuilder.hasFastEnabled(modelRaw)
     }
 
     // MARK: - Helpers

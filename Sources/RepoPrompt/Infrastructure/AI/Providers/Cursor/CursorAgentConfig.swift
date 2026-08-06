@@ -10,6 +10,7 @@ struct CursorAgentConfig {
     let includeRepoPromptMCPServer: Bool
     let cleanupProjectMCPApproval: Bool
     let sessionModeID: String?
+    let enableParameterizedModelPicker: Bool
 
     init(
         commandName: String = "cursor-agent",
@@ -18,7 +19,8 @@ struct CursorAgentConfig {
         modelString: String? = nil,
         includeRepoPromptMCPServer: Bool = true,
         cleanupProjectMCPApproval: Bool = true,
-        sessionModeID: String? = nil
+        sessionModeID: String? = nil,
+        enableParameterizedModelPicker: Bool = CursorParameterizedModels.isEnabled
     ) {
         self.commandName = commandName
         self.additionalPathHints = additionalPathHints
@@ -27,5 +29,6 @@ struct CursorAgentConfig {
         self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
         self.cleanupProjectMCPApproval = cleanupProjectMCPApproval
         self.sessionModeID = sessionModeID
+        self.enableParameterizedModelPicker = enableParameterizedModelPicker
     }
 }

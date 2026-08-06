@@ -25,6 +25,10 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         .cursor
     }
 
+    var initializeClientCapabilityMetadata: [String: Bool] {
+        config.enableParameterizedModelPicker ? ["parameterizedModelPicker": true] : [:]
+    }
+
     func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
         try await launchResolver.probeSupport(for: config)
     }
@@ -153,6 +157,13 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         if lower.contains("session mode")
             || lower.contains("session/set_config_option")
             || lower.contains("mode config option")
+            || lower.contains("model config option")
+            || lower.contains("parameter selection")
+            || lower.contains("parameter selector")
+            || lower.contains("for cursor parameter")
+            || lower.contains("invalid value for")
+            || lower.contains("partial model configuration")
+            || lower.contains("parameterized model")
         {
             return AIProviderError.invalidConfiguration(detail: description)
         }

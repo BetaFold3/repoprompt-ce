@@ -1591,7 +1591,8 @@ final class AgentModeViewModel: ObservableObject {
             agentKind: agentKind,
             availability: agentAvailabilityContext,
             codexDynamicModels: codexDynamicModels,
-            includeEffortSuffix: false
+            includeEffortSuffix: false,
+            includeCursorParameterSuffix: true
         )
     }
 

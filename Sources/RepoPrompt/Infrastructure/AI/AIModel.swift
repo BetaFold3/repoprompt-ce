@@ -603,17 +603,12 @@ public enum AIModel: Equatable, Hashable {
             return n
         }
         if case let .cursorCustom(n) = self {
-            if let option = ACPAIModelCatalog.cursorModelOption(for: n) {
-                return option.displayName
-            }
-            let normalized = ACPAIModelCatalog.normalizedCursorModelAlias(n)
-            if normalized == AgentModel.cursorAuto.rawValue {
-                return AgentModel.cursorAuto.displayName
-            }
-            if normalized == AgentModel.cursorComposer2.rawValue {
-                return AgentModel.cursorComposer2.displayName
-            }
-            return n
+            return AgentModelCatalog.displayName(
+                for: n,
+                agentKind: .cursor,
+                availability: .init(cursorAvailable: true),
+                includeCursorParameterSuffix: true
+            )
         }
         if case let .customProviderUser(name) = self { return "Custom/\(name)" }
         if case .ollama = self {
