@@ -71,12 +71,35 @@ final class HeadlessAgentModeRunner {
             return
         }
 
-        let provider = headlessProviderFactory(
-            session.selectedAgent,
-            session.selectedModelRaw == AgentModel.defaultModel.rawValue
-                ? nil
-                : session.selectedModelRaw
-        )
+        let provider: HeadlessAgentProvider
+        do {
+            provider = try headlessProviderFactory(
+                session.selectedAgent,
+                session.selectedModelRaw == AgentModel.defaultModel.rawValue
+                    ? nil
+                    : session.selectedModelRaw
+            )
+        } catch {
+            await terminalCommitBarrier.commit(.init(
+                session: session,
+                ownership: ownership,
+                expectedRunID: runID,
+                terminalState: .failed,
+                source: "headless.providerFactory",
+                errorText: error.localizedDescription,
+                attachmentReservationID: attachmentReservationID,
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: false,
+                notifyTurnComplete: false,
+                prepareProviderState: {
+                    session.provider = nil
+                    session.runID = nil
+                    return nil
+                }
+            ))
+            return
+        }
         session.provider = provider
         session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
             session.provider = nil

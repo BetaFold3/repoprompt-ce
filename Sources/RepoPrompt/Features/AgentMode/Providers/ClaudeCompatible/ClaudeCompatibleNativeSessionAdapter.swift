@@ -33,6 +33,10 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         get async { await controller.events }
     }
 
+    var requiresReplacementAfterTerminalStartupFailure: Bool {
+        get async { await controller.requiresReplacementAfterTerminalStartupFailure }
+    }
+
     func ensureEventsStreamReady() async {
         await controller.ensureEventsStreamReady()
     }

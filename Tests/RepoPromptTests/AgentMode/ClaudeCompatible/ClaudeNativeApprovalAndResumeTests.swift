@@ -28,7 +28,7 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
 
     func testNativeFlagResolutionPassesEncodedGLMModelToResolver() async throws {
         let resolver = RecordingLaunchEnvironmentResolver()
-        let controller = ClaudeNativeProcessSessionController(
+        let controller = try ClaudeNativeProcessSessionController(
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
@@ -51,8 +51,8 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertEqual(requestedModels, ["glm-5-turbo:xhigh"])
     }
 
-    func testNativeLiveModelSwitchRequiresRestartWhenLaunchEnvironmentChanges() async {
-        let controller = ClaudeNativeProcessSessionController(
+    func testNativeLiveModelSwitchRequiresRestartWhenLaunchEnvironmentChanges() async throws {
+        let controller = try ClaudeNativeProcessSessionController(
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,

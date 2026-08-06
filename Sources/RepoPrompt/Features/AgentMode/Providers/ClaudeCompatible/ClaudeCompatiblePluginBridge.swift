@@ -78,13 +78,15 @@ enum ClaudeCompatiblePluginBridge {
     static func agentModeRuntimeConfig(
         agentKind: AgentProviderKind,
         modelString: String?,
-        enableDebugLogging: Bool
-    ) -> ClaudeCompatiblePluginRuntimeConfig? {
+        enableDebugLogging: Bool,
+        defaults: UserDefaults = .standard
+    ) throws -> ClaudeCompatiblePluginRuntimeConfig? {
         guard let runtimeVariant = agentKind.claudeRuntimeVariant else { return nil }
-        let config = ClaudeCodeAgentConfig.agentMode(
+        let config = try ClaudeCodeAgentConfig.agentMode(
             modelString: modelString,
             runtimeVariant: runtimeVariant,
-            enableDebugLogging: enableDebugLogging
+            enableDebugLogging: enableDebugLogging,
+            defaults: defaults
         )
         return runtimeConfig(from: config, mode: .agentMode)
     }
@@ -92,13 +94,15 @@ enum ClaudeCompatiblePluginBridge {
     static func discoveryRuntimeConfig(
         agentKind: AgentProviderKind,
         modelString: String?,
-        enableDebugLogging: Bool
-    ) -> ClaudeCompatiblePluginRuntimeConfig? {
+        enableDebugLogging: Bool,
+        defaults: UserDefaults = .standard
+    ) throws -> ClaudeCompatiblePluginRuntimeConfig? {
         guard let runtimeVariant = agentKind.claudeRuntimeVariant else { return nil }
-        let config = ClaudeCodeAgentConfig.discovery(
+        let config = try ClaudeCodeAgentConfig.discovery(
             modelString: modelString,
             runtimeVariant: runtimeVariant,
-            enableDebugLogging: enableDebugLogging
+            enableDebugLogging: enableDebugLogging,
+            defaults: defaults
         )
         return runtimeConfig(from: config, mode: .discovery)
     }

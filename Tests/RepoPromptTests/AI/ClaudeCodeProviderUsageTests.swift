@@ -4,7 +4,7 @@ import XCTest
 
 final class ClaudeCodeProviderUsageTests: XCTestCase {
     func testCompletionPayloadReportsCacheInclusiveInputAcrossTypedFallbackAndBoundaries() throws {
-        let provider = ClaudeCodeProvider()
+        let provider = try ClaudeCodeProvider()
         let cases: [(name: String, json: String, promptTokens: Int, outputTokens: Int, cost: Double)] = [
             (
                 "typed result",

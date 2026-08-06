@@ -206,6 +206,20 @@ final class AgentRuntimeProviderService {
 
     private init() {}
 
+    static func claudeProcessConfiguration(for config: ClaudeCodeAgentConfig) -> CLIProcessConfiguration {
+        var processConfig = CLIProcessConfiguration(
+            command: config.commandName,
+            validationCommandName: CLILaunchProfiles.claudeCode.commandName,
+            commandSelection: config.commandSelection,
+            enableDebugLogging: enableDebugLogging,
+            captureStdoutTailBytes: 128 * 1024,
+            captureStderrTailBytes: 256 * 1024,
+            logStdinSampleBytes: 0
+        )
+        processConfig.ensureAdditionalPaths(config.additionalPathHints)
+        return processConfig
+    }
+
     /// Create a headless agent provider.
     /// - Parameters:
     ///   - agent: The provider kind to create
@@ -219,27 +233,22 @@ final class AgentRuntimeProviderService {
         for agent: AgentProviderKind,
         modelString: String? = nil,
         runType: AgentRunType = .discover,
-        workspacePath: String? = nil
-    ) -> HeadlessAgentProvider {
+        workspacePath: String? = nil,
+        defaults: UserDefaults = .standard
+    ) throws -> HeadlessAgentProvider {
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
         }
         switch agent {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             let runtimeVariant = agent.claudeRuntimeVariant ?? .standard
-            let config: ClaudeCodeAgentConfig = .discovery(
+            let config: ClaudeCodeAgentConfig = try .discovery(
                 modelString: modelString,
                 runtimeVariant: runtimeVariant,
-                enableDebugLogging: Self.enableDebugLogging
-            )
-            var processConfig = CLIProcessConfiguration(
-                command: config.commandName,
                 enableDebugLogging: Self.enableDebugLogging,
-                captureStdoutTailBytes: 128 * 1024,
-                captureStderrTailBytes: 256 * 1024,
-                logStdinSampleBytes: 0
+                defaults: defaults
             )
-            processConfig.ensureAdditionalPaths(config.additionalPathHints)
+            let processConfig = Self.claudeProcessConfiguration(for: config)
             let runner = CLIProcessRunner(config: processConfig)
             let wrappedProvider = ClaudeCodeAgentProvider(runner: runner, config: config)
             let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: config, mode: .discovery)

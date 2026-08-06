@@ -98,8 +98,8 @@ final class AgentRunCoordinator {
         modelString: String?,
         runType: AgentRunType = .discover,
         workspacePath: String? = nil
-    ) -> HeadlessAgentProvider {
-        AgentRuntimeProviderService.shared.makeProvider(
+    ) throws -> HeadlessAgentProvider {
+        try AgentRuntimeProviderService.shared.makeProvider(
             for: agentKind,
             modelString: modelString,
             runType: runType,

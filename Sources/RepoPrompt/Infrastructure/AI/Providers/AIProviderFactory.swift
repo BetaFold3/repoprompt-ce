@@ -79,7 +79,7 @@ class AIProviderFactory {
         case .zAI:
             return ZAIProvider(apiKey: key)
         case .claudeCode: // <-- Add Claude Code case
-            return ClaudeCodeProvider()
+            return try ClaudeCodeProvider()
         case .codex:
             // Standard non-agent Codex chat owns a fresh app-server client per request.
             return CodexCLIProvider()

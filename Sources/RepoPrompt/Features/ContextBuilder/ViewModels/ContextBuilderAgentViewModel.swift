@@ -114,7 +114,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         _ agent: AgentProviderKind,
         _ modelString: String?,
         _ workspacePath: String?
-    ) -> HeadlessAgentProvider
+    ) throws -> HeadlessAgentProvider
 
     private func debugLog(_ message: @autoclosure () -> String) {
         #if DEBUG
@@ -912,7 +912,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.oracleViewModel = oracleViewModel
         self.codexModelPollingService = codexModelPollingService
         self.providerFactory = providerFactory ?? { agent, modelString, workspacePath in
-            AgentRuntimeProviderService.shared.makeProvider(
+            try AgentRuntimeProviderService.shared.makeProvider(
                 for: agent,
                 modelString: modelString,
                 workspacePath: workspacePath
@@ -2575,7 +2575,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let providerWorkspacePath = record.mcpConfiguration?.providerWorkspacePath
                 ?? record.workspaceContext?.providerWorkspacePath
                 ?? currentWorkspacePath
-            let provider = providerFactory(record.agentKind, modelString, providerWorkspacePath)
+            let provider: HeadlessAgentProvider
+            do {
+                provider = try providerFactory(record.agentKind, modelString, providerWorkspacePath)
+            } catch {
+                await lease.failAndCleanup()
+                return .failed(error.localizedDescription)
+            }
             guard record.installProvider(provider) else {
                 await provider.dispose()
                 await lease.failAndCleanup()

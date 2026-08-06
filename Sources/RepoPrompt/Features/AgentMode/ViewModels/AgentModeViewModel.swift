@@ -65,7 +65,7 @@ final class AgentModeViewModel: ObservableObject {
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?
     ) -> any CodexSessionControlling
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
-    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
+    typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) throws -> HeadlessAgentProvider
     typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
     typealias ConnectionPolicyInstaller = (
@@ -1837,9 +1837,9 @@ final class AgentModeViewModel: ObservableObject {
     private nonisolated static func defaultHeadlessProviderFactory(
         agent: AgentProviderKind,
         modelString: String?
-    ) -> HeadlessAgentProvider {
+    ) throws -> HeadlessAgentProvider {
         assert(agent != .codexExec, "Codex native runs must not use headless provider factory.")
-        return AgentRuntimeProviderService.shared.makeProvider(for: agent, modelString: modelString)
+        return try AgentRuntimeProviderService.shared.makeProvider(for: agent, modelString: modelString)
     }
 
     private nonisolated static func defaultConnectionPolicyInstaller(
@@ -2089,7 +2089,7 @@ final class AgentModeViewModel: ObservableObject {
             codexControllerFactoryWithComputerUse: CodexControllerFactoryWithComputerUse? = nil,
             claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
             headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString in
-                AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
+                try AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
             },
             acpProviderFactory: @escaping ACPProviderFactory = { agent, modelString in
                 ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)

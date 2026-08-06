@@ -47,6 +47,7 @@ struct CLIProvidersSettingsView: View {
     @State private var showCursorTraceDump = false
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
+    @State private var isRecheckingClaudeExecutable = false
 
     // Progressive disclosure state stays user-controlled. Async provider refreshes must not
     // expand or collapse cards after the user starts interacting with this view.
@@ -398,6 +399,8 @@ struct CLIProvidersSettingsView: View {
             isExpanded: $isClaudeCodeExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
+                claudeExecutableOverrideSection
+
                 if viewModel.isClaudeCodeConnected {
                     // Actions
                     HStack(spacing: 8) {
@@ -478,6 +481,235 @@ struct CLIProvidersSettingsView: View {
                 }
             }
         }
+    }
+
+    private var claudeExecutableOverrideSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+
+            Text("Claude CLI Executable")
+                .font(.subheadline)
+                .fontWeight(.semibold)
+
+            HStack(spacing: 8) {
+                TextField(
+                    "Automatic login-shell lookup",
+                    text: Binding(
+                        get: { viewModel.claudeExecutableOverrideDraft },
+                        set: { viewModel.updateClaudeExecutableOverrideDraft($0) }
+                    )
+                )
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+
+                Button("Browse…", action: browseForClaudeExecutable)
+                    .disabled(viewModel.isClaudeExecutableOverrideMutationInProgress)
+            }
+
+            if viewModel.claudeExecutableOverrideDraftDiffersFromApplied {
+                Label("Draft differs from the applied value.", systemImage: "pencil.circle.fill")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+            } else {
+                Label("Draft matches the applied value.", systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            claudeExecutableDraftValidationDetail
+
+            HStack(spacing: 8) {
+                Button("Apply") {
+                    Task {
+                        _ = await viewModel.applyClaudeExecutableOverride()
+                    }
+                }
+                .disabled(
+                    viewModel.isClaudeExecutableOverrideMutationInProgress
+                        || !viewModel.claudeExecutableOverrideDraftDiffersFromApplied
+                )
+                .buttonStyle(CustomButtonStyle())
+
+                Button("Use Automatic") {
+                    Task {
+                        _ = await viewModel.resetClaudeExecutableOverrideToAutomatic()
+                    }
+                }
+                .disabled(
+                    viewModel.isClaudeExecutableOverrideMutationInProgress
+                        || (
+                            viewModel.claudeExecutableOverrideAppliedState == .automatic
+                                && viewModel.claudeExecutableOverrideDraft.isEmpty
+                        )
+                )
+                .buttonStyle(CustomButtonStyle())
+
+                Button {
+                    isRecheckingClaudeExecutable = true
+                    Task {
+                        _ = await viewModel.recheckClaudeExecutableOverride()
+                        isRecheckingClaudeExecutable = false
+                    }
+                } label: {
+                    if isRecheckingClaudeExecutable {
+                        ProgressView()
+                            .scaleEffect(0.6)
+                            .frame(height: 16)
+                    } else {
+                        Label("Recheck / Test", systemImage: "arrow.clockwise")
+                    }
+                }
+                .disabled(isRecheckingClaudeExecutable || viewModel.isClaudeExecutableOverrideMutationInProgress)
+                .buttonStyle(CustomButtonStyle())
+            }
+
+            claudeExecutableAppliedStateDetail
+
+            Text("Used by Claude Code and Claude-compatible backends (GLM, Kimi, Custom). Applies to new sessions. Wrappers must exec the real CLI and keep stdout clean.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("The first read of a TCC-protected folder may prompt for macOS permission.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(Color.secondary.opacity(0.05))
+        .cornerRadius(6)
+    }
+
+    @ViewBuilder
+    private var claudeExecutableDraftValidationDetail: some View {
+        if viewModel.claudeExecutableOverrideDraftDiffersFromApplied {
+            switch viewModel.claudeExecutableOverrideDraftValidation {
+            case .notChecked:
+                EmptyView()
+            case .checking:
+                Label("Checking draft…", systemImage: "clock")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            case .valid:
+                Label("Draft is a launchable executable.", systemImage: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundColor(.green)
+            case let .invalid(message):
+                Label(message, systemImage: "xmark.octagon.fill")
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let warning = viewModel.claudeExecutableOverrideDraftQuarantineWarning {
+                Label(warning, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var claudeExecutableAppliedStateDetail: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Effective state")
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundColor(.secondary)
+
+            switch viewModel.claudeExecutableOverrideAppliedState {
+            case .automatic:
+                Text("Automatic (login-shell lookup)")
+                    .font(.caption)
+            case let .configured(path, validation, isQuarantined):
+                Text(path)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                switch validation {
+                case .valid:
+                    Label("Applied path is launchable.", systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundColor(.green)
+                case let .invalid(message):
+                    Label(message, systemImage: "xmark.octagon.fill")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                case .notChecked, .checking:
+                    Label("Checking applied path…", systemImage: "clock")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                if isQuarantined {
+                    Label(
+                        "This file has the com.apple.quarantine attribute. RepoPrompt will not remove it.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            case let .corrupt(message):
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(message, systemImage: "xmark.octagon.fill")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    Button("Reset") {
+                        Task {
+                            _ = await viewModel.resetClaudeExecutableOverrideToAutomatic()
+                        }
+                    }
+                    .disabled(viewModel.isClaudeExecutableOverrideMutationInProgress)
+                    .buttonStyle(CustomButtonStyle())
+                }
+            }
+
+            switch viewModel.displayedClaudeExecutableProbeStatus {
+            case .none:
+                Text("Not tested for the current selection.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            case .probing:
+                Label("Running `--version`…", systemImage: "clock.arrow.circlepath")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            case let .succeeded(resolvedCommand, version):
+                if case .automatic = viewModel.claudeExecutableOverrideAppliedState {
+                    Text("Last resolved command: \(resolvedCommand)")
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+                Text("`--version`: \(version)")
+                    .font(.caption)
+                    .textSelection(.enabled)
+            case let .failed(message):
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.secondary.opacity(0.05))
+        .cornerRadius(6)
+    }
+
+    private func browseForClaudeExecutable() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Claude CLI Executable"
+        panel.prompt = "Choose"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+
+        guard panel.runModal() == .OK, let selectedURL = panel.url else { return }
+        viewModel.updateClaudeExecutableOverrideDraft(
+            viewModel.claudeExecutablePathSuggestedBySelection(selectedURL)
+        )
     }
 
     // MARK: - Claude Code-Compatible Backends Section

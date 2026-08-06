@@ -1,4 +1,5 @@
 import Combine
+import Darwin
 import SwiftUI
 
 #if DEBUG
@@ -113,6 +114,76 @@ enum ClaudeCodeCLIStatus: Equatable {
         if case .binaryMissing = self { return true }
         return false
     }
+}
+
+enum ClaudeExecutableOverrideValidation: Equatable {
+    case notChecked
+    case checking
+    case valid
+    case invalid(message: String)
+}
+
+enum ClaudeExecutableOverrideAppliedState: Equatable {
+    case automatic
+    case configured(path: String, validation: ClaudeExecutableOverrideValidation, isQuarantined: Bool)
+    case corrupt(message: String)
+
+    fileprivate var fingerprint: ClaudeExecutableSelectionFingerprint {
+        switch self {
+        case .automatic:
+            .automatic
+        case let .configured(path, _, _):
+            .configured(path: path)
+        case let .corrupt(message):
+            .corrupt(message: message)
+        }
+    }
+
+    var appliedPath: String? {
+        guard case let .configured(path, _, _) = self else { return nil }
+        return path
+    }
+}
+
+enum ClaudeExecutableProbeStatus: Equatable {
+    case probing
+    case succeeded(resolvedCommand: String, version: String)
+    case failed(message: String)
+}
+
+enum ClaudeExecutableOverridePipelineStage: Equatable {
+    case validate
+    case persist
+    case invalidateResolvedCommandCache
+    case clearProbeFingerprint
+    case probe
+}
+
+struct ClaudeExecutableDraftAssessment: Equatable {
+    let validation: ClaudeExecutableOverrideValidation
+    let normalizedPath: String?
+    let isQuarantined: Bool
+}
+
+enum ClaudeExecutableProbeOutcome: Equatable {
+    case succeeded(resolvedCommand: String, version: String)
+    case failed(message: String)
+
+    var succeeded: Bool {
+        if case .succeeded = self { return true }
+        return false
+    }
+}
+
+private enum ClaudeExecutableSelectionFingerprint: Equatable {
+    case automatic
+    case configured(path: String)
+    case corrupt(message: String)
+}
+
+private struct FingerprintedClaudeExecutableProbe: Equatable {
+    let fingerprint: ClaudeExecutableSelectionFingerprint
+    let status: ClaudeExecutableProbeStatus
 }
 
 enum ClaudeCompatibleBackendTestResult: Equatable {
@@ -262,7 +333,27 @@ public class APISettingsViewModel: ObservableObject {
     @Published var isClaudeCodeConnected: Bool = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
     @Published private(set) var claudeCodeCLIStatus: ClaudeCodeCLIStatus = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected") ? .binaryPresent : .unknown
     @Published var claudeCodeError: String? = nil
+    @Published private(set) var claudeExecutableOverrideDraft = ""
+    @Published private(set) var claudeExecutableOverrideDraftValidation: ClaudeExecutableOverrideValidation = .notChecked
+    @Published private(set) var claudeExecutableOverrideDraftQuarantineWarning: String?
+    @Published private(set) var claudeExecutableOverrideAppliedState: ClaudeExecutableOverrideAppliedState = .automatic
+    @Published private(set) var isClaudeExecutableOverrideMutationInProgress = false
+    @Published private var fingerprintedClaudeExecutableProbe: FingerprintedClaudeExecutableProbe?
+    private var claudeExecutableDraftValidationTask: Task<Void, Never>?
+    private var claudeExecutableOverrideMutationGeneration = 0
+    private var claudeExecutableProbeGeneration: UInt64 = 0
     private var claudeCodeLogCollector: CLIProcessLogCollector?
+
+    var displayedClaudeExecutableProbeStatus: ClaudeExecutableProbeStatus? {
+        guard fingerprintedClaudeExecutableProbe?.fingerprint == claudeExecutableOverrideAppliedState.fingerprint else {
+            return nil
+        }
+        return fingerprintedClaudeExecutableProbe?.status
+    }
+
+    var claudeExecutableOverrideDraftDiffersFromApplied: Bool {
+        claudeExecutableOverrideDraft != (claudeExecutableOverrideAppliedState.appliedPath ?? "")
+    }
 
     var isClaudeCodeBinaryPresent: Bool {
         isClaudeCodeConnected || claudeCodeCLIStatus.binaryPresent
@@ -605,14 +696,161 @@ public class APISettingsViewModel: ObservableObject {
         return compatibleBackendStore.config(for: id)
     }
 
+    static func claudeCodeProbeConfiguration(
+        defaults: UserDefaults,
+        captureTailBytes: Int,
+        logCollector: CLIProcessLogCollector? = nil
+    ) throws -> CLIProcessConfiguration {
+        let commandSelection = try CLIExecutableOverrideStore.effectiveCommand(
+            for: CLILaunchProfiles.claudeCode,
+            defaults: defaults
+        )
+        var config = CLIProcessConfiguration(
+            command: commandSelection.command,
+            validationCommandName: CLILaunchProfiles.claudeCode.commandName,
+            commandSelection: commandSelection,
+            shellLookupMode: .preferShell,
+            captureStdoutTailBytes: captureTailBytes,
+            captureStderrTailBytes: captureTailBytes
+        )
+        config.logCollector = logCollector
+        config.ensureAdditionalPaths(CLIPathHints.claudeCode)
+        return config
+    }
+
+    func updateClaudeExecutableOverrideDraft(_ draft: String) {
+        claudeExecutableOverrideDraft = draft
+        claudeExecutableOverrideDraftValidation = .checking
+        claudeExecutableOverrideDraftQuarantineWarning = nil
+        claudeExecutableDraftValidationTask?.cancel()
+
+        let validator = claudeExecutableDraftValidator
+        claudeExecutableDraftValidationTask = Task { [weak self] in
+            let assessment = await validator(draft)
+            guard let self,
+                  !Task.isCancelled,
+                  claudeExecutableOverrideDraft == draft
+            else {
+                return
+            }
+            claudeExecutableOverrideDraftValidation = assessment.validation
+            claudeExecutableOverrideDraftQuarantineWarning = assessment.isQuarantined
+                ? Self.claudeExecutableQuarantineWarning
+                : nil
+        }
+    }
+
+    @discardableResult
+    func applyClaudeExecutableOverride() async -> Bool {
+        let capturedDraft = claudeExecutableOverrideDraft
+        claudeExecutableDraftValidationTask?.cancel()
+        claudeExecutableDraftValidationTask = nil
+        claudeExecutableOverrideMutationGeneration += 1
+        let generation = claudeExecutableOverrideMutationGeneration
+        isClaudeExecutableOverrideMutationInProgress = true
+        defer {
+            if claudeExecutableOverrideMutationGeneration == generation {
+                isClaudeExecutableOverrideMutationInProgress = false
+            }
+        }
+
+        do {
+            if let normalizedPath = try CLIExecutableOverrideStore.normalizeForApply(capturedDraft) {
+                try CLIExecutableOverrideStore.validateForLaunch(
+                    normalizedPath,
+                    commandName: CLILaunchProfiles.claudeCode.commandName
+                )
+            }
+            claudeExecutableOverridePipelineObserver(.validate)
+
+            _ = try CLIExecutableOverrideStore.apply(
+                capturedDraft,
+                for: CLILaunchProfiles.claudeCode,
+                defaults: cliExecutableOverrideDefaults
+            )
+            claudeExecutableOverridePipelineObserver(.persist)
+        } catch {
+            if claudeExecutableOverrideDraft == capturedDraft {
+                claudeExecutableOverrideDraftValidation = .invalid(message: error.localizedDescription)
+                claudeExecutableOverrideDraftQuarantineWarning = nil
+            }
+            return false
+        }
+
+        synchronizeClaudeExecutableOverrideAppliedState(
+            updateDraft: claudeExecutableOverrideDraft == capturedDraft
+        )
+        await cliResolvedCommandCacheInvalidator()
+        guard claudeExecutableOverrideMutationGeneration == generation else { return true }
+        claudeExecutableOverridePipelineObserver(.invalidateResolvedCommandCache)
+
+        fingerprintedClaudeExecutableProbe = nil
+        claudeExecutableOverridePipelineObserver(.clearProbeFingerprint)
+        claudeExecutableOverridePipelineObserver(.probe)
+        return await refreshClaudeCodeBinaryStatus(forceProbe: true)
+    }
+
+    @discardableResult
+    func resetClaudeExecutableOverrideToAutomatic() async -> Bool {
+        claudeExecutableOverrideMutationGeneration += 1
+        let generation = claudeExecutableOverrideMutationGeneration
+        isClaudeExecutableOverrideMutationInProgress = true
+        defer {
+            if claudeExecutableOverrideMutationGeneration == generation {
+                isClaudeExecutableOverrideMutationInProgress = false
+            }
+        }
+
+        claudeExecutableOverridePipelineObserver(.validate)
+        CLIExecutableOverrideStore.reset(
+            for: CLILaunchProfiles.claudeCode,
+            defaults: cliExecutableOverrideDefaults
+        )
+        claudeExecutableOverridePipelineObserver(.persist)
+        claudeExecutableDraftValidationTask?.cancel()
+        synchronizeClaudeExecutableOverrideAppliedState(updateDraft: true)
+
+        await cliResolvedCommandCacheInvalidator()
+        guard claudeExecutableOverrideMutationGeneration == generation else { return true }
+        claudeExecutableOverridePipelineObserver(.invalidateResolvedCommandCache)
+
+        fingerprintedClaudeExecutableProbe = nil
+        claudeExecutableOverridePipelineObserver(.clearProbeFingerprint)
+        claudeExecutableOverridePipelineObserver(.probe)
+        return await refreshClaudeCodeBinaryStatus(forceProbe: true)
+    }
+
+    @discardableResult
+    func recheckClaudeExecutableOverride() async -> Bool {
+        await refreshClaudeCodeBinaryStatus(forceProbe: true)
+    }
+
+    func claudeExecutablePathSuggestedBySelection(_ selectedURL: URL) -> String {
+        let resourceValues = try? selectedURL.resourceValues(forKeys: [.isDirectoryKey])
+        guard resourceValues?.isDirectory == true else {
+            return selectedURL.path
+        }
+
+        let candidate = selectedURL
+            .appendingPathComponent(CLILaunchProfiles.claudeCode.commandName, isDirectory: false)
+            .path
+        guard (try? CLIExecutableOverrideStore.validateForLaunch(candidate)) != nil else {
+            return selectedURL.path
+        }
+        return candidate
+    }
+
     @discardableResult
     func refreshClaudeCodeBinaryStatus(
         timeout: TimeInterval = 10,
         forceProbe: Bool = false
     ) async -> Bool {
+        synchronizeClaudeExecutableOverrideAppliedState(updateDraft: false)
+        let fingerprint = claudeExecutableOverrideAppliedState.fingerprint
         let previousAvailability = isClaudeFamilyModelProviderAvailable
         let previousStatus = claudeCodeCLIStatus
-        if case .probing = claudeCodeCLIStatus {
+
+        if !forceProbe, displayedClaudeExecutableProbeStatus == .probing {
             // Avoid turning an in-flight binary probe into a hard block. The caller's
             // concrete launch/test attempt will still surface command-not-found if needed.
             return true
@@ -623,19 +861,93 @@ public class APISettingsViewModel: ObservableObject {
             return true
         }
 
+        claudeExecutableProbeGeneration &+= 1
+        let probeGeneration = claudeExecutableProbeGeneration
         claudeCodeCLIStatus = .probing
+        fingerprintedClaudeExecutableProbe = FingerprintedClaudeExecutableProbe(
+            fingerprint: fingerprint,
+            status: .probing
+        )
         let collector = CLIProcessLogCollector()
         collector.append("Claude Code binary probe started")
-        await CLIEnvironmentCache.shared.invalidate()
-        var config = CLIProcessConfiguration(
-            shellLookupMode: .fallbackOnly,
-            captureStdoutTailBytes: 16 * 1024,
-            captureStderrTailBytes: 16 * 1024
-        )
-        config.logCollector = collector
-        config.ensureAdditionalPaths(CLIPathHints.claudeCode)
-        let runner = CLIProcessRunner(config: config)
+        let config: CLIProcessConfiguration
+        do {
+            config = try Self.claudeCodeProbeConfiguration(
+                defaults: cliExecutableOverrideDefaults,
+                captureTailBytes: 16 * 1024,
+                logCollector: collector
+            )
+        } catch {
+            collector.append("Claude Code binary probe configuration failed: \(error.localizedDescription)")
+            let outcome = ClaudeExecutableProbeOutcome.failed(message: error.localizedDescription)
+            await publishClaudeExecutableProbeOutcome(
+                outcome,
+                fingerprint: fingerprint,
+                probeGeneration: probeGeneration,
+                previousStatus: previousStatus,
+                previousAvailability: previousAvailability
+            )
+            return false
+        }
 
+        await CLIEnvironmentCache.shared.invalidate()
+        let outcome = if let claudeExecutableProbeOperation {
+            await claudeExecutableProbeOperation(config, timeout)
+        } else {
+            await Self.executeClaudeExecutableProbe(
+                config: config,
+                timeout: timeout,
+                collector: collector
+            )
+        }
+
+        await publishClaudeExecutableProbeOutcome(
+            outcome,
+            fingerprint: fingerprint,
+            probeGeneration: probeGeneration,
+            previousStatus: previousStatus,
+            previousAvailability: previousAvailability
+        )
+        return outcome.succeeded
+    }
+
+    private func publishClaudeExecutableProbeOutcome(
+        _ outcome: ClaudeExecutableProbeOutcome,
+        fingerprint: ClaudeExecutableSelectionFingerprint,
+        probeGeneration: UInt64,
+        previousStatus: ClaudeCodeCLIStatus,
+        previousAvailability: Bool
+    ) async {
+        guard probeGeneration == claudeExecutableProbeGeneration,
+              fingerprint == claudeExecutableOverrideAppliedState.fingerprint
+        else {
+            return
+        }
+
+        switch outcome {
+        case let .succeeded(resolvedCommand, version):
+            fingerprintedClaudeExecutableProbe = FingerprintedClaudeExecutableProbe(
+                fingerprint: fingerprint,
+                status: .succeeded(resolvedCommand: resolvedCommand, version: version)
+            )
+            claudeCodeCLIStatus = .binaryPresent
+        case let .failed(message):
+            fingerprintedClaudeExecutableProbe = FingerprintedClaudeExecutableProbe(
+                fingerprint: fingerprint,
+                status: .failed(message: message)
+            )
+            claudeCodeCLIStatus = .binaryMissing(message: message)
+        }
+        notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
+        await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
+    }
+
+    private static func executeClaudeExecutableProbe(
+        config: CLIProcessConfiguration,
+        timeout: TimeInterval,
+        collector: CLIProcessLogCollector
+    ) async -> ClaudeExecutableProbeOutcome {
+        let runner = CLIProcessRunner(config: config)
         do {
             let result = try await runner.run(
                 args: ["--version"],
@@ -646,22 +958,105 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Claude Code binary probe exited with status \(result.status)")
             await runner.cancelAll()
             guard result.status == 0 else {
-                claudeCodeCLIStatus = .binaryMissing(message: Self.claudeCodeBinaryUnavailableMessage(from: result))
-                notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
-                await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
-                return false
+                return .failed(message: claudeCodeBinaryUnavailableMessage(from: result))
             }
-            claudeCodeCLIStatus = .binaryPresent
-            notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
-            await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
-            return true
+
+            let stdout = String(data: result.stdout, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let stderr = String(data: result.stderr, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let version = stdout.isEmpty ? stderr : stdout
+            return .succeeded(
+                resolvedCommand: result.resolvedCommand,
+                version: version.isEmpty ? "Version output was empty." : version
+            )
         } catch {
             collector.append("Claude Code binary probe failed: \(error.localizedDescription)")
             await runner.cancelAll()
-            claudeCodeCLIStatus = .binaryMissing(message: Self.claudeCodeBinaryUnavailableMessage(from: error))
-            notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
-            await refreshClaudeFamilyModelAvailabilityIfNeeded(previousAvailability: previousAvailability)
-            return false
+            return .failed(message: claudeCodeBinaryUnavailableMessage(from: error))
+        }
+    }
+
+    private func synchronizeClaudeExecutableOverrideAppliedState(updateDraft: Bool) {
+        do {
+            let selection = try CLIExecutableOverrideStore.effectiveCommand(
+                for: CLILaunchProfiles.claudeCode,
+                defaults: cliExecutableOverrideDefaults
+            )
+            switch selection {
+            case .automatic:
+                claudeExecutableOverrideAppliedState = .automatic
+                if updateDraft {
+                    claudeExecutableOverrideDraft = ""
+                    claudeExecutableOverrideDraftValidation = .valid
+                    claudeExecutableOverrideDraftQuarantineWarning = nil
+                }
+            case let .configuredExactPath(path):
+                let validation: ClaudeExecutableOverrideValidation
+                do {
+                    try CLIExecutableOverrideStore.validateForLaunch(path)
+                    validation = .valid
+                } catch {
+                    validation = .invalid(message: error.localizedDescription)
+                }
+                let isQuarantined = Self.hasQuarantineAttribute(atPath: path)
+                claudeExecutableOverrideAppliedState = .configured(
+                    path: path,
+                    validation: validation,
+                    isQuarantined: isQuarantined
+                )
+                if updateDraft {
+                    claudeExecutableOverrideDraft = path
+                    claudeExecutableOverrideDraftValidation = validation
+                    claudeExecutableOverrideDraftQuarantineWarning = isQuarantined
+                        ? Self.claudeExecutableQuarantineWarning
+                        : nil
+                }
+            case .programmaticOverride:
+                assertionFailure("UserDefaults-backed Claude selection cannot be programmatic")
+            }
+        } catch {
+            claudeExecutableOverrideAppliedState = .corrupt(message: error.localizedDescription)
+            if updateDraft {
+                claudeExecutableOverrideDraft = ""
+                claudeExecutableOverrideDraftValidation = .notChecked
+                claudeExecutableOverrideDraftQuarantineWarning = nil
+            }
+        }
+    }
+
+    private static func assessClaudeExecutableDraft(_ draft: String) -> ClaudeExecutableDraftAssessment {
+        do {
+            guard let normalizedPath = try CLIExecutableOverrideStore.normalizeForApply(draft) else {
+                return ClaudeExecutableDraftAssessment(
+                    validation: .valid,
+                    normalizedPath: nil,
+                    isQuarantined: false
+                )
+            }
+            try CLIExecutableOverrideStore.validateForLaunch(normalizedPath)
+            return ClaudeExecutableDraftAssessment(
+                validation: .valid,
+                normalizedPath: normalizedPath,
+                isQuarantined: hasQuarantineAttribute(atPath: normalizedPath)
+            )
+        } catch {
+            return ClaudeExecutableDraftAssessment(
+                validation: .invalid(message: error.localizedDescription),
+                normalizedPath: nil,
+                isQuarantined: false
+            )
+        }
+    }
+
+    private static let claudeExecutableQuarantineWarning =
+        "This file has the com.apple.quarantine attribute. macOS may block or prompt when it launches; RepoPrompt will not remove the attribute."
+
+    private static func hasQuarantineAttribute(atPath path: String) -> Bool {
+        path.withCString { pathPointer in
+            "com.apple.quarantine".withCString { attributePointer in
+                getxattr(pathPointer, attributePointer, nil, 0, 0, 0) >= 0
+            }
         }
     }
 
@@ -705,7 +1100,18 @@ public class APISettingsViewModel: ObservableObject {
             return result
         }
 
-        let provider = ClaudeCodeProvider()
+        let provider: ClaudeCodeProvider
+        do {
+            provider = try ClaudeCodeProvider(defaults: cliExecutableOverrideDefaults)
+        } catch {
+            let message = error.localizedDescription
+            let result = ClaudeCompatibleBackendTestResult.binaryMissing(message: message)
+            compatibleBackendLastTestResult[id] = result
+            let previousStatus = claudeCodeCLIStatus
+            claudeCodeCLIStatus = .binaryMissing(message: message)
+            notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
+            return result
+        }
         let start = Date()
         do {
             let ok = try await provider.testCompatibleBackendConnection(id, timeout: 30)
@@ -756,6 +1162,8 @@ public class APISettingsViewModel: ObservableObject {
     private static func claudeCodeBinaryUnavailableMessage(from error: Error) -> String {
         if let runnerError = error as? CLIProcessRunnerError {
             switch runnerError {
+            case let .explicitCommandNotLaunchable(path, reason):
+                return "\(reason.localizedDescription) Configured path: \(path)."
             case .commandNotFound:
                 return "Claude Code CLI isn't installed or isn't on PATH."
             case let .spawnFailed(message):
@@ -960,6 +1368,11 @@ public class APISettingsViewModel: ObservableObject {
 
     private let aiQueriesService: AIQueriesService
     private let keyManager: KeyManager
+    private let cliExecutableOverrideDefaults: UserDefaults
+    private let claudeExecutableDraftValidator: (String) async -> ClaudeExecutableDraftAssessment
+    private let claudeExecutableProbeOperation: ((CLIProcessConfiguration, TimeInterval) async -> ClaudeExecutableProbeOutcome)?
+    private let cliResolvedCommandCacheInvalidator: () async -> Void
+    private let claudeExecutableOverridePipelineObserver: (ClaudeExecutableOverridePipelineStage) -> Void
     private let codexModelPollingService: CodexModelPollingService
     private let apiModelCatalog: APIModelCatalog
     private let anthropicModelsLoader: @Sendable (String) async throws -> [String]
@@ -975,12 +1388,28 @@ public class APISettingsViewModel: ObservableObject {
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
         apiModelCatalog: APIModelCatalog? = nil,
+        cliExecutableOverrideDefaults: UserDefaults = .standard,
+        claudeExecutableDraftValidator: ((String) async -> ClaudeExecutableDraftAssessment)? = nil,
+        claudeExecutableProbeOperation: ((CLIProcessConfiguration, TimeInterval) async -> ClaudeExecutableProbeOutcome)? = nil,
+        cliResolvedCommandCacheInvalidator: (() async -> Void)? = nil,
+        claudeExecutableOverridePipelineObserver: ((ClaudeExecutableOverridePipelineStage) -> Void)? = nil,
         anthropicModelsLoader: (@Sendable (String) async throws -> [String])? = nil,
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil
     ) {
         self.aiQueriesService = aiQueriesService
         self.keyManager = keyManager
+        self.cliExecutableOverrideDefaults = cliExecutableOverrideDefaults
+        self.claudeExecutableDraftValidator = claudeExecutableDraftValidator ?? { input in
+            Self.assessClaudeExecutableDraft(input)
+        }
+        self.claudeExecutableProbeOperation = claudeExecutableProbeOperation
+        self.cliResolvedCommandCacheInvalidator = cliResolvedCommandCacheInvalidator ?? {
+            await CLIProcessRunner.invalidateResolvedCommandCache(
+                command: CLILaunchProfiles.claudeCode.commandName
+            )
+        }
+        self.claudeExecutableOverridePipelineObserver = claudeExecutableOverridePipelineObserver ?? { _ in }
         self.codexModelPollingService = codexModelPollingService
         self.apiModelCatalog = apiModelCatalog ?? Self.makeDefaultAPIModelCatalog()
         self.anthropicModelsLoader = anthropicModelsLoader ?? { apiKey in
@@ -988,6 +1417,7 @@ public class APISettingsViewModel: ObservableObject {
         }
         self.storedDataLoadBoundary = storedDataLoadBoundary
         self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
+        synchronizeClaudeExecutableOverrideAppliedState(updateDraft: true)
         installCLIConnectionObservers()
         installAgentAvailabilityObservers()
         refreshAgentAvailability()
@@ -1029,6 +1459,8 @@ public class APISettingsViewModel: ObservableObject {
         customModelsTask = nil
         contextBuilderProviderValidationTask?.cancel()
         contextBuilderProviderValidationTask = nil
+        claudeExecutableDraftValidationTask?.cancel()
+        claudeExecutableDraftValidationTask = nil
         cliConnectionCancellables.removeAll()
         agentAvailabilityCancellable?.cancel()
         agentAvailabilityCancellable = nil
@@ -1205,12 +1637,18 @@ public class APISettingsViewModel: ObservableObject {
             return false
         }
 
-        var config = CLIProcessConfiguration(
-            shellLookupMode: .fallbackOnly,
-            captureStdoutTailBytes: 8 * 1024,
-            captureStderrTailBytes: 8 * 1024
-        )
-        config.ensureAdditionalPaths(CLIPathHints.claudeCode)
+        let config: CLIProcessConfiguration
+        do {
+            config = try Self.claudeCodeProbeConfiguration(
+                defaults: cliExecutableOverrideDefaults,
+                captureTailBytes: 8 * 1024
+            )
+        } catch {
+            let previousStatus = claudeCodeCLIStatus
+            claudeCodeCLIStatus = .binaryMissing(message: error.localizedDescription)
+            notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
+            return false
+        }
         let runner = CLIProcessRunner(config: config)
         do {
             let result = try await runner.run(
@@ -2820,7 +3258,21 @@ public class APISettingsViewModel: ObservableObject {
         collector.append("Refreshing login-shell environment cache")
         await CLIEnvironmentCache.shared.invalidate()
 
-        let provider = ClaudeCodeProvider(logCollector: collector)
+        let provider: ClaudeCodeProvider
+        do {
+            provider = try ClaudeCodeProvider(
+                logCollector: collector,
+                defaults: cliExecutableOverrideDefaults
+            )
+        } catch {
+            collector.append("Claude Code provider configuration failed: \(error.localizedDescription)")
+            isClaudeCodeConnected = false
+            setContextBuilderProviderVerified(.claudeCode, verified: false)
+            claudeCodeCLIStatus = .binaryMissing(message: error.localizedDescription)
+            notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
+            claudeCodeError = error.localizedDescription
+            throw error
+        }
         collector.append("Created Claude Code provider for health check")
 
         do {

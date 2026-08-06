@@ -14,22 +14,22 @@ import XCTest
 /// on the real `claude` binary and is verified as a local capture-proxy diagnostic, not a committed
 /// test, since it requires the binary and live credentials.
 final class ClaudeNativeIdentityPreambleTests: XCTestCase {
-    private func makeController(variant: ClaudeCodeRuntimeVariant) -> ClaudeNativeProcessSessionController {
+    private func makeController(variant: ClaudeCodeRuntimeVariant) throws -> ClaudeNativeProcessSessionController {
         // buildArguments' append logic keys only on `runtimeVariant`; the other fields .agentMode
         // derives from UserDefaults do not affect the assertions below.
-        ClaudeNativeProcessSessionController(
+        try ClaudeNativeProcessSessionController(
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
             workspacePath: nil,
-            config: .agentMode(modelString: nil, runtimeVariant: variant)
+            config: .agentMode(commandName: "claude", modelString: nil, runtimeVariant: variant)
         )
     }
 
     func testGLMVariantAppendsIdentityPreambleFlagWithValidValue() async throws {
         // Defect guarded: dropping the gate, mis-scoping it, or using an empty/trigger-word value
         // re-exposes GLM runs to z.ai's 529 shedding under peak load (issue #295).
-        let controller = makeController(variant: .glm)
+        let controller = try makeController(variant: .glm)
         let args = await controller.test_buildArguments(existingSessionID: nil, model: nil)
 
         let flagIndex = try XCTUnwrap(
@@ -52,12 +52,12 @@ final class ClaudeNativeIdentityPreambleTests: XCTestCase {
         )
     }
 
-    func testNonGLMVariantsDoNotAppendIdentityPreambleFlag() async {
+    func testNonGLMVariantsDoNotAppendIdentityPreambleFlag() async throws {
         // .standard is a hard contract: real-Anthropic usage is never shed and must stay untouched.
         // .kimi/.customCompatible lock the current GLM-only scope; if they later show the same
         // symptom, broaden the gate from `.glm` to `!= .standard` and drop those rows here.
         for variant in [ClaudeCodeRuntimeVariant.standard, .kimi, .customCompatible] {
-            let controller = makeController(variant: variant)
+            let controller = try makeController(variant: variant)
             let args = await controller.test_buildArguments(existingSessionID: nil, model: nil)
             XCTAssertFalse(
                 args.contains("--append-system-prompt"),

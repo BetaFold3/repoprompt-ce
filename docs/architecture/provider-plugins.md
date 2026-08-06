@@ -127,6 +127,16 @@ The remote-by-default policy avoids breaking checkouts that do not have a siblin
 
 The package never touches `UserDefaults`, `Keychain`, or `AgentPermissionSecureStore`. Secrets and persisted backend configs are read in core, sanitized into plugin DTOs (`ClaudeCompatibleBackendConfig`, `ClaudeCompatibleLaunchEnvironment`), and handed to the package at launch/catalog time through bridge functions and provider closures.
 
+## Claude CLI executable selection
+
+Core owns the user-configurable Claude CLI executable override. Settings persists the applied path under `cliExecutableOverride.claude`; `CLIProvidersSettingsView` presents it in the Claude CLI section, and `APISettingsViewModel` owns draft validation, apply/reset, and probes.
+
+The override is sampled for new local Claude-family sessions and one-shot operations. It covers interactive Agent Mode, headless discovery, Settings probes, and Claude MCP installation for standard Claude Code, GLM, Kimi, and custom Claude-compatible backends. Remote-host sessions ignore the local preference, and Codex executable selection is unaffected.
+
+A configured path is validated before launch. Failure produces a typed error and never falls back to another `claude`; configured launches bypass `CommandPathResolver` and `ResolvedCommandCache`. With an empty setting, automatic resolution retains `.preferShell` login-shell lookup. The two Settings probes also use `.preferShell`, matching the local runtime instead of their former `.fallbackOnly` behavior.
+
+`CLIProcessConfiguration.init` requires every call site to name `command:` explicitly; the parameter has no default value. Wrapper or shim paths apply only to new sessions, must `exec` the real CLI, and must keep stdout transparent for the stream-JSON protocol.
+
 ## Bridge responsibilities
 
 ### `ClaudeCompatibleProviderRuntimeBridge` (infrastructure)

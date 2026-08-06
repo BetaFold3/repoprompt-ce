@@ -247,8 +247,14 @@ struct TailscaleStatusClient: TailscaleStatusProviding {
                     throw TailscaleStatusError.outputTooLarge
                 }
                 stderr.append(chunk)
-            case let .terminated(status, timedOut):
-                return CLIProcessRunner.Result(stdout: stdout, stderr: stderr, status: status, timedOut: timedOut)
+            case let .terminated(status, timedOut, resolvedCommand):
+                return CLIProcessRunner.Result(
+                    stdout: stdout,
+                    stderr: stderr,
+                    status: status,
+                    timedOut: timedOut,
+                    resolvedCommand: resolvedCommand
+                )
             }
         }
         throw TailscaleStatusError.processFailed(status: -1, message: "process ended without termination status")

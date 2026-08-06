@@ -9,7 +9,7 @@ final class ClaudeAgentModeCoordinator {
         _ tabID: UUID,
         _ windowID: Int,
         _ launchSettings: ControllerLaunchSettings
-    ) -> any NativeAgentRuntimeControlling
+    ) throws -> any NativeAgentRuntimeControlling
 
     /// Closure that waits until the given runID has zero active MCP tool executions.
     /// Throws `CancellationError` if the calling Task is cancelled.
@@ -101,8 +101,8 @@ final class ClaudeAgentModeCoordinator {
         tabID: UUID,
         windowID: Int,
         launchSettings: ControllerLaunchSettings
-    ) -> any NativeAgentRuntimeControlling {
-        let coreConfig = ClaudeCodeAgentConfig.agentMode(
+    ) throws -> any NativeAgentRuntimeControlling {
+        let coreConfig = try ClaudeCodeAgentConfig.agentMode(
             runtimeVariant: launchSettings.runtimeVariant,
             permissionMode: launchSettings.permissionMode,
             allowNativeBashTool: launchSettings.allowNativeBashTool,
@@ -121,7 +121,8 @@ final class ClaudeAgentModeCoordinator {
                 tabID: tabID,
                 windowID: windowID,
                 workspacePath: launchSettings.workspacePath,
-                config: coreConfig
+                config: coreConfig,
+                commandSelection: coreConfig.commandSelection
             )
         }
     }
@@ -342,12 +343,21 @@ final class ClaudeAgentModeCoordinator {
                 sessionProfile: session.profile,
                 toolSearchEnabled: effectiveToolSearchEnabled
             )
-            let createdController = claudeControllerFactory(
-                runID,
-                session.tabID,
-                windowID,
-                launchSettings
-            )
+            let createdController: any NativeAgentRuntimeControlling
+            do {
+                createdController = try claudeControllerFactory(
+                    runID,
+                    session.tabID,
+                    windowID,
+                    launchSettings
+                )
+            } catch {
+                let message = Self.providerStartupFailureMessage(for: error)
+                let errorItem = AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex)
+                session.appendItem(errorItem)
+                finalizeSession(session, state: .failed, save: true)
+                return
+            }
             invalidateControllerRetirement(for: session)
             session.claudeController = createdController
             controllerLaunchSettingsByTabID[session.tabID] = launchSettings
@@ -383,6 +393,19 @@ final class ClaudeAgentModeCoordinator {
         } catch ControllerLifecycleError.superseded {
             return
         } catch {
+            if await controller.requiresReplacementAfterTerminalStartupFailure,
+               let detached = detachClaudeController(
+                   controller,
+                   from: session,
+                   removeToolTracking: true
+               )
+            {
+                _ = await retireClaudeController(
+                    detached,
+                    for: session,
+                    captureProviderSessionID: false
+                )
+            }
             let errorItem = AgentChatItem.error(
                 "Claude native start failed: \(error.localizedDescription)",
                 sequenceIndex: session.nextSequenceIndex
@@ -628,7 +651,7 @@ final class ClaudeAgentModeCoordinator {
                 sessionProfile: session.profile,
                 toolSearchEnabled: effectiveToolSearchEnabled
             )
-            let freshController = claudeControllerFactory(
+            let freshController = try claudeControllerFactory(
                 freshRunID,
                 session.tabID,
                 windowID,

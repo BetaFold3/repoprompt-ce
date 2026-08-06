@@ -98,9 +98,17 @@ final class ClaudeCodeProvider: AIProvider {
         defaultRequestTimeout: TimeInterval? = nil,
         testRequestTimeout: TimeInterval? = nil,
         maxRetries: Int? = nil,
-        logCollector: CLIProcessLogCollector? = nil
-    ) {
+        logCollector: CLIProcessLogCollector? = nil,
+        defaults: UserDefaults = .standard
+    ) throws {
+        let commandSelection = try CLIExecutableOverrideStore.effectiveCommand(
+            for: CLILaunchProfiles.claudeCode,
+            defaults: defaults
+        )
         var config = CLIProcessConfiguration(
+            command: commandSelection.command,
+            validationCommandName: CLILaunchProfiles.claudeCode.commandName,
+            commandSelection: commandSelection,
             workingDirectory: workingDirectory,
             captureStdoutTailBytes: 128 * 1024,
             captureStderrTailBytes: 256 * 1024
@@ -264,6 +272,8 @@ final class ClaudeCodeProvider: AIProvider {
     private func mapProcessError(_ error: Error) -> Error {
         if let runnerError = error as? CLIProcessRunnerError {
             switch runnerError {
+            case .explicitCommandNotLaunchable:
+                return AIProviderError.invalidConfiguration(detail: runnerError.localizedDescription)
             case let .commandNotFound(command):
                 return AIProviderError.invalidConfiguration(detail: "Command not found: \(command)")
             case let .spawnFailed(message):

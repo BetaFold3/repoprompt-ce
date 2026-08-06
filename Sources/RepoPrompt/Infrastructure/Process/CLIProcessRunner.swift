@@ -28,17 +28,27 @@ private actor GateReleaseCoordinator {
 private actor ResolvedCommandCache {
     static let shared = ResolvedCommandCache()
     private var map: [String: String] = [:] // command -> absolute path
-    func get(for command: String) -> String? {
-        map[command]
+    private var generation: UInt64 = 0
+
+    func lookup(for command: String) -> (path: String?, generation: UInt64) {
+        (map[command], generation)
     }
 
-    func put(_ path: String, for command: String) {
+    func put(_ path: String, for command: String, observedGeneration: UInt64) {
+        guard generation == observedGeneration else { return }
         map[command] = path
     }
 
     func invalidate(_ command: String? = nil) {
+        generation &+= 1
         if let command { map.removeValue(forKey: command) } else { map.removeAll() }
     }
+}
+
+private struct ResolvedAutomaticCommand {
+    let command: String
+    let cacheKey: String
+    let cacheGeneration: UInt64
 }
 
 /// Diagnostics logger for lifecycle gate operations
@@ -52,6 +62,7 @@ enum LifecycleGateDiagnostics {
 }
 
 enum CLIProcessRunnerError: Error, LocalizedError {
+    case explicitCommandNotLaunchable(path: String, reason: CLIExecutableOverrideError)
     case commandNotFound(String)
     case spawnFailed(String)
     case inputEncodingFailed
@@ -60,6 +71,8 @@ enum CLIProcessRunnerError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case let .explicitCommandNotLaunchable(path, reason):
+            "Configured CLI executable is not launchable at \(path): \(reason.localizedDescription)"
         case let .commandNotFound(command):
             "Command not found: \(command)"
         case let .spawnFailed(message):
@@ -80,6 +93,7 @@ final class CLIProcessRunner {
         let stderr: Data
         let status: Int32
         let timedOut: Bool
+        let resolvedCommand: String
     }
 
     enum OutputFlagMode {
@@ -91,7 +105,7 @@ final class CLIProcessRunner {
     enum StreamEvent {
         case stdout(Data)
         case stderr(Data)
-        case terminated(status: Int32, timedOut: Bool)
+        case terminated(status: Int32, timedOut: Bool, resolvedCommand: String)
     }
 
     let config: CLIProcessConfiguration
@@ -101,6 +115,64 @@ final class CLIProcessRunner {
     init(config: CLIProcessConfiguration, concurrencyLimit: Int = 1) {
         self.config = config
         gate = TaskSemaphore(max(concurrencyLimit, 1))
+    }
+
+    static func invalidateResolvedCommandCache(command: String) async {
+        await ResolvedCommandCache.shared.invalidate(command)
+    }
+
+    private var commandForAutomaticResolution: String {
+        switch config.commandSelection {
+        case let .automatic(command), let .programmaticOverride(command):
+            command
+        case .configuredExactPath, nil:
+            config.command
+        }
+    }
+
+    private func validatedConfiguredCommandForLaunch() throws -> String? {
+        guard case let .configuredExactPath(path) = config.commandSelection else {
+            return nil
+        }
+        do {
+            return try CLIExecutableOverrideStore.validateForLaunch(
+                path,
+                commandName: config.validationCommandName
+            )
+        } catch let reason as CLIExecutableOverrideError {
+            throw CLIProcessRunnerError.explicitCommandNotLaunchable(path: path, reason: reason)
+        }
+    }
+
+    private func resolveAutomaticCommand(
+        _ command: String,
+        environment: [String: String]
+    ) async -> ResolvedAutomaticCommand {
+        let lookup = await ResolvedCommandCache.shared.lookup(for: command)
+        if let cached = lookup.path, Self.isRunnableExecutable(cached) {
+            log("Using cached command path for \(command): \(cached)")
+            return ResolvedAutomaticCommand(
+                command: cached,
+                cacheKey: command,
+                cacheGeneration: lookup.generation
+            )
+        }
+        log("Resolving command: \(command)")
+        let resolved = CommandPathResolver.resolve(
+            command,
+            environment: environment,
+            additionalPaths: config.additionalPaths,
+            logger: { [weak self] message in
+                self?.log(message)
+            },
+            preferredBasenames: (config.resolveCandidates?.isEmpty == false ? config.resolveCandidates : [command]),
+            shellLookupMode: config.shellLookupMode
+        )
+        return ResolvedAutomaticCommand(
+            command: resolved,
+            cacheKey: command,
+            cacheGeneration: lookup.generation
+        )
     }
 
     @inline(__always)
@@ -145,30 +217,23 @@ final class CLIProcessRunner {
         cancelChildOnTaskCancellation: Bool = false
     ) async throws -> Result {
         try await gate.withPermit { [self] in
+            let configuredCommand = try validatedConfiguredCommandForLaunch()
+            let resolutionCommand = commandForAutomaticResolution
             let environment = await resolvedEnvironment(
                 additionalEnvironment: additionalEnvironment,
                 additionalRemovedKeys: additionalRemovedKeys
             )
-            // Prefer a previously successful absolute path for this command.
-            let resolvedCommand: String = await {
-                if let cached = await ResolvedCommandCache.shared.get(for: config.command),
-                   Self.isRunnableExecutable(cached)
-                {
-                    log("Using cached command path for \(config.command): \(cached)")
-                    return cached
-                }
-                log("Resolving command: \(config.command)")
-                return CommandPathResolver.resolve(
-                    config.command,
-                    environment: environment,
-                    additionalPaths: config.additionalPaths,
-                    logger: { [weak self] message in
-                        self?.log(message)
-                    },
-                    preferredBasenames: (config.resolveCandidates?.isEmpty == false ? config.resolveCandidates : [config.command]),
-                    shellLookupMode: config.shellLookupMode
-                )
-            }()
+            // Strict configured paths bypass both automatic resolution and its cache.
+            let resolvedCommand: String
+            let automaticResolution: ResolvedAutomaticCommand?
+            if let configuredCommand {
+                resolvedCommand = configuredCommand
+                automaticResolution = nil
+            } else {
+                let resolution = await resolveAutomaticCommand(resolutionCommand, environment: environment)
+                resolvedCommand = resolution.command
+                automaticResolution = resolution
+            }
             let workingDirectory = CommandPathResolver.expandPath(config.workingDirectory, environment: environment)
             log("Using working directory: \(workingDirectory)")
             var arguments = config.commandSuffix + args
@@ -346,12 +411,22 @@ final class CLIProcessRunner {
                 }
                 log("Process \(spawned.pid) exited with status \(status) (timed out: \(timedOut))")
                 // On success, memorize the absolute path for next time.
-                if status == 0, !timedOut, resolvedCommand.contains("/"),
+                if let automaticResolution, status == 0, !timedOut, resolvedCommand.contains("/"),
                    Self.isRunnableExecutable(resolvedCommand)
                 {
-                    await ResolvedCommandCache.shared.put(resolvedCommand, for: config.command)
+                    await ResolvedCommandCache.shared.put(
+                        resolvedCommand,
+                        for: automaticResolution.cacheKey,
+                        observedGeneration: automaticResolution.cacheGeneration
+                    )
                 }
-                return Result(stdout: stdoutData, stderr: stderrData, status: status, timedOut: timedOut)
+                return Result(
+                    stdout: stdoutData,
+                    stderr: stderrData,
+                    status: status,
+                    timedOut: timedOut,
+                    resolvedCommand: resolvedCommand
+                )
             }
         }
     }
@@ -366,10 +441,21 @@ final class CLIProcessRunner {
         onProcessStarted: (@Sendable (pid_t) async -> Void)? = nil,
         onProcessTerminated: (@Sendable (pid_t) async -> Void)? = nil
     ) async throws -> AsyncThrowingStream<StreamEvent, Error> {
-        // Hold the permit for the entire lifetime of the child process
+        let resolutionCommand = commandForAutomaticResolution
+
+        // Hold the permit for the entire lifetime of the child process.
         ProcessDiagnostics.log("🔵 [GATE] Acquiring gate...")
         await gate.acquire()
         ProcessDiagnostics.log("🟢 [GATE] Acquired")
+
+        // Validate strict paths after acquiring the gate so queued launches cannot use stale validation.
+        let configuredCommand: String?
+        do {
+            configuredCommand = try validatedConfiguredCommandForLaunch()
+        } catch {
+            await gate.release()
+            throw error
+        }
 
         // If the caller cancelled before we even start heavy work, bail out now.
         try await cancelEarlyReleasingGate(phase: "after acquiring gate")
@@ -381,25 +467,16 @@ final class CLIProcessRunner {
 
         // Cancellation can happen while we were building environment; check again.
         try await cancelEarlyReleasingGate(phase: "after env/compose")
-        let resolvedCommand: String = await {
-            if let cached = await ResolvedCommandCache.shared.get(for: config.command),
-               Self.isRunnableExecutable(cached)
-            {
-                log("Using cached command path for \(config.command): \(cached)")
-                return cached
-            }
-            log("Resolving command: \(config.command)")
-            return CommandPathResolver.resolve(
-                config.command,
-                environment: environment,
-                additionalPaths: config.additionalPaths,
-                logger: { [weak self] message in
-                    self?.log(message)
-                },
-                preferredBasenames: (config.resolveCandidates?.isEmpty == false ? config.resolveCandidates : [config.command]),
-                shellLookupMode: config.shellLookupMode
-            )
-        }()
+        let resolvedCommand: String
+        let automaticResolution: ResolvedAutomaticCommand?
+        if let configuredCommand {
+            resolvedCommand = configuredCommand
+            automaticResolution = nil
+        } else {
+            let resolution = await resolveAutomaticCommand(resolutionCommand, environment: environment)
+            resolvedCommand = resolution.command
+            automaticResolution = resolution
+        }
 
         // Command resolution (which can spawn an interactive shell) finished; check again.
         try await cancelEarlyReleasingGate(phase: "after command resolve")
@@ -592,12 +669,20 @@ final class CLIProcessRunner {
                         collector?.appendDataSection(title: "STDERR", data: stderrTail)
                     }
                     // On success, memorize the absolute path for next time.
-                    if status == 0, !timedOut, resolvedCommand.contains("/"),
+                    if let automaticResolution, status == 0, !timedOut, resolvedCommand.contains("/"),
                        Self.isRunnableExecutable(resolvedCommand)
                     {
-                        await ResolvedCommandCache.shared.put(resolvedCommand, for: config.command)
+                        await ResolvedCommandCache.shared.put(
+                            resolvedCommand,
+                            for: automaticResolution.cacheKey,
+                            observedGeneration: automaticResolution.cacheGeneration
+                        )
                     }
-                    continuation.yield(.terminated(status: status, timedOut: timedOut))
+                    continuation.yield(.terminated(
+                        status: status,
+                        timedOut: timedOut,
+                        resolvedCommand: resolvedCommand
+                    ))
                     continuation.finish()
                     ProcessDiagnostics.log("✅ [STREAM] Finished normally for pid=\(spawned.pid)")
                 } catch {
@@ -778,6 +863,16 @@ final class CLIProcessRunner {
             return .spawnFailed("Failed to configure spawn attributes (\(operation)) for \(command): \(message)")
         case let .spawnFailed(errnoValue):
             if errnoValue == ENOENT {
+                if case .configuredExactPath = config.commandSelection {
+                    let underlying = NSError(
+                        domain: NSPOSIXErrorDomain,
+                        code: Int(errnoValue)
+                    )
+                    return .explicitCommandNotLaunchable(
+                        path: command,
+                        reason: .launchFailedAfterValidation(underlying: underlying)
+                    )
+                }
                 return .commandNotFound(command)
             }
             let message = String(cString: strerror(errnoValue))

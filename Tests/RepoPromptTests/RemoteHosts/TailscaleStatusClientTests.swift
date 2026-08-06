@@ -57,7 +57,7 @@ final class TailscaleStatusClientTests: XCTestCase {
         }
         """.utf8)
         let client = TailscaleStatusClient(run: {
-            CLIProcessRunner.Result(stdout: data, stderr: Data(), status: 0, timedOut: false)
+            CLIProcessRunner.Result(stdout: data, stderr: Data(), status: 0, timedOut: false, resolvedCommand: "/usr/bin/tailscale")
         })
 
         let status = try await client.status()
@@ -78,7 +78,7 @@ final class TailscaleStatusClientTests: XCTestCase {
         await assertStatusError(data: Data("not-json".utf8), expected: .invalidJSON)
 
         let failed = TailscaleStatusClient(run: {
-            CLIProcessRunner.Result(stdout: Data(), stderr: Data("no daemon".utf8), status: 1, timedOut: false)
+            CLIProcessRunner.Result(stdout: Data(), stderr: Data("no daemon".utf8), status: 1, timedOut: false, resolvedCommand: "/usr/bin/tailscale")
         })
         do {
             _ = try await failed.status()
@@ -92,7 +92,8 @@ final class TailscaleStatusClientTests: XCTestCase {
                 stdout: Data(repeating: 0, count: TailscaleStatusClient.maximumCombinedOutputBytes + 1),
                 stderr: Data(),
                 status: 0,
-                timedOut: false
+                timedOut: false,
+                resolvedCommand: "/usr/bin/tailscale"
             )
         })
         do {
@@ -105,7 +106,7 @@ final class TailscaleStatusClientTests: XCTestCase {
 
     private func assertStatusError(data: Data, expected: TailscaleStatusError) async {
         let client = TailscaleStatusClient(run: {
-            CLIProcessRunner.Result(stdout: data, stderr: Data(), status: 0, timedOut: false)
+            CLIProcessRunner.Result(stdout: data, stderr: Data(), status: 0, timedOut: false, resolvedCommand: "/usr/bin/tailscale")
         })
         do {
             _ = try await client.status()

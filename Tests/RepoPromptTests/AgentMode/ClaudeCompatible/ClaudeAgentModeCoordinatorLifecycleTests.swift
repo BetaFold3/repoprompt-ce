@@ -330,6 +330,39 @@ extension AgentModeRunServiceLifecycleTests {
         ], in: recorder)
     }
 
+    func testConfiguredTerminalStartupFailureDiscardsControllerAndLaunchSettings() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "configured-failure",
+            failStart: true,
+            requiresReplacementAfterTerminalStartupFailure: true
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = makeRunningClaudeSession(controller: controller)
+        let runtime = resolvedClaudeLaunchPolicy(
+            profile: session.permissionProfile,
+            harness: harness
+        )
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+
+        await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+
+        XCTAssertNil(session.claudeController)
+        XCTAssertNil(harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session))
+        XCTAssertEqual(session.runState, .failed)
+        assertOrderedEvents([
+            "configured-failure:start",
+            "configured-failure:shutdown"
+        ], in: recorder)
+    }
+
     func testClaudeSendCompletionDoesNotFailReplacementController() async {
         let recorder = LifecycleRecorder()
         let sendGate = LifecycleAsyncGate()
@@ -499,6 +532,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let label: String
     private let turnInFlight: Bool
     private let failSend: Bool
+    private let failStart: Bool
+    private let replacementAfterTerminalStartupFailure: Bool
     private let currentSessionRefGate: LifecycleAsyncGate?
     private let eventsStreamReadyGate: LifecycleAsyncGate?
     private let sendUserMessageGate: LifecycleAsyncGate?
@@ -510,6 +545,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         label: String = "claude",
         hasTurnInFlight: Bool = false,
         failSend: Bool = false,
+        failStart: Bool = false,
+        requiresReplacementAfterTerminalStartupFailure: Bool = false,
         currentSessionRefGate: LifecycleAsyncGate? = nil,
         eventsStreamReadyGate: LifecycleAsyncGate? = nil,
         sendUserMessageGate: LifecycleAsyncGate? = nil
@@ -518,6 +555,8 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.label = label
         turnInFlight = hasTurnInFlight
         self.failSend = failSend
+        self.failStart = failStart
+        replacementAfterTerminalStartupFailure = requiresReplacementAfterTerminalStartupFailure
         self.currentSessionRefGate = currentSessionRefGate
         self.eventsStreamReadyGate = eventsStreamReadyGate
         self.sendUserMessageGate = sendUserMessageGate
@@ -536,6 +575,10 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         stream
     }
 
+    var requiresReplacementAfterTerminalStartupFailure: Bool {
+        replacementAfterTerminalStartupFailure
+    }
+
     func ensureEventsStreamReady() async {
         if let eventsStreamReadyGate {
             recorder.record("\(label):events-ready")
@@ -552,6 +595,9 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         systemPromptOverride: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
         recorder.record("\(label):start")
+        if failStart {
+            throw AIProviderError.invalidConfiguration(detail: "Expected configured startup failure")
+        }
         return sessionRef
     }
 

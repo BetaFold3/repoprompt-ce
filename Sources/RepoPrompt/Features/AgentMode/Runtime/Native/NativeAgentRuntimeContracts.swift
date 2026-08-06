@@ -11,6 +11,7 @@ protocol NativeAgentRuntimeControlling: Actor {
     var hasActiveSession: Bool { get async }
     var hasTurnInFlight: Bool { get async }
     var events: AsyncStream<NativeAgentRuntimeEvent> { get async }
+    var requiresReplacementAfterTerminalStartupFailure: Bool { get async }
 
     func ensureEventsStreamReady() async
     func resetEventsStreamForNewRun() async
@@ -30,10 +31,17 @@ protocol NativeAgentRuntimeControlling: Actor {
     func respondToPermissionRequest(id: String, decision: AgentApprovalDecision) async
 }
 
+extension NativeAgentRuntimeControlling {
+    var requiresReplacementAfterTerminalStartupFailure: Bool {
+        false
+    }
+}
+
 // MARK: - Current Claude-compatible native runtime aliases
 
-// Native process control is still core-owned in this wave. These compatibility
-// aliases let coordinators/runners depend on the provider-neutral contract
+// Native process control is still core-owned in this wave. Typed executable-selection
+// strictness is likewise core-owned today and is intentionally absent from the plugin DTO.
+// These compatibility aliases let coordinators/runners depend on the provider-neutral contract
 // while preserving the current Claude runtime DTO shapes. When a second native
 // provider lands, the aliases become proper neutral DTOs and the Claude
 // controller conforms via its own mapping.

@@ -1,0 +1,1005 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Human-friendly technical implementation report for the Claude CLI executable path override in RepoPrompt CE.">
+  <title>Claude CLI Executable Path Override — Technical Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f4f7f9;
+      --surface: #ffffff;
+      --surface-2: #f7fafc;
+      --ink: #17212b;
+      --muted: #5d6b78;
+      --line: #d9e2e9;
+      --blue: #245cc5;
+      --blue-soft: #eaf1ff;
+      --green: #17754c;
+      --green-soft: #e7f7ef;
+      --amber: #946200;
+      --amber-soft: #fff3d5;
+      --red: #ad3f49;
+      --red-soft: #ffeaed;
+      --purple: #6944aa;
+      --purple-soft: #f0eaff;
+      --cyan: #087286;
+      --cyan-soft: #e5f6f8;
+      --shadow: 0 16px 44px rgba(30, 52, 70, .08);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d141b;
+        --surface: #171f28;
+        --surface-2: #202a35;
+        --ink: #edf3f7;
+        --muted: #b2bec8;
+        --line: #35424f;
+        --blue: #91b0ff;
+        --blue-soft: #27365c;
+        --green: #78d6aa;
+        --green-soft: #173d2d;
+        --amber: #ebc46d;
+        --amber-soft: #4b391a;
+        --red: #ff9da7;
+        --red-soft: #4c292e;
+        --purple: #c9b1ff;
+        --purple-soft: #392d55;
+        --cyan: #75d1df;
+        --cyan-soft: #173d45;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 92% -4%, color-mix(in srgb, var(--blue) 13%, transparent), transparent 34rem),
+        radial-gradient(circle at -8% 35%, color-mix(in srgb, var(--cyan) 8%, transparent), transparent 29rem),
+        var(--bg);
+      color: var(--ink);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    }
+    a { color: var(--blue); text-underline-offset: 3px; }
+    code, pre { font-family: var(--mono); }
+    code {
+      padding: .08rem .34rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-2);
+      font-size: .9em;
+      overflow-wrap: anywhere;
+    }
+    pre {
+      margin: 12px 0;
+      overflow-x: auto;
+      padding: 15px 17px;
+      border: 1px solid #2d3a48;
+      border-radius: 13px;
+      background: #111923;
+      color: #edf5fb;
+      font-size: .82rem;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    kbd {
+      padding: 2px 6px;
+      border: 1px solid var(--line);
+      border-bottom-width: 2px;
+      border-radius: 6px;
+      background: var(--surface-2);
+      font: .82em var(--mono);
+    }
+    .skip-link {
+      position: fixed;
+      left: 12px;
+      top: -60px;
+      z-index: 100;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+    }
+    .skip-link:focus { top: 12px; }
+    .page { width: min(1180px, calc(100% - 28px)); margin: 0 auto; padding: 26px 0 72px; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(28px, 5vw, 54px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: linear-gradient(135deg, var(--surface) 0%, color-mix(in srgb, var(--blue-soft) 72%, var(--surface)) 100%);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 420px;
+      height: 420px;
+      right: -170px;
+      top: -250px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--blue) 13%, transparent);
+    }
+    .eyebrow {
+      position: relative;
+      z-index: 1;
+      margin: 0 0 9px;
+      color: var(--blue);
+      font-size: .76rem;
+      font-weight: 850;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 940px;
+      margin: 0;
+      font-size: clamp(2.15rem, 5.2vw, 4.25rem);
+      line-height: 1.03;
+      letter-spacing: -.05em;
+    }
+    .subtitle {
+      position: relative;
+      z-index: 1;
+      max-width: 950px;
+      margin: 20px 0 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.18rem);
+    }
+    .badges { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .badge, .evidence {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-weight: 760;
+    }
+    .badge { padding: 6px 10px; background: var(--surface); color: var(--muted); font-size: .8rem; }
+    .badge.good, .evidence.test { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); background: var(--green-soft); color: var(--green); }
+    .badge.info, .evidence.code { border-color: color-mix(in srgb, var(--blue) 45%, var(--line)); background: var(--blue-soft); color: var(--blue); }
+    .badge.warn, .evidence.session { border-color: color-mix(in srgb, var(--amber) 45%, var(--line)); background: var(--amber-soft); color: var(--amber); }
+    .badge.review, .evidence.review { border-color: color-mix(in srgb, var(--purple) 45%, var(--line)); background: var(--purple-soft); color: var(--purple); }
+    .badge.risk, .evidence.inferred { border-color: color-mix(in srgb, var(--red) 45%, var(--line)); background: var(--red-soft); color: var(--red); }
+    .evidence { padding: 2px 7px; margin-left: 3px; font-size: .67rem; letter-spacing: .02em; vertical-align: middle; }
+    .toc {
+      position: sticky;
+      top: 10px;
+      z-index: 20;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin: 18px 0 28px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--surface) 91%, transparent);
+      box-shadow: 0 7px 24px rgba(26, 31, 38, .07);
+      backdrop-filter: blur(16px);
+    }
+    .toc a {
+      padding: 5px 8px;
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: .8rem;
+      font-weight: 720;
+      text-decoration: none;
+    }
+    .toc a:hover { background: var(--blue-soft); color: var(--blue); }
+    section {
+      margin-top: 24px;
+      padding: clamp(20px, 3vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    h2 { margin: 0 0 15px; font-size: clamp(1.5rem, 3vw, 2.15rem); letter-spacing: -.025em; }
+    h3 { margin: 25px 0 10px; font-size: 1.16rem; }
+    h4 { margin: 16px 0 7px; font-size: 1rem; }
+    p { margin: 9px 0; }
+    ul, ol { padding-left: 1.35rem; }
+    li + li { margin-top: .38rem; }
+    .lead { max-width: 970px; color: var(--muted); font-size: 1.04rem; }
+    .grid { display: grid; gap: 14px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-2);
+    }
+    .card h3, .card h4 { margin-top: 0; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .label { color: var(--muted); font-size: .74rem; font-weight: 820; letter-spacing: .08em; text-transform: uppercase; }
+    .value { margin-top: 4px; font-size: 1.48rem; font-weight: 850; letter-spacing: -.03em; }
+    .callout {
+      margin: 15px 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--blue);
+      border-radius: 0 12px 12px 0;
+      background: var(--blue-soft);
+    }
+    .callout.good { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.danger { border-left-color: var(--red); background: var(--red-soft); }
+    .callout.review { border-left-color: var(--purple); background: var(--purple-soft); }
+    .before-after { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+    .before, .after { padding: 17px; border: 1px solid var(--line); border-radius: 14px; }
+    .before { background: var(--red-soft); }
+    .after { background: var(--green-soft); }
+    .before h3, .after h3 { margin-top: 0; }
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+    .flow .node {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface-2);
+    }
+    .flow .arrow { align-self: center; color: var(--blue); font-size: 1.45rem; font-weight: 900; }
+    .timeline { position: relative; margin: 18px 0 0 10px; padding-left: 24px; border-left: 2px solid var(--line); }
+    .turn { position: relative; margin: 0 0 22px; }
+    .turn::before {
+      content: "";
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      left: -31px;
+      top: 6px;
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 0 0 5px var(--blue-soft);
+    }
+    .turn h3 { margin: 0 0 5px; }
+    .step {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 14px;
+      margin: 13px 0;
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-2);
+    }
+    .step-number {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      background: var(--blue-soft);
+      color: var(--blue);
+      font-weight: 900;
+    }
+    .step h3 { margin: 0 0 5px; }
+    .status {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: .72rem;
+      font-weight: 850;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .status.pass { background: var(--green-soft); color: var(--green); }
+    .status.open { background: var(--amber-soft); color: var(--amber); }
+    .status.info { background: var(--blue-soft); color: var(--blue); }
+    .status.risk { background: var(--red-soft); color: var(--red); }
+    .table-wrap { overflow-x: auto; margin: 14px 0; border: 1px solid var(--line); border-radius: 13px; }
+    table { width: 100%; border-collapse: collapse; min-width: 760px; }
+    th, td { padding: 11px 13px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-2); color: var(--muted); font-size: .75rem; letter-spacing: .06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    details { margin: 11px 0; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); }
+    summary { cursor: pointer; padding: 12px 15px; font-weight: 780; }
+    details > div { padding: 0 15px 15px; }
+    .checklist { list-style: none; padding-left: 0; }
+    .checklist li { position: relative; padding-left: 28px; }
+    .checklist li::before { content: "□"; position: absolute; left: 2px; color: var(--blue); font-weight: 900; }
+    .file-list { columns: 2; column-gap: 28px; }
+    .file-list li { break-inside: avoid; }
+    .muted { color: var(--muted); }
+    .small { font-size: .86rem; }
+    .footer { margin-top: 24px; color: var(--muted); text-align: center; font-size: .82rem; }
+    @media (max-width: 820px) {
+      .grid.two, .grid.three, .grid.four, .before-after { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .flow .arrow { transform: rotate(90deg); justify-self: center; }
+      .file-list { columns: 1; }
+      .toc { position: static; }
+    }
+    @media print {
+      body { background: #fff; color: #111; font-size: 11pt; }
+      .page { width: 100%; padding: 0; }
+      .hero, section { box-shadow: none; break-inside: avoid; }
+      .toc { display: none; }
+      a { color: inherit; text-decoration: none; }
+      details > div { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to report</a>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Technical implementation report · 6 August 2026</p>
+      <h1>Claude CLI executable path override</h1>
+      <p class="subtitle">
+        RepoPrompt CE can now pin every local Claude-family launch to one exact executable path,
+        validate it before use, show what actually ran, and fail safely instead of silently finding a different <code>claude</code>.
+      </p>
+      <div class="badges">
+        <span class="badge good">Implementation complete</span>
+        <span class="badge good">4,941 tests · 0 failures</span>
+        <span class="badge review">Dual Oracle review completed</span>
+        <span class="badge info">Standard · GLM · Kimi · Custom</span>
+        <span class="badge warn">Uncommitted working tree</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Report sections">
+      <a href="#summary">Outcome</a>
+      <a href="#expect">What to expect</a>
+      <a href="#architecture">How it works</a>
+      <a href="#scope">Change inventory</a>
+      <a href="#test">Try it</a>
+      <a href="#decisions">Major decisions</a>
+      <a href="#review">Oracle review</a>
+      <a href="#validation">Validation</a>
+      <a href="#risks">Risks</a>
+      <a href="#actions">Your actions</a>
+      <a href="#evidence">Evidence</a>
+    </nav>
+
+    <main id="main">
+      <section id="summary">
+        <h2>Outcome in plain language</h2>
+        <p class="lead">
+          The original problem was that RepoPrompt CE asked the login shell where <code>claude</code> lived.
+          A user-installed wrapper exposed only through a GUI or LaunchAgent path could therefore be bypassed.
+          The new setting lets the user select an absolute executable path and makes that selection authoritative.
+          <span class="evidence session">Observed in session</span>
+        </p>
+
+        <div class="before-after">
+          <article class="before">
+            <h3>Before</h3>
+            <ul>
+              <li>Claude launches were resolved through automatic shell-first lookup.</li>
+              <li>A wrapper or auth rotator could be skipped if the login shell returned another installation.</li>
+              <li>Settings could probe a different executable-resolution path from Agent Mode.</li>
+              <li>An invalid path could fall through resolution and surface later as an opaque spawn failure.</li>
+            </ul>
+          </article>
+          <article class="after">
+            <h3>After</h3>
+            <ul>
+              <li>The user can choose one exact Claude executable in Settings.</li>
+              <li>Configured launches validate and execute that path verbatim—no shell lookup and no cache fallback.</li>
+              <li>Settings reports the applied state, validation, actual resolved command, and <code>--version</code>.</li>
+              <li>Bad or corrupt configuration produces a typed, actionable error and remains resettable.</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="callout good">
+          <strong>Safety property:</strong> once a configured path is applied, RepoPrompt either launches that path or reports why it cannot.
+          It does not silently substitute another <code>claude</code>.
+          <span class="evidence code">Observed in code</span>
+        </div>
+      </section>
+
+      <section id="expect">
+        <h2>What you can expect from this change</h2>
+        <div class="grid three">
+          <article class="card">
+            <div class="label">Coverage</div>
+            <div class="value">All local Claude-family flows</div>
+            <p>Interactive Agent Mode, headless discovery, Settings probes, and Claude MCP install/management use the selection. Standard Claude, GLM, Kimi, and custom compatible backends share it.</p>
+          </article>
+          <article class="card">
+            <div class="label">Compatibility</div>
+            <div class="value">Automatic stays automatic</div>
+            <p>An empty setting preserves the existing login-shell-first behavior. Codex and remote-host executable selection remain outside this feature.</p>
+          </article>
+          <article class="card">
+            <div class="label">Session behavior</div>
+            <div class="value">New sessions sample changes</div>
+            <p>Running sessions are not disturbed. An established logical session retains its captured selection across child-process relaunches; a new session or one-shot operation samples the current setting.</p>
+          </article>
+          <article class="card">
+            <div class="label">Input support</div>
+            <div class="value">Absolute path with useful sugar</div>
+            <p>The Apply flow accepts <code>~/…</code> and local <code>file://</code> URLs, preserves valid symlink paths, and supports spaces and Unicode through argv-based launching.</p>
+          </article>
+          <article class="card">
+            <div class="label">Failure behavior</div>
+            <div class="value">Loud, typed, recoverable</div>
+            <p>Relative paths, variable expressions, missing files, directories, non-executable files, broken symlinks, and corrupt stored values are identified without fallback.</p>
+          </article>
+          <article class="card">
+            <div class="label">Diagnostics</div>
+            <div class="value">Actual command provenance</div>
+            <p>Local raw-event diagnostics can identify <code>configuredOverride</code>, <code>automaticResolved</code>, or <code>programmaticOverride</code>. Configured timeout hints explain wrapper transparency requirements.</p>
+          </article>
+        </div>
+
+        <div class="callout warn">
+          <strong>Wrapper contract:</strong> a wrapper must <code>exec</code> the real Claude CLI, keep stdin/stdout stream-json transparent,
+          and avoid printing banners to stdout. A wrapper that forks or decorates stdout can still break the Claude protocol.
+        </div>
+      </section>
+
+      <section id="architecture">
+        <h2>How the implementation works</h2>
+        <p class="lead">The design keeps user preferences out of the low-level process runner. Higher-level Claude configuration captures a typed selection, then process code enforces it.</p>
+
+        <div class="flow" aria-label="Configured path launch flow">
+          <div class="node">
+            <strong>1 · Capture</strong>
+            <p>Read <code>cliExecutableOverride.claude</code> when creating a Claude session or one-shot operation.</p>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <strong>2 · Validate</strong>
+            <p>Require an absolute, executable regular file. Preserve a valid symlink path rather than canonicalizing it.</p>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <strong>3 · Launch exactly</strong>
+            <p>Bypass <code>CommandPathResolver</code> and <code>ResolvedCommandCache</code>; pass the configured path as argv[0].</p>
+          </div>
+        </div>
+
+        <h3>Core mechanisms</h3>
+        <div class="grid two">
+          <article class="card">
+            <h4>Typed selection and storage</h4>
+            <p><a href="../../Sources/RepoPrompt/Infrastructure/Process/CLIExecutableOverride.swift"><code>CLIExecutableOverride.swift</code></a> introduces:</p>
+            <ul>
+              <li><code>automatic(command:)</code></li>
+              <li><code>configuredExactPath</code></li>
+              <li><code>programmaticOverride(command:)</code></li>
+              <li><code>CLIExecutableOverrideStore</code> with injectable <code>UserDefaults</code></li>
+              <li>Typed <code>CLIExecutableOverrideError</code> cases with a stable message prefix</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h4>Strict process gate</h4>
+            <p><a href="../../Sources/RepoPrompt/Infrastructure/Process/CLIProcessRunner.swift"><code>CLIProcessRunner</code></a> validates configured paths before resolution or spawning in both buffered and streaming modes. Results now include the actual <code>resolvedCommand</code>.</p>
+            <p>A generation token prevents an in-flight automatic run from repopulating a cache entry after invalidation.</p>
+          </article>
+          <article class="card">
+            <h4>Native Claude controller</h4>
+            <p><a href="../../Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeProcessSessionController.swift"><code>ClaudeNativeProcessSessionController</code></a> retains the captured selection, revalidates the same path before every spawn, and emits command provenance in local raw-event records.</p>
+          </article>
+          <article class="card">
+            <h4>Settings state machine</h4>
+            <p><a href="../../Sources/RepoPrompt/Features/Settings/ViewModels/APISettingsViewModel.swift"><code>APISettingsViewModel</code></a> separates draft input from applied state, orders the mutation pipeline, fingerprints probes, and rejects late results from stale or superseded probes.</p>
+          </article>
+        </div>
+
+        <h3>The Apply pipeline</h3>
+        <pre aria-label="Apply pipeline">validate draft
+  → persist configured path
+  → invalidate the Claude resolved-command cache entry
+  → clear the old probe fingerprint
+  → force a fresh --version probe</pre>
+        <p>The Settings probe uses the same automatic <code>.preferShell</code> policy as the runtime, eliminating the prior probe/runtime mismatch. The broader Claude/Codex resolution strategy was deliberately left unchanged.</p>
+
+        <h3>Why stale probe results cannot mislead the UI</h3>
+        <p>
+          Each probe is associated with both the current executable-selection fingerprint and a monotonic generation.
+          The UI only displays a result matching the applied selection, and an older forced probe cannot overwrite a newer result for that same selection.
+          <span class="evidence test">Observed in tests</span>
+        </p>
+      </section>
+
+      <section id="scope">
+        <h2>Change inventory and scope boundaries</h2>
+        <div class="callout">
+          <strong>Important review boundary:</strong> the working tree combines the executable-override feature with a later,
+          user-approved full-suite stabilization pass. Review and stage those groups deliberately rather than assuming every changed file belongs to the feature.
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Area</th>
+                <th>Git state</th>
+                <th>Representative files</th>
+                <th>Purpose</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Process selection and enforcement</td>
+                <td>1 untracked source; 2 modified sources</td>
+                <td><code>CLIExecutableOverride.swift</code>, <code>CLIProcessRunner.swift</code>, <code>CLIProcessConfiguration.swift</code></td>
+                <td>Typed selection, strict validation, cache behavior, actual resolved-command reporting, and removal of the silent <code>command: "claude"</code> default.</td>
+              </tr>
+              <tr>
+                <td>Claude runtime wiring</td>
+                <td>Modified sources</td>
+                <td><code>ClaudeCodeAgentConfig.swift</code>, native controller, provider/service/coordinator/bridge call sites</td>
+                <td>Carry the selection through interactive, discovery, compatible-backend, and install flows without affecting remote execution.</td>
+              </tr>
+              <tr>
+                <td>Settings experience</td>
+                <td>2 modified sources</td>
+                <td><code>APISettingsViewModel.swift</code>, <code>CLIProvidersSettingsView.swift</code></td>
+                <td>Draft/applied separation, Browse, Apply, Use Automatic, Recheck/Test, quarantine advisory, and fingerprinted probe diagnostics.</td>
+              </tr>
+              <tr>
+                <td>Feature regression tests</td>
+                <td>6 untracked tests plus modified integration tests</td>
+                <td>Store, runner, settings, wiring, resolver, and native-controller selection suites</td>
+                <td>Pin strict no-fallback behavior, precedence, session capture, probe race handling, MCP install, and Codex non-interference.</td>
+              </tr>
+              <tr>
+                <td>Owning architecture documentation</td>
+                <td>Modified</td>
+                <td><a href="../architecture/provider-plugins.md"><code>docs/architecture/provider-plugins.md</code></a></td>
+                <td>Records the durable executable-selection contract and scope.</td>
+              </tr>
+              <tr>
+                <td>Full-suite stabilization</td>
+                <td>Modified source, tests, and ledger rows</td>
+                <td><code>EditFlowPerf.swift</code>, <code>TailscaleStatusClient.swift</code>, stale golden/contract tests, isolated fixtures, and test ledger updates</td>
+                <td>Repairs exposed by the first full run; session evidence classifies these as unrelated to the override implementation.</td>
+              </tr>
+              <tr>
+                <td>Working evidence</td>
+                <td>Untracked / ignored</td>
+                <td><code>prompt-exports/*.md</code>; ignored implementation plan under <code>docs/plans/</code></td>
+                <td>Planning and Oracle artifacts. These are not product deliverables and should not be staged accidentally.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details>
+          <summary>Feature-focused file map</summary>
+          <div>
+            <ul class="file-list">
+              <li><code>Sources/RepoPrompt/Infrastructure/Process/CLIExecutableOverride.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/Process/CLIProcessRunner.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/Process/CLIProcessConfiguration.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeAgentConfig.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeProvider.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCodeIntegrationConfiguration.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeProcessSessionController.swift</code></li>
+              <li><code>Sources/RepoPrompt/Features/Settings/ViewModels/APISettingsViewModel.swift</code></li>
+              <li><code>Sources/RepoPrompt/Features/Settings/Views/CLIProvidersSettingsView.swift</code></li>
+              <li><code>Sources/RepoPrompt/Features/AgentMode/**</code> Claude selection propagation</li>
+              <li><code>Sources/RepoPrompt/Features/ContextBuilder/ViewModels/ContextBuilderAgentViewModel.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/AI/Agents/AgentRunCoordinator.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderFactory.swift</code></li>
+              <li><code>Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeAgentProvider.swift</code></li>
+              <li><code>Tests/RepoPromptTests/AI/CLIExecutableOverrideStoreTests.swift</code></li>
+              <li><code>Tests/RepoPromptTests/AI/CLIProcessRunnerCommandSelectionTests.swift</code></li>
+              <li><code>Tests/RepoPromptTests/AI/ClaudeCLIExecutableOverrideSettingsTests.swift</code></li>
+              <li><code>Tests/RepoPromptTests/AI/ClaudeCLIExecutableOverrideWiringTests.swift</code></li>
+              <li><code>Tests/RepoPromptTests/AI/CommandPathResolverExplicitPathTests.swift</code></li>
+              <li><code>Tests/RepoPromptTests/AgentMode/ClaudeCompatible/ClaudeNativeProcessCommandSelectionTests.swift</code></li>
+            </ul>
+          </div>
+        </details>
+      </section>
+
+      <section id="test">
+        <h2>How to test and see the effect, step by step</h2>
+        <p class="lead">
+          The automated suite already passed. The following manual walkthrough is designed to make the user-visible behavior obvious.
+          It was <strong>not</strong> run during report generation because launching the visible app requires action-boundary approval.
+        </p>
+
+        <div class="step">
+          <div class="step-number">1</div>
+          <div>
+            <h3>Build the debug app</h3>
+            <pre>make dev-build</pre>
+            <p>Expected: the coordinated development build completes successfully. This command passed during the implementation session.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">2</div>
+          <div>
+            <h3>Prepare a harmless exact-path fixture</h3>
+            <p>First identify the real Claude executable, then create a symlink in a temporary directory. Replace the placeholder with the path you verified.</p>
+            <pre>mkdir -p /tmp/rpce-claude-override-demo
+ln -sfn /absolute/path/to/real/claude /tmp/rpce-claude-override-demo/claude
+ls -l /tmp/rpce-claude-override-demo/claude</pre>
+            <p>A symlink is useful here because the implementation intentionally stores and displays the configured link path rather than canonicalizing its target.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">3</div>
+          <div>
+            <h3>Open the new Settings control</h3>
+            <p>Run the app using the normal coordinated workflow, then open the Claude CLI provider settings. Locate <strong>Claude CLI Executable</strong>.</p>
+            <pre>make dev-run</pre>
+            <p class="muted">Expected initial state: <strong>Automatic (login-shell lookup)</strong>. Click <strong>Recheck / Test</strong> to see the last resolved command and version for automatic mode.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">4</div>
+          <div>
+            <h3>Apply the exact path</h3>
+            <p>Paste <code>/tmp/rpce-claude-override-demo/claude</code>, or use <strong>Browse…</strong>. Confirm the draft shows as launchable, then click <strong>Apply</strong>.</p>
+            <p>Expected:</p>
+            <ul>
+              <li>The effective state shows the exact temporary path.</li>
+              <li>The forced probe succeeds and displays the configured command plus Claude’s version.</li>
+              <li>The previous automatic-probe result is not reused.</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">5</div>
+          <div>
+            <h3>Exercise a new Claude session</h3>
+            <p>Start a new local Claude-family Agent Mode session and send a simple prompt such as “Reply with OK.”</p>
+            <p>Expected: the turn completes normally through the selected executable. The same setting also applies to GLM, Kimi, and custom Claude-compatible local backends because they share the Claude CLI launch path.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">6</div>
+          <div>
+            <h3>Prove invalid drafts do not overwrite the applied value</h3>
+            <p>Edit the draft to <code>/tmp/rpce-claude-override-demo/does-not-exist</code> and click <strong>Apply</strong>.</p>
+            <p>Expected: an inline missing-path error appears, while the effective/applied state remains the previously valid symlink.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">7</div>
+          <div>
+            <h3>Prove there is no silent fallback</h3>
+            <p>After the valid path is applied, remove only the temporary symlink, then start a <em>new</em> Claude session.</p>
+            <pre>unlink /tmp/rpce-claude-override-demo/claude</pre>
+            <p>Expected: RepoPrompt reports that the configured path is not launchable. It must not find and launch another <code>claude</code>. Recreate the symlink and use <strong>Recheck / Test</strong> to recover.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">8</div>
+          <div>
+            <h3>Return to automatic mode</h3>
+            <p>Click <strong>Use Automatic</strong>.</p>
+            <p>Expected: the effective state returns to login-shell lookup, the relevant resolved-command cache is invalidated, and a fresh probe reports the automatically resolved command.</p>
+          </div>
+        </div>
+
+        <details>
+          <summary>Optional: test a real wrapper instead of a symlink</summary>
+          <div>
+            <p>A minimal transparent wrapper should emit nothing of its own to stdout and replace itself with the real CLI:</p>
+            <pre>#!/bin/sh
+exec /absolute/path/to/real/claude "$@"</pre>
+            <p>Make it executable, apply its absolute path, and repeat steps 4–8. If it prints a banner to stdout or does not preserve stream-json stdin/stdout, a connection timeout or protocol error is expected.</p>
+          </div>
+        </details>
+      </section>
+
+      <section id="decisions">
+        <h2>Major turns and decisions</h2>
+        <p class="lead">These decisions explain why the implementation is stricter than a simple PATH setting and why some seemingly smaller alternatives were rejected.</p>
+
+        <div class="timeline">
+          <article class="turn">
+            <h3>1 · The problem was not solved by switching PATH order</h3>
+            <p>Investigation showed that the captured login-shell environment overrides much of the GUI environment. Merely changing Claude from shell-first to PATH-first would still miss a GUI-PATH-only wrapper in common setups.</p>
+            <p><strong>Decision:</strong> add an explicit exact-path setting and keep automatic mode’s existing behavior.</p>
+          </article>
+
+          <article class="turn">
+            <h3>2 · Exact means exact—no fallback</h3>
+            <p>The previous resolver only short-circuited for a valid explicit path; an invalid one could continue into shell queries and fail later.</p>
+            <p><strong>Decision:</strong> model configured paths as a distinct typed selection, validate before shell/cache/spawn work, and either launch verbatim or throw a typed error.</p>
+          </article>
+
+          <article class="turn">
+            <h3>3 · Capture per logical session, validate per spawn</h3>
+            <p>The duel surfaced a tension between stable active sessions and immediate pickup of setting changes.</p>
+            <p><strong>Decision:</strong> a logical session retains path A across child relaunches, so settings changes do not mutate an active session. The file at path A is revalidated before each spawn, so repairing or replacing that file can recover. Changing A→B requires a new session.</p>
+          </article>
+
+          <article class="turn">
+            <h3>4 · Draft and applied state must be separate</h3>
+            <p>Persisting invalid text would convert a settings typo into a runtime outage and obscure which value is active.</p>
+            <p><strong>Decision:</strong> invalid saves are blocked, the draft remains visibly distinct, and corrupt stored data is surfaced as a resettable error instead of being interpreted as automatic mode.</p>
+          </article>
+
+          <article class="turn">
+            <h3>5 · Diagnostics use the command that actually executed</h3>
+            <p>Predicting a resolved path separately could disagree with the process launch, especially around caches.</p>
+            <p><strong>Decision:</strong> extend runner results with <code>resolvedCommand</code> and include provenance in native process diagnostics.</p>
+          </article>
+
+          <article class="turn">
+            <h3>6 · The command default was removed as a future-proofing guard</h3>
+            <p>A silent <code>command: "claude"</code> default allowed new call sites to compile without choosing a selection policy.</p>
+            <p><strong>Decision:</strong> require every <code>CLIProcessConfiguration</code> call site to name its command explicitly. The compile sweep found all 16 sites were already explicit after earlier wiring work.</p>
+          </article>
+
+          <article class="turn">
+            <h3>7 · Full-suite failures changed the work plan</h3>
+            <p>The first full run exposed 18 failures across 11 unique cases. At the user’s direction, a scoped worker investigated them instead of dismissing them as unrelated.</p>
+            <p><strong>Resolution:</strong> seven stale or broken tests were aligned to already-committed contracts, and four load-sensitive cases received isolation fixes. An attempted fix for the workspace seeded-root race deadlocked and was fully reverted rather than weakening the test.</p>
+          </article>
+        </div>
+
+        <h3>Alternatives deliberately not taken</h3>
+        <div class="grid two">
+          <div class="card">
+            <ul>
+              <li>No <code>CLAUDE_CLI_PATH</code> environment-variable contract.</li>
+              <li>No automatic canonicalization of symlinks.</li>
+              <li>No broad invalidation of <code>CLIEnvironmentCache</code>.</li>
+              <li>No change to Codex resolution behavior.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <ul>
+              <li>No separate executable setting for each compatible backend.</li>
+              <li>No remote-host override in this scope.</li>
+              <li>No generic Codex/OpenCode/Cursor settings UI yet.</li>
+              <li>No automatic removal of macOS quarantine attributes.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="review">
+        <h2>Dual Oracle post-implementation review</h2>
+        <p class="lead">
+          Two independent Oracle lanes reviewed the completed implementation concurrently.
+          OracleA returned <strong>REQUEST-CHANGES</strong>; OracleB returned <strong>APPROVE-WITH-NITS</strong>.
+          The implementation worker applied all ten adjudicated findings, then reran affected validation.
+          <span class="evidence review">Observed in session</span>
+        </p>
+
+        <div class="grid two">
+          <article class="card">
+            <h3>Highest-impact correction</h3>
+            <p>The native controller’s optional selection default could have fallen back to automatic resolution instead of inheriting the configured selection already stored in <code>ClaudeCodeAgentConfig</code>.</p>
+            <p><strong>Fix:</strong> <code>commandSelection ?? config.commandSelection</code>, pinned by a regression test.</p>
+          </article>
+          <article class="card">
+            <h3>Cache correctness</h3>
+            <p>Invalidation was narrowed to Claude, and cache generations now prevent a successful in-flight automatic launch from restoring a stale entry after invalidation.</p>
+          </article>
+          <article class="card">
+            <h3>Queued streaming launch safety</h3>
+            <p>Configured paths are validated after acquiring the concurrency gate, preventing queued launches from relying on stale pre-gate validation.</p>
+          </article>
+          <article class="card">
+            <h3>Probe ordering</h3>
+            <p>Monotonic probe generations prevent an older forced probe for the same selection from overwriting a newer result.</p>
+          </article>
+          <article class="card">
+            <h3>Error quality and provenance</h3>
+            <p>Path-bearing diagnostics, accurate post-validation ENOENT wording, directory suggestions using the bare profile command, session-retention pins, and emitted provenance tests were added or corrected.</p>
+          </article>
+          <article class="card">
+            <h3>One no-action disagreement</h3>
+            <p>An environment-cache invalidation suggestion was rejected because the approved contract explicitly keeps that command-agnostic cache and avoids its 1–5 second recapture cost.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="validation">
+        <h2>Validation and test evidence</h2>
+        <div class="callout good">
+          <strong>Final result:</strong> the full coordinated suite completed with <strong>4,941 executed, 10 skipped, 0 failures</strong>.
+          <span class="evidence test">Observed in session</span>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Check</th>
+                <th>Result</th>
+                <th>What it covers</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>make dev-test</code></td>
+                <td><span class="status pass">Pass</span> 4,941 executed; 10 skipped; 0 failures</td>
+                <td>Repository-wide regression coverage after feature and stabilization repairs.</td>
+              </tr>
+              <tr>
+                <td><code>make dev-build</code></td>
+                <td><span class="status pass">Pass</span></td>
+                <td>Debug application/package compilation and call-site sweep.</td>
+              </tr>
+              <tr>
+                <td><code>make dev-lint</code></td>
+                <td><span class="status pass">Pass</span></td>
+                <td>Configured lint checks.</td>
+              </tr>
+              <tr>
+                <td><code>make dev-format-check</code></td>
+                <td><span class="status pass">Pass</span></td>
+                <td>Non-mutating Swift formatting verification.</td>
+              </tr>
+              <tr>
+                <td><code>make dev-test-list</code></td>
+                <td><span class="status pass">Pass</span></td>
+                <td>Test discovery/inventory generation.</td>
+              </tr>
+              <tr>
+                <td><code>Scripts/check-agent-context</code></td>
+                <td><span class="status pass">Pass</span></td>
+                <td>Agent-context document structure after the owning provider architecture update.</td>
+              </tr>
+              <tr>
+                <td>Repository-wide ledger verifier</td>
+                <td><span class="status open">Pre-existing drift</span> 273 missing; 3 stale</td>
+                <td>Documented as predating this implementation; the curated ledger was not overwritten to conceal the drift.</td>
+              </tr>
+              <tr>
+                <td>Manual visible-app walkthrough in this report</td>
+                <td><span class="status info">Not run</span></td>
+                <td>Deferred because visible app launch/relaunch requires explicit approval at the action boundary.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>New regression coverage at a glance</h3>
+        <ul>
+          <li>11 store tests cover normalization, type corruption, filesystem errors, and symlink preservation.</li>
+          <li>8 runner tests cover strict exact-path execution, buffered/streaming parity, cache invalidation, stale puts, and post-validation launch failure.</li>
+          <li>5 Settings tests cover probe races, mutation ordering, invalid drafts, and corrupt stored values.</li>
+          <li>9 wiring tests cover both factories, four runtime variants, probes, MCP install, precedence, and Codex non-interference.</li>
+          <li>8 native-controller tests cover provenance, session capture, fresh-controller requirements, timeout hints, and pre-shell failure.</li>
+          <li>1 resolver contract test covers shell bypass in all three lookup modes.</li>
+        </ul>
+      </section>
+
+      <section id="risks">
+        <h2>Risks, limitations, and technical debt</h2>
+        <div class="grid two">
+          <article class="card">
+            <h3><span class="status open">Known debt</span> Managed preferences</h3>
+            <p>A managed <code>cliExecutableOverride.claude</code> value is read as effective, but Settings does not yet disable editing using <code>objectIsForced</code>. There is no repository-wide MDM pattern yet.</p>
+          </article>
+          <article class="card">
+            <h3><span class="status open">Known debt</span> More CLI families</h3>
+            <p>The storage/type design is generic enough for Codex, OpenCode, and Cursor, but their override UI and wiring are not implemented.</p>
+          </article>
+          <article class="card">
+            <h3><span class="status open">Known debt</span> Remote selection</h3>
+            <p>Remote-host sessions intentionally ignore this local setting. A remote executable override would need a separate host-scoped contract.</p>
+          </article>
+          <article class="card">
+            <h3><span class="status risk">Latent test risk</span> Seeded-root watcher race</h3>
+            <p><code>WorkspacePendingSeededRootTests</code> passes in the final suite, but the session recorded a remaining FSEvents/authority race under load. A quick attempted fix deadlocked and was reverted; a deeper watcher/authority seam is still needed.</p>
+          </article>
+          <article class="card">
+            <h3><span class="status info">Operational</span> Wrapper correctness</h3>
+            <p>RepoPrompt validates file launchability, not wrapper semantics, architecture compatibility, Rosetta availability, or downstream interpreter availability. Those failures surface at spawn or protocol initialization.</p>
+          </article>
+          <article class="card">
+            <h3><span class="status info">Operational</span> Quarantine and TCC</h3>
+            <p>The UI warns about <code>com.apple.quarantine</code> but never removes it. Gatekeeper, protected-folder prompts, and other macOS policy decisions remain user-controlled.</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="actions">
+        <h2>Action items for the maintainer</h2>
+        <div class="callout warn">
+          <strong>The implementation is not committed or staged.</strong> The next meaningful action is change-set review and commit preparation, not more feature coding.
+        </div>
+
+        <h3>Immediate</h3>
+        <ul class="checklist">
+          <li>Review the feature files and the full-suite stabilization files as two explicit groups.</li>
+          <li>Decide whether this HTML report should be included in the eventual contribution.</li>
+          <li>Keep <code>prompt-exports/*.md</code> out of staging unless the working evidence is intentionally requested.</li>
+          <li>Remember that <code>docs/plans/claude-cli-executable-path-override-2026-08-05.md</code> is ignored and its “Implemented” note is currently local-only.</li>
+          <li>Before any commit, read and run the contribution-check workflow, stage only intended files, and execute <code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code>.</li>
+          <li>If desired, perform the manual walkthrough above—especially the no-fallback failure case—before staging.</li>
+        </ul>
+
+        <h3>Future, non-blocking</h3>
+        <ul class="checklist">
+          <li>Add MDM forced-value editing behavior once a repository-wide managed-preferences pattern exists.</li>
+          <li>Consider executable override support for Codex, OpenCode, and Cursor as separate scoped work.</li>
+          <li>Investigate the remaining seeded-root FSEvents/authority race through a dedicated watcher seam rather than weakening the test.</li>
+          <li>Treat remote-host executable selection as a separate host-scoped feature.</li>
+        </ul>
+      </section>
+
+      <section id="evidence">
+        <h2>Evidence, limitations, and metrics</h2>
+        <div class="grid two">
+          <article class="card">
+            <h3>Evidence basis</h3>
+            <ul>
+              <li><strong>Session context:</strong> available through the implementation handoff, including user steering, Oracle outcomes, test commands, failures, and final results.</li>
+              <li><strong>Repository state:</strong> inspected on 2026-08-06 with Git status, diff statistics, current code, test names, owning documentation, and the ignored plan.</li>
+              <li><strong>Implementation claims:</strong> cross-checked against the current source and tests where load-bearing.</li>
+              <li><strong>Validation claims:</strong> reported from the original implementation session; the full suite was not rerun while writing this report.</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>Limitations</h3>
+            <ul>
+              <li>No session-start Git commit was supplied, so the report cannot derive a perfectly isolated baseline from Git alone.</li>
+              <li>The working tree includes feature work, stabilization work, and untracked planning evidence.</li>
+              <li>Classification of the full-suite repairs relies on the scoped worker’s session report plus the observable file set.</li>
+              <li>No visible-app smoke test was performed during report generation.</li>
+            </ul>
+          </article>
+        </div>
+
+        <h3>Working-tree snapshot before this report was created</h3>
+        <div class="grid four">
+          <div class="card">
+            <div class="label">Changed paths</div>
+            <div class="value">49</div>
+            <p class="small muted">40 modified + 9 untracked</p>
+          </div>
+          <div class="card">
+            <div class="label">Diff additions</div>
+            <div class="value">4,324</div>
+            <p class="small muted">Includes untracked planning exports</p>
+          </div>
+          <div class="card">
+            <div class="label">Diff deletions</div>
+            <div class="value">233</div>
+            <p class="small muted">No staged changes</p>
+          </div>
+          <div class="card">
+            <div class="label">Branch state</div>
+            <div class="value">+1</div>
+            <p class="small muted">One local commit ahead of origin before this uncommitted work</p>
+          </div>
+        </div>
+        <p class="small muted">These figures intentionally exclude this newly created report file. They describe the entire pre-report working tree, not only the Claude override feature.</p>
+
+        <h3>Primary sources</h3>
+        <ul>
+          <li><a href="../plans/claude-cli-executable-path-override-2026-08-05.md">Implementation plan and decision log</a> <span class="muted">(ignored by Git, present locally)</span></li>
+          <li><a href="../architecture/provider-plugins.md">Provider plugin architecture: Claude CLI executable selection</a></li>
+          <li><a href="../../Sources/RepoPrompt/Infrastructure/Process/CLIExecutableOverride.swift">Typed selection, storage, normalization, and validation</a></li>
+          <li><a href="../../Sources/RepoPrompt/Infrastructure/Process/CLIProcessRunner.swift">Strict runner enforcement and cache behavior</a></li>
+          <li><a href="../../Sources/RepoPrompt/Features/Settings/Views/CLIProvidersSettingsView.swift">Settings UI</a></li>
+          <li><a href="../../Sources/RepoPrompt/Features/Settings/ViewModels/APISettingsViewModel.swift">Settings pipeline and probe freshness</a></li>
+          <li><a href="../../Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeProcessSessionController.swift">Native session sampling, validation, and provenance</a></li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="footer">
+      Generated from AI-agent coding-session evidence on 2026-08-06. This report contains no external assets and is suitable for local viewing or printing.
+    </footer>
+  </div>
+</body>
+</html>

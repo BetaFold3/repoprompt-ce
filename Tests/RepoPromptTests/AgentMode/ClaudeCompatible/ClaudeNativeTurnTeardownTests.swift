@@ -10,8 +10,8 @@ import XCTest
 /// recorded and recovered from, never trapped, and it must not leak turn state into the next
 /// session on this reusable controller.
 final class ClaudeNativeTurnTeardownTests: XCTestCase {
-    private func makeController() -> ClaudeNativeProcessSessionController {
-        ClaudeNativeProcessSessionController(
+    private func makeController() throws -> ClaudeNativeProcessSessionController {
+        try ClaudeNativeProcessSessionController(
             runID: UUID(),
             tabID: UUID(),
             windowID: 1,
@@ -23,8 +23,8 @@ final class ClaudeNativeTurnTeardownTests: XCTestCase {
         )
     }
 
-    func testTrailingResultAfterShutdownIsRecoveredWithoutTrappingOrRestoringTurnInFlight() async {
-        let controller = makeController()
+    func testTrailingResultAfterShutdownIsRecoveredWithoutTrappingOrRestoringTurnInFlight() async throws {
+        let controller = try makeController()
         await controller.test_setTurnWasInterrupted(true)
         await controller.shutdown()
 
@@ -41,8 +41,8 @@ final class ClaudeNativeTurnTeardownTests: XCTestCase {
         XCTAssertFalse(inFlight, "A post-shutdown trailing result must not resurrect turn tracking.")
     }
 
-    func testReplayedResultWithoutShutdownIsRecoveredWithoutTrapping() async {
-        let controller = makeController()
+    func testReplayedResultWithoutShutdownIsRecoveredWithoutTrapping() async throws {
+        let controller = try makeController()
 
         // Mirrors the 2026-07-27 19:28 host crash: reattaching an existing CLI
         // session replayed the final `result`/`message_stop` of an
@@ -61,8 +61,8 @@ final class ClaudeNativeTurnTeardownTests: XCTestCase {
         XCTAssertFalse(inFlight, "A replayed live-path result must not resurrect turn tracking.")
     }
 
-    func testShutdownClearsInterruptMarkerSoALaterResultIsNotMisreportedAsCancelled() async {
-        let controller = makeController()
+    func testShutdownClearsInterruptMarkerSoALaterResultIsNotMisreportedAsCancelled() async throws {
+        let controller = try makeController()
         await controller.test_setTurnWasInterrupted(true)
         await controller.shutdown()
 

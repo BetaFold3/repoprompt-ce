@@ -303,7 +303,7 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                                     )
                                                 }
                                             }
-                                        case let .terminated(status, didTimeout):
+                                        case let .terminated(status, didTimeout, _):
                                             exitStatus = status
                                             timedOut = didTimeout
                                             if self.enableDebugLogging {

@@ -13,6 +13,11 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
     }
 
     func testBridgeRuntimeSmokeMapsPluginIDsDiscoveryRuntimeAndHeadlessAdapters() throws {
+        let suiteName = "ClaudeCompatiblePluginBridgeTests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
         let cases: [(AgentProviderKind, String)] = [
             (.claudeCode, "claude-code"),
             (.claudeCodeGLM, "zai-claude-code"),
@@ -24,9 +29,10 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
             XCTAssertEqual(ClaudeCompatiblePluginBridge.pluginID(for: agentKind)?.rawValue, expectedPluginID)
             XCTAssertEqual(try ClaudeCompatiblePluginBridge.agentKind(for: XCTUnwrap(ClaudeCompatiblePluginBridge.pluginID(for: agentKind))), agentKind)
 
-            let provider = AgentRuntimeProviderService.shared.makeProvider(
+            let provider = try AgentRuntimeProviderService.shared.makeProvider(
                 for: agentKind,
-                modelString: "sonnet"
+                modelString: "sonnet",
+                defaults: defaults
             )
             let adapter = try XCTUnwrap(provider as? ClaudeCompatibleHeadlessProviderAdapter)
             XCTAssertEqual(adapter.runtimeConfig.pluginID.rawValue, expectedPluginID)
@@ -39,7 +45,8 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         let config = try XCTUnwrap(ClaudeCompatiblePluginBridge.discoveryRuntimeConfig(
             agentKind: .claudeCodeGLM,
             modelString: "sonnet",
-            enableDebugLogging: true
+            enableDebugLogging: true,
+            defaults: defaults
         ))
         XCTAssertEqual(config.pluginID.rawValue, "zai-claude-code")
         XCTAssertEqual(config.mode.rawValue, "discovery")

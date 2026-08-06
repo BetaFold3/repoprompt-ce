@@ -1,7 +1,23 @@
 import Darwin
 import Foundation
+import OSLog
 
 final actor ClaudeNativeProcessSessionController {
+    enum CommandProvenance: String, Equatable {
+        case configuredOverride
+        case automaticResolved
+        case programmaticOverride
+    }
+
+    struct ResolvedLaunchCommand: Equatable {
+        let command: String
+        let provenance: CommandProvenance
+    }
+
+    private static let processLogger = Logger(
+        subsystem: "com.repoprompt.agents",
+        category: "ClaudeNativeProcess"
+    )
     private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"
     private static let lastRawEventLogFilePathKey = "claudeLastRawEventLogFilePath"
     private static let rawEventTimestampFormatter: ISO8601DateFormatter = {
@@ -100,7 +116,7 @@ final actor ClaudeNativeProcessSessionController {
         case initializationFailed(String)
         case invalidControlResponse(String)
         case inputWriteFailed(String)
-        case controlRequestTimedOut(requestID: String)
+        case controlRequestTimedOut(requestID: String, detail: String?)
         case liveModelSwitchRequiresRestart
 
         var errorDescription: String? {
@@ -113,8 +129,12 @@ final actor ClaudeNativeProcessSessionController {
                 "Claude control response failed: \(message)"
             case let .inputWriteFailed(message):
                 "Failed writing to Claude process stdin: \(message)"
-            case let .controlRequestTimedOut(requestID):
-                "Claude control request timed out: \(requestID)"
+            case let .controlRequestTimedOut(requestID, detail):
+                if let detail {
+                    "Claude control request timed out: \(requestID); \(detail)"
+                } else {
+                    "Claude control request timed out: \(requestID)"
+                }
             case .liveModelSwitchRequiresRestart:
                 "Changing to the selected model requires restarting Claude because its launch environment changes."
             }
@@ -143,6 +163,7 @@ final actor ClaudeNativeProcessSessionController {
     private let windowID: Int
     private let workspacePath: String?
     private let config: ClaudeCodeAgentConfig
+    private let commandSelection: CLICommandSelection
     private let environmentResolver: any ClaudeCodeLaunchEnvironmentResolving
     private let configService = MCPConfigExportService.shared
     private let rawEventFileLoggingEnabled: Bool
@@ -178,6 +199,7 @@ final actor ClaudeNativeProcessSessionController {
     private var translator: ClaudeSDKNDJSONTranslator
     private var sessionID: String?
     private var configuredContextWindow: Int?
+    private var lastSpawnedCommand: String?
     private var turnInFlight: Bool {
         pendingTurnIDHead < pendingTurnIDBuffer.count
     }
@@ -235,6 +257,14 @@ final actor ClaudeNativeProcessSessionController {
 
     var hasActiveSession: Bool {
         process != nil
+    }
+
+    var requiresReplacementAfterTerminalStartupFailure: Bool {
+        if case .configuredExactPath = commandSelection {
+            true
+        } else {
+            false
+        }
     }
 
     deinit {
@@ -341,6 +371,7 @@ final actor ClaudeNativeProcessSessionController {
         windowID: Int,
         workspacePath: String?,
         config: ClaudeCodeAgentConfig,
+        commandSelection: CLICommandSelection? = nil,
         environmentResolver: any ClaudeCodeLaunchEnvironmentResolving = ClaudeCodeLaunchEnvironmentResolver(),
         authoritativeTurnIdleFallbackSeconds: TimeInterval = 1.0
     ) {
@@ -349,6 +380,7 @@ final actor ClaudeNativeProcessSessionController {
         self.windowID = windowID
         self.workspacePath = workspacePath
         self.config = config
+        self.commandSelection = commandSelection ?? config.commandSelection
         self.environmentResolver = environmentResolver
         self.authoritativeTurnIdleFallbackSeconds = authoritativeTurnIdleFallbackSeconds
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
@@ -571,6 +603,86 @@ final actor ClaudeNativeProcessSessionController {
         finishEventsStreamIfNeeded()
     }
 
+    static func resolveCommandForLaunch(
+        selection: CLICommandSelection,
+        environment: [String: String],
+        additionalPaths: [String],
+        logger: ((String) -> Void)? = nil
+    ) throws -> ResolvedLaunchCommand {
+        if let configuredCommand = try validatedConfiguredCommandForLaunch(selection: selection) {
+            return configuredCommand
+        }
+        switch selection {
+        case .configuredExactPath:
+            preconditionFailure("Configured command validation must return a launch command")
+        case let .automatic(command):
+            return ResolvedLaunchCommand(
+                command: CommandPathResolver.resolve(
+                    command,
+                    environment: environment,
+                    additionalPaths: additionalPaths,
+                    logger: logger,
+                    preferredBasenames: [command],
+                    shellLookupMode: .preferShell
+                ),
+                provenance: .automaticResolved
+            )
+        case let .programmaticOverride(command):
+            return ResolvedLaunchCommand(
+                command: CommandPathResolver.resolve(
+                    command,
+                    environment: environment,
+                    additionalPaths: additionalPaths,
+                    logger: logger,
+                    preferredBasenames: [command],
+                    shellLookupMode: .preferShell
+                ),
+                provenance: .programmaticOverride
+            )
+        }
+    }
+
+    private static func validatedConfiguredCommandForLaunch(
+        selection: CLICommandSelection
+    ) throws -> ResolvedLaunchCommand? {
+        guard case let .configuredExactPath(path) = selection else { return nil }
+        do {
+            let validatedPath = try CLIExecutableOverrideStore.validateForLaunch(
+                path,
+                commandName: CLILaunchProfiles.claudeCode.commandName
+            )
+            return ResolvedLaunchCommand(command: validatedPath, provenance: .configuredOverride)
+        } catch let reason as CLIExecutableOverrideError {
+            throw AIProviderError.invalidConfiguration(
+                detail: "The configured Claude executable path '\(path)' is not launchable. "
+                    + "\(reason.localizedDescription) Fix the path in Settings or use Automatic."
+            )
+        }
+    }
+
+    private static func processSpawnedPayload(
+        command: String,
+        provenance: CommandProvenance,
+        arguments: [String],
+        workingDirectory: String
+    ) -> [String: Any] {
+        [
+            "command": command,
+            "commandProvenance": provenance.rawValue,
+            "arguments": arguments,
+            "workingDirectory": workingDirectory
+        ]
+    }
+
+    static func connectTimeoutHint(for selection: CLICommandSelection) -> String? {
+        guard case let .configuredExactPath(path) = selection else { return nil }
+        return "a custom Claude executable path is configured: \(path) — wrappers must exec and keep stdin/stdout stream-json-transparent"
+    }
+
+    private var configuredCommandConnectTimeoutHint: String? {
+        Self.connectTimeoutHint(for: commandSelection)
+    }
+
     private func prepareRuntimeIfNeeded() async throws {
         if configURL != nil {
             return
@@ -594,19 +706,23 @@ final actor ClaudeNativeProcessSessionController {
         flagSettingsRequestGeneration = 0
         hasCompletedInitialFlagSettings = false
 
+        // Strict paths must fail before environment composition can consult the login shell.
+        let configuredLaunchCommand = try Self.validatedConfiguredCommandForLaunch(
+            selection: commandSelection
+        )
         let resolvedFlags = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
         let launchEnvironment = resolvedFlags.launchEnvironment
         let environment = await resolvedLaunchEnvironment(
             resolverOverrides: launchEnvironment.environmentOverrides,
             resolverRemovedKeys: launchEnvironment.removedEnvironmentKeys
         )
-        let resolvedCommand = CommandPathResolver.resolve(
-            config.commandName,
+        let resolvedLaunchCommand = try configuredLaunchCommand ?? Self.resolveCommandForLaunch(
+            selection: commandSelection,
             environment: environment,
             additionalPaths: CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints),
-            logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : nil,
-            preferredBasenames: [config.commandName]
+            logger: config.enableDebugLogging ? { print("[ClaudeNativeSession] \($0)") } : nil
         )
+        let resolvedCommand = resolvedLaunchCommand.command
         storeFlagSettingsRequest(resolvedFlags.request)
         activeFlagSettingsBaseModel = Self.flagSettingsBaseModel(from: resolvedFlags.request)
         activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
@@ -626,13 +742,20 @@ final actor ClaudeNativeProcessSessionController {
             environment: environment,
             workingDirectory: workingDirectory
         )
+        if let lastSpawnedCommand, lastSpawnedCommand != resolvedCommand {
+            Self.processLogger.notice(
+                "Claude executable changed between controller spawns from \(lastSpawnedCommand, privacy: .private) to \(resolvedCommand, privacy: .private)"
+            )
+        }
+        lastSpawnedCommand = resolvedCommand
         writeRawEventLogRecord(
             kind: "process.spawned",
-            payload: [
-                "command": resolvedCommand,
-                "arguments": arguments,
-                "workingDirectory": workingDirectory
-            ] as [String: Any]
+            payload: Self.processSpawnedPayload(
+                command: resolvedCommand,
+                provenance: resolvedLaunchCommand.provenance,
+                arguments: arguments,
+                workingDirectory: workingDirectory
+            )
         )
         translator.resetMainModelTracking()
         stdoutFramer = LineFramer()
@@ -1731,6 +1854,31 @@ final actor ClaudeNativeProcessSessionController {
             handleStreamPayload(payload)
         }
 
+        func test_resolveCapturedCommandForLaunch(
+            environment: [String: String],
+            additionalPaths: [String] = []
+        ) throws -> ResolvedLaunchCommand {
+            try Self.resolveCommandForLaunch(
+                selection: commandSelection,
+                environment: environment,
+                additionalPaths: additionalPaths
+            )
+        }
+
+        static func test_processSpawnedPayload(
+            command: String,
+            provenance: CommandProvenance,
+            arguments: [String] = [],
+            workingDirectory: String = "/tmp"
+        ) -> [String: Any] {
+            processSpawnedPayload(
+                command: command,
+                provenance: provenance,
+                arguments: arguments,
+                workingDirectory: workingDirectory
+            )
+        }
+
         func test_effectiveLaunchEnvironment(
             base: [String: String],
             resolverOverrides: [String: String] = [:],
@@ -2010,7 +2158,10 @@ final actor ClaudeNativeProcessSessionController {
             return
         }
         pendingControlRequestTimeoutTasks.removeValue(forKey: requestID)?.cancel()
-        continuation.resume(throwing: ControllerError.controlRequestTimedOut(requestID: requestID))
+        continuation.resume(throwing: ControllerError.controlRequestTimedOut(
+            requestID: requestID,
+            detail: isInitialized ? nil : configuredCommandConnectTimeoutHint
+        ))
     }
 
     private func finishEventsStreamIfNeeded() {

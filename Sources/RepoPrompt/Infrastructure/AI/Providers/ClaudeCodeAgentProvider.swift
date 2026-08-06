@@ -452,7 +452,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                                             }
                                         case let .stderr(chunk):
                                             appendTail(&stderrTail, chunk: chunk, limit: 256 * 1024)
-                                        case let .terminated(status, didTimeout):
+                                        case let .terminated(status, didTimeout, _):
                                             exitStatus = status
                                             timedOut = didTimeout
                                         }

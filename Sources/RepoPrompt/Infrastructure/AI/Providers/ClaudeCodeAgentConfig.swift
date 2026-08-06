@@ -13,6 +13,7 @@ import Foundation
 /// Configuration for Claude Code agent provider.
 struct ClaudeCodeAgentConfig {
     let commandName: String
+    let commandSelection: CLICommandSelection
     let additionalPathHints: [String]
     let modelString: String?
     let runtimeVariant: ClaudeCodeRuntimeVariant
@@ -57,9 +58,9 @@ struct ClaudeCodeAgentConfig {
         disallowedBuiltInTools: [String]? = nil,
         mcpStrictMode: Bool? = nil,
         toolSearchEnabled: Bool? = nil,
-        effortLevel: ClaudeCodeEffortLevel? = nil
-    ) -> ClaudeCodeAgentConfig {
-        let defaults = UserDefaults.standard
+        effortLevel: ClaudeCodeEffortLevel? = nil,
+        defaults: UserDefaults = .standard
+    ) throws -> ClaudeCodeAgentConfig {
         let resolvedPermission = sanitizePermissionMode(
             permissionMode ?? ClaudeAgentToolPreferences.permissionMode(defaults: defaults)
         )
@@ -75,7 +76,7 @@ struct ClaudeCodeAgentConfig {
                 runtimeVariant: runtimeVariant,
                 defaults: defaults
             )
-        return ClaudeCodeAgentConfig(
+        return try ClaudeCodeAgentConfig(
             commandName: commandName,
             modelString: modelString,
             runtimeVariant: runtimeVariant,
@@ -88,7 +89,8 @@ struct ClaudeCodeAgentConfig {
             disallowedBuiltInTools: disallowedBuiltInTools,
             mcpStrictMode: resolvedStrictMode,
             toolSearchEnabled: resolvedToolSearch,
-            effortLevel: resolvedEffortLevel
+            effortLevel: resolvedEffortLevel,
+            defaults: defaults
         )
     }
 
@@ -114,9 +116,10 @@ struct ClaudeCodeAgentConfig {
         commandName: String? = nil,
         modelString: String? = nil,
         runtimeVariant: ClaudeCodeRuntimeVariant = .standard,
-        enableDebugLogging: Bool = false
-    ) -> ClaudeCodeAgentConfig {
-        ClaudeCodeAgentConfig(
+        enableDebugLogging: Bool = false,
+        defaults: UserDefaults = .standard
+    ) throws -> ClaudeCodeAgentConfig {
+        try ClaudeCodeAgentConfig(
             commandName: commandName,
             modelString: modelString,
             runtimeVariant: runtimeVariant,
@@ -129,7 +132,8 @@ struct ClaudeCodeAgentConfig {
             disallowedBuiltInTools: nil,
             mcpStrictMode: true,
             toolSearchEnabled: false,
-            effortLevel: nil
+            effortLevel: nil,
+            defaults: defaults
         )
     }
 
@@ -149,12 +153,22 @@ struct ClaudeCodeAgentConfig {
         disallowedBuiltInTools: [String]?,
         mcpStrictMode: Bool,
         toolSearchEnabled: Bool,
-        effortLevel: ClaudeCodeEffortLevel?
-    ) {
-        let resolvedCommand = commandName ?? "claude"
+        effortLevel: ClaudeCodeEffortLevel?,
+        defaults: UserDefaults
+    ) throws {
+        let commandSelection: CLICommandSelection = if let commandName {
+            .programmaticOverride(command: commandName)
+        } else {
+            try CLIExecutableOverrideStore.effectiveCommand(
+                for: CLILaunchProfiles.claudeCode,
+                defaults: defaults
+            )
+        }
+        let resolvedCommand = commandSelection.command
         let modelSpecifier = ClaudeModelSpecifier(raw: modelString)
         claudeCodeAgentConfigDebugLog("Using command '\(resolvedCommand)' (DEBUG build)")
         self.commandName = resolvedCommand
+        self.commandSelection = commandSelection
         additionalPathHints = CLIPathHints.claudeCode
         self.modelString = modelSpecifier.runtimeModelParam
         self.runtimeVariant = runtimeVariant

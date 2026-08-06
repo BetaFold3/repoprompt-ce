@@ -232,10 +232,27 @@ enum ClaudeCodeIntegrationConfiguration {
     @discardableResult
     static func installInClaudeCode(
         workspacePath: String? = nil,
-        configuration: RepoPromptMCPServerConfiguration = .repoPrompt
+        configuration: RepoPromptMCPServerConfiguration = .repoPrompt,
+        defaults: UserDefaults = .standard
     ) async -> InstallResult {
+        let commandSelection: CLICommandSelection
+        do {
+            commandSelection = try CLIExecutableOverrideStore.effectiveCommand(
+                for: CLILaunchProfiles.claudeCode,
+                defaults: defaults
+            )
+        } catch {
+            return InstallResult(
+                success: false,
+                errorMessage: error.localizedDescription,
+                wasAlreadyPresent: false
+            )
+        }
+
         let config = CLIProcessConfiguration(
-            command: "claude",
+            command: commandSelection.command,
+            validationCommandName: CLILaunchProfiles.claudeCode.commandName,
+            commandSelection: commandSelection,
             workingDirectory: workspacePath,
             enableDebugLogging: false
         )
@@ -291,8 +308,17 @@ enum ClaudeCodeIntegrationConfiguration {
             return InstallResult(success: false, errorMessage: friendlyClaudeCodeError(stderr), wasAlreadyPresent: false)
         } catch {
             print("ClaudeCodeIntegrationConfiguration – Claude Code install error: \(error)")
-            let message = if let runnerError = error as? CLIProcessRunnerError, case .commandNotFound = runnerError {
-                "Claude Code CLI not found. Install it from claude.ai/download"
+            let message = if let runnerError = error as? CLIProcessRunnerError {
+                switch runnerError {
+                case let .explicitCommandNotLaunchable(path, reason):
+                    "\(reason.localizedDescription) Configured path: \(path)."
+                case .commandNotFound:
+                    "Claude Code CLI not found. Install it from claude.ai/download"
+                default:
+                    "Install error: \(runnerError.localizedDescription)"
+                }
+            } else if let overrideError = error as? CLIExecutableOverrideError {
+                overrideError.localizedDescription
             } else {
                 "Install error: \(error.localizedDescription)"
             }

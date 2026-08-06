@@ -2,6 +2,10 @@ import Foundation
 
 struct CLIProcessConfiguration {
     var command: String
+    /// Bare profile command name used in configured-path validation diagnostics.
+    var validationCommandName: String
+    /// Optional typed command selection. Nil preserves legacy automatic resolution of `command`.
+    var commandSelection: CLICommandSelection?
     /// Working directory for the CLI process. Defaults to temp directory to avoid macOS security popups.
     var workingDirectory: String
     var environment: [String: String]
@@ -22,6 +26,8 @@ struct CLIProcessConfiguration {
 
     init(
         command: String = "claude",
+        validationCommandName: String? = nil,
+        commandSelection: CLICommandSelection? = nil,
         workingDirectory: String? = nil, // nil → temp directory to avoid macOS security popups
         environment: [String: String] = [:],
         additionalPaths: [String] = CLINativePathDefaults.defaultAdditionalPaths,
@@ -35,6 +41,8 @@ struct CLIProcessConfiguration {
         logStdinSampleBytes: Int = 0
     ) {
         self.command = command
+        self.validationCommandName = validationCommandName ?? command
+        self.commandSelection = commandSelection
         self.workingDirectory = workingDirectory ?? FileManager.default.temporaryDirectory.path
         self.environment = environment
         self.additionalPaths = additionalPaths
