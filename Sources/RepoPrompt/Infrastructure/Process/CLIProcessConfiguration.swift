@@ -25,7 +25,7 @@ struct CLIProcessConfiguration {
     var logStdinSampleBytes: Int
 
     init(
-        command: String = "claude",
+        command: String,
         validationCommandName: String? = nil,
         commandSelection: CLICommandSelection? = nil,
         workingDirectory: String? = nil, // nil → temp directory to avoid macOS security popups
