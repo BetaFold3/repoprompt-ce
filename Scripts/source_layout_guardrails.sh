@@ -410,6 +410,10 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-07-30-knowledge-agent-profile.html"
   "docs/technical_implementation_reports/2026-07-30-oracle-continuation-preset-inheritance.html"
   "docs/technical_implementation_reports/2026-07-31-api-provider-model-modernization.html"
+  "docs/technical_implementation_reports/2026-08-02-right-utility-panel.html"
+  "docs/technical_implementation_reports/2026-08-04-right-utility-panel-complete.html"
+  "docs/technical_implementation_reports/2026-08-05-cursor-parameterized-model-picker.html"
+  "docs/technical_implementation_reports/2026-08-05-oracle-duel-hardening-transcript-qol.html"
 )
 while IFS= read -r path; do
   allowed_tracked_docs+=("$path")

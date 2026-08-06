@@ -164,7 +164,7 @@ final class RemoteWorkspaceSessionCatalogTests: XCTestCase {
         XCTAssertEqual(degradedCommandCount, 2)
     }
 
-    func testReconnectInvalidationDropsStateButRetainsLearnedHostWorkspaceID() async {
+    func testReconnectInvalidationDropsStateAndLearnedHostWorkspaceID() async {
         let connection = CatalogRecordingConnection(steps: [
             .value(Self.catalogPayload(workspaceID: "HOST-WORKSPACE-ID")),
             .value(Self.catalogPayload(workspaceID: "HOST-WORKSPACE-ID"))
@@ -173,14 +173,21 @@ final class RemoteWorkspaceSessionCatalogTests: XCTestCase {
         let workspaceID = UUID()
 
         _ = await store.fetch(hostID: "host-a", clientWorkspaceID: workspaceID, workspaceName: "Project Alpha")
+        XCTAssertEqual(
+            store.learnedHostWorkspaceID(hostID: "host-a", clientWorkspaceID: workspaceID),
+            "HOST-WORKSPACE-ID"
+        )
+
         let coordinator = RemoteAgentModeCoordinator(workspaceSessionCatalogStore: store)
         await coordinator.test_deliverConnectionState(.connected(scopes: []), hostID: "host-a")
         XCTAssertNil(store.cachedState(hostID: "host-a", clientWorkspaceID: workspaceID))
+        XCTAssertNil(store.learnedHostWorkspaceID(hostID: "host-a", clientWorkspaceID: workspaceID))
         _ = await store.fetch(hostID: "host-a", clientWorkspaceID: workspaceID, workspaceName: "Project Alpha")
 
         let frames = await connection.recordedFrames()
         XCTAssertEqual(frames.count, 2)
-        XCTAssertEqual(frames[1].payload?.objectValue?["workspace_id"]?.stringValue, "HOST-WORKSPACE-ID")
+        XCTAssertNil(frames[1].payload?.objectValue?["workspace_id"])
+        XCTAssertEqual(frames[1].payload?.objectValue?["workspace_name"]?.stringValue, "Project Alpha")
     }
 
     private static func catalogPayload(workspaceID: String) -> JSONValue {

@@ -13,7 +13,7 @@ final class RemoteAgentModeCoordinatorSubmitResponseWiringTests: XCTestCase {
             "respond": [.failure(StubCommandError())],
             "subscribe": [.failure(StubCommandError())]
         ])
-        installController(connection: connection, fixture: fixture)
+        await installController(connection: connection, fixture: fixture)
 
         fixture.coordinator.submitAskUserResponse(
             session: fixture.session,
@@ -43,7 +43,7 @@ final class RemoteAgentModeCoordinatorSubmitResponseWiringTests: XCTestCase {
             "poll": [.success(Self.questionSnapshot())],
             "get_log": [.success(Self.emptyLogPayload())]
         ])
-        installController(connection: connection, fixture: fixture)
+        await installController(connection: connection, fixture: fixture)
 
         fixture.coordinator.submitAskUserResponse(
             session: fixture.session,
@@ -68,7 +68,7 @@ final class RemoteAgentModeCoordinatorSubmitResponseWiringTests: XCTestCase {
             "poll": [.success(Self.runningSnapshot())],
             "get_log": [.success(Self.emptyLogPayload())]
         ])
-        installController(connection: connection, fixture: fixture)
+        await installController(connection: connection, fixture: fixture)
 
         fixture.coordinator.submitAskUserResponse(
             session: fixture.session,
@@ -96,7 +96,7 @@ final class RemoteAgentModeCoordinatorSubmitResponseWiringTests: XCTestCase {
             "poll": [.success(Self.runningSnapshot())],
             "get_log": [.success(Self.emptyLogPayload())]
         ])
-        installController(connection: connection, fixture: fixture)
+        await installController(connection: connection, fixture: fixture)
 
         fixture.coordinator.submitAskUserResponse(
             session: fixture.session,
@@ -128,8 +128,9 @@ final class RemoteAgentModeCoordinatorSubmitResponseWiringTests: XCTestCase {
     }
 
     @MainActor
-    private func installController(connection: StubRemoteConnection, fixture: SubmitResponseFixture) {
+    private func installController(connection: StubRemoteConnection, fixture: SubmitResponseFixture) async {
         let controller = RemoteAgentSessionController(binding: makeBinding(), connection: connection)
+        await controller.test_markObservationAttached()
         fixture.coordinator.test_installController(controller, for: fixture.session, hostID: "host-id")
     }
 

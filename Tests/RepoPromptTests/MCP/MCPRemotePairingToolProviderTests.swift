@@ -211,7 +211,7 @@ final class MCPRemotePairingToolProviderTests: XCTestCase {
         XCTAssertEqual(missing.objectValue?["code"]?.stringValue, "unknown_device")
         XCTAssertEqual(missing.objectValue?["status"]?.intValue, 404)
 
-        let record = RemotePairingTestSupport.deviceRecord(id: "remote:revoked")
+        let record = RemotePairingTestSupport.deviceRecord(id: "remote:deadbeef")
         try store.upsertDevice(record)
         _ = try store.revokeDevice(id: record.id, revokedAt: Date())
 

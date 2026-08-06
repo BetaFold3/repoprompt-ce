@@ -25,6 +25,10 @@ enum EditFlowPerf {
     static var currentLifecycleCorrelation: LifecycleCorrelation?
     @TaskLocal
     static var currentFileSystemPublicationCorrelation: LifecycleCorrelation?
+    #if DEBUG
+        @TaskLocal
+        static var debugCaptureIsolationTokenForTesting: UUID?
+    #endif
 
     #if DEBUG || EDIT_FLOW_PERF
         struct IntervalState {
@@ -1033,6 +1037,7 @@ enum EditFlowPerf {
             private var retainedLifecycleEventCount = 0
             private var droppedLifecycleEventCount = 0
             private var lifecycleEvents: [DebugCaptureLifecycleEvent] = []
+            private var captureIsolationTokenForTesting: UUID?
 
             var isActive: Bool {
                 if let active = activeHint.loadIfAvailable() {
@@ -1043,11 +1048,16 @@ enum EditFlowPerf {
                 return active
             }
 
-            func begin(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
+            func begin(
+                label: String,
+                maxSamples: Int,
+                isolationTokenForTesting: UUID?
+            ) -> DebugCaptureBeginResult {
                 lock.lock()
                 defer { lock.unlock() }
                 guard !active else { return .busy(snapshotLocked()) }
                 captureEpoch += 1
+                captureIsolationTokenForTesting = isolationTokenForTesting
                 self.label = Self.sanitizedLabel(label)
                 // Defense in depth for non-MCP callers; MCP controls reject out-of-range input earlier.
                 self.maxSamples = Self.clampedMaxSamples(maxSamples)
@@ -1093,22 +1103,30 @@ enum EditFlowPerf {
                 retainedLifecycleEventCount = 0
                 droppedLifecycleEventCount = 0
                 lifecycleEvents.removeAll(keepingCapacity: false)
+                captureIsolationTokenForTesting = nil
                 lock.unlock()
             }
 
-            func startTimestampIfActive() -> DebugCaptureStart? {
+            func startTimestampIfActive(isolationTokenForTesting: UUID?) -> DebugCaptureStart? {
                 if let active = activeHint.loadIfAvailable(), !active { return nil }
                 lock.lock()
                 defer { lock.unlock() }
-                guard active else { return nil }
+                guard active,
+                      captureIsolationTokenForTesting == nil
+                      || captureIsolationTokenForTesting == isolationTokenForTesting
+                else { return nil }
                 return DebugCaptureStart(epoch: captureEpoch, startNanoseconds: DispatchTime.now().uptimeNanoseconds)
             }
 
-            func activeEpochIfActive() -> UInt64? {
+            func activeEpochIfActive(isolationTokenForTesting: UUID?) -> UInt64? {
                 if let active = activeHint.loadIfAvailable(), !active { return nil }
                 lock.lock()
                 defer { lock.unlock() }
-                return active ? captureEpoch : nil
+                guard active,
+                      captureIsolationTokenForTesting == nil
+                      || captureIsolationTokenForTesting == isolationTokenForTesting
+                else { return nil }
+                return captureEpoch
             }
 
             func shouldRecordLifecycleEvent(_ correlation: LifecycleCorrelation) -> Bool {
@@ -1230,7 +1248,11 @@ enum EditFlowPerf {
         }
 
         static func beginDebugCapture(label: String, maxSamples: Int) -> DebugCaptureBeginResult {
-            debugCaptureRecorder.begin(label: label, maxSamples: maxSamples)
+            debugCaptureRecorder.begin(
+                label: label,
+                maxSamples: maxSamples,
+                isolationTokenForTesting: debugCaptureIsolationTokenForTesting
+            )
         }
 
         static func debugCaptureSnapshot(finish: Bool) -> DebugCaptureSnapshot {
@@ -1240,6 +1262,7 @@ enum EditFlowPerf {
         static func resetDebugCaptureForTesting() {
             debugCaptureRecorder.resetForTesting()
         }
+
     #endif
 
     #if DEBUG || EDIT_FLOW_PERF
@@ -1268,7 +1291,9 @@ enum EditFlowPerf {
         private static func makeIntervalState(_ name: StaticString, dimensions: Dimensions) -> IntervalState? {
             let signpostState = isEnabled ? signposter.beginInterval(name) : nil
             #if DEBUG
-                let debugCaptureStart = debugCaptureRecorder.startTimestampIfActive()
+                let debugCaptureStart = debugCaptureRecorder.startTimestampIfActive(
+                    isolationTokenForTesting: debugCaptureIsolationTokenForTesting
+                )
                 guard signpostState != nil || debugCaptureStart != nil else { return nil }
                 return IntervalState(
                     signpostState: signpostState,
@@ -1356,7 +1381,9 @@ enum EditFlowPerf {
             requestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineContext.current
         ) -> LifecycleCorrelation? {
             #if DEBUG
-                let captureEpoch = debugCaptureRecorder.activeEpochIfActive()
+                let captureEpoch = debugCaptureRecorder.activeEpochIfActive(
+                    isolationTokenForTesting: debugCaptureIsolationTokenForTesting
+                )
                 guard isEnabled || captureEpoch != nil else { return nil }
                 return LifecycleCorrelation(
                     id: UUID(),

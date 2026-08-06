@@ -2000,11 +2000,18 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         )
         XCTAssertEqual(managerStore.globalAgentModelsProfile(), globalProfile)
 
+        let expectedRecommendation = try AIModel.openAIConfigured(selection: XCTUnwrap(
+            OpenAIConfiguredModelSelection(
+                modelID: AIModel.gpt56Sol.modelName,
+                reasoningMode: .pro,
+                reasoningEffort: .high
+            )
+        ))
         viewModel.applyOracleRecommendation()
 
         XCTAssertEqual(
             managerStore.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
-            AIModel.gpt54Pro.rawValue
+            expectedRecommendation.rawValue
         )
         XCTAssertEqual(
             engineStore.workspaceAgentModelsProfile(for: workspaceID),

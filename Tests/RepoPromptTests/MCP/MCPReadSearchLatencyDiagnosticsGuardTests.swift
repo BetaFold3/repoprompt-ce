@@ -1654,28 +1654,30 @@
         }
 
         func testBoundedCaptureReportsDroppedSamplesAndSanitizedDimensions() throws {
-            switch EditFlowPerf.beginDebugCapture(label: "bounded", maxSamples: 100) {
-            case .started:
-                break
-            case .busy:
-                XCTFail("Capture should start.")
-            }
+            try EditFlowPerf.$debugCaptureIsolationTokenForTesting.withValue(UUID()) {
+                switch EditFlowPerf.beginDebugCapture(label: "bounded", maxSamples: 100) {
+                case .started:
+                    break
+                case .busy:
+                    XCTFail("Capture should start.")
+                }
 
-            for _ in 0 ..< 101 {
-                EditFlowPerf.measure(
-                    EditFlowPerf.Stage.MCPToolCall.providerExecution,
-                    EditFlowPerf.Dimensions(toolName: "read_file", status: "ok")
-                ) {}
-            }
+                for _ in 0 ..< 101 {
+                    EditFlowPerf.measure(
+                        EditFlowPerf.Stage.MCPToolCall.providerExecution,
+                        EditFlowPerf.Dimensions(toolName: "read_file", status: "ok")
+                    ) {}
+                }
 
-            let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
-            XCTAssertEqual(snapshot.retainedSampleCount, 100)
-            XCTAssertEqual(snapshot.droppedSampleCount, 1)
-            let aggregate = try XCTUnwrap(snapshot.stages.first)
-            XCTAssertEqual(aggregate.sampleCount, 100)
-            XCTAssertTrue(aggregate.sanitizedDimensions.contains("tool=read_file"))
-            XCTAssertFalse(aggregate.sanitizedDimensions.contains("/"))
-            XCTAssertFalse(aggregate.sanitizedDimensions.contains("namespace"))
+                let snapshot = EditFlowPerf.debugCaptureSnapshot(finish: true)
+                XCTAssertEqual(snapshot.retainedSampleCount, 100)
+                XCTAssertEqual(snapshot.droppedSampleCount, 1)
+                let aggregate = try XCTUnwrap(snapshot.stages.first)
+                XCTAssertEqual(aggregate.sampleCount, 100)
+                XCTAssertTrue(aggregate.sanitizedDimensions.contains("tool=read_file"))
+                XCTAssertFalse(aggregate.sanitizedDimensions.contains("/"))
+                XCTAssertFalse(aggregate.sanitizedDimensions.contains("namespace"))
+            }
         }
 
         func testLifecycleTimelinePreservesCorrelationOrderingAndSanitizesDimensions() throws {
