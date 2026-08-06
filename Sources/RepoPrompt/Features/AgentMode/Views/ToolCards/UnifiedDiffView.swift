@@ -86,22 +86,6 @@ private struct LargeUnifiedDiffContainer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Spacer(minLength: 0)
-                Toggle(isOn: Binding(
-                    get: { wrapLines },
-                    set: { globalSettings.setWrapTranscriptDiffLines($0) }
-                )) {
-                    Text("Wrap")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                        .foregroundColor(.secondary)
-                }
-                .toggleStyle(.checkbox)
-                .hoverTooltip("Wrap long diff lines instead of scrolling horizontally")
-            }
-            .padding(.horizontal, 6)
-            .padding(.top, 4)
-
             UnifiedDiffTextView(
                 document: document,
                 fontSize: fontSize,
@@ -110,6 +94,9 @@ private struct LargeUnifiedDiffContainer: View {
                 wrapLines: wrapLines,
                 preferredPostScriptName: preferredCodeFontPostScriptName
             )
+            // Live TextKit 1 wrap-geometry mutation can leave the view blank; the creation path is the
+            // only reliable one, so this forces recreation. Removing it regresses the blank-card bug.
+            .id(wrapLines)
             .frame(maxWidth: .infinity)
             .frame(height: resolvedHeight)
             .background {

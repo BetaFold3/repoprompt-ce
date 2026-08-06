@@ -1,4 +1,5 @@
 import Combine
+import OSLog
 import SwiftUI
 
 /// Agent Mode view - a chat-style interface for long-running agent interactions
@@ -206,6 +207,10 @@ struct AgentModeChatDetailView: View {
     let windowID: Int
     let currentTabID: UUID?
     let codexManagedLoginAction: CodexManagedLoginAction
+    private static let previewLinkLogger = Logger(
+        subsystem: "com.repoprompt.agents",
+        category: "PreviewLinkRouter"
+    )
     @Environment(\.agentWindowIsFocused) private var agentWindowIsFocused
     @ObservedObject private var workflowStore: AgentWorkflowStore = .shared
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -221,6 +226,7 @@ struct AgentModeChatDetailView: View {
     // Non-grouped state
     @State private var resetTextFieldTrigger = false
     @State private var isTranscriptWindowExpanded = false
+    @State private var previewLinkResolutionTask: Task<Void, Never>?
     @StateObject private var viewportRegistry = AgentTranscriptViewportRegistry()
 
     // MARK: - Assistant transcript search & ephemeral expansion (Workstream 5 item 1)
@@ -1917,6 +1923,84 @@ struct AgentModeChatDetailView: View {
             }
             .frame(maxHeight: .infinity)
         }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .toggleAgentTranscriptSearch)
+        ) { note in
+            guard let id = note.userInfo?["windowID"] as? Int,
+                  id == windowID,
+                  let currentTabID,
+                  currentTabID == promptManager.activeComposeTabID
+            else { return }
+
+            if isAssistantSearchActive {
+                closeAssistantSearch()
+            } else {
+                isAssistantSearchActive = true
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .toggleAgentTranscriptExpandAllReplies)
+        ) { note in
+            guard let id = note.userInfo?["windowID"] as? Int,
+                  id == windowID,
+                  let currentTabID,
+                  currentTabID == promptManager.activeComposeTabID
+            else { return }
+
+            if assistantExpansionStore.expandAllAssistants {
+                performAgentToolCardExpansionStateUpdateWithoutAnimation {
+                    assistantExpansionStore.restoreAutomaticCollapsing()
+                }
+            } else {
+                expandAllAssistantReplies()
+            }
+        }
+    }
+
+    private func handleTranscriptURL(_ url: URL) -> OpenURLAction.Result {
+        guard url.scheme?.caseInsensitiveCompare(RepoPreviewURLScheme.scheme) == .orderedSame else {
+            return .systemAction
+        }
+        guard let path = AgentPreviewLinkRouter.candidateFilePath(from: url) else {
+            Self.previewLinkLogger.debug("Rejected preview link without a candidate file path")
+            return .handled
+        }
+
+        let tabID = currentTabID
+        previewLinkResolutionTask?.cancel()
+        previewLinkResolutionTask = Task { @MainActor in
+            let environment = AgentChangesPanelLiveEnvironment(agentModeVM: agentModeVM)
+            let rootInputs = await environment.rootInputs(tabID: tabID)
+            guard !Task.isCancelled else { return }
+
+            let resolution = await AgentPanelCheckoutResolver.resolve(
+                AgentPanelCheckoutRequest(
+                    logicalRoots: rootInputs.logicalRoots,
+                    worktreeBindings: rootInputs.worktreeBindings,
+                    isPreparingWorktree: rootInputs.isPreparingWorktree
+                ),
+                probe: AgentPanelLiveCheckoutProbe()
+            )
+            guard !Task.isCancelled else { return }
+
+            let checkouts: [AgentPanelResolvedCheckout] = resolution.items.compactMap { item in
+                guard case let .resolved(checkout) = item else { return nil }
+                return checkout
+            }
+            guard let reference = AgentChangesArtifactLinkResolver.reference(
+                forArtifactPath: path,
+                checkouts: checkouts,
+                logicalRoots: rootInputs.logicalRoots,
+                rootIDsByPath: rootInputs.rootIDsByPath
+            ) else {
+                Self.previewLinkLogger.debug(
+                    "Unable to resolve transcript preview link in the active workspace: \(path, privacy: .private)"
+                )
+                return
+            }
+            agentModeVM.showUtilityPanelPreview(of: reference, tabID: tabID)
+        }
+        return .handled
     }
 
     // MARK: - Chat Transcript
@@ -1926,6 +2010,9 @@ struct AgentModeChatDetailView: View {
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottomTrailing) {
                     versionedScrollableContent(proxy: proxy, viewportHeight: geometry.size.height)
+                        .environment(\.openURL, OpenURLAction { url in
+                            handleTranscriptURL(url)
+                        })
 
                     VStack(spacing: 10) {
                         #if DEBUG
@@ -2578,69 +2665,22 @@ struct AgentModeChatDetailView: View {
 
     // MARK: - Assistant Transcript Search (Workstream 5 item 1)
 
-    /// Floating chrome pinned to the top of the transcript: the always-available bulk-expansion
-    /// menu, the search toggle/close control, and — while active — the search bar itself.
+    /// Floating search chrome pinned to the top of the transcript while search is active.
+    @ViewBuilder
     private var assistantSearchOverlay: some View {
-        VStack(alignment: .trailing, spacing: 6) {
-            HStack(spacing: 6) {
-                Spacer(minLength: 0)
-                assistantBulkActionsMenu
-                if !isAssistantSearchActive {
-                    searchToggleButton
-                }
-            }
-            if isAssistantSearchActive {
-                AgentAssistantTranscriptSearchBarView(
-                    query: $assistantSearchQuery,
-                    counterText: assistantSearchVM.state.counterText,
-                    hasMatches: !assistantSearchVM.state.matches.isEmpty,
-                    onNext: { assistantSearchVM.selectNext() },
-                    onPrevious: { assistantSearchVM.selectPrevious() },
-                    onClose: closeAssistantSearch
-                )
-                .frame(maxWidth: 340)
-            }
+        if isAssistantSearchActive {
+            AgentAssistantTranscriptSearchBarView(
+                query: $assistantSearchQuery,
+                counterText: assistantSearchVM.state.counterText,
+                hasMatches: !assistantSearchVM.state.matches.isEmpty,
+                onNext: { assistantSearchVM.selectNext() },
+                onPrevious: { assistantSearchVM.selectPrevious() },
+                onClose: closeAssistantSearch
+            )
+            .frame(maxWidth: 340)
+            .padding(.top, 10)
+            .padding(.trailing, 14)
         }
-        .padding(.top, 10)
-        .padding(.trailing, 14)
-    }
-
-    private var searchToggleButton: some View {
-        Button {
-            isAssistantSearchActive = true
-        } label: {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 12, weight: .medium))
-                .frame(width: 26, height: 26)
-                .background(Circle().fill(.regularMaterial))
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .hoverTooltip("Search assistant replies")
-        .accessibilityLabel("Search assistant replies")
-        .accessibilityIdentifier("agentTranscript.assistantSearch.toggle")
-    }
-
-    /// Always available (independent of search being open) so the ephemeral bulk actions stay
-    /// reachable without requiring the search bar to be open first.
-    private var assistantBulkActionsMenu: some View {
-        Menu {
-            Button("Expand All Assistant Replies", action: expandAllAssistantReplies)
-                .disabled(assistantExpansionStore.expandAllAssistants)
-            Button("Restore Automatic Collapsing", action: assistantExpansionStore.restoreAutomaticCollapsing)
-                .disabled(!assistantExpansionStore.expandAllAssistants)
-        } label: {
-            Image(systemName: "ellipsis.circle")
-                .font(.system(size: 12, weight: .medium))
-                .frame(width: 26, height: 26)
-                .background(Circle().fill(.regularMaterial))
-                .contentShape(Circle())
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .hoverTooltip("Assistant reply bulk actions")
-        .accessibilityLabel("Assistant reply bulk actions")
-        .accessibilityIdentifier("agentTranscript.assistantSearch.bulkActions")
     }
 
     private func closeAssistantSearch() {

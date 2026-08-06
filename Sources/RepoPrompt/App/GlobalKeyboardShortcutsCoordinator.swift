@@ -213,6 +213,9 @@ final class GlobalKeyboardShortcutsCoordinator {
     private func registerAgentShortcuts() {
         register(.agentNewChat) { [weak self] in self?.startNewAgentSessionFromShortcut() }
         register(.toggleNavigationSidebar) { [weak self] in self?.toggleNavigationSidebarFromShortcut() }
+        register(.toggleAssistantTranscriptSearch) { [weak self] in self?.toggleAssistantTranscriptSearchFromShortcut() }
+        register(.toggleExpandAllAssistantReplies) { [weak self] in self?.toggleAssistantTranscriptExpandAllRepliesFromShortcut() }
+        register(.toggleTranscriptWordWrap) { [weak self] in self?.toggleTranscriptWordWrapFromShortcut() }
         register(.previousParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: false) }
         register(.nextParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: true) }
         register(.showCurrentWindowAgentNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .currentWindow) }
@@ -230,6 +233,31 @@ final class GlobalKeyboardShortcutsCoordinator {
             name: .toggleRepoPromptNavigationSidebar,
             object: nil,
             userInfo: ["windowID": win.windowID]
+        )
+    }
+
+    private func toggleAssistantTranscriptSearchFromShortcut() {
+        guard let win = guardedFocusedWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .toggleAgentTranscriptSearch,
+            object: nil,
+            userInfo: ["windowID": win.windowID]
+        )
+    }
+
+    private func toggleAssistantTranscriptExpandAllRepliesFromShortcut() {
+        guard let win = guardedFocusedWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .toggleAgentTranscriptExpandAllReplies,
+            object: nil,
+            userInfo: ["windowID": win.windowID]
+        )
+    }
+
+    private func toggleTranscriptWordWrapFromShortcut() {
+        guard guardedFocusedWindowState() != nil else { return }
+        GlobalSettingsStore.shared.setWrapTranscriptDiffLines(
+            !GlobalSettingsStore.shared.wrapTranscriptDiffLines()
         )
     }
 

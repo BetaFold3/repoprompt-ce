@@ -375,6 +375,10 @@ struct TextKitView: NSViewRepresentable {
         }
 
         // Ensure wrapping mode is still respected with minimal churn
+        let shouldBeHorizontallyResizable = !wrapLines
+        if textView.isHorizontallyResizable != shouldBeHorizontallyResizable {
+            textView.isHorizontallyResizable = shouldBeHorizontallyResizable
+        }
         if let container = textView.textContainer {
             if wrapLines {
                 if container.widthTracksTextView == false {

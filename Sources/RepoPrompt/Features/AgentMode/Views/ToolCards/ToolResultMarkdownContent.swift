@@ -63,6 +63,9 @@ struct ToolScrollableMarkdownTextView: View {
             autohidesScrollers: true,
             scrollerStyle: .overlay
         )
+        // Live TextKit 1 wrap-geometry mutation can leave the view blank; the creation path is the
+        // only reliable one, so this forces recreation. Removing it regresses the blank-card bug.
+        .id(wrapLines)
         .frame(height: maxHeight, alignment: .topLeading)
     }
 }

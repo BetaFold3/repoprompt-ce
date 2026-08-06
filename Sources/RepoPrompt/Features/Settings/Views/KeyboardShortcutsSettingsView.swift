@@ -24,6 +24,31 @@ enum KeyboardShortcutCatalog {
             ]
         ),
         KeyboardShortcutCatalogSection(
+            id: "transcript",
+            title: "Transcript",
+            blurb: "Search, expand, and wrap Agent transcript content.",
+            bindings: [
+                .init(
+                    id: "transcript-search",
+                    title: "Search assistant replies",
+                    detail: "Opens and focuses the transcript search bar; press again to close.",
+                    name: .toggleAssistantTranscriptSearch
+                ),
+                .init(
+                    id: "transcript-expand-all",
+                    title: "Expand all assistant replies",
+                    detail: "Expands every assistant reply; press again to restore automatic collapsing.",
+                    name: .toggleExpandAllAssistantReplies
+                ),
+                .init(
+                    id: "transcript-word-wrap",
+                    title: "Toggle word wrap for transcript code and diffs",
+                    detail: nil,
+                    name: .toggleTranscriptWordWrap
+                )
+            ]
+        ),
+        KeyboardShortcutCatalogSection(
             id: "workspace-presets",
             title: "Workspace & presets",
             blurb: "Save and navigate the active workspace. Preset shortcuts jump to the numbered preset in the workspace manager.",

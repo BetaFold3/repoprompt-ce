@@ -91,6 +91,14 @@ extension Notification.Name {
     /// `userInfo["windowID"]` should be the target window ID.
     static let toggleRepoPromptNavigationSidebar = Notification.Name("toggleRepoPromptNavigationSidebar")
 
+    /// Toggle assistant-reply transcript search for the focused window.
+    /// `userInfo["windowID"]` should be the target window ID.
+    static let toggleAgentTranscriptSearch = Notification.Name("toggleAgentTranscriptSearch")
+
+    /// Toggle expansion of all assistant replies for the focused window.
+    /// `userInfo["windowID"]` should be the target window ID.
+    static let toggleAgentTranscriptExpandAllReplies = Notification.Name("toggleAgentTranscriptExpandAllReplies")
+
     /// Toggle the Agent Mode right utility panel (Changes / Preview) for the focused window.
     /// `userInfo[AgentUtilityPanelNotificationUserInfoKey.windowID]` should be the target window ID.
     static let toggleAgentUtilityPanel = Notification.Name("toggleAgentUtilityPanel")

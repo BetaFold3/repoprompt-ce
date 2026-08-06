@@ -39,6 +39,12 @@ extension KeyboardShortcuts.Name {
     static let agentNewChat = Self("agentNewChat", default: .init(.n, modifiers: [.command, .option]))
     /// Toggle the Agent session sidebar.
     static let toggleNavigationSidebar = Self("toggleNavigationSidebar", default: .init(.b, modifiers: [.command, .option]))
+    /// Toggle assistant-reply transcript search.
+    static let toggleAssistantTranscriptSearch = Self("toggleAssistantTranscriptSearch", default: .init(.f, modifiers: [.command, .option]))
+    /// Toggle expansion of all assistant replies.
+    static let toggleExpandAllAssistantReplies = Self("toggleExpandAllAssistantReplies", default: .init(.e, modifiers: [.command, .option]))
+    /// Toggle word wrap for transcript code and diffs.
+    static let toggleTranscriptWordWrap = Self("toggleTranscriptWordWrap", default: .init(.l, modifiers: [.command, .option]))
     /// Show the current-window Agent navigation HUD.
     static let showCurrentWindowAgentNavigationHUD = Self("showCurrentWindowAgentNavigationHUD", default: .init(.k, modifiers: [.command]))
     /// Show the all-active/recent Agents navigation HUD.

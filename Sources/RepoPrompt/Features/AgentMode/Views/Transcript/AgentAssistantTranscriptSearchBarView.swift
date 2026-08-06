@@ -1,9 +1,7 @@
 import SwiftUI
 
 /// Compact chrome for Workstream 5 item 1's assistant-only transcript search: query field,
-/// match counter, and prev/next navigation. Ephemeral bulk-expansion actions live in a separate,
-/// always-available affordance next to this bar (`AgentModeChatDetailView.assistantBulkActionsMenu`)
-/// rather than inside it, so they stay reachable without opening search first.
+/// match counter, and prev/next navigation.
 struct AgentAssistantTranscriptSearchBarView: View {
     @Binding var query: String
     let counterText: String?
