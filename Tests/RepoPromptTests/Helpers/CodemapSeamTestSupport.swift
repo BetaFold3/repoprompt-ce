@@ -381,6 +381,8 @@ class WorkspaceFileContextStoreCodemapSeamTestSupport: XCTestCase {
             reason != .releasedRootEpoch
         case let .demandUnavailable(reason):
             reason != .transient
+        case .runtimeFailureParked:
+            true
         case .gitTransient, .busy, .rejected, .routeConflict, .registrationFailed,
              .runtimeFailure, .staleCurrentness, .cancelled:
             false

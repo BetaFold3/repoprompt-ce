@@ -23,6 +23,7 @@ enum WorkspaceCodemapArtifactDemandUnavailableReason: Equatable {
     case routeConflict
     case registrationFailed
     case runtimeFailure
+    case runtimeFailureParked
     case staleCurrentness
     case cancelled
 }

@@ -5354,7 +5354,8 @@ final class MCPServerViewModel: ObservableObject {
             retryAfterMilliseconds: retryAfterMilliseconds,
             attempted: issue.attempted,
             limit: issue.limit,
-            message: issue.message
+            message: issue.message,
+            detail: issue.detail == "runtime_failure_parked" ? issue.detail : nil
         )
     }
 
@@ -5586,6 +5587,14 @@ final class MCPServerViewModel: ObservableObject {
                     attempted: nil, limit: nil,
                     message: "A codemap artifact is unavailable. (reason=runtime_failure)",
                     detail: "runtime_failure"
+                )
+            case .runtimeFailureParked:
+                return DTO(
+                    code: "artifact_unavailable", phase: "seed_demand", path: path,
+                    retryable: false, retryAfterMilliseconds: nil,
+                    attempted: nil, limit: nil,
+                    message: "A codemap artifact is unavailable. (reason=runtime_failure_parked)",
+                    detail: "runtime_failure_parked"
                 )
             case .cancelled:
                 return DTO(

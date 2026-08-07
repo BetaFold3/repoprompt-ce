@@ -405,6 +405,39 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         XCTAssertNil(window.mcpServer.capturedCodeStructureRequestForTesting())
     }
 
+    func testParkedRuntimeFailureDTOIsTerminalWithStableReasonToken() throws {
+        let fileID = UUID()
+        let path = "Sources/Parked.swift"
+        let presentation = WorkspaceCodemapStructurePresentation(
+            outcome: .unavailable,
+            entries: [],
+            issues: [.artifactUnavailable(fileID: fileID, reason: .runtimeFailureParked)],
+            requestedSeedCount: 1,
+            resolvedSeedCount: 1,
+            examinedEdgeCount: 0,
+            codemapTokenCount: 0
+        )
+
+        let dto = MCPServerViewModel.codeStructureReplyDTO(
+            presentation: presentation,
+            logicalPathsByFileID: [fileID: path],
+            worktreeScope: nil
+        )
+
+        XCTAssertEqual(dto.status, "unavailable")
+        let issue = try XCTUnwrap(dto.issues.first)
+        XCTAssertEqual(issue.code, "artifact_unavailable")
+        XCTAssertEqual(issue.path, path)
+        XCTAssertFalse(issue.retryable)
+        XCTAssertNil(issue.retryAfterMilliseconds)
+        XCTAssertEqual(issue.detail, "runtime_failure_parked")
+        XCTAssertEqual(
+            issue.message,
+            "A codemap artifact is unavailable. (reason=runtime_failure_parked)"
+        )
+        XCTAssertNil(dto.retry)
+    }
+
     func testReadinessPressureDTOsAreTypedEmptyAndRetryConsistent() throws {
         let rendered = try renderedStructureEntry()
         let cases: [(

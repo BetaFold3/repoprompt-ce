@@ -615,6 +615,49 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         await store.unloadRoot(id: loaded.id)
     }
 
+    func testParkedRuntimeProviderFailureYieldsStableParkedReason() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let runtimeCalls = CodemapLockedCounter()
+        let runtimeProvider = CodeMapArtifactRuntimeProvider {
+            runtimeCalls.increment()
+            throw CodeMapRepositoryNamespaceSaltStoreError.insecureStorage
+        }
+        addTeardownBlock {
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = WorkspaceFileContextStore(
+            codemapRuntimeProvider: {
+                try runtimeProvider.runtime()
+            },
+            codemapLocalGitClassificationProbe: .init { _ in .requiresGitPreflight },
+            codemapGitEligibilityProbe: .init { _ in .eligible },
+            codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+        )
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+
+        let ticket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: file.id)
+        )
+        let firstResult = try await settledResult(store: store, ticket: ticket)
+        guard case .unavailable(.runtimeFailureParked) = firstResult else {
+            return XCTFail("Expected a parked runtime failure, got \(firstResult)")
+        }
+        let repeatedResult = await store.requestCodemapArtifact(forFileID: file.id)
+        guard case .unavailable(.runtimeFailureParked) = repeatedResult else {
+            return XCTFail("Expected the parked setup reason to remain stable, got \(repeatedResult)")
+        }
+        XCTAssertEqual(runtimeCalls.value, 1)
+        await store.unloadRoot(id: loaded.id)
+    }
+
     func testTransientSetupUsesOneBackoffThenFreshSetupRegistration() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(
@@ -640,7 +683,10 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         let store = WorkspaceFileContextStore(
             codemapRuntimeProvider: {
                 if runtimeCalls.incrementAndGet() == 1 {
-                    throw WorkspaceCodemapBindingEngineProviderError.unconfigured
+                    throw CodeMapRepositoryNamespaceSaltStoreError.ioFailure(
+                        operation: "test",
+                        code: EIO
+                    )
                 }
                 return try fixture.runtime()
             },

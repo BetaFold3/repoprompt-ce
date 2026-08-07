@@ -499,6 +499,7 @@ private func automaticSelectionUnavailableReasonSortComponents(
     case .routeConflict: ["routeConflict"]
     case .registrationFailed: ["registrationFailed"]
     case .runtimeFailure: ["runtimeFailure"]
+    case .runtimeFailureParked: ["runtimeFailureParked"]
     case .staleCurrentness: ["staleCurrentness"]
     case .cancelled: ["cancelled"]
     }

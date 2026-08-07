@@ -152,6 +152,42 @@ final class SnippetPaletteHelperTests: XCTestCase {
         XCTAssertFalse(idleHandled)
     }
 
+    func testCommitBreaksTypingUndoCoalescingAroundSnippetInsertion() {
+        let snippet = makeItem(title: "duel oracles", content: "CONTENT")
+        let textView = ImageAwareTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
+        textView.allowsUndo = true
+        let delegate = UndoProvidingTextViewDelegate()
+        textView.delegate = delegate
+        textView.string = "Hello "
+        textView.setSelectedRange(NSRange(location: 6, length: 0))
+        textView.insertText("due", replacementRange: textView.selectedRange())
+        XCTAssertEqual(textView.string, "Hello due")
+        let typingEventBoundary = expectation(description: "typing event boundary")
+        DispatchQueue.main.async {
+            typingEventBoundary.fulfill()
+        }
+        wait(for: [typingEventBoundary], timeout: 1)
+        let helper = SnippetPaletteHelper()
+        helper.setSessionStateForTesting(
+            matchedItems: [snippet],
+            highlightedIndex: 0,
+            anchorLocation: 6
+        )
+
+        let handled = helper.handleCommandIfNeeded(
+            textView: textView,
+            commandSelector: #selector(NSResponder.insertNewline(_:)),
+            enabled: true
+        )
+
+        XCTAssertTrue(handled)
+        XCTAssertEqual(textView.string, "Hello CONTENT")
+        delegate.textViewUndoManager.undo()
+        XCTAssertEqual(textView.string, "Hello due")
+        delegate.textViewUndoManager.undo()
+        XCTAssertEqual(textView.string, "Hello ")
+    }
+
     func testCommitRegistersUndoSoUndoRestoresTypedQuery() {
         let snippet = makeItem(title: "duel oracles", content: "CONTENT")
         let textView = ImageAwareTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))

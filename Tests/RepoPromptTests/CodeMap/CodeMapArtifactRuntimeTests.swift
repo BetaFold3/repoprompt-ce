@@ -276,6 +276,69 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         XCTAssertEqual(parkedFactoryCount.value, 1)
     }
 
+    func testRuntimeProviderCancellationRetriesImmediatelyWithoutGrowingBackoff() throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clock = RuntimeProviderTestClock()
+        let factoryCount = RuntimeProviderTestCounter()
+        let transient = NSError(
+            domain: "CodeMapArtifactRuntimeTests.AfterCancellation",
+            code: 95
+        )
+        let provider = CodeMapArtifactRuntimeProvider(factory: {
+            factoryCount.increment()
+            switch factoryCount.value {
+            case 1, 2:
+                throw CancellationError()
+            case 3:
+                throw transient
+            default:
+                return try CodeMapArtifactRuntime(rootURL: root)
+            }
+        }, now: { clock.now })
+
+        for expectedCount in 1 ... 2 {
+            XCTAssertThrowsError(try provider.runtime()) {
+                XCTAssertTrue($0 is CancellationError)
+            }
+            XCTAssertEqual(factoryCount.value, expectedCount)
+        }
+        XCTAssertThrowsError(try provider.runtime()) {
+            XCTAssertTrue(($0 as NSError) === transient)
+        }
+        XCTAssertEqual(factoryCount.value, 3)
+        clock.advance(by: 29)
+        XCTAssertThrowsError(try provider.runtime())
+        XCTAssertEqual(factoryCount.value, 3)
+        clock.advance(by: 1)
+        _ = try provider.runtime()
+        XCTAssertEqual(factoryCount.value, 4)
+    }
+
+    func testRuntimeProviderTransientBackoffCapsAtFiveMinutes() {
+        let clock = RuntimeProviderTestClock()
+        let factoryCount = RuntimeProviderTestCounter()
+        let sentinel = NSError(
+            domain: "CodeMapArtifactRuntimeTests.BackoffCap",
+            code: 96
+        )
+        let provider = CodeMapArtifactRuntimeProvider(factory: {
+            factoryCount.increment()
+            throw sentinel
+        }, now: { clock.now })
+
+        XCTAssertThrowsError(try provider.runtime())
+        XCTAssertEqual(factoryCount.value, 1)
+        for (index, delay) in [30, 60, 120, 240, 300, 300].enumerated() {
+            clock.advance(by: TimeInterval(delay - 1))
+            XCTAssertThrowsError(try provider.runtime())
+            XCTAssertEqual(factoryCount.value, index + 1)
+            clock.advance(by: 1)
+            XCTAssertThrowsError(try provider.runtime())
+            XCTAssertEqual(factoryCount.value, index + 2)
+        }
+    }
+
     func testRuntimeProviderBackoffStartsWhenFactoryFailureReturns() {
         let clock = RuntimeProviderTestClock()
         let factoryCount = RuntimeProviderTestCounter()
@@ -298,6 +361,37 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         XCTAssertEqual(factoryCount.value, 1)
         clock.advance(by: 1)
         XCTAssertThrowsError(try provider.runtime())
+        XCTAssertEqual(factoryCount.value, 2)
+    }
+
+    func testBindingEngineProviderBackoffStartsWhenFactoryFailureReturns() throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let clock = RuntimeProviderTestClock()
+        let factoryCount = RuntimeProviderTestCounter()
+        let sentinel = NSError(
+            domain: "CodeMapArtifactRuntimeTests.BindingFailureTime",
+            code: 97
+        )
+        let runtime = try CodeMapArtifactRuntime(
+            rootURL: root,
+            bindingEngineFactory: { _ in
+                factoryCount.increment()
+                clock.advance(by: 31)
+                throw sentinel
+            },
+            bindingEngineProviderNow: { clock.now }
+        )
+
+        XCTAssertThrowsError(try runtime.bindingEngine())
+        XCTAssertEqual(factoryCount.value, 1)
+        XCTAssertThrowsError(try runtime.bindingEngine())
+        XCTAssertEqual(factoryCount.value, 1)
+        clock.advance(by: 29)
+        XCTAssertThrowsError(try runtime.bindingEngine())
+        XCTAssertEqual(factoryCount.value, 1)
+        clock.advance(by: 1)
+        XCTAssertThrowsError(try runtime.bindingEngine())
         XCTAssertEqual(factoryCount.value, 2)
     }
 

@@ -1664,7 +1664,7 @@ import XCTest
                 true
             case .rootNotLoaded, .fileNotCataloged, .unsupportedFileType,
                  .gitTerminal, .demandUnavailable, .rejected, .routeConflict,
-                 .registrationFailed, .runtimeFailure, .cancelled:
+                 .registrationFailed, .runtimeFailure, .runtimeFailureParked, .cancelled:
                 false
             }
         }

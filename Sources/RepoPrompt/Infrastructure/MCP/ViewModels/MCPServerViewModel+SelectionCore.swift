@@ -496,7 +496,7 @@ extension MCPServerViewModel {
             _ reason: WorkspaceCodemapArtifactDemandUnavailableReason
         ) -> CodemapIssueDisposition {
             switch reason {
-            case .unsupportedFileType:
+            case .unsupportedFileType, .runtimeFailureParked:
                 .unmapped(terminal: true)
             case .gitTerminal:
                 .unmapped(terminal: true)

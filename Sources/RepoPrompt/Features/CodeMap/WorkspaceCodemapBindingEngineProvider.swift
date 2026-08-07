@@ -106,6 +106,13 @@ final class WorkspaceCodemapBindingEngineProvider: @unchecked Sendable {
         }
     }
 
+    static func isParkedFailure(_ error: Error) -> Bool {
+        if case .parked = classify(error) {
+            return true
+        }
+        return false
+    }
+
     private static func retryDelay(forAttempt attempt: Int) -> TimeInterval {
         let exponent = min(max(0, attempt - 1), 4)
         return min(initialRetryDelay * TimeInterval(1 << exponent), maximumRetryDelay)

@@ -16001,7 +16001,11 @@ actor WorkspaceFileContextStore {
                 phase: "runtime_construction",
                 error: error
             )
-            let disposition = CodemapSetupDisposition.unavailable(.runtimeFailure)
+            let reason: WorkspaceCodemapArtifactDemandUnavailableReason =
+                CodeMapArtifactRuntimeProvider.isParkedFailure(error)
+                    ? .runtimeFailureParked
+                    : .runtimeFailure
+            let disposition = CodemapSetupDisposition.unavailable(reason)
             await publishCodemapSetupDisposition(disposition, authority: authority)
             return disposition
         }
@@ -16094,7 +16098,11 @@ actor WorkspaceFileContextStore {
                 codemapSessionsByRootEpoch[authority.rootEpoch]?.routeToken = nil
                 codemapSessionsByRootEpoch[authority.rootEpoch]?.runtime = nil
             }
-            let disposition = CodemapSetupDisposition.unavailable(.runtimeFailure)
+            let reason: WorkspaceCodemapArtifactDemandUnavailableReason =
+                WorkspaceCodemapBindingEngineProvider.isParkedFailure(error)
+                    ? .runtimeFailureParked
+                    : .runtimeFailure
+            let disposition = CodemapSetupDisposition.unavailable(reason)
             await publishCodemapSetupDisposition(disposition, authority: authority)
             return disposition
         }
@@ -16199,7 +16207,9 @@ actor WorkspaceFileContextStore {
         } else if let currentSetupTask = session.setupTask {
             await currentSetupTask.value
         } else {
-            .unavailable(.runtimeFailure)
+            // A ready-without-engine cleanup can clear both setup references
+            // after this demand captures them. The next enqueue reruns setup.
+            .unavailable(.busy(retryAfterMilliseconds: nil))
         }
 
         guard codemapDemandIsCurrent(ticket), !Task.isCancelled,
@@ -18083,6 +18093,8 @@ actor WorkspaceFileContextStore {
             reason != .releasedRootEpoch
         case let .demandUnavailable(reason):
             reason != .transient
+        case .runtimeFailureParked:
+            true
         case .gitTransient, .busy, .rejected, .routeConflict, .registrationFailed,
              .runtimeFailure, .staleCurrentness, .cancelled:
             false

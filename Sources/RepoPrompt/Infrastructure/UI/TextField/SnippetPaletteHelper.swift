@@ -249,10 +249,10 @@ final class SnippetPaletteHelper {
         // Route the mutation through the undo-aware text view protocol so the
         // insertion registers as a single undoable step; a bare textStorage
         // write would leave ⌘Z replaying stale typing ranges over the new text.
+        textView.breakUndoCoalescing()
         guard textView.shouldChangeText(in: replacementRange, replacementString: content) else {
             return
         }
-        textView.breakUndoCoalescing()
         textView.textStorage?.replaceCharacters(in: replacementRange, with: content)
         textView.didChangeText()
         textView.breakUndoCoalescing()
