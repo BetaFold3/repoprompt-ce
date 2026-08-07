@@ -20,7 +20,8 @@ enum KeyboardShortcutCatalog {
                 .init(id: "agent-new", title: "New Agent chat", detail: nil, name: .agentNewChat),
                 .init(id: "toggle-sidebar", title: "Toggle session sidebar", detail: "Show or hide the Agent sessions list.", name: .toggleNavigationSidebar),
                 .init(id: "agent-nav-current", title: "Show Agent Session Switcher", detail: "Jump between Agent sessions in the focused window.", name: .showCurrentWindowAgentNavigationHUD),
-                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD)
+                .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD),
+                .init(id: "snippet-palette", title: "Open prompt snippet palette", detail: "Insert a saved prompt at the cursor while typing in the Agent composer.", name: .openPromptSnippetPalette)
             ]
         ),
         KeyboardShortcutCatalogSection(

@@ -657,6 +657,15 @@ struct AgentComposerView: View, Equatable {
                     onFileTagCommitted: handleFileTagCommitted(_:),
                     slashSkillSuggestionsProvider: { query in
                         await actions.slashSkillSuggestions(query)
+                    },
+                    snippetPaletteItemsProvider: { [promptManager] in
+                        promptManager.storedPrompts.map { prompt in
+                            SnippetPaletteItem(
+                                id: prompt.id,
+                                title: prompt.title,
+                                content: prompt.content
+                            )
+                        }
                     }
                 ),
                 onHeightChange: { newHeight in

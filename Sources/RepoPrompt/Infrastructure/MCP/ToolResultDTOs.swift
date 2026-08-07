@@ -323,9 +323,32 @@ enum ToolResultDTOs {
             let attempted: Int?
             let limit: Int?
             let message: String
+            let detail: String?
+
+            init(
+                code: String,
+                phase: String,
+                path: String?,
+                retryable: Bool,
+                retryAfterMilliseconds: Int?,
+                attempted: Int?,
+                limit: Int?,
+                message: String,
+                detail: String? = nil
+            ) {
+                self.code = code
+                self.phase = phase
+                self.path = path
+                self.retryable = retryable
+                self.retryAfterMilliseconds = retryAfterMilliseconds
+                self.attempted = attempted
+                self.limit = limit
+                self.message = message
+                self.detail = detail
+            }
 
             private enum CodingKeys: String, CodingKey {
-                case code, phase, path, retryable, attempted, limit, message
+                case code, phase, path, retryable, attempted, limit, message, detail
                 case retryAfterMilliseconds = "retry_after_ms"
             }
         }

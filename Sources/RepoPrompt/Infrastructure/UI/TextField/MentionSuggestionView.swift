@@ -92,6 +92,7 @@ struct MentionSuggestionRowView: View {
         case .folder: "folder.fill"
         case .file: "doc.text.fill"
         case .skill: "terminal"
+        case .snippet: "text.quote"
         }
     }
 
@@ -100,6 +101,7 @@ struct MentionSuggestionRowView: View {
         case .folder: .blue
         case .file: Color(.secondaryLabelColor)
         case .skill: Color(.secondaryLabelColor)
+        case .snippet: .purple
         }
     }
 }

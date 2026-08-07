@@ -14,6 +14,10 @@ extension Notification.Name {
     static let showManagePresetsTab = Notification.Name("showManagePresetsTab")
     /// Posted when the UI should present the "Create Preset" naming sheet
     static let showCreatePresetSheet = Notification.Name("showCreatePresetSheet")
+    /// Posted by the global shortcut to open the prompt snippet palette in the
+    /// focused Agent composer text view. The composer coordinator that owns
+    /// the focused text view responds; all others ignore it.
+    static let openPromptSnippetPalette = Notification.Name("openPromptSnippetPalette")
     /// Posted when the UI should show the MCP settings tab
     static let showMCPSettingsTab = Notification.Name("showMCPSettingsTab")
     /// Posted when the UI should show the CLI Providers settings tab

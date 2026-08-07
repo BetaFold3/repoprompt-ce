@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import OSLog
 import RepoPromptShared
 
 /// Process-lifetime ownership for content-addressed codemap artifact infrastructure.
@@ -34,7 +35,8 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         bindingIntegrationRegistry: WorkspaceCodemapBindingIntegrationRegistry =
             WorkspaceCodemapBindingIntegrationRegistry(),
         bindingEngineFactory: @escaping WorkspaceCodemapBindingEngineProvider.Factory =
-            WorkspaceCodemapBindingEngineProvider.unconfiguredFactory
+            WorkspaceCodemapBindingEngineProvider.unconfiguredFactory,
+        bindingEngineProviderNow: @escaping @Sendable () -> Date = Date.init
     ) throws {
         let artifactStore = try CodeMapArtifactStore(
             rootURL: rootURL,
@@ -67,7 +69,10 @@ final class CodeMapArtifactRuntime: @unchecked Sendable {
         self.manifestStore = manifestStore
         self.coordinator = coordinator
         self.bindingIntegrationRegistry = bindingIntegrationRegistry
-        bindingEngineProvider = WorkspaceCodemapBindingEngineProvider(factory: bindingEngineFactory)
+        bindingEngineProvider = WorkspaceCodemapBindingEngineProvider(
+            factory: bindingEngineFactory,
+            now: bindingEngineProviderNow
+        )
     }
 
     func bindingEngine() throws -> WorkspaceCodemapBindingEngine {
@@ -349,29 +354,142 @@ enum CodeMapRepositoryNamespaceSaltStore {
 final class CodeMapArtifactRuntimeProvider: @unchecked Sendable {
     typealias Factory = @Sendable () throws -> CodeMapArtifactRuntime
 
+    private enum FailureClassification {
+        case transient
+        case freelyRetryable
+        case parked(reason: String)
+    }
+
+    private struct RetryFailure {
+        let error: Error
+        let retryNotBefore: Date
+        let attempt: Int
+    }
+
+    private static let logger = Logger(
+        subsystem: "com.repoprompt.codemap",
+        category: "artifact-runtime"
+    )
+    private static let initialRetryDelay: TimeInterval = 30
+    private static let maximumRetryDelay: TimeInterval = 5 * 60
+
     private let lock = NSLock()
     private let factory: Factory
-    private var cachedResult: Result<CodeMapArtifactRuntime, Error>?
+    private let now: @Sendable () -> Date
+    private var cachedRuntime: CodeMapArtifactRuntime?
+    private var retryFailure: RetryFailure?
+    private var parkedFailure: Error?
 
-    init(factory: @escaping Factory) {
+    init(
+        factory: @escaping Factory,
+        now: @escaping @Sendable () -> Date = Date.init
+    ) {
         self.factory = factory
+        self.now = now
     }
 
     func runtime() throws -> CodeMapArtifactRuntime {
         lock.lock()
         defer { lock.unlock() }
 
-        if let cachedResult {
-            return try cachedResult.get()
+        if let cachedRuntime {
+            return cachedRuntime
+        }
+        if let parkedFailure {
+            throw parkedFailure
         }
 
-        let result: Result<CodeMapArtifactRuntime, Error>
-        do {
-            result = try .success(factory())
-        } catch {
-            result = .failure(error)
+        let currentTime = now()
+        if let retryFailure, currentTime < retryFailure.retryNotBefore {
+            throw retryFailure.error
         }
-        cachedResult = result
-        return try result.get()
+
+        do {
+            let runtime = try factory()
+            cachedRuntime = runtime
+            retryFailure = nil
+            return runtime
+        } catch {
+            switch Self.classify(error) {
+            case .freelyRetryable:
+                retryFailure = nil
+                Self.logger.error(
+                    "Codemap runtime construction failed classification=freely_retryable error=\(String(describing: error), privacy: .private)"
+                )
+            case .transient:
+                let attempt = (retryFailure?.attempt ?? 0) + 1
+                let delay = Self.retryDelay(forAttempt: attempt)
+                retryFailure = RetryFailure(
+                    error: error,
+                    retryNotBefore: now().addingTimeInterval(delay),
+                    attempt: attempt
+                )
+                Self.logger.error(
+                    "Codemap runtime construction failed classification=transient attempt=\(attempt, privacy: .public) retryAfterSeconds=\(Int(delay), privacy: .public) error=\(String(describing: error), privacy: .private)"
+                )
+            case let .parked(reason):
+                parkedFailure = error
+                retryFailure = nil
+                Self.logger.fault(
+                    "Codemap runtime construction parked reason=\(reason, privacy: .public) error=\(String(describing: error), privacy: .private)"
+                )
+            }
+            throw error
+        }
+    }
+
+    private static func retryDelay(forAttempt attempt: Int) -> TimeInterval {
+        let exponent = min(max(0, attempt - 1), 4)
+        return min(initialRetryDelay * TimeInterval(1 << exponent), maximumRetryDelay)
+    }
+
+    private static func classify(_ error: Error) -> FailureClassification {
+        if error is CancellationError {
+            return .freelyRetryable
+        }
+        if let coordinatorError = error as? CodeMapArtifactBuildCoordinatorError,
+           case .busy = coordinatorError
+        {
+            return .freelyRetryable
+        }
+        if let error = error as? CodeMapRepositoryNamespaceSaltStoreError {
+            return switch error {
+            case .ioFailure: .transient
+            case .insecureStorage: .parked(reason: "insecure_namespace_salt_storage")
+            }
+        }
+        if let error = error as? CodeMapArtifactFileStoreError {
+            return switch error {
+            case .ioFailure: .transient
+            case .invalidRoot, .insecureDirectory, .insecureLeaf, .integrityCollision:
+                .parked(reason: "artifact_file_store_invariant")
+            }
+        }
+        if let error = error as? CodeMapArtifactCatalogError {
+            return switch error {
+            case .ioFailure: .transient
+            case .invalidLayout, .insecureEntry, .boundedScanExceeded, .invalidMetadata:
+                .parked(reason: "artifact_catalog_invariant")
+            }
+        }
+        if let error = error as? GitBlobCodeMapLocatorStoreError {
+            return switch error {
+            case .ioFailure: .transient
+            case .invalidRoot, .insecureDirectory, .insecureLeaf, .integrityCollision, .quotaExceeded:
+                .parked(reason: "locator_store_invariant")
+            }
+        }
+        if let error = error as? CodeMapRootManifestStoreError {
+            return switch error {
+            case .ioFailure: .transient
+            case .invalidRoot, .insecureDirectory, .insecureLeaf, .quotaExceeded,
+                 .staleWriterAuthority, .simulatedProcessTermination:
+                .parked(reason: "manifest_store_invariant")
+            }
+        }
+        if error is WorkspaceCodemapBindingEngineProviderError {
+            return .parked(reason: "binding_engine_provider_invariant")
+        }
+        return .transient
     }
 }

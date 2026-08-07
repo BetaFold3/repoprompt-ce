@@ -2,9 +2,38 @@ import Combine
 import CoreServices
 import Dispatch
 import Foundation
+import OSLog
 #if DEBUG
     import CryptoKit
 #endif
+
+private enum WorkspaceCodemapSetupLog {
+    private static let logger = Logger(
+        subsystem: "com.repoprompt.workspace",
+        category: "CodemapSetup"
+    )
+
+    static func recordFailure(phase: String, error: Error) {
+        logger.error(
+            "Codemap setup failed phase=\(phase, privacy: .public) error=\(String(describing: error), privacy: .private)"
+        )
+    }
+
+    static func recordRootRegistrationFailure(
+        reason: String,
+        detail: String? = nil
+    ) {
+        if let detail {
+            logger.error(
+                "Codemap setup failed phase=root_registration reason=\(reason, privacy: .public) detail=\(detail, privacy: .private)"
+            )
+        } else {
+            logger.error(
+                "Codemap setup failed phase=root_registration reason=\(reason, privacy: .public)"
+            )
+        }
+    }
+}
 
 enum WorkspaceFileTreePresentationMode: String {
     case none
@@ -2325,6 +2354,13 @@ actor WorkspaceFileContextStore {
         private var debugCodemapProjectionHoldExpiryTasks: [UUID: Task<Void, Never>] = [:]
         private var codemapProjectionPreloadStoreEvents: [CodemapProjectionPreloadStoreEvent] = []
         private var nextCodemapProjectionPreloadStoreEventOrdinal: UInt64 = 0
+        private let codemapRootRegistrationResultHookForTesting: @Sendable (
+            WorkspaceCodemapBindingRegistrationResult
+        ) async -> WorkspaceCodemapBindingRegistrationResult
+        private let codemapSetupDispositionDidPublishHookForTesting: @Sendable (Bool) async -> Void
+        private let codemapDemandWillResolveSetupHookForTesting: @Sendable (
+            WorkspaceCodemapArtifactDemandTicket
+        ) async -> Void
         private var codemapProjectionPreloadStartHandler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
         private var codemapProjectionCatalogBuildHandler: (@Sendable (WorkspaceCodemapRootEpoch) async -> Void)?
         private var codemapStructureSeedAdmissionRequestCountForTesting = 0
@@ -2471,6 +2507,15 @@ actor WorkspaceFileContextStore {
                 WorkspaceCodemapArtifactDemandTicket,
                 WorkspaceCodemapBindingDemandResult
             ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result },
+            codemapRootRegistrationResultHookForTesting: @escaping @Sendable (
+                WorkspaceCodemapBindingRegistrationResult
+            ) async -> WorkspaceCodemapBindingRegistrationResult = { result in result },
+            codemapSetupDispositionDidPublishHookForTesting: @escaping @Sendable (
+                Bool
+            ) async -> Void = { _ in },
+            codemapDemandWillResolveSetupHookForTesting: @escaping @Sendable (
+                WorkspaceCodemapArtifactDemandTicket
+            ) async -> Void = { _ in },
             codemapAutomaticSelectionQueryHook: @escaping @Sendable (
                 WorkspaceCodemapRootEpoch
             ) async -> Void = { _ in }
@@ -2495,6 +2540,9 @@ actor WorkspaceFileContextStore {
             self.codemapReadyPublicationHook = codemapReadyPublicationHook
             self.codemapGraphPublicationWaiter = codemapGraphPublicationWaiter
             self.codemapDemandResultHook = codemapDemandResultHook
+            self.codemapRootRegistrationResultHookForTesting = codemapRootRegistrationResultHookForTesting
+            self.codemapSetupDispositionDidPublishHookForTesting = codemapSetupDispositionDidPublishHookForTesting
+            self.codemapDemandWillResolveSetupHookForTesting = codemapDemandWillResolveSetupHookForTesting
             self.codemapAutomaticSelectionQueryHook = codemapAutomaticSelectionQueryHook
             isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
@@ -14224,7 +14272,7 @@ actor WorkspaceFileContextStore {
             task: nil
         )
 
-        _ = ensureCodemapSetupTask(authority: authority)
+        let setupTask = ensureCodemapSetupTask(authority: authority)
 
         codemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id] = record
         #if DEBUG
@@ -14232,7 +14280,11 @@ actor WorkspaceFileContextStore {
         #endif
         let demandTask = Task { [weak self] in
             guard let self else { return }
-            await performCodemapDemand(ticket: ticket, priority: priority)
+            await performCodemapDemand(
+                ticket: ticket,
+                priority: priority,
+                setupTask: setupTask
+            )
         }
         record.task = demandTask
         codemapSessionsByRootEpoch[rootEpoch]?.demandsByFileID[file.id] = record
@@ -15764,6 +15816,11 @@ actor WorkspaceFileContextStore {
             let projectionRecoveryObserverRearms: Int
         }
 
+        struct CodemapSetupStateForTesting: Equatable {
+            let setupTaskActive: Bool
+            let setupDispositionPresent: Bool
+        }
+
         struct CodemapGraphPublicationRecoveryStateForTesting: Equatable {
             let flightActive: Bool
             let flightFollowUpStarted: Bool
@@ -15817,6 +15874,16 @@ actor WorkspaceFileContextStore {
                 flightLatestSignalSerial: session?.graphPublicationFlight?.latestSignalSerial,
                 observerActive: session?.projectionRecoveryObserver != nil,
                 observerLatestSignalSerial: session?.projectionRecoveryObserver?.latestSignalSerial
+            )
+        }
+
+        func codemapSetupStateForTesting(
+            rootEpoch: WorkspaceCodemapRootEpoch
+        ) -> CodemapSetupStateForTesting {
+            let session = codemapSessionsByRootEpoch[rootEpoch]
+            return CodemapSetupStateForTesting(
+                setupTaskActive: session?.setupTask != nil,
+                setupDispositionPresent: session?.setupDisposition != nil
             )
         }
 
@@ -15930,8 +15997,12 @@ actor WorkspaceFileContextStore {
         do {
             runtime = try codemapRuntimeProvider()
         } catch {
+            WorkspaceCodemapSetupLog.recordFailure(
+                phase: "runtime_construction",
+                error: error
+            )
             let disposition = CodemapSetupDisposition.unavailable(.runtimeFailure)
-            publishCodemapSetupDisposition(disposition, authority: authority)
+            await publishCodemapSetupDisposition(disposition, authority: authority)
             return disposition
         }
         guard codemapAuthorityIsCurrent(authority), !Task.isCancelled else {
@@ -15995,8 +16066,9 @@ actor WorkspaceFileContextStore {
             rootEpoch: authority.rootEpoch,
             endpoint: endpoint
         ) else {
+            WorkspaceCodemapSetupLog.recordRootRegistrationFailure(reason: "route_conflict")
             let disposition = CodemapSetupDisposition.unavailable(.routeConflict)
-            publishCodemapSetupDisposition(disposition, authority: authority)
+            await publishCodemapSetupDisposition(disposition, authority: authority)
             return disposition
         }
         guard codemapAuthorityIsCurrent(authority), !Task.isCancelled else {
@@ -16012,6 +16084,10 @@ actor WorkspaceFileContextStore {
         do {
             engine = try runtime.bindingEngine()
         } catch {
+            WorkspaceCodemapSetupLog.recordFailure(
+                phase: "binding_engine",
+                error: error
+            )
             _ = await registry.unregister(routeToken)
             if codemapAuthorityIsCurrent(authority) {
                 codemapSessionsByRootEpoch[authority.rootEpoch]?.endpoint = nil
@@ -16019,7 +16095,7 @@ actor WorkspaceFileContextStore {
                 codemapSessionsByRootEpoch[authority.rootEpoch]?.runtime = nil
             }
             let disposition = CodemapSetupDisposition.unavailable(.runtimeFailure)
-            publishCodemapSetupDisposition(disposition, authority: authority)
+            await publishCodemapSetupDisposition(disposition, authority: authority)
             return disposition
         }
         guard codemapAuthorityIsCurrent(authority), !Task.isCancelled else {
@@ -16036,11 +16112,39 @@ actor WorkspaceFileContextStore {
             catalogGeneration: authority.catalogGeneration,
             ingressGeneration: authority.ingressGeneration
         )
-        let registrationResult = await engine.registerRoot(registration)
+        let engineRegistrationResult = await engine.registerRoot(registration)
+        #if DEBUG
+            let registrationResult = await codemapRootRegistrationResultHookForTesting(
+                engineRegistrationResult
+            )
+        #else
+            let registrationResult = engineRegistrationResult
+        #endif
         guard codemapAuthorityIsCurrent(authority), !Task.isCancelled else {
             _ = await registry.unregister(routeToken)
             await fenceLateCodemapSetup(engine: engine, authority: authority)
             return .unavailable(.staleCurrentness)
+        }
+
+        switch registrationResult {
+        case .registered, .exactDuplicate:
+            break
+        case let .unavailable(state):
+            let reason = switch state {
+            case .terminalUnavailable: "terminal_unavailable"
+            case .transientUnavailable: "transient_unavailable"
+            case .unresolved: "unresolved"
+            case .resolving: "resolving"
+            case .eligible: "eligible"
+            }
+            WorkspaceCodemapSetupLog.recordRootRegistrationFailure(
+                reason: reason,
+                detail: String(describing: state)
+            )
+        case .busy:
+            WorkspaceCodemapSetupLog.recordRootRegistrationFailure(reason: "busy")
+        case .failed:
+            WorkspaceCodemapSetupLog.recordRootRegistrationFailure(reason: "failed")
         }
 
         let disposition: CodemapSetupDisposition = switch registrationResult {
@@ -16060,14 +16164,28 @@ actor WorkspaceFileContextStore {
         case .failed:
             .unavailable(.registrationFailed)
         }
-        publishCodemapSetupDisposition(disposition, authority: authority)
+        if codemapSetupDispositionIsRetryable(disposition) {
+            _ = await registry.unregister(routeToken)
+            await fenceLateCodemapSetup(engine: engine, authority: authority)
+            if codemapAuthorityIsCurrent(authority) {
+                codemapSessionsByRootEpoch[authority.rootEpoch]?.endpoint = nil
+                codemapSessionsByRootEpoch[authority.rootEpoch]?.routeToken = nil
+                codemapSessionsByRootEpoch[authority.rootEpoch]?.runtime = nil
+                codemapSessionsByRootEpoch[authority.rootEpoch]?.engine = nil
+            }
+        }
+        await publishCodemapSetupDisposition(disposition, authority: authority)
         return disposition
     }
 
     private func performCodemapDemand(
         ticket: WorkspaceCodemapArtifactDemandTicket,
-        priority: CodeMapArtifactBuildPriority
+        priority: CodeMapArtifactBuildPriority,
+        setupTask: Task<CodemapSetupDisposition, Never>?
     ) async {
+        #if DEBUG
+            await codemapDemandWillResolveSetupHookForTesting(ticket)
+        #endif
         guard codemapDemandIsCurrent(ticket),
               let session = codemapSessionsByRootEpoch[ticket.rootEpoch],
               let record = session.demandsByFileID[ticket.fileID],
@@ -16076,8 +16194,10 @@ actor WorkspaceFileContextStore {
 
         let setupDisposition: CodemapSetupDisposition = if let existing = session.setupDisposition {
             existing
-        } else if let setupTask = session.setupTask {
+        } else if let setupTask {
             await setupTask.value
+        } else if let currentSetupTask = session.setupTask {
+            await currentSetupTask.value
         } else {
             .unavailable(.runtimeFailure)
         }
@@ -16096,6 +16216,7 @@ actor WorkspaceFileContextStore {
             break
         }
         guard let engine = refreshedSession.engine else {
+            codemapSessionsByRootEpoch[ticket.rootEpoch]?.setupDisposition = nil
             publishCodemapDemandResult(.unavailable(.runtimeFailure), ticket: ticket)
             return
         }
@@ -16234,10 +16355,15 @@ actor WorkspaceFileContextStore {
     private func publishCodemapSetupDisposition(
         _ disposition: CodemapSetupDisposition,
         authority: CodemapRootAuthority
-    ) {
+    ) async {
         guard codemapAuthorityIsCurrent(authority) else { return }
-        codemapSessionsByRootEpoch[authority.rootEpoch]?.setupDisposition = disposition
+        let retryable = codemapSetupDispositionIsRetryable(disposition)
+        codemapSessionsByRootEpoch[authority.rootEpoch]?.setupDisposition =
+            retryable ? nil : disposition
         codemapSessionsByRootEpoch[authority.rootEpoch]?.setupTask = nil
+        #if DEBUG
+            await codemapSetupDispositionDidPublishHookForTesting(retryable)
+        #endif
     }
 
     @discardableResult

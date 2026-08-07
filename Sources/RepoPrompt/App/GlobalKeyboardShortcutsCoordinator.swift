@@ -216,6 +216,7 @@ final class GlobalKeyboardShortcutsCoordinator {
         register(.toggleAssistantTranscriptSearch) { [weak self] in self?.toggleAssistantTranscriptSearchFromShortcut() }
         register(.toggleExpandAllAssistantReplies) { [weak self] in self?.toggleAssistantTranscriptExpandAllRepliesFromShortcut() }
         register(.toggleTranscriptWordWrap) { [weak self] in self?.toggleTranscriptWordWrapFromShortcut() }
+        register(.openPromptSnippetPalette) { [weak self] in self?.openPromptSnippetPaletteFromShortcut() }
         register(.previousParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: false) }
         register(.nextParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: true) }
         register(.showCurrentWindowAgentNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .currentWindow) }
@@ -225,6 +226,12 @@ final class GlobalKeyboardShortcutsCoordinator {
     private func startNewAgentSessionFromShortcut() {
         guard let win = guardedFocusedWindowState() else { return }
         win.startNewAgentSessionFromGlobalShortcut()
+    }
+
+    private func openPromptSnippetPaletteFromShortcut() {
+        guard guardedFocusedWindowState() != nil else { return }
+        // The composer coordinator that owns the focused text view responds.
+        NotificationCenter.default.post(name: .openPromptSnippetPalette, object: nil)
     }
 
     private func toggleNavigationSidebarFromShortcut() {

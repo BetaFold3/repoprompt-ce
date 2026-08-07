@@ -190,7 +190,9 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         XCTAssertTrue(try provider.runtime() === first)
     }
 
-    func testRuntimeProviderMemoizesInitializationFailureWithoutFallback() {
+    func testRuntimeProviderMemoizesInitializationFailureWithoutFallback() throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
         let callerCount = 32
         let sentinel = NSError(
             domain: "CodeMapArtifactRuntimeTests.Sentinel",
@@ -198,13 +200,20 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
             userInfo: [NSLocalizedDescriptionKey: "reference-identical sentinel"]
         )
         let factoryCount = RuntimeProviderTestCounter()
+        let clock = RuntimeProviderTestClock()
         let results = RuntimeProviderTestResults()
         let overlapGate = RuntimeProviderOverlapGate(expectedCallerCount: callerCount)
-        let provider = CodeMapArtifactRuntimeProvider {
+        let provider = CodeMapArtifactRuntimeProvider(factory: {
             factoryCount.increment()
-            overlapGate.factoryEnteredAndWaitForRelease()
-            throw sentinel
-        }
+            if factoryCount.value == 1 {
+                overlapGate.factoryEnteredAndWaitForRelease()
+                throw sentinel
+            }
+            return try CodeMapArtifactRuntime(
+                rootURL: root,
+                builder: CodeMapArtifactBuilderClient(build: { _, _, _ in .readyNoSymbols })
+            )
+        }, now: { clock.now })
 
         let callers = startProviderCallers(
             count: callerCount,
@@ -227,13 +236,69 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
         XCTAssertTrue(snapshot.errors.allSatisfy {
             ($0 as NSError) === sentinel
         })
-        do {
-            _ = try provider.runtime()
-            XCTFail("expected memoized initialization failure")
-        } catch {
-            XCTAssertTrue((error as NSError) === sentinel)
-        }
+        XCTAssertThrowsError(try provider.runtime())
+        clock.advance(by: 29)
+        XCTAssertThrowsError(try provider.runtime())
         XCTAssertEqual(factoryCount.value, 1)
+        clock.advance(by: 1)
+        let recovered = try provider.runtime()
+        XCTAssertEqual(factoryCount.value, 2)
+        XCTAssertTrue(try provider.runtime() === recovered)
+        XCTAssertEqual(factoryCount.value, 2)
+
+        let backoffClock = RuntimeProviderTestClock()
+        let backoffFactoryCount = RuntimeProviderTestCounter()
+        let backoffProvider = CodeMapArtifactRuntimeProvider(factory: {
+            backoffFactoryCount.increment()
+            throw sentinel
+        }, now: { backoffClock.now })
+        XCTAssertThrowsError(try backoffProvider.runtime())
+        backoffClock.advance(by: 29)
+        XCTAssertThrowsError(try backoffProvider.runtime())
+        XCTAssertEqual(backoffFactoryCount.value, 1)
+        backoffClock.advance(by: 1)
+        XCTAssertThrowsError(try backoffProvider.runtime())
+        XCTAssertEqual(backoffFactoryCount.value, 2)
+        backoffClock.advance(by: 59)
+        XCTAssertThrowsError(try backoffProvider.runtime())
+        XCTAssertEqual(backoffFactoryCount.value, 2)
+        backoffClock.advance(by: 1)
+        XCTAssertThrowsError(try backoffProvider.runtime())
+        XCTAssertEqual(backoffFactoryCount.value, 3)
+
+        let parkedFactoryCount = RuntimeProviderTestCounter()
+        let parkedProvider = CodeMapArtifactRuntimeProvider {
+            parkedFactoryCount.increment()
+            throw CodeMapRepositoryNamespaceSaltStoreError.insecureStorage
+        }
+        XCTAssertThrowsError(try parkedProvider.runtime())
+        XCTAssertThrowsError(try parkedProvider.runtime())
+        XCTAssertEqual(parkedFactoryCount.value, 1)
+    }
+
+    func testRuntimeProviderBackoffStartsWhenFactoryFailureReturns() {
+        let clock = RuntimeProviderTestClock()
+        let factoryCount = RuntimeProviderTestCounter()
+        let sentinel = NSError(
+            domain: "CodeMapArtifactRuntimeTests.FailureTime",
+            code: 94
+        )
+        let provider = CodeMapArtifactRuntimeProvider(factory: {
+            factoryCount.increment()
+            clock.advance(by: 31)
+            throw sentinel
+        }, now: { clock.now })
+
+        XCTAssertThrowsError(try provider.runtime())
+        XCTAssertEqual(factoryCount.value, 1)
+        XCTAssertThrowsError(try provider.runtime())
+        XCTAssertEqual(factoryCount.value, 1)
+        clock.advance(by: 29)
+        XCTAssertThrowsError(try provider.runtime())
+        XCTAssertEqual(factoryCount.value, 1)
+        clock.advance(by: 1)
+        XCTAssertThrowsError(try provider.runtime())
+        XCTAssertEqual(factoryCount.value, 2)
     }
 
     func testBindingEngineProviderIsInertAndMemoizesOneEngineAcrossConcurrentCallers() throws {
@@ -298,6 +363,33 @@ final class CodeMapArtifactRuntimeTests: XCTestCase {
             }
         }
         XCTAssertEqual(factoryCount.value, 1)
+
+        let retryRoot = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: retryRoot) }
+        let retryClock = RuntimeProviderTestClock()
+        let retryFactoryCount = RuntimeProviderTestCounter()
+        let retryRuntime = try CodeMapArtifactRuntime(
+            rootURL: retryRoot,
+            bindingEngineFactory: { runtime in
+                retryFactoryCount.increment()
+                if retryFactoryCount.value == 1 {
+                    throw CodeMapRepositoryNamespaceSaltStoreError.ioFailure(
+                        operation: "test",
+                        code: EIO
+                    )
+                }
+                return Self.makeBindingEngine(runtime: runtime)
+            },
+            bindingEngineProviderNow: { retryClock.now }
+        )
+        XCTAssertThrowsError(try retryRuntime.bindingEngine())
+        retryClock.advance(by: 29)
+        XCTAssertThrowsError(try retryRuntime.bindingEngine())
+        XCTAssertEqual(retryFactoryCount.value, 1)
+        retryClock.advance(by: 1)
+        let recovered = try retryRuntime.bindingEngine()
+        XCTAssertTrue(try retryRuntime.bindingEngine() === recovered)
+        XCTAssertEqual(retryFactoryCount.value, 2)
     }
 
     func testEachRuntimeOwnsItsOwnMemoizedBindingEngine() throws {
@@ -779,6 +871,19 @@ private final class RuntimeProviderOverlapGate: @unchecked Sendable {
 
     func releaseFactory() {
         factoryFence.release()
+    }
+}
+
+private final class RuntimeProviderTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = Date(timeIntervalSince1970: 0)
+
+    var now: Date {
+        lock.withLock { value }
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.withLock { value = value.addingTimeInterval(interval) }
     }
 }
 

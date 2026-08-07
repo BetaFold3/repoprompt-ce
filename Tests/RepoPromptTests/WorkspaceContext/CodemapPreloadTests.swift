@@ -546,6 +546,75 @@ final class CodemapPreloadTests: WorkspaceFileContextStoreCodemapSeamTestSupport
         XCTAssertEqual(delays, [1000])
     }
 
+    func testRetryableSetupDispositionIsNonStickyAndPreservesInFlightReason() async throws {
+        let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositoryFixture.makeRepository(
+            named: "repository",
+            files: ["Sources/Feature.swift": SwiftFixtureSource.emptyStruct("Feature")]
+        )
+        let fixture = try CodemapStoreFixture(name: #function)
+        let registrationAttempts = CodemapLockedCounter()
+        let setupPublicationGate = CodemapSuspensionGate()
+        let demandResolutionGate = CodemapSuspensionGate()
+        addTeardownBlock {
+            setupPublicationGate.release()
+            demandResolutionGate.release()
+            await fixture.shutdown()
+            repositoryFixture.cleanup()
+        }
+        let store = fixture.makeStore(
+            codemapProjectionPreloadLaunchPolicy: .disabled,
+            rootRegistrationResultHook: { result in
+                registrationAttempts.incrementAndGet() == 1 ? .busy : result
+            },
+            setupDispositionDidPublishHook: { retryable in
+                if retryable {
+                    await setupPublicationGate.enterAndWait()
+                }
+            },
+            demandWillResolveSetupHook: { _ in
+                await demandResolutionGate.enterAndWait()
+            }
+        )
+        let loaded = try await store.loadRoot(path: root.path)
+        let files = await store.files(inRoot: loaded.id)
+        let file = try XCTUnwrap(files.first)
+
+        let firstTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: file.id)
+        )
+        let setupPublicationEntered = await setupPublicationGate.waitUntilEntered()
+        let demandResolutionEntered = await demandResolutionGate.waitUntilEntered()
+        XCTAssertTrue(setupPublicationEntered)
+        XCTAssertTrue(demandResolutionEntered)
+        let clearedState = await store.codemapSetupStateForTesting(
+            rootEpoch: firstTicket.rootEpoch
+        )
+        XCTAssertFalse(clearedState.setupTaskActive)
+        XCTAssertFalse(clearedState.setupDispositionPresent)
+
+        demandResolutionGate.release()
+        setupPublicationGate.release()
+        let firstResult = try await settledResult(store: store, ticket: firstTicket)
+        guard case let .unavailable(.busy(retryAfterMilliseconds)) = firstResult else {
+            return XCTFail("Expected the first setup attempt's busy result, got \(firstResult)")
+        }
+        XCTAssertNil(retryAfterMilliseconds)
+        var counts = await store.codemapPresentationOperationCountsForTesting()
+        XCTAssertEqual(counts.setupTasksCreated, 1)
+        XCTAssertEqual(registrationAttempts.value, 1)
+
+        let secondTicket = try await pendingTicket(
+            store.requestCodemapArtifact(forFileID: file.id)
+        )
+        _ = try await readyResult(settledResult(store: store, ticket: secondTicket))
+        counts = await store.codemapPresentationOperationCountsForTesting()
+        XCTAssertEqual(counts.setupTasksCreated, 2)
+        XCTAssertEqual(registrationAttempts.value, 2)
+        _ = await store.cancelCodemapArtifactDemand(secondTicket)
+        await store.unloadRoot(id: loaded.id)
+    }
+
     func testTransientSetupUsesOneBackoffThenFreshSetupRegistration() async throws {
         let repositoryFixture = try ReviewGitRepositoryFixture(name: #function)
         let root = try repositoryFixture.makeRepository(

@@ -3457,7 +3457,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                     refreshRootFolderState()
                 }
                 return
-            case .skill:
+            case .skill, .snippet:
                 return
             }
         }
@@ -3501,7 +3501,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                     refreshRootFolderState()
                 }
                 return
-            case .skill:
+            case .skill, .snippet:
                 return
             }
         }

@@ -5502,12 +5502,21 @@ final class MCPServerViewModel: ObservableObject {
                     attempted: nil, limit: nil,
                     message: "The file type does not support codemaps."
                 )
-            case .rootNotLoaded, .gitTerminal:
+            case .rootNotLoaded:
                 return DTO(
                     code: "git_root_unavailable", phase: "seed_demand", path: path,
                     retryable: false, retryAfterMilliseconds: nil,
                     attempted: nil, limit: nil,
-                    message: "The Git root is unavailable for codemap generation."
+                    message: "The Git root is unavailable for codemap generation. (reason=root_not_loaded)",
+                    detail: "root_not_loaded"
+                )
+            case let .gitTerminal(reason):
+                return DTO(
+                    code: "git_root_unavailable", phase: "seed_demand", path: path,
+                    retryable: reason == .releasedRootEpoch, retryAfterMilliseconds: nil,
+                    attempted: nil, limit: nil,
+                    message: "The Git root is unavailable for codemap generation. (reason=git_terminal)",
+                    detail: "git_terminal"
                 )
             case let .busy(retryAfterMilliseconds):
                 return DTO(
@@ -5538,13 +5547,53 @@ final class MCPServerViewModel: ObservableObject {
                     attempted: nil, limit: nil,
                     message: "The file is no longer cataloged."
                 )
-            case .demandUnavailable, .rejected, .routeConflict, .registrationFailed,
-                 .runtimeFailure, .cancelled:
+            case let .demandUnavailable(reason):
                 return DTO(
                     code: "artifact_unavailable", phase: "seed_demand", path: path,
-                    retryable: false, retryAfterMilliseconds: nil,
+                    retryable: reason == .transient, retryAfterMilliseconds: nil,
                     attempted: nil, limit: nil,
-                    message: "A codemap artifact is unavailable."
+                    message: "A codemap artifact is unavailable. (reason=demand_unavailable)",
+                    detail: "demand_unavailable"
+                )
+            case .rejected:
+                return DTO(
+                    code: "artifact_unavailable", phase: "seed_demand", path: path,
+                    retryable: true, retryAfterMilliseconds: nil,
+                    attempted: nil, limit: nil,
+                    message: "A codemap artifact is unavailable. (reason=rejected)",
+                    detail: "rejected"
+                )
+            case .routeConflict:
+                return DTO(
+                    code: "artifact_unavailable", phase: "seed_demand", path: path,
+                    retryable: true, retryAfterMilliseconds: nil,
+                    attempted: nil, limit: nil,
+                    message: "A codemap artifact is unavailable. (reason=route_conflict)",
+                    detail: "route_conflict"
+                )
+            case .registrationFailed:
+                return DTO(
+                    code: "artifact_unavailable", phase: "seed_demand", path: path,
+                    retryable: true, retryAfterMilliseconds: nil,
+                    attempted: nil, limit: nil,
+                    message: "A codemap artifact is unavailable. (reason=registration_failed)",
+                    detail: "registration_failed"
+                )
+            case .runtimeFailure:
+                return DTO(
+                    code: "artifact_unavailable", phase: "seed_demand", path: path,
+                    retryable: true, retryAfterMilliseconds: nil,
+                    attempted: nil, limit: nil,
+                    message: "A codemap artifact is unavailable. (reason=runtime_failure)",
+                    detail: "runtime_failure"
+                )
+            case .cancelled:
+                return DTO(
+                    code: "artifact_unavailable", phase: "seed_demand", path: path,
+                    retryable: true, retryAfterMilliseconds: nil,
+                    attempted: nil, limit: nil,
+                    message: "A codemap artifact is unavailable. (reason=cancelled)",
+                    detail: "cancelled"
                 )
             }
         case let .traversalPartial(reason):

@@ -25,6 +25,8 @@ struct AdvancedSettingsView: View {
     @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     let windowState: WindowState
 
+    @State private var savedPromptEditorState: SavedPromptEditorState?
+
     private var historyIdleThresholdDoubleBinding: Binding<Double> {
         Binding(
             get: { Double(globalSettings.historyIdleThresholdMinutes()) },
@@ -385,9 +387,20 @@ struct AdvancedSettingsView: View {
     private var savedPromptsSection: some View {
         SettingSection(
             title: "Saved Prompts",
-            description: "Manage your saved instruction prompts. Reset to defaults if you're experiencing issues."
+            description: "Reusable prompt snippets. Insert them at the cursor in the Agent composer with the snippet palette shortcut (default ⇧⌘P), or attach them to classic Copy/Chat presets."
         ) {
             VStack(alignment: .leading, spacing: 12) {
+                savedPromptsList
+
+                HStack(spacing: 12) {
+                    Button("Add Prompt") {
+                        savedPromptEditorState = SavedPromptEditorState(promptID: nil, title: "", content: "")
+                    }
+                    .buttonStyle(CustomButtonStyle())
+                    .hoverTooltip("Create a new saved prompt snippet.")
+                    .frame(minWidth: 120)
+                }
+
                 HStack(spacing: 12) {
                     Button("Export Prompts") {
                         let savePanel = NSSavePanel()
@@ -455,6 +468,148 @@ struct AdvancedSettingsView: View {
                     .frame(minWidth: 120)
                 }
             }
+            .sheet(item: $savedPromptEditorState) { state in
+                SavedPromptEditorSheet(state: state) { title, content in
+                    if let promptID = state.promptID {
+                        promptViewModel.updateStoredPrompt(
+                            PromptViewModel.StoredPrompt(id: promptID, title: title, content: content)
+                        )
+                    } else {
+                        _ = promptViewModel.addStoredPrompt(title: title, content: content)
+                    }
+                }
+            }
         }
+    }
+
+    private var savedPromptsList: some View {
+        VStack(spacing: 0) {
+            if promptViewModel.storedPrompts.isEmpty {
+                Text("No saved prompts yet. Use Add Prompt to create one.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+            } else {
+                ForEach(promptViewModel.storedPrompts) { prompt in
+                    VStack(spacing: 0) {
+                        HStack(spacing: 8) {
+                            Text(prompt.title)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Spacer(minLength: 8)
+                            Button {
+                                savedPromptEditorState = SavedPromptEditorState(
+                                    promptID: prompt.id,
+                                    title: prompt.title,
+                                    content: prompt.content
+                                )
+                            } label: {
+                                Image(systemName: "pencil")
+                            }
+                            .buttonStyle(.borderless)
+                            .hoverTooltip("Edit this prompt.")
+                            Button {
+                                confirmDeleteSavedPrompt(prompt)
+                            } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .hoverTooltip("Delete this prompt.")
+                        }
+                        .padding(.vertical, 5)
+                        if prompt.id != promptViewModel.storedPrompts.last?.id {
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 2)
+        .background(Color(NSColor.textBackgroundColor))
+        .cornerRadius(6)
+    }
+
+    private func confirmDeleteSavedPrompt(_ prompt: PromptViewModel.StoredPrompt) {
+        let isBuiltIn = promptViewModel.builtInStoredPrompts.contains { $0.id == prompt.id }
+        let alert = NSAlert()
+        alert.messageText = "Delete Saved Prompt"
+        // Startup reconciliation re-adds missing built-ins on the next launch,
+        // so be honest about how long a built-in deletion lasts.
+        alert.informativeText = isBuiltIn
+            ? "Delete “\(prompt.title)”? This is a built-in prompt — it will be restored automatically the next time the app launches."
+            : "Delete “\(prompt.title)”? This cannot be undone."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            promptViewModel.removeStoredPrompt(prompt)
+        }
+    }
+}
+
+// MARK: - Saved prompt editor
+
+private struct SavedPromptEditorState: Identifiable {
+    let promptID: UUID?
+    var title: String
+    var content: String
+
+    var id: String {
+        promptID?.uuidString ?? "new"
+    }
+}
+
+private struct SavedPromptEditorSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String
+    @State private var content: String
+    private let isNew: Bool
+    private let onSave: (String, String) -> Void
+
+    init(state: SavedPromptEditorState, onSave: @escaping (String, String) -> Void) {
+        _title = State(initialValue: state.title)
+        _content = State(initialValue: state.content)
+        isNew = state.promptID == nil
+        self.onSave = onSave
+    }
+
+    private var trimmedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(isNew ? "New Saved Prompt" : "Edit Saved Prompt")
+                .font(.headline)
+
+            TextField("Title", text: $title)
+                .textFieldStyle(.roundedBorder)
+
+            TextEditor(text: $content)
+                .font(.system(.body, design: .monospaced))
+                .frame(minHeight: 220)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                )
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                Button("Save") {
+                    onSave(trimmedTitle, content)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(trimmedTitle.isEmpty || content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(16)
+        .frame(width: 560)
     }
 }

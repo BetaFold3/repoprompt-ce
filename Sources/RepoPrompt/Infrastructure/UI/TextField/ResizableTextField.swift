@@ -145,6 +145,8 @@ struct ResizableTextFieldFeatures {
     var onFileTagCommitted: ((MentionSuggestion) -> Void)?
     var enableSlashSkillOverlay: Bool = false
     var slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?
+    var enableSnippetPalette: Bool = false
+    var snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])?
 
     static let plain = ResizableTextFieldFeatures()
 
@@ -156,7 +158,8 @@ struct ResizableTextFieldFeatures {
         fileTagLookupContextProvider: (() async -> WorkspaceLookupContext)? = nil,
         fileMentionPickerConfiguration: FileMentionPickerConfiguration = .compact,
         onFileTagCommitted: ((MentionSuggestion) -> Void)?,
-        slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?
+        slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?,
+        snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])? = nil
     ) -> ResizableTextFieldFeatures {
         ResizableTextFieldFeatures(
             enableFileTagOverlay: true,
@@ -168,7 +171,9 @@ struct ResizableTextFieldFeatures {
             fileTagPickerConfiguration: fileMentionPickerConfiguration,
             onFileTagCommitted: onFileTagCommitted,
             enableSlashSkillOverlay: true,
-            slashSkillSuggestionsProvider: slashSkillSuggestionsProvider
+            slashSkillSuggestionsProvider: slashSkillSuggestionsProvider,
+            enableSnippetPalette: snippetPaletteItemsProvider != nil,
+            snippetPaletteItemsProvider: snippetPaletteItemsProvider
         )
     }
 }
@@ -338,6 +343,11 @@ struct CustomTextField: NSViewRepresentable {
             enabled: features.enableSlashSkillOverlay,
             suggestionsProvider: features.slashSkillSuggestionsProvider
         )
+        context.coordinator.configureSnippetPaletteSupport(
+            textView: textView,
+            enabled: features.enableSnippetPalette,
+            itemsProvider: features.snippetPaletteItemsProvider
+        )
         textView.string = text
         context.coordinator.clearUndoHistory()
 
@@ -375,6 +385,11 @@ struct CustomTextField: NSViewRepresentable {
             enabled: features.enableSlashSkillOverlay,
             suggestionsProvider: features.slashSkillSuggestionsProvider
         )
+        context.coordinator.configureSnippetPaletteSupport(
+            textView: textView,
+            enabled: features.enableSnippetPalette,
+            itemsProvider: features.snippetPaletteItemsProvider
+        )
 
         var appliedProgrammaticTextChange = false
         // IME FIX: Avoid stomping marked text (composition) with programmatic writes.
@@ -405,6 +420,10 @@ struct CustomTextField: NSViewRepresentable {
         if appliedProgrammaticTextChange {
             context.coordinator.scheduleFileTagSuggestionsRefresh(for: textView, immediate: true)
             context.coordinator.scheduleSlashSkillSuggestionsRefresh(for: textView, immediate: true)
+            // A programmatic rewrite (draft restore, tab switch) invalidates the
+            // palette's caret anchor; the session cannot survive text it never
+            // observed.
+            context.coordinator.dismissSnippetPaletteSession()
         }
     }
 
@@ -417,6 +436,7 @@ struct CustomTextField: NSViewRepresentable {
         coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
         coordinator.dismissSlashSkillOverlay()
+        coordinator.tearDownSnippetPaletteSupport()
         coordinator.isActive = false
     }
 
@@ -429,6 +449,9 @@ struct CustomTextField: NSViewRepresentable {
         private let textViewUndoManager = UndoManager()
         private let fileTagHelper = FileTagMentionHelper()
         private let slashSkillHelper = SlashSkillMentionHelper()
+        private let snippetPaletteHelper = SnippetPaletteHelper()
+        private weak var snippetPaletteTextView: ImageAwareTextView?
+        private var snippetPaletteShortcutObserver: (any NSObjectProtocol)?
         // NEW: mark inactive after dismantle
         var isActive: Bool = true
 
@@ -444,12 +467,14 @@ struct CustomTextField: NSViewRepresentable {
             updateHeightIfNeeded(textView: textView)
             scheduleFileTagSuggestionsRefresh(for: textView, immediate: false)
             scheduleSlashSkillSuggestionsRefresh(for: textView, immediate: false)
+            refreshOrDismissSnippetPalette(for: textView)
         }
 
         func textDidEndEditing(_ notification: Notification) {
             guard isActive else { return }
             dismissFileTagOverlay()
             dismissSlashSkillOverlay()
+            snippetPaletteHelper.dismiss()
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -458,12 +483,20 @@ struct CustomTextField: NSViewRepresentable {
             // refreshes alongside textDidChange.
             scheduleFileTagSuggestionsRefresh(for: textView, immediate: false)
             scheduleSlashSkillSuggestionsRefresh(for: textView, immediate: false)
+            refreshOrDismissSnippetPalette(for: textView)
         }
 
         func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             // IME FIX: if composing, let IME handle keys (Return/space/numbers etc.)
             if textView.hasMarkedText() { return false }
             guard isActive else { return false }
+            if snippetPaletteHelper.handleCommandIfNeeded(
+                textView: textView,
+                commandSelector: commandSelector,
+                enabled: parent.features.enableSnippetPalette
+            ) {
+                return true
+            }
             if slashSkillHelper.handleCommandIfNeeded(
                 textView: textView,
                 commandSelector: commandSelector,
@@ -605,6 +638,76 @@ struct CustomTextField: NSViewRepresentable {
 
         func dismissSlashSkillOverlay() {
             slashSkillHelper.dismiss()
+        }
+
+        func configureSnippetPaletteSupport(
+            textView: ImageAwareTextView,
+            enabled: Bool,
+            itemsProvider: (() -> [SnippetPaletteItem])?
+        ) {
+            snippetPaletteTextView = textView
+            snippetPaletteHelper.configure(enabled: enabled, itemsProvider: itemsProvider)
+            guard enabled, itemsProvider != nil else {
+                removeSnippetPaletteShortcutObserver()
+                return
+            }
+            guard snippetPaletteShortcutObserver == nil else { return }
+            snippetPaletteShortcutObserver = NotificationCenter.default.addObserver(
+                forName: .openPromptSnippetPalette,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.handleOpenSnippetPaletteShortcut()
+                }
+            }
+        }
+
+        func scheduleSnippetPaletteRefresh(for textView: NSTextView, immediate: Bool) {
+            snippetPaletteHelper.scheduleRefresh(
+                for: textView,
+                immediate: immediate,
+                enabled: parent.features.enableSnippetPalette,
+                isActive: isActive
+            )
+        }
+
+        /// Undo/redo arrives via the responder chain (never `doCommandBy`), so
+        /// a rewind can leave the palette's integer anchor in-bounds over text
+        /// it was never anchored to. Drop the session instead of refreshing.
+        func refreshOrDismissSnippetPalette(for textView: NSTextView) {
+            if textViewUndoManager.isUndoing || textViewUndoManager.isRedoing {
+                snippetPaletteHelper.dismiss()
+            } else {
+                scheduleSnippetPaletteRefresh(for: textView, immediate: false)
+            }
+        }
+
+        func dismissSnippetPaletteSession() {
+            snippetPaletteHelper.dismiss()
+        }
+
+        func tearDownSnippetPaletteSupport() {
+            snippetPaletteHelper.dismiss()
+            removeSnippetPaletteShortcutObserver()
+            snippetPaletteTextView = nil
+        }
+
+        private func removeSnippetPaletteShortcutObserver() {
+            if let snippetPaletteShortcutObserver {
+                NotificationCenter.default.removeObserver(snippetPaletteShortcutObserver)
+            }
+            snippetPaletteShortcutObserver = nil
+        }
+
+        private func handleOpenSnippetPaletteShortcut() {
+            guard isActive, parent.features.enableSnippetPalette else { return }
+            guard let textView = snippetPaletteTextView,
+                  let window = textView.window,
+                  window.isKeyWindow,
+                  window.firstResponder === textView
+            else { return }
+            snippetPaletteHelper.toggleSession(in: textView)
         }
     }
 }

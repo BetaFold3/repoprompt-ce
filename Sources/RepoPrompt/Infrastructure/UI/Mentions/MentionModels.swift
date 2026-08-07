@@ -6,6 +6,7 @@ public enum MentionKind: String, Codable {
     case folder
     case file
     case skill
+    case snippet
 }
 
 /// Single suggestion row.

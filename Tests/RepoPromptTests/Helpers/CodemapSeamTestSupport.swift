@@ -1044,6 +1044,13 @@ final class CodemapStoreFixture: @unchecked Sendable {
             WorkspaceCodemapArtifactDemandTicket,
             WorkspaceCodemapBindingDemandResult
         ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result },
+        rootRegistrationResultHook: @escaping @Sendable (
+            WorkspaceCodemapBindingRegistrationResult
+        ) async -> WorkspaceCodemapBindingRegistrationResult = { result in result },
+        setupDispositionDidPublishHook: @escaping @Sendable (Bool) async -> Void = { _ in },
+        demandWillResolveSetupHook: @escaping @Sendable (
+            WorkspaceCodemapArtifactDemandTicket
+        ) async -> Void = { _ in },
         automaticSelectionQueryHook: @escaping @Sendable (
             WorkspaceCodemapRootEpoch
         ) async -> Void = { _ in },
@@ -1075,6 +1082,9 @@ final class CodemapStoreFixture: @unchecked Sendable {
             codemapReadyPublicationHook: readyPublicationHook,
             codemapGraphPublicationWaiter: graphPublicationWaiter,
             codemapDemandResultHook: demandResultHook,
+            codemapRootRegistrationResultHookForTesting: rootRegistrationResultHook,
+            codemapSetupDispositionDidPublishHookForTesting: setupDispositionDidPublishHook,
+            codemapDemandWillResolveSetupHookForTesting: demandWillResolveSetupHook,
             codemapAutomaticSelectionQueryHook: automaticSelectionQueryHook
         )
     }
