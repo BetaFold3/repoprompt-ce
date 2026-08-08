@@ -1401,15 +1401,17 @@ class WindowState: ObservableObject {
 
         // Apply new prompt if provided
         if let prompt = command.newPrompt {
-            // 1. add to the PromptViewModel's storage
-            let stored = promptManager.addStoredPrompt(
-                title: prompt.title,
-                content: prompt.content
-            )
-            // 2. select it so it appears checked/active
-            promptManager.selectNewPrompt(stored)
+            do {
+                let stored = try promptManager.addStoredPrompt(
+                    title: prompt.title,
+                    content: prompt.content
+                )
+                promptManager.selectNewPrompt(stored)
+            } catch {
+                print("⚠️ Failed to add saved prompt from app command: \(error.localizedDescription)")
+            }
 
-            // 3. if this window isn't front-most and focus flag was set, focus us
+            // If this window isn't front-most and focus flag was set, focus us
             if command.focus == true {
                 NSApplication.shared.activate(ignoringOtherApps: true)
                 focusWindowIfPossible()

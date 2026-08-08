@@ -9,9 +9,18 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
     /// window's cached value, because all windows share one `GlobalSettingsStore`. Defect:
     /// window A showed "fable" while every other window kept "gpt-5.5" until the app restarted.
     func testOracleModelChangePropagatesAcrossWindows() async throws {
-        let store = try makeIsolatedStore()
-        let windowA = makePromptViewModel(windowID: 1, store: store)
-        let windowB = makePromptViewModel(windowID: 2, store: store)
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let windowA = makePromptViewModel(
+            windowID: 1,
+            store: fixture.settingsStore,
+            promptStore: fixture.promptStore
+        )
+        let windowB = makePromptViewModel(
+            windowID: 2,
+            store: fixture.settingsStore,
+            promptStore: fixture.promptStore
+        )
 
         let baseline = windowB.planningModelName
         XCTAssertNotEqual(baseline, "sonnet", "test is only meaningful if B does not already hold sonnet")
@@ -31,9 +40,19 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
     /// `isSyncingSettings` and direct storage writes). Defect: a naive subscription could
     /// make every change cascade into unbounded store writes / UI churn.
     func testOraclePropagationDoesNotFeedbackLoop() async throws {
-        let store = try makeIsolatedStore()
-        let windowA = makePromptViewModel(windowID: 1, store: store)
-        let windowB = makePromptViewModel(windowID: 2, store: store) // retained additional observer
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let store = fixture.settingsStore
+        let windowA = makePromptViewModel(
+            windowID: 1,
+            store: store,
+            promptStore: fixture.promptStore
+        )
+        let windowB = makePromptViewModel(
+            windowID: 2,
+            store: store,
+            promptStore: fixture.promptStore
+        ) // retained additional observer
 
         var storeEmissions = 0
         let cancellable = store.objectWillChange.sink { _ in storeEmissions += 1 }
@@ -59,8 +78,14 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         }
         UserDefaults.standard.set(true, forKey: "CodexCLIConnected")
 
-        let store = try makeIsolatedStore()
-        let prompt = makePromptViewModel(windowID: 1, store: store)
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let store = fixture.settingsStore
+        let prompt = makePromptViewModel(
+            windowID: 1,
+            store: store,
+            promptStore: fixture.promptStore
+        )
         prompt.apiSettingsViewModel?.test_completeContextBuilderProviderValidation(
             verifiedProviders: [.codexExec]
         )
@@ -83,18 +108,47 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeIsolatedStore() throws -> GlobalSettingsStore {
-        let temp = FileManager.default.temporaryDirectory
+    private struct Fixture {
+        let directory: URL
+        let defaults: UserDefaults
+        let suiteName: String
+        let settingsStore: GlobalSettingsStore
+        let promptStore: PromptStorage
+
+        @MainActor
+        func cleanup() {
+            promptStore.waitForPendingWrites()
+            defaults.removePersistentDomain(forName: suiteName)
+            try? FileManager.default.removeItem(at: directory)
+        }
+    }
+
+    private func makeFixture() throws -> Fixture {
+        let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CrossWindowPropagation-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
-        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let settingsFileURL = directory.appendingPathComponent("Settings/globalSettings.json")
+        let promptFileURL = directory.appendingPathComponent("Prompts/SavedPrompts.json")
         let suiteName = "CrossWindowPropagation.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
         defaults.removePersistentDomain(forName: suiteName)
-        return GlobalSettingsStore(defaults: defaults, fileStore: GlobalSettingsFileStore(fileURL: fileURL))
+        return Fixture(
+            directory: directory,
+            defaults: defaults,
+            suiteName: suiteName,
+            settingsStore: GlobalSettingsStore(
+                defaults: defaults,
+                fileStore: GlobalSettingsFileStore(fileURL: settingsFileURL)
+            ),
+            promptStore: PromptStorage(fileURL: promptFileURL)
+        )
     }
 
-    private func makePromptViewModel(windowID: Int, store: GlobalSettingsStore) -> PromptViewModel {
+    private func makePromptViewModel(
+        windowID: Int,
+        store: GlobalSettingsStore,
+        promptStore: PromptStorage
+    ) -> PromptViewModel {
         let secureService = SecureKeysService(secureStorage: TestSecureStorageBackend(values: [:]))
         let keyManager = KeyManager(secureService: secureService)
         let apiSettings = APISettingsViewModel(
@@ -106,7 +160,8 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
             fileManager: WorkspaceFilesViewModel(),
             apiSettingsViewModel: apiSettings,
             windowID: windowID,
-            settingsManager: WindowSettingsManager(windowID: windowID, store: store)
+            settingsManager: WindowSettingsManager(windowID: windowID, store: store),
+            promptLibraryStore: promptStore
         )
     }
 

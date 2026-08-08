@@ -96,7 +96,15 @@ struct PromptSettingsView: View {
 
                                 let response = alert.runModal()
                                 if response == .alertFirstButtonReturn {
-                                    promptViewModel.resetUserPrompts()
+                                    do {
+                                        try promptViewModel.resetUserPrompts()
+                                    } catch {
+                                        let failureAlert = NSAlert()
+                                        failureAlert.messageText = "Reset Failed"
+                                        failureAlert.informativeText = error.localizedDescription
+                                        failureAlert.alertStyle = .warning
+                                        failureAlert.runModal()
+                                    }
                                 }
                             }
                             .buttonStyle(CustomButtonStyle())

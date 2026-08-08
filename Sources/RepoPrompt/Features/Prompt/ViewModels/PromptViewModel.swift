@@ -1353,7 +1353,7 @@ class PromptViewModel: ObservableObject {
 
     // MARK: - Prompt Management Properties
 
-    @Published var storedPrompts: [StoredPrompt] = []
+    @Published private(set) var storedPrompts: [StoredPrompt] = []
     @Published var metaInstructions: [MetaInstruction] = []
     @Published var metaInstructionsForChat: [MetaInstruction] = []
     @Published var selectedInstructionsText: String = "" {
@@ -2091,13 +2091,15 @@ class PromptViewModel: ObservableObject {
     // MARK: - Initialization
 
     private let settingsManager: SettingsManaging
+    private let promptLibraryStore: PromptStorage
 
     init(
         fileManager: WorkspaceFilesViewModel,
         aiQueriesService: AIQueriesService? = nil,
         apiSettingsViewModel: APISettingsViewModel,
         windowID: Int,
-        settingsManager: SettingsManaging
+        settingsManager: SettingsManaging,
+        promptLibraryStore: PromptStorage = .shared
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2105,6 +2107,7 @@ class PromptViewModel: ObservableObject {
         self.apiSettingsViewModel = apiSettingsViewModel
         self.windowID = windowID
         self.settingsManager = settingsManager
+        self.promptLibraryStore = promptLibraryStore
         codeMapsGloballyDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
 
         // Removed usage of workspaceManager to load an initial prompt
@@ -2114,6 +2117,7 @@ class PromptViewModel: ObservableObject {
         setupAPISettingsObserver()
         configureTokenCountingViewModel()
         startTokenCountUpdateTimer()
+        setupPromptLibraryObserver()
         loadStoredPrompts()
         updateFileTree()
 
@@ -2140,6 +2144,16 @@ class PromptViewModel: ObservableObject {
     }
 
     // MARK: - Setup and Observer Configuration
+
+    private func setupPromptLibraryObserver() {
+        promptLibraryStore.$prompts
+            .sink { [weak self] prompts in
+                guard let self else { return }
+                storedPrompts = prompts
+                updateSelectedInstructions()
+            }
+            .store(in: &cancellables)
+    }
 
     private func setupObservers() {
         // Live cross-window sync: when another window mutates the shared global store
@@ -4331,16 +4345,23 @@ class PromptViewModel: ObservableObject {
         updateSelectedInstructions()
     }
 
-    func addStoredPrompt(title: String, content: String) -> StoredPrompt {
+    func addStoredPrompt(title: String, content: String) throws -> StoredPrompt {
         let newPrompt = StoredPrompt(id: UUID(), title: title, content: content)
-        storedPrompts.append(newPrompt)
-        saveStoredPrompts()
-        updateMetaInstructions()
+        try promptLibraryStore.mutate { prompts in
+            prompts.append(newPrompt)
+            return true
+        }
         return newPrompt
     }
 
-    func removeStoredPrompt(_ prompt: StoredPrompt) {
-        storedPrompts.removeAll { $0.id == prompt.id }
+    func removeStoredPrompt(_ prompt: StoredPrompt) throws {
+        let didRemove = try promptLibraryStore.mutate { prompts in
+            let previousCount = prompts.count
+            prompts.removeAll { $0.id == prompt.id }
+            return prompts.count != previousCount
+        }
+        guard didRemove else { return }
+
         if selectedPromptIDs.contains(prompt.id) {
             var currentCopySelection = selectedPromptIDs
             currentCopySelection.remove(prompt.id)
@@ -4351,83 +4372,63 @@ class PromptViewModel: ObservableObject {
             currentChatSelection.remove(prompt.id)
             updatePromptSelection(currentChatSelection, for: .chat)
         }
-        saveStoredPrompts()
     }
 
-    func updateStoredPrompt(_ prompt: StoredPrompt) {
-        if let index = storedPrompts.firstIndex(where: { $0.id == prompt.id }) {
+    /// `promptNotFound` means the UUID is absent, including a custom prompt removed by delete or reset.
+    /// Built-in resets preserve UUIDs, so stale built-in saves are last-writer-wins and become user-edited.
+    func updateStoredPrompt(_ prompt: StoredPrompt) throws {
+        let didUpdate = try promptLibraryStore.mutate { prompts in
+            guard let index = prompts.firstIndex(where: { $0.id == prompt.id }) else {
+                return false
+            }
             var updated = prompt
             // Mark built-in prompts as user-edited so auto-upgrades are skipped
             if builtInPromptIDs.contains(prompt.id) {
                 updated.isUserEdited = true
             }
-            storedPrompts[index] = updated
-            saveStoredPrompts()
-            updateSelectedInstructions()
+            prompts[index] = updated
+            return true
+        }
+        guard didUpdate else {
+            throw SavedPromptLibraryError.promptNotFound(prompt.id)
         }
     }
 
-    /// Clears out all saved prompts and re-adds the default ones.
-    /// This helps users fix corrupted data quickly.
-    func resetUserPrompts() {
-        // Clear in-memory prompts
-        storedPrompts.removeAll()
+    /// Clears out all saved prompts and restores the default library in one mutation.
+    func resetUserPrompts() throws {
+        let defaults = [architectPrompt, engineerPrompt, mcpPairProgramPrompt, mcpAgentPrompt, reviewPrompt]
+        guard try promptLibraryStore.replacePrompts(defaults) else { return }
 
-        // Write the empty array to the file
-        saveStoredPrompts()
-
-        // Re-add the built-in defaults
-        insertDefaultPromptsIfNeeded()
-
-        // Save again with the defaults
-        saveStoredPrompts()
-
-        // Update selected instructions
         selectedPromptIDs.removeAll()
         updateSelectedInstructions()
     }
 
-    func resetBuiltInPrompts() {
+    func resetBuiltInPrompts() throws {
         let builtInDefaults = [architectPrompt, engineerPrompt, mcpPairProgramPrompt, mcpAgentPrompt, reviewPrompt]
-        var didMutate = false
+        let builtInOrder = builtInDefaults.map(\.id)
 
-        for defaultPrompt in builtInDefaults {
-            if let index = storedPrompts.firstIndex(where: { $0.id == defaultPrompt.id }) {
-                if storedPrompts[index] != defaultPrompt {
-                    storedPrompts[index] = defaultPrompt
+        try promptLibraryStore.mutate { prompts in
+            var didMutate = false
+            for defaultPrompt in builtInDefaults {
+                if let index = prompts.firstIndex(where: { $0.id == defaultPrompt.id }) {
+                    if prompts[index] != defaultPrompt {
+                        prompts[index] = defaultPrompt
+                        didMutate = true
+                    }
+                } else {
+                    prompts.append(defaultPrompt)
                     didMutate = true
                 }
-            } else {
-                storedPrompts.append(defaultPrompt)
-                didMutate = true
             }
+
+            guard didMutate else { return false }
+            let orderedBuiltIns = builtInOrder.compactMap { id in
+                prompts.first(where: { $0.id == id })
+            }
+            let userPrompts = prompts.filter { !builtInOrder.contains($0.id) }
+            prompts = orderedBuiltIns + userPrompts
+            return true
         }
-
-        if didMutate {
-            reorderBuiltInPrompts()
-            saveStoredPrompts()
-            updateSelectedInstructions()
-        }
-    }
-
-    private func reorderBuiltInPrompts() {
-        let builtInOrder = [
-            architectPrompt.id,
-            engineerPrompt.id,
-            mcpPairProgramPrompt.id,
-            mcpAgentPrompt.id,
-            reviewPrompt.id
-        ]
-
-        let orderedBuiltIns = builtInOrder.compactMap { id in
-            storedPrompts.first(where: { $0.id == id })
-        }
-
-        let remainingPrompts = storedPrompts.filter { prompt in
-            !builtInOrder.contains(prompt.id)
-        }
-
-        storedPrompts = orderedBuiltIns + remainingPrompts
     }
 
     func selectNewPrompt(_ prompt: StoredPrompt, context: PromptSelectionContext = .copy) {
@@ -4468,24 +4469,23 @@ class PromptViewModel: ObservableObject {
         updateMetaInstructions()
     }
 
-    func saveStoredPrompts() {
-        PromptStorage.shared.savePrompts(storedPrompts)
-    }
-
     func exportPrompts(to url: URL) throws {
-        try PromptStorage.shared.exportPrompts(to: url, prompts: storedPrompts)
+        try promptLibraryStore.exportPrompts(to: url)
     }
 
     func importPrompts(from url: URL) throws -> Int {
-        let external = try PromptStorage.shared.loadExternalPrompts(from: url)
-        let (merged, addedCount) = PromptStorage.shared.mergeExternalPrompts(
-            current: storedPrompts,
-            external: external
-        )
-        if addedCount > 0 {
-            storedPrompts = merged
-            saveStoredPrompts()
-            updateSelectedInstructions() // refresh anything that depends on storedPrompts
+        try promptLibraryStore.requireAvailable()
+        let external = try promptLibraryStore.loadExternalPrompts(from: url)
+        var addedCount = 0
+        try promptLibraryStore.mutate { prompts in
+            let merged = promptLibraryStore.mergeExternalPrompts(
+                current: prompts,
+                external: external
+            )
+            addedCount = merged.addedCount
+            guard addedCount > 0 else { return false }
+            prompts = merged.merged
+            return true
         }
         return addedCount
     }
@@ -4531,58 +4531,24 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-    /// Ensure the default prompts (Architect, Engineer, MCP Pair Program, MCP Agent, MCP Plan, and Review) are available
-    private func insertDefaultPromptsIfNeeded() {
-        // If architectPrompt not found, add it
-        if !storedPrompts.contains(where: { $0.id == architectPrompt.id }) {
-            storedPrompts.append(architectPrompt)
-        }
-
-        // If engineerPrompt not found, add it
-        if !storedPrompts.contains(where: { $0.id == engineerPrompt.id }) {
-            storedPrompts.append(engineerPrompt)
-        }
-
-        // If mcpPairProgramPrompt not found, add it
-        if !storedPrompts.contains(where: { $0.id == mcpPairProgramPrompt.id }) {
-            storedPrompts.append(mcpPairProgramPrompt)
-        }
-
-        // If mcpAgentPrompt not found, add it
-        if !storedPrompts.contains(where: { $0.id == mcpAgentPrompt.id }) {
-            storedPrompts.append(mcpAgentPrompt)
-        }
-
-        // mcpDiscover is now a built-in system prompt; do not add as stored prompt
-
-        // If reviewPrompt not found, add it
-        if !storedPrompts.contains(where: { $0.id == reviewPrompt.id }) {
-            storedPrompts.append(reviewPrompt)
-        }
-    }
-
     func loadStoredPrompts() {
-        let loadResult = PromptStorage.shared.loadPrompts()
-
-        // Handle the load result
-        let loadedPrompts: [StoredPrompt]
+        let loadResult = promptLibraryStore.loadIfNeeded { loadedPrompts in
+            resolveLoadedPrompts(loadedPrompts)
+        }
 
         switch loadResult {
-        case let .success(prompts):
-            loadedPrompts = prompts
+        case .success:
+            syncPromptSelectionToPreset(for: .copy, force: false)
+            syncPromptSelectionToPreset(for: .chat, force: false)
         case let .failure(error):
-            // File exists but couldn't be loaded - DO NOT overwrite!
             print("⚠️ CRITICAL: Cannot load prompts file, aborting to prevent data loss")
             print("⚠️ Error details: \(error)")
             print("⚠️ Keeping current in-memory prompts. User should check file at:")
             print("⚠️ ~/Library/Application Support/com.pvncher.repoprompt/SavedPrompts.json")
-
-            // Keep whatever prompts we have in memory, don't save
-            updateMetaInstructions()
-            return
         }
+    }
 
-        // Separate built-in prompts from user prompts, upgrading unedited built-ins
+    private func resolveLoadedPrompts(_ loadedPrompts: [StoredPrompt]) -> (prompts: [StoredPrompt], needsSave: Bool) {
         let builtInIds = Set(builtInCanonical.keys)
         var resolvedBuiltIns: [UUID: StoredPrompt] = [:]
         var userPrompts: [StoredPrompt] = []
@@ -4597,19 +4563,13 @@ class PromptViewModel: ObservableObject {
             guard let canonical = builtInCanonical[prompt.id] else { continue }
 
             if prompt.content == canonical.content, prompt.title == canonical.title {
-                // Already up to date
                 resolvedBuiltIns[prompt.id] = prompt
             } else if isKnownPreviousCanonical(prompt) {
-                // Content matches a known previous canonical version — safe to upgrade,
-                // even if an earlier release incorrectly marked it as user-edited.
                 resolvedBuiltIns[prompt.id] = canonical
                 needsSave = true
             } else if prompt.isUserEdited {
-                // User explicitly edited this prompt — keep their version
                 resolvedBuiltIns[prompt.id] = prompt
             } else {
-                // Content differs from canonical and all known previous versions.
-                // This means the user edited it before we started tracking isUserEdited.
                 var edited = prompt
                 edited.isUserEdited = true
                 resolvedBuiltIns[prompt.id] = edited
@@ -4617,8 +4577,7 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        // Add any built-ins that weren't in the persisted data at all
-        let orderedBuiltIns: [StoredPrompt] = [architectPrompt, engineerPrompt, mcpPairProgramPrompt, mcpAgentPrompt, reviewPrompt].map { canonical in
+        let orderedBuiltIns = [architectPrompt, engineerPrompt, mcpPairProgramPrompt, mcpAgentPrompt, reviewPrompt].map { canonical in
             if let resolved = resolvedBuiltIns[canonical.id] {
                 return resolved
             }
@@ -4626,17 +4585,10 @@ class PromptViewModel: ObservableObject {
             return canonical
         }
 
-        // Reorder: built-in prompts first, then user prompts
-        storedPrompts = orderedBuiltIns + userPrompts
-
         if needsSave {
             print("✓ Built-in prompts updated, saving...")
-            saveStoredPrompts()
         }
-
-        updateMetaInstructions()
-        syncPromptSelectionToPreset(for: .copy, force: false)
-        syncPromptSelectionToPreset(for: .chat, force: false)
+        return (orderedBuiltIns + userPrompts, needsSave)
     }
 
     // MARK: - AI Query & Chat Methods

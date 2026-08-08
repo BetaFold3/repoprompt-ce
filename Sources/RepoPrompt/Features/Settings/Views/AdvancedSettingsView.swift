@@ -460,7 +460,11 @@ struct AdvancedSettingsView: View {
 
                         let response = alert.runModal()
                         if response == .alertFirstButtonReturn {
-                            promptViewModel.resetUserPrompts()
+                            do {
+                                try promptViewModel.resetUserPrompts()
+                            } catch {
+                                showSavedPromptFailure(title: "Reset Failed", error: error)
+                            }
                         }
                     }
                     .buttonStyle(CustomButtonStyle())
@@ -470,12 +474,18 @@ struct AdvancedSettingsView: View {
             }
             .sheet(item: $savedPromptEditorState) { state in
                 SavedPromptEditorSheet(state: state) { title, content in
-                    if let promptID = state.promptID {
-                        promptViewModel.updateStoredPrompt(
-                            PromptViewModel.StoredPrompt(id: promptID, title: title, content: content)
-                        )
-                    } else {
-                        _ = promptViewModel.addStoredPrompt(title: title, content: content)
+                    do {
+                        if let promptID = state.promptID {
+                            try promptViewModel.updateStoredPrompt(
+                                PromptViewModel.StoredPrompt(id: promptID, title: title, content: content)
+                            )
+                        } else {
+                            _ = try promptViewModel.addStoredPrompt(title: title, content: content)
+                        }
+                        return true
+                    } catch {
+                        showSavedPromptFailure(title: "Save Failed", error: error)
+                        return false
                     }
                 }
             }
@@ -531,6 +541,14 @@ struct AdvancedSettingsView: View {
         .cornerRadius(6)
     }
 
+    private func showSavedPromptFailure(title: String, error: Error) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = error.localizedDescription
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
     private func confirmDeleteSavedPrompt(_ prompt: PromptViewModel.StoredPrompt) {
         let isBuiltIn = promptViewModel.builtInStoredPrompts.contains { $0.id == prompt.id }
         let alert = NSAlert()
@@ -544,7 +562,11 @@ struct AdvancedSettingsView: View {
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
-            promptViewModel.removeStoredPrompt(prompt)
+            do {
+                try promptViewModel.removeStoredPrompt(prompt)
+            } catch {
+                showSavedPromptFailure(title: "Delete Failed", error: error)
+            }
         }
     }
 }
@@ -566,9 +588,9 @@ private struct SavedPromptEditorSheet: View {
     @State private var title: String
     @State private var content: String
     private let isNew: Bool
-    private let onSave: (String, String) -> Void
+    private let onSave: (String, String) -> Bool
 
-    init(state: SavedPromptEditorState, onSave: @escaping (String, String) -> Void) {
+    init(state: SavedPromptEditorState, onSave: @escaping (String, String) -> Bool) {
         _title = State(initialValue: state.title)
         _content = State(initialValue: state.content)
         isNew = state.promptID == nil
@@ -602,8 +624,9 @@ private struct SavedPromptEditorSheet: View {
                 }
                 .keyboardShortcut(.cancelAction)
                 Button("Save") {
-                    onSave(trimmedTitle, content)
-                    dismiss()
+                    if onSave(trimmedTitle, content) {
+                        dismiss()
+                    }
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(trimmedTitle.isEmpty || content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
