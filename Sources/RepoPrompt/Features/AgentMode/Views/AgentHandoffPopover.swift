@@ -32,44 +32,30 @@ enum AgentHandoffCodexEffortMenu {
         selectedModelRaw: String,
         selectedReasoningEffortRaw: String?
     ) -> Content {
-        let menu = AgentModelCatalog.codexMenu(for: options)
-        let defaultLeaf = menu.defaultOption.map {
+        let expanded = AgentCodexModelEffortExpansion.content(options: options)
+        let defaultLeaf = expanded.defaultLeaf.map {
             leaf(
-                option: $0,
-                effort: CodexModelSpecifier(raw: $0.rawValue).reasoningEffort,
-                isDefault: true,
+                expandedLeaf: $0,
                 selectedModelRaw: selectedModelRaw,
                 selectedReasoningEffortRaw: selectedReasoningEffortRaw
             )
         }
-        let groups = menu.groups.map { group in
-            let leaves = group.options.flatMap { option -> [Leaf] in
-                let encodedEffort = CodexModelSpecifier(raw: option.rawValue).reasoningEffort
-                guard encodedEffort == nil, !option.supportedReasoningEfforts.isEmpty else {
-                    return [leaf(
-                        option: option,
-                        effort: encodedEffort,
-                        isDefault: option.isProviderDefault
-                            || (encodedEffort != nil && option.defaultReasoningEffort == encodedEffort),
-                        selectedModelRaw: selectedModelRaw,
-                        selectedReasoningEffortRaw: selectedReasoningEffortRaw
-                    )]
-                }
-                return option.supportedReasoningEfforts.map { effort in
-                    leaf(
-                        option: option,
-                        effort: effort,
-                        isDefault: option.defaultReasoningEffort == effort,
-                        selectedModelRaw: selectedModelRaw,
-                        selectedReasoningEffortRaw: selectedReasoningEffortRaw
-                    )
-                }
+        let groups = expanded.groups.map { group in
+            let leaves = group.leaves.map {
+                leaf(
+                    expandedLeaf: $0,
+                    selectedModelRaw: selectedModelRaw,
+                    selectedReasoningEffortRaw: selectedReasoningEffortRaw
+                )
             }
             return Group(
                 id: group.id,
                 displayName: group.displayName,
                 leaves: leaves,
-                showsWarning: AgentModelSelectionWarningVisuals.codexGroupShowsWarning(group)
+                showsWarning: AgentModelSelectionWarningVisuals.showsWarning(
+                    agent: .codexExec,
+                    rawModel: group.baseModelID
+                ) || leaves.contains(where: \.showsWarning)
             )
         }
         return Content(defaultLeaf: defaultLeaf, groups: groups)
@@ -96,12 +82,13 @@ enum AgentHandoffCodexEffortMenu {
     }
 
     private static func leaf(
-        option: AgentModelOption,
-        effort: CodexReasoningEffort?,
-        isDefault: Bool,
+        expandedLeaf: AgentCodexModelEffortExpansion.Leaf,
         selectedModelRaw: String,
         selectedReasoningEffortRaw: String?
     ) -> Leaf {
+        let option = expandedLeaf.option
+        let effort = expandedLeaf.effort
+        let isDefault = expandedLeaf.isDefault
         let encodedEffort = CodexModelSpecifier(raw: option.rawValue).reasoningEffort
         let selectedEffort = CodexReasoningEffort.parse(selectedReasoningEffortRaw)
         let effortMatches = if let encodedEffort {
@@ -719,23 +706,12 @@ struct AgentHandoffPopover: View {
         )
     }
 
-    enum Action: Equatable {
-        case copyPayload
-        case handoff
-    }
-
-    enum ClipboardPayloadResult: Equatable {
-        case success(String)
-        case failure(String)
-    }
+    typealias Action = AgentHandoffActionSupport.Action
+    typealias ClipboardPayloadResult = AgentHandoffActionSupport.ClipboardPayloadResult
 
     @MainActor
     static func clipboardPayloadResult(config: AgentHandoffConfig) async -> ClipboardPayloadResult {
-        do {
-            return try await .success(config.buildPayloadForClipboard())
-        } catch {
-            return .failure(errorMessage(for: .copyPayload, error: error))
-        }
+        await AgentHandoffActionSupport.clipboardPayloadResult(config: config)
     }
 
     @MainActor
@@ -744,61 +720,21 @@ struct AgentHandoffPopover: View {
         defaults: UserDefaults = .standard,
         perform: @MainActor (AgentHandoffDestination) async throws -> Void
     ) async throws {
-        let canonicalDestination = canonicalizedDestination(destination)
-        try await perform(canonicalDestination)
-        guard case let .local(selection) = canonicalDestination,
-              selection.agent == .codexExec
-        else {
-            return
-        }
-
-        if let effort = CodexReasoningEffort.parse(selection.reasoningEffortRaw) {
-            CodexAgentToolPreferences.setLastUsedReasoningEffort(
-                effort,
-                forModelRaw: selection.modelRaw,
-                defaults: defaults
-            )
-        }
-    }
-
-    private static func canonicalizedDestination(
-        _ destination: AgentHandoffDestination
-    ) -> AgentHandoffDestination {
-        guard case let .local(selection) = destination else { return destination }
-        return .local(canonicalizedSelection(selection))
+        try await AgentHandoffActionSupport.performCommittedHandoff(
+            destination,
+            defaults: defaults,
+            perform: perform
+        )
     }
 
     private static func canonicalizedSelection(
         _ selection: AgentHandoffSelection
     ) -> AgentHandoffSelection {
-        guard selection.agent == .codexExec,
-              let encodedEffort = CodexModelSpecifier(raw: selection.modelRaw).reasoningEffort
-        else {
-            return selection
-        }
-        return AgentHandoffSelection(
-            agent: selection.agent,
-            modelRaw: selection.modelRaw,
-            reasoningEffortRaw: encodedEffort.rawValue
-        )
+        AgentHandoffActionSupport.canonicalizedSelection(selection)
     }
 
     static func errorMessage(for action: Action, error: Error) -> String {
-        if let remoteError = error as? RemoteClientError,
-           case let .inDoubt(commandError) = remoteError
-        {
-            let detail = commandError.message.trimmingCharacters(in: .whitespacesAndNewlines)
-            if action == .copyPayload {
-                let suffix = detail.isEmpty
-                    ? "The host did not confirm whether payload extraction completed."
-                    : detail
-                return "Copy Payload outcome is uncertain (in doubt). \(suffix)"
-            }
-            let suffix = detail.isEmpty ? "The host may already have created the fork." : detail
-            return "Handoff outcome is uncertain (in doubt). \(suffix) Check remote sessions before retrying."
-        }
-        let prefix = action == .copyPayload ? "Copy Payload failed" : "Handoff failed"
-        return "\(prefix): \(error.localizedDescription)"
+        AgentHandoffActionSupport.errorMessage(for: action, error: error)
     }
 
     static func initialSelection(for config: AgentHandoffConfig) -> AgentHandoffSelection {
@@ -896,28 +832,10 @@ struct AgentHandoffPopover: View {
         for agent: AgentProviderKind,
         in options: [AgentModelOption]
     ) -> AgentModelOption? {
-        guard agent == .cursor else {
-            return options.first {
-                $0.rawValue.caseInsensitiveCompare(rawValue) == .orderedSame
-            }
-        }
-        if let exact = options.first(where: { $0.rawValue == rawValue }) {
-            return exact
-        }
-        guard let selection = CursorBracketModelID.parse(
-            CursorBracketModelID.strippingCursorPrefix(rawValue)
+        AgentModelCatalog.modelOption(
+            matching: rawValue,
+            for: agent,
+            in: options
         )
-        else {
-            return nil
-        }
-        let normalizedBase = CursorModelRegistryGate.normalizedAlias(selection.base)
-        return options.first { option in
-            guard let parsedOption = CursorBracketModelID.parse(
-                CursorBracketModelID.strippingCursorPrefix(option.rawValue)
-            ) else {
-                return false
-            }
-            return CursorModelRegistryGate.normalizedAlias(parsedOption.base) == normalizedBase
-        }
     }
 }

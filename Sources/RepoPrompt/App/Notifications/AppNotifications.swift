@@ -111,6 +111,10 @@ extension Notification.Name {
     /// userInfo: ["windowID": Int, "mode": AgentNavigationHUDMode.rawValue]
     static let showAgentNavigationHUD = Notification.Name("showAgentNavigationHUD")
 
+    /// Show the model-selection HUD for the target window.
+    /// userInfo: ["windowID": Int, "mode": AgentModelSelectionHUDMode.rawValue]
+    static let showAgentModelSelectionHUD = Notification.Name("showAgentModelSelectionHUD")
+
     /// Select a numbered result in the Agent navigation HUD for the target window.
     /// `handledRequest` is a synchronous mutable acknowledgement used by global
     /// ⌘1–⌘9 handlers before they fall through to regular compose-tab switching.

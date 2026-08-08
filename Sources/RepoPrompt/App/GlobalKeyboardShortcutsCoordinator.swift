@@ -221,6 +221,12 @@ final class GlobalKeyboardShortcutsCoordinator {
         register(.nextParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: true) }
         register(.showCurrentWindowAgentNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .currentWindow) }
         register(.showAllAgentsNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .allAgents) }
+        register(.showAgentQuickModelSelectionHUD) { [weak self] in
+            self?.showAgentModelSelectionHUD(mode: .switchModel)
+        }
+        register(.showAgentQuickHandoffHUD) { [weak self] in
+            self?.showAgentModelSelectionHUD(mode: .handoffLastReply)
+        }
     }
 
     private func startNewAgentSessionFromShortcut() {
@@ -290,6 +296,18 @@ final class GlobalKeyboardShortcutsCoordinator {
             userInfo: [
                 AgentNavigationHUDNotificationUserInfoKey.windowID: win.windowID,
                 AgentNavigationHUDNotificationUserInfoKey.mode: mode.rawValue
+            ]
+        )
+    }
+
+    private func showAgentModelSelectionHUD(mode: AgentModelSelectionHUDMode) {
+        guard let win = guardedHUDWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .showAgentModelSelectionHUD,
+            object: nil,
+            userInfo: [
+                AgentModelSelectionHUDNotificationUserInfoKey.windowID: win.windowID,
+                AgentModelSelectionHUDNotificationUserInfoKey.mode: mode.rawValue
             ]
         )
     }

@@ -5,6 +5,7 @@ extension AgentModeViewModel {
         let tabID = explicitTabID ?? currentTabID
         let session = tabID.flatMap { sessions[$0] }
         let isMCPControlled = isMCPControlled(tabID: tabID)
+        let modelSelectionInteractivity = modelSelectionInteractivity(tabID: tabID)
         let availableAgentsForTab = selectableAgents(forTabID: tabID)
         let selectedAgentForTab = session?.selectedAgent ?? selectedAgent
         let canSendWithProviderForTab = availableAgentsForTab.contains(selectedAgentForTab)
@@ -41,7 +42,7 @@ extension AgentModeViewModel {
             isWaitingForInstruction: isWaitingForInstruction,
             canUseLinkedAgentSession: hasLinkedAgentSession(for: tabID),
             isCurrentTabMCPControlled: isMCPControlled,
-            areModelControlsDisabled: isMCPControlled,
+            areModelControlsDisabled: modelSelectionInteractivity.isDisabled,
             providerControls: activeProviderControlsBinding,
             isCodexRunActive: isCodexRunActive,
             hasAvailableAgentProviders: isRemoteSession ? true : !availableAgentsForTab.isEmpty,

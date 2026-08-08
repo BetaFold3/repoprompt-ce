@@ -370,7 +370,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
                     sourceSessionID: sourceRemoteSessionID,
                     hostRowID: hostRowID
                 ))
-                .items.first?.id
+                .items.last?.id
         )
         await waitUntil {
             fixture.coordinator.hostRowID(for: sourceSession, clientItemID: clientItemID) == hostRowID
@@ -451,6 +451,26 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         )
         let sourceSession = fixture.viewModel.session(for: fixture.initialTabID)
         sourceSession.remoteHost = binding(host: fixture.host, remoteSessionID: sourceRemoteSessionID)
+        fixture.viewModel.test_resetRemoteCatalogLoadState(hostID: fixture.host.id)
+        XCTAssertNil(
+            fixture.viewModel.cachedRemoteHostCatalog(sourceTabID: sourceSession.tabID)
+        )
+        XCTAssertFalse(
+            fixture.viewModel.test_hasRemoteCatalogLoadTask(hostID: fixture.host.id),
+            "The HUD cache-only accessor must not start a host catalog load on a miss."
+        )
+        let currentPresentation = fixture.viewModel.makeModelSelectionHUDPresentation(
+            mode: .switchModel,
+            sourceTabID: sourceSession.tabID,
+            windowID: 1
+        )
+        XCTAssertEqual(currentPresentation.index.leaves.count, 1)
+        guard case let .hostDefault(hostID)? = currentPresentation.index.leaves.first?.commitPayload else {
+            return XCTFail("Current-session remote HUD should retain the host-default choice")
+        }
+        XCTAssertEqual(hostID, fixture.host.id)
+        XCTAssertFalse(fixture.viewModel.test_hasRemoteCatalogLoadTask(hostID: fixture.host.id))
+
         let controller = try RemoteAgentSessionController(
             binding: XCTUnwrap(sourceSession.remoteHost),
             connection: connection
@@ -463,7 +483,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
                     sourceSessionID: sourceRemoteSessionID,
                     hostRowID: hostRowID
                 ))
-                .items.first?.id
+                .items.last?.id
         )
 
         let beforeRowMirror = fixture.viewModel.test_syncRunInteractionCallCount
@@ -477,6 +497,30 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             fixture.coordinator.canForkRemoteSession(session: sourceSession)
         }
         XCTAssertTrue(fixture.coordinator.canForkRemoteSession(session: sourceSession))
+
+        let resolution = fixture.viewModel.resolveLastReplyHandoffTarget(
+            sourceTabID: sourceSession.tabID
+        )
+        guard case let .target(target) = resolution else {
+            return XCTFail("Expected VM resolver to use the coordinator's host-row mirror")
+        }
+        XCTAssertEqual(target.clientRowID, clientItemID)
+        XCTAssertEqual(target.hostRowID, hostRowID)
+
+        let handoffPresentation = fixture.viewModel.makeModelSelectionHUDPresentation(
+            mode: .handoffLastReply,
+            sourceTabID: sourceSession.tabID,
+            windowID: 1
+        )
+        XCTAssertTrue(handoffPresentation.index.leaves.isEmpty)
+        XCTAssertEqual(
+            handoffPresentation.unavailableMessage,
+            "This host did not expose handoff destination models."
+        )
+        XCTAssertFalse(
+            fixture.viewModel.test_hasRemoteCatalogLoadTask(hostID: fixture.host.id),
+            "Remote handoff HUD presentation must remain cache-only."
+        )
     }
 
     @MainActor
@@ -2723,7 +2767,10 @@ private actor HandoffRecordingConnection: RemoteAgentSessionConnection {
             "returned_turn_count": .int(1),
             "total_turns": .int(1),
             "completed_turn_count": .int(1),
-            "transcript_xml": .string("<user id=\"\(hostRowID.uuidString)\">Prompt</user>")
+            "transcript_xml": .string(
+                "<user id=\"00000000-0000-0000-0000-000000000001\">Prompt</user>" +
+                    "<assistant id=\"\(hostRowID.uuidString)\">Completed reply</assistant>"
+            )
         ])
     }
 }

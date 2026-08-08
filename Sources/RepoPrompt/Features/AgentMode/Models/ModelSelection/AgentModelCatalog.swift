@@ -861,6 +861,57 @@ enum AgentModelCatalog {
         return ClaudeModelSpecifier(raw: only.rawValue).effortLevel != nil
     }
 
+    /// Resolves a presentation selection against a live provider catalog.
+    ///
+    /// Cursor parameterized raws match their live base option, while Claude effort
+    /// raws match a base option only when that effort is supported by the provider.
+    static func modelOption(
+        matching rawValue: String,
+        for agentKind: AgentProviderKind,
+        in options: [AgentModelOption]
+    ) -> AgentModelOption? {
+        if let exact = options.first(where: {
+            $0.rawValue.caseInsensitiveCompare(rawValue) == .orderedSame
+        }) {
+            return exact
+        }
+
+        if agentKind == .cursor {
+            guard let selection = CursorBracketModelID.parse(
+                CursorBracketModelID.strippingCursorPrefix(rawValue)
+            ) else {
+                return nil
+            }
+            let normalizedBase = CursorModelRegistryGate.normalizedAlias(selection.base)
+            return options.first { option in
+                guard let parsedOption = CursorBracketModelID.parse(
+                    CursorBracketModelID.strippingCursorPrefix(option.rawValue)
+                ) else {
+                    return false
+                }
+                return CursorModelRegistryGate.normalizedAlias(parsedOption.base) == normalizedBase
+            }
+        }
+
+        guard agentKind.usesClaudeTooling else { return nil }
+        let specifier = ClaudeModelSpecifier(raw: rawValue)
+        if let effort = specifier.effortLevel,
+           !supportedClaudeEfforts(
+               forSelectedModelRaw: rawValue,
+               agentKind: agentKind
+           ).contains(effort)
+        {
+            return nil
+        }
+        return options.first {
+            modelOptionIsSelected(
+                optionRaw: $0.rawValue,
+                selectedRaw: rawValue,
+                agentKind: agentKind
+            )
+        }
+    }
+
     static func modelOptionIsSelected(
         optionRaw: String,
         selectedRaw: String,

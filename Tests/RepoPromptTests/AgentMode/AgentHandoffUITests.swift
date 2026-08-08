@@ -82,6 +82,12 @@ final class AgentHandoffUITests: XCTestCase {
             }
         )
         XCTAssertEqual(copyResult, .failure("Copy Payload failed: Host extraction failed."))
+        let supportCopyResult = await AgentHandoffActionSupport.clipboardPayloadResult(
+            config: remoteConfig(catalog: .degraded) {
+                throw HandoffUITestError.extractionFailed
+            }
+        )
+        XCTAssertEqual(supportCopyResult, copyResult)
 
         let inDoubt = RemoteClientError.inDoubt(RemoteCommandError(
             code: "in_doubt",
@@ -91,6 +97,10 @@ final class AgentHandoffUITests: XCTestCase {
         XCTAssertTrue(message.contains("uncertain (in doubt)"), message)
         XCTAssertTrue(message.contains("The command outcome is unknown."), message)
         XCTAssertTrue(message.contains("before retrying"), message)
+        XCTAssertEqual(
+            AgentHandoffActionSupport.errorMessage(for: .handoff, error: inDoubt),
+            message
+        )
 
         let copyMessage = AgentHandoffPopover.errorMessage(for: .copyPayload, error: inDoubt)
         XCTAssertTrue(copyMessage.contains("Copy Payload outcome is uncertain (in doubt)"), copyMessage)

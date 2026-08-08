@@ -21,6 +21,8 @@ enum KeyboardShortcutCatalog {
                 .init(id: "toggle-sidebar", title: "Toggle session sidebar", detail: "Show or hide the Agent sessions list.", name: .toggleNavigationSidebar),
                 .init(id: "agent-nav-current", title: "Show Agent Session Switcher", detail: "Jump between Agent sessions in the focused window.", name: .showCurrentWindowAgentNavigationHUD),
                 .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD),
+                .init(id: "agent-model-picker", title: "Quick model picker", detail: "Switch models in the active Agent session.", name: .showAgentQuickModelSelectionHUD),
+                .init(id: "agent-quick-handoff", title: "Quick handoff", detail: "Start a new session from the last completed assistant reply.", name: .showAgentQuickHandoffHUD),
                 .init(id: "snippet-palette", title: "Open prompt snippet palette", detail: "Insert a saved prompt at the cursor while typing in the Agent composer.", name: .openPromptSnippetPalette)
             ]
         ),

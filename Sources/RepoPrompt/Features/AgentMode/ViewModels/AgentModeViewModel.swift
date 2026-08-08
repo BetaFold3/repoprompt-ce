@@ -445,7 +445,16 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func canSelectAgentInCurrentChat(_ candidate: AgentProviderKind) -> Bool {
-        guard let session = activeSession else { return true }
+        canSelectAgentInCurrentChat(candidate, tabID: currentTabID)
+    }
+
+    func canSelectAgentInCurrentChat(
+        _ candidate: AgentProviderKind,
+        tabID: UUID?
+    ) -> Bool {
+        guard let tabID,
+              let session = sessions[tabID]
+        else { return true }
         return canSelectAgent(candidate, for: session)
     }
 
@@ -656,6 +665,9 @@ final class AgentModeViewModel: ObservableObject {
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var remoteCatalogLoadTasksByHostID: [String: Task<Void, Never>] = [:]
+    #if DEBUG
+        private var testModelOptionsOverrideByAgent: [AgentProviderKind: [AgentModelOption]] = [:]
+    #endif
     var sidebarRegisteredRemoteHostsCache: (
         remoteHostIDs: Set<String>,
         hosts: [(id: String, displayName: String)]
@@ -1140,6 +1152,11 @@ final class AgentModeViewModel: ObservableObject {
         for agentKind: AgentProviderKind,
         includeClaudeEffortVariants: Bool = true
     ) -> [AgentModelOption] {
+        #if DEBUG
+            if let override = testModelOptionsOverrideByAgent[agentKind] {
+                return override
+            }
+        #endif
         guard AgentModelCatalog.isAgentAvailable(agentKind, availability: agentAvailabilityContext) else { return [] }
         return codexCoordinator.modelOptions(
             for: agentKind,
@@ -1148,6 +1165,19 @@ final class AgentModeViewModel: ObservableObject {
             includeClaudeEffortVariants: includeClaudeEffortVariants
         )
     }
+
+    #if DEBUG
+        func test_setModelOptionsOverride(
+            _ options: [AgentModelOption]?,
+            for agentKind: AgentProviderKind
+        ) {
+            testModelOptionsOverrideByAgent[agentKind] = options
+        }
+
+        func test_setAvailableAgents(_ agents: [AgentProviderKind]) {
+            availableAgents = agents
+        }
+    #endif
 
     func selectModel(rawModel: String) {
         selectedModelRaw = rawModel
@@ -1214,6 +1244,17 @@ final class AgentModeViewModel: ObservableObject {
             syncComposerUIState()
         }
     }
+
+    #if DEBUG
+        func test_resetRemoteCatalogLoadState(hostID: String) {
+            remoteCatalogLoadTasksByHostID.removeValue(forKey: hostID)?.cancel()
+            remoteHostCatalog.invalidate(hostID: hostID)
+        }
+
+        func test_hasRemoteCatalogLoadTask(hostID: String) -> Bool {
+            remoteCatalogLoadTasksByHostID[hostID] != nil
+        }
+    #endif
 
     @discardableResult
     func materializeRemoteChildSession(
@@ -17553,6 +17594,10 @@ final class AgentModeViewModel: ObservableObject {
     var canForkCurrentSession: Bool {
         guard let tabID = currentTabID,
               let session = sessions[tabID] else { return false }
+        return canForkSession(session)
+    }
+
+    func canForkSession(_ session: TabSession) -> Bool {
         if session.remoteHost != nil {
             return remoteCoordinator.canForkRemoteSession(session: session)
         }
@@ -17565,12 +17610,31 @@ final class AgentModeViewModel: ObservableObject {
     /// Build the handoff payload string for a given item cutoff (used for clipboard copy and handoff).
     @MainActor
     func buildHandoffPayload(upToItemID: UUID?) async -> String {
-        guard let sourceTabID = currentTabID,
-              let sourceSession = sessions[sourceTabID],
-              let sourceTranscript = resolvedHandoffSourceTranscript(
-                  for: sourceSession,
-                  upToItemID: upToItemID
-              ) else { return "" }
+        guard let sourceTabID = currentTabID else { return "" }
+        do {
+            return try await buildHandoffPayload(
+                sourceTabID: sourceTabID,
+                upToItemID: upToItemID
+            )
+        } catch {
+            return ""
+        }
+    }
+
+    @MainActor
+    func buildHandoffPayload(
+        sourceTabID: UUID,
+        upToItemID: UUID?
+    ) async throws -> String {
+        guard let sourceSession = sessions[sourceTabID] else {
+            throw AgentHandoffConfigurationError.sourceUnavailable
+        }
+        guard let sourceTranscript = resolvedHandoffSourceTranscript(
+            for: sourceSession,
+            upToItemID: upToItemID
+        ) else {
+            throw AgentSessionError.invalidHandoffCutoff
+        }
 
         return await buildHandoffPayload(
             sourceTabID: sourceTabID,
@@ -17732,16 +17796,6 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
-    @MainActor
-    private func fallbackHandoffTranscript(from items: [AgentChatItem]) -> AgentTranscript {
-        AgentTranscriptIO.buildTranscript(
-            from: items,
-            nextSequenceIndex: (items.map(\.sequenceIndex).max() ?? -1) + 1,
-            policy: .canonical,
-            compact: false
-        )
-    }
-
     /// Resolves the authoritative transcript used for handoff payloads and destination
     /// migration. Prefer the structured transcript because historical/compacted rows
     /// can be absent from the mutable `items` suffix.
@@ -17759,7 +17813,7 @@ final class AgentModeViewModel: ObservableObject {
                     : nil
             }
 
-            let itemTranscript = fallbackHandoffTranscript(from: session.items)
+            let itemTranscript = AgentTranscriptIO.handoffTranscript(fromLegacyItems: session.items)
             if AgentTranscriptIO.isValidHandoffExportCutoffRowID(upToItemID, in: itemTranscript) {
                 return itemTranscript
             }
@@ -17768,7 +17822,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         if !hasStructuredTranscript, !session.items.isEmpty {
-            return fallbackHandoffTranscript(from: session.items)
+            return AgentTranscriptIO.handoffTranscript(fromLegacyItems: session.items)
         }
 
         return session.transcript
@@ -17791,7 +17845,7 @@ final class AgentModeViewModel: ObservableObject {
         upToItemID: UUID
     ) -> [AgentChatItem] {
         buildHandoffTranscriptItems(
-            sourceTranscript: fallbackHandoffTranscript(from: sourceItems),
+            sourceTranscript: AgentTranscriptIO.handoffTranscript(fromLegacyItems: sourceItems),
             upToItemID: upToItemID
         )
     }
@@ -17930,9 +17984,30 @@ final class AgentModeViewModel: ObservableObject {
         destinationModelRaw: String,
         destinationReasoningEffortRaw: String?
     ) async throws -> UUID {
+        guard let sourceTabID = currentTabID else {
+            throw AgentSessionError.noActiveWorkspace
+        }
+        return try await prepareHandoffToNewTab(
+            sourceTabID: sourceTabID,
+            upToItemID: upToItemID,
+            destinationAgent: destinationAgent,
+            destinationModelRaw: destinationModelRaw,
+            destinationReasoningEffortRaw: destinationReasoningEffortRaw
+        )
+    }
+
+    /// Source-addressed foreground handoff used by UI actions that pin their source at presentation.
+    @MainActor
+    @discardableResult
+    func prepareHandoffToNewTab(
+        sourceTabID: UUID,
+        upToItemID: UUID,
+        destinationAgent: AgentProviderKind,
+        destinationModelRaw: String,
+        destinationReasoningEffortRaw: String?
+    ) async throws -> UUID {
         guard let promptManager,
-              let workspaceManager,
-              let sourceTabID = currentTabID
+              let workspaceManager
         else {
             throw AgentSessionError.noActiveWorkspace
         }

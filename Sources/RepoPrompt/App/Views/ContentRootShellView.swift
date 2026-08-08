@@ -8,13 +8,16 @@ struct ContentRootShellView: View {
     @ObservedObject var remoteDeviceApprovalManager: RemoteDeviceApprovalManager
     @Binding var showWorkspaceSwitchOverlay: Bool
     @StateObject private var agentNavigationHUD = AgentNavigationHUDViewModel()
+    @StateObject private var agentModelSelectionHUD = AgentModelSelectionHUDViewModel()
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var lastAgentNavigationHUDCommand: (mode: AgentNavigationHUDMode, at: Date)?
+    @State private var lastAgentModelSelectionHUDCommand: (mode: AgentModelSelectionHUDMode, at: Date)?
 
     private var isBlockingOverlayVisible: Bool {
         showWorkspaceSwitchOverlay
             || (viewModel.state.mcpServer.pendingClientID != nil && viewModel.state.mcpServer.isApprovalOverlayVisible)
             || (workspaceApprovalManager.pendingRequest != nil && workspaceApprovalManager.isApprovalOverlayVisible)
+            || (remoteDeviceApprovalManager.pendingRequest != nil && remoteDeviceApprovalManager.isApprovalOverlayVisible)
     }
 
     var body: some View {
@@ -30,6 +33,12 @@ struct ContentRootShellView: View {
                 )
                 .transition(hudTransition)
                 .zIndex(998)
+            }
+
+            if agentModelSelectionHUD.isPresented {
+                AgentModelSelectionHUDView(viewModel: agentModelSelectionHUD)
+                    .transition(hudTransition)
+                    .zIndex(998)
             }
 
             if showWorkspaceSwitchOverlay {
@@ -74,10 +83,15 @@ struct ContentRootShellView: View {
             }
         }
         .animation(hudAnimation, value: agentNavigationHUD.isPresented)
+        .animation(hudAnimation, value: agentModelSelectionHUD.isPresented)
         .onReceive(NotificationCenter.default.publisher(for: .showAgentNavigationHUD)) { note in
             guard noteTargetsCurrentWindow(note) else { return }
+            guard !agentModelSelectionHUD.isCommitting else { return }
             guard !isBlockingOverlayVisible else {
-                animateHUD { agentNavigationHUD.dismiss() }
+                animateHUD {
+                    agentNavigationHUD.dismiss()
+                    agentModelSelectionHUD.dismiss()
+                }
                 return
             }
             let rawMode = note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.mode] as? String
@@ -88,7 +102,44 @@ struct ContentRootShellView: View {
                 return
             }
             animateHUD {
+                agentModelSelectionHUD.dismiss()
                 agentNavigationHUD.present(mode: mode, currentWindow: viewModel.state)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showAgentModelSelectionHUD)) { note in
+            guard noteTargetsCurrentWindow(note) else { return }
+            guard !agentNavigationHUD.isRouting else { return }
+            guard !isBlockingOverlayVisible else {
+                animateHUD {
+                    agentNavigationHUD.dismiss()
+                    agentModelSelectionHUD.dismiss()
+                }
+                return
+            }
+            let rawMode = note.userInfo?[AgentModelSelectionHUDNotificationUserInfoKey.mode] as? String
+            let mode = rawMode.flatMap(AgentModelSelectionHUDMode.init(rawValue:)) ?? .switchModel
+            guard !isDuplicateAgentModelSelectionHUDCommand(mode) else { return }
+            guard viewModel.rootRoute != .workspaceEntry else {
+                animateHUD { agentModelSelectionHUD.dismiss() }
+                return
+            }
+
+            let sourceTabID = viewModel.state.promptManager.activeComposeTabID
+            animateHUD {
+                agentNavigationHUD.dismiss()
+                agentModelSelectionHUD.present(mode: mode) {
+                    guard let sourceTabID else {
+                        return .unavailable(
+                            title: mode.title,
+                            message: "No active Agent session is available."
+                        )
+                    }
+                    return viewModel.state.agentModeViewModel.makeModelSelectionHUDPresentation(
+                        mode: mode,
+                        sourceTabID: sourceTabID,
+                        windowID: viewModel.state.windowID
+                    )
+                }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .selectAgentNavigationHUDResult)) { note in
@@ -101,12 +152,27 @@ struct ContentRootShellView: View {
         }
         .onChange(of: isBlockingOverlayVisible) { _, isVisible in
             if isVisible {
-                animateHUD { agentNavigationHUD.dismiss() }
+                animateHUD {
+                    agentNavigationHUD.dismiss()
+                    if agentModelSelectionHUD.isCommitting {
+                        agentModelSelectionHUD.suspendForBlockingOverlay()
+                    } else {
+                        agentModelSelectionHUD.dismiss()
+                    }
+                }
+            }
+        }
+        .onChange(of: agentModelSelectionHUD.isCommitting) { _, isCommitting in
+            if !isCommitting, isBlockingOverlayVisible {
+                animateHUD { agentModelSelectionHUD.dismiss() }
             }
         }
         .onChange(of: viewModel.state.promptManager.activeComposeTabID) { _, _ in
             if agentNavigationHUD.isPresented, !agentNavigationHUD.isRouting {
                 animateHUD { agentNavigationHUD.dismiss() }
+            }
+            if agentModelSelectionHUD.isPresented, !agentModelSelectionHUD.isRouting {
+                animateHUD { agentModelSelectionHUD.dismiss() }
             }
         }
     }
@@ -136,6 +202,15 @@ struct ContentRootShellView: View {
               lastAgentNavigationHUDCommand.mode == mode
         else { return false }
         return now.timeIntervalSince(lastAgentNavigationHUDCommand.at) < 0.20
+    }
+
+    private func isDuplicateAgentModelSelectionHUDCommand(_ mode: AgentModelSelectionHUDMode) -> Bool {
+        let now = Date()
+        defer { lastAgentModelSelectionHUDCommand = (mode, now) }
+        guard let lastAgentModelSelectionHUDCommand,
+              lastAgentModelSelectionHUDCommand.mode == mode
+        else { return false }
+        return now.timeIntervalSince(lastAgentModelSelectionHUDCommand.at) < 0.20
     }
 
     private func noteTargetsCurrentWindow(_ note: Notification) -> Bool {

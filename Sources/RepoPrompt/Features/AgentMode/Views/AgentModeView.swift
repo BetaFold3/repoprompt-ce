@@ -3419,69 +3419,14 @@ struct AgentModeChatDetailView: View {
 
     private func handoffConfig(for itemID: UUID) -> AgentHandoffConfig? {
         guard runInteractionSnapshot.canForkCurrentSession,
-              let tabID = currentTabID,
-              let session = agentModeVM.sessions[tabID]
-        else { return nil }
-
-        let remoteHostID = session.remoteHost?.hostID
-        let resolvedHostRowID = remoteHostID.map { _ in
-            agentModeVM.remoteCoordinator.hostRowID(for: session, clientItemID: itemID)
-        } ?? nil
-        guard let destinationSource = AgentHandoffConfig.destinationSource(
-            remoteHostID: remoteHostID,
-            resolvedHostRowID: resolvedHostRowID
-        ) else { return nil }
-
-        return AgentHandoffConfig(
-            itemID: itemID,
-            destinationSource: destinationSource,
-            defaultDestinationAgent: runInteractionSnapshot.selectedAgent,
-            defaultModelRaw: runInteractionSnapshot.selectedModelRaw,
-            defaultReasoningEffortRaw: runInteractionSnapshot.selectedReasoningEffortRaw,
-            availableAgentsProvider: { [weak agentModeVM] in
-                agentModeVM?.selectableAgents(forTabID: runInteractionSnapshot.currentTabID) ?? []
-            },
-            modelOptionsProvider: { [weak agentModeVM] agent in
-                agentModeVM?.modelOptions(for: agent) ?? []
-            },
-            remoteCatalogSnapshot: remoteHostID == nil ? nil : agentModeVM.remoteHostCatalogSnapshot(for: session),
-            windowID: windowID,
-            buildPayloadForClipboard: { [weak agentModeVM] in
-                guard let vm = agentModeVM else {
-                    throw AgentHandoffConfigurationError.sourceUnavailable
-                }
-                if remoteHostID != nil {
-                    return try await vm.remoteCoordinator.extractHandoff(
-                        session: session,
-                        upToClientItemID: itemID
-                    )
-                }
-                return await vm.buildHandoffPayload(upToItemID: itemID)
-            },
-            performHandoff: { [weak agentModeVM] destination in
-                guard let vm = agentModeVM else {
-                    throw AgentHandoffConfigurationError.sourceUnavailable
-                }
-                switch (destinationSource, destination) {
-                case let (.localProviders, .local(selection)):
-                    try await vm.prepareHandoffToNewTab(
-                        upToItemID: itemID,
-                        destinationAgent: selection.agent,
-                        destinationModelRaw: selection.modelRaw,
-                        destinationReasoningEffortRaw: selection.reasoningEffortRaw
-                    )
-                case let (.remoteCatalog, .remote(agentID, modelID, effort)):
-                    try await vm.remoteCoordinator.fork(
-                        session: session,
-                        upToClientItemID: itemID,
-                        destinationAgent: agentID,
-                        destinationModelID: modelID,
-                        destinationEffort: effort
-                    )
-                default:
-                    throw AgentHandoffConfigurationError.invalidDestination
-                }
-            }
+              let sourceTabID = currentTabID
+        else {
+            return nil
+        }
+        return agentModeVM.makeHandoffConfig(
+            for: itemID,
+            sourceTabID: sourceTabID,
+            windowID: windowID
         )
     }
 

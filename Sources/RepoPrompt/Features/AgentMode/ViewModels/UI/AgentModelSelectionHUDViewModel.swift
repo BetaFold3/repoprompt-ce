@@ -1,0 +1,308 @@
+import Foundation
+
+enum AgentModelSelectionHUDMode: String, CaseIterable, Identifiable {
+    case switchModel
+    case handoffLastReply
+
+    var id: String {
+        rawValue
+    }
+
+    var title: String {
+        switch self {
+        case .switchModel:
+            "Quick Model Picker"
+        case .handoffLastReply:
+            "Quick Handoff"
+        }
+    }
+
+    var searchPlaceholder: String {
+        switch self {
+        case .switchModel:
+            "Search models"
+        case .handoffLastReply:
+            "Search destination models"
+        }
+    }
+
+    var commitLabel: String {
+        switch self {
+        case .switchModel:
+            "Select"
+        case .handoffLastReply:
+            "Hand off"
+        }
+    }
+}
+
+enum AgentModelSelectionHUDPhase: Equatable {
+    case ready
+    case unavailable(message: String)
+    case committing
+}
+
+enum AgentModelSelectionHUDNotificationUserInfoKey {
+    static let windowID = "windowID"
+    static let mode = "mode"
+}
+
+struct AgentModelSelectionHUDPresentation {
+    let title: String
+    let subtitle: String?
+    let index: AgentModelSelectionIndex
+    let noticeText: String?
+    let unavailableMessage: String?
+    let commit: @MainActor (AgentModelSelectionLeaf) async throws -> Void
+
+    init(
+        title: String,
+        subtitle: String? = nil,
+        index: AgentModelSelectionIndex,
+        noticeText: String? = nil,
+        unavailableMessage: String? = nil,
+        commit: @escaping @MainActor (AgentModelSelectionLeaf) async throws -> Void
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.index = index
+        self.noticeText = noticeText
+        self.unavailableMessage = unavailableMessage
+        self.commit = commit
+    }
+
+    static func unavailable(
+        title: String,
+        subtitle: String? = nil,
+        message: String,
+        noticeText: String? = nil
+    ) -> AgentModelSelectionHUDPresentation {
+        AgentModelSelectionHUDPresentation(
+            title: title,
+            subtitle: subtitle,
+            index: AgentModelSelectionIndex(leaves: []),
+            noticeText: noticeText,
+            unavailableMessage: message,
+            commit: { _ in }
+        )
+    }
+}
+
+@MainActor
+final class AgentModelSelectionHUDViewModel: ObservableObject {
+    static let displayLimit = 50
+
+    @Published private(set) var isPresented = false
+    @Published private(set) var mode: AgentModelSelectionHUDMode = .switchModel
+    @Published private(set) var phase: AgentModelSelectionHUDPhase = .ready
+    @Published private(set) var title = AgentModelSelectionHUDMode.switchModel.title
+    @Published private(set) var subtitle: String?
+    @Published private(set) var noticeText: String?
+    @Published private(set) var filteredLeaves: [AgentModelSelectionLeaf] = []
+    @Published private(set) var selectedLeafID: AgentModelSelectionLeafID?
+    @Published private(set) var errorMessage: String?
+    @Published private(set) var isRouting = false
+    @Published private(set) var isShowingLimitedResults = false
+    @Published private(set) var totalMatchedLeafCount = 0
+    @Published var query = "" {
+        didSet { rebuildFilteredLeaves(preserveSelection: true) }
+    }
+
+    private var index = AgentModelSelectionIndex(leaves: [])
+    private var commitAction: (@MainActor (AgentModelSelectionLeaf) async throws -> Void)?
+    private var isSuspendedDuringCommit = false
+
+    var queryIsEmpty: Bool {
+        query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var totalLeafCount: Int {
+        index.leaves.count
+    }
+
+    var canDismiss: Bool {
+        phase != .committing
+    }
+
+    var isCommitting: Bool {
+        phase == .committing
+    }
+
+    var unavailableMessage: String? {
+        guard case let .unavailable(message) = phase else { return nil }
+        return message
+    }
+
+    func present(
+        mode: AgentModelSelectionHUDMode,
+        presentationProvider: () -> AgentModelSelectionHUDPresentation
+    ) {
+        if isPresented, self.mode == mode {
+            dismiss()
+            return
+        }
+        guard phase != .committing else { return }
+
+        let wasPresented = isPresented
+        let presentation = presentationProvider()
+        self.mode = mode
+        title = presentation.title
+        subtitle = presentation.subtitle
+        noticeText = presentation.noticeText
+        index = presentation.index
+        commitAction = presentation.commit
+        errorMessage = nil
+        isRouting = false
+        phase = presentation.unavailableMessage.map(AgentModelSelectionHUDPhase.unavailable) ?? .ready
+        isPresented = true
+
+        if !wasPresented {
+            query = ""
+        }
+        rebuildFilteredLeaves(preserveSelection: wasPresented)
+    }
+
+    func dismiss() {
+        guard phase != .committing else { return }
+        resetPresentedState()
+    }
+
+    /// Immediately unmounts a committing HUD when a higher-priority blocking
+    /// overlay appears without cancelling or detaching the in-flight action.
+    func suspendForBlockingOverlay() {
+        guard phase == .committing else {
+            dismiss()
+            return
+        }
+        isSuspendedDuringCommit = true
+        isPresented = false
+    }
+
+    @discardableResult
+    func clearQueryOrDismiss() -> Bool {
+        guard phase != .committing else { return false }
+        if !queryIsEmpty {
+            query = ""
+            errorMessage = nil
+            return false
+        }
+        dismiss()
+        return true
+    }
+
+    func moveSelection(by delta: Int) {
+        guard phase == .ready, !filteredLeaves.isEmpty else {
+            selectedLeafID = nil
+            return
+        }
+        guard let selectedLeafID,
+              let current = filteredLeaves.firstIndex(where: { $0.id == selectedLeafID })
+        else {
+            selectedLeafID = delta < 0 ? filteredLeaves.last?.id : filteredLeaves.first?.id
+            return
+        }
+        let next = (current + delta + filteredLeaves.count) % filteredLeaves.count
+        self.selectedLeafID = filteredLeaves[next].id
+    }
+
+    func moveSelection(to leafID: AgentModelSelectionLeafID) {
+        guard phase == .ready,
+              filteredLeaves.contains(where: { $0.id == leafID })
+        else {
+            return
+        }
+        selectedLeafID = leafID
+    }
+
+    func commit(_ leaf: AgentModelSelectionLeaf) async {
+        guard phase == .ready,
+              filteredLeaves.contains(where: { $0.id == leaf.id })
+        else {
+            return
+        }
+        selectedLeafID = leaf.id
+        await commitSelected()
+    }
+
+    func commitSelected() async {
+        guard phase == .ready,
+              let selectedLeafID,
+              let selectedIndex = filteredLeaves.firstIndex(where: { $0.id == selectedLeafID }),
+              let commitAction
+        else {
+            return
+        }
+
+        let leaf = filteredLeaves[selectedIndex]
+        phase = .committing
+        errorMessage = nil
+        isRouting = mode == .handoffLastReply
+
+        do {
+            try await commitAction(leaf)
+            resetPresentedState()
+        } catch {
+            if isSuspendedDuringCommit {
+                resetPresentedState()
+            } else {
+                isRouting = false
+                phase = .ready
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func resetPresentedState() {
+        isPresented = false
+        phase = .ready
+        errorMessage = nil
+        noticeText = nil
+        subtitle = nil
+        isRouting = false
+        isSuspendedDuringCommit = false
+        query = ""
+        selectedLeafID = nil
+        index = AgentModelSelectionIndex(leaves: [])
+        commitAction = nil
+        filteredLeaves = []
+        isShowingLimitedResults = false
+        totalMatchedLeafCount = 0
+    }
+
+    private func rebuildFilteredLeaves(preserveSelection: Bool) {
+        let previousSelection = preserveSelection ? selectedLeafID : nil
+        let ranked = index.ranked(query: query)
+        totalMatchedLeafCount = ranked.count
+        var displayed = Array(ranked.prefix(Self.displayLimit))
+        isShowingLimitedResults = ranked.count > displayed.count
+
+        let preferredSelection: AgentModelSelectionLeafID? = {
+            if queryIsEmpty {
+                return index.currentSelectionID
+            }
+            if let previousSelection,
+               ranked.contains(where: { $0.id == previousSelection })
+            {
+                return previousSelection
+            }
+            return ranked.first?.id
+        }()
+
+        if let preferredSelection,
+           !displayed.contains(where: { $0.id == preferredSelection }),
+           let preferredLeaf = ranked.first(where: { $0.id == preferredSelection })
+        {
+            if displayed.count == Self.displayLimit {
+                displayed.removeLast()
+            }
+            displayed.append(preferredLeaf)
+        }
+
+        if filteredLeaves != displayed {
+            filteredLeaves = displayed
+        }
+        selectedLeafID = preferredSelection.flatMap { preferred in
+            displayed.contains(where: { $0.id == preferred }) ? preferred : nil
+        }
+    }
+}

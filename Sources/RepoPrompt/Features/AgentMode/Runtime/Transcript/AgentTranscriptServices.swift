@@ -2269,6 +2269,16 @@ enum AgentTranscriptIO {
         return compact ? AgentTranscriptCompactor.compact(transcript, protection: protection) : transcript
     }
 
+    /// Canonical compatibility projection for handoff callers that only retain legacy items.
+    static func handoffTranscript(fromLegacyItems items: [AgentChatItem]) -> AgentTranscript {
+        buildTranscript(
+            from: items,
+            nextSequenceIndex: (items.map(\.sequenceIndex).max() ?? -1) + 1,
+            policy: .canonical,
+            compact: false
+        )
+    }
+
     static func runtimeNormalizedTranscript(
         _ transcript: AgentTranscript,
         protection: AgentTranscriptProjectionProtection = .none
@@ -3922,7 +3932,7 @@ enum AgentTranscriptIO {
         handoffExportCutoffRowIDs(from: transcript).contains(rowID)
     }
 
-    private static func handoffExportCutoffRowIDs(from transcript: AgentTranscript) -> Set<UUID> {
+    static func handoffExportCutoffRowIDs(from transcript: AgentTranscript) -> Set<UUID> {
         let materialized = AgentTranscriptPolicyPipeline.handoffTranscript(
             from: transcript,
             upToRowID: nil
@@ -5158,6 +5168,141 @@ enum AgentTranscriptIO {
     private static func truncateArgs(_ rawArgs: String?, max limit: Int) -> String {
         guard let rawArgs, !rawArgs.isEmpty else { return "" }
         return rawArgs.count > limit ? String(rawArgs.prefix(limit)) + "…" : rawArgs
+    }
+}
+
+struct AgentLastCompletedAssistantReplyHandoffTarget: Equatable {
+    let clientRowID: UUID
+    let hostRowID: UUID?
+    let previewText: String
+}
+
+enum AgentLastCompletedAssistantReplyHandoffResolution: Equatable {
+    case target(AgentLastCompletedAssistantReplyHandoffTarget)
+    case unavailable(message: String)
+}
+
+/// Pure resolver for the newest concrete, completed assistant reply accepted by
+/// the handoff export projection. Remote callers supply their cached client→host
+/// row mapping; no coordinator or network work occurs here.
+enum AgentLastCompletedAssistantReplyHandoffCutoffResolver {
+    static func resolve(
+        runState: AgentSessionRunState,
+        canForkCurrentSession: Bool,
+        transcript: AgentTranscript,
+        legacyItems: [AgentChatItem],
+        remoteHostRowIDForClientItemID: ((UUID) -> UUID?)? = nil
+    ) -> AgentLastCompletedAssistantReplyHandoffResolution {
+        if runState.isActive {
+            return .unavailable(message: "Wait for the current reply to finish.")
+        }
+        guard canForkCurrentSession else {
+            return .unavailable(message: "Nothing to hand off yet.")
+        }
+
+        if !transcript.turns.isEmpty {
+            if let resolution = newestTarget(
+                in: transcript,
+                remoteHostRowIDForClientItemID: remoteHostRowIDForClientItemID
+            ) {
+                return resolution
+            }
+            return .unavailable(message: "No completed assistant reply to hand off.")
+        }
+
+        let legacyTranscript = AgentTranscriptIO.handoffTranscript(fromLegacyItems: legacyItems)
+        if let resolution = newestTarget(
+            in: legacyTranscript,
+            remoteHostRowIDForClientItemID: remoteHostRowIDForClientItemID
+        ) {
+            return resolution
+        }
+        return .unavailable(message: "No completed assistant reply to hand off.")
+    }
+
+    private static func newestTarget(
+        in transcript: AgentTranscript,
+        remoteHostRowIDForClientItemID: ((UUID) -> UUID?)?
+    ) -> AgentLastCompletedAssistantReplyHandoffResolution? {
+        let validCutoffRowIDs = AgentTranscriptIO.handoffExportCutoffRowIDs(from: transcript)
+        for turn in transcript.turns.reversed() {
+            guard turn.terminalState != .failed,
+                  turn.terminalState != .cancelled
+            else {
+                continue
+            }
+            let activities = turn.allActivities
+            guard !isActive(turn, activities: activities) else { continue }
+
+            var candidates: [AgentTranscriptActivity] = []
+            if let conclusionActivityID = turn.conclusionActivityID,
+               let storedConclusion = activities.first(where: { $0.id == conclusionActivityID })
+            {
+                candidates.append(storedConclusion)
+            }
+            if let recomputed = AgentTranscriptQualityRepair.recomputedConclusionActivity(in: activities) {
+                candidates.append(recomputed)
+            }
+            if let latest = activities.reversed().first(where: isCompletedDisplayableAssistant) {
+                candidates.append(latest)
+            }
+
+            var seenCandidateIDs: Set<UUID> = []
+            for candidate in candidates where seenCandidateIDs.insert(candidate.id).inserted {
+                guard isCompletedDisplayableAssistant(candidate),
+                      validCutoffRowIDs.contains(candidate.id)
+                else {
+                    continue
+                }
+
+                let hostRowID: UUID?
+                if let remoteHostRowIDForClientItemID {
+                    // Never fall back to an older reply when the newest eligible reply has
+                    // not synced; doing so would silently hand off different content.
+                    guard let resolvedHostRowID = remoteHostRowIDForClientItemID(candidate.id) else {
+                        return .unavailable(message: "This reply hasn't synced with the host yet.")
+                    }
+                    hostRowID = resolvedHostRowID
+                } else {
+                    hostRowID = nil
+                }
+                return .target(AgentLastCompletedAssistantReplyHandoffTarget(
+                    clientRowID: candidate.id,
+                    hostRowID: hostRowID,
+                    previewText: firstLineExcerpt(candidate.text)
+                ))
+            }
+        }
+        return nil
+    }
+
+    private static func isActive(
+        _ turn: AgentTranscriptTurn,
+        activities: [AgentTranscriptActivity]
+    ) -> Bool {
+        if turn.terminalState?.isActive == true {
+            return true
+        }
+        if turn.responseSpans.contains(where: { $0.lifecycle == .open }) {
+            return true
+        }
+        return activities.contains(where: \.isStreaming)
+    }
+
+    private static func isCompletedDisplayableAssistant(
+        _ activity: AgentTranscriptActivity
+    ) -> Bool {
+        (activity.itemKind == .assistant || activity.itemKind == .assistantInline)
+            && !activity.isStreaming
+            && AgentDisplayableText.hasDisplayableBody(activity.text)
+    }
+
+    private static func firstLineExcerpt(_ text: String, limit: Int = 160) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let firstLine = trimmed.split(whereSeparator: \.isNewline).first.map(String.init) ?? trimmed
+        guard firstLine.count > limit else { return firstLine }
+        let endIndex = firstLine.index(firstLine.startIndex, offsetBy: limit)
+        return String(firstLine[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
     }
 }
 

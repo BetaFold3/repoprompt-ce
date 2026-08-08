@@ -60,8 +60,13 @@ enum AgentTranscriptQualityRepair {
         return !AgentDisplayableText.hasDisplayableBody(conclusion.text)
     }
 
-    private static func recomputedConclusionActivity(in turn: AgentTranscriptTurn) -> AgentTranscriptActivity? {
-        let activities = turn.allActivities
+    static func recomputedConclusionActivity(in turn: AgentTranscriptTurn) -> AgentTranscriptActivity? {
+        recomputedConclusionActivity(in: turn.allActivities)
+    }
+
+    static func recomputedConclusionActivity(
+        in activities: [AgentTranscriptActivity]
+    ) -> AgentTranscriptActivity? {
         let assistantActivities = activities.filter {
             ($0.itemKind == .assistant || $0.itemKind == .assistantInline)
                 && AgentDisplayableText.hasDisplayableBody($0.text)

@@ -1,0 +1,1233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Human-friendly technical implementation report for the Agent Mode quick model picker and quick handoff HUD in RepoPrompt CE.">
+  <title>Quick Model Picker and Quick Handoff — Implementation Report</title>
+  <style>
+    :root {
+      --bg: #f4f1eb;
+      --surface: #fffdf8;
+      --surface-2: #f8f4ed;
+      --surface-3: #eee7dc;
+      --ink: #202a34;
+      --muted: #66727e;
+      --line: #ddd5ca;
+      --blue: #315fc7;
+      --blue-soft: #e9efff;
+      --green: #18734d;
+      --green-soft: #e7f6ee;
+      --amber: #8a5c00;
+      --amber-soft: #fff1cd;
+      --red: #a63f47;
+      --red-soft: #ffeaec;
+      --purple: #704bb0;
+      --purple-soft: #f0e9ff;
+      --shadow: 0 18px 50px rgba(42, 37, 29, .08);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0e141b;
+        --surface: #171e27;
+        --surface-2: #202936;
+        --surface-3: #283341;
+        --ink: #edf2f7;
+        --muted: #b4bfca;
+        --line: #35414e;
+        --blue: #9ab3ff;
+        --blue-soft: #27345c;
+        --green: #79d5aa;
+        --green-soft: #173d2d;
+        --amber: #e9c16c;
+        --amber-soft: #4c3818;
+        --red: #ff9da6;
+        --red-soft: #4b282e;
+        --purple: #c8b0ff;
+        --purple-soft: #392d55;
+        --shadow: none;
+      }
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 92% -8%, color-mix(in srgb, var(--blue) 13%, transparent), transparent 32rem),
+        radial-gradient(circle at -8% 30%, color-mix(in srgb, var(--purple) 8%, transparent), transparent 28rem),
+        var(--bg);
+      color: var(--ink);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    }
+    a { color: var(--blue); text-underline-offset: 3px; }
+    code, kbd { font-family: var(--mono); }
+    code {
+      padding: .08rem .34rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-2);
+      font-size: .9em;
+    }
+    kbd {
+      padding: .12rem .42rem;
+      border: 1px solid var(--line);
+      border-bottom-width: 2px;
+      border-radius: 6px;
+      background: var(--surface-2);
+      font-size: .82em;
+      white-space: nowrap;
+    }
+    .skip-link {
+      position: fixed;
+      left: 12px;
+      top: -60px;
+      z-index: 100;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+    }
+    .skip-link:focus { top: 12px; }
+    .page { width: min(1180px, calc(100% - 30px)); margin: 0 auto; padding: 26px 0 72px; }
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(28px, 5vw, 52px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: linear-gradient(135deg, var(--surface) 0%, color-mix(in srgb, var(--blue-soft) 72%, var(--surface)) 100%);
+      box-shadow: var(--shadow);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      width: 390px;
+      height: 390px;
+      right: -160px;
+      top: -230px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--blue) 13%, transparent);
+    }
+    .eyebrow {
+      position: relative;
+      z-index: 1;
+      margin: 0 0 8px;
+      color: var(--blue);
+      font-size: .77rem;
+      font-weight: 850;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 950px;
+      margin: 0;
+      font-size: clamp(2.2rem, 5.2vw, 4.35rem);
+      line-height: 1.03;
+      letter-spacing: -.05em;
+    }
+    .subtitle {
+      position: relative;
+      z-index: 1;
+      max-width: 900px;
+      margin: 20px 0 0;
+      color: var(--muted);
+      font-size: clamp(1rem, 2vw, 1.18rem);
+    }
+    .badges { position: relative; z-index: 1; display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .badge, .evidence {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-weight: 750;
+    }
+    .badge { padding: 6px 10px; background: var(--surface); color: var(--muted); font-size: .8rem; }
+    .badge.good, .evidence.test { border-color: color-mix(in srgb, var(--green) 45%, var(--line)); background: var(--green-soft); color: var(--green); }
+    .badge.info, .evidence.code { border-color: color-mix(in srgb, var(--blue) 45%, var(--line)); background: var(--blue-soft); color: var(--blue); }
+    .badge.warn, .evidence.session { border-color: color-mix(in srgb, var(--amber) 45%, var(--line)); background: var(--amber-soft); color: var(--amber); }
+    .evidence.inferred { border-color: color-mix(in srgb, var(--purple) 45%, var(--line)); background: var(--purple-soft); color: var(--purple); }
+    .evidence { padding: 3px 7px; font-size: .68rem; letter-spacing: .02em; vertical-align: middle; }
+    .toc {
+      position: sticky;
+      top: 10px;
+      z-index: 20;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin: 18px 0 28px;
+      padding: 11px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--surface) 91%, transparent);
+      box-shadow: 0 7px 24px rgba(26, 31, 38, .07);
+      backdrop-filter: blur(16px);
+    }
+    .toc a {
+      padding: 5px 8px;
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: .81rem;
+      font-weight: 720;
+      text-decoration: none;
+    }
+    .toc a:hover, .toc a:focus { background: var(--blue-soft); color: var(--blue); }
+    section {
+      margin-top: 24px;
+      padding: clamp(20px, 3vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    h2 { margin: 0 0 15px; font-size: clamp(1.5rem, 3vw, 2.2rem); letter-spacing: -.025em; }
+    h3 { margin: 26px 0 10px; font-size: 1.16rem; }
+    h4 { margin: 17px 0 7px; font-size: 1rem; }
+    p { margin: 9px 0; }
+    ul, ol { padding-left: 1.35rem; }
+    li + li { margin-top: .42rem; }
+    .lead { max-width: 940px; color: var(--muted); font-size: 1.03rem; }
+    .grid { display: grid; gap: 14px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-2);
+    }
+    .card h3, .card h4 { margin-top: 0; }
+    .card p:last-child, .card ul:last-child, .card ol:last-child { margin-bottom: 0; }
+    .label { color: var(--muted); font-size: .75rem; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .value { margin-top: 4px; font-size: 1.55rem; font-weight: 850; letter-spacing: -.03em; }
+    .callout {
+      margin: 15px 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--blue);
+      border-radius: 0 12px 12px 0;
+      background: var(--blue-soft);
+    }
+    .callout.good { border-left-color: var(--green); background: var(--green-soft); }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-soft); }
+    .callout.danger { border-left-color: var(--red); background: var(--red-soft); }
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+    .flow .node {
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface-2);
+    }
+    .flow .arrow { align-self: center; color: var(--blue); font-size: 1.45rem; font-weight: 900; }
+    .before-after {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 14px;
+    }
+    .before, .after { padding: 17px; border: 1px solid var(--line); border-radius: 14px; }
+    .before { background: var(--red-soft); }
+    .after { background: var(--green-soft); }
+    .before h3, .after h3 { margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: .91rem; }
+    th, td { padding: 10px 11px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: var(--surface-2); font-size: .77rem; letter-spacing: .04em; text-transform: uppercase; }
+    tr:nth-child(even) td { background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
+    .table-wrap { overflow-x: auto; }
+    .step {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      gap: 12px;
+      margin: 12px 0;
+      align-items: start;
+    }
+    .step-number {
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: var(--blue);
+      color: white;
+      font-weight: 850;
+    }
+    .step-body { padding: 2px 0 12px; border-bottom: 1px solid var(--line); }
+    .step-body h4 { margin: 0 0 4px; }
+    .checklist { list-style: none; padding: 0; }
+    .checklist li { position: relative; padding-left: 1.7rem; }
+    .checklist li::before { content: "□"; position: absolute; left: 0; color: var(--blue); font-weight: 900; }
+    .status-pass { color: var(--green); font-weight: 800; }
+    .status-open { color: var(--amber); font-weight: 800; }
+    .status-block { color: var(--red); font-weight: 800; }
+    .small { color: var(--muted); font-size: .88rem; }
+    .path { overflow-wrap: anywhere; }
+    footer { margin-top: 28px; color: var(--muted); font-size: .85rem; text-align: center; }
+    @media (max-width: 820px) {
+      .grid.two, .grid.three, .grid.four, .before-after { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .flow .arrow { transform: rotate(90deg); justify-self: center; }
+      .toc { position: static; }
+    }
+    @media print {
+      body { background: white; color: black; font-size: 11pt; }
+      .page { width: 100%; padding: 0; }
+      .hero, section { box-shadow: none; break-inside: avoid; }
+      .toc { display: none; }
+      a { color: black; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to report</a>
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Technical implementation report · 2026-08-08</p>
+      <h1>Quick model selection and quick handoff for Agent Mode</h1>
+      <p class="subtitle">
+        RepoPrompt CE now has two keyboard-first model search panels. One panel changes the model in the current session.
+        The other panel sends the last completed assistant reply to a new session.
+      </p>
+      <div class="badges">
+        <span class="badge good">Implementation complete</span>
+        <span class="badge good">Dual Oracle approved</span>
+        <span class="badge info">Focused tests passed</span>
+        <span class="badge warn">Manual macOS check is open</span>
+        <span class="badge warn">Approved fix is not staged</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Report sections">
+      <a href="#summary">Summary</a>
+      <a href="#expect">Expected effect</a>
+      <a href="#use">How to use</a>
+      <a href="#design">Design</a>
+      <a href="#changes">Change inventory</a>
+      <a href="#decisions">Major decisions</a>
+      <a href="#review">Review turns</a>
+      <a href="#validation">Validation</a>
+      <a href="#manual-test">Manual test</a>
+      <a href="#risks">Risks</a>
+      <a href="#actions">Your actions</a>
+      <a href="#evidence">Evidence</a>
+    </nav>
+
+    <main id="main">
+      <section id="summary">
+        <h2>Executive summary</h2>
+        <p class="lead">
+          The change removes several mouse steps from two common Agent Mode tasks. You can now search for a model,
+          choose an effort level, and confirm the choice with the keyboard. You can also start a handoff from the
+          last completed assistant reply with the same type of search panel.
+        </p>
+
+        <div class="grid four">
+          <div class="card">
+            <div class="label">Quick model picker</div>
+            <div class="value"><kbd>⌥⌘K</kbd></div>
+            <p>Change the model for the active Agent session.</p>
+          </div>
+          <div class="card">
+            <div class="label">Quick handoff</div>
+            <div class="value"><kbd>⇧⌥⌘K</kbd></div>
+            <p>Create a new session from the last completed reply.</p>
+          </div>
+          <div class="card">
+            <div class="label">Search work</div>
+            <div class="value">In memory</div>
+            <p>The panel does not start a process or load a remote catalog while you type.</p>
+          </div>
+          <div class="card">
+            <div class="label">Review state</div>
+            <div class="value">Approved</div>
+            <p>OracleB and OracleC approved the final Default-model correction.</p>
+          </div>
+        </div>
+
+        <div class="callout good">
+          <strong>Result:</strong> The implementation is complete in the working tree. The focused automated checks passed.
+          A visible app test and a live remote-host handoff were not done.
+          <span class="evidence session">Observed in session</span>
+        </div>
+
+        <div class="callout warn">
+          <strong>Git note:</strong> The main implementation has 27 staged paths. The final Oracle-approved correction is
+          still unstaged in three of those paths. Do not commit the staged index before you stage or intentionally reject
+          that correction.
+          <span class="evidence code">Observed in Git</span>
+        </div>
+      </section>
+
+      <section id="expect">
+        <h2>What you can expect</h2>
+        <div class="before-after">
+          <div class="before">
+            <h3>Before this change</h3>
+            <ul>
+              <li>You used the model menus in the input bar.</li>
+              <li>You used a small handoff button under a reply.</li>
+              <li>You moved through several menus to choose a provider, model, and effort.</li>
+              <li>You used the mouse for most of the flow.</li>
+            </ul>
+          </div>
+          <div class="after">
+            <h3>After this change</h3>
+            <ul>
+              <li>You open a focused search panel with one shortcut.</li>
+              <li>You type model, provider, effort, or raw identifier text.</li>
+              <li>You use the arrow keys and Enter to confirm.</li>
+              <li>The handoff panel uses the newest eligible completed assistant reply.</li>
+            </ul>
+          </div>
+        </div>
+
+        <h3>Main behavior</h3>
+        <div class="grid two">
+          <div class="card">
+            <h4>Fast model search</h4>
+            <p>
+              A query such as <code>Fable high</code> can find a Claude Fable model with High effort.
+              A query such as <code>Sol xhigh</code> can show the normal and Fast Sol choices.
+            </p>
+            <p>The normal choice stays before the Fast choice when their search score is equal.</p>
+          </div>
+          <div class="card">
+            <h4>Safe current-session changes</h4>
+            <p>
+              The quick model picker uses the same model-control rule as the input bar. It keeps the provider-family
+              lock and the knowledge-session policy.
+            </p>
+            <p>It checks the live session and model again before it saves the choice.</p>
+          </div>
+          <div class="card">
+            <h4>Safe handoff target</h4>
+            <p>
+              The quick handoff panel refuses an active reply. It skips failed and cancelled turns. It also requires
+              the exact remote host row when the source session is remote.
+            </p>
+          </div>
+          <div class="card">
+            <h4>Stable panel behavior</h4>
+            <p>
+              The search panel captures one catalog snapshot when it opens. Each key press only ranks that snapshot.
+              The panel and the Agent navigation panel cannot be open at the same time.
+            </p>
+          </div>
+        </div>
+
+        <h3>Keyboard rules</h3>
+        <ul>
+          <li><kbd>↑</kbd> and <kbd>↓</kbd> move the selection.</li>
+          <li><kbd>Enter</kbd> confirms the selected row.</li>
+          <li>The first <kbd>Esc</kbd> clears a non-empty query. The next <kbd>Esc</kbd> closes the panel.</li>
+          <li>Digits are search text. The panel does not use digits as result shortcuts.</li>
+          <li>An empty query selects only the exact current model row. If no current row exists, Enter does nothing.</li>
+        </ul>
+      </section>
+
+      <section id="use">
+        <h2>How to use the feature</h2>
+
+        <h3>Change the current model</h3>
+        <div class="step">
+          <div class="step-number">1</div>
+          <div class="step-body">
+            <h4>Open an Agent Mode session</h4>
+            <p>Use a session that has a configured provider and model catalog.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">2</div>
+          <div class="step-body">
+            <h4>Open Quick Model Picker</h4>
+            <p>Press <kbd>⌥⌘K</kbd>. The search field must have keyboard focus.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">3</div>
+          <div class="step-body">
+            <h4>Type a short query</h4>
+            <p>For example, type <code>Fable high</code>, <code>Sol xhigh</code>, or part of a raw model identifier.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">4</div>
+          <div class="step-body">
+            <h4>Choose a row</h4>
+            <p>Use <kbd>↑</kbd> or <kbd>↓</kbd>. A Fast model has a warning icon.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">5</div>
+          <div class="step-body">
+            <h4>Confirm the choice</h4>
+            <p>Press <kbd>Enter</kbd>. The model label in the composer must show the new model and effort.</p>
+          </div>
+        </div>
+
+        <h3>Start a quick handoff</h3>
+        <div class="step">
+          <div class="step-number">1</div>
+          <div class="step-body">
+            <h4>Wait for an assistant reply to complete</h4>
+            <p>Do not start this check while the reply is still active.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">2</div>
+          <div class="step-body">
+            <h4>Open Quick Handoff</h4>
+            <p>Press <kbd>⇧⌥⌘K</kbd>. The panel shows a short preview of the reply that it will use.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">3</div>
+          <div class="step-body">
+            <h4>Choose the destination</h4>
+            <p>Type the provider, model, and effort. A handoff can use a different provider family when policy allows it.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">4</div>
+          <div class="step-body">
+            <h4>Start the handoff</h4>
+            <p>Press <kbd>Enter</kbd>. The panel shows progress. Do not repeat the command while it is in progress.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-number">5</div>
+          <div class="step-body">
+            <h4>Verify the new session</h4>
+            <p>A new session must open. It must contain the transcript up to the selected completed reply.</p>
+          </div>
+        </div>
+
+        <div class="callout">
+          You can change both shortcuts in <strong>Settings → Keyboard Shortcuts → Agent &amp; layout</strong>.
+          <span class="evidence code">Observed in code</span>
+        </div>
+      </section>
+
+      <section id="design">
+        <h2>How the implementation works</h2>
+        <p class="lead">
+          HUD means “heads-up display.” In this report, HUD means the small search panel that appears above the Agent view.
+        </p>
+
+        <h3>Quick model flow</h3>
+        <div class="flow" aria-label="Quick model selection flow">
+          <div class="node">
+            <strong>1. Shortcut</strong>
+            <p>The global coordinator sends a window-scoped notification.</p>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <strong>2. Snapshot and rank</strong>
+            <p>The view model captures catalog data once. The pure index ranks rows in memory.</p>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <strong>3. Recheck and save</strong>
+            <p>The commit path checks the source tab, policy, controls, and live model before it changes state.</p>
+          </div>
+        </div>
+
+        <h3>Quick handoff flow</h3>
+        <div class="flow" aria-label="Quick handoff flow">
+          <div class="node">
+            <strong>1. Find a reply</strong>
+            <p>The resolver finds the newest eligible completed assistant activity.</p>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <strong>2. Choose a destination</strong>
+            <p>The same search index shows local or cached remote destination models.</p>
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <strong>3. Create the handoff</strong>
+            <p>The source tab stays pinned. The existing handoff service creates the destination session.</p>
+          </div>
+        </div>
+
+        <h3>Important implementation areas</h3>
+        <div class="grid three">
+          <div class="card">
+            <h4>Pure model index</h4>
+            <p class="path"><code>AgentModelSelectionIndex.swift</code></p>
+            <p>It converts current provider catalogs into searchable model-and-effort rows. It keeps provider raw identifiers.</p>
+          </div>
+          <div class="card">
+            <h4>Panel state and view</h4>
+            <p class="path"><code>AgentModelSelectionHUDViewModel.swift</code><br><code>AgentModelSelectionHUDView.swift</code></p>
+            <p>They own the query, selected row, keyboard input, progress state, errors, and accessible panel UI.</p>
+          </div>
+          <div class="card">
+            <h4>Presentation and commit</h4>
+            <p class="path"><code>AgentModeViewModel+ModelSelectionHUD.swift</code></p>
+            <p>It builds the snapshot and checks the live destination again before commit.</p>
+          </div>
+          <div class="card">
+            <h4>Shared session rules</h4>
+            <p class="path"><code>AgentModeViewModel+Handoff.swift</code></p>
+            <p>It owns current-model interactivity, source-pinned handoff setup, cached remote access, and final live checks.</p>
+          </div>
+          <div class="card">
+            <h4>Reply cutoff</h4>
+            <p class="path"><code>AgentTranscriptServices.swift</code></p>
+            <p>It rejects active, failed, cancelled, streaming, invalid, and unsynced reply targets.</p>
+          </div>
+          <div class="card">
+            <h4>Window host</h4>
+            <p class="path"><code>ContentRootShellView.swift</code></p>
+            <p>It keeps the two HUD types exclusive. It removes the model HUD when a blocking approval overlay appears.</p>
+          </div>
+        </div>
+
+        <div class="callout good">
+          <strong>Performance rule:</strong> Presentation can read the current in-memory catalog and transcript. Typing can only
+          do in-memory ranking. A remote cache miss does not start a remote load.
+          <span class="evidence code">Observed in code and durable contract</span>
+        </div>
+      </section>
+
+      <section id="changes">
+        <h2>Change inventory</h2>
+        <p>
+          The table groups related files. The counts describe the implementation state before this report file was created.
+          Two unrelated Oracle prompt exports are not part of this feature report.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Git state</th>
+                <th>Files or group</th>
+                <th>Role</th>
+                <th>Purpose</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Staged</td>
+                <td>19 files under <code>Sources/RepoPrompt/…</code></td>
+                <td>Swift source</td>
+                <td>Add the index, HUD state, HUD view, shortcut flow, hosting, handoff resolver, and shared commit services.</td>
+              </tr>
+              <tr>
+                <td>Staged</td>
+                <td>7 files under <code>Tests/RepoPromptTests/…</code></td>
+                <td>Swift tests</td>
+                <td>Cover ranking, lifecycle, cutoff selection, commit checks, remote data, handoff behavior, and shortcut catalog data.</td>
+              </tr>
+              <tr>
+                <td>Staged</td>
+                <td><code>Scripts/Fixtures/test-suite-contract-ledger.tsv</code></td>
+                <td>Test ledger</td>
+                <td>Add the new test methods to the curated XCTest inventory.</td>
+              </tr>
+              <tr>
+                <td>Unstaged correction</td>
+                <td><code>AgentModeViewModel+Handoff.swift</code></td>
+                <td>Swift source</td>
+                <td>Validate the Default model against the same full live catalog that supplies the HUD row.</td>
+              </tr>
+              <tr>
+                <td>Unstaged correction</td>
+                <td><code>AgentModeChatSwitchActivationTests.swift</code><br><code>AgentModelSelectionIndexTests.swift</code></td>
+                <td>Swift tests</td>
+                <td>Prove that Default is a valid current row and commit target when concrete Codex models also exist.</td>
+              </tr>
+              <tr>
+                <td>Modified, unstaged</td>
+                <td><code>AGENTS.md</code></td>
+                <td>Agent guidance</td>
+                <td>Route future quick model and handoff work to the owning durable context document.</td>
+              </tr>
+              <tr>
+                <td>Untracked</td>
+                <td><code>docs/context/quick-model-picker-and-handoff-hud.md</code></td>
+                <td>Durable documentation</td>
+                <td>Record the implemented contract, file ownership, safety rules, and focused validation routes.</td>
+              </tr>
+              <tr>
+                <td>Untracked</td>
+                <td><code>docs/context/plans/completed/quick-model-picker-and-handoff-hud.md</code></td>
+                <td>Completed plan</td>
+                <td>Archive the original plan with the outcome and final decision summary.</td>
+              </tr>
+              <tr>
+                <td>Untracked, excluded</td>
+                <td>2 files under <code>prompt-exports/</code></td>
+                <td>Working evidence</td>
+                <td>These files existed before this report task. The feature work did not modify them.</td>
+              </tr>
+              <tr>
+                <td>New, untracked</td>
+                <td><code>docs/technical_implementation_reports/2026-08-08-quick-model-picker-and-handoff-hud.html</code></td>
+                <td>Technical report</td>
+                <td>Provide this human-friendly implementation and test guide.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Measured Git state</h3>
+        <div class="grid three">
+          <div class="card">
+            <div class="label">Main staged change</div>
+            <div class="value">27 files</div>
+            <p><code>+4108 / -218</code> at evidence collection time.</p>
+          </div>
+          <div class="card">
+            <div class="label">Final correction</div>
+            <div class="value">3 files</div>
+            <p>The three paths are also in the staged set. Their newest changes remain unstaged.</p>
+          </div>
+          <div class="card">
+            <div class="label">Relevant distinct paths</div>
+            <div class="value">30</div>
+            <p>This count includes 27 staged paths, <code>AGENTS.md</code>, and two context documents. It excludes this report and two prompt exports.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="decisions">
+        <h2>Major technical decisions</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Decision</th>
+                <th>Reason</th>
+                <th>Effect</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Use one HUD with two modes.</td>
+                <td>The model picker and handoff picker need the same search and keyboard behavior.</td>
+                <td>The UI stays consistent. The commit action remains different for each mode.</td>
+              </tr>
+              <tr>
+                <td>Do not refactor the existing navigation HUD now.</td>
+                <td>The Oracles applied the rule of two. The new HUD first copies proven UI patterns. A later change can extract a shared form with evidence from both HUDs.</td>
+                <td>The feature avoids unrelated risk in the shipped navigation panel.</td>
+              </tr>
+              <tr>
+                <td>Build a pure model-leaf index.</td>
+                <td>Provider catalogs already own model names and effort rules. The index must not add a second model catalog.</td>
+                <td>New and future models can appear without hard-coded search rules.</td>
+              </tr>
+              <tr>
+                <td>Keep ranking snapshot-based.</td>
+                <td>The user asked for a fast panel. Network work and provider discovery would add variable delay.</td>
+                <td>Each key press only parses and ranks local strings.</td>
+              </tr>
+              <tr>
+                <td>Use one shared current-model commit seam.</td>
+                <td>The input bar and the HUD must use the same side-effect order and live checks.</td>
+                <td>The two model-control surfaces are less likely to drift.</td>
+              </tr>
+              <tr>
+                <td>Pin handoff work to the source tab.</td>
+                <td>An async handoff can run while the active tab changes.</td>
+                <td>The handoff cannot silently use a new active session after a tab switch.</td>
+              </tr>
+              <tr>
+                <td>Do not use digits as row shortcuts.</td>
+                <td>Model names and versions contain digits, such as <code>5.6</code>.</td>
+                <td>All digits remain valid query text.</td>
+              </tr>
+              <tr>
+                <td>Keep Default selectable.</td>
+                <td>The HUD can show Default as the exact current Codex row. The final fix makes commit validation use the same full live catalog.</td>
+                <td>Default does not become a dead row when concrete models also exist.</td>
+              </tr>
+              <tr>
+                <td>Do not cancel a handoff after commit starts.</td>
+                <td>The destination can already exist when cancellation arrives.</td>
+                <td>A blocking overlay hides the HUD without cancelling the handoff task.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="small">
+          <span class="evidence session">Observed in session</span>
+          The dual-Oracle planning rounds and implementation review produced these decisions.
+        </p>
+      </section>
+
+      <section id="review">
+        <h2>Major turns in the work</h2>
+
+        <div class="step">
+          <div class="step-number">1</div>
+          <div class="step-body">
+            <h4>The investigation found reusable parts</h4>
+            <p>
+              The code already had a keyboard HUD pattern, a string search matcher, provider catalogs, family locks,
+              and a handoff service. The plan reused these parts instead of making a new model system.
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">2</div>
+          <div class="step-body">
+            <h4>Two Oracles planned the feature independently</h4>
+            <p>
+              OracleB and OracleC received the same prompt. They challenged each other on the main design differences.
+              The final plan used a sibling HUD, a pure index, a shared commit seam, and a source-pinned handoff.
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">3</div>
+          <div class="step-body">
+            <h4>Scoped workers implemented the plan</h4>
+            <p>
+              The implementation was split into bounded work areas. A fresh review then checked the integrated result.
+              This followed the user request to use workers and keep the main agent in an orchestration role.
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">4</div>
+          <div class="step-body">
+            <h4>A fresh review found four correctness issues</h4>
+            <ul>
+              <li>Empty-query Enter could select an arbitrary model.</li>
+              <li>A parameterized Cursor selection could lose its exact raw identifier.</li>
+              <li>A failed or cancelled assistant turn could become a handoff target.</li>
+              <li>A blocking approval overlay did not always remove a committing HUD at once.</li>
+            </ul>
+            <p>The implementation corrected all four issues before the first validation summary.</p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">5</div>
+          <div class="step-body">
+            <h4>The dual-Oracle implementation review found one blocker</h4>
+            <p>
+              The Codex catalog could show a Default row. The HUD could select it, but commit validation removed that row
+              when concrete models existed. This made Default a dead row.
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">6</div>
+          <div class="step-body">
+            <h4>A scoped worker fixed the blocker</h4>
+            <p>
+              The worker kept Default selectable. It changed commit validation to use the full live catalog.
+              This was the smaller semantic fix because the HUD and handoff paths already treated Default as valid.
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="step-number">7</div>
+          <div class="step-body">
+            <h4>Both Oracles approved the final correction</h4>
+            <p>
+              OracleB returned <strong>APPROVE_WITH_NONBLOCKING_FOLLOWUPS</strong>.
+              OracleC returned <strong>APPROVE</strong>. Both agreed that the dead-row defect was resolved.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section id="validation">
+        <h2>Validation and test evidence</h2>
+        <p>
+          The implementation session ran focused checks for each changed boundary. The final Default correction then
+          ran the two directly affected suites and lint again.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Check</th>
+                <th>Command</th>
+                <th>Recorded result</th>
+                <th>Scope</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Model index</td>
+                <td><code>make dev-test FILTER=AgentModelSelectionIndexTests</code></td>
+                <td class="status-pass">Passed, 6 tests</td>
+                <td>Ranking, raw identifiers, efforts, Fast warnings, and Default behavior. Rerun after the final correction.</td>
+              </tr>
+              <tr>
+                <td>HUD state</td>
+                <td><code>make dev-test FILTER=AgentModelSelectionHUDViewModelTests</code></td>
+                <td class="status-pass">Passed, 6 tests</td>
+                <td>Selection and async lifecycle.</td>
+              </tr>
+              <tr>
+                <td>Last reply resolver</td>
+                <td><code>make dev-test FILTER=AgentLastCompletedAssistantReplyHandoffCutoffResolverTests</code></td>
+                <td class="status-pass">Passed, 5 tests</td>
+                <td>Eligible replies and remote row mapping.</td>
+              </tr>
+              <tr>
+                <td>View-model integration</td>
+                <td><code>make dev-test FILTER=AgentModeChatSwitchActivationTests</code></td>
+                <td class="status-pass">Passed, 16 tests</td>
+                <td>Commit checks, tab/host drift, presentation, and Default commit. Rerun after the final correction.</td>
+              </tr>
+              <tr>
+                <td>Handoff UI support</td>
+                <td><code>make dev-test FILTER=AgentHandoffUITests</code></td>
+                <td class="status-pass">Passed, 8 tests</td>
+                <td>Preference persistence and error formatting.</td>
+              </tr>
+              <tr>
+                <td>Remote catalog</td>
+                <td><code>make dev-test FILTER=RemoteWorkspaceSidebarTests</code></td>
+                <td class="status-pass">Passed, 47 tests</td>
+                <td>Cached remote catalog integration.</td>
+              </tr>
+              <tr>
+                <td>Shortcut catalog</td>
+                <td><code>make dev-test FILTER=KeyboardShortcutCatalogTests</code></td>
+                <td class="status-pass">Passed, 2 tests</td>
+                <td>Stable names, defaults, and Settings rows.</td>
+              </tr>
+              <tr>
+                <td>Swift lint</td>
+                <td><code>make dev-lint</code></td>
+                <td class="status-pass">Passed</td>
+                <td>Rerun after the final correction.</td>
+              </tr>
+              <tr>
+                <td>App product build</td>
+                <td><code>make dev-swift-build PRODUCT=RepoPrompt</code></td>
+                <td class="status-pass">Passed</td>
+                <td>Passed before the final three-file correction. The two rerun test suites compiled the corrected source.</td>
+              </tr>
+              <tr>
+                <td>Agent context structure</td>
+                <td><code>Scripts/check-agent-context</code></td>
+                <td class="status-pass">Passed</td>
+                <td>Context structure and routes.</td>
+              </tr>
+              <tr>
+                <td>Agent context tests</td>
+                <td><code>Scripts/test-check-agent-context</code></td>
+                <td class="status-pass">Passed, 23 checks</td>
+                <td>Agent-context verification.</td>
+              </tr>
+              <tr>
+                <td>Repository guardrails</td>
+                <td><code>make guardrails</code></td>
+                <td class="status-pass">Passed</td>
+                <td>Source and document layout.</td>
+              </tr>
+              <tr>
+                <td>Full root suite</td>
+                <td><code>make dev-test-parallel</code></td>
+                <td class="status-open">Not run</td>
+                <td>Focused evidence exists. Full contribution evidence is still open.</td>
+              </tr>
+              <tr>
+                <td>Visible macOS check</td>
+                <td>Run the CE debug app and use both shortcuts</td>
+                <td class="status-open">Not run</td>
+                <td>Requires a visible app launch.</td>
+              </tr>
+              <tr>
+                <td>Live remote handoff</td>
+                <td>Use a connected remote host</td>
+                <td class="status-open">Not run</td>
+                <td>Needs a real host and synced row mapping.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout warn">
+          A non-fatal missing bundled-gateway diagnostic appeared during focused tests. The test commands still passed.
+          The session did not identify this diagnostic as a defect in this feature.
+          <span class="evidence session">Observed in session</span>
+        </div>
+      </section>
+
+      <section id="manual-test">
+        <h2>Step-by-step manual test plan</h2>
+        <p class="lead">
+          Use the CE debug app. Do not use the production CLI for CE validation. A visible app launch needs approval
+          when an agent performs it. You can perform these steps directly.
+        </p>
+
+        <h3>A. Basic model selection</h3>
+        <ol>
+          <li>Open a real workspace and an Agent Mode session.</li>
+          <li>Press <kbd>⌥⌘K</kbd>.</li>
+          <li>Confirm that the search field has focus.</li>
+          <li>Confirm that the current model row has a <strong>Current</strong> mark.</li>
+          <li>Type <code>Fable high</code>.</li>
+          <li>Use <kbd>↓</kbd> if more than one row appears.</li>
+          <li>Press <kbd>Enter</kbd>.</li>
+          <li>Confirm that the model control in the composer shows the selected model and effort.</li>
+        </ol>
+        <p><strong>Pass result:</strong> The panel closes and the current session uses the selected valid model.</p>
+
+        <h3>B. Sol and Fast ranking</h3>
+        <ol>
+          <li>Open Quick Model Picker again.</li>
+          <li>Type <code>Sol xhigh</code>.</li>
+          <li>Confirm that the normal Sol row is before the Fast Sol row when both exist.</li>
+          <li>Move to the Fast row.</li>
+          <li>Confirm that the row has a Fast warning icon.</li>
+          <li>Press <kbd>Enter</kbd> and confirm the selected model label.</li>
+        </ol>
+        <p><strong>Pass result:</strong> The selected Fast variant and XHigh effort stay exact.</p>
+
+        <h3>C. Query and Escape behavior</h3>
+        <ol>
+          <li>Open the picker and type <code>5.6</code>.</li>
+          <li>Confirm that the digits remain in the query field.</li>
+          <li>Press <kbd>Esc</kbd> once.</li>
+          <li>Confirm that the query becomes empty and the panel stays open.</li>
+          <li>Press <kbd>Esc</kbd> again.</li>
+          <li>Confirm that the panel closes.</li>
+        </ol>
+
+        <h3>D. Provider-family lock</h3>
+        <ol>
+          <li>Use a session that has sent its first message and has a provider lock.</li>
+          <li>Open Quick Model Picker.</li>
+          <li>Search for a model from a provider family that the current chat cannot select.</li>
+          <li>Confirm that the disallowed family does not appear.</li>
+          <li>Confirm that valid models in the allowed family still appear.</li>
+        </ol>
+
+        <h3>E. Local quick handoff</h3>
+        <ol>
+          <li>Complete an assistant reply.</li>
+          <li>Press <kbd>⇧⌥⌘K</kbd>.</li>
+          <li>Confirm that the panel shows a preview of the last eligible reply.</li>
+          <li>Select a model in the same or a different allowed provider family.</li>
+          <li>Press <kbd>Enter</kbd> once.</li>
+          <li>Confirm that a progress state appears.</li>
+          <li>Confirm that a new session opens.</li>
+          <li>Confirm that the new session contains the transcript through the expected assistant reply.</li>
+        </ol>
+
+        <h3>F. Active reply refusal</h3>
+        <ol>
+          <li>Start a reply and keep it active.</li>
+          <li>Press <kbd>⇧⌥⌘K</kbd>.</li>
+          <li>Confirm that the panel says to wait for the current reply to finish.</li>
+          <li>Confirm that no destination session is created.</li>
+        </ol>
+
+        <h3>G. HUD and overlay behavior</h3>
+        <ol>
+          <li>Open the Agent navigation HUD with <kbd>⌘K</kbd>.</li>
+          <li>Open Quick Model Picker.</li>
+          <li>Confirm that only one HUD is visible.</li>
+          <li>If you can safely trigger an approval overlay, do so while the model HUD is open.</li>
+          <li>Confirm that the model HUD is removed at once.</li>
+        </ol>
+
+        <h3>H. Remote handoff</h3>
+        <ol>
+          <li>Connect a remote host and open a remote Agent session.</li>
+          <li>Wait for a completed reply to sync.</li>
+          <li>Press <kbd>⇧⌥⌘K</kbd>.</li>
+          <li>Confirm that only cached remote destination rows appear.</li>
+          <li>Select a destination and press <kbd>Enter</kbd>.</li>
+          <li>Confirm that the host creates the new handoff session.</li>
+          <li>Repeat before sync completes. Confirm that the panel refuses the handoff and does not use a local client row as a substitute.</li>
+        </ol>
+
+        <div class="callout">
+          <strong>Shortcut conflict check:</strong> If <kbd>⌥⌘K</kbd> or <kbd>⇧⌥⌘K</kbd> does not reach RepoPrompt on your macOS setup,
+          change the binding in Settings and repeat the test.
+        </div>
+      </section>
+
+      <section id="risks">
+        <h2>Risks, limits, and technical debt</h2>
+        <div class="grid two">
+          <div class="card">
+            <h4>Manual UI behavior is not verified</h4>
+            <p>
+              The automated tests do not prove macOS shortcut delivery, first focus, animation, or real mouse and keyboard behavior.
+            </p>
+            <p><span class="evidence session">Observed in session</span></p>
+          </div>
+          <div class="card">
+            <h4>Live remote handoff is not verified</h4>
+            <p>
+              The remote tests cover cached catalog and row-mapping logic. They do not prove a complete handoff with a real connected host.
+            </p>
+            <p><span class="evidence session">Observed in session</span></p>
+          </div>
+          <div class="card">
+            <h4>Remote session identity can be stronger</h4>
+            <p>
+              The current-model path checks tab, session object, and host. A future hardening change can also pin the exact remote session ID.
+            </p>
+            <p><span class="evidence session">Oracle non-blocking follow-up</span></p>
+          </div>
+          <div class="card">
+            <h4>Codex restore coverage can be stronger</h4>
+            <p>
+              A future test can cover a bare stored model raw when the live catalog has only encoded effort variants.
+            </p>
+            <p><span class="evidence session">Oracle non-blocking follow-up</span></p>
+          </div>
+          <div class="card">
+            <h4>Failure notice after overlay suspension</h4>
+            <p>
+              A future design can show a window-level error if a handoff fails after an approval overlay removes the HUD.
+            </p>
+            <p><span class="evidence session">Oracle non-blocking follow-up</span></p>
+          </div>
+          <div class="card">
+            <h4>Full root test evidence is open</h4>
+            <p>
+              The focused suites passed. The unfiltered root test lane did not run.
+            </p>
+            <p><span class="evidence test">Observed in tests</span></p>
+          </div>
+        </div>
+
+        <h3>Operational impact</h3>
+        <ul>
+          <li><strong>Dependencies:</strong> No dependency change was observed.</li>
+          <li><strong>Configuration:</strong> Two user-configurable keyboard shortcuts were added. No environment variable was added.</li>
+          <li><strong>Database or migration:</strong> None observed.</li>
+          <li><strong>External API:</strong> No external public API change was identified.</li>
+          <li><strong>Feature flag:</strong> None observed.</li>
+          <li><strong>Compatibility:</strong> Existing input-bar selection and reply-button handoff paths use shared services. The feature keeps those paths.</li>
+          <li><strong>Runtime:</strong> The app uses cached data for remote HUD presentation. It does not load a catalog on a cache miss.</li>
+        </ul>
+      </section>
+
+      <section id="actions">
+        <h2>Action items for you</h2>
+        <div class="callout danger">
+          <strong>Immediate action:</strong> Stage the Oracle-approved three-file correction before you commit the feature.
+          The paths are:
+          <ul>
+            <li><code>Sources/RepoPrompt/Features/AgentMode/ViewModels/AgentModeViewModel+Handoff.swift</code></li>
+            <li><code>Tests/RepoPromptTests/AgentMode/AgentModeChatSwitchActivationTests.swift</code></li>
+            <li><code>Tests/RepoPromptTests/AgentMode/ModelSelection/AgentModelSelectionIndexTests.swift</code></li>
+          </ul>
+        </div>
+
+        <h3>Before commit</h3>
+        <ul class="checklist">
+          <li>Review the unstaged Default-model correction.</li>
+          <li>Decide if <code>AGENTS.md</code> and the two context documents must be in the same contribution.</li>
+          <li>Do not stage the two files in <code>prompt-exports/</code> unless you intentionally want them in Git.</li>
+          <li>Run the contribution-check commit preflight after the final staging change.</li>
+          <li>For full PR evidence, run <code>make dev-test-parallel</code>.</li>
+        </ul>
+
+        <h3>Recommended user acceptance check</h3>
+        <ul class="checklist">
+          <li>Run test A through G on macOS.</li>
+          <li>Run test H if a remote host is available.</li>
+          <li>Check both default shortcuts for conflicts on your macOS setup.</li>
+          <li>Check first focus when the Agent composer had focus before the shortcut.</li>
+        </ul>
+
+        <h3>Future, non-blocking work</h3>
+        <ul>
+          <li>Pin the exact remote session ID for current-model changes.</li>
+          <li>Add the Codex cross-representation restore test.</li>
+          <li>Consider a window-level failure notice after HUD suspension.</li>
+          <li>Consider a shared HUD chrome abstraction only after both HUDs have stable use evidence.</li>
+        </ul>
+      </section>
+
+      <section id="evidence">
+        <h2>Evidence and limits</h2>
+        <div class="grid two">
+          <div class="card">
+            <h4>Evidence available</h4>
+            <ul>
+              <li>Full forked session transcript and user direction.</li>
+              <li>Current staged, unstaged, and untracked Git state.</li>
+              <li>Final source and test files.</li>
+              <li>Focused test, lint, build, context, and guardrail results.</li>
+              <li>Independent Oracle plans, duel results, review findings, and final approvals.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h4>Evidence limits</h4>
+            <ul>
+              <li>No reliable session-start Git commit was supplied.</li>
+              <li>The report uses the current working tree and the supplied session record.</li>
+              <li>No visible app run occurred in the recorded implementation session.</li>
+              <li>No live remote-host handoff occurred.</li>
+              <li>Session duration is unknown.</li>
+            </ul>
+          </div>
+        </div>
+
+        <h3>Evidence labels</h3>
+        <p>
+          <span class="evidence code">Observed in code or Git</span>
+          means the current files or diff show the fact.
+        </p>
+        <p>
+          <span class="evidence test">Observed in tests</span>
+          means recorded command output shows the result.
+        </p>
+        <p>
+          <span class="evidence session">Observed in session</span>
+          means the supplied session transcript records the event or decision.
+        </p>
+        <p>
+          <span class="evidence inferred">Inferred</span>
+          means the report draws a limited conclusion from file ownership or code structure.
+          This report does not use an inference as proof of a test result.
+        </p>
+
+        <h3>Metrics</h3>
+        <ul>
+          <li><strong>Main staged change:</strong> 27 files, <code>+4108 / -218</code>.</li>
+          <li><strong>Relevant implementation paths before this report:</strong> 30 distinct paths.</li>
+          <li><strong>Focused test cases recorded:</strong> 90 across the seven named suites.</li>
+          <li><strong>Components affected:</strong> Agent Mode model catalog, model selection, transcript cutoff, handoff, SwiftUI HUD hosting, shortcuts, Settings, tests, and agent context.</li>
+          <li><strong>Duration:</strong> Unknown.</li>
+        </ul>
+
+        <div class="callout good">
+          <strong>Final review state:</strong> OracleB approved with non-blocking follow-ups. OracleC approved.
+          No reviewed merge blocker remains in the final working-tree correction.
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      Generated from AI-agent coding session evidence on 2026-08-08.
+      This file is a report only. It does not change runtime behavior.
+    </footer>
+  </div>
+</body>
+</html>

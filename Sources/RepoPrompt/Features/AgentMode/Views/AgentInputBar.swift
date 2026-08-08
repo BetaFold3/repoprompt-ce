@@ -25,7 +25,8 @@ struct AgentComposerActions {
     let slashSkillSuggestions: (_ query: String) async -> [MentionSuggestion]
     let modelOptions: (_ agent: AgentProviderKind, _ includeClaudeEffortVariants: Bool) -> [AgentModelOption]
     let canSelectAgentInCurrentChat: (_ agent: AgentProviderKind) -> Bool
-    let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> Void
+    /// Returns a localized rejection message when the presentation snapshot is stale.
+    let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> String?
     let selectRemoteAgentModel: (_ rawModel: String) -> Void
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
@@ -151,8 +152,20 @@ struct AgentInputBar: View {
             },
             canSelectAgentInCurrentChat: { agent in agentModeVM.canSelectAgentInCurrentChat(agent) },
             selectAgentModel: { agent, rawModel in
-                agentModeVM.selectedAgent = agent
-                agentModeVM.selectModel(rawModel: rawModel)
+                guard let sourceTabID = currentTabID else {
+                    return AgentModelSelectionCommitError.sourceUnavailable.localizedDescription
+                }
+                do {
+                    try agentModeVM.commitCurrentSessionModelSelection(
+                        agent: agent,
+                        rawModel: rawModel,
+                        explicitCodexEffort: nil,
+                        sourceTabID: sourceTabID
+                    )
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
             },
             selectRemoteAgentModel: { rawModel in
                 agentModeVM.selectRemoteAgentModel(rawModel: rawModel)
@@ -1036,7 +1049,9 @@ struct AgentComposerView: View, Equatable {
                 selectedAgent: props.selectedAgent,
                 selectedModelRaw: props.selectedModelRaw
             ) { selectedAgent, model in
-                actions.selectAgentModel(selectedAgent, model.rawValue)
+                if let message = actions.selectAgentModel(selectedAgent, model.rawValue) {
+                    showSteeringUnsupportedNotice(message)
+                }
             }
         }
         guard agent == .openCode else {
@@ -1077,11 +1092,9 @@ struct AgentComposerView: View, Equatable {
             imageSystemName: AgentModelSelectionWarningVisuals.stableMenuImageSystemName(agent: agent, rawModel: model.rawValue),
             style: AgentModelSelectionWarningVisuals.stableMenuStyle(agent: agent, rawModel: model.rawValue)
         ) {
-            AgentModelCatalog.updateLastUsedEffortIfEncoded(
-                agentKind: agent,
-                rawModel: model.rawValue
-            )
-            actions.selectAgentModel(agent, model.rawValue)
+            if let message = actions.selectAgentModel(agent, model.rawValue) {
+                showSteeringUnsupportedNotice(message)
+            }
         }
     }
 
@@ -1337,7 +1350,10 @@ struct AgentComposerView: View, Equatable {
             return
         }
         cursorLastSelfCommittedRaw = selectionRaw
-        actions.selectAgentModel(.cursor, selectionRaw)
+        if let message = actions.selectAgentModel(.cursor, selectionRaw) {
+            cursorLastSelfCommittedRaw = nil
+            showSteeringUnsupportedNotice(message)
+        }
     }
 
     private func dismissCursorModelParametersPopover() {
