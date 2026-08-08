@@ -18,6 +18,7 @@ import textwrap
 import threading
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -26,9 +27,19 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import conductor  # noqa: E402
+import parallel_xctest_runner as parallel_runner  # noqa: E402
 
 
 class LifecycleTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        launchd_opt_out = mock.patch.dict(
+            os.environ,
+            {"REPOPROMPT_DEV_DAEMON_LAUNCHD": "0"},
+        )
+        launchd_opt_out.start()
+        self.addCleanup(launchd_opt_out.stop)
+
     def make_state(self) -> tuple[tempfile.TemporaryDirectory[str], conductor.DaemonState]:
         tmp = tempfile.TemporaryDirectory()
         root = Path(tmp.name)
@@ -77,7 +88,7 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 12)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 15)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -207,6 +218,25 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(launch_existing_lanes, ["liveApp"])
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
 
+    def test_build_fast_cli_explicitly_forwards_package_marker(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "build", ["--fast"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[2], {"fastPackage": True})
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+        fast_argv, fast_lanes, _cwd, _env, _timeout = registry.prepare(
+            {"operation": "build", "args": {"fastPackage": True}}
+        )
+        default_argv, _lanes, _cwd, _env, _timeout = registry.prepare(
+            {"operation": "build", "args": {}}
+        )
+        self.assertEqual(fast_argv[-2:], ["debug", "fast"])
+        self.assertEqual(default_argv[-1:], ["debug"])
+        self.assertEqual(fast_lanes, ["build", "debugArtifact"])
+
     def test_guardrails_delegates_aggregator_without_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
@@ -308,7 +338,7 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertNotIn("LOCAL_SELF_SIGNED_CERTIFICATE_NAME", env)
         self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
 
-    def test_ensure_daemon_starts_daemon_with_devnull_stdin(self) -> None:
+    def test_ensure_daemon_launchd_opt_out_uses_direct_spawn_with_devnull_stdin(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
         fake_proc = mock.Mock()
@@ -320,13 +350,20 @@ class LifecycleQueueTests(LifecycleTestCase):
             conductor,
             "request_daemon",
             side_effect=[down_before_start, down_before_spawn, {"protocolVersion": conductor.PROTOCOL_VERSION}],
-        ), mock.patch.object(conductor.subprocess, "Popen", return_value=fake_proc) as popen:
+        ), mock.patch.object(conductor, "run_launchctl") as launchctl, mock.patch.object(
+            conductor.subprocess, "Popen", return_value=fake_proc
+        ) as popen:
             payload = conductor.ensure_daemon(state.paths)
 
         self.assertEqual(payload["protocolVersion"], conductor.PROTOCOL_VERSION)
+        launchctl.assert_not_called()
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(popen.call_args.kwargs["stdout"].name, str(state.paths.daemon_log_path))
         self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
+        self.assertIn(
+            "possibly QoS-clamped context",
+            state.paths.daemon_log_path.read_text(encoding="utf-8"),
+        )
 
     def test_daemon_run_job_launches_process_with_devnull_stdin(self) -> None:
         tmp, state = self.make_state()
@@ -1204,6 +1241,275 @@ class ConductorTestContractTests(LifecycleTestCase):
         resource.write_text("resource version one\n", encoding="utf-8")
         return resource
 
+    def test_parallel_runner_uses_absolute_xcrun_and_explicit_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs_dir = root / "logs"
+            logs_dir.mkdir()
+            suite = parallel_runner.SuiteWork(
+                name="FirstModule.ExampleTests",
+                methods=("testExample",),
+                expected_count=1,
+                weight=1.0,
+                ledger_runtime_s=1.0,
+                deadline_s=10.0,
+                serial_tags=(),
+                exclusive=False,
+            )
+            process = mock.Mock()
+            process.communicate.return_value = (
+                "Executed 1 test, with 0 failures in 0.001 seconds\n",
+                None,
+            )
+            process.returncode = 0
+            poisoned = {
+                "PATH": "/poisoned/bin",
+                "GH_TOKEN": "gh-secret",
+                "GITHUB_TOKEN": "github-secret",
+                "SOURCE_TOKEN": "source-secret",
+                "DYLD_INSERT_LIBRARIES": "/tmp/poison.dylib",
+                "REPOPROMPT_CONDUCTOR_JOB_TICKET": "ticket-secret",
+                "UNRELATED_METADATA": "metadata",
+                "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+                "RPCE_RUN_SCALE_TESTS": "1",
+            }
+
+            with mock.patch.dict(os.environ, poisoned, clear=True), mock.patch.object(
+                parallel_runner.subprocess, "Popen", return_value=process
+            ) as popen:
+                attempt = parallel_runner.run_attempt(
+                    suite,
+                    attempt_number=1,
+                    worker="w1",
+                    tmpdir=root / "tmp",
+                    bundle=root / "Tests.xctest",
+                    logs_dir=logs_dir,
+                    registry=parallel_runner.ProcessRegistry(),
+                )
+
+            self.assertEqual(attempt.status, "PASS")
+            command = popen.call_args.args[0]
+            environment = popen.call_args.kwargs["env"]
+            self.assertEqual(command[0], "/usr/bin/xcrun")
+            self.assertEqual(environment["PATH"], parallel_runner.RUNTIME_PATH)
+            self.assertEqual(environment["TMPDIR"], str(root / "tmp"))
+            self.assertEqual(
+                environment["DEVELOPER_DIR"],
+                "/Applications/Xcode.app/Contents/Developer",
+            )
+            self.assertEqual(environment["RPCE_RUN_SCALE_TESTS"], "1")
+            self.assertEqual(
+                set(environment),
+                {
+                    "PATH",
+                    "TMPDIR",
+                    "DEVELOPER_DIR",
+                    "RPCE_RUN_SCALE_TESTS",
+                },
+            )
+
+    def test_parallel_runner_census_includes_multiple_modules_and_rejects_bad_test_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            test_list = Path(tmp) / "tests.txt"
+            test_list.write_text(
+                "[1/1] Planning build\n"
+                "FirstModule.FirstSuite/testOne\n"
+                "SecondModule.SecondSuite/testTwo\n",
+                encoding="utf-8",
+            )
+
+            expected = parallel_runner.parse_test_list(test_list)
+            work = parallel_runner.build_work_list(
+                expected,
+                {},
+                {},
+                parallel_runner.CROSS_PROCESS_UNSAFE_TAGS,
+                None,
+                (),
+            )
+
+            self.assertEqual(
+                {suite.name: suite.methods for suite in work},
+                {
+                    "FirstModule.FirstSuite": ("testOne",),
+                    "SecondModule.SecondSuite": ("testTwo",),
+                },
+            )
+
+            test_list.write_text(
+                "FirstModule.FirstSuite/testOne\n"
+                "SecondModule.Bad-Suite/testTwo\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                parallel_runner.RunnerError, "unrecognized test identifier"
+            ):
+                parallel_runner.parse_test_list(test_list)
+
+    def test_parallel_runner_signals_reap_fake_xcrun_process_group(self) -> None:
+        fake_source = """\
+#!/usr/bin/env python3
+import json
+import signal
+import subprocess
+import sys
+from pathlib import Path
+
+ready = Path(sys.argv[-1])
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(600)"]
+)
+
+def stop(signum, _frame):
+    try:
+        child.terminate()
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait(timeout=2)
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGTERM, stop)
+ready.write_text(
+    json.dumps({"worker": __import__("os").getpid(), "child": child.pid}),
+    encoding="utf-8",
+)
+child.wait()
+"""
+        harness_source = """\
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[4])
+import parallel_xctest_runner as runner
+
+runner.XCRUN_PATH = Path(sys.argv[1])
+suite = runner.SuiteWork(
+    name="FakeModule.FakeSuite",
+    methods=("testLongRunning",),
+    expected_count=1,
+    weight=1.0,
+    ledger_runtime_s=1.0,
+    deadline_s=30.0,
+    serial_tags=(),
+    exclusive=False,
+)
+raise SystemExit(
+    runner.run_suites(
+        [suite],
+        workers=1,
+        bundle=Path(sys.argv[2]),
+        workdir=Path(sys.argv[3]),
+        retry_failed=False,
+    )
+)
+"""
+
+        def pid_exists(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            return True
+
+        for cancellation_signal in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=signal.Signals(cancellation_signal).name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    fake_xcrun = root / "fake-xcrun"
+                    fake_xcrun.write_text(
+                        fake_source.replace(
+                            "#!/usr/bin/env python3",
+                            f"#!{sys.executable}",
+                            1,
+                        ),
+                        encoding="utf-8",
+                    )
+                    fake_xcrun.chmod(0o755)
+                    ready = root / "ready.json"
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            harness_source,
+                            str(fake_xcrun),
+                            str(ready),
+                            str(root / "work"),
+                            str(SCRIPT_DIR),
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    deadline = time.monotonic() + 5.0
+                    payload = None
+                    while time.monotonic() < deadline:
+                        try:
+                            payload = json.loads(ready.read_text(encoding="utf-8"))
+                            break
+                        except (FileNotFoundError, json.JSONDecodeError):
+                            time.sleep(0.01)
+                    if payload is None:
+                        process.kill()
+                        output, _ = process.communicate(timeout=5)
+                        self.fail(f"fake xcrun did not become ready:\n{output}")
+
+                    process.send_signal(cancellation_signal)
+                    output, _ = process.communicate(timeout=8)
+                    self.assertNotEqual(process.returncode, 0, output)
+
+                    for name in ("worker", "child"):
+                        pid = int(payload[name])
+                        reap_deadline = time.monotonic() + 3.0
+                        while pid_exists(pid) and time.monotonic() < reap_deadline:
+                            time.sleep(0.01)
+                        self.assertFalse(
+                            pid_exists(pid),
+                            f"{name} pid {pid} survived cancellation:\n{output}",
+                        )
+
+    def write_parallel_candidate(
+        self,
+        state: conductor.DaemonState,
+        job: conductor.Job,
+        run_id: str,
+        toolchain: dict[str, str],
+        filter_value: str | None = None,
+    ) -> tuple[Path, dict]:
+        snapshot = conductor.source_snapshot(state.paths.repo_root)
+        self.assertIsNotNone(snapshot)
+        artifact_path = conductor.discover_root_test_artifact(
+            state.paths.repo_root, toolchain["arch"]
+        )
+        self.assertIsNotNone(artifact_path)
+        candidate_path = (
+            state.paths.jobs_dir
+            / f"parallel-xctest-{run_id}-candidate.json"
+        )
+        candidate = {
+            "schema_version": conductor.PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION,
+            "kind": conductor.PARALLEL_TEST_CANDIDATE_KIND,
+            "run_id": run_id,
+            "ticket_id": job.ticket,
+            "filter": filter_value,
+            "evidence_scope": conductor.parallel_test_evidence_scope(filter_value),
+            "source_snapshot": snapshot,
+            "env_gates": conductor.artifact_env_gates(os.environ),
+            "worker_runtime_gates": conductor.parallel_xctest_runtime_gates(os.environ),
+            "toolchain": toolchain,
+            "artifact_path": str((artifact_path or Path()).resolve()),
+            "artifact_fingerprint": conductor.test_artifact_fingerprint(
+                artifact_path or Path()
+            ),
+            "build_duration_seconds": 1.25,
+            "runner_started_at": conductor.now(),
+        }
+        conductor.write_build_ticket(candidate_path, candidate)
+        return candidate_path, candidate
+
     def test_source_snapshot_hashes_untracked_file_contents(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -1735,7 +2041,11 @@ class ConductorTestContractTests(LifecycleTestCase):
 
         def launch_fake_swift(argv: object, *args: object, **kwargs: object) -> subprocess.Popen[bytes]:
             command = list(argv) if isinstance(argv, (list, tuple)) else argv
-            if isinstance(command, list) and command and command[0] == "swift":
+            if (
+                isinstance(command, list)
+                and command
+                and Path(command[0]).name in {"swift", "canonical_swift.sh"}
+            ):
                 command = [sys.executable, str(swift), *command[1:]]
             return real_popen(command, *args, **kwargs)
 
@@ -1777,6 +2087,435 @@ class ConductorTestContractTests(LifecycleTestCase):
         self.assertEqual(job.exit_code, 65)
         self.assertIn("build ticket is missing", job.error or "")
         self.assertNotIn("daemon runner error", job.result_summary or "")
+
+    def test_parallel_internal_operation_builds_before_runner_without_prior_ticket(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        executable = self.create_test_artifact(state.paths.repo_root)
+        artifact_path = executable.parents[2]
+        run_id = str(uuid.uuid4())
+        args = {
+            "workers": 2,
+            "parallelRunId": run_id,
+            "parallelCandidate": str(
+                state.paths.jobs_dir / f"parallel-xctest-{run_id}-candidate.json"
+            ),
+            "parallelTestList": str(
+                state.paths.jobs_dir / f"parallel-xctest-{run_id}-test-list.txt"
+            ),
+            "parallelWorkdir": str(
+                state.paths.jobs_dir / f"parallel-xctest-{run_id}"
+            ),
+        }
+        snapshot = {
+            "head": "head",
+            "porcelain_sha256": "porcelain",
+            "dirty_file_sha256": {},
+        }
+        toolchain = {
+            "swift_version": "Swift test",
+            "arch": "testarch",
+            "config": "debug",
+        }
+        completed = mock.Mock(returncode=0)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"REPOPROMPT_CONDUCTOR_JOB_TICKET": "parallel-ticket"},
+                clear=False,
+            ),
+            mock.patch.object(
+                conductor, "source_snapshot", side_effect=[snapshot, snapshot]
+            ),
+            mock.patch.object(
+                conductor, "artifact_toolchain_snapshot", return_value=toolchain
+            ),
+            mock.patch.object(
+                conductor.subprocess, "run", side_effect=[completed, completed]
+            ) as run,
+        ):
+            code = conductor.operation_parallel_root_test(
+                state.paths.repo_root, args
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [
+                str(state.paths.repo_root / "Scripts" / "canonical_swift.sh"),
+                "build",
+                "--build-tests",
+            ],
+        )
+        runner_argv = run.call_args_list[1].args[0]
+        self.assertEqual(
+            runner_argv[:3],
+            [
+                sys.executable,
+                "-u",
+                str(
+                    state.paths.repo_root
+                    / "Scripts"
+                    / "parallel_xctest_runner.py"
+                ),
+            ],
+        )
+        self.assertEqual(
+            runner_argv[runner_argv.index("--bundle") + 1],
+            str(artifact_path.resolve()),
+        )
+        candidate = json.loads(
+            Path(args["parallelCandidate"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(candidate["run_id"], run_id)
+        self.assertEqual(candidate["ticket_id"], "parallel-ticket")
+        self.assertEqual(candidate["evidence_scope"], "full-root")
+        self.assertEqual(candidate["source_snapshot"], snapshot)
+        self.assertEqual(
+            candidate["worker_runtime_gates"],
+            conductor.parallel_xctest_runtime_gates(os.environ),
+        )
+        self.assertEqual(candidate["toolchain"], toolchain)
+        self.assertEqual(candidate["artifact_path"], str(artifact_path.resolve()))
+        self.assertGreaterEqual(candidate["build_duration_seconds"], 0)
+        self.assertGreater(candidate["runner_started_at"], 0)
+
+    def test_parallel_internal_operation_fails_67_on_build_source_drift(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        run_id = str(uuid.uuid4())
+        args = {
+            "parallelRunId": run_id,
+            "parallelCandidate": str(
+                state.paths.jobs_dir / f"parallel-xctest-{run_id}-candidate.json"
+            ),
+            "parallelTestList": str(
+                state.paths.jobs_dir / f"parallel-xctest-{run_id}-test-list.txt"
+            ),
+            "parallelWorkdir": str(
+                state.paths.jobs_dir / f"parallel-xctest-{run_id}"
+            ),
+        }
+        snapshot_s0 = {
+            "head": "head",
+            "porcelain_sha256": "before",
+            "dirty_file_sha256": {},
+        }
+        snapshot_s1 = {
+            "head": "head",
+            "porcelain_sha256": "after",
+            "dirty_file_sha256": {},
+        }
+        completed = mock.Mock(returncode=0)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"REPOPROMPT_CONDUCTOR_JOB_TICKET": "parallel-ticket"},
+                clear=False,
+            ),
+            mock.patch.object(
+                conductor,
+                "source_snapshot",
+                side_effect=[snapshot_s0, snapshot_s1],
+            ),
+            mock.patch.object(
+                conductor.subprocess, "run", return_value=completed
+            ) as run,
+        ):
+            code = conductor.operation_parallel_root_test(
+                state.paths.repo_root, args
+            )
+
+        self.assertEqual(
+            code, conductor.XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+        )
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse(Path(args["parallelCandidate"]).exists())
+
+    def test_parallel_missing_candidate_fails_67_and_invalidates_old_ticket(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        run_id = str(uuid.uuid4())
+        ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+        ticket_path.write_text('{"ticket_id":"old"}\n', encoding="utf-8")
+        job = self.make_job(
+            state,
+            "parallel-missing-candidate",
+            "test-parallel",
+            {
+                "workers": 2,
+                "parallelRunId": run_id,
+                "parallelCandidate": str(
+                    state.paths.jobs_dir
+                    / f"parallel-xctest-{run_id}-candidate.json"
+                ),
+            },
+            ["build"],
+            job_state="running",
+        )
+        state.jobs[job.ticket] = job
+        command = [sys.executable, "-c", "raise SystemExit(0)"]
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(
+                    command,
+                    ["build"],
+                    state.paths.repo_root,
+                    os.environ.copy(),
+                    5.0,
+                ),
+            ),
+            mock.patch.object(
+                conductor, "operation_requires_global_heavy_slot", return_value=False
+            ),
+            mock.patch.object(
+                conductor, "operation_requires_global_xctest_slot", return_value=False
+            ),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(job.state, "failed")
+        self.assertEqual(
+            job.exit_code, conductor.XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+        )
+        self.assertIn("candidate is missing or unreadable", job.error or "")
+        self.assertFalse(ticket_path.exists())
+
+    def test_parallel_green_full_and_filtered_runs_create_provenance_tickets(self) -> None:
+        for filter_value, expected_scope in [
+            (None, "full-root"),
+            ("RepoPromptTests.AlphaTests", "filtered"),
+        ]:
+            with self.subTest(scope=expected_scope):
+                tmp, state = self.make_state()
+                self.addCleanup(tmp.cleanup)
+                self.initialize_git_repo(state.paths.repo_root)
+                self.create_test_artifact(state.paths.repo_root)
+                toolchain = {
+                    "swift_version": "Swift test",
+                    "arch": "testarch",
+                    "config": "debug",
+                }
+                run_id = str(uuid.uuid4())
+                args: dict[str, object] = {
+                    "workers": 2,
+                    "parallelRunId": run_id,
+                }
+                if filter_value is not None:
+                    args["filter"] = filter_value
+                job = self.make_job(
+                    state,
+                    f"parallel-{expected_scope}",
+                    "test-parallel",
+                    args,
+                    ["build"],
+                    job_state="running",
+                )
+                candidate_path, candidate = self.write_parallel_candidate(
+                    state, job, run_id, toolchain, filter_value
+                )
+                job.args["parallelCandidate"] = str(candidate_path)
+                state.jobs[job.ticket] = job
+                ticket_path = state.paths.jobs_dir / "build-ticket-root.json"
+                ticket_path.write_text(
+                    '{"ticket_id":"old"}\n', encoding="utf-8"
+                )
+                command = [sys.executable, "-c", "raise SystemExit(0)"]
+
+                with (
+                    mock.patch.object(
+                        state.registry,
+                        "prepare",
+                        return_value=(
+                            command,
+                            ["build"],
+                            state.paths.repo_root,
+                            os.environ.copy(),
+                            5.0,
+                        ),
+                    ),
+                    mock.patch.object(
+                        conductor,
+                        "operation_requires_global_heavy_slot",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        conductor,
+                        "operation_requires_global_xctest_slot",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        conductor,
+                        "artifact_toolchain_snapshot",
+                        return_value=toolchain,
+                    ),
+                ):
+                    state._run_job(job.ticket)
+
+                self.assertEqual(job.state, "completed", job.result_summary)
+                self.assertEqual(job.build_phase_seconds, 1.25)
+                self.assertIsNotNone(job.run_phase_seconds)
+                ticket = json.loads(ticket_path.read_text(encoding="utf-8"))
+                self.assertEqual(ticket["ticket_id"], job.ticket)
+                self.assertEqual(
+                    ticket["artifact_fingerprint"],
+                    candidate["artifact_fingerprint"],
+                )
+                self.assertEqual(
+                    ticket["provenance"]["claim"],
+                    "artifact-provenance-only",
+                )
+                self.assertEqual(
+                    ticket["provenance"]["completion"], expected_scope
+                )
+                if expected_scope == "full-root":
+                    self.assertIn(
+                        "full-root source validation", job.result_summary or ""
+                    )
+                else:
+                    self.assertIn(
+                        "not full-root contribution evidence",
+                        job.result_summary or "",
+                    )
+
+    def test_parallel_bad_candidate_fails_67(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        self.initialize_git_repo(state.paths.repo_root)
+        self.create_test_artifact(state.paths.repo_root)
+        toolchain = {
+            "swift_version": "Swift test",
+            "arch": "testarch",
+            "config": "debug",
+        }
+        run_id = str(uuid.uuid4())
+        job = self.make_job(
+            state,
+            "parallel-bad-candidate",
+            "test-parallel",
+            {"parallelRunId": run_id},
+            ["build"],
+            job_state="running",
+        )
+        candidate_path, candidate = self.write_parallel_candidate(
+            state, job, run_id, toolchain
+        )
+        candidate["unexpected"] = True
+        conductor.write_build_ticket(candidate_path, candidate)
+        job.args["parallelCandidate"] = str(candidate_path)
+        state.jobs[job.ticket] = job
+        command = [sys.executable, "-c", "raise SystemExit(0)"]
+
+        with (
+            mock.patch.object(
+                state.registry,
+                "prepare",
+                return_value=(
+                    command,
+                    ["build"],
+                    state.paths.repo_root,
+                    os.environ.copy(),
+                    5.0,
+                ),
+            ),
+            mock.patch.object(
+                conductor, "operation_requires_global_heavy_slot", return_value=False
+            ),
+            mock.patch.object(
+                conductor, "operation_requires_global_xctest_slot", return_value=False
+            ),
+        ):
+            state._run_job(job.ticket)
+
+        self.assertEqual(
+            job.exit_code, conductor.XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+        )
+        self.assertIn("schema mismatch", job.error or "")
+
+    def test_parallel_post_run_source_artifact_and_worker_gate_drift_fail_67(self) -> None:
+        for drift in ("source", "artifact", "worker-gate"):
+            with self.subTest(drift=drift):
+                tmp, state = self.make_state()
+                self.addCleanup(tmp.cleanup)
+                source = self.initialize_git_repo(state.paths.repo_root)
+                executable = self.create_test_artifact(state.paths.repo_root)
+                toolchain = {
+                    "swift_version": "Swift test",
+                    "arch": "testarch",
+                    "config": "debug",
+                }
+                run_id = str(uuid.uuid4())
+                job = self.make_job(
+                    state,
+                    f"parallel-{drift}-drift",
+                    "test-parallel",
+                    {"parallelRunId": run_id},
+                    ["build"],
+                    job_state="running",
+                )
+                candidate_path, candidate = self.write_parallel_candidate(
+                    state, job, run_id, toolchain
+                )
+                job.args["parallelCandidate"] = str(candidate_path)
+                state.jobs[job.ticket] = job
+                job_env = os.environ.copy()
+                if drift == "source":
+                    source.write_text("let value = 2\n", encoding="utf-8")
+                elif drift == "artifact":
+                    executable.write_bytes(b"mutated executable")
+                else:
+                    prior_gate = candidate["worker_runtime_gates"]["RPCE_RUN_SCALE_TESTS"]
+                    job_env["RPCE_RUN_SCALE_TESTS"] = (
+                        "post-run-drift" if prior_gate != "post-run-drift" else "other-drift"
+                    )
+                command = [sys.executable, "-c", "raise SystemExit(0)"]
+
+                with (
+                    mock.patch.object(
+                        state.registry,
+                        "prepare",
+                        return_value=(
+                            command,
+                            ["build"],
+                            state.paths.repo_root,
+                            job_env,
+                            5.0,
+                        ),
+                    ),
+                    mock.patch.object(
+                        conductor,
+                        "operation_requires_global_heavy_slot",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        conductor,
+                        "operation_requires_global_xctest_slot",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        conductor,
+                        "artifact_toolchain_snapshot",
+                        return_value=toolchain,
+                    ),
+                ):
+                    state._run_job(job.ticket)
+
+                self.assertEqual(job.state, "failed")
+                self.assertEqual(
+                    job.exit_code,
+                    conductor.XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE,
+                )
+                self.assertIn(
+                    "source/artifact integrity check failed", job.error or ""
+                )
+                self.assertFalse(
+                    (state.paths.jobs_dir / "build-ticket-root.json").exists()
+                )
 
     def test_zero_tests_postcondition_fails_filtered_success(self) -> None:
         tmp, state = self.make_state()
@@ -2761,10 +3500,121 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
 
         self.assertEqual(
             root_argv,
-            ["swift", "test", "--test-product", "RepoPromptWorkspaceTests", "--filter", "WorkspaceTests"],
+            [
+                str(state.paths.repo_root / "Scripts" / "canonical_swift.sh"),
+                "test",
+                "--test-product",
+                "RepoPromptWorkspaceTests",
+                "--filter",
+                "WorkspaceTests",
+            ],
         )
         self.assertEqual(root_lanes, ["build"])
         self.assertEqual(root_cwd, state.paths.repo_root)
+
+    def test_parallel_test_cli_and_registry_construct_source_validating_job(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with (
+            mock.patch.object(conductor, "preflight_test_filter") as preflight,
+            mock.patch.object(
+                conductor, "enqueue_and_maybe_wait", return_value=0
+            ) as enqueue,
+            mock.patch.object(
+                conductor,
+                "evaluate_test_artifact",
+                side_effect=AssertionError("parallel lane must not require a ticket"),
+            ),
+        ):
+            code = conductor.handle_real_operation(
+                state.paths,
+                "test-parallel",
+                ["--workers", "3", "--filter", "RepoPromptTests.AlphaTests"],
+            )
+
+        self.assertEqual(code, 0)
+        preflight.assert_called_once_with(
+            state.paths.repo_root,
+            "test-parallel",
+            "RepoPromptTests.AlphaTests",
+        )
+        cli_args = enqueue.call_args.args[2]
+        self.assertEqual(
+            cli_args,
+            {
+                "workers": 3,
+                "filter": "RepoPromptTests.AlphaTests",
+            },
+        )
+
+        registry_args = dict(cli_args)
+        argv, lanes, cwd, _env, timeout = state.registry.prepare(
+            {"operation": "test-parallel", "args": registry_args}
+        )
+
+        self.assertEqual(
+            argv[:4],
+            [
+                sys.executable,
+                "-u",
+                str(Path(conductor.__file__).resolve()),
+                "__operation_runner",
+            ],
+        )
+        payload = json.loads(argv[4])
+        self.assertEqual(payload["kind"], "parallel_root_test")
+        internal_args = payload["args"]
+        self.assertEqual(internal_args["workers"], 3)
+        self.assertEqual(
+            internal_args["filter"], "RepoPromptTests.AlphaTests"
+        )
+        run_id = internal_args["parallelRunId"]
+        self.assertEqual(
+            Path(internal_args["parallelCandidate"]).name,
+            f"parallel-xctest-{run_id}-candidate.json",
+        )
+        self.assertEqual(
+            Path(internal_args["parallelTestList"]).parent,
+            state.paths.jobs_dir,
+        )
+        self.assertEqual(
+            Path(internal_args["parallelWorkdir"]).parent,
+            state.paths.jobs_dir,
+        )
+        other_args: dict[str, object] = {"workers": 3}
+        state.registry.prepare(
+            {"operation": "test-parallel", "args": other_args}
+        )
+        self.assertNotEqual(
+            other_args["parallelRunId"], internal_args["parallelRunId"]
+        )
+        self.assertEqual(lanes, ["build"])
+        self.assertEqual(cwd, state.paths.repo_root)
+        self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
+        self.assertTrue(
+            conductor.operation_invalidates_root_build_ticket(
+                "test-parallel", registry_args
+            )
+        )
+        self.assertTrue(
+            conductor.operation_requires_global_heavy_slot(
+                "test-parallel", registry_args
+            )
+        )
+        self.assertTrue(
+            conductor.operation_requires_global_xctest_slot(
+                "test-parallel", registry_args
+            )
+        )
+        watchdog_job = self.make_job(
+            state,
+            "parallel-watchdog",
+            "test-parallel",
+            registry_args,
+            ["build"],
+            job_state="running",
+        )
+        self.assertFalse(state._xctest_watchdog_enabled(watchdog_job))
 
     def test_test_list_cli_preserves_build_lane_and_package_roots(self) -> None:
         tmp, state = self.make_state()
@@ -2786,16 +3636,17 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             {"operation": "core-test", "args": {"list": True}}
         )
 
-        self.assertEqual(root_argv, ["swift", "test", "list"])
+        canonical_swift = str(state.paths.repo_root / "Scripts" / "canonical_swift.sh")
+        self.assertEqual(root_argv, [canonical_swift, "test", "list"])
         self.assertEqual(root_lanes, ["build"])
         self.assertEqual(root_cwd, state.paths.repo_root)
-        self.assertEqual(provider_argv, ["swift", "test", "list"])
+        self.assertEqual(provider_argv, [canonical_swift, "test", "list"])
         self.assertEqual(provider_lanes, ["build"])
         self.assertEqual(
             provider_cwd,
             state.paths.repo_root / "Packages" / "RepoPromptAgentProviders",
         )
-        self.assertEqual(core_argv, ["swift", "test", "list"])
+        self.assertEqual(core_argv, [canonical_swift, "test", "list"])
         self.assertEqual(core_lanes, ["build"])
         self.assertEqual(core_cwd, state.paths.repo_root / "Packages" / "RepoPromptCore")
 
@@ -2865,6 +3716,44 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(env["RPCE_RUN_CODEMAP_E2E"], "1")
         self.assertEqual(env["RPCE_RUN_SCALE_TESTS"], "1")
         self.assertNotIn("RPCE_UNRELATED_TEST_GATE", env)
+
+    def test_launchd_plist_keeps_request_gates_out_of_daemon_environment(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "RPCE_RUN_SCALE_TESTS": "1",
+                "GITHUB_TOKEN": "secret",
+            },
+            clear=False,
+        ):
+            plist_path = conductor.write_daemon_launchd_plist(
+                state.paths, state.paths.repo_root / "Scripts" / "conductor.py"
+            )
+            snapshot = conductor.OperationRegistry.client_env_snapshot()
+
+        payload = conductor.plistlib.loads(plist_path.read_bytes())
+        self.assertEqual(
+            payload["EnvironmentVariables"],
+            {
+                "REPOPROMPT_DEV_DAEMON_STATE_DIR": str(state.paths.state_dir),
+                "REPOPROMPT_DEV_DAEMON_SOCKET": str(state.paths.socket_path),
+            },
+        )
+        self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
+        self.assertNotIn("GITHUB_TOKEN", snapshot)
+
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+        _argv, _lanes, _cwd, job_env, _timeout = registry.prepare(
+            {
+                "operation": "test-parallel",
+                "args": {"workers": 2},
+                "env": snapshot,
+            }
+        )
+        self.assertEqual(job_env["RPCE_RUN_SCALE_TESTS"], "1")
+        self.assertNotIn("GITHUB_TOKEN", job_env)
 
     def test_test_cli_forwards_watchdog_options_and_requires_threshold(self) -> None:
         tmp, state = self.make_state()

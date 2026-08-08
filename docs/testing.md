@@ -15,7 +15,7 @@ Search existing direct and outcome-level coverage first. Prefer a test that fail
 
 ## Add a root or provider XCTest
 
-- **Root target:** place app-integrated and root-package tests under `Tests/RepoPromptTests` and validate with `make dev-test`.
+- **Root target:** place app-integrated and root-package tests under `Tests/RepoPromptTests`; use focused `make dev-test FILTER=<Suite>` during iteration and unfiltered `make dev-test-parallel` for full-root contribution evidence.
 - **Provider target:** place provider protocol, codec, translation, launch-argument, or model-mapping tests under `Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests` and validate with `make dev-provider-test`.
 - Keep one coherent contract per method. Labeled tables are appropriate when cases differ only by input, boundary, or expected outcome.
 - Control time, randomness, environment, resources, ordering, and concurrency. Prefer gates, clocks, or continuations over sleeps, and verify meaningful cleanup or ownership.
@@ -41,7 +41,7 @@ make dev-test-impacted RANGE=origin/main...HEAD
 
 This calls `Scripts/test_suite_optimizer.py impacted` with the curated ledger, obtains changed files from `git diff --name-only`, prints exact selected XCTest IDs with reasons, includes a small smoke-floor suite set, reports heavy/opt-in tests skipped by `execution_tier`, and then invokes conductor with an exact XCTest filter. The selector is conservative: broad build/tooling/package/ledger boundaries report `full_root_required=true` instead of pretending a narrow subset is sufficient. Set `INCLUDE_HEAVY=1` only when intentionally running selected `codemap_e2e`, `scale`, `diagnostic`, `live_smoke`, or `release` rows and after setting any required environment gate.
 
-Full root `make dev-test` remains the explicit PR-ready/full local lane, nightly/merge/release lane, or fallback for broad changes. Do not use a green impacted run as evidence that broad package, build graph, conductor, ledger-schema, or generated-workspace changes are fully validated.
+Unfiltered `make dev-test-parallel` is the explicit PR-ready/full-root local lane. Any `FILTER` is labeled filtered and is never full-root evidence. Serial `make dev-test` remains the supported focused iteration path and fallback for environments where the parallel lane is unavailable. Do not use a green impacted or filtered run as evidence that broad package, build graph, conductor, ledger-schema, or generated-workspace changes are fully validated.
 
 For planning the remaining full root lane, generate runtime-balanced shards from ledger timing metadata:
 

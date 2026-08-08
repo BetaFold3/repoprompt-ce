@@ -18,7 +18,7 @@ GUARDRAILS_TARGET = "guardrails"
 CONDUCTOR_SELFTEST_TARGET = "conductor-selftest"
 CI_APP_TEST_RUNNER_SELFTEST_TARGET = "ci-app-test-runner-selftest"
 SWIFT_LINT_TARGET = "dev-lint"
-ROOT_TEST_TARGET = "dev-test"
+ROOT_TEST_TARGET = "dev-test-parallel FILTER="
 PROVIDER_TEST_TARGET = "dev-provider-test"
 CORE_TEST_TARGET = "dev-core-test"
 REPOPROMPT_BUILD_TARGET = "dev-swift-build PRODUCT=RepoPrompt"
@@ -59,6 +59,7 @@ class ContributionPreflightTests(unittest.TestCase):
         self.run_git(repo, "init", "-b", "main")
         self.run_git(repo, "config", "user.name", "Preflight Tests")
         self.run_git(repo, "config", "user.email", "preflight-tests@example.invalid")
+        self.run_git(repo, "config", "commit.gpgsign", "false")
 
         preflight = repo / ".agents/skills/rpce-contribution-check/scripts/preflight.sh"
         preflight.parent.mkdir(parents=True)
@@ -155,6 +156,21 @@ class ContributionPreflightTests(unittest.TestCase):
                 ],
             )
             self.assertIn("PR-ready preflight passed", result.stdout)
+
+    def test_pr_ready_clears_exported_filter_for_full_root_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, preflight, env = self.create_repo(
+                Path(tmp), outgoing_path="Sources/RepoPrompt/Example.swift"
+            )
+            env["FILTER"] = "OnlyThisSuite"
+
+            result = self.run_preflight(repo, preflight, env, "pr-ready")
+
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            root_invocations = [
+                line for line in self.make_lines(env) if line.startswith("dev-test-parallel")
+            ]
+            self.assertEqual(root_invocations, ["dev-test-parallel FILTER="])
 
     def test_pr_ready_runs_conductor_selftest_for_preflight_control_plane_changes(self) -> None:
         cases = [

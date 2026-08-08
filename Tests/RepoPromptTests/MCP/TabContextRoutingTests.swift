@@ -2620,7 +2620,9 @@ final class TabContextRoutingTests: XCTestCase {
                         XCTAssertEqual(metadata.explicitWindowRoutingHint, hint)
                         return try await windowB.mcpServer.executeAgentRunForTesting(args: [
                             "op": .string("start"),
-                            "message": .string("start in window b")
+                            "message": .string("start in window b"),
+                            // The stubbed dispatch never produces an interesting state, so bound the non-detached wait.
+                            "timeout": .int(1)
                         ])
                     }
                 }

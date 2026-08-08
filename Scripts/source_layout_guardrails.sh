@@ -415,6 +415,7 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-08-05-cursor-parameterized-model-picker.html"
   "docs/technical_implementation_reports/2026-08-05-oracle-duel-hardening-transcript-qol.html"
   "docs/technical_implementation_reports/2026-08-06-claude-cli-executable-path-override.html"
+  "docs/technical_implementation_reports/2026-08-08-build-test-performance-optimization.html"
 )
 while IFS= read -r path; do
   allowed_tracked_docs+=("$path")

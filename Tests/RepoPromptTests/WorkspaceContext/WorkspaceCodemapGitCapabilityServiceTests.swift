@@ -404,6 +404,29 @@ final class WorkspaceCodemapGitCapabilityServiceTests: XCTestCase {
         guard case .transientUnavailable(.repositoryChanging, _) = await parentService.resolve(
             root: request(for: parentRoot, seed: 27)
         ) else { return XCTFail("Parent symlink swap after descriptor open must fail closed.") }
+
+        let churnRoot = try fixture.makeRepository(named: "intermediate-churn")
+        let churn = AuthorityEvidenceIntermediateAncestorChurn(
+            ancestor: fixture.sandbox
+        )
+        let churnService = WorkspaceCodemapGitCapabilityService(
+            namespaceSalt: namespaceSalt,
+            hooks: WorkspaceCodemapGitCapabilityServiceHooks(
+                afterAuthorityEvidenceComponentStat: { component, isLeaf in
+                    churn.mutateIfTarget(component: component, isLeaf: isLeaf)
+                }
+            )
+        )
+
+        let resolved = try await capability(
+            churnService.resolve(root: request(for: churnRoot, seed: 28))
+        )
+
+        XCTAssertEqual(
+            resolved.repositoryLayout.workTreeRoot,
+            churnRoot.standardizedFileURL
+        )
+        XCTAssertTrue(churn.didMutate())
     }
 
     func testLinkedWorktreeCommonAndPerWorktreeAuthorityChanges() async throws {
@@ -1036,6 +1059,37 @@ private final class AuthorityEvidenceParentSymlinkSwap: @unchecked Sendable {
             at: targetDirectory,
             withDestinationURL: outsideDirectory
         )
+    }
+}
+
+private final class AuthorityEvidenceIntermediateAncestorChurn: @unchecked Sendable {
+    private let lock = NSLock()
+    private let ancestor: URL
+    private let targetComponent: String
+    private var mutationSucceeded = false
+
+    init(ancestor: URL) {
+        self.ancestor = ancestor.standardizedFileURL
+        targetComponent = ancestor.lastPathComponent
+    }
+
+    func mutateIfTarget(component: String, isLeaf: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !mutationSucceeded, !isLeaf, component == targetComponent else { return }
+        let marker = ancestor.appendingPathComponent("authority-evidence-sibling-churn")
+        do {
+            try "churn\n".write(to: marker, atomically: false, encoding: .utf8)
+            mutationSucceeded = true
+        } catch {
+            return
+        }
+    }
+
+    func didMutate() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return mutationSucceeded
     }
 }
 

@@ -2,6 +2,7 @@
 set -euo pipefail
 
 CONF="${1:-debug}"
+FAST_PACKAGE_MARKER="${2:-}"
 ROOT_DIR="${REPOPROMPT_RELEASE_SOURCE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CONTROL_PLANE_SCRIPTS_DIR="${REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR:-$ROOT_DIR/Scripts}"
 RUN_WITHOUT_GITHUB_TOKENS="$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh"
@@ -81,6 +82,15 @@ finish(){
 }
 trap 'finish $?' EXIT
 
+case "$FAST_PACKAGE_MARKER" in
+    "") FAST_PACKAGE_REQUESTED=0 ;;
+    fast) FAST_PACKAGE_REQUESTED=1 ;;
+    *) fail "Unknown package mode '$FAST_PACKAGE_MARKER'. Expected 'fast' or no package mode." ;;
+esac
+if (( $# > 2 )); then
+    fail "Too many arguments. Usage: $0 [debug|release] [fast]"
+fi
+
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
 RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"
 # Invalidate public-release manifests before metadata parsing, checks, or builds
@@ -99,6 +109,15 @@ SENTRY_SYMBOLS_DIR="$ROOT_DIR/.build/sentry-symbols/$CONF"
 
 IS_RELEASE=0
 [[ "$CONF" == "release" ]] && IS_RELEASE=1
+FAST_PACKAGE_ACTIVE=0
+if (( FAST_PACKAGE_REQUESTED )); then
+    if (( IS_RELEASE )); then
+        echo "WARNING: Fast packaging is debug-only; ignoring the 'fast' marker for release packaging."
+    else
+        FAST_PACKAGE_ACTIVE=1
+        echo "*** FAST DEBUG PACKAGING REQUESTED: all signing remains enabled; verification skips require an exact match to the last fully verified package. ***"
+    fi
+fi
 if (( IS_RELEASE )); then
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-$BASE_BUNDLE_ID}"
     URL_SCHEME="repoprompt-ce"
@@ -236,17 +255,17 @@ else
     run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
 
     phase "Building $APP_NAME ($CONF, host-native)"
-    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
+    run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
 
     phase "Building repoprompt-mcp ($CONF, host-native)"
-    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
+    run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
 
     phase "Building repoprompt-gateway ($CONF, host-native)"
-    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-gateway
+    run "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-gateway
 
     phase "Resolving build artifact paths"
-    echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path
-    BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path)"
+    echo_cmd "$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build -c "$CONF" --show-bin-path
+    BUILD_DIR="$("$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build -c "$CONF" --show-bin-path)"
 fi
 if (( PUBLIC_UNIVERSAL_RELEASE )); then
     APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
@@ -400,6 +419,31 @@ PY
         "$APP_BUNDLE/Contents/Resources/RepoPromptDebugProvenance.json"
 fi
 
+FAST_PACKAGE_CACHE="$ROOT_DIR/.build/debug/fast-package-verified.sha256"
+FAST_PACKAGE_LAYOUT_VALIDATOR_NAME="validate_embedded_mcp_helper_layout.sh"
+FAST_PACKAGE_FINGERPRINT=""
+FAST_PACKAGE_CAN_SKIP_VERIFICATION=0
+if (( ! IS_RELEASE )); then
+    FAST_PACKAGE_FINGERPRINT="$(
+        python3 "$CONTROL_PLANE_SCRIPTS_DIR/fast_package_fingerprint.py" \
+            --bundle "$APP_BUNDLE" \
+            --sign-identity "$SIGN_IDENTITY" \
+            --signing-mode "$SIGNING_MODE_MARKER" \
+            --script "$CONTROL_PLANE_SCRIPTS_DIR/fast_package_fingerprint.py" \
+            --script "$CONTROL_PLANE_SCRIPTS_DIR/package_app.sh" \
+            --script "$CONTROL_PLANE_SCRIPTS_DIR/run_without_github_tokens.sh" \
+            --script "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" \
+            --script "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
+            --script "$CONTROL_PLANE_SCRIPTS_DIR/$FAST_PACKAGE_LAYOUT_VALIDATOR_NAME"
+    )"
+    if (( FAST_PACKAGE_ACTIVE )) && [[ -f "$FAST_PACKAGE_CACHE" ]] && [[ "$(cat "$FAST_PACKAGE_CACHE")" == "$FAST_PACKAGE_FINGERPRINT" ]]; then
+        FAST_PACKAGE_CAN_SKIP_VERIFICATION=1
+        echo "*** FAST DEBUG PACKAGING ACTIVE: skipping deep codesign verification, redundant post-sign architecture validation, and the embedded MCP-helper smoke; all signing and identity/layout checks remain enabled. ***"
+    elif (( FAST_PACKAGE_ACTIVE )); then
+        echo "WARNING: Fast-package inputs do not match the last fully verified package; running all verification and refreshing the baseline."
+    fi
+fi
+
 phase "Signing app bundle"
 sign_path(){
     local path="$1"
@@ -484,9 +528,17 @@ if (( ${#APP_SIGN_ARGS[@]} )); then
 else
     sign_path "$APP_BUNDLE"
 fi
-run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then
+    echo "FAST PACKAGE SKIP: codesign --verify --deep --strict (matching fully verified package fingerprint)."
+else
+    run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+fi
 verify_signed_app_identity
-run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Post-sign packaged app"
+if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then
+    echo "FAST PACKAGE SKIP: post-sign architecture validation (the same bundle passed pre-sign validation; signing does not change Mach-O slices)."
+else
+    run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Post-sign packaged app"
+fi
 if (( PUBLIC_UNIVERSAL_RELEASE )); then
     run "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" write \
         --app "$APP_BUNDLE" \
@@ -494,7 +546,17 @@ if (( PUBLIC_UNIVERSAL_RELEASE )); then
         --expected-architectures "$ARCHITECTURE_POLICY"
 fi
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Packaged app MCP helper layout"
-run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
+if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then
+    echo "FAST PACKAGE SKIP: embedded MCP-helper smoke (helper bytes match the fully verified package fingerprint)."
+else
+    run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
+    if (( ! IS_RELEASE )); then
+        mkdir -p "$(dirname "$FAST_PACKAGE_CACHE")"
+        FAST_PACKAGE_CACHE_TEMP="$FAST_PACKAGE_CACHE.tmp.$$"
+        printf '%s\n' "$FAST_PACKAGE_FINGERPRINT" > "$FAST_PACKAGE_CACHE_TEMP"
+        mv -f "$FAST_PACKAGE_CACHE_TEMP" "$FAST_PACKAGE_CACHE"
+    fi
+fi
 if truthy "${REPOPROMPT_UPLOAD_SENTRY_SYMBOLS:-}"; then
     sentry_linking_enabled || fail "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS requires REPOPROMPT_ENABLE_SENTRY=1."
     require_sentry_upload_credentials

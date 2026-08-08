@@ -2,7 +2,7 @@
 
 Scope: read when the task touches validation selection, tests, builds, style checks, smoke checks, release checks, or contribution evidence.
 Authority: Authoritative
-Last-verified: 2026-08-01
+Last-verified: 2026-08-08
 
 ## Select evidence by changed boundary
 
@@ -14,6 +14,7 @@ Run the smallest coordinated check that can fail for the behavior you changed. D
 | Repository/source layout or durable docs | Run `make guardrails`. |
 | Swift behavior (iteration and focused validation) | Run `make dev-lint` and `make dev-test FILTER=<SuiteName>`; run `make dev-format` first only when formatting mutation is intended. |
 | Swift behavior (instant re-run of an unchanged build) | Run `make dev-test-artifact FILTER=<SuiteName>`; its result is artifact-scoped and is never validation evidence for source edited after the recorded build ticket. |
+| Full root contribution evidence | Run unfiltered `make dev-test-parallel`; it builds tests from a stable source snapshot, runs the parallel root bundle, and fails closed on post-run source/toolchain/artifact drift. The acceptance gate passed on 2026-08-07 (10/10 greens, p90 about 194s). Any `FILTER` is filtered evidence only; serial `make dev-test` remains the supported fallback. |
 | Root app product | Run `make dev-swift-build PRODUCT=RepoPrompt`. |
 | MCP/shared protocol product | Run `make dev-swift-build PRODUCT=repoprompt-mcp`. |
 | Provider package | Run `make dev-provider-test`; use `FILTER=<SuiteName>` for focused iteration. |
@@ -32,9 +33,10 @@ Coordinated test jobs enforce fail-fast and containment guarantees; treat these 
 - **Exit 64** — the `FILTER` matched no curated-ledger entry and no source suite; the job never built. Fix the filter, or set `RPCE_ALLOW_UNKNOWN_FILTER=1` only for a genuinely new suite, then add its surgical ledger rows.
 - **Exit 66** — the run succeeded but executed zero tests (stale ledger entry, regex mismatch, or config-gated suite). `RPCE_ALLOW_ZERO_TESTS=1` suppresses this only for intentionally gated runs.
 - **Exit 70** — an XCTest phase deadline fired (startup, active-method, or between-method); this is hang containment with diagnostics, not a test failure. The active-method budget is ledger-derived (`max(90s, 4×runtime+30s)`; 180s when the method has no ledger runtime); `--xctest-stall-seconds` overrides only that active-method budget, and the startup and between-method bounds are fixed, so disable all deadlines with `REPOPROMPT_DEV_XCTEST_DEADLINES=0` only when a legitimately long startup or inter-case gap is expected.
-- **Exit 65** — `dev-test-artifact` found missing, unreadable, or changed ticket/artifact state (no ticket, no bundle, or a bundle that no longer matches the ticket's fingerprint); run `make dev-test` first.
+- **Exit 65** — `dev-test-artifact` found missing, unreadable, or changed ticket/artifact state (no ticket, no bundle, or a bundle that no longer matches the ticket's fingerprint); run a successful root serial or parallel test first.
+- **Exit 67** — `dev-test-parallel` could not prove stable source/artifact provenance: a source snapshot, candidate manifest, environment/toolchain check, artifact path, or artifact fingerprint was missing, invalid, or changed. The old root ticket remains invalidated.
 
-`make dev-test-artifact` re-runs the already-built test bundle in seconds. Every result carries an `artifact_scope`: `current` means the working tree matches the recorded build ticket; `stale` means it does not, and the summary states that current source was NOT validated. A stale-scoped pass never satisfies pre-commit or contribution evidence. A ticket is recorded only by a successful root `dev-test` whose source snapshot is available and stable across the run; a ticket from a filtered run attests tree↔ticket match only, never full-suite coverage.
+`make dev-test-artifact` retains artifact-only semantics and re-runs the already-built test bundle in seconds. Every result carries an `artifact_scope`: `current` means the working tree matches the recorded build ticket; `stale` means it does not, and the summary states that current source was NOT validated. A stale-scoped pass never satisfies contribution evidence. Successful stable root serial and parallel runs record compatible tickets that attest source/environment/toolchain↔artifact provenance only, never full-suite coverage. For contribution evidence, only an unfiltered green `make dev-test-parallel` is the full-root lane; a filtered parallel or serial result remains focused evidence.
 
 `make dev-test-impacted` fails when a changed production path has no domain mapping; pass `--allow-unmapped` (via the optimizer CLI) only when the loud smoke-floor degradation is an accepted, explicit choice.
 

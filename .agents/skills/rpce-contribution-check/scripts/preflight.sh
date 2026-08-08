@@ -147,8 +147,8 @@ run_pr_ready_path_validations() {
     make dev-lint
   fi
   if (( has_root_test_changes )); then
-    log "Run coordinated root tests"
-    make dev-test
+    log "Run unfiltered coordinated parallel root tests"
+    make dev-test-parallel FILTER=
   fi
   if (( has_provider_package_changes )); then
     log "Run coordinated provider tests"

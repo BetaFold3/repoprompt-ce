@@ -2,17 +2,23 @@
 
 Scope: read when the task touches local setup, builds, tests, packaging, the debug app, MCP CLI, or developer-daemon coordination.
 Authority: Authoritative
-Last-verified: 2026-08-01
+Last-verified: 2026-08-08
 
 ## Choose the coordinated path
 
 Follow the [pinned coordination invariants](../../../AGENTS.md#invariants-pinned--apply-always), then use the `make dev-*` targets shown by [`make help`](../../../Makefile). The conductor daemon auto-starts, serializes jobs that share lanes, admits Swift/Xcode-heavy work through machine-wide slots, and protects the singleton debug app with a machine-wide live-app lock.
 
-Heavy admission defaults to one job; change `REPOPROMPT_DEV_HEAVY_SLOTS=N` only when concurrent heavy work is intentional. Run-only artifact test jobs use a separate machine-wide `xctest` slot (`REPOPROMPT_DEV_XCTEST_SLOTS`, default 1) instead of the heavy slot; a job that holds its lanes while waiting for a machine-wide slot reports `waiting-heavy-slot` or `waiting-xctest-slot` for its slot class.
+Heavy admission defaults to one job; change `REPOPROMPT_DEV_HEAVY_SLOTS=N` only when concurrent heavy work is intentional. Run-only `dev-test-artifact` jobs use a separate machine-wide `xctest` slot (`REPOPROMPT_DEV_XCTEST_SLOTS`, default 1) instead of the heavy slot. Source-validating `dev-test-parallel` holds the local `build` lane plus both machine-wide heavy and XCTest slots across its build and runner phases. A job that holds its local lanes while waiting for a machine-wide slot reports `waiting-heavy-slot` or `waiting-xctest-slot` for its slot class.
 
-Coordinated test jobs default to bounded execution: a filter must resolve against the curated ledger or a source suite before any build starts (exit 64 otherwise), a filtered run that executes zero tests fails (exit 66), XCTest phase deadlines contain hangs (exit 70; startup 90s after `Build complete!`, active-method budget `max(90s, 4×ledger runtime+30s)` — 180s for methods without ledger runtime — between-method 60s), and filtered jobs time out at 20 minutes. After every successful root test job the daemon records a build ticket (source snapshot, env gates, toolchain); `make dev-test-artifact FILTER=<SuiteName>` re-runs the recorded bundle in seconds via `swift test --skip-build`, reporting `artifact_scope: current` or a prominent stale label. See the [validation workflow](validation.md#fast-test-loop-semantics) for the exit-code contract and evidence rules.
+Coordinated test jobs default to bounded execution: a filter must resolve against the curated ledger or a source suite before any build starts (exit 64 otherwise), a filtered serial run that executes zero tests fails (exit 66), source/artifact integrity failures in the parallel lane fail closed (exit 67), and serial XCTest phase deadlines contain hangs (exit 70; startup 90s after `Build complete!`, active-method budget `max(90s, 4×ledger runtime+30s)` — 180s for methods without ledger runtime — between-method 60s). The parallel runner applies its own ledger-derived per-suite deadlines. Successful root serial and parallel jobs record a compatible artifact-provenance ticket; `make dev-test-artifact FILTER=<SuiteName>` re-runs that recorded bundle in seconds via `swift test --skip-build`, reporting `artifact_scope: current` or a prominent stale label. See the [validation workflow](validation.md#fast-test-loop-semantics) for the exit-code contract and evidence rules.
 
-Direct swift invocations deliberately do not receive per-job environment values such as the conductor job ticket: SwiftPM keys its manifest and build-plan caches on the child environment, and a unique per-job value forces a full re-plan on every coordinated swift job.
+All coordinated and packaging SwiftPM invocations construct one byte-identical minimal environment through `Scripts/canonical_swift.sh`. Per-job values such as the conductor job ticket are excluded because SwiftPM keys its manifest-evaluation and build-plan caches on the exact child environment. The daemon runs as a launchd Interactive agent so coordinated jobs are not QoS-clamped; `REPOPROMPT_DEV_DAEMON_LAUNCHD=0` forces the legacy direct spawn.
+
+### Parallel source-validating root tests
+
+`make dev-test-parallel` is the promoted full-root contribution lane (`WORKERS=8` by default; `FILTER=<suite-regex>` is optional). It needs no prior ticket: the conductor invalidates any old root ticket, snapshots source, runs `Scripts/canonical_swift.sh build --build-tests`, rejects source drift, fingerprints the discovered root XCTest artifact, and then runs the direct-`xctest` worker pool. After the runner exits it rechecks source, environment gates, toolchain, artifact path, and artifact fingerprint before atomically recording a compatible artifact-provenance ticket. Per-job workdirs, test censuses, and strict candidate manifests live under the conductor jobs directory.
+
+An unfiltered green run is full-root contribution evidence. Any `FILTER` is prominently labeled filtered and never satisfies full-root PR-ready evidence. The acceptance gate passed on 2026-08-07 with 10/10 consecutive green 8-worker runs (p50 about 166s, p90 about 194s, versus about 798s serial); the residual crash-retry tail sits in gateway/remote-session suites and is auto-retried by the runner. Serial `make dev-test` remains supported as the focused iteration path and fallback.
 
 Daemon lanes coordinate submitted jobs, not source edits. Don't edit inputs during a build; wait for the build or edit activity to settle, then retry failures caused by concurrent modification. Mutating format jobs also claim the `build` lane; non-mutating format-check and lint use `style`, while format-tools status is unlaned.
 
@@ -35,7 +41,9 @@ Debug signing and secure-storage behavior are documented in the [local-build REA
 
 The generated Xcode workspace is disposable. Follow the [Xcode workspace workflow](../../architecture/xcode-workspace.md); don't edit or commit `.build/xcode`.
 
-A debug package is written to `.build/debug/RepoPrompt.app`; architecture-specific SwiftPM products are normally under `.build/<architecture>-apple-macosx/debug/`. If the daemon is unavailable and direct packaging fails or hangs, capture traced output with `VERBOSE=1 ./Scripts/package_app.sh debug 2>&1 | tee /tmp/repoprompt-build.log`.
+A debug package is written to `.build/debug/RepoPrompt.app`; architecture-specific SwiftPM products are normally under `.build/<architecture>-apple-macosx/debug/`. `make dev-build FAST=1` explicitly opts into fast debug packaging; when package inputs match the last fully verified build it keeps all signing and identity/layout checks but skips redundant deep signature verification, post-sign architecture validation, and the embedded-helper smoke. The default remains fully verified, and release packaging ignores fast mode.
+
+If the daemon is unavailable and direct packaging fails or hangs, capture traced output with `VERBOSE=1 ./Scripts/package_app.sh debug 2>&1 | tee /tmp/repoprompt-build.log`.
 
 ## Use the CE debug CLI
 

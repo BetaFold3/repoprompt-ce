@@ -21,6 +21,7 @@ import hashlib
 import json
 import math
 import os
+import plistlib
 import re
 import signal
 import shutil
@@ -38,7 +39,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 15
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -65,6 +66,18 @@ XCTEST_STALL_DIAGNOSTIC_MAX_PROCESSES = 64
 XCTEST_STALL_SAMPLE_MAX_BYTES = 128 * 1024
 XCTEST_STALL_FAILURE_EXIT_CODE = 70
 XCTEST_ZERO_TESTS_FAILURE_EXIT_CODE = 66
+XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE = 67
+PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION = 2
+PARALLEL_TEST_CANDIDATE_KIND = "repoprompt-root-parallel-test-candidate"
+PARALLEL_XCTEST_RUNTIME_GATE_KEYS = (
+    "DEVELOPER_DIR",
+    "REPOPROMPT_ENABLE_SENTRY",
+    "RPCE_ENABLE_BENCHMARK_TESTS",
+    "RPCE_RUN_CODEMAP_E2E",
+    "RPCE_RUN_SCALE_TESTS",
+    "SDKROOT",
+    "TOOLCHAINS",
+)
 XCTEST_STARTUP_DEADLINE_SECONDS = 90.0
 XCTEST_ACTIVE_METHOD_FLOOR_SECONDS = 90.0
 XCTEST_ACTIVE_METHOD_RUNTIME_MULTIPLIER = 4.0
@@ -105,6 +118,7 @@ IMPLEMENTED_OPERATIONS = {
     "package",
     "test",
     "test-artifact",
+    "test-parallel",
     "provider-test",
     "core-test",
     "install-debug-cli",
@@ -147,10 +161,11 @@ Operation commands:
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
   ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-gateway|all
-  ./conductor build
+  ./conductor build [--fast]
   ./conductor package debug|release
   ./conductor test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor test-artifact --filter <filter> [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor test-parallel [--workers <count>] [--filter <suite-regex>]
   ./conductor provider-test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor core-test [--list | --filter <filter>] [--test-product <product>] [--no-xctest-deadlines] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
@@ -234,7 +249,7 @@ def _read_test_ledger_rows(repo_root: Path) -> List[Dict[str, str]]:
 
 def _ledger_filter_rows(repo_root: Path, operation: str) -> List[Tuple[str, str]]:
     ledger_path = _test_ledger_path(repo_root)
-    target = "root" if operation in {"test", "test-artifact"} else "core" if operation == "core-test" else "provider"
+    target = "root" if operation in {"test", "test-artifact", "test-parallel"} else "core" if operation == "core-test" else "provider"
     try:
         rows = _read_test_ledger_rows(repo_root)
     except (OSError, csv.Error, UnicodeError) as exc:
@@ -330,7 +345,7 @@ def preflight_test_filter(repo_root: Path, operation: str, filter_value: str) ->
 
     suite_part = filter_value.split("/", 1)[0]
     candidate = suite_part.rsplit(".", 1)[-1]
-    if operation in {"test", "test-artifact"}:
+    if operation in {"test", "test-artifact", "test-parallel"}:
         test_root = repo_root / "Tests" / "RepoPromptTests"
     elif operation == "core-test":
         test_root = repo_root / "Packages" / "RepoPromptCore" / "Tests"
@@ -466,6 +481,10 @@ def artifact_env_gates(env: Dict[str, str]) -> Dict[str, Optional[str]]:
         "REPOPROMPT_ENABLE_SENTRY": env.get("REPOPROMPT_ENABLE_SENTRY"),
         "RPCE_ENABLE_BENCHMARK_TESTS": env.get("RPCE_ENABLE_BENCHMARK_TESTS"),
     }
+
+
+def parallel_xctest_runtime_gates(env: Dict[str, str]) -> Dict[str, Optional[str]]:
+    return {key: env.get(key) for key in PARALLEL_XCTEST_RUNTIME_GATE_KEYS}
 
 
 def build_ticket_payload(
@@ -703,6 +722,228 @@ def evaluate_test_artifact(
         "artifactScopeMessage": artifact_scope_message(scope, differences),
         "artifactTicketSourceSnapshot": ticket_source,
         "buildTicketId": ticket.get("ticket_id"),
+    }
+
+
+class ParallelTestIntegrityError(ConductorError):
+    pass
+
+
+def parallel_test_evidence_scope(filter_value: Any) -> str:
+    return "filtered" if isinstance(filter_value, str) and filter_value else "full-root"
+
+
+def _valid_parallel_toolchain(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"swift_version", "arch", "config"}
+        and isinstance(value.get("swift_version"), str)
+        and bool(value.get("swift_version"))
+        and isinstance(value.get("arch"), str)
+        and bool(value.get("arch"))
+        and value.get("config") == "debug"
+    )
+
+
+def _valid_parallel_source_snapshot(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"head", "porcelain_sha256", "dirty_file_sha256"}
+        and isinstance(value.get("head"), str)
+        and bool(value.get("head"))
+        and isinstance(value.get("porcelain_sha256"), str)
+        and bool(value.get("porcelain_sha256"))
+        and isinstance(value.get("dirty_file_sha256"), dict)
+        and all(
+            isinstance(path, str) and isinstance(digest, str) and bool(digest)
+            for path, digest in value.get("dirty_file_sha256", {}).items()
+        )
+    )
+
+
+def _valid_parallel_artifact_fingerprint(value: Any) -> bool:
+    expected_keys = {
+        "executable_path",
+        "size",
+        "mtime_ns",
+        "sha256",
+        "closure_manifest_sha256",
+        "closure_file_count",
+    }
+    return (
+        isinstance(value, dict)
+        and set(value) == expected_keys
+        and isinstance(value.get("executable_path"), str)
+        and bool(value.get("executable_path"))
+        and isinstance(value.get("size"), int)
+        and not isinstance(value.get("size"), bool)
+        and value.get("size", -1) >= 0
+        and isinstance(value.get("mtime_ns"), int)
+        and not isinstance(value.get("mtime_ns"), bool)
+        and value.get("mtime_ns", -1) >= 0
+        and isinstance(value.get("sha256"), str)
+        and bool(value.get("sha256"))
+        and isinstance(value.get("closure_manifest_sha256"), str)
+        and bool(value.get("closure_manifest_sha256"))
+        and isinstance(value.get("closure_file_count"), int)
+        and not isinstance(value.get("closure_file_count"), bool)
+        and value.get("closure_file_count", -1) >= 0
+    )
+
+
+def _parallel_candidate_number(value: Any, *, positive: bool = False) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    numeric = float(value)
+    return math.isfinite(numeric) and (numeric > 0 if positive else numeric >= 0)
+
+
+def read_parallel_test_candidate(
+    path: Path,
+    *,
+    expected_run_id: str,
+    expected_ticket_id: str,
+    expected_filter: Optional[str],
+) -> Dict[str, Any]:
+    try:
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ParallelTestIntegrityError(
+            f"parallel test candidate is missing or unreadable: {path} ({exc})"
+        ) from exc
+    if not isinstance(candidate, dict):
+        raise ParallelTestIntegrityError("parallel test candidate must be a JSON object")
+
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "run_id",
+        "ticket_id",
+        "filter",
+        "evidence_scope",
+        "source_snapshot",
+        "env_gates",
+        "worker_runtime_gates",
+        "toolchain",
+        "artifact_path",
+        "artifact_fingerprint",
+        "build_duration_seconds",
+        "runner_started_at",
+    }
+    if set(candidate) != expected_keys:
+        missing = sorted(expected_keys - set(candidate))
+        extra = sorted(set(candidate) - expected_keys)
+        raise ParallelTestIntegrityError(
+            f"parallel test candidate schema mismatch; missing={missing}; extra={extra}"
+        )
+    expected_scope = parallel_test_evidence_scope(expected_filter)
+    if candidate.get("schema_version") != PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION:
+        raise ParallelTestIntegrityError("parallel test candidate schema version is unsupported")
+    if candidate.get("kind") != PARALLEL_TEST_CANDIDATE_KIND:
+        raise ParallelTestIntegrityError("parallel test candidate kind is invalid")
+    if candidate.get("run_id") != expected_run_id:
+        raise ParallelTestIntegrityError("parallel test candidate run ID does not match the job")
+    if candidate.get("ticket_id") != expected_ticket_id:
+        raise ParallelTestIntegrityError("parallel test candidate ticket ID does not match the job")
+    if candidate.get("filter") != expected_filter:
+        raise ParallelTestIntegrityError("parallel test candidate filter does not match the job")
+    if candidate.get("evidence_scope") != expected_scope:
+        raise ParallelTestIntegrityError("parallel test candidate evidence scope does not match the filter")
+    if not _valid_parallel_source_snapshot(candidate.get("source_snapshot")):
+        raise ParallelTestIntegrityError("parallel test candidate source snapshot is invalid")
+    if candidate.get("env_gates") is None or not isinstance(candidate.get("env_gates"), dict):
+        raise ParallelTestIntegrityError("parallel test candidate environment gates are invalid")
+    if set(candidate["env_gates"]) != {"REPOPROMPT_ENABLE_SENTRY", "RPCE_ENABLE_BENCHMARK_TESTS"}:
+        raise ParallelTestIntegrityError("parallel test candidate environment gate schema is invalid")
+    if not all(value is None or isinstance(value, str) for value in candidate["env_gates"].values()):
+        raise ParallelTestIntegrityError("parallel test candidate environment gate value is invalid")
+    worker_runtime_gates = candidate.get("worker_runtime_gates")
+    if not isinstance(worker_runtime_gates, dict):
+        raise ParallelTestIntegrityError("parallel test candidate worker runtime gates are invalid")
+    if set(worker_runtime_gates) != set(PARALLEL_XCTEST_RUNTIME_GATE_KEYS):
+        raise ParallelTestIntegrityError("parallel test candidate worker runtime gate schema is invalid")
+    if not all(value is None or isinstance(value, str) for value in worker_runtime_gates.values()):
+        raise ParallelTestIntegrityError("parallel test candidate worker runtime gate value is invalid")
+    if not _valid_parallel_toolchain(candidate.get("toolchain")):
+        raise ParallelTestIntegrityError("parallel test candidate toolchain is unavailable or invalid")
+    artifact_path_value = candidate.get("artifact_path")
+    if not isinstance(artifact_path_value, str) or not Path(artifact_path_value).is_absolute():
+        raise ParallelTestIntegrityError("parallel test candidate artifact path is invalid")
+    if not _valid_parallel_artifact_fingerprint(candidate.get("artifact_fingerprint")):
+        raise ParallelTestIntegrityError("parallel test candidate artifact fingerprint is invalid")
+    if not _parallel_candidate_number(candidate.get("build_duration_seconds")):
+        raise ParallelTestIntegrityError("parallel test candidate build duration is invalid")
+    if not _parallel_candidate_number(candidate.get("runner_started_at"), positive=True):
+        raise ParallelTestIntegrityError("parallel test candidate runner start is invalid")
+    return candidate
+
+
+def verify_parallel_test_candidate(
+    repo_root: Path,
+    candidate: Dict[str, Any],
+    env: Dict[str, str],
+) -> None:
+    differences: List[str] = []
+    current_source = source_snapshot(repo_root, env)
+    differences.extend(
+        f"source {difference}"
+        for difference in source_snapshot_differences(
+            candidate.get("source_snapshot"), current_source
+        )
+    )
+    if artifact_env_gates(env) != candidate.get("env_gates"):
+        differences.append("environment gates")
+    if parallel_xctest_runtime_gates(env) != candidate.get("worker_runtime_gates"):
+        differences.append("worker runtime gates")
+    current_toolchain = artifact_toolchain_snapshot(repo_root, env)
+    if not _valid_parallel_toolchain(current_toolchain):
+        differences.append("toolchain unavailable")
+    elif current_toolchain != candidate.get("toolchain"):
+        differences.append("toolchain")
+
+    current_artifact = discover_root_test_artifact(
+        repo_root, current_toolchain.get("arch", "")
+    )
+    candidate_artifact = Path(str(candidate.get("artifact_path")))
+    if current_artifact is None:
+        differences.append("artifact missing")
+    elif current_artifact.resolve() != candidate_artifact.resolve():
+        differences.append("artifact path")
+    else:
+        try:
+            current_fingerprint = test_artifact_fingerprint(current_artifact)
+            differences.extend(
+                artifact_fingerprint_differences(
+                    candidate.get("artifact_fingerprint"), current_fingerprint
+                )
+            )
+        except ArtifactUnavailableError:
+            differences.append("artifact unreadable")
+
+    if differences:
+        raise ParallelTestIntegrityError(
+            "parallel test source/artifact integrity check failed: "
+            + ", ".join(dict.fromkeys(differences))
+        )
+
+
+def parallel_build_ticket_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ticket_id": candidate["ticket_id"],
+        "created_at": now(),
+        "source_snapshot": candidate["source_snapshot"],
+        "env_gates": candidate["env_gates"],
+        "worker_runtime_gates": candidate["worker_runtime_gates"],
+        "toolchain": candidate["toolchain"],
+        "artifact_fingerprint": candidate["artifact_fingerprint"],
+        "artifact_path": candidate["artifact_path"],
+        "provenance": {
+            "producer": "test-parallel",
+            "run_id": candidate["run_id"],
+            "completion": candidate["evidence_scope"],
+            "filter": candidate["filter"],
+            "claim": "artifact-provenance-only",
+        },
     }
 
 
@@ -1626,19 +1867,19 @@ def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
 def job_ticket_env_eligible(argv: Sequence[str]) -> bool:
     """Whether the child process should receive REPOPROMPT_CONDUCTOR_JOB_TICKET.
 
-    Direct swift invocations must not receive per-job environment values:
-    SwiftPM keys its manifest/build-plan caches on the child environment, so a
-    unique per-job value forces a full multi-second re-plan on every
-    coordinated swift build/test job. Delegated scripts (packaging, debug-CLI
-    install, release) still receive the ticket for lock metadata.
+    SwiftPM child invocations, including the canonical wrapper, must not
+    receive per-job environment values: SwiftPM keys its manifest/build-plan
+    caches on the child environment, so a unique per-job value forces a full
+    multi-second re-plan. Delegated scripts still receive the ticket for lock
+    metadata; canonical_swift.sh excludes it before invoking SwiftPM.
     """
     if not argv:
         return True
-    return Path(str(argv[0])).name != "swift"
+    return Path(str(argv[0])).name not in {"swift", "canonical_swift.sh"}
 
 
 def operation_invalidates_root_build_ticket(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"test", "swift-build", "build", "package", "install-debug-cli"}:
+    if operation in {"test", "test-parallel", "swift-build", "build", "package", "install-debug-cli"}:
         return True
     return operation == "release" and args.get("subcommand") in {
         "artifact",
@@ -1648,7 +1889,7 @@ def operation_invalidates_root_build_ticket(operation: str, args: Dict[str, Any]
 
 
 def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -> bool:
-    if operation in {"swift-build", "build", "package", "test", "provider-test", "core-test", "install-debug-cli"}:
+    if operation in {"swift-build", "build", "package", "test", "test-parallel", "provider-test", "core-test", "install-debug-cli"}:
         return True
     if operation in {"sleep", "fake-sleep"} and "build" in set(args.get("lanes") or []):
         return True
@@ -1658,7 +1899,7 @@ def operation_requires_global_heavy_slot(operation: str, args: Dict[str, Any]) -
 
 
 def operation_requires_global_xctest_slot(operation: str, args: Dict[str, Any]) -> bool:
-    return operation == "test-artifact"
+    return operation in {"test-artifact", "test-parallel"}
 
 
 def format_duration(seconds: Optional[float]) -> str:
@@ -1723,6 +1964,8 @@ class Job:
     artifact_scope: Optional[str] = None
     artifact_scope_differences: List[str] = dataclasses.field(default_factory=list)
     artifact_scope_message: Optional[str] = None
+    test_evidence_scope: Optional[str] = None
+    build_phase_seconds: Optional[float] = None
     run_phase_seconds: Optional[float] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
@@ -1795,6 +2038,8 @@ class Job:
             "artifactScope": self.artifact_scope,
             "artifactScopeDifferences": list(self.artifact_scope_differences),
             "artifactScopeMessage": self.artifact_scope_message,
+            "testEvidenceScope": self.test_evidence_scope,
+            "buildPhaseSeconds": self.build_phase_seconds,
             "runPhaseSeconds": self.run_phase_seconds,
             "exitCode": self.exit_code,
             "error": self.error,
@@ -1952,6 +2197,7 @@ class OperationRegistry:
             effective_timeout = float(timeout)
 
         script = lambda name: str(self.repo_root / "Scripts" / name)
+        canonical_swift = script("canonical_swift.sh")
         lanes: List[str] = []
         cwd = self.repo_root
 
@@ -1976,15 +2222,18 @@ class OperationRegistry:
             lanes = ["build"]
             if product == "all":
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
-            return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            return [canonical_swift, "build", "--product", str(product)], lanes, cwd, env, effective_timeout
         if operation == "build":
-            return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
+            argv = [script("package_app.sh"), "debug"]
+            if args.get("fastPackage"):
+                argv.append("fast")
+            return argv, ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
             config = str(args.get("config"))
             lanes = ["build", "debugArtifact"] + (["release"] if config == "release" else [])
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
-            argv = ["swift", "test"]
+            argv = [canonical_swift, "test"]
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("list"):
@@ -1996,9 +2245,27 @@ class OperationRegistry:
             if not args.get("filter"):
                 raise ConductorError("test-artifact requires --filter")
             args.update(evaluate_test_artifact(self.repo_root, self.jobs_dir, env))
-            return ["swift", "test", "--skip-build", "--filter", str(args["filter"])], ["build"], cwd, env, effective_timeout
+            return [canonical_swift, "test", "--skip-build", "--filter", str(args["filter"])], ["build"], cwd, env, effective_timeout
+        if operation == "test-parallel":
+            if not args.get("parallelRunId"):
+                run_id = str(uuid.uuid4())
+                args["parallelRunId"] = run_id
+                args["parallelWorkdir"] = str(self.jobs_dir / f"parallel-xctest-{run_id}")
+                args["parallelTestList"] = str(
+                    self.jobs_dir / f"parallel-xctest-{run_id}-test-list.txt"
+                )
+                args["parallelCandidate"] = str(
+                    self.jobs_dir / f"parallel-xctest-{run_id}-candidate.json"
+                )
+            return (
+                self._internal_argv("parallel_root_test", dict(args)),
+                ["build"],
+                cwd,
+                env,
+                effective_timeout,
+            )
         if operation in {"provider-test", "core-test"}:
-            argv = ["swift", "test"]
+            argv = [canonical_swift, "test"]
             if args.get("testProduct"):
                 argv.extend(["--test-product", str(args["testProduct"])])
             if args.get("list"):
@@ -2135,6 +2402,8 @@ class OperationRegistry:
             return SHORT_TIMEOUT_SECONDS
         if operation == "test-artifact":
             return ARTIFACT_TEST_TIMEOUT_SECONDS
+        if operation == "test-parallel":
+            return MEDIUM_TIMEOUT_SECONDS
         if operation in {"test", "provider-test", "core-test"} and args.get("filter"):
             return FILTERED_TEST_TIMEOUT_SECONDS
         return MEDIUM_TIMEOUT_SECONDS
@@ -2266,6 +2535,14 @@ class DaemonState:
             raise ConductorError("request args must be an object")
         args = dict(raw_args)
         operation = str(request.get("operation") or "")
+        if operation == "test-parallel":
+            for key in (
+                "parallelRunId",
+                "parallelCandidate",
+                "parallelTestList",
+                "parallelWorkdir",
+            ):
+                args.pop(key, None)
         if operation == "app" and args.get("subcommand") in {"stop", "launch-existing", "relaunch"}:
             # Derived exclusively by supersession below, never accepted from a client.
             args.pop("guardDelayedLaunch", None)
@@ -2317,6 +2594,11 @@ class DaemonState:
                 artifact_scope=args.get("artifactScope"),
                 artifact_scope_differences=list(args.get("artifactScopeDifferences") or []),
                 artifact_scope_message=args.get("artifactScopeMessage"),
+                test_evidence_scope=(
+                    parallel_test_evidence_scope(args.get("filter"))
+                    if operation == "test-parallel"
+                    else None
+                ),
             )
             intent = latest_lifecycle_intent(job.operation, job.args)
             superseded_jobs: List[Dict[str, Any]] = []
@@ -2788,7 +3070,7 @@ class DaemonState:
                     if self._xctest_watchdog_enabled(job):
                         swiftpm_build_expected = (
                             len(argv) >= 2
-                            and Path(argv[0]).name == "swift"
+                            and Path(argv[0]).name in {"swift", "canonical_swift.sh"}
                             and argv[1] == "test"
                             and "--skip-build" not in argv
                         )
@@ -2924,6 +3206,66 @@ class DaemonState:
                             )
                     except Exception as exc:
                         ticket_error = str(exc)
+                parallel_candidate: Optional[Dict[str, Any]] = None
+                parallel_integrity_error: Optional[str] = None
+                if job.operation == "test-parallel":
+                    candidate_value = job.args.get("parallelCandidate")
+                    candidate_path = (
+                        Path(candidate_value) if isinstance(candidate_value, str) else None
+                    )
+                    should_validate_candidate = (
+                        exit_code in {0, XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE}
+                        or (candidate_path is not None and candidate_path.exists())
+                    )
+                    if should_validate_candidate:
+                        try:
+                            if candidate_path is None:
+                                raise ParallelTestIntegrityError(
+                                    "parallel test candidate path is unavailable"
+                                )
+                            parallel_candidate = read_parallel_test_candidate(
+                                candidate_path,
+                                expected_run_id=str(job.args.get("parallelRunId") or ""),
+                                expected_ticket_id=job.ticket,
+                                expected_filter=(
+                                    str(job.args["filter"])
+                                    if isinstance(job.args.get("filter"), str)
+                                    and job.args.get("filter")
+                                    else None
+                                ),
+                            )
+                            verify_parallel_test_candidate(
+                                self.paths.repo_root, parallel_candidate, env
+                            )
+                            job.build_phase_seconds = float(
+                                parallel_candidate["build_duration_seconds"]
+                            )
+                            runner_started_at = float(
+                                parallel_candidate["runner_started_at"]
+                            )
+                            if job.process_finished_at is not None:
+                                job.run_phase_seconds = max(
+                                    0.0, job.process_finished_at - runner_started_at
+                                )
+                            if (
+                                exit_code == 0
+                                and not job.cancel_requested
+                                and not job.measurement_invalid
+                                and not job.timed_out
+                            ):
+                                write_build_ticket(
+                                    self.paths.jobs_dir / "build-ticket-root.json",
+                                    parallel_build_ticket_payload(parallel_candidate),
+                                )
+                        except (OSError, ParallelTestIntegrityError) as exc:
+                            parallel_integrity_error = str(exc)
+                            exit_code = XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+                    elif exit_code == XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE:
+                        parallel_integrity_error = (
+                            "parallel test source/artifact integrity check failed "
+                            "before candidate creation"
+                        )
+
                 artifact_post_differences: List[str] = []
                 if job.operation == "test-artifact":
                     post_snapshot = source_snapshot(self.paths.repo_root, env)
@@ -2952,6 +3294,10 @@ class DaemonState:
                         self._append_system_line_locked(job, f"could not compute root build ticket: {ticket_error}\n")
                     if ticket_withheld_reason:
                         self._append_system_line_locked(job, ticket_withheld_reason + "\n")
+                    if parallel_integrity_error:
+                        self._append_system_line_locked(
+                            job, f"parallel integrity failure: {parallel_integrity_error}\n"
+                        )
                     if job.operation == "test-artifact" and artifact_post_differences:
                         for difference in artifact_post_differences:
                             if difference not in job.artifact_scope_differences:
@@ -2961,15 +3307,39 @@ class DaemonState:
                             "stale", job.artifact_scope_differences
                         )
                     self._finalize_process_exit_locked(job, exit_code)
-                    if job.operation == "test-artifact" and job.process_started_at is not None and job.process_finished_at is not None:
-                        job.run_phase_seconds = max(0.0, job.process_finished_at - job.process_started_at)
+                    if parallel_integrity_error:
+                        job.error = parallel_integrity_error
+                        job.result_summary = parallel_integrity_error
+                    if (
+                        job.operation == "test-artifact"
+                        and job.process_started_at is not None
+                        and job.process_finished_at is not None
+                    ):
+                        job.run_phase_seconds = max(
+                            0.0, job.process_finished_at - job.process_started_at
+                        )
                     if job.state == "completed" and job.operation == "test" and ticket_payload is not None:
                         try:
                             write_build_ticket(self.paths.jobs_dir / "build-ticket-root.json", ticket_payload)
                         except OSError as exc:
                             self._append_system_line_locked(job, f"could not write root build ticket: {exc}\n")
-                    if job.state == "completed" and job.operation == "test-artifact" and job.artifact_scope_message:
+                    if (
+                        job.state == "completed"
+                        and job.operation == "test-artifact"
+                        and job.artifact_scope_message
+                    ):
                         job.result_summary = job.artifact_scope_message
+                    if job.state == "completed" and job.operation == "test-parallel":
+                        scope = parallel_test_evidence_scope(job.args.get("filter"))
+                        if scope == "full-root":
+                            job.result_summary = (
+                                "full-root source validation completed successfully"
+                            )
+                        else:
+                            job.result_summary = (
+                                "filtered source validation completed successfully; "
+                                "not full-root contribution evidence"
+                            )
                     job.finished_at = now()
         except ArtifactUnavailableError as exc:
             if job is not None:
@@ -4028,6 +4398,87 @@ def compatible_daemon_status_or_stop_idle_mismatch(paths: Paths) -> Tuple[Option
     return None, None
 
 
+def daemon_launchd_label(paths: Paths) -> str:
+    return f"com.repoprompt.ce.conductor.{paths.repo_hash[:16]}"
+
+
+def daemon_launchd_plist_path(paths: Paths) -> Path:
+    return paths.state_dir / f"{daemon_launchd_label(paths)}.plist"
+
+
+def run_launchctl(args: Sequence[str]) -> int:
+    try:
+        completed = subprocess.run(
+            ["launchctl", *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return 127
+    return completed.returncode
+
+
+def bootout_daemon_launchd(paths: Paths) -> None:
+    uid = os.getuid()
+    run_launchctl(["bootout", f"gui/{uid}/{daemon_launchd_label(paths)}"])
+
+
+def write_daemon_launchd_plist(paths: Paths, script: Path) -> Path:
+    plist_path = daemon_launchd_plist_path(paths)
+    payload = {
+        "Label": daemon_launchd_label(paths),
+        "ProgramArguments": [
+            sys.executable,
+            str(script),
+            "__daemon",
+            "--repo-root",
+            str(paths.repo_root),
+        ],
+        "ProcessType": "Interactive",
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "WorkingDirectory": str(paths.repo_root),
+        "StandardOutPath": str(paths.daemon_log_path),
+        "StandardErrorPath": str(paths.daemon_log_path),
+        "EnvironmentVariables": {
+            "REPOPROMPT_DEV_DAEMON_STATE_DIR": str(paths.state_dir),
+            "REPOPROMPT_DEV_DAEMON_SOCKET": str(paths.socket_path),
+        },
+    }
+    plist_path.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False))
+    with contextlib.suppress(OSError):
+        os.chmod(plist_path, 0o600)
+    return plist_path
+
+
+def spawn_daemon_direct(paths: Paths, script: Path) -> None:
+    with paths.daemon_log_path.open("ab") as daemon_log:
+        daemon_log.write(
+            b"WARNING: conductor daemon is running in a possibly QoS-clamped context.\n"
+        )
+        daemon_log.flush()
+        subprocess.Popen(
+            [sys.executable, str(script), "__daemon", "--repo-root", str(paths.repo_root)],
+            cwd=str(paths.repo_root),
+            stdin=subprocess.DEVNULL,
+            stdout=daemon_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+
+def spawn_daemon(paths: Paths, script: Path) -> None:
+    if os.environ.get("REPOPROMPT_DEV_DAEMON_LAUNCHD") != "0":
+        plist_path = write_daemon_launchd_plist(paths, script)
+        bootout_daemon_launchd(paths)
+        uid = os.getuid()
+        if run_launchctl(["bootstrap", f"gui/{uid}", str(plist_path)]) == 0:
+            return
+    spawn_daemon_direct(paths, script)
+
+
 def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
     ensure_state_dirs(paths)
     cleanup_stale_files(paths)
@@ -4061,20 +4512,10 @@ def ensure_daemon(paths: Paths, start_if_needed: bool = True) -> Dict[str, Any]:
                 "run './conductor daemon stop --force' before starting a replacement"
             )
         script = Path(__file__).resolve()
-        with paths.daemon_log_path.open("ab") as daemon_log:
-            proc = subprocess.Popen(
-                [sys.executable, str(script), "__daemon", "--repo-root", str(paths.repo_root)],
-                cwd=str(paths.repo_root),
-                stdin=subprocess.DEVNULL,
-                stdout=daemon_log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+        spawn_daemon(paths, script)
         deadline = now() + STARTUP_TIMEOUT_SECONDS
         last_error: Optional[Exception] = None
         while now() < deadline:
-            if proc.poll() is not None:
-                break
             try:
                 return request_daemon(paths, {"type": "status"}, timeout=0.5)
             except Exception as exc:  # wait until socket accepts
@@ -4558,6 +4999,7 @@ def handle_daemon_command(paths: Paths, argv: List[str]) -> int:
             if not force:
                 raise
             payload = force_stop_unresponsive_daemon(paths)
+        bootout_daemon_launchd(paths)
         if json_mode:
             print_json(payload)
         else:
@@ -5438,8 +5880,13 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
+    canonical_swift = str(repo_root / "Scripts" / "canonical_swift.sh")
     for product in ["RepoPrompt", "repoprompt-mcp", "repoprompt-gateway"]:
-        code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
+        code, _stdout, _stderr = run_operation_command(
+            f"swift build --product {product}",
+            [canonical_swift, "build", "--product", product],
+            repo_root,
+        )
         if code != 0:
             return code
     return 0
@@ -5732,6 +6179,158 @@ def operation_diagnostics_agent_mode_on(repo_root: Path, args: Dict[str, Any]) -
     return 0
 
 
+def operation_parallel_root_test(repo_root: Path, args: Dict[str, Any]) -> int:
+    run_id = args.get("parallelRunId")
+    ticket_id = os.environ.get("REPOPROMPT_CONDUCTOR_JOB_TICKET")
+    candidate_value = args.get("parallelCandidate")
+    test_list_value = args.get("parallelTestList")
+    workdir_value = args.get("parallelWorkdir")
+    if not all(
+        isinstance(value, str) and value
+        for value in (run_id, ticket_id, candidate_value, test_list_value, workdir_value)
+    ):
+        print("parallel test source/artifact integrity check failed: internal job identity is incomplete", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+    try:
+        parsed_run_id = str(uuid.UUID(str(run_id)))
+    except ValueError:
+        parsed_run_id = ""
+    if parsed_run_id != run_id:
+        print("parallel test source/artifact integrity check failed: run ID is invalid", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+
+    candidate_path = Path(str(candidate_value))
+    test_list_path = Path(str(test_list_value))
+    workdir = Path(str(workdir_value))
+    expected_parent = candidate_path.parent
+    names_are_valid = (
+        candidate_path.name == f"parallel-xctest-{run_id}-candidate.json"
+        and test_list_path.name == f"parallel-xctest-{run_id}-test-list.txt"
+        and workdir.name == f"parallel-xctest-{run_id}"
+    )
+    if (
+        not candidate_path.is_absolute()
+        or not test_list_path.is_absolute()
+        or not workdir.is_absolute()
+        or test_list_path.parent != expected_parent
+        or workdir.parent != expected_parent
+        or not names_are_valid
+    ):
+        print("parallel test source/artifact integrity check failed: per-job paths are invalid", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+
+    snapshot_s0 = source_snapshot(repo_root, os.environ.copy())
+    if snapshot_s0 is None:
+        print("parallel test source/artifact integrity check failed: source snapshot S0 is unavailable", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+
+    build_argv = [
+        str(repo_root / "Scripts" / "canonical_swift.sh"),
+        "build",
+        "--build-tests",
+    ]
+    print("\n==> Build root XCTest artifact", flush=True)
+    print(f"$ {format_argv(build_argv)}", flush=True)
+    build_started = time.monotonic()
+    try:
+        build_exit_code = subprocess.run(
+            build_argv,
+            cwd=str(repo_root),
+            stdin=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"could not start root test build: {exc}", file=sys.stderr, flush=True)
+        return 1
+    build_duration = time.monotonic() - build_started
+    if build_exit_code != 0:
+        return int(build_exit_code)
+
+    snapshot_s1 = source_snapshot(repo_root, os.environ.copy())
+    if snapshot_s1 is None:
+        print("parallel test source/artifact integrity check failed: source snapshot S1 is unavailable", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+    if snapshot_s1 != snapshot_s0:
+        print("parallel test source/artifact integrity check failed: source changed during build", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+
+    toolchain = artifact_toolchain_snapshot(repo_root, os.environ.copy())
+    if not _valid_parallel_toolchain(toolchain):
+        print("parallel test source/artifact integrity check failed: toolchain is unavailable", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+    artifact_path = discover_root_test_artifact(repo_root, toolchain["arch"])
+    if artifact_path is None:
+        print("parallel test source/artifact integrity check failed: built root artifact is missing", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+    try:
+        artifact_fingerprint = test_artifact_fingerprint(artifact_path)
+    except ArtifactUnavailableError as exc:
+        print(f"parallel test source/artifact integrity check failed: {exc}", file=sys.stderr)
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+
+    filter_value = args.get("filter")
+    normalized_filter = str(filter_value) if isinstance(filter_value, str) and filter_value else None
+    runner_started_at = now()
+    candidate = {
+        "schema_version": PARALLEL_TEST_CANDIDATE_SCHEMA_VERSION,
+        "kind": PARALLEL_TEST_CANDIDATE_KIND,
+        "run_id": run_id,
+        "ticket_id": ticket_id,
+        "filter": normalized_filter,
+        "evidence_scope": parallel_test_evidence_scope(normalized_filter),
+        "source_snapshot": snapshot_s0,
+        "env_gates": artifact_env_gates(os.environ),
+        "worker_runtime_gates": parallel_xctest_runtime_gates(os.environ),
+        "toolchain": toolchain,
+        "artifact_path": str(artifact_path.resolve()),
+        "artifact_fingerprint": artifact_fingerprint,
+        "build_duration_seconds": build_duration,
+        "runner_started_at": runner_started_at,
+    }
+    try:
+        write_build_ticket(candidate_path, candidate)
+    except OSError as exc:
+        print(
+            f"parallel test source/artifact integrity check failed: "
+            f"could not write candidate manifest ({exc})",
+            file=sys.stderr,
+        )
+        return XCTEST_SOURCE_ARTIFACT_INTEGRITY_EXIT_CODE
+
+    runner_argv = [
+        sys.executable,
+        "-u",
+        str(repo_root / "Scripts" / "parallel_xctest_runner.py"),
+        "--workers",
+        str(args.get("workers", 8)),
+        "--bundle",
+        candidate["artifact_path"],
+        "--test-list",
+        str(test_list_path),
+        "--generate-test-list",
+        "--workdir",
+        str(workdir),
+        "--exclusive-suite",
+        r"^RepoPromptTests\.TabContextRoutingTests$",
+    ]
+    if normalized_filter is not None:
+        runner_argv.extend(["--filter", normalized_filter])
+    print("\n==> Run parallel root XCTest suites", flush=True)
+    print(f"$ {format_argv(runner_argv)}", flush=True)
+    try:
+        return int(
+            subprocess.run(
+                runner_argv,
+                cwd=str(repo_root),
+                stdin=subprocess.DEVNULL,
+                check=False,
+            ).returncode
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"could not start parallel XCTest runner: {exc}", file=sys.stderr, flush=True)
+        return 1
+
+
 def run_operation_runner(payload_json: str) -> int:
     payload = json.loads(payload_json)
     kind = payload.get("kind")
@@ -5739,6 +6338,8 @@ def run_operation_runner(payload_json: str) -> int:
     repo_root = Path(payload.get("repoRoot") or resolve_repo_root()).resolve()
     if kind == "swift_build_all":
         return operation_swift_build_all(repo_root)
+    if kind == "parallel_root_test":
+        return operation_parallel_root_test(repo_root, args)
     if kind == "app_stop":
         return operation_app_stop(repo_root, args)
     if kind == "app_status":
@@ -5820,7 +6421,6 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
     if operation in {
         "doctor",
         "guardrails",
-        "build",
         "install-debug-cli",
         "debug-cli-status",
         "format",
@@ -5831,6 +6431,12 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "install-format-tools",
     }:
         parse_no_args(f"conductor {operation}", rest)
+    elif operation == "build":
+        parser = argparse.ArgumentParser(prog="conductor build")
+        parser.add_argument("--fast", action="store_true")
+        ns = parser.parse_args(rest)
+        if ns.fast:
+            args["fastPackage"] = True
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
         parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "repoprompt-gateway", "all"])
@@ -5841,6 +6447,17 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("config", choices=["debug", "release"])
         ns = parser.parse_args(rest)
         args["config"] = ns.config
+    elif operation == "test-parallel":
+        parser = argparse.ArgumentParser(prog="conductor test-parallel")
+        parser.add_argument("--workers", type=int, default=8)
+        parser.add_argument("--filter")
+        ns = parser.parse_args(rest)
+        if ns.workers < 1:
+            raise ConductorError("--workers must be at least 1")
+        args["workers"] = ns.workers
+        if ns.filter:
+            args["filter"] = ns.filter
+            preflight_test_filter(paths.repo_root, operation, ns.filter)
     elif operation == "test-artifact":
         parser = argparse.ArgumentParser(prog="conductor test-artifact")
         parser.add_argument("--filter", required=True)

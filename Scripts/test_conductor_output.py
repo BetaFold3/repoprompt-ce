@@ -439,6 +439,9 @@ class OutputSummarizerTests(unittest.TestCase):
                 process_started_at=13.0,
                 process_finished_at=19.25,
                 progress_transport="pty",
+                test_evidence_scope="full-root",
+                build_phase_seconds=2.5,
+                run_phase_seconds=3.75,
                 xctest_progress_sequence=17,
                 xctest_last_progress_test="RepoPromptTests.ExampleTests.testProgress",
                 xctest_last_progress_action="started",
@@ -456,6 +459,9 @@ class OutputSummarizerTests(unittest.TestCase):
         self.assertEqual(payload["processFinishedAt"], 19.25)
         self.assertEqual(payload["queueWaitSeconds"], 2.5)
         self.assertEqual(payload["executionSeconds"], 6.25)
+        self.assertEqual(payload["testEvidenceScope"], "full-root")
+        self.assertEqual(payload["buildPhaseSeconds"], 2.5)
+        self.assertEqual(payload["runPhaseSeconds"], 3.75)
         self.assertFalse(payload["measurementInvalid"])
         self.assertEqual(payload["progressTransport"], "pty")
         self.assertEqual(payload["progressSequence"], 17)
@@ -558,6 +564,11 @@ class JobTicketEnvEligibilityTests(unittest.TestCase):
     def test_direct_swift_invocations_do_not_receive_job_ticket_env(self) -> None:
         self.assertFalse(conductor.job_ticket_env_eligible(["swift", "test", "--filter", "X"]))
         self.assertFalse(conductor.job_ticket_env_eligible(["/usr/bin/swift", "build", "--product", "RepoPrompt"]))
+        self.assertFalse(
+            conductor.job_ticket_env_eligible(
+                ["/repo/Scripts/canonical_swift.sh", "build", "--product", "RepoPrompt"]
+            )
+        )
 
     def test_delegated_scripts_receive_job_ticket_env(self) -> None:
         self.assertTrue(conductor.job_ticket_env_eligible(["/repo/Scripts/package_app.sh", "debug"]))

@@ -21,9 +21,57 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import fast_package_fingerprint  # noqa: E402
 
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_fast_package_fingerprint_covers_bundle_resources_and_control_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "RepoPrompt.app"
+            resource = bundle / "Contents" / "Resources" / "Configuration.json"
+            executable = bundle / "Contents" / "MacOS" / "RepoPrompt"
+            provenance = (
+                bundle
+                / "Contents"
+                / "Resources"
+                / "RepoPromptDebugProvenance.json"
+            )
+            resource.parent.mkdir(parents=True)
+            executable.parent.mkdir(parents=True)
+            resource.write_text('{"version":1}\n', encoding="utf-8")
+            provenance.write_text('{"generated":1}\n', encoding="utf-8")
+            executable.write_bytes(b"executable-v1")
+            executable.chmod(0o755)
+            package_helper = root / "package_app.sh"
+            verification_helper = root / "smoke_embedded_mcp_helper.sh"
+            package_helper.write_text("package-v1\n", encoding="utf-8")
+            verification_helper.write_text("verify-v1\n", encoding="utf-8")
+            scripts = [package_helper, verification_helper]
+
+            def fingerprint() -> str:
+                return fast_package_fingerprint.fast_package_fingerprint(
+                    bundle,
+                    sign_identity="-",
+                    signing_mode="adhoc",
+                    scripts=scripts,
+                )
+
+            baseline = fingerprint()
+            provenance.write_text('{"generated":2}\n', encoding="utf-8")
+            self.assertEqual(fingerprint(), baseline)
+
+            resource.write_text('{"version":2}\n', encoding="utf-8")
+            resource_changed = fingerprint()
+            self.assertNotEqual(resource_changed, baseline)
+
+            resource.write_text('{"version":1}\n', encoding="utf-8")
+            verification_helper.write_text("verify-v2\n", encoding="utf-8")
+            self.assertNotEqual(fingerprint(), baseline)
+
     def test_debug_provenance_uses_json_validation_and_rejects_truncated_output(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         validator = SCRIPT_DIR / "validate_json.py"
@@ -125,7 +173,7 @@ class ReleaseToolingTests(unittest.TestCase):
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         sign_path_body = package_script.split("sign_path(){", 1)[1].split("\n}\nsign_sparkle_framework(){", 1)[0]
         app_signing_body = package_script.split("APP_SIGN_ARGS=()", 1)[1].split(
-            'run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"',
+            "if (( FAST_PACKAGE_CAN_SKIP_VERIFICATION )); then",
             1,
         )[0]
         temp_dir = Path(tempfile.mkdtemp())
@@ -2306,7 +2354,11 @@ label_generated_tip_appcast""",
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         self.assertIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve', release_script)
-        self.assertEqual(package_script.count('"$RUN_WITHOUT_GITHUB_TOKENS" swift build'), 5)
+        self.assertEqual(
+            package_script.count('"$CONTROL_PLANE_SCRIPTS_DIR/canonical_swift.sh" build'),
+            5,
+        )
+        self.assertNotIn('"$RUN_WITHOUT_GITHUB_TOKENS" swift build', package_script)
         self.assertIn(
             '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"',
             package_script,
@@ -2944,6 +2996,7 @@ esac
         self.run_checked(["git", "clone", str(remote), str(work)])
         self.git(work, "config", "user.email", "release-tests@example.com")
         self.git(work, "config", "user.name", "Release Tests")
+        self.git(work, "config", "commit.gpgsign", "false")
         self.git(work, "checkout", "-b", "main")
         return remote, work
 

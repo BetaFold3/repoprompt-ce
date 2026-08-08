@@ -160,17 +160,20 @@ struct WorkspaceCodemapGitCapabilityServiceHooks {
     var beforeResolution: @Sendable () async -> Void
     var afterFirstAuthorityCapture: @Sendable () async -> Void
     var afterSourcePathFingerprintCapture: @Sendable () async -> Void
+    var afterAuthorityEvidenceComponentStat: @Sendable (String, Bool) -> Void
     var afterAuthorityEvidenceOpen: @Sendable (URL) -> Void
 
     init(
         beforeResolution: @escaping @Sendable () async -> Void = {},
         afterFirstAuthorityCapture: @escaping @Sendable () async -> Void = {},
         afterSourcePathFingerprintCapture: @escaping @Sendable () async -> Void = {},
+        afterAuthorityEvidenceComponentStat: @escaping @Sendable (String, Bool) -> Void = { _, _ in },
         afterAuthorityEvidenceOpen: @escaping @Sendable (URL) -> Void = { _ in }
     ) {
         self.beforeResolution = beforeResolution
         self.afterFirstAuthorityCapture = afterFirstAuthorityCapture
         self.afterSourcePathFingerprintCapture = afterSourcePathFingerprintCapture
+        self.afterAuthorityEvidenceComponentStat = afterAuthorityEvidenceComponentStat
         self.afterAuthorityEvidenceOpen = afterAuthorityEvidenceOpen
     }
 
@@ -1321,6 +1324,7 @@ actor WorkspaceCodemapGitCapabilityService {
                 throw CapabilityCaptureError.layoutChanged
             }
             let isLeaf = index == components.count - 1
+            hooks.afterAuthorityEvidenceComponentStat(component, isLeaf)
             if !isLeaf, (linkStat.st_mode & S_IFMT) != S_IFDIR {
                 if missingAllowed { return nil }
                 throw POSIXError(.ENOTDIR)
@@ -1339,7 +1343,14 @@ actor WorkspaceCodemapGitCapabilityService {
             guard fstat(descriptor, &descriptorStat) == 0 else {
                 throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
             }
-            guard sameStableStat(linkStat, descriptorStat) else {
+            // Intermediate directories are traversal capabilities, not authority
+            // evidence. Sibling churn may change their size/timestamps without
+            // changing the descriptor-bound path. The leaf's complete stat is
+            // authority evidence and must remain stable across lookup and open.
+            let componentRemainedStable = isLeaf
+                ? sameStableStat(linkStat, descriptorStat)
+                : sameDescriptorIdentity(linkStat, descriptorStat)
+            guard componentRemainedStable else {
                 throw CapabilityCaptureError.layoutChanged
             }
             links.append(DescriptorLink(

@@ -121,13 +121,16 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
 
         let firstRoot = try await store.loadRoot(path: root.path)
         let firstRecord = try await firstFile(in: firstRoot, store: store)
-        await assertNonGit(store.requestCodemapArtifact(forFileID: firstRecord.id))
-        await assertNonGit(store.requestCodemapArtifact(forFileID: firstRecord.id))
+        let firstDemand = await store.requestCodemapArtifact(forFileID: firstRecord.id)
+        await assertEventuallyNonGit(firstDemand, store: store)
+        let cachedDemand = await store.requestCodemapArtifact(forFileID: firstRecord.id)
+        await assertEventuallyNonGit(cachedDemand, store: store)
         await store.unloadRoot(id: firstRoot.id)
 
         let secondRoot = try await store.loadRoot(path: root.path)
         let secondRecord = try await firstFile(in: secondRoot, store: store)
-        await assertNonGit(store.requestCodemapArtifact(forFileID: secondRecord.id))
+        let reloadedDemand = await store.requestCodemapArtifact(forFileID: secondRecord.id)
+        await assertEventuallyNonGit(reloadedDemand, store: store)
         await store.unloadRoot(id: secondRoot.id)
 
         XCTAssertNotEqual(firstRoot.id, secondRoot.id)
@@ -287,6 +290,49 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
         guard case .unavailable(.gitTerminal(.nonGit)) = result else {
             return XCTFail("Expected terminal non-Git result, got \(result)", file: file, line: line)
         }
+    }
+
+    private func assertEventuallyNonGit(
+        _ initial: WorkspaceCodemapArtifactDemandResult,
+        store: WorkspaceFileContextStore,
+        timeout: Duration = .seconds(10),
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        var result = initial
+        guard case let .pending(ticket) = result else {
+            assertNonGit(result, file: file, line: line)
+            return
+        }
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        var delay: Duration = .milliseconds(1)
+        while clock.now < deadline {
+            result = await store.codemapArtifactDemandStatus(ticket)
+            guard case .pending = result else {
+                assertNonGit(result, file: file, line: line)
+                return
+            }
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                XCTFail(
+                    "Cancelled while waiting for terminal non-Git classification; " +
+                        "last result = \(result).",
+                    file: file,
+                    line: line
+                )
+                return
+            }
+            delay = min(delay * 2, .milliseconds(50))
+        }
+
+        XCTFail(
+            "Timed out waiting for terminal non-Git classification; last result = \(result).",
+            file: file,
+            line: line
+        )
     }
 
     private func settledReady(
