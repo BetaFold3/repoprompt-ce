@@ -78,6 +78,16 @@ enum AgentModeMCPToolPolicy {
 
     static let cursorGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
 
+    /// OMP is launched with no native tools; RepoPrompt MCP is its sole tool surface.
+    static let ohMyPiGrantedCapabilities: Set<MCPToolCapability> = [
+        .userInteraction,
+        .agentSessionControl,
+        .agentConversationSend,
+        .conversationLog
+    ]
+
+    static let ohMyPiGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: ohMyPiGrantedCapabilities)
+
     static func grantedTools(
         forAgent agent: AgentProviderKind,
         sessionProfile: AgentSessionProfile = .standard
@@ -91,6 +101,8 @@ enum AgentModeMCPToolPolicy {
             openCodeGrantedTools
         case .cursor:
             cursorGrantedTools
+        case .ohMyPi:
+            ohMyPiGrantedTools
         }
         return sessionProfile == .knowledge
             ? tools.intersection(knowledgeAllowedTools)

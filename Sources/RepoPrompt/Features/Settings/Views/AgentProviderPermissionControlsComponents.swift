@@ -89,6 +89,7 @@ struct AgentProviderPermissionLevelSection: View {
         case .codex, .claude: "Permission Level"
         case .openCode: "ACP Session Mode"
         case .cursor: "ACP Auto-Approve"
+        case .ohMyPi: "Managed ACP Profile"
         }
     }
 }
@@ -139,7 +140,7 @@ struct AgentProviderToolsRuntimeDisclosure: View {
         switch providerID {
         case .codex: binding.codexTools != nil
         case .claude: binding.claudeTools != nil
-        case .openCode, .cursor: false
+        case .openCode, .cursor, .ohMyPi: false
         }
     }
 }
@@ -167,7 +168,7 @@ struct AgentProviderToolsRuntimeControls: View {
                         onApplyMutation: onApplyClaudeToolSettingMutation
                     )
                 }
-            case .openCode, .cursor:
+            case .openCode, .cursor, .ohMyPi:
                 EmptyView()
             }
         }

@@ -135,6 +135,8 @@ final class AgentProviderPreferenceSnapshotStore {
                 autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
                 acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
             )
+        case .ohMyPi:
+            return AgentProviderRuntimePermissionBinding()
         }
     }
 
@@ -149,6 +151,8 @@ final class AgentProviderPreferenceSnapshotStore {
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case .ohMyPi:
+            break
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -344,6 +348,24 @@ final class AgentProviderPreferenceSnapshotStore {
                     )
                 }
             )
+        case .ohMyPi:
+            let effective = OhMyPiAgentToolPreferences.PermissionLevel.managedBarebones
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: false,
+                externallyManagedReason: externallyManagedReason,
+                options: [AgentPermissionOptionBinding(
+                    id: .ohMyPi(effective),
+                    title: effective.displayName,
+                    iconName: effective.iconName,
+                    detailText: effective.detailText,
+                    isWarning: false,
+                    isSelected: true,
+                    isEnabled: false
+                )]
+            )
         }
     }
 
@@ -513,6 +535,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .claude: .claudeCode
         case .openCode: .openCode
         case .cursor: .cursor
+        case .ohMyPi: .ohMyPi
         }
     }
 

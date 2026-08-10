@@ -235,7 +235,7 @@ struct AgentSubagentPolicySettingsView: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(AgentProviderBindingID.allCases, id: \.self) { providerID in
+                ForEach(AgentProviderBindingID.publicSettingsCases, id: \.self) { providerID in
                     customProviderRow(providerID: providerID)
                 }
             }

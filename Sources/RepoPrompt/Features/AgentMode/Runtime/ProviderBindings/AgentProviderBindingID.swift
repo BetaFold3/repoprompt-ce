@@ -5,6 +5,12 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
     case claude
     case openCode
     case cursor
+    case ohMyPi
+
+    /// User-facing provider rows exclude dark integrations without weakening exhaustive persistence sweeps.
+    static var publicSettingsCases: [Self] {
+        allCases.filter { $0 != .ohMyPi }
+    }
 
     var displayName: String {
         switch self {
@@ -16,6 +22,8 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
             "OpenCode"
         case .cursor:
             "Cursor CLI"
+        case .ohMyPi:
+            "Oh My Pi"
         }
     }
 }
@@ -31,6 +39,8 @@ extension AgentProviderKind {
             .openCode
         case .cursor:
             .cursor
+        case .ohMyPi:
+            .ohMyPi
         }
     }
 }

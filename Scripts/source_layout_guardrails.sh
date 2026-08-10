@@ -368,6 +368,9 @@ allowed_tracked_docs=(
   "docs/context/archive/2026-07-30-AGENTS.md"
   "docs/context/archive/2026-07-30-CLAUDE.md"
   "docs/context/archive/MANIFEST.md"
+  "docs/context/plans/completed/quick-model-picker-and-handoff-hud.md"
+  "docs/context/plans/omp-provider-integration.md"
+  "docs/context/quick-model-picker-and-handoff-hud.md"
   "docs/context/workflows/development.md"
   "docs/context/workflows/doc-gardening.md"
   "docs/context/workflows/validation.md"
@@ -416,6 +419,7 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-08-05-oracle-duel-hardening-transcript-qol.html"
   "docs/technical_implementation_reports/2026-08-06-claude-cli-executable-path-override.html"
   "docs/technical_implementation_reports/2026-08-08-build-test-performance-optimization.html"
+  "docs/technical_implementation_reports/2026-08-08-quick-model-picker-and-handoff-hud.html"
 )
 while IFS= read -r path; do
   allowed_tracked_docs+=("$path")

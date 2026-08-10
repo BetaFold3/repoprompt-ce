@@ -694,7 +694,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode:
+        case .openCode, .ohMyPi:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -3095,7 +3095,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .ohMyPi:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         }
         return optionID(for: options, preferences: preferences) ?? options.first?.optionID ?? ""
@@ -3123,7 +3123,7 @@ actor ACPAgentSessionController {
         switch provider.providerID {
         case .cursor:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
-        case .openCode:
+        case .openCode, .ohMyPi:
             return nil
         }
     }
@@ -3154,11 +3154,8 @@ actor ACPAgentSessionController {
         requestPayload: [String: Any],
         options: [PermissionOption]
     ) -> AutoApprovalSelection? {
-        guard let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
-            requestToolName: requestToolName,
-            requestPayload: requestPayload
-        ), isStrictACPRepoPromptPermissionMatch(
-            match,
+        guard let match = Self.repoPromptScopedAutoApprovalMatch(
+            providerID: provider.providerID,
             requestToolName: requestToolName,
             requestPayload: requestPayload
         ) else {
@@ -3166,7 +3163,7 @@ actor ACPAgentSessionController {
         }
 
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .ohMyPi:
             [
                 .optionID("always"),
                 .optionID("allow_always"),
@@ -3181,23 +3178,57 @@ actor ACPAgentSessionController {
         return AutoApprovalSelection(optionID: optionID, match: match)
     }
 
-    private func isStrictACPRepoPromptPermissionMatch(
+    static func repoPromptScopedAutoApprovalMatch(
+        providerID: ACPProviderID,
+        requestToolName: String?,
+        requestPayload: [String: Any]
+    ) -> MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch? {
+        // Keep this exhaustive switch as a forcing function: every new ACP provider must
+        // explicitly opt into strict RepoPrompt-tool recognition before duplicate approval.
+        switch providerID {
+        case .openCode, .cursor, .ohMyPi:
+            break
+        }
+        guard let match = MCPIntegrationHelper.repoPromptPermissionAutoApprovalMatch(
+            requestToolName: requestToolName,
+            requestPayload: requestPayload
+        ), isStrictACPRepoPromptPermissionMatch(
+            match,
+            requestToolName: requestToolName,
+            requestPayload: requestPayload
+        ) else {
+            return nil
+        }
+        return match
+    }
+
+    private static func isStrictACPRepoPromptPermissionMatch(
         _ match: MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch,
         requestToolName: String?,
         requestPayload: [String: Any]
     ) -> Bool {
+        let hasExactServerIdentity = isExactRepoPromptPermissionServerIdentifier(match.serverIdentifier)
+            || isExactRepoPromptPermissionServerIdentifier(
+                MCPIntegrationHelper.repoPromptPermissionServerIdentifier(in: requestPayload)
+            )
         switch match.source {
         case .serverIdentifier:
-            return true
+            return hasExactServerIdentity
         case .topLevelToolName:
-            if let requestToolName, MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(requestToolName) {
-                return true
-            }
-            return MCPIntegrationHelper.repoPromptPermissionServerIdentifier(in: requestPayload) != nil
+            return (requestToolName.map(MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix) ?? false)
+                || hasExactServerIdentity
         case .nestedToolName:
             return MCPIntegrationHelper.repoPromptPermissionContainsServerPrefixedToolName(in: requestPayload)
-                || MCPIntegrationHelper.repoPromptPermissionServerIdentifier(in: requestPayload) != nil
+                || hasExactServerIdentity
         }
+    }
+
+    private static func isExactRepoPromptPermissionServerIdentifier(_ rawValue: String?) -> Bool {
+        guard let normalized = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalized.isEmpty else { return false }
+        let serverName = MCPIntegrationHelper.repoPromptMCPServerName
+        return normalized.caseInsensitiveCompare(serverName) == .orderedSame
+            || normalized.caseInsensitiveCompare("\(serverName) MCP Server") == .orderedSame
     }
 
     private func repoPromptPermissionAutoApprovalPayload(
@@ -3358,6 +3389,8 @@ actor ACPAgentSessionController {
                 "RP_CURSOR_RAW_CAPTURE_PATH"
             case .openCode:
                 "RP_OPENCODE_ACP_RAW_CAPTURE_PATH"
+            case .ohMyPi:
+                "RP_OMP_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3847,6 +3880,8 @@ actor ACPAgentSessionController {
                 "RP_CURSOR_ACP_FRAGMENT_DIAGNOSTICS"
             case .openCode:
                 "RP_OPENCODE_ACP_FRAGMENT_DIAGNOSTICS"
+            case .ohMyPi:
+                "RP_OMP_ACP_FRAGMENT_DIAGNOSTICS"
             }
             return isTruthyEnvironmentFlag(env[providerSpecificKey])
         }

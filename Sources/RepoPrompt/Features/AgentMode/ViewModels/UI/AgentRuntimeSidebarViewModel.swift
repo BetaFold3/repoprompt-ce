@@ -83,7 +83,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         private var fallbackContextWindowTokens: Int {
             switch selectedAgent {
             case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: 200_000
-            case .openCode, .cursor: 200_000
+            case .openCode, .cursor, .ohMyPi: 200_000
             case .codexExec, .none: 200_000
             }
         }

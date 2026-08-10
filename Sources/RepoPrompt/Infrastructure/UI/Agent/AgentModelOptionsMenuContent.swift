@@ -172,8 +172,11 @@ struct AgentModelOptionsMenuContent: View {
                     modelOptionButton(option)
                 }
             }
-        } else if agentKind == .openCode {
-            ForEach(AgentModelCatalog.openCodeMenu(for: options).providerGroups) { providerGroup in
+        } else if agentKind == .openCode || agentKind == .ohMyPi {
+            ForEach(AgentModelCatalog.openCodeMenu(
+                for: options,
+                providerID: agentKind.acpProviderID ?? .openCode
+            ).providerGroups) { providerGroup in
                 if providerGroup.rendersAsSubmenu {
                     Menu(providerGroup.displayName) {
                         openCodeModelGroupContent(providerGroup.groups)
@@ -372,8 +375,11 @@ enum AgentModelStableMenuItems {
                 onSelect: onSelect
             )
         }
-        if agentKind == .openCode, groupOpenCode {
-            return AgentModelCatalog.openCodeMenu(for: visibleOptions).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
+        if agentKind == .openCode || agentKind == .ohMyPi, groupOpenCode {
+            return AgentModelCatalog.openCodeMenu(
+                for: visibleOptions,
+                providerID: agentKind.acpProviderID ?? .openCode
+            ).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
                 let modelItems = providerGroup.groups.map { group in
                     openCodeModelItem(
                         agentKind: agentKind,

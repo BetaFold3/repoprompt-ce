@@ -168,6 +168,13 @@ final class AgentModeRunService {
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         let selectedAgent = session.selectedAgent
+        if selectedAgent == .ohMyPi,
+           !AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable
+        {
+            let message = "Oh My Pi support is not enabled in this build."
+            await failBeforeProviderStartup(session: session, message: message)
+            return nil
+        }
         if session.profile == .knowledge,
            !KnowledgeSessionPolicy.supportedProviders.contains(selectedAgent)
         {

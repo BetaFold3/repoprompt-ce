@@ -1,6 +1,6 @@
 # Agent Provider Plugin Seam
 
-Current as of 2026-05-13. This document is contributor-facing: use it when you are wiring a new autonomous-agent provider, editing the Claude-compatible runtime, or moving code across the core ↔ plugin boundary.
+Current as of 2026-08-09. This document is contributor-facing: use it when you are wiring a new autonomous-agent provider, editing the Claude-compatible runtime, or moving code across the core ↔ plugin boundary.
 
 ## Scope and goals
 
@@ -226,6 +226,27 @@ protocol NativeAgentRuntimeControlling: Actor {
 The associated event/session/turn types are currently `typealias`es over the Claude-native runtime DTOs (`NativeAgentRuntimeEvent = ClaudeNativeProcessSessionController.Event`, etc.). When a second native provider arrives, the aliases will become proper neutral DTOs and the Claude controller will conform via its own mapping. Until then the alias layer keeps the seam ergonomic without forcing churn on coordinators, runners, and tab-session storage.
 
 `ClaudeSessionControlling` is retained as a backwards-compatible alias for existing Claude call sites.
+
+
+## Oh My Pi managed ACP integration (dark)
+
+Oh My Pi (OMP) is implemented as an app-internal ACP provider under `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/`, not through the Claude-compatible package seam. Its stable identities are `ACPProviderID.ohMyPi`, `AgentProviderKind.ohMyPi`, and `AgentProviderBindingID.ohMyPi` (raw `"ohMyPi"`); the executable is `omp` and the runtime kind is `"omp_acp"`. The provisional expected-PID routing hint `"oh-my-pi"` comes only from the observed ACP `agentInfo.name`; no live OMP MCP `clientInfo.name` or PID match has been captured. The hint and provider remain dark until that tool-round-trip/PID evidence exists.
+
+RepoPrompt owns the launch profile. New processes receive exactly:
+
+```text
+omp acp --no-tools --no-extensions --no-skills --no-rules --approval-mode yolo
+```
+
+There is no argument passthrough or per-flag opt-out. Preflight resolves a trusted executable (including the OMP/Bun home-bin hint), separately requires `omp acp --help` to exit successfully, validates every managed global flag in `omp --help`, and rejects versions older than the locally captured `17.2.12` baseline. OMP 17.2.12's ACP subcommand help contains only subcommand usage, so it is not used as evidence for global flags.
+
+Sessions are intentionally fresh-only. `session/new` receives exactly one command-shaped RepoPrompt stdio MCP server for interactive/headless runs; model discovery uses no MCP server. A resume candidate is never authorization for `session/load`, and the headless adapter discards it. Transcript handoff is prepended to the new prompt instead. Models are dynamic ACP `configOptions` data stored in `AgentACPModelRegistry`, with `Default` as the sole static sentinel. RepoPrompt does not set OMP's `thinking` option.
+
+The OMP permission binding has its own RepoPrompt MCP capability grant and a fixed managed-barebones profile. ACP duplicate approval is allowed only for an exact known RepoPrompt server identity and/or an explicit server-prefixed canonical RepoPrompt tool name; substring server matches and unrecognized requests retain the existing interactive behavior. This optimization does not change the server-side MCP permission decision.
+
+This implementation remains deliberately dark. `AvailabilityContext.current.ohMyPiAvailable` is false, and OMP is excluded from public provider lists, Context Builder's public agent schema, generic binding/subagent Settings rows, recommendations, and task-label resolution. Settings exposes only a labeled diagnostic/model-cache surface; a successful probe does not flip availability. Headless OMP waits for the already-registered MCP routing signal before sending its first prompt, while `MCPBootstrapLease` remains the routing cleanup owner.
+
+Do not treat this as release-ready. Public availability remains blocked on live evidence for: RepoPrompt stdio MCP round-trip, poisoned-workspace isolation, real-call yolo suppression, deny enforcement, captured tool-event shapes/card recognition, at least a 10-minute MCP call, authenticated prompt lifecycle, and cancellation/crash cleanup. Cross-process `session/load` with MCP re-registration must additionally be proven before resume can be considered. OMP has no supported CE timeout override today; do not add a speculative one.
 
 ## ACP provider MCP tool-call timeouts
 

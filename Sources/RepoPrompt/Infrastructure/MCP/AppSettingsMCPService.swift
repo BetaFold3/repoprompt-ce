@@ -812,7 +812,7 @@ private enum AppSettingsMCPRegistry {
             key: "context_builder.agent",
             group: "context_builder",
             description: "CLI agent used by the Context Builder MCP tool.",
-            allowedValues: AgentProviderKind.allCases.map(\.rawValue),
+            allowedValues: AgentProviderKind.publicContextBuilderCases.map(\.rawValue),
             read: { .string($0.globalContextBuilderAgentSelection().agentRaw ?? AgentProviderKind.claudeCode.rawValue) },
             write: { store, value in
                 let agentRaw = try requiredString(from: value)
@@ -1469,6 +1469,8 @@ private enum AppSettingsMCPRegistry {
             .openCode
         case .cursor:
             .cursor
+        case .ohMyPi:
+            nil
         }
     }
 

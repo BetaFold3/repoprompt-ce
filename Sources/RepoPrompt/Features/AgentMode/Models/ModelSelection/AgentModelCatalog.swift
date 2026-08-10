@@ -6,6 +6,7 @@ enum AgentModelCatalog {
         let codexAvailable: Bool
         let openCodeAvailable: Bool
         let cursorAvailable: Bool
+        let ohMyPiAvailable: Bool
         let zaiConfigured: Bool
         let kimiConfigured: Bool
         let customClaudeCompatibleConfigured: Bool
@@ -15,6 +16,7 @@ enum AgentModelCatalog {
             codexAvailable: false,
             openCodeAvailable: false,
             cursorAvailable: false,
+            ohMyPiAvailable: false,
             zaiConfigured: false,
             kimiConfigured: false,
             customClaudeCompatibleConfigured: false
@@ -26,6 +28,7 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable && providers.contains(.codex),
                 openCodeAvailable: false,
                 cursorAvailable: cursorAvailable && providers.contains(.cursor),
+                ohMyPiAvailable: false,
                 zaiConfigured: zaiConfigured && providers.contains(.claudeCode),
                 kimiConfigured: kimiConfigured && providers.contains(.claudeCode),
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured && providers.contains(.claudeCode)
@@ -39,6 +42,7 @@ enum AgentModelCatalog {
                 codexAvailable: true,
                 openCodeAvailable: true,
                 cursorAvailable: false,
+                ohMyPiAvailable: false,
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -50,6 +54,7 @@ enum AgentModelCatalog {
             codexAvailable: Bool = true,
             openCodeAvailable: Bool = true,
             cursorAvailable: Bool = false,
+            ohMyPiAvailable: Bool = false,
             zaiConfigured: Bool = false,
             kimiConfigured: Bool = false,
             customClaudeCompatibleConfigured: Bool = false
@@ -58,6 +63,7 @@ enum AgentModelCatalog {
             self.codexAvailable = codexAvailable
             self.openCodeAvailable = openCodeAvailable
             self.cursorAvailable = cursorAvailable
+            self.ohMyPiAvailable = ohMyPiAvailable
             self.zaiConfigured = zaiConfigured
             self.kimiConfigured = kimiConfigured
             self.customClaudeCompatibleConfigured = customClaudeCompatibleConfigured
@@ -80,6 +86,7 @@ enum AgentModelCatalog {
                 codexAvailable: codexAvailable || agentKind == .codexExec,
                 openCodeAvailable: openCodeAvailable || agentKind == .openCode,
                 cursorAvailable: cursorAvailable || agentKind == .cursor,
+                ohMyPiAvailable: ohMyPiAvailable || agentKind == .ohMyPi,
                 zaiConfigured: zaiConfigured || agentKind == .claudeCodeGLM,
                 kimiConfigured: kimiConfigured || agentKind == .kimiCode,
                 customClaudeCompatibleConfigured: customClaudeCompatibleConfigured || agentKind == .customClaudeCompatible
@@ -216,6 +223,8 @@ enum AgentModelCatalog {
             availability.openCodeAvailable
         case .cursor:
             availability.cursorAvailable
+        case .ohMyPi:
+            availability.ohMyPiAvailable
         }
     }
 
@@ -228,6 +237,9 @@ enum AgentModelCatalog {
         if agentKind == .cursor {
             return AgentModel.cursorAuto.rawValue
         }
+        if agentKind == .ohMyPi {
+            return AgentModel.defaultModel.rawValue
+        }
         if isAgentAvailable(agentKind, availability: availability),
            let preferredModelRaw = resolvedACPDiscoveredModels(for: agentKind)?.preferredModelRaw
         {
@@ -239,7 +251,7 @@ enum AgentModelCatalog {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             return ClaudeCompatibleModelCatalogAdapter.defaultModelRaw(for: agentKind, availability: availability)
                 ?? AgentModel.defaultModel.rawValue
-        case .codexExec, .openCode:
+        case .codexExec, .openCode, .ohMyPi:
             return AgentModel.defaultModel.rawValue
         }
     }
@@ -329,6 +341,17 @@ enum AgentModelCatalog {
             }
             return fallbacks
         }
+        if agentKind == .ohMyPi {
+            let sentinel = staticOption(.defaultModel, for: .ohMyPi)
+            guard let discoveredOptions = resolvedACPDiscoveredModels(for: .ohMyPi)?.options,
+                  !discoveredOptions.isEmpty
+            else {
+                return [sentinel]
+            }
+            return [sentinel] + discoveredOptions.filter {
+                $0.rawValue.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+            }
+        }
         if let discoveredOptions = resolvedACPDiscoveredModels(for: agentKind)?.options,
            !discoveredOptions.isEmpty
         {
@@ -347,7 +370,7 @@ enum AgentModelCatalog {
                 availability: availability,
                 includeClaudeEffortVariants: includeClaudeEffortVariants
             ) ?? []
-        case .openCode, .cursor:
+        case .openCode, .cursor, .ohMyPi:
             return AgentModel.modelsForAgent(agentKind)
                 .filter { isAvailable($0, for: agentKind, availability: availability) }
                 .map { staticOption($0, for: agentKind) }
@@ -366,6 +389,11 @@ enum AgentModelCatalog {
         guard !normalized.isEmpty else { return false }
         if agentKind == .cursor,
            normalized.caseInsensitiveCompare(AgentModel.cursorAuto.rawValue) == .orderedSame
+        {
+            return true
+        }
+        if agentKind == .ohMyPi,
+           normalized.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
         {
             return true
         }
@@ -496,7 +524,10 @@ enum AgentModelCatalog {
         return baseDisplayName(for: effectiveRaw)
     }
 
-    static func openCodeMenu(for options: [AgentModelOption]) -> OpenCodeMenu {
+    static func openCodeMenu(
+        for options: [AgentModelOption],
+        providerID: ACPProviderID = .openCode
+    ) -> OpenCodeMenu {
         struct Entry {
             let option: AgentModelOption
             let providerID: String?
@@ -509,7 +540,10 @@ enum AgentModelCatalog {
         }
 
         let entries = options.enumerated().map { index, option -> Entry in
-            let normalized = normalizedOpenCodeVariant(option: option)
+            let normalized = normalizedOpenCodeVariant(
+                option: option,
+                groupsReasoningSuffixes: providerID == .openCode
+            )
             return Entry(
                 option: option,
                 providerID: normalized.providerID,
@@ -1245,7 +1279,8 @@ enum AgentModelCatalog {
     }
 
     private static func normalizedOpenCodeVariant(
-        option: AgentModelOption
+        option: AgentModelOption,
+        groupsReasoningSuffixes: Bool
     ) -> (
         providerID: String?,
         providerDisplayName: String?,
@@ -1256,9 +1291,15 @@ enum AgentModelCatalog {
     ) {
         let rawValue = option.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let displayName = option.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let displayAnalysis = stripOpenCodeParenthesizedVariant(from: displayName)
-        let rawSlashAnalysis = stripOpenCodeSlashVariant(from: rawValue)
-        let rawParenAnalysis = stripOpenCodeParenthesizedVariant(from: rawValue)
+        let displayAnalysis = groupsReasoningSuffixes
+            ? stripOpenCodeParenthesizedVariant(from: displayName)
+            : nil
+        let rawSlashAnalysis = groupsReasoningSuffixes
+            ? stripOpenCodeSlashVariant(from: rawValue)
+            : nil
+        let rawParenAnalysis = groupsReasoningSuffixes
+            ? stripOpenCodeParenthesizedVariant(from: rawValue)
+            : nil
 
         let rawVariant = rawSlashAnalysis?.variant ?? rawParenAnalysis?.variant
         let trailingDisplayAnalysis = rawVariant.flatMap { stripOpenCodeTrailingVariantWord(from: displayName, expected: $0) }
@@ -1477,7 +1518,7 @@ enum AgentModelCatalog {
             .kimi
         case .customClaudeCompatible:
             .custom
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .ohMyPi:
             nil
         }
     }
@@ -1680,7 +1721,7 @@ enum AgentModelCatalog {
             availability.kimiConfigured
         case .customClaudeCompatible:
             availability.customClaudeCompatibleConfigured
-        case .claudeCode, .codexExec, .openCode, .cursor:
+        case .claudeCode, .codexExec, .openCode, .cursor, .ohMyPi:
             true
         }
     }
@@ -2015,7 +2056,6 @@ enum AgentModelCatalog {
     ) -> [DiscoveryTaskLabel] {
         taskLabels.compactMap { entry in
             guard let resolved = resolveTaskLabelKind(entry.kind, availability: availability) else { return nil }
-            let selectionID = AgentModelSelectionID(agentRaw: resolved.agent.rawValue, modelRaw: resolved.modelRaw)
             let name = displayName(for: resolved.modelRaw, agentKind: resolved.agent, availability: availability)
             return DiscoveryTaskLabel(
                 label: entry.label,
@@ -2032,9 +2072,11 @@ enum AgentModelCatalog {
     static func discoveryAgents(
         availability: AvailabilityContext = .current
     ) -> [DiscoveryAgent] {
-        AgentProviderKind.allCases.map { agent in
-            discoveryAgent(agent, availability: availability)
-        }
+        AgentProviderKind.allCases
+            .filter { $0 != .ohMyPi }
+            .map { agent in
+                discoveryAgent(agent, availability: availability)
+            }
     }
 
     /// Resolves a selection ID string to an agent + modelRaw pair.

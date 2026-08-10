@@ -386,7 +386,7 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
-            case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            case .openCode, .ohMyPi, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
             }
         }) else {
@@ -404,7 +404,7 @@ final class AutoRecommendationEngine {
         for agent: AgentProviderKind,
         availability: AgentModelCatalog.AvailabilityContext
     ) -> Bool {
-        if agent == .openCode,
+        if agent == .openCode || agent == .ohMyPi,
            rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
            .caseInsensitiveCompare(AgentModel.defaultModel.rawValue) == .orderedSame
         {

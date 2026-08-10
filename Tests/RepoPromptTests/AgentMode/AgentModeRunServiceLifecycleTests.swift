@@ -105,6 +105,72 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testDarkOhMyPiPersistedOrMCPConfiguredSelectionFailsBeforeProviderDispatch() async throws {
+        XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
+
+        let recorder = LifecycleRecorder()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in
+                recorder.record("workspace")
+                return FileManager.default.currentDirectoryPath
+            },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .ohMyPi)
+                recorder.record("factory:acp-provider")
+                return provider
+            },
+            acpControllerFactory: { _, _ in
+                recorder.record("factory:acp-controller")
+                throw LifecycleTestError.unexpectedACPControllerCreation
+            }
+        )
+        let persistedSelection = AgentModelCatalog.normalizePersistedSelection(
+            agentRaw: AgentProviderKind.ohMyPi.rawValue,
+            modelRaw: AgentModel.defaultModel.rawValue
+        )
+        XCTAssertEqual(persistedSelection.agent, .ohMyPi)
+
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = persistedSelection.agent
+        session.selectedModelRaw = persistedSelection.modelRaw
+        harness.host.test_installLiveSession(session)
+        try await harness.host.mcpConfigureSession(
+            tabID: session.tabID,
+            agentRaw: AgentProviderKind.ohMyPi.rawValue,
+            modelRaw: AgentModel.defaultModel.rawValue,
+            reasoningEffortRaw: nil
+        )
+        XCTAssertEqual(session.selectedAgent, .ohMyPi)
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "start",
+            initialMessageForRun: "start",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertNil(session.activeRunAttemptID)
+        XCTAssertNil(session.agentTask)
+        XCTAssertNil(session.acpController)
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .error }.map(\.text),
+            ["Oh My Pi support is not enabled in this build."]
+        )
+        XCTAssertFalse(recorder.contains("workspace"))
+        XCTAssertFalse(recorder.contains(prefix: "factory:"))
+        XCTAssertFalse(recorder.contains("provider:support"))
+    }
+
     func testCodexRejectedSendOnlyEndsOwnershipCreatedByInvocation() async {
         let recorder = LifecycleRecorder()
         let codexController = LifecycleNoopCodexController(recorder: recorder, failSend: true)

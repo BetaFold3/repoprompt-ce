@@ -293,7 +293,7 @@ enum AgentModel: String, CaseIterable, Codable {
                 .claudeSonnet, .claudeSonnet5, .claudeSonnet46, .claudeSonnet45,
                 .claudeHaiku, .claudeHaiku45
             ]
-        case .openCode:
+        case .openCode, .ohMyPi:
             [.defaultModel]
         case .cursor:
             [.cursorAuto, .cursorComposer2]

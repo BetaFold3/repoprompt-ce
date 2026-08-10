@@ -101,19 +101,23 @@ final class AgentACPModelRegistry {
         return liveSnapshotsByProvider[providerID] ?? persistedSnapshotsByProvider[providerID]
     }
 
+    func reset(providerID: ACPProviderID) {
+        lock.lock()
+        liveSnapshotsByProvider.removeValue(forKey: providerID)
+        liveSignaturesByProvider.removeValue(forKey: providerID)
+        persistedSnapshotsByProvider.removeValue(forKey: providerID)
+        standardStoreWarmTask?.cancel()
+        standardStoreWarmTask = nil
+        didWarmStandardStore = false
+        standardStoreWarmGeneration &+= 1
+        lock.unlock()
+        ACPDynamicModelStore.remove(providerID: providerID)
+    }
+
     #if DEBUG
         @_spi(TestSupport)
         public func test_reset(providerID: ACPProviderID) {
-            lock.lock()
-            liveSnapshotsByProvider.removeValue(forKey: providerID)
-            liveSignaturesByProvider.removeValue(forKey: providerID)
-            persistedSnapshotsByProvider.removeValue(forKey: providerID)
-            standardStoreWarmTask?.cancel()
-            standardStoreWarmTask = nil
-            didWarmStandardStore = false
-            standardStoreWarmGeneration &+= 1
-            lock.unlock()
-            ACPDynamicModelStore.remove(providerID: providerID)
+            reset(providerID: providerID)
         }
 
         @_spi(TestSupport)

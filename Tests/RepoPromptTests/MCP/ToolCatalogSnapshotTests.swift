@@ -80,7 +80,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             .customClaudeCompatible: claudeBinaryGuidance,
             .codexExec: codexBinaryGuidance,
             .openCode: openCodeBinaryGuidance,
-            .cursor: providerNeutralBinaryGuidance
+            .cursor: providerNeutralBinaryGuidance,
+            .ohMyPi: providerNeutralBinaryGuidance
         ]
         let allBinaryGuidance = [
             claudeBinaryGuidance,

@@ -1,0 +1,11 @@
+{
+  "protocolVersion": 1,
+  "agentInfo": {"name": "oh-my-pi", "title": "Oh My Pi", "version": "17.2.12"},
+  "authMethods": [{"id": "agent"}],
+  "agentCapabilities": {
+    "loadSession": true,
+    "mcpCapabilities": {"http": true, "sse": true},
+    "promptCapabilities": {"embeddedContext": true, "image": true},
+    "sessionCapabilities": {"list": true, "fork": true, "resume": true, "close": true}
+  }
+}

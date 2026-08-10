@@ -171,8 +171,11 @@ struct AgentModelSelectionIndex {
                     }
                 }
 
-            case .openCode:
-                let menu = AgentModelCatalog.openCodeMenu(for: options)
+            case .openCode, .ohMyPi:
+                let menu = AgentModelCatalog.openCodeMenu(
+                    for: options,
+                    providerID: agent.acpProviderID ?? .openCode
+                )
                 for providerGroup in menu.providerGroups {
                     for group in providerGroup.groups {
                         for menuOption in group.options {

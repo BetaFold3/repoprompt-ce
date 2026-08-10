@@ -105,7 +105,7 @@ final class ClaudeProvisionalContextWindowResolver {
                 forRequestedModelRaw: modelRaw,
                 agentKind: agentKind
             )
-        case .claudeCode, .kimiCode, .customClaudeCompatible, .codexExec, .openCode, .cursor:
+        case .claudeCode, .kimiCode, .customClaudeCompatible, .codexExec, .openCode, .cursor, .ohMyPi:
             nil
         }
     }

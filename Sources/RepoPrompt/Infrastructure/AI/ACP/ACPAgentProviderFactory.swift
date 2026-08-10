@@ -14,6 +14,13 @@ enum ACPAgentProviderFactory {
                     toolProfile: .agentMode
                 )
             )
+        case .ohMyPi:
+            OhMyPiACPAgentProvider(
+                config: OhMyPiAgentConfig(
+                    modelString: modelString,
+                    enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging
+                )
+            )
         case .cursor:
             CursorACPAgentProvider(
                 config: CursorAgentConfig(

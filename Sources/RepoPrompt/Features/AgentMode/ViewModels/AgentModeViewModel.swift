@@ -663,6 +663,7 @@ final class AgentModeViewModel: ObservableObject {
     var provisionalClaudeContextWindowResolver = ClaudeProvisionalContextWindowResolver()
     var provisionalClaudeContextWindowInFlightKeys: Set<ClaudeProvisionalContextWindowResolver.Key> = []
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
+    private var ohMyPiModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private var remoteCatalogLoadTasksByHostID: [String: Task<Void, Never>] = [:]
     #if DEBUG
@@ -1779,6 +1780,7 @@ final class AgentModeViewModel: ObservableObject {
         guard usesProductionAgentDefaultsAndModelPolling else { return }
         codexCoordinator.updateCodexModelPolling()
         updateOpenCodeModelPolling()
+        updateOhMyPiModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
     }
 
@@ -1810,6 +1812,36 @@ final class AgentModeViewModel: ObservableObject {
     private func stopOpenCodeModelsSubscription() {
         openCodeModelsSubscriptionTask?.cancel()
         openCodeModelsSubscriptionTask = nil
+    }
+
+    private func updateOhMyPiModelPolling() {
+        if selectedAgent == .ohMyPi {
+            startOhMyPiModelsSubscriptionIfNeeded()
+        } else {
+            stopOhMyPiModelsSubscription()
+        }
+    }
+
+    private func startOhMyPiModelsSubscriptionIfNeeded() {
+        guard ohMyPiModelsSubscriptionTask == nil else { return }
+        let workspacePath = workspacePathProvider()
+        ohMyPiModelsSubscriptionTask = Task { [weak self, workspacePath] in
+            let stream = await OhMyPiACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await _ in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    acpDynamicModelRevision &+= 1
+                    syncSelectedACPModelFromRegistryIfNeeded(for: .ohMyPi)
+                    syncComposerUIState()
+                }
+            }
+        }
+    }
+
+    private func stopOhMyPiModelsSubscription() {
+        ohMyPiModelsSubscriptionTask?.cancel()
+        ohMyPiModelsSubscriptionTask = nil
     }
 
     private func updateCursorModelPolling(startPolling: Bool = true) {
@@ -2325,6 +2357,7 @@ final class AgentModeViewModel: ObservableObject {
         cancellables.removeAll()
         uiRefreshTask?.cancel()
         openCodeModelsSubscriptionTask?.cancel()
+        ohMyPiModelsSubscriptionTask?.cancel()
         cursorModelsSubscriptionTask?.cancel()
         for task in remoteCatalogLoadTasksByHostID.values {
             task.cancel()
@@ -4684,7 +4717,7 @@ final class AgentModeViewModel: ObservableObject {
                     configuredContextWindow: session.claudeConfiguredContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .ohMyPi:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -14238,7 +14271,7 @@ final class AgentModeViewModel: ObservableObject {
     ) -> String {
         guard !attachments.isEmpty else { return text }
         switch agent {
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor, .ohMyPi:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec:
             return text

@@ -156,6 +156,18 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: "Auto-accept: \(level.acceptsPendingApprovalWhenActivated ? "on" : "off")",
                 warnings: warnings
             )
+        case .ohMyPi:
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "RepoPrompt MCP policy",
+                shell: "No native shell",
+                externalMCP: "RepoPrompt MCP only",
+                search: "RepoPrompt MCP only",
+                approvalModeDescription: "OMP yolo; strict RepoPrompt-only duplicate approval",
+                warnings: ["Dark integration: poisoned-workspace isolation and server-side deny behavior are not yet proven live."]
+            )
         case .cursor:
             let level = cursorPermissionLevel(profile: profile)
             let warnings = level == .fullAccess
@@ -193,6 +205,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .claude: availability.claudeCodeAvailable
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
+        case .ohMyPi: availability.ohMyPiAvailable
         }
     }
 

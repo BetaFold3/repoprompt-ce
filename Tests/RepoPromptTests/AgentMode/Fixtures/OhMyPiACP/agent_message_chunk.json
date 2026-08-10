@@ -1,0 +1,5 @@
+{
+  "sessionUpdate": "agent_message_chunk",
+  "messageId": "omp-standard-message-1",
+  "content": {"type": "text", "text": "OMP reply"}
+}

@@ -192,7 +192,7 @@ struct AgentModeGeneralSettingsView: View {
     /// Compact horizontal strip of per-provider status "lights". Uses the same
     /// green-dot / dim-dot vocabulary as `CLIProvidersSettingsView.connectionBadge`.
     private var cliStatusProviders: [AgentProviderBindingID] {
-        AgentProviderBindingID.allCases
+        AgentProviderBindingID.publicSettingsCases
     }
 
     private var providerStatusStrip: some View {
@@ -235,6 +235,7 @@ struct AgentModeGeneralSettingsView: View {
         case .codex: apiSettingsVM.isCodexConnected
         case .openCode: apiSettingsVM.isOpenCodeConnected
         case .cursor: apiSettingsVM.isCursorConnected
+        case .ohMyPi: false
         }
     }
 

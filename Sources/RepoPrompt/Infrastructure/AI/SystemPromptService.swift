@@ -687,7 +687,7 @@ class SystemPromptService {
             "Use the provider's native image or document reading tools for binary assets — always, including @path references in the user's message."
         case .openCode:
             "Binary and media files (images, screenshots, PDFs) cannot be read in this session; when the task depends on one — including an @path reference in the user's message — tell the user that limitation and ask for the content in a text form."
-        case .cursor, nil:
+        case .cursor, .ohMyPi, nil:
             "If the provider exposes a native image or document reading capability, use it for binary assets — including @path references in the user's message; if it does not, tell the user the file cannot be read and ask for the content in another form."
         }
 

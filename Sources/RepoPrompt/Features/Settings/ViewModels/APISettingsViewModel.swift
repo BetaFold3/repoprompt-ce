@@ -385,6 +385,11 @@ public class APISettingsViewModel: ObservableObject {
     @Published var openCodeError: String? = nil
     @Published private(set) var availableOpenCodeModelOptions: [AgentModelOption] = []
     private var openCodeLogCollector: CLIProcessLogCollector?
+    // Oh My Pi CLI / ACP (connection state is diagnostic only; public availability stays false)
+    @Published var isOhMyPiConnected: Bool = UserDefaults.standard.bool(forKey: "OhMyPiCLIConnected")
+    @Published var ohMyPiError: String? = nil
+    @Published private(set) var availableOhMyPiModelOptions: [AgentModelOption] = []
+    private var ohMyPiLogCollector: CLIProcessLogCollector?
     // Cursor Agent CLI / ACP
     @Published var isCursorConnected: Bool = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
     @Published var cursorError: String? = nil
@@ -441,6 +446,7 @@ public class APISettingsViewModel: ObservableObject {
     private var groqModelsTask: Task<Void, Never>? // NEW
     private var codexModelsTask: Task<Void, Never>?
     private var openCodeModelsTask: Task<Void, Never>?
+    private var ohMyPiModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
     private var openRouterModelsTask: Task<Void, Never>?
     private var customModelsTask: Task<Void, Never>?
@@ -575,7 +581,7 @@ public class APISettingsViewModel: ObservableObject {
             isOpenCodeConnected
         case .cursor:
             isCursorConnected
-        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .ohMyPi, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
     }
@@ -1478,6 +1484,8 @@ public class APISettingsViewModel: ObservableObject {
         stopCodexModelsSubscription()
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
+        ohMyPiModelsTask?.cancel()
+        ohMyPiModelsTask = nil
         cursorModelsTask?.cancel()
         cursorModelsTask = nil
         openRouterModelsTask?.cancel()
@@ -1503,6 +1511,7 @@ public class APISettingsViewModel: ObservableObject {
         groqModelsTask?.cancel()
         codexModelsTask?.cancel()
         openCodeModelsTask?.cancel()
+        ohMyPiModelsTask?.cancel()
         cursorModelsTask?.cancel()
         openRouterModelsTask?.cancel()
         customModelsTask?.cancel()
@@ -1809,6 +1818,8 @@ public class APISettingsViewModel: ObservableObject {
         codexModelsTask = nil
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
+        ohMyPiModelsTask?.cancel()
+        ohMyPiModelsTask = nil
         cursorModelsTask?.cancel()
         cursorModelsTask = nil
         openRouterModelsTask?.cancel()
@@ -1967,6 +1978,7 @@ public class APISettingsViewModel: ObservableObject {
             stopCodexModelsSubscription()
         }
         if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
+        if isOhMyPiConnected { startOhMyPiModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOhMyPiModelsSubscription(clearModels: true) }
         if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
         if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
         if isCustomProviderValid { customModelsTask = Task { await self.fetchCustomModels() } }
@@ -3816,6 +3828,110 @@ public class APISettingsViewModel: ObservableObject {
         openCodeModelsTask = nil
         if clearModels {
             availableOpenCodeModelOptions = []
+        }
+    }
+
+    // MARK: - Oh My Pi CLI / ACP
+
+    /// Diagnostic preflight only. A successful probe does not enable public OMP availability.
+    func testOhMyPiConnection() async throws -> Bool {
+        let collector = CLIProcessLogCollector()
+        collector.append("Oh My Pi CLI connection test started")
+        ohMyPiLogCollector = collector
+        await CLIEnvironmentCache.shared.invalidate()
+
+        do {
+            let snapshot = try await OhMyPiACPModelPollingService.shared.discoverOnce(workspacePath: nil)
+            guard let snapshot else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: "Oh My Pi ACP preflight completed but no model metadata was discovered."
+                )
+            }
+            availableOhMyPiModelOptions = snapshot.models.options
+            isOhMyPiConnected = true
+            ohMyPiError = nil
+            UserDefaults.standard.set(true, forKey: "OhMyPiCLIConnected")
+            startOhMyPiModelsSubscriptionIfNeeded(workspacePath: nil)
+            collector.append("Discovered \(snapshot.models.options.count) Oh My Pi model option(s); public availability remains disabled")
+            ohMyPiLogCollector = nil
+            NotificationCenter.default.post(name: .ohMyPiConnectionChanged, object: nil, userInfo: ["windowID": 0])
+            return true
+        } catch {
+            isOhMyPiConnected = false
+            ohMyPiError = friendlyOhMyPiMessage(for: error)
+            UserDefaults.standard.set(false, forKey: "OhMyPiCLIConnected")
+            stopOhMyPiModelsSubscription(clearModels: true)
+            collector.append("Connection test failed: \(ohMyPiError ?? error.localizedDescription)")
+            NotificationCenter.default.post(name: .ohMyPiConnectionChanged, object: nil, userInfo: ["windowID": 0])
+            throw error
+        }
+    }
+
+    func disconnectOhMyPi() {
+        isOhMyPiConnected = false
+        ohMyPiError = nil
+        UserDefaults.standard.set(false, forKey: "OhMyPiCLIConnected")
+        stopOhMyPiModelsSubscription(clearModels: true)
+        NotificationCenter.default.post(name: .ohMyPiConnectionChanged, object: nil, userInfo: ["windowID": 0])
+    }
+
+    func resetOhMyPiModels() async {
+        stopOhMyPiModelsSubscription(clearModels: true)
+        await OhMyPiACPModelPollingService.shared.reset()
+        availableOhMyPiModelOptions = []
+    }
+
+    private func friendlyOhMyPiMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError {
+            switch providerError {
+            case let .invalidConfiguration(detail):
+                return detail
+            case let .apiError(source):
+                return source?.localizedDescription ?? "Unknown Oh My Pi CLI error"
+            default:
+                return error.localizedDescription
+            }
+        }
+        return error.localizedDescription
+    }
+
+    func hasOhMyPiTrace() -> Bool {
+        ohMyPiLogCollector?.isEmpty == false
+    }
+
+    func dumpOhMyPiTrace() throws -> URL {
+        guard let collector = ohMyPiLogCollector else {
+            throw CLIProcessLogCollectorError.noEntries
+        }
+        collector.append("Exporting trace to Downloads folder")
+        let exportDate = Date()
+        let url = try collector.writeMarkdownToDownloads(
+            baseFilename: "RepoPrompt-OhMyPiTrace",
+            title: "Oh My Pi CLI Diagnostic Trace",
+            timestamp: exportDate
+        )
+        collector.append("Trace exported to \(url.lastPathComponent)")
+        return url
+    }
+
+    private func startOhMyPiModelsSubscriptionIfNeeded(workspacePath: String?) {
+        guard !hasPreparedForWindowClose, ohMyPiModelsTask == nil else { return }
+        ohMyPiModelsTask = Task { [weak self, workspacePath] in
+            let stream = await OhMyPiACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await snapshot in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    self?.availableOhMyPiModelOptions = snapshot.models.options
+                }
+            }
+        }
+    }
+
+    private func stopOhMyPiModelsSubscription(clearModels: Bool = false) {
+        ohMyPiModelsTask?.cancel()
+        ohMyPiModelsTask = nil
+        if clearModels {
+            availableOhMyPiModelOptions = []
         }
     }
 

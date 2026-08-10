@@ -811,12 +811,19 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runID: UUID
     ) async throws {
-        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor else { return }
+        guard runRequest.agentKind == .openCode || runRequest.agentKind == .cursor || runRequest.agentKind == .ohMyPi else { return }
         guard let model = runRequest.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
               !model.isEmpty,
               model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
         else {
             return
+        }
+        if runRequest.agentKind == .ohMyPi {
+            guard let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .ohMyPi),
+                  snapshot.contains(rawModel: model)
+            else {
+                return
+            }
         }
         if runRequest.agentKind == .cursor,
            let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),

@@ -51,7 +51,7 @@ final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
                 )
             },
             makeController: controllerFactory,
-            beforePrompt: { controller, _ in
+            beforePrompt: { controller, _, _ in
                 if let model = Self.selectedModelToApply(config: config) {
                     try await controller.setSessionModel(model)
                 }

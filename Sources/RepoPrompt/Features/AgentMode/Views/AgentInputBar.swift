@@ -1054,10 +1054,13 @@ struct AgentComposerView: View, Equatable {
                 }
             }
         }
-        guard agent == .openCode else {
+        guard agent == .openCode || agent == .ohMyPi else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
         }
-        return AgentModelCatalog.openCodeMenu(for: options).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
+        return AgentModelCatalog.openCodeMenu(
+            for: options,
+            providerID: agent.acpProviderID ?? .openCode
+        ).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
             let modelItems = providerGroup.groups.map { inputBarOpenCodeModelMenuItem(agent: agent, group: $0) }
             guard providerGroup.rendersAsSubmenu else { return modelItems }
             return [.submenu(providerGroup.displayName, items: modelItems)]

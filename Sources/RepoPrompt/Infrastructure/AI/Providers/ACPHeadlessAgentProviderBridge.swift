@@ -19,7 +19,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         _ request: ACPRunRequest,
         _ diagnosticSink: ACPAgentSessionController.DiagnosticSink?
     ) throws -> ACPAgentSessionController
-    typealias BeforePrompt = (_ controller: ACPAgentSessionController, _ request: ACPRunRequest) async throws -> Void
+    typealias BeforePrompt = (_ controller: ACPAgentSessionController, _ request: ACPRunRequest, _ runID: UUID) async throws -> Void
 
     private let providerName: String
     private let makeProvider: ProviderFactory
@@ -34,7 +34,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         makeProvider: @escaping ProviderFactory,
         makeRequest: @escaping RequestFactory,
         makeController: @escaping ControllerFactory,
-        beforePrompt: @escaping BeforePrompt = { _, _ in },
+        beforePrompt: @escaping BeforePrompt = { _, _, _ in },
         approvalPolicy: ApprovalPolicy
     ) {
         self.providerName = providerName
@@ -134,8 +134,10 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
 
             do {
                 _ = try await controller.bootstrap()
-                try await beforePrompt(controller, request)
-                try await controller.prompt(message, request: request)
+                try await Self.performPromptAfterBarrier(
+                    beforePrompt: { try await beforePrompt(controller, request, runID) },
+                    sendPrompt: { try await controller.prompt(message, request: request) }
+                )
                 await controller.shutdown()
                 await forwardTask.value
             } catch {
@@ -148,6 +150,14 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         } catch {
             continuation.finish(throwing: provider.normalizeError(error))
         }
+    }
+
+    static func performPromptAfterBarrier(
+        beforePrompt: () async throws -> Void,
+        sendPrompt: () async throws -> Void
+    ) async throws {
+        try await beforePrompt()
+        try await sendPrompt()
     }
 
     private static func forwardEvents(

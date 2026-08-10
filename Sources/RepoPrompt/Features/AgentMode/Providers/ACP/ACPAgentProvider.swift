@@ -3,6 +3,7 @@ import Foundation
 enum ACPProviderID: String, Hashable {
     case openCode
     case cursor
+    case ohMyPi
 }
 
 enum ACPSupportResult: Equatable {

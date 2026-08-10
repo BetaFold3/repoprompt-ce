@@ -197,6 +197,7 @@ extension SentryTelemetryBootstrap {
         case customClaudeCompatible = "custom_claude_compatible"
         case kimiCode = "kimi_code"
         case openCode = "opencode"
+        case ohMyPi = "oh_my_pi"
 
         init(agentKind: AgentProviderKind) {
             switch agentKind {
@@ -208,6 +209,8 @@ extension SentryTelemetryBootstrap {
                 self = .openCode
             case .cursor:
                 self = .cursor
+            case .ohMyPi:
+                self = .ohMyPi
             case .claudeCodeGLM:
                 self = .claudeCodeGLM
             case .kimiCode:

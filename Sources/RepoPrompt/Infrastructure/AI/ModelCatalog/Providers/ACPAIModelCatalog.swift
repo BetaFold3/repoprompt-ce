@@ -18,24 +18,26 @@ struct ACPDynamicProviderRecord: Codable, Hashable {
 
 enum ACPDynamicModelStore {
     private static let storageKey = "ACPDynamicModelProviders"
+    private static let transactionLock = NSLock()
 
     static func save(
         _ snapshot: ACPDiscoveredSessionModels,
         for providerID: ACPProviderID,
         defaults: UserDefaults = .standard
     ) {
-        guard let record = canonicalProviderRecord(from: snapshot, providerID: providerID) else {
-            remove(providerID: providerID, defaults: defaults)
-            return
-        }
+        let record = canonicalProviderRecord(from: snapshot, providerID: providerID)
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+
         var records = loadProviderRecords(defaults: defaults)
         records.removeAll { $0.providerID == providerID.rawValue }
-        records.append(record)
-        records.sort {
-            $0.providerID.localizedCaseInsensitiveCompare($1.providerID) == .orderedAscending
+        if let record {
+            records.append(record)
+            records.sort {
+                $0.providerID.localizedCaseInsensitiveCompare($1.providerID) == .orderedAscending
+            }
         }
-        guard let data = try? JSONEncoder().encode(records) else { return }
-        defaults.set(data, forKey: storageKey)
+        writeProviderRecords(records, defaults: defaults)
     }
 
     static func load(
@@ -62,14 +64,12 @@ enum ACPDynamicModelStore {
         providerID: ACPProviderID,
         defaults: UserDefaults = .standard
     ) {
+        transactionLock.lock()
+        defer { transactionLock.unlock() }
+
         var records = loadProviderRecords(defaults: defaults)
         records.removeAll { $0.providerID == providerID.rawValue }
-        guard !records.isEmpty else {
-            defaults.removeObject(forKey: storageKey)
-            return
-        }
-        guard let data = try? JSONEncoder().encode(records) else { return }
-        defaults.set(data, forKey: storageKey)
+        writeProviderRecords(records, defaults: defaults)
     }
 
     static func canonicalProviderRecord(
@@ -90,6 +90,18 @@ enum ACPDynamicModelStore {
         guard !options.isEmpty else { return nil }
         let currentModelRaw = normalizedCurrentModelRaw(record.currentModelRaw, options: record.options)
         return ACPDiscoveredSessionModels(options: options, currentModelRaw: currentModelRaw)
+    }
+
+    private static func writeProviderRecords(
+        _ records: [ACPDynamicProviderRecord],
+        defaults: UserDefaults
+    ) {
+        guard !records.isEmpty else {
+            defaults.removeObject(forKey: storageKey)
+            return
+        }
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        defaults.set(data, forKey: storageKey)
     }
 
     private static func loadProviderRecords(defaults: UserDefaults) -> [ACPDynamicProviderRecord] {

@@ -15,6 +15,7 @@ enum CLILaunchProfiles {
         "~/.opencode/bin"
     ]
     static let cursorProviderSpecificPaths: [String] = []
+    static let ohMyPiProviderSpecificPaths: [String] = ["~/.bun/bin"]
 
     /// Preserve the committed Codex hint order exactly: shell/package-manager
     /// fallbacks first, then Codex.app resources. System bins are intentionally not
@@ -58,6 +59,12 @@ enum CLILaunchProfiles {
         commandName: "cursor-agent",
         preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
+    )
+
+    static let ohMyPi = CLILaunchProfile(
+        commandName: "omp",
+        preferredBasenames: ["omp"],
+        supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(ohMyPiProviderSpecificPaths)
     )
 
     static let tailscaleAppBundleExecutablePath = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"

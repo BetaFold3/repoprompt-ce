@@ -39,11 +39,13 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoadingCodex = false
     @State private var isLoggingIntoCodex = false
     @State private var isLoadingOpenCode = false
+    @State private var isLoadingOhMyPi = false
     @State private var isLoadingCursor = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
     @State private var showOpenCodeTraceDump = false
+    @State private var showOhMyPiTraceDump = false
     @State private var showCursorTraceDump = false
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
@@ -57,6 +59,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCustomCompatibleExpanded: Bool = false
     @State private var isCodexExpanded: Bool = false
     @State private var isOpenCodeExpanded: Bool = false
+    @State private var isOhMyPiExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
@@ -132,6 +135,7 @@ struct CLIProvidersSettingsView: View {
                 claudeCodeCard
                 claudeCompatibleBackendsSection
                 openCodeCard
+                ohMyPiCard
                 cursorCard
             }
             .padding(16)
@@ -165,6 +169,13 @@ struct CLIProvidersSettingsView: View {
                     primaryButton: .default(Text("Save Trace to Downloads"), action: dumpOpenCodeTrace),
                     secondaryButton: .cancel(Text("OK"), action: { showOpenCodeTraceDump = false })
                 )
+            } else if showOhMyPiTraceDump, viewModel.hasOhMyPiTrace() {
+                Alert(
+                    title: Text("CLI Provider Management"),
+                    message: Text(alertMessage),
+                    primaryButton: .default(Text("Save Trace to Downloads"), action: dumpOhMyPiTrace),
+                    secondaryButton: .cancel(Text("OK"), action: { showOhMyPiTraceDump = false })
+                )
             } else if showCursorTraceDump, viewModel.hasCursorTrace() {
                 Alert(
                     title: Text("CLI Provider Management"),
@@ -185,6 +196,7 @@ struct CLIProvidersSettingsView: View {
                 showClaudeCodeTraceDump = false
                 showCodexTraceDump = false
                 showOpenCodeTraceDump = false
+                showOhMyPiTraceDump = false
                 showCursorTraceDump = false
             }
         }
@@ -1926,11 +1938,83 @@ struct CLIProvidersSettingsView: View {
         if count == 0 {
             return "Model discovery will refresh in the background."
         }
-        let groupedBaseCount = AgentModelCatalog.openCodeMenu(for: options).groups.count
+        let groupedBaseCount = AgentModelCatalog.openCodeMenu(for: options, providerID: .ohMyPi).groups.count
         if groupedBaseCount > 0, groupedBaseCount < count {
             return "\(count) models discovered across \(groupedBaseCount) base models."
         }
         return count == 1 ? "1 model discovered." : "\(count) models discovered."
+    }
+
+    // MARK: - Oh My Pi Diagnostics Card
+
+    private var ohMyPiCard: some View {
+        providerCard(
+            title: "Oh My Pi CLI (Preview Diagnostics)",
+            subtitle: "Validates the managed OMP ACP profile and dynamic model discovery. This provider remains unavailable for user runs.",
+            infoURL: "https://github.com/can1357/oh-my-pi",
+            isConnected: viewModel.isOhMyPiConnected,
+            isExpanded: $isOhMyPiExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Dark integration only: a successful diagnostic does not enable Oh My Pi in Agent Mode, chat, recommendations, or delegated tasks.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    Button(action: { testOhMyPiConnection() }) {
+                        if isLoadingOhMyPi {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                                .frame(height: 16)
+                        } else {
+                            Label(viewModel.isOhMyPiConnected ? "Test Again" : "Run Diagnostic", systemImage: "stethoscope")
+                        }
+                    }
+                    .disabled(isLoadingOhMyPi)
+                    .buttonStyle(CustomButtonStyle())
+
+                    Button("Reset Model Cache") {
+                        Task { await viewModel.resetOhMyPiModels() }
+                    }
+                    .disabled(isLoadingOhMyPi)
+                    .buttonStyle(CustomButtonStyle())
+
+                    Spacer()
+
+                    if viewModel.isOhMyPiConnected {
+                        Button("Clear Diagnostic State") {
+                            viewModel.disconnectOhMyPi()
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+                }
+
+                Text(ohMyPiModelSummary)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let error = viewModel.ohMyPiError, !error.isEmpty {
+                    Text(error)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("Requires omp 17.2.12 or newer and an authenticated OMP installation.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+    }
+
+    private var ohMyPiModelSummary: String {
+        let count = viewModel.availableOhMyPiModelOptions.count
+        if count == 0 {
+            return "No dynamic models are cached."
+        }
+        return count == 1 ? "1 model discovered for diagnostics." : "\(count) models discovered for diagnostics."
     }
 
     // MARK: - Cursor Card
@@ -2354,6 +2438,48 @@ struct CLIProvidersSettingsView: View {
         showOpenCodeTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
+    }
+
+    private func testOhMyPiConnection() {
+        isLoadingOhMyPi = true
+        Task {
+            do {
+                let ok = try await viewModel.testOhMyPiConnection()
+                await MainActor.run {
+                    isLoadingOhMyPi = false
+                    if ok {
+                        alertMessage = "Oh My Pi diagnostic passed. Public availability remains disabled."
+                        showOhMyPiTraceDump = false
+                    }
+                    showAlert = true
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingOhMyPi = false
+                    alertMessage = viewModel.ohMyPiError ?? error.asFriendlyString()
+                    showOhMyPiTraceDump = viewModel.hasOhMyPiTrace()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func dumpOhMyPiTrace() {
+        do {
+            let url = try viewModel.dumpOhMyPiTrace()
+            alertMessage = "Trace saved to Downloads/\(url.lastPathComponent)."
+        } catch let error as CLIProcessLogCollectorError {
+            switch error {
+            case .noEntries:
+                alertMessage = "No trace data is available to export yet."
+            case .downloadsDirectoryUnavailable:
+                alertMessage = "Unable to locate the Downloads folder."
+            }
+        } catch {
+            alertMessage = "Failed to export trace: \(error.localizedDescription)"
+        }
+        showOhMyPiTraceDump = false
+        showAlert = true
     }
 
     private func testCursorConnection() {

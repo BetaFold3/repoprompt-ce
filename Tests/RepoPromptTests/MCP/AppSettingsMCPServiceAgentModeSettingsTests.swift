@@ -60,6 +60,39 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertFalse(store.codexReasoningSummariesEnabled())
     }
 
+    func testContextBuilderAgentAllowedValuesExcludeDarkOhMyPi() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let service = AppSettingsMCPService(
+            store: GlobalSettingsStore(
+                defaults: defaults,
+                fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
+            )
+        )
+        let listed = try await service.handleForTesting([
+            "op": .string("list"),
+            "group": .string("context_builder"),
+            "detailed": .bool(true)
+        ])
+        let settings = try XCTUnwrap(listed.objectValue?["settings"]?.arrayValue)
+        let agent = try XCTUnwrap(
+            settings.first { $0.objectValue?["key"]?.stringValue == "context_builder.agent" }
+        )
+        let allowedValues = try XCTUnwrap(agent.objectValue?["allowed_values"]?.arrayValue)
+            .compactMap(\.stringValue)
+
+        XCTAssertTrue(allowedValues.contains(AgentProviderKind.openCode.rawValue))
+        XCTAssertTrue(allowedValues.contains(AgentProviderKind.cursor.rawValue))
+        XCTAssertFalse(allowedValues.contains(AgentProviderKind.ohMyPi.rawValue))
+    }
+
     func testSetWarnsWhenGlobalSettingsPersistenceIsBlocked() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
