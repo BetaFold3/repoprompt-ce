@@ -11,12 +11,24 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     private var lifecycleHosts: [AgentModeViewModel] = []
     private var acpControllers: [ObjectIdentifier: ACPAgentSessionController] = [:]
 
+    override func setUp() async throws {
+        try await super.setUp()
+        #if DEBUG
+            await OMPQualificationSharedGateTestIsolation.shared.acquire()
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+        #endif
+    }
+
     override func tearDown() async throws {
         await cleanupRegisteredRuntime()
         for url in temporaryURLs {
             try? FileManager.default.removeItem(at: url)
         }
         temporaryURLs.removeAll()
+        #if DEBUG
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+            await OMPQualificationSharedGateTestIsolation.shared.release()
+        #endif
         try await super.tearDown()
     }
 
@@ -105,10 +117,70 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testAuthorizedOhMyPiProviderStartPreservesRunIDThroughDispatch() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        var authorizedPair: (UUID, UUID)?
+        var providerRunID: UUID?
+        var controllerRunID: UUID?
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .ohMyPi)
+                providerRunID = session.runID
+                recorder.record("factory:acp-provider")
+                return provider
+            },
+            acpControllerFactory: { _, _ in
+                controllerRunID = session.runID
+                recorder.record("factory:acp-controller")
+                throw LifecycleTestError.expectedACPDispatchStop
+            },
+            ompQualificationAuthorizer: { sessionID, runID in
+                authorizedPair = (sessionID, runID)
+                return true
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "authorized OMP start",
+            initialMessageForRun: "authorized OMP start",
+            attachments: []
+        )
+
+        XCTAssertEqual(authorizedPair?.0, qualificationSessionID)
+        XCTAssertNotNil(authorizedPair?.1)
+        XCTAssertEqual(providerRunID, authorizedPair?.1)
+        XCTAssertEqual(controllerRunID, authorizedPair?.1)
+        XCTAssertTrue(recorder.contains("factory:acp-provider"))
+        XCTAssertTrue(recorder.contains("factory:acp-controller"))
+    }
+
     func testDarkOhMyPiPersistedOrMCPConfiguredSelectionFailsBeforeProviderDispatch() async throws {
         XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
 
         let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        var deniedAuthorization: (UUID, UUID)?
         let provider = LifecycleFakeACPProvider(
             providerID: .ohMyPi,
             commandPath: "/usr/bin/true",
@@ -128,6 +200,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             acpControllerFactory: { _, _ in
                 recorder.record("factory:acp-controller")
                 throw LifecycleTestError.unexpectedACPControllerCreation
+            },
+            ompQualificationAuthorizer: { sessionID, runID in
+                deniedAuthorization = (sessionID, runID)
+                recorder.record("omp-authorization:\(sessionID.uuidString):\(runID.uuidString)")
+                return false
             }
         )
         let persistedSelection = AgentModelCatalog.normalizePersistedSelection(
@@ -141,6 +218,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.selectedAgent = persistedSelection.agent
         session.selectedModelRaw = persistedSelection.modelRaw
         harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
         try await harness.host.mcpConfigureSession(
             tabID: session.tabID,
             agentRaw: AgentProviderKind.ohMyPi.rawValue,
@@ -164,9 +250,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertNil(session.acpController)
         XCTAssertEqual(
             session.items.filter { $0.kind == .error }.map(\.text),
-            ["Oh My Pi support is not enabled in this build."]
+            ["Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session."]
         )
-        XCTAssertFalse(recorder.contains("workspace"))
+        XCTAssertEqual(deniedAuthorization?.0, qualificationSessionID)
+        XCTAssertNotNil(deniedAuthorization?.1)
         XCTAssertFalse(recorder.contains(prefix: "factory:"))
         XCTAssertFalse(recorder.contains("provider:support"))
     }
@@ -1655,7 +1742,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
         publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
-        autoSignalACPRouting: Bool = false
+        autoSignalACPRouting: Bool = false,
+        ompQualificationAuthorizer: @escaping (UUID, UUID) -> Bool = { _, _ in false }
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let claudeController = claudeController ?? LifecycleFakeNativeController(recorder: recorder)
@@ -1717,7 +1805,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             cancelMCPToolsForRun: cancelMCPTools,
             awaitNoActiveMCPTools: idleWaiter,
             activeAgentRunWaitQuery: { _ in false },
-            childAgentRunWaitDrainTimeoutSeconds: 0.01
+            childAgentRunWaitDrainTimeoutSeconds: 0.01,
+            ompQualificationAuthorizer: ompQualificationAuthorizer
         )
         return LifecycleHarness(
             service: AgentModeRunService(

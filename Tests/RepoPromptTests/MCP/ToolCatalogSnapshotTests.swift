@@ -569,6 +569,11 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
         let agentExploreProperties = try Self.schemaProperties(for: agentExplore)
         let agentRunProperties = try Self.schemaProperties(for: agentRun)
+        XCTAssertEqual(
+            agentRunProperties["run_id"]?.objectValue?["description"]?.stringValue,
+            "[cancel] Optional exact current run UUID fence. When present, cancellation is rejected unless it matches the session's current run."
+        )
+        XCTAssertNil(agentExploreProperties["run_id"])
         let worktreeFields = [
             "worktree",
             "worktree_id",
@@ -589,6 +594,13 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #if DEBUG
             XCTAssertNotNil(agentRunProperties["_worktree_startup_benchmark_token"])
             XCTAssertNil(agentExploreProperties["_worktree_startup_benchmark_token"])
+            let qualificationLease = try XCTUnwrap(agentRunProperties["_omp_qualification_lease_id"]?.objectValue)
+            XCTAssertEqual(qualificationLease["type"]?.stringValue, "string")
+            XCTAssertEqual(
+                qualificationLease["description"]?.stringValue,
+                "[DEBUG start] Private single-use OMP qualification lease UUID. Accepted only for the fail-closed qualification smoke path."
+            )
+            XCTAssertNil(agentExploreProperties["_omp_qualification_lease_id"])
         #endif
 
         let exploreOpEnum = agentExploreProperties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -772,7 +784,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
         "17|remote_pairing|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b66a65cddc2ce05b1aa4bd372bf87806149f0059c77318f2c0c88d998953733b|schema=78d2d5faef64665bd00b69fe88ebd9776445c1b21e028dbaf03f7bbeaa6dfed2",
         "18|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=7b3c869b0c959c1c162dfadfd4ea578b05ed0834b2e930d177a8c38f96c31a4b",
-        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d7e34e45febbe2f158be407285081ebc1aa06de44f7c08247e6716cdce930069|schema=79bfc628048f12c0d221c1930df5d60ae2fd7ff1d93e53dee5d77df74f2af052",
+        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d7e34e45febbe2f158be407285081ebc1aa06de44f7c08247e6716cdce930069|schema=ce85bab1f07e61dd47ffb3a48bbee1ba999c4fc1b4b6b4f8048933d9ae2ed6f2",
         "20|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=9642d68a071c59dedd7e2e50da6e39288cb4b6065333cf84237dc1b7b13aed05|schema=e596c8c7039c910fe8c0ee8502bf845ee440b1b0c3153cdf33068dedf921ab45",
         "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",

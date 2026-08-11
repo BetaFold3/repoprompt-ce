@@ -5,6 +5,24 @@ import XCTest
 
 @MainActor
 final class AgentManageMCPToolServiceListAgentsTests: XCTestCase {
+    override func setUp() async throws {
+        try await super.setUp()
+        #if DEBUG
+            await OMPQualificationSharedGateTestIsolation.shared.acquire()
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+            AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        #endif
+    }
+
+    override func tearDown() async throws {
+        #if DEBUG
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+            AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+            await OMPQualificationSharedGateTestIsolation.shared.release()
+        #endif
+        try await super.tearDown()
+    }
+
     func testListAgentsModelEntriesIncludeStructuredRemotePickerFields() async throws {
         let window = try await makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -39,6 +57,30 @@ final class AgentManageMCPToolServiceListAgentsTests: XCTestCase {
         })
         XCTAssertEqual(effortModel["reasoning_effort"]?.stringValue, effortModel["effort"]?.stringValue)
         XCTAssertNotEqual(effortModel["name"]?.stringValue, effortModel["model_display_name"]?.stringValue)
+    }
+
+    func testFirstQualificationListAgentsAdvertisesOnlyOhMyPiDefaultSentinel() async throws {
+        #if DEBUG
+            let window = try await makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            _ = try OhMyPiAgentModeSmokeGate.shared.acquireForTesting()
+
+            let value = try await makeService(window: window).execute(args: ["op": .string("list_agents")])
+            let agents = try XCTUnwrap(value.objectValue?["agents"]?.arrayValue)
+            let ohMyPi = try XCTUnwrap(agents.compactMap(\.objectValue).first { agent in
+                agent["models"]?.arrayValue?.contains { model in
+                    model.objectValue?["agent_id"]?.stringValue == AgentProviderKind.ohMyPi.rawValue
+                } == true
+            })
+            XCTAssertEqual(ohMyPi["name"]?.stringValue, "Oh My Pi")
+            XCTAssertEqual(ohMyPi["available"]?.boolValue, true)
+            let models = try XCTUnwrap(ohMyPi["models"]?.arrayValue).compactMap(\.objectValue)
+            XCTAssertEqual(models.count, 1)
+            XCTAssertEqual(models[0]["model_id"]?.stringValue, "ohMyPi:default")
+            XCTAssertEqual(ohMyPi["default_model_id"]?.stringValue, "ohMyPi:default")
+        #else
+            throw XCTSkip("OMP qualification discovery is DEBUG-only")
+        #endif
     }
 
     private func makeWindow() async throws -> WindowState {

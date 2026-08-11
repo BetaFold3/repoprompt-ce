@@ -53,6 +53,14 @@ import MCP
                 return debugRestartStatusToolPayload(op: op, arguments: arguments)
             case "connections":
                 return await debugConnectionsPayload(op: op, arguments: arguments)
+            case "omp_qualification_lease":
+                return debugOMPQualificationLeasePayload(
+                    op: op,
+                    connectionID: connectionID,
+                    arguments: arguments
+                )
+            case "routing_sequence_baseline":
+                return debugDiagnosticsResult(debugRoutingSequenceBaselinePayload(op: op))
             case "sleep":
                 return await debugSleepPayload(op: op, arguments: arguments)
             case "large_response":

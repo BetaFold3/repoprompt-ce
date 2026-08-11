@@ -260,6 +260,14 @@ enum MCPIntegrationHelper {
         return lowered == repoPromptServer || lowered.contains(repoPromptServer)
     }
 
+    /// Exact, trusted server labels only. Do not use fuzzy display matching for authorization.
+    static func isExactRepoPromptServerIdentifier(_ rawValue: String?) -> Bool {
+        guard let rawValue else { return false }
+        let lowered = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let repoPromptServer = repoPromptMCPServerName.lowercased()
+        return lowered == repoPromptServer || lowered == "\(repoPromptServer) mcp server"
+    }
+
     static func repoPromptPermissionAutoApprovalMatch(
         requestToolName: String?,
         requestPayload: [String: Any]
@@ -304,7 +312,7 @@ enum MCPIntegrationHelper {
 
     static func repoPromptPermissionServerIdentifier(in requestPayload: [String: Any]) -> String? {
         for serverName in permissionRequestServerCandidates(input: requestPayload) {
-            guard isRepoPromptServerIdentifier(serverName) else { continue }
+            guard isExactRepoPromptServerIdentifier(serverName) else { continue }
             return serverName.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return nil
@@ -360,17 +368,10 @@ enum MCPIntegrationHelper {
                 ["tool_title"],
                 ["displayName"],
                 ["display_name"],
-                ["rawInput", "title"],
-                ["rawInput", "toolTitle"],
-                ["rawInput", "tool_title"],
                 ["toolCall", "title"],
                 ["toolCall", "name"],
                 ["toolCall", "displayName"],
                 ["toolCall", "display_name"],
-                ["rawInput", "toolCall", "title"],
-                ["rawInput", "toolCall", "name"],
-                ["rawInput", "toolCall", "displayName"],
-                ["rawInput", "toolCall", "display_name"],
                 ["request", "title"],
                 ["request", "toolTitle"],
                 ["request", "tool_title"],
@@ -396,11 +397,6 @@ enum MCPIntegrationHelper {
                 ["server"],
                 ["mcp_server"],
                 ["mcpServer"],
-                ["rawInput", "server_name"],
-                ["rawInput", "serverName"],
-                ["rawInput", "server"],
-                ["rawInput", "mcp_server"],
-                ["rawInput", "mcpServer"],
                 ["serverInfo", "name"],
                 ["tool", "server"],
                 ["tool", "server_name"],
@@ -408,9 +404,6 @@ enum MCPIntegrationHelper {
                 ["toolCall", "server"],
                 ["toolCall", "server_name"],
                 ["toolCall", "serverName"],
-                ["rawInput", "toolCall", "server"],
-                ["rawInput", "toolCall", "server_name"],
-                ["rawInput", "toolCall", "serverName"],
                 ["request", "server"],
                 ["request", "server_name"],
                 ["request", "serverName"],
@@ -432,9 +425,6 @@ enum MCPIntegrationHelper {
                 ["tool_name"],
                 ["toolName"],
                 ["name"],
-                ["rawInput", "tool_name"],
-                ["rawInput", "toolName"],
-                ["rawInput", "name"],
                 ["tool", "tool_name"],
                 ["tool", "toolName"],
                 ["tool", "name"],
@@ -442,13 +432,6 @@ enum MCPIntegrationHelper {
                 ["toolCall", "toolName"],
                 ["toolCall", "name"],
                 ["toolCall", "title"],
-                ["rawInput", "tool", "tool_name"],
-                ["rawInput", "tool", "toolName"],
-                ["rawInput", "tool", "name"],
-                ["rawInput", "toolCall", "tool_name"],
-                ["rawInput", "toolCall", "toolName"],
-                ["rawInput", "toolCall", "name"],
-                ["rawInput", "toolCall", "title"],
                 ["request", "tool_name"],
                 ["request", "toolName"],
                 ["request", "name"],

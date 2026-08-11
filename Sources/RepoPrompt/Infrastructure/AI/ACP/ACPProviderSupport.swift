@@ -77,7 +77,7 @@ enum ACPRuntimeEventParsing {
 
         let toolName = String(match.1)
         let serverName = String(match.2)
-        guard MCPIntegrationHelper.isRepoPromptServerIdentifier(serverName),
+        guard MCPIntegrationHelper.isExactRepoPromptServerIdentifier(serverName),
               let canonicalToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName)
         else {
             return nil

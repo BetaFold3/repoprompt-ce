@@ -26,6 +26,11 @@ final class AgentModeRunService {
         let activeAgentRunWaitQuery: (_ runID: UUID) -> Bool
         /// Bounded wait for child `agent_run.wait` scopes to drain before Claude native interrupt.
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
+        #if DEBUG
+            var ompQualificationAuthorizer: (UUID, UUID) -> Bool = {
+                OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(sessionID: $0, runID: $1)
+            }
+        #endif
     }
 
     enum CancellationIntent {
@@ -168,12 +173,18 @@ final class AgentModeRunService {
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         let selectedAgent = session.selectedAgent
-        if selectedAgent == .ohMyPi,
-           !AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable
-        {
-            let message = "Oh My Pi support is not enabled in this build."
-            await failBeforeProviderStartup(session: session, message: message)
-            return nil
+        if selectedAgent == .ohMyPi {
+            #if DEBUG
+                guard session.mcpControlContext?.sessionID != nil else {
+                    let message = "Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session."
+                    await failBeforeProviderStartup(session: session, message: message)
+                    return nil
+                }
+            #else
+                let message = "Oh My Pi support is not enabled in this build."
+                await failBeforeProviderStartup(session: session, message: message)
+                return nil
+            #endif
         }
         if session.profile == .knowledge,
            !KnowledgeSessionPolicy.supportedProviders.contains(selectedAgent)
@@ -257,6 +268,15 @@ final class AgentModeRunService {
             return nil
         }
         if let acpRunRequest {
+            let providerStartAuthorizer: (UUID) -> Bool = { runID in
+                guard selectedAgent == .ohMyPi else { return true }
+                #if DEBUG
+                    guard let sessionID = session.mcpControlContext?.sessionID else { return false }
+                    return self.dependencies.ompQualificationAuthorizer(sessionID, runID)
+                #else
+                    return false
+                #endif
+            }
             await acpRunner.startRun(
                 tabID: tabID,
                 session: session,
@@ -264,7 +284,8 @@ final class AgentModeRunService {
                 initialMessageForRun: initialMessageForRun,
                 attachments: attachments,
                 runRequest: acpRunRequest,
-                makeLease: makeLease
+                makeLease: makeLease,
+                providerStartAuthorizer: providerStartAuthorizer
             )
             return nil
         }

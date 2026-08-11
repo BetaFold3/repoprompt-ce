@@ -756,6 +756,11 @@ struct AgentManageMCPToolService {
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
             workspaceID: workspace.id
         )
+        if selection.agentRaw == AgentProviderKind.ohMyPi.rawValue {
+            throw MCPError.invalidParams(
+                "Oh My Pi sessions cannot be resumed. Start a fresh OMP session with agent_run op=start or agent_manage op=create_session."
+            )
+        }
         let resolved = resolvedModelAndEffort(agentRaw: selection.agentRaw, modelRaw: selection.modelRaw, args: args)
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: nil,
@@ -765,6 +770,14 @@ struct AgentManageMCPToolService {
             parentSessionID: spawnParentSessionID,
             inheritWorktreeBindings: false
         )
+        if selection.agentRaw == nil,
+           agentModeVM.session(for: target.tabID, createIfNeeded: false)?.selectedAgent == .ohMyPi
+        {
+            await agentModeVM.mcpDiscardSessionTarget(target)
+            throw MCPError.invalidParams(
+                "Oh My Pi sessions cannot be resumed. Start a fresh OMP session with agent_run op=start or agent_manage op=create_session."
+            )
+        }
         let hadMatchingMCPControl = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext?.sessionID == sessionID
         do {
             // Resume adopts the live session's existing control registration. Re-registering the

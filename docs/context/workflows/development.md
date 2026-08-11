@@ -2,7 +2,7 @@
 
 Scope: read when the task touches local setup, builds, tests, packaging, the debug app, MCP CLI, or developer-daemon coordination.
 Authority: Authoritative
-Last-verified: 2026-08-08
+Last-verified: 2026-08-10
 
 ## Choose the coordinated path
 
@@ -69,6 +69,23 @@ rpce-cli-debug -w 1 -e 'workspace switch repoprompt-ce'
 rpce-cli-debug -w 1 -e 'tree --type roots'
 rpce-cli-debug -w 1 -c agent_manage -j '{"op":"list_agents","roles_only":true}'
 ```
+
+### Run the transient OMP DEBUG smoke
+
+`Scripts/smoke_omp_agent_mode.sh` is the one-command OMP post-relaunch smoke. Use it only after one coordinated relaunch has installed the current DEBUG binary, with fresh explicit approval obtained immediately before that relaunch. The script itself requires an already-running current DEBUG app and never launches, stops, relaunches, switches workspaces, or resumes a session.
+
+For the first smoke, obtain only the target window's positive ID before running the script. Use the known catalog sentinel exact model ID `ohMyPi:default` (`AgentModel.defaultModel.rawValue == "default"`):
+
+```bash
+Scripts/smoke_omp_agent_mode.sh \
+  --window-id <positive-window-id> \
+  --model-id 'ohMyPi:default' \
+  --output-parent /tmp
+```
+
+Do not try to discover OMP through `list_agents` before this first run: the transient gate is still false, so OMP is intentionally absent. The script enables the gate first and then verifies the exact supplied ID through `list_agents`. For a later smoke with an explicit discovered OMP model, copy its exact ID from the private `list_agents.json` evidence produced by the first script run, or obtain it during a separately gated diagnostic.
+
+The script acquires one hidden DEBUG-only process-owned qualification lease through `__repoprompt_debug_diagnostics`, verifies the supplied exact model ID through `list_agents`, and supplies the lease UUID only through the dedicated DEBUG `_omp_qualification_lease_id` start parameter. The lease is exclusive, process-local, expiring, non-persistent, absent from RELEASE, and transactionally bound by the app to the created session/run; discovery availability is not authorization. The script requires terminal exact-connection zero raw tool calls/in-flight calls/scopes, unchanged target-workspace identity and bounded no-follow content snapshots of tracked/index/existing-untracked state for every active root (Git-ignored paths are excluded), one strictly ordered post-baseline route with a distinct launched OMP ancestor and bundled helper descendant correlated by executable and process-start identity, and terminal expected-PID/policy cleanup. Every CLI call is output-bounded and process-group-owned with TERM/KILL/reap; failure cleanup cancels the exact nonterminal session, releases the exact lease, and verifies the lease inactive. The script never launches, stops, relaunches, switches workspaces, or resumes. This is a qualification path only: it does not enable resume or public production availability. Treat the private evidence directory as temporary sensitive working evidence; do not publish or stage its raw JSON.
 
 Use `agent_run` for an end-to-end provider probe only when credentials and model access are available:
 

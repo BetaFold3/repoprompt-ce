@@ -89,6 +89,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             "request_id": .string(description: "[start, steer, respond] Optional idempotency key. Duplicate calls with the same request_id and identical arguments return the recorded outcome instead of re-executing (a duplicate start returns the original session_id; a duplicate steer does not enqueue a second instruction; a duplicate respond returns the recorded resolution). Reusing a request_id with different arguments is rejected as a conflict."),
             "model_id": .string(description: "[start] Role label from agent_manage.list_agents task_labels (explore, engineer, pair, design — resolved via global role defaults), or an explicit compound model_id from agents[].models[].model_id to pin an exact target. Defaults to pair when omitted."),
             "session_id": .string(description: "[poll, wait, cancel, steer, respond] Session UUID returned by a prior start/steer response. Do not fabricate it. Not accepted by start — use steer to continue an existing session."),
+            "run_id": .string(description: "[cancel] Optional exact current run UUID fence. When present, cancellation is rejected unless it matches the session's current run."),
             "session_ids": .array(description: "[wait, poll] Array of session UUIDs. For wait: returns when first session reaches interesting state. For poll: returns all current snapshots. Mutually exclusive with session_id.", items: .string()),
             "session_name": .string(description: "[start] Display name for a new session."),
             "workspace_id": .string(description: "[start] Optional workspace UUID guard. The start fails with workspace_mismatch when the resolved target window's active workspace differs; combine with the hidden _windowID routing override to target a specific window explicitly."),
@@ -118,6 +119,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
         ]
         #if DEBUG
             properties["_worktree_startup_benchmark_token"] = .string(description: "[DEBUG start] Single-use token from the scoped worktree startup benchmark diagnostics surface.")
+            properties["_omp_qualification_lease_id"] = .string(description: "[DEBUG start] Private single-use OMP qualification lease UUID. Accepted only for the fail-closed qualification smoke path.")
         #endif
         return runtime.tool(
             name: MCPWindowToolName.agentRun,

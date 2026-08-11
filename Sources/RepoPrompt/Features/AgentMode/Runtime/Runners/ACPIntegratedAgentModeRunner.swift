@@ -3,6 +3,13 @@ import MCP
 
 @MainActor
 final class ACPIntegratedAgentModeRunner {
+    #if DEBUG
+        private static let ohMyPiAuthorizationFailureText =
+            "Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session."
+    #else
+        private static let ohMyPiAuthorizationFailureText = "Oh My Pi support is not enabled in this build."
+    #endif
+
     private struct ConsumeEventsOutcome {
         let terminalState: AgentSessionRunState
         let errorText: String?
@@ -89,7 +96,8 @@ final class ACPIntegratedAgentModeRunner {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
         runRequest: ACPRunRequest,
-        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease
+        makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
+        providerStartAuthorizer: (_ runID: UUID) -> Bool
     ) async {
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
@@ -121,6 +129,17 @@ final class ACPIntegratedAgentModeRunner {
                let runID = AgentModeProcessRunIdentity.existingProcessRunID(for: session)
             {
                 guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
+                guard providerStartAuthorizer(runID) else {
+                    await failBeforeProviderSend(
+                        tabID: tabID,
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID,
+                        attachmentReservationID: attachmentReservationID,
+                        errorText: Self.ohMyPiAuthorizationFailureText
+                    )
+                    return
+                }
                 let deferredLease = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
                     ? nil
                     : makeLease(runID)
@@ -169,8 +188,19 @@ final class ACPIntegratedAgentModeRunner {
             guard isStartupStillCurrent(session: session, runAttemptID: runAttemptID) else { return }
         }
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
-        let lease = makeLease(runID)
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
+        guard providerStartAuthorizer(runID) else {
+            await failBeforeProviderSend(
+                tabID: tabID,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                attachmentReservationID: attachmentReservationID,
+                errorText: Self.ohMyPiAuthorizationFailureText
+            )
+            return
+        }
+        let lease = makeLease(runID)
 
         guard let provider = providerFactory(runRequest.agentKind, runRequest.modelString) else {
             await failBeforeProviderSend(

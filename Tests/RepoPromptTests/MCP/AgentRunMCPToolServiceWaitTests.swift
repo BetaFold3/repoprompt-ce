@@ -5,6 +5,347 @@ import XCTest
 
 @MainActor
 final class AgentRunMCPToolServiceWaitTests: XCTestCase {
+    override func setUp() async throws {
+        try await super.setUp()
+        #if DEBUG
+            await OMPQualificationSharedGateTestIsolation.shared.acquire()
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+        #endif
+    }
+
+    override func tearDown() async throws {
+        #if DEBUG
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+            await OMPQualificationSharedGateTestIsolation.shared.release()
+        #endif
+        try await super.tearDown()
+    }
+
+    func testCancelRunIDFenceRejectsMalformedAndMismatchBeforeExactCurrentCancellation() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        let currentRunID = UUID()
+        fixture.session.runID = currentRunID
+        fixture.session.runState = .running
+        await liveSnapshots.set(makeSnapshot(
+            sessionID: fixture.sessionID,
+            runID: currentRunID,
+            status: .running
+        ))
+        let service = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder
+        )
+
+        for malformed in ["", "not-a-uuid"] {
+            do {
+                _ = try await service.execute(args: [
+                    "op": .string("cancel"),
+                    "session_id": .string(fixture.sessionID.uuidString),
+                    "run_id": .string(malformed)
+                ])
+                XCTFail("Expected malformed run_id to be rejected")
+            } catch let error as MCPError {
+                XCTAssertTrue(String(describing: error).contains("non-empty UUID"))
+            }
+            XCTAssertEqual(fixture.session.runID, currentRunID)
+            XCTAssertTrue(fixture.session.runState.isActive)
+        }
+
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("cancel"),
+                "session_id": .string(fixture.sessionID.uuidString),
+                "run_id": .string(UUID().uuidString)
+            ])
+            XCTFail("Expected stale run_id to be rejected")
+        } catch let error as MCPError {
+            XCTAssertTrue(String(describing: error).contains("not the current run"))
+        }
+        XCTAssertEqual(fixture.session.runID, currentRunID)
+        XCTAssertTrue(fixture.session.runState.isActive, "A stale fence must not cancel the later/current run")
+
+        let successorRunID = UUID()
+        let successorService = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder,
+            beforeHeartbeatOperation: {
+                fixture.session.runID = successorRunID
+                fixture.session.runState = .running
+                await liveSnapshots.set(self.makeSnapshot(
+                    sessionID: fixture.sessionID,
+                    runID: successorRunID,
+                    status: .running
+                ))
+            }
+        )
+        do {
+            _ = try await successorService.execute(args: [
+                "op": .string("cancel"),
+                "session_id": .string(fixture.sessionID.uuidString),
+                "run_id": .string(currentRunID.uuidString)
+            ])
+            XCTFail("Expected a successor run installed before dispatch to be rejected")
+        } catch let error as MCPError {
+            XCTAssertTrue(String(describing: error).contains("not the current run"))
+        }
+        XCTAssertEqual(fixture.session.runID, successorRunID)
+        XCTAssertTrue(fixture.session.runState.isActive, "Dispatch must not cancel a successor run")
+
+        fixture.session.runID = currentRunID
+        fixture.session.runState = .running
+        await liveSnapshots.set(makeSnapshot(
+            sessionID: fixture.sessionID,
+            runID: currentRunID,
+            status: .running
+        ))
+
+        _ = try await service.execute(args: [
+            "op": .string("cancel"),
+            "session_id": .string(fixture.sessionID.uuidString),
+            "run_id": .string(currentRunID.uuidString)
+        ])
+        XCTAssertFalse(fixture.session.runState.isActive)
+    }
+
+    func testOMPQualificationTransactionCommitsAllLiveActionableResponseStates() {
+        #if DEBUG
+            XCTAssertTrue(AgentRunMCPToolService.ompQualificationTransactionCommits(status: .running))
+            XCTAssertTrue(AgentRunMCPToolService.ompQualificationTransactionCommits(status: .waitingForInput))
+            XCTAssertTrue(AgentRunMCPToolService.ompQualificationTransactionCommits(status: .completed))
+            XCTAssertFalse(AgentRunMCPToolService.ompQualificationTransactionCommits(status: .failed))
+            XCTAssertFalse(AgentRunMCPToolService.ompQualificationTransactionCommits(status: .cancelled))
+            XCTAssertFalse(AgentRunMCPToolService.ompQualificationTransactionCommits(status: .expired))
+        #endif
+    }
+
+    func testOMPQualificationStartWaitKeepsBoundLeaseAndExactRunActiveAfterActionableResponse() async throws {
+        #if DEBUG
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("OMPQualificationStartWait-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "OMP Qualification Start Wait",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ompQualificationStartWaitTest"
+            )
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+
+            let connectionID = UUID()
+            let lease = try OhMyPiAgentModeSmokeGate.shared.acquire(
+                ownerConnectionID: connectionID,
+                ownerProcessID: getpid(),
+                ownerProcessStartSeconds: 123,
+                ownerProcessStartMicroseconds: 456,
+                duration: 30
+            )
+            XCTAssertTrue(window.apiSettingsViewModel.agentModeAvailabilityContext.ohMyPiAvailable)
+
+            let liveSnapshots = LiveSnapshots()
+            let runID = UUID()
+            var startedSession: AgentModeViewModel.TabSession?
+            var waitCursor: AgentRunSessionStore.WaitCursor?
+            var waitingSnapshot: AgentRunMCPSnapshot?
+            var service = AgentRunMCPToolService(
+                toolName: MCPWindowToolName.agentRun,
+                captureRequestMetadata: {
+                    MCPServerViewModel.RequestMetadata(
+                        connectionID: connectionID,
+                        clientName: AgentProviderKind.ohMyPiMCPClientID,
+                        windowID: window.windowID
+                    )
+                },
+                requireTargetWindow: { window },
+                resolveRequestedTabID: { _ in nil },
+                resolveSpawnParentSourceTabID: { _ in nil },
+                resolveSpawnParentSessionID: { _, _ in nil },
+                bindCurrentRequestToTab: { _, _ in },
+                withHeartbeat: { _, _, _, _, operation in try await operation() },
+                startRun: { target, _, metadata, _, agentModeVM, agentRaw, modelRaw, _, taskLabelKind, _, _, _ in
+                    let sessionID = try XCTUnwrap(target.sessionID)
+                    try await agentModeVM.mcpActivateControlContext(
+                        forTabID: target.tabID,
+                        sessionID: sessionID,
+                        originatingConnectionID: metadata.connectionID,
+                        taskLabelKind: taskLabelKind,
+                        startPending: true
+                    )
+                    let session = agentModeVM.session(for: target.tabID)
+                    await agentModeVM.prepareMCPWaitTrackingForRunStart(session: session)
+                    session.runID = runID
+                    session.runState = .running
+                    let context = try XCTUnwrap(session.mcpControlContext)
+                    waitCursor = try AgentRunSessionStore.WaitCursor(
+                        registration: context.registration,
+                        epoch: XCTUnwrap(context.currentEpoch)
+                    )
+                    startedSession = session
+                    let running = AgentRunMCPSnapshot(
+                        sessionID: sessionID,
+                        runID: runID,
+                        tabID: target.tabID,
+                        sessionName: "OMP Qualification Start Wait",
+                        agentRaw: agentRaw,
+                        agentDisplayName: AgentProviderKind.ohMyPi.displayName,
+                        modelRaw: modelRaw,
+                        reasoningEffortRaw: nil,
+                        status: .running,
+                        statusText: "Running",
+                        latestAssistantPreview: nil,
+                        interaction: nil,
+                        transcriptItemCount: 0,
+                        updatedAt: Date(),
+                        parentSessionID: nil,
+                        failureReason: nil,
+                        worktreeBindings: [],
+                        activeWorktreeMerges: []
+                    )
+                    waitingSnapshot = AgentRunMCPSnapshot(
+                        sessionID: sessionID,
+                        runID: runID,
+                        tabID: target.tabID,
+                        sessionName: "OMP Qualification Start Wait",
+                        agentRaw: agentRaw,
+                        agentDisplayName: AgentProviderKind.ohMyPi.displayName,
+                        modelRaw: modelRaw,
+                        reasoningEffortRaw: nil,
+                        status: .waitingForInput,
+                        statusText: "Waiting for input",
+                        latestAssistantPreview: "Please confirm",
+                        interaction: nil,
+                        transcriptItemCount: 1,
+                        updatedAt: Date(),
+                        parentSessionID: nil,
+                        failureReason: nil,
+                        worktreeBindings: [],
+                        activeWorktreeMerges: []
+                    )
+                    await liveSnapshots.set(running)
+                    return AgentExternalMCPRunStarter.StartOutcome(snapshot: running, delivery: .startedRun)
+                }
+            )
+            service.testOMPQualificationOwnerVerifier = { candidateConnectionID, pid, seconds, microseconds in
+                candidateConnectionID == connectionID
+                    && pid == getpid()
+                    && seconds == 123
+                    && microseconds == 456
+            }
+            service.currentSnapshotProvider = { sessionID, _ in
+                await liveSnapshots.snapshot(for: sessionID)
+            }
+            service.beginAgentRunWait = { _, _, _ in
+                let snapshot = try? XCTUnwrap(waitingSnapshot)
+                let cursor = try? XCTUnwrap(waitCursor)
+                if let snapshot, let cursor {
+                    await liveSnapshots.set(snapshot)
+                    await AgentRunSessionStore.signalSnapshot(snapshot, cursor: cursor)
+                }
+                return UUID()
+            }
+            service.resolveOracleReviewLaunchSource = { _, targetWindow in
+                let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
+                let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+                let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                    route: .windowOnlyActiveCompose,
+                    windowID: targetWindow.windowID,
+                    workspaceID: workspace.id,
+                    tabID: tabID,
+                    selectionRevision: targetWindow.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: workspace.id,
+                        tabID: tabID
+                    ),
+                    promptText: "",
+                    selection: StoredSelection(),
+                    sourceAgentSessionID: nil,
+                    routedRunID: nil
+                )
+                return ResolvedAgentRunOracleReviewLaunchSource(
+                    snapshot: snapshot,
+                    source: .unavailable(.init(
+                        delegationID: UUID(),
+                        sourceTabID: tabID,
+                        workspaceID: workspace.id,
+                        sourceAgentSessionID: nil,
+                        sourceAgentRunID: nil,
+                        reason: .sourceCaptureFailed("Qualification transaction fixture")
+                    ))
+                )
+            }
+
+            let response = try await service.execute(args: [
+                "op": .string("start"),
+                "message": .string("Wait for input without using tools."),
+                "model_id": .string("ohMyPi:default"),
+                "timeout": .double(2),
+                "detach": .bool(false),
+                "_omp_qualification_lease_id": .string(lease.leaseID.uuidString)
+            ])
+
+            XCTAssertEqual(response.objectValue?["status"]?.stringValue, AgentRunMCPSnapshot.Status.waitingForInput.rawValue)
+            let bound = try XCTUnwrap(OhMyPiAgentModeSmokeGate.shared.activeSnapshot())
+            XCTAssertEqual(bound.leaseID, lease.leaseID)
+            XCTAssertEqual(bound.sessionID, waitingSnapshot?.sessionID)
+            XCTAssertEqual(bound.runID, runID)
+            let session = try XCTUnwrap(startedSession)
+            XCTAssertEqual(session.runID, runID)
+            XCTAssertTrue(session.runState.isActive, "Successful actionable response delivery must not cancel the exact run")
+
+            for (label, modelID) in [
+                ("second OMP start", "ohMyPi:default"),
+                ("second non-OMP start", "claudeCode:default")
+            ] {
+                do {
+                    _ = try await service.execute(args: [
+                        "op": .string("start"),
+                        "message": .string("Must not disturb the already-bound qualification run."),
+                        "model_id": .string(modelID),
+                        "timeout": .double(2),
+                        "detach": .bool(false),
+                        "_omp_qualification_lease_id": .string(lease.leaseID.uuidString)
+                    ])
+                    XCTFail("Expected \(label) to reject the already-bound lease")
+                } catch let error as MCPError {
+                    XCTAssertTrue(
+                        String(describing: error).contains("already consumed by an earlier start"),
+                        "\(label): \(error)"
+                    )
+                }
+
+                let preserved = try XCTUnwrap(OhMyPiAgentModeSmokeGate.shared.activeSnapshot(), label)
+                XCTAssertEqual(preserved.leaseID, bound.leaseID, label)
+                XCTAssertEqual(preserved.sessionID, bound.sessionID, label)
+                XCTAssertEqual(preserved.runID, bound.runID, label)
+                XCTAssertEqual(session.runID, runID, label)
+                XCTAssertTrue(session.runState.isActive, "\(label) must not cancel the healthy bound run")
+            }
+
+            if let context = session.mcpControlContext {
+                await AgentRunSessionStore.cleanup(registration: context.registration)
+            }
+        #else
+            throw XCTSkip("OMP qualification transaction is DEBUG-only")
+        #endif
+    }
+
     func testSingleWaitSteeringInterruptCompletesOnceAndKeepsRegistrationActive() async throws {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
@@ -796,7 +1137,8 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         window: WindowState,
         viewModel: AgentModeViewModel,
         liveSnapshots: LiveSnapshots,
-        recorder: WaitScopeRecorder
+        recorder: WaitScopeRecorder,
+        beforeHeartbeatOperation: @escaping () async -> Void = {}
     ) -> AgentRunMCPToolService {
         var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
@@ -812,7 +1154,10 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
             bindCurrentRequestToTab: { _, _ in },
-            withHeartbeat: { _, _, _, _, operation in try await operation() },
+            withHeartbeat: { _, _, _, _, operation in
+                await beforeHeartbeatOperation()
+                return try await operation()
+            },
             startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
                 throw MCPError.internalError("startRun should not be used by wait tests")
             }

@@ -1552,7 +1552,11 @@ actor ACPAgentSessionController {
         }
 
         let rawInput = toolCall["rawInput"] as? [String: Any]
-        let autoApprovalPayload = repoPromptPermissionAutoApprovalPayload(
+        let requestToolName = Self.repoPromptPermissionRequestToolName(
+            toolCall: toolCall,
+            toolTitle: toolTitle
+        )
+        let autoApprovalPayload = Self.repoPromptPermissionAutoApprovalPayload(
             toolTitle: toolTitle,
             toolKind: toolKind,
             toolCall: toolCall,
@@ -1578,7 +1582,7 @@ actor ACPAgentSessionController {
         )
 
         if let autoApproval = autoApprovalSelection(
-            requestToolName: toolTitle,
+            requestToolName: requestToolName,
             requestPayload: autoApprovalPayload,
             options: options
         ) {
@@ -3194,44 +3198,63 @@ actor ACPAgentSessionController {
             requestPayload: requestPayload
         ), isStrictACPRepoPromptPermissionMatch(
             match,
-            requestToolName: requestToolName,
-            requestPayload: requestPayload
+            requestToolName: requestToolName
         ) else {
             return nil
         }
         return match
     }
 
+    private static func repoPromptPermissionRequestToolName(
+        toolCall: [String: Any],
+        toolTitle: String?
+    ) -> String? {
+        ACPRuntimeEventParsing.repoPromptToolName(from: toolCall) ?? toolTitle
+    }
+
+    #if DEBUG
+        static func testRepoPromptPermissionEntryPointMatch(
+            providerID: ACPProviderID,
+            params: [String: Any]
+        ) -> MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch? {
+            guard let toolCall = params["toolCall"] as? [String: Any] else { return nil }
+            let toolTitle = (toolCall["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawInput = toolCall["rawInput"] as? [String: Any]
+            let options = params["options"] as? [[String: Any]] ?? []
+            let requestToolName = repoPromptPermissionRequestToolName(
+                toolCall: toolCall,
+                toolTitle: toolTitle
+            )
+            let payload = repoPromptPermissionAutoApprovalPayload(
+                toolTitle: toolTitle,
+                toolKind: (toolCall["kind"] as? String)?.lowercased(),
+                toolCall: toolCall,
+                rawInput: rawInput,
+                options: options
+            )
+            return repoPromptScopedAutoApprovalMatch(
+                providerID: providerID,
+                requestToolName: requestToolName,
+                requestPayload: payload
+            )
+        }
+    #endif
+
     private static func isStrictACPRepoPromptPermissionMatch(
         _ match: MCPIntegrationHelper.RepoPromptPermissionAutoApprovalMatch,
-        requestToolName: String?,
-        requestPayload: [String: Any]
+        requestToolName: String?
     ) -> Bool {
-        let hasExactServerIdentity = isExactRepoPromptPermissionServerIdentifier(match.serverIdentifier)
-            || isExactRepoPromptPermissionServerIdentifier(
-                MCPIntegrationHelper.repoPromptPermissionServerIdentifier(in: requestPayload)
-            )
-        switch match.source {
-        case .serverIdentifier:
-            return hasExactServerIdentity
-        case .topLevelToolName:
-            return (requestToolName.map(MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix) ?? false)
-                || hasExactServerIdentity
-        case .nestedToolName:
-            return MCPIntegrationHelper.repoPromptPermissionContainsServerPrefixedToolName(in: requestPayload)
-                || hasExactServerIdentity
+        // ACP permission payloads may contain model-controlled tool arguments. Only the
+        // protocol-level request tool name may establish duplicate-approval identity.
+        guard case .topLevelToolName = match.source,
+              let requestToolName
+        else {
+            return false
         }
+        return MCPIntegrationHelper.isRepoPromptToolNameWithServerPrefix(requestToolName)
     }
 
-    private static func isExactRepoPromptPermissionServerIdentifier(_ rawValue: String?) -> Bool {
-        guard let normalized = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !normalized.isEmpty else { return false }
-        let serverName = MCPIntegrationHelper.repoPromptMCPServerName
-        return normalized.caseInsensitiveCompare(serverName) == .orderedSame
-            || normalized.caseInsensitiveCompare("\(serverName) MCP Server") == .orderedSame
-    }
-
-    private func repoPromptPermissionAutoApprovalPayload(
+    private static func repoPromptPermissionAutoApprovalPayload(
         toolTitle: String?,
         toolKind: String?,
         toolCall: [String: Any],
@@ -3250,11 +3273,8 @@ actor ACPAgentSessionController {
         }
         if let rawInputValue = toolCall["rawInput"] {
             payload["rawInput"] = rawInputValue
-        }
-        if let rawInput {
-            for (key, value) in rawInput where payload[key] == nil {
-                payload[key] = value
-            }
+        } else if let rawInput {
+            payload["rawInput"] = rawInput
         }
         return payload
     }

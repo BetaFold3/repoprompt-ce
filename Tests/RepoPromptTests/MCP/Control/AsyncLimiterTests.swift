@@ -653,6 +653,119 @@ import XCTest
             WindowStatesManager.shared.unregisterWindowState(window)
         }
 
+        func testDiagnosticsProjectRawAndNonBookkeepingQualificationIngress() async throws {
+            let manager = ServerNetworkManager()
+            let mixedConnectionID = UUID()
+            let bookkeepingConnectionID = UUID()
+            let unknownConnectionID = UUID()
+            let connectionIDs = [mixedConnectionID, bookkeepingConnectionID, unknownConnectionID]
+            for connectionID in connectionIDs {
+                await manager.debugInstallAdmissionEvictionCandidateForTesting(
+                    connectionID: connectionID,
+                    connection: AdmissionEvictionTestConnection(idleSeconds: 0),
+                    clientID: "qualification-envelope-\(connectionID.uuidString)",
+                    totalToolCalls: 0,
+                    createdAt: .distantPast
+                )
+            }
+            defer {
+                Task {
+                    for connectionID in connectionIDs {
+                        await manager.debugRemoveConnection(connectionID)
+                    }
+                }
+            }
+
+            for toolName in ["set_status", "bind_context", "read_file"] {
+                await manager.debugRecordQualificationRawIngressForTesting(
+                    connectionID: mixedConnectionID,
+                    toolName: toolName
+                )
+            }
+            for toolName in ["set_status", "bind_context", "mcp__RepoPromptCE__set_status"] {
+                await manager.debugRecordQualificationRawIngressForTesting(
+                    connectionID: bookkeepingConnectionID,
+                    toolName: toolName
+                )
+            }
+            await manager.debugRecordQualificationRawIngressForTesting(
+                connectionID: unknownConnectionID,
+                toolName: "some_new_tool"
+            )
+
+            let result = await manager.debugConnectionsPayload(op: "connections", arguments: [:])
+            let payload = try diagnosticsPayload(result)
+            let connections = try XCTUnwrap(payload["connections"] as? [[String: Any]])
+            func connection(_ id: UUID) throws -> [String: Any] {
+                try XCTUnwrap(connections.first { $0["id"] as? String == id.uuidString })
+            }
+
+            let mixed = try connection(mixedConnectionID)
+            XCTAssertEqual(mixed["qualification_raw_tool_call_count"] as? Int, 3)
+            XCTAssertEqual(
+                mixed["qualification_raw_tool_names"] as? [String],
+                ["bind_context", "read_file", "set_status"]
+            )
+            XCTAssertEqual(
+                mixed["qualification_raw_canonical_tool_names"] as? [String],
+                ["bind_context", "read_file", "set_status"]
+            )
+            XCTAssertEqual(mixed["non_bookkeeping_tool_call_count"] as? Int, 1)
+            XCTAssertEqual(mixed["non_bookkeeping_tool_names"] as? [String], ["read_file"])
+
+            let bookkeeping = try connection(bookkeepingConnectionID)
+            XCTAssertEqual(bookkeeping["qualification_raw_tool_call_count"] as? Int, 3)
+            XCTAssertEqual(
+                bookkeeping["qualification_raw_tool_names"] as? [String],
+                ["bind_context", "mcp__RepoPromptCE__set_status", "set_status"]
+            )
+            XCTAssertEqual(
+                bookkeeping["qualification_raw_canonical_tool_names"] as? [String],
+                ["bind_context", "set_status"]
+            )
+            XCTAssertEqual(bookkeeping["non_bookkeeping_tool_call_count"] as? Int, 0)
+            XCTAssertEqual(bookkeeping["non_bookkeeping_tool_names"] as? [String], [])
+
+            let unknown = try connection(unknownConnectionID)
+            XCTAssertEqual(unknown["qualification_raw_canonical_tool_names"] as? [String], ["some_new_tool"])
+            XCTAssertEqual(unknown["non_bookkeeping_tool_call_count"] as? Int, 1)
+            XCTAssertEqual(unknown["non_bookkeeping_tool_names"] as? [String], ["some_new_tool"])
+        }
+
+        func testTerminalRemovedHistoryRetainsQualificationIdentityAndToolEvidence() async throws {
+            let manager = ServerNetworkManager()
+            let connectionID = UUID()
+            let helperPeerPID = 4242
+            await manager.test_installQualificationTeardownConnection(
+                AdmissionEvictionTestConnection(idleSeconds: 0),
+                connectionID: connectionID,
+                helperPeerPID: helperPeerPID
+            )
+            await manager.debugRecordQualificationRawIngressForTesting(
+                connectionID: connectionID,
+                toolName: "set_status"
+            )
+
+            await manager.removeConnection(connectionID)
+
+            let payload = await manager.debugConnectionHistoryPayload(
+                limit: 10,
+                clientName: nil,
+                sessionFingerprint: nil,
+                connectionID: connectionID
+            )
+            let events = try XCTUnwrap(payload["events"] as? [[String: Any]])
+            let removed = try XCTUnwrap(events.first { $0["event"] as? String == "removed" })
+            XCTAssertEqual(removed["helper_peer_pid"] as? Int, helperPeerPID)
+            XCTAssertEqual(removed["qualification_raw_tool_call_count"] as? Int, 1)
+            XCTAssertEqual(removed["qualification_raw_in_flight_call_count"] as? Int, 0)
+            XCTAssertEqual(removed["qualification_raw_tool_names"] as? [String], ["set_status"])
+            XCTAssertEqual(removed["qualification_raw_canonical_tool_names"] as? [String], ["set_status"])
+            XCTAssertEqual(removed["non_bookkeeping_tool_call_count"] as? Int, 0)
+            XCTAssertEqual(removed["non_bookkeeping_tool_names"] as? [String], [])
+            XCTAssertEqual(removed["active_tool_scope_count"] as? Int, 0)
+        }
+
         func testDiagnosticsExposeSelectedActiveScopeWindowInsteadOfAssignedWindow() async throws {
             let manager = ServerNetworkManager()
             let connectionID = UUID()

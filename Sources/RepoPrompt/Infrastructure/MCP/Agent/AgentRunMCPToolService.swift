@@ -292,6 +292,12 @@ struct AgentRunMCPToolService {
         var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
         var testBeforeProviderDispatch: (() async -> Void)?
         var testAfterProviderStartBeforeBookkeeping: (() async -> Void)?
+        var testOMPQualificationOwnerVerifier: ((
+            _ connectionID: UUID,
+            _ ownerProcessID: Int32,
+            _ ownerStartSeconds: Int64,
+            _ ownerStartMicroseconds: Int32
+        ) async -> Bool)?
         var testDispatchSteerInstruction: ((
             _ sessionID: UUID,
             _ text: String,
@@ -317,6 +323,9 @@ struct AgentRunMCPToolService {
         #if DEBUG
             if op != "start", args["_worktree_startup_benchmark_token"] != nil {
                 throw MCPError.invalidParams("The worktree startup benchmark token is only supported with agent_run op=start.")
+            }
+            if op != "start", args["_omp_qualification_lease_id"] != nil {
+                throw MCPError.invalidParams("The OMP qualification lease parameter is only supported with agent_run op=start.")
             }
         #endif
         if op != "start", startWorktreeCoordinator.containsArguments(args) {
@@ -421,6 +430,64 @@ struct AgentRunMCPToolService {
     }
 
     private func executeStart(args: [String: Value]) async throws -> Value {
+        let metadata = await captureRequestMetadata()
+        #if DEBUG
+            var ompQualificationLease: OhMyPiAgentModeSmokeGate.Snapshot?
+            var ompQualificationTransactionSucceeded = false
+            if let rawLeaseID = normalizedString(args["_omp_qualification_lease_id"]) {
+                let activeLease = OhMyPiAgentModeSmokeGate.shared.activeSnapshot()
+                let ownerVerified: Bool = if let connectionID = metadata.connectionID, let activeLease {
+                    if let testOMPQualificationOwnerVerifier {
+                        await testOMPQualificationOwnerVerifier(
+                            connectionID,
+                            activeLease.ownerProcessID,
+                            activeLease.ownerProcessStartSeconds,
+                            activeLease.ownerProcessStartMicroseconds
+                        )
+                    } else {
+                        await ServerNetworkManager.shared.debugQualificationOwnerIsAncestor(
+                            connectionID: connectionID,
+                            ownerProcessID: activeLease.ownerProcessID,
+                            ownerStartSeconds: activeLease.ownerProcessStartSeconds,
+                            ownerStartMicroseconds: activeLease.ownerProcessStartMicroseconds
+                        )
+                    }
+                } else {
+                    false
+                }
+                guard metadata.connectionID != nil,
+                      let leaseID = UUID(uuidString: rawLeaseID),
+                      let activeLease,
+                      activeLease.leaseID == leaseID,
+                      ownerVerified
+                else {
+                    throw MCPError.invalidParams(
+                        "The dedicated DEBUG OMP qualification lease parameter was invalid or its controller ownership could not be verified."
+                    )
+                }
+                guard activeLease.sessionID == nil, activeLease.runID == nil else {
+                    throw MCPError.invalidParams(
+                        "The OMP qualification lease was already consumed by an earlier start."
+                    )
+                }
+                ompQualificationLease = activeLease
+            } else if normalizedString(args["model_id"])?.hasPrefix("ohMyPi:") == true {
+                throw MCPError.invalidParams(
+                    "Fresh OMP qualification starts require _omp_qualification_lease_id."
+                )
+            }
+            // Rollback ownership begins only after the bound-lease guard above; hoisting this
+            // defer would let a rejected replay release and cancel the earlier healthy run.
+            defer {
+                if let ompQualificationLease, !ompQualificationTransactionSucceeded {
+                    _ = try? OhMyPiAgentModeSmokeGate.shared.release(
+                        leaseID: ompQualificationLease.leaseID,
+                        ownerProcessID: ompQualificationLease.ownerProcessID
+                    )
+                }
+            }
+        #endif
+
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
@@ -437,7 +504,6 @@ struct AgentRunMCPToolService {
         let detach = parseBool(args["detach"]) ?? false
         let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(args["timeout"])
 
-        let metadata = await captureRequestMetadata()
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace available for agent_run.start.")
@@ -523,6 +589,15 @@ struct AgentRunMCPToolService {
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
             workspaceID: workspace.id
         )
+        #if DEBUG
+            if selection.agentRaw == AgentProviderKind.ohMyPi.rawValue,
+               ompQualificationLease == nil
+            {
+                throw MCPError.invalidParams(
+                    "Fresh OMP qualification starts require _omp_qualification_lease_id."
+                )
+            }
+        #endif
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -572,6 +647,40 @@ struct AgentRunMCPToolService {
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
         }
+        #if DEBUG
+            let existingTargetAgent = agentModeVM.session(
+                for: target.tabID,
+                createIfNeeded: false
+            )?.selectedAgent
+            let effectiveTargetIsOhMyPi = selection.agentRaw == AgentProviderKind.ohMyPi.rawValue
+                || (selection.agentRaw == nil && existingTargetAgent == .ohMyPi)
+            if effectiveTargetIsOhMyPi {
+                guard let ompQualificationLease,
+                      let connectionID = metadata.connectionID
+                else {
+                    await agentModeVM.mcpDiscardSessionTarget(target)
+                    throw MCPError.invalidParams(
+                        "The effective OMP target requires _omp_qualification_lease_id, including when model_id is omitted."
+                    )
+                }
+                do {
+                    _ = try OhMyPiAgentModeSmokeGate.shared.consume(
+                        leaseID: ompQualificationLease.leaseID,
+                        ownerConnectionID: connectionID,
+                        ownerProcessID: ompQualificationLease.ownerProcessID,
+                        sessionID: targetSessionID
+                    )
+                } catch {
+                    await agentModeVM.mcpDiscardSessionTarget(target)
+                    throw MCPError.invalidParams("The OMP qualification lease was expired, stolen, or already consumed.")
+                }
+            } else if ompQualificationLease != nil {
+                await agentModeVM.mcpDiscardSessionTarget(target)
+                throw MCPError.invalidParams(
+                    "_omp_qualification_lease_id may only authorize an effective OMP target."
+                )
+            }
+        #endif
         #if DEBUG
             if worktreeStartupBenchmarkToken != nil {
                 do {
@@ -709,6 +818,11 @@ struct AgentRunMCPToolService {
                 )
             }
         } catch {
+            #if DEBUG
+                if ompQualificationLease != nil, let connectionID = metadata.connectionID {
+                    _ = OhMyPiAgentModeSmokeGate.shared.releaseOwned(by: connectionID)
+                }
+            #endif
             WorktreeStartupInstrumentation.record(
                 .failed,
                 context: worktreeStartupContext,
@@ -797,6 +911,11 @@ struct AgentRunMCPToolService {
                 }
             #endif
         } catch {
+            #if DEBUG
+                if ompQualificationLease != nil, let connectionID = metadata.connectionID {
+                    _ = OhMyPiAgentModeSmokeGate.shared.releaseOwned(by: connectionID)
+                }
+            #endif
             let decoratedError = startWorktreeCoordinator.providerStartError(
                 error,
                 targetSessionID: target.sessionID,
@@ -829,6 +948,32 @@ struct AgentRunMCPToolService {
             throw decoratedError
         }
         #if DEBUG
+            if let ompQualificationLease {
+                guard let connectionID = metadata.connectionID,
+                      let runID = outcome.snapshot.runID
+                else {
+                    await agentModeVM.cancelAgentRun(
+                        tabID: target.tabID,
+                        completion: .terminalPublished
+                    )
+                    throw MCPError.invalidParams("The OMP qualification start did not expose a bindable run identity.")
+                }
+                do {
+                    _ = try OhMyPiAgentModeSmokeGate.shared.bindRun(
+                        leaseID: ompQualificationLease.leaseID,
+                        ownerConnectionID: connectionID,
+                        sessionID: outcome.snapshot.sessionID,
+                        runID: runID
+                    )
+                } catch {
+                    _ = OhMyPiAgentModeSmokeGate.shared.releaseOwned(by: connectionID)
+                    await agentModeVM.cancelAgentRun(
+                        tabID: target.tabID,
+                        completion: .terminalPublished
+                    )
+                    throw MCPError.invalidParams("The OMP qualification lease could not bind the created run.")
+                }
+            }
             if worktreeStartupBenchmarkToken != nil {
                 try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
                     correlationID: worktreeStartupCorrelationID,
@@ -838,9 +983,13 @@ struct AgentRunMCPToolService {
             }
         #endif
         if detach || outcome.snapshot.status != .running || timeoutSeconds <= 0 {
+            #if DEBUG
+                ompQualificationTransactionSucceeded = ompQualificationLease == nil
+                    || Self.ompQualificationTransactionCommits(status: outcome.snapshot.status)
+            #endif
             return decoratedRunValue(snapshot: outcome.snapshot, workflow: workflow, delivery: outcome.delivery)
         }
-        return try await waitForInterestingState(
+        let waitedValue = try await waitForInterestingState(
             sessionID: outcome.snapshot.sessionID,
             agentModeVM: agentModeVM,
             metadata: metadata,
@@ -850,6 +999,15 @@ struct AgentRunMCPToolService {
             workflow: workflow,
             initialDelivery: outcome.delivery
         )
+        #if DEBUG
+            let committedStatus = await currentSnapshot(
+                sessionID: outcome.snapshot.sessionID,
+                agentModeVM: agentModeVM
+            ).status
+            ompQualificationTransactionSucceeded = ompQualificationLease == nil
+                || Self.ompQualificationTransactionCommits(status: committedStatus)
+        #endif
+        return waitedValue
     }
 
     private func executeWait(args: [String: Value], forcePoll: Bool = false) async throws -> Value {
@@ -985,18 +1143,45 @@ struct AgentRunMCPToolService {
         return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots)
     }
 
+    #if DEBUG
+        static func ompQualificationTransactionCommits(status: AgentRunMCPSnapshot.Status) -> Bool {
+            switch status {
+            case .running, .waitingForInput, .completed:
+                true
+            case .failed, .cancelled, .expired:
+                false
+            }
+        }
+    #endif
+
     private func executeCancel(args: [String: Value]) async throws -> Value {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        let expectedRunID: UUID?
+        if args["run_id"] != nil {
+            guard let expectedRunIDRaw = normalizedString(args["run_id"]),
+                  let parsedExpectedRunID = UUID(uuidString: expectedRunIDRaw)
+            else {
+                throw MCPError.invalidParams("agent_run cancel run_id must be a non-empty UUID string when provided.")
+            }
+            expectedRunID = parsedExpectedRunID
+            guard initialSnapshot.runID == parsedExpectedRunID else {
+                throw MCPError.invalidParams(
+                    "The requested run_id is not the current run for this session; refusing to cancel a different run."
+                )
+            }
+        } else {
+            expectedRunID = nil
+        }
         if initialSnapshot.status == .expired {
             throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
         }
         if initialSnapshot.status.isTerminal {
             throw MCPError.invalidParams("The run is not currently active (status: \(initialSnapshot.status.rawValue)) and cannot be cancelled.")
         }
-        guard let session = agentModeVM.mcpControlledSession(sessionID: sessionID), session.runState.isActive else {
+        guard agentModeVM.mcpControlledSession(sessionID: sessionID)?.runState.isActive == true else {
             throw MCPError.invalidParams("The run is not currently active and cannot be cancelled.")
         }
         let metadata = await captureRequestMetadata()
@@ -1006,7 +1191,25 @@ struct AgentRunMCPToolService {
             "cancelling",
             "Cancelling the agent run..."
         ) {
-            await agentModeVM.cancelAgentRun(tabID: session.tabID, completion: .terminalPublished)
+            let cancelTarget = await MainActor.run {
+                guard let session = agentModeVM.mcpControlledSession(sessionID: sessionID), session.runState.isActive else {
+                    return nil as AgentRunCancelTarget?
+                }
+                return agentModeVM.makeRunCancelTarget(tabID: session.tabID, session: session)
+            }
+            guard let cancelTarget else {
+                throw MCPError.invalidParams("The run is not currently active and cannot be cancelled.")
+            }
+            if let expectedRunID, cancelTarget.expectedRunID != expectedRunID {
+                throw MCPError.invalidParams(
+                    "The requested run_id is not the current run for this session; refusing to cancel a different run."
+                )
+            }
+            guard await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished) else {
+                throw MCPError.invalidParams(
+                    "The requested run is no longer current; refusing to cancel a different run."
+                )
+            }
             await Task.yield()
             return await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM).toValue()
         }

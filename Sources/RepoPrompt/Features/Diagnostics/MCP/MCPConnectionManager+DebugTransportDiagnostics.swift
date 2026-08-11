@@ -327,7 +327,8 @@ import MCP
                 "ok": true,
                 "op": op,
                 "connections": snapshot.connections.map { entry in
-                    [
+                    let rawIngress = debugQualificationRawIngressSnapshot(connectionID: entry.id)
+                    return [
                         "id": entry.id.uuidString,
                         "client_name": entry.clientName.isEmpty ? NSNull() : entry.clientName,
                         "normalized_client_id": debugNormalizedClientID(for: entry.clientName) ?? NSNull(),
@@ -335,6 +336,14 @@ import MCP
                         "state": entry.state.rawValue,
                         "transport": entry.transport.rawValue,
                         "has_in_flight_calls": entry.hasInFlightCalls,
+                        "total_tool_calls": entry.totalToolCalls,
+                        "qualification_raw_tool_call_count": rawIngress.totalCalls,
+                        "qualification_raw_in_flight_call_count": rawIngress.inFlightCalls,
+                        "qualification_raw_tool_names": rawIngress.observedToolNames,
+                        "qualification_raw_canonical_tool_names": rawIngress.canonicalToolNames,
+                        "non_bookkeeping_tool_call_count": rawIngress.nonBookkeepingCalls,
+                        "non_bookkeeping_tool_names": rawIngress.nonBookkeepingToolNames,
+                        "helper_peer_pid": debugHelperPeerPID(connectionID: entry.id) ?? NSNull(),
                         "active_tool_name": entry.activeToolName ?? NSNull(),
                         "active_tool_window_id": entry.activeToolWindowID.map { $0 as Any } ?? NSNull(),
                         "active_tool_scope_count": entry.activeToolScopeCount,
@@ -371,6 +380,112 @@ import MCP
                 }
             }
             return debugDiagnosticsResult(payload)
+        }
+
+        func debugOMPQualificationLeasePayload(
+            op: String,
+            connectionID: UUID,
+            arguments: [String: Value]
+        ) -> CallTool.Result {
+            guard let action = debugString(arguments, "action") else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "action must be acquire, status, or release.")
+            }
+            let gate = OhMyPiAgentModeSmokeGate.shared
+            let ownerProcessID: Int32?
+            let ownerProcessIdentity: (startSeconds: Int64, startMicroseconds: Int32)?
+            if action == "acquire" || action == "release" {
+                guard let rawOwnerPID = arguments["owner_pid"]?.intValue,
+                      rawOwnerPID > 1,
+                      rawOwnerPID <= Int(Int32.max)
+                else {
+                    return debugDiagnosticsError(op: op, code: "owner_mismatch", message: "owner_pid must identify the verified qualification controller process.")
+                }
+                let parsedOwnerPID = Int32(rawOwnerPID)
+                if action == "acquire" {
+                    guard let identity = debugQualificationOwnerIdentity(
+                        connectionID: connectionID,
+                        ownerProcessID: parsedOwnerPID
+                    ) else {
+                        return debugDiagnosticsError(op: op, code: "owner_mismatch", message: "owner_pid must be a verified ancestor of the calling DEBUG CLI process.")
+                    }
+                    ownerProcessIdentity = identity
+                } else {
+                    guard let snapshot = try? gate.requireOwner(processID: parsedOwnerPID),
+                          debugQualificationOwnerIsAncestor(
+                              connectionID: connectionID,
+                              ownerProcessID: parsedOwnerPID,
+                              ownerStartSeconds: snapshot.ownerProcessStartSeconds,
+                              ownerStartMicroseconds: snapshot.ownerProcessStartMicroseconds
+                          )
+                    else {
+                        return debugDiagnosticsError(op: op, code: "owner_mismatch", message: "The qualification controller process identity or ancestry no longer matches.")
+                    }
+                    ownerProcessIdentity = (
+                        snapshot.ownerProcessStartSeconds,
+                        snapshot.ownerProcessStartMicroseconds
+                    )
+                }
+                ownerProcessID = parsedOwnerPID
+            } else {
+                ownerProcessID = nil
+                ownerProcessIdentity = nil
+            }
+            do {
+                let snapshot: OhMyPiAgentModeSmokeGate.Snapshot?
+                switch action {
+                case "acquire":
+                    let duration: Int
+                    switch debugBoundedInt(arguments, "duration_seconds", defaultValue: 300, range: 10 ... 600) {
+                    case let .value(value), let .defaulted(value): duration = value
+                    case .invalid:
+                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "duration_seconds must be an integer in 10...600.")
+                    }
+                    snapshot = try gate.acquire(
+                        ownerConnectionID: connectionID,
+                        ownerProcessID: ownerProcessID!,
+                        ownerProcessStartSeconds: ownerProcessIdentity!.startSeconds,
+                        ownerProcessStartMicroseconds: ownerProcessIdentity!.startMicroseconds,
+                        duration: TimeInterval(duration)
+                    )
+                case "status":
+                    snapshot = gate.activeSnapshot()
+                case "release":
+                    guard let rawLeaseID = debugString(arguments, "lease_id"),
+                          let leaseID = UUID(uuidString: rawLeaseID)
+                    else {
+                        return debugDiagnosticsError(op: op, code: "invalid_params", message: "release requires a UUID lease_id.")
+                    }
+                    snapshot = try gate.release(
+                        leaseID: leaseID,
+                        ownerProcessID: ownerProcessID!
+                    )
+                default:
+                    return debugDiagnosticsError(op: op, code: "invalid_params", message: "action must be acquire, status, or release.")
+                }
+                let active = action != "release" && snapshot != nil
+                return debugDiagnosticsResult([
+                    "ok": true,
+                    "op": op,
+                    "action": action,
+                    "active": active,
+                    "lease_id": snapshot?.leaseID.uuidString ?? NSNull(),
+                    "owner_connection_id": snapshot?.ownerConnectionID.uuidString ?? NSNull(),
+                    "owner_pid": snapshot.map { Int($0.ownerProcessID) } ?? NSNull(),
+                    "owner_process_start_seconds": snapshot?.ownerProcessStartSeconds ?? NSNull(),
+                    "owner_process_start_microseconds": snapshot.map { Int($0.ownerProcessStartMicroseconds) } ?? NSNull(),
+                    "expires_at_ms": snapshot.map { Int($0.expiresAt.timeIntervalSince1970 * 1000) } ?? NSNull(),
+                    "session_id": snapshot?.sessionID?.uuidString ?? NSNull(),
+                    "run_id": snapshot?.runID?.uuidString ?? NSNull()
+                ])
+            } catch let error as OhMyPiAgentModeSmokeGate.LeaseError {
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "lease_\(String(describing: error))",
+                    message: "OMP qualification lease request rejected: \(error)."
+                )
+            } catch {
+                return debugDiagnosticsError(op: op, code: "lease_error", message: "OMP qualification lease request failed.")
+            }
         }
 
         func debugSleepPayload(op: String, arguments: [String: Value]) async -> CallTool.Result {

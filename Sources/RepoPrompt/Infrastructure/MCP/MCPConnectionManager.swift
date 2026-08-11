@@ -12,6 +12,110 @@ import RepoPromptShared
 import SwiftUI
 
 #if DEBUG
+    private final class OMPQualificationRawIngressRecorder: @unchecked Sendable {
+        struct Snapshot {
+            let totalCalls: Int
+            let inFlightCalls: Int
+            let observedToolNames: [String]
+            let canonicalToolNames: [String]
+            let nonBookkeepingCalls: Int
+            let nonBookkeepingToolNames: [String]
+        }
+
+        final class Lease: @unchecked Sendable {
+            private let lock = NSLock()
+            private var released = false
+            private let releaseAction: @Sendable () -> Void
+
+            init(releaseAction: @escaping @Sendable () -> Void) {
+                self.releaseAction = releaseAction
+            }
+
+            func release() {
+                let shouldRelease = lock.withLock { () -> Bool in
+                    guard !released else { return false }
+                    released = true
+                    return true
+                }
+                if shouldRelease { releaseAction() }
+            }
+
+            deinit { release() }
+        }
+
+        private let lock = NSLock()
+        private var totals: [UUID: Int] = [:]
+        private var inFlight: [UUID: Int] = [:]
+        private var observedToolNames: [UUID: Set<String>] = [:]
+        private var canonicalToolNames: [UUID: Set<String>] = [:]
+        private var nonBookkeepingTotals: [UUID: Int] = [:]
+        private var nonBookkeepingToolNames: [UUID: Set<String>] = [:]
+
+        func begin(
+            connectionID: UUID,
+            observedToolName: String,
+            canonicalToolName: String,
+            isBookkeeping: Bool
+        ) -> Lease {
+            lock.withLock {
+                totals[connectionID, default: 0] += 1
+                inFlight[connectionID, default: 0] += 1
+                if observedToolNames[connectionID, default: []].count < 32 {
+                    observedToolNames[connectionID, default: []].insert(observedToolName)
+                }
+                if canonicalToolNames[connectionID, default: []].count < 32 {
+                    canonicalToolNames[connectionID, default: []].insert(canonicalToolName)
+                }
+                if !isBookkeeping {
+                    nonBookkeepingTotals[connectionID, default: 0] += 1
+                    if nonBookkeepingToolNames[connectionID, default: []].count < 32 {
+                        nonBookkeepingToolNames[connectionID, default: []].insert(observedToolName)
+                    }
+                }
+            }
+            return Lease { [weak self] in
+                self?.finish(connectionID: connectionID)
+            }
+        }
+
+        func snapshot(connectionID: UUID) -> Snapshot {
+            lock.withLock {
+                Snapshot(
+                    totalCalls: totals[connectionID, default: 0],
+                    inFlightCalls: inFlight[connectionID, default: 0],
+                    observedToolNames: observedToolNames[connectionID, default: []].sorted(),
+                    canonicalToolNames: canonicalToolNames[connectionID, default: []].sorted(),
+                    nonBookkeepingCalls: nonBookkeepingTotals[connectionID, default: 0],
+                    nonBookkeepingToolNames: nonBookkeepingToolNames[connectionID, default: []].sorted()
+                )
+            }
+        }
+
+        func remove(connectionID: UUID) {
+            lock.withLock {
+                totals.removeValue(forKey: connectionID)
+                inFlight.removeValue(forKey: connectionID)
+                observedToolNames.removeValue(forKey: connectionID)
+                canonicalToolNames.removeValue(forKey: connectionID)
+                nonBookkeepingTotals.removeValue(forKey: connectionID)
+                nonBookkeepingToolNames.removeValue(forKey: connectionID)
+            }
+        }
+
+        private func finish(connectionID: UUID) {
+            lock.withLock {
+                let remaining = max(0, inFlight[connectionID, default: 0] - 1)
+                if remaining == 0 {
+                    inFlight.removeValue(forKey: connectionID)
+                } else {
+                    inFlight[connectionID] = remaining
+                }
+            }
+        }
+    }
+#endif
+
+#if DEBUG
     private var mcpConnectionManagerDebugLoggingEnabled = ProcessInfo.processInfo.environment["REPOPROMPT_MCP_DEBUG"] == "1"
     private var mcpRoutingDebugLoggingEnabled = false
     private var mcpPolicyDebugLoggingEnabled = false
@@ -415,6 +519,12 @@ actor ServerNetworkManager {
         toolNameAliases[name] ?? name
     }
 
+    #if DEBUG
+        private nonisolated static func qualificationCanonicalToolName(for name: String) -> String {
+            MCPIntegrationHelper.canonicalRepoPromptToolName(name) ?? canonicalToolName(for: name)
+        }
+    #endif
+
     nonisolated static func isAllowedByPositiveToolCeiling(
         canonicalToolName: String,
         allowedToolsOverride: Set<String>?
@@ -467,6 +577,17 @@ actor ServerNetworkManager {
     }
 
     #if DEBUG
+        func test_installQualificationTeardownConnection(
+            _ connection: any MCPServerConnection,
+            connectionID: UUID,
+            helperPeerPID: Int? = nil
+        ) {
+            connections[connectionID] = connection
+            if let helperPeerPID {
+                bootstrapPeerPIDByConnectionID[connectionID] = helperPeerPID
+            }
+        }
+
         nonisolated static func test_validatedLiveRunID(
             candidateRunID: UUID,
             connectionID: UUID,
@@ -895,6 +1016,14 @@ actor ServerNetworkManager {
             let state: String?
             let reason: String?
             let transportIngress: MCPTransportIngressSnapshot?
+            let qualificationRawToolCallCount: Int
+            let qualificationRawInFlightCallCount: Int
+            let qualificationRawToolNames: [String]
+            let qualificationRawCanonicalToolNames: [String]
+            let qualificationRawNonBookkeepingToolCallCount: Int
+            let qualificationRawNonBookkeepingToolNames: [String]
+            let activeToolScopeCount: Int
+            let helperPeerPID: Int?
         }
 
         private struct DebugRunRoutingEvent {
@@ -934,6 +1063,15 @@ actor ServerNetworkManager {
         private let debugRestartStatusLimit = 50
         private var debugResolvedToolOperationOverrides: [String: @Sendable () async throws -> Value] = [:]
         private var debugExecutionWatchdogAbortTargets: [UUID: any MCPServerConnection] = [:]
+        private struct DebugExpectedProcessIdentity {
+            let seconds: Int64
+            let microseconds: Int32
+            let executablePath: String?
+            let executableIdentity: ExecutableFileIdentity?
+        }
+
+        private var debugExpectedProcessIdentityByRunID: [UUID: [pid_t: DebugExpectedProcessIdentity]] = [:]
+        private let debugQualificationRawIngress = OMPQualificationRawIngressRecorder()
     #endif
 
     private var connections: [UUID: any MCPServerConnection] = [:]
@@ -5186,23 +5324,33 @@ actor ServerNetworkManager {
                                     .map(String.init)
                                     .sorted()
                                     .joined(separator: ",")
+                                var identityFields = [
+                                    "bootstrap_client_name": bootstrapClientName ?? "nil",
+                                    "authoritative_client_name": clientInfo.name,
+                                    "helper_peer_pid": String(clientPid),
+                                    "ancestor_chain": self.pidAncestorChainDescription(from: pid_t(clientPid)),
+                                    "expected_pids": expectedPIDs,
+                                    "pending_policy_key": diagnosticPolicy.key,
+                                    "policy_consumable": String(self.canConsumePendingPolicy(
+                                        diagnosticPolicy.policy,
+                                        clientName: clientInfo.name,
+                                        clientPid: clientPid
+                                    ))
+                                ]
+                                if clientInfo.name == AgentProviderKind.ohMyPiMCPClientID {
+                                    identityFields.merge(
+                                        self.debugOMPProcessCorrelationFields(
+                                            runID: runID,
+                                            helperPeerPID: pid_t(clientPid)
+                                        ),
+                                        uniquingKeysWith: { _, verified in verified }
+                                    )
+                                }
                                 self.debugRecordRunRoutingEvent(
                                     runID: runID,
                                     event: "client_identity_observed",
                                     connectionID: connectionID,
-                                    fields: [
-                                        "bootstrap_client_name": bootstrapClientName ?? "nil",
-                                        "authoritative_client_name": clientInfo.name,
-                                        "helper_peer_pid": String(clientPid),
-                                        "ancestor_chain": self.pidAncestorChainDescription(from: pid_t(clientPid)),
-                                        "expected_pids": expectedPIDs,
-                                        "pending_policy_key": diagnosticPolicy.key,
-                                        "policy_consumable": String(self.canConsumePendingPolicy(
-                                            diagnosticPolicy.policy,
-                                            clientName: clientInfo.name,
-                                            clientPid: clientPid
-                                        ))
-                                    ]
+                                    fields: identityFields
                                 )
                             }
                         #endif
@@ -5497,6 +5645,9 @@ actor ServerNetworkManager {
         pendingPoliciesByClient.removeAll()
         expectedAgentPIDsByClient.removeAll()
         expectedAgentPIDsByRunID.removeAll()
+        #if DEBUG
+            debugExpectedProcessIdentityByRunID.removeAll()
+        #endif
         runPolicyStateByRunID.removeAll()
         admittedPolicyRunIDs.removeAll()
         windowIDByRunID.removeAll()
@@ -6203,6 +6354,17 @@ actor ServerNetworkManager {
         let cleanupRunID = runIDByConnectionID[id]
         let detachContextBuilderRunID: UUID? = cleanupRunPurpose == .discoverRun ? cleanupRunID : nil
         let responseDeliverySnapshot = await connections[id]?.responseDeliverySnapshot()
+        #if DEBUG
+            if let qualificationLease = OhMyPiAgentModeSmokeGate.shared.activeSnapshot(),
+               qualificationLease.ownerConnectionID == id,
+               let responseDeliverySnapshot,
+               responseDeliverySnapshot.acceptedRequestsFullyResponded == false
+            {
+                if OhMyPiAgentModeSmokeGate.shared.releaseOwned(by: id) != nil {
+                    connectionLog("removeConnection: released incompletely delivered OMP qualification lease owned by \(id)")
+                }
+            }
+        #endif
 
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
@@ -6237,6 +6399,7 @@ actor ServerNetworkManager {
                 sessionToken: sessionToken,
                 windowID: assignedWindowID
             )
+            debugQualificationRawIngress.remove(connectionID: id)
         #endif
 
         restrictedToolsByConnection.removeValue(forKey: id)
@@ -6573,6 +6736,18 @@ actor ServerNetworkManager {
             var runPIDs = expectedAgentPIDsByRunID[runID] ?? []
             runPIDs.insert(pid)
             expectedAgentPIDsByRunID[runID] = runPIDs
+            #if DEBUG
+                if let identity = processIdentity(of: pid) {
+                    debugExpectedProcessIdentityByRunID[runID, default: [:]][pid] = DebugExpectedProcessIdentity(
+                        seconds: identity.startSeconds,
+                        microseconds: identity.startMicroseconds,
+                        executablePath: identity.executablePath,
+                        executableIdentity: identity.executablePath.flatMap {
+                            try? ExecutableFileIdentity.capture(atPath: $0)
+                        }
+                    )
+                }
+            #endif
         }
         mcpPolicyLog(
             "registered expected agent pid client=\(clientName) storageKey=\(storageKey) pid=\(pid) runID=\(runID?.uuidString ?? "nil") count=\(pids.count)"
@@ -6636,8 +6811,14 @@ actor ServerNetworkManager {
     private func removeExpectedAgentPID(_ pid: pid_t, forRunID runID: UUID) {
         guard var pids = expectedAgentPIDsByRunID[runID] else { return }
         pids.remove(pid)
+        #if DEBUG
+            debugExpectedProcessIdentityByRunID[runID]?.removeValue(forKey: pid)
+        #endif
         if pids.isEmpty {
             expectedAgentPIDsByRunID.removeValue(forKey: runID)
+            #if DEBUG
+                debugExpectedProcessIdentityByRunID.removeValue(forKey: runID)
+            #endif
         } else {
             expectedAgentPIDsByRunID[runID] = pids
         }
@@ -6862,6 +7043,153 @@ actor ServerNetworkManager {
         return false
     }
 
+    #if DEBUG
+        func debugHelperPeerPID(connectionID: UUID) -> Int? {
+            bootstrapPeerPIDByConnectionID[connectionID]
+        }
+
+        func debugQualificationRawIngressSnapshot(
+            connectionID: UUID
+        ) -> (
+            totalCalls: Int,
+            inFlightCalls: Int,
+            observedToolNames: [String],
+            canonicalToolNames: [String],
+            nonBookkeepingCalls: Int,
+            nonBookkeepingToolNames: [String]
+        ) {
+            let snapshot = debugQualificationRawIngress.snapshot(connectionID: connectionID)
+            return (
+                snapshot.totalCalls,
+                snapshot.inFlightCalls,
+                snapshot.observedToolNames,
+                snapshot.canonicalToolNames,
+                snapshot.nonBookkeepingCalls,
+                snapshot.nonBookkeepingToolNames
+            )
+        }
+
+        func debugRecordQualificationRawIngressForTesting(connectionID: UUID, toolName: String) {
+            let canonicalName = Self.qualificationCanonicalToolName(for: toolName)
+            let lease = debugQualificationRawIngress.begin(
+                connectionID: connectionID,
+                observedToolName: toolName,
+                canonicalToolName: canonicalName,
+                isBookkeeping: canonicalName == "set_status" || canonicalName == "bind_context"
+            )
+            lease.release()
+        }
+
+        private func debugOMPProcessCorrelationFields(runID: UUID, helperPeerPID: pid_t) -> [String: String] {
+            let helperIdentity = processIdentity(of: helperPeerPID)
+            let bundledIdentity = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp")
+                .flatMap { try? ExecutableFileIdentity.capture(atPath: $0.path) }
+            let actualHelperIdentity = helperIdentity?.executablePath
+                .flatMap { try? ExecutableFileIdentity.capture(atPath: $0) }
+            let bundledMatch = bundledIdentity != nil && actualHelperIdentity == bundledIdentity
+
+            var chain: [String] = []
+            var current = helperPeerPID
+            var matchedExpectedPID: pid_t?
+            var matchedExpectedIdentity: DebugExpectedProcessIdentity?
+            var ompCurrentExecutableIdentityMatch = false
+            for depth in 0 ..< 16 {
+                guard let identity = processIdentity(of: current) else { break }
+                chain.append("\(current)@\(identity.startSeconds).\(identity.startMicroseconds)")
+                if depth > 0,
+                   let registered = debugExpectedProcessIdentityByRunID[runID]?[current],
+                   registered.seconds == identity.startSeconds,
+                   registered.microseconds == identity.startMicroseconds
+                {
+                    matchedExpectedPID = current
+                    matchedExpectedIdentity = registered
+                    ompCurrentExecutableIdentityMatch = Self.debugProcessIdentityMatches(
+                        expectedStartSeconds: registered.seconds,
+                        expectedStartMicroseconds: registered.microseconds,
+                        expectedExecutableIdentity: registered.executableIdentity,
+                        currentStartSeconds: identity.startSeconds,
+                        currentStartMicroseconds: identity.startMicroseconds,
+                        currentExecutablePath: identity.executablePath
+                    )
+                    break
+                }
+                guard let parent = parentPID(of: current), parent > 1, parent != current else { break }
+                current = parent
+            }
+            let strictDescendant = matchedExpectedPID != nil && matchedExpectedPID != helperPeerPID
+            let correlationOK = strictDescendant && ompCurrentExecutableIdentityMatch && bundledMatch
+            return [
+                "process_correlation_ok": String(correlationOK),
+                "matched_expected_pid": matchedExpectedPID.map(String.init) ?? "nil",
+                "matched_expected_start_seconds": matchedExpectedIdentity.map { String($0.seconds) } ?? "nil",
+                "matched_expected_start_microseconds": matchedExpectedIdentity.map { String($0.microseconds) } ?? "nil",
+                "matched_expected_executable_path": matchedExpectedIdentity?.executablePath ?? "nil",
+                "omp_current_executable_identity_match": String(ompCurrentExecutableIdentityMatch),
+                "helper_peer_pid": String(helperPeerPID),
+                "helper_process_start_seconds": helperIdentity.map { String($0.startSeconds) } ?? "nil",
+                "helper_process_start_microseconds": helperIdentity.map { String($0.startMicroseconds) } ?? "nil",
+                "helper_executable_path": helperIdentity?.executablePath ?? "nil",
+                "helper_bundled_identity_match": String(bundledMatch),
+                "helper_current_executable_identity_match": String(bundledMatch),
+                "helper_strict_descendant": String(strictDescendant),
+                "process_identity_chain": chain.joined(separator: "<-")
+            ]
+        }
+
+        nonisolated static func debugProcessIdentityMatches(
+            expectedStartSeconds: Int64,
+            expectedStartMicroseconds: Int32,
+            expectedExecutableIdentity: ExecutableFileIdentity?,
+            currentStartSeconds: Int64,
+            currentStartMicroseconds: Int32,
+            currentExecutablePath: String?
+        ) -> Bool {
+            guard expectedStartSeconds == currentStartSeconds,
+                  expectedStartMicroseconds == currentStartMicroseconds,
+                  let expectedExecutableIdentity,
+                  let currentExecutablePath,
+                  let currentExecutableIdentity = try? ExecutableFileIdentity.capture(atPath: currentExecutablePath)
+            else { return false }
+            return currentExecutableIdentity == expectedExecutableIdentity
+        }
+
+        func debugQualificationOwnerIdentity(
+            connectionID: UUID,
+            ownerProcessID: Int32
+        ) -> (startSeconds: Int64, startMicroseconds: Int32)? {
+            guard ownerProcessID > 1,
+                  let peerPID = bootstrapPeerPIDByConnectionID[connectionID],
+                  isAncestor(expectedPIDs: [pid_t(ownerProcessID)], ofPid: pid_t(peerPID)),
+                  let identity = processIdentity(of: pid_t(ownerProcessID))
+            else { return nil }
+            return (identity.startSeconds, identity.startMicroseconds)
+        }
+
+        func debugQualificationOwnerIsAncestor(
+            connectionID: UUID,
+            ownerProcessID: Int32,
+            ownerStartSeconds: Int64,
+            ownerStartMicroseconds: Int32
+        ) -> Bool {
+            guard ownerProcessID > 1,
+                  let peerPID = bootstrapPeerPIDByConnectionID[connectionID],
+                  let ownerIdentity = processIdentity(of: pid_t(ownerProcessID)),
+                  ownerIdentity.startSeconds == ownerStartSeconds,
+                  ownerIdentity.startMicroseconds == ownerStartMicroseconds
+            else { return false }
+            return isAncestor(expectedPIDs: [pid_t(ownerProcessID)], ofPid: pid_t(peerPID))
+        }
+
+        func debugRoutingSequenceBaselinePayload(op: String) -> [String: Any] {
+            [
+                "ok": true,
+                "op": op,
+                "run_routing_sequence": Int(debugRunRoutingHistorySeq),
+                "connection_sequence": Int(debugConnectionHistorySeq)
+            ]
+        }
+    #endif
+
     private nonisolated func pidAncestorChainDescription(from startPid: pid_t) -> String {
         var chain = [String(startPid)]
         var current = startPid
@@ -6873,6 +7201,24 @@ actor ServerNetworkManager {
             current = parent
         }
         return chain.joined(separator: "<-")
+    }
+
+    private nonisolated func processIdentity(
+        of pid: pid_t
+    ) -> (startSeconds: Int64, startMicroseconds: Int32, executablePath: String?)? {
+        var info = kinfo_proc()
+        var size = MemoryLayout.stride(ofValue: info)
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else {
+            return nil
+        }
+        var pathBuffer = [CChar](repeating: 0, count: 4096)
+        let pathLength = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+        return (
+            Int64(info.kp_proc.p_starttime.tv_sec),
+            Int32(info.kp_proc.p_starttime.tv_usec),
+            pathLength > 0 ? String(cString: pathBuffer) : nil
+        )
     }
 
     private nonisolated func parentPID(of pid: pid_t) -> pid_t? {
@@ -7567,6 +7913,10 @@ actor ServerNetworkManager {
                 let resolvedClientName = overrideClientName ?? connectionID.flatMap { clientIdentifier(forConnection: $0) }
                 let resolvedSessionToken = overrideSessionToken ?? connectionID.flatMap { sessionToken(for: $0) }
                 let resolvedState: String? = state
+                let rawIngress = connectionID.map { debugQualificationRawIngress.snapshot(connectionID: $0) }
+                let activeScopeCount = connectionID.map {
+                    activeToolScopeIDs(ownedBy: $0).values.reduce(0) { $0 + $1.count }
+                } ?? 0
                 let entry = DebugConnectionEvent(
                     seq: debugConnectionHistorySeq,
                     timestamp: Date(),
@@ -7579,7 +7929,15 @@ actor ServerNetworkManager {
                     windowID: overrideWindowID ?? connectionID.flatMap { connectionWindowMap[$0] },
                     state: resolvedState,
                     reason: reason,
-                    transportIngress: transportIngress
+                    transportIngress: transportIngress,
+                    qualificationRawToolCallCount: rawIngress?.totalCalls ?? 0,
+                    qualificationRawInFlightCallCount: rawIngress?.inFlightCalls ?? 0,
+                    qualificationRawToolNames: rawIngress?.observedToolNames ?? [],
+                    qualificationRawCanonicalToolNames: rawIngress?.canonicalToolNames ?? [],
+                    qualificationRawNonBookkeepingToolCallCount: rawIngress?.nonBookkeepingCalls ?? 0,
+                    qualificationRawNonBookkeepingToolNames: rawIngress?.nonBookkeepingToolNames ?? [],
+                    activeToolScopeCount: activeScopeCount,
+                    helperPeerPID: connectionID.flatMap { bootstrapPeerPIDByConnectionID[$0] }
                 )
                 debugConnectionHistory.append(entry)
                 if debugConnectionHistory.count > debugConnectionHistoryLimit {
@@ -7614,6 +7972,16 @@ actor ServerNetworkManager {
                     "window_id": event.windowID ?? NSNull(),
                     "state": event.state ?? NSNull(),
                     "reason": event.reason ?? NSNull(),
+                    "qualification_raw_tool_call_count": event.qualificationRawToolCallCount,
+                    "qualification_raw_in_flight_call_count": event.qualificationRawInFlightCallCount,
+                    "qualification_raw_tool_names": event.qualificationRawToolNames,
+                    "qualification_raw_canonical_tool_names": event.qualificationRawCanonicalToolNames,
+                    "qualification_raw_nonbookkeeping_tool_call_count": event.qualificationRawNonBookkeepingToolCallCount,
+                    "qualification_raw_nonbookkeeping_tool_names": event.qualificationRawNonBookkeepingToolNames,
+                    "non_bookkeeping_tool_call_count": event.qualificationRawNonBookkeepingToolCallCount,
+                    "non_bookkeeping_tool_names": event.qualificationRawNonBookkeepingToolNames,
+                    "active_tool_scope_count": event.activeToolScopeCount,
+                    "helper_peer_pid": event.helperPeerPID ?? NSNull(),
                     "transport_ingress": event.transportIngress.map(debugTransportIngressObject) ?? NSNull()
                 ]
             }
@@ -7634,8 +8002,17 @@ actor ServerNetworkManager {
                     "created_at_ms": debugDateMilliseconds(entry.createdAt),
                     "last_tool_call_at_ms": entry.lastToolCallAt.map(debugDateMilliseconds) ?? NSNull(),
                     "total_tool_calls": entry.totalToolCalls,
+                    "helper_peer_pid": bootstrapPeerPIDByConnectionID[entry.id] ?? NSNull(),
                     "idle_seconds": entry.idleSeconds ?? NSNull(),
                     "has_in_flight_calls": entry.hasInFlightCalls,
+                    "active_tool_scope_count": entry.activeToolScopeCount,
+                    "active_tool_scopes": entry.activeToolScopes.map { scope in
+                        [
+                            "window_id": scope.windowID,
+                            "tool_name": scope.toolName,
+                            "sequence": scope.sequence
+                        ] as [String: Any]
+                    },
                     "active_tool_name": entry.activeToolName ?? NSNull(),
                     "identity": [
                         "client_name": identity?.clientName ?? NSNull(),
@@ -10720,6 +11097,16 @@ actor ServerNetworkManager {
 
             let originalName = params.name
             let toolName = Self.canonicalToolName(for: originalName)
+            #if DEBUG
+                let qualificationCanonicalToolName = Self.qualificationCanonicalToolName(for: originalName)
+                let qualificationRawIngressLease = debugQualificationRawIngress.begin(
+                    connectionID: connectionID,
+                    observedToolName: originalName,
+                    canonicalToolName: qualificationCanonicalToolName,
+                    isBookkeeping: qualificationCanonicalToolName == "set_status" || qualificationCanonicalToolName == "bind_context"
+                )
+                defer { qualificationRawIngressLease.release() }
+            #endif
             connectionLog("tools/call received original=\(originalName) canonical=\(toolName) connection=\(connectionID)")
 
             // Match tools/list: a resumed agent session can restore its run-scoped
@@ -12971,6 +13358,17 @@ actor ServerNetworkManager {
         // Hidden coordination calls should not appear in dashboards/histories.
         let canonicalToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
         if canonicalToolName == "set_status" || canonicalToolName == "bind_context" { return }
+
+        #if DEBUG
+            if let runID = runIDByConnectionID[connectionID] {
+                debugRecordRunRoutingEvent(
+                    runID: runID,
+                    event: "tool_call_observed",
+                    connectionID: connectionID,
+                    fields: ["tool_name": canonicalToolName]
+                )
+            }
+        #endif
 
         // If this connection dropped out of the active sets (e.g., after transport toggles),
         // re-associate it now that we have a live tool call.

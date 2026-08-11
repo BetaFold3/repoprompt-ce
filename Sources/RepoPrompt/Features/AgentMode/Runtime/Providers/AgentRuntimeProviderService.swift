@@ -49,8 +49,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let codexMCPClientID = "codex-mcp-client"
     static let openCodeMCPClientID = "opencode"
     static let cursorMCPClientID = "cursor"
-    /// Dark provisional routing hint derived from ACP `agentInfo.name`, not a live MCP `clientInfo.name` capture.
-    static let ohMyPiProvisionalMCPClientIDHint = "oh-my-pi"
+    /// Captured and verified production MCP `clientInfo.name`; independent of ACP `agentInfo.name`.
+    static let ohMyPiMCPClientID = "omp-coding-agent"
 
     /// Provider values exposed by public Context Builder settings while dark providers remain unavailable.
     static var publicContextBuilderCases: [Self] {
@@ -104,7 +104,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         case .cursor:
             Self.cursorMCPClientID
         case .ohMyPi:
-            Self.ohMyPiProvisionalMCPClientIDHint
+            Self.ohMyPiMCPClientID
         }
     }
 
@@ -256,6 +256,11 @@ final class AgentRuntimeProviderService {
         workspacePath: String? = nil,
         defaults: UserDefaults = .standard
     ) throws -> HeadlessAgentProvider {
+        if agent == .ohMyPi {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Oh My Pi generic headless starts are disabled. Model discovery uses the dedicated ACP polling path; qualification runs require the fresh-session Agent Mode transaction."
+            )
+        }
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
         }

@@ -3,9 +3,37 @@ import Foundation
 import XCTest
 
 final class OhMyPiACPProviderTests: XCTestCase {
-    override func tearDown() {
+    override func setUp() async throws {
+        try await super.setUp()
+        #if DEBUG
+            await OMPQualificationSharedGateTestIsolation.shared.acquire()
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+        #endif
+    }
+
+    override func tearDown() async throws {
         AgentACPModelRegistry.shared.reset(providerID: .ohMyPi)
-        super.tearDown()
+        #if DEBUG
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+            await OMPQualificationSharedGateTestIsolation.shared.release()
+        #endif
+        try await super.tearDown()
+    }
+
+    func testGenericHeadlessFactoryRejectsOhMyPiWhileDark() {
+        XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
+
+        XCTAssertThrowsError(
+            try AgentRuntimeProviderService.shared.makeProvider(for: .ohMyPi)
+        ) { error in
+            guard case let AIProviderError.invalidConfiguration(detail) = error else {
+                return XCTFail("Expected typed invalid-configuration error, got \(error)")
+            }
+            XCTAssertEqual(
+                detail,
+                "Oh My Pi generic headless starts are disabled. Model discovery uses the dedicated ACP polling path; qualification runs require the fresh-session Agent Mode transaction."
+            )
+        }
     }
 
     func testIdentityAndManagedArgumentsAreExact() throws {
@@ -15,7 +43,9 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertEqual(AgentProviderKind.ohMyPi.commandName, "omp")
         XCTAssertEqual(AgentProviderKind.ohMyPi.runtimeKind, "omp_acp")
         XCTAssertEqual(AgentProviderKind.ohMyPi.displayName, "Oh My Pi")
-        XCTAssertEqual(AgentProviderKind.ohMyPi.mcpClientNameHint, "oh-my-pi")
+        XCTAssertEqual(AgentProviderKind.ohMyPi.mcpClientNameHint, "omp-coding-agent")
+        XCTAssertTrue(AgentProviderKind.ohMyPi.requiresExpectedPIDOwnedAgentModeMCPRouting)
+        XCTAssertTrue(AgentProviderKind.ohMyPi.requiresPrePromptAgentModeMCPRouting)
         XCTAssertEqual(
             OhMyPiAgentConfig.managedArguments,
             ["acp", "--no-tools", "--no-extensions", "--no-skills", "--no-rules", "--approval-mode", "yolo"]
@@ -135,6 +165,97 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertEqual(result.type, "content")
         XCTAssertEqual(result.text, "OMP reply")
         XCTAssertEqual(result.contentMessageID, "omp-standard-message-1")
+    }
+
+    func testOpenCodeAndCursorCapturedRepoPromptServerLabelsStillCanonicalize() throws {
+        let fixtures: [(String, [NormalizedAgentRuntimeEvent])] = [
+            (
+                "OpenCode",
+                OpenCodeACPEventNormalizer.normalize([
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "opencode-repoprompt-call",
+                    "title": "read_file (RepoPromptCE)",
+                    "status": "pending"
+                ], toolProfile: .agentMode)
+            ),
+            (
+                "Cursor",
+                CursorACPEventNormalizer.normalize([
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "cursor-repoprompt-call",
+                    "title": "read_file (RepoPromptCE MCP Server)",
+                    "status": "pending"
+                ])
+            )
+        ]
+
+        for (provider, events) in fixtures {
+            guard case let .stream(result) = try XCTUnwrap(events.first, provider) else {
+                return XCTFail("Expected \(provider) tool call normalization")
+            }
+            XCTAssertEqual(result.toolName, "mcp__RepoPromptCE__read_file", provider)
+        }
+    }
+
+    func testObservedOMPSingleUnderscoreRepoPromptTitleCanonicalizesForPresentationOnly() {
+        let observedPayload: [String: Any] = [
+            "sessionUpdate": "tool_call",
+            "toolCallId": "omp-live-tool-call-1",
+            "title": "mcp__repopromptce_get_file_tree",
+            "status": "pending"
+        ]
+        let observedEvents = OhMyPiACPEventNormalizer.normalize(observedPayload)
+        guard case let .stream(observedResult) = try? XCTUnwrap(observedEvents.first) else {
+            return XCTFail("Expected normalized OMP tool call")
+        }
+        XCTAssertEqual(observedResult.type, "tool_call")
+        XCTAssertEqual(observedResult.toolName, "mcp__RepoPromptCE__get_file_tree")
+
+        let aliasPayload: [String: Any] = [
+            "sessionUpdate": "tool_call",
+            "toolCallId": "omp-live-tool-call-alias",
+            "title": "mcp__repopromptce_ask_user_question",
+            "status": "pending"
+        ]
+        let aliasEvents = OhMyPiACPEventNormalizer.normalize(aliasPayload)
+        guard case let .stream(aliasResult) = try? XCTUnwrap(aliasEvents.first) else {
+            return XCTFail("Expected normalized OMP alias tool call")
+        }
+        XCTAssertEqual(aliasResult.toolName, "mcp__RepoPromptCE__ask_user")
+
+        let adversarialTitles = [
+            "mcp__repopromptce_functions.read_file",
+            "mcp__repopromptce_mcp__RepoPromptCE__read_file",
+            "mcp__repopromptce_RepoPromptCE_read_file"
+        ]
+        for (index, title) in adversarialTitles.enumerated() {
+            let payload: [String: Any] = [
+                "sessionUpdate": "tool_call",
+                "toolCallId": "omp-live-tool-call-adversarial-\(index)",
+                "title": title,
+                "status": "pending"
+            ]
+            let events = OhMyPiACPEventNormalizer.normalize(payload)
+            guard case let .stream(result) = try? XCTUnwrap(events.first) else {
+                return XCTFail("Expected adversarial OMP tool call to remain presentational")
+            }
+            XCTAssertEqual(result.toolName, title)
+        }
+
+        let nonRepoPromptPayload: [String: Any] = [
+            "sessionUpdate": "tool_call",
+            "toolCallId": "omp-live-tool-call-2",
+            "title": "mcp__repopromptce_bash",
+            "status": "pending"
+        ]
+        let nonRepoPromptEvents = OhMyPiACPEventNormalizer.normalize(nonRepoPromptPayload)
+        guard case let .stream(nonRepoPromptResult) = try? XCTUnwrap(nonRepoPromptEvents.first) else {
+            return XCTFail("Expected normalized non-RepoPrompt tool call")
+        }
+        XCTAssertEqual(nonRepoPromptResult.toolName, "mcp__repopromptce_bash")
+        XCTAssertTrue(MCPIntegrationHelper.isExactRepoPromptServerIdentifier("RepoPromptCE"))
+        XCTAssertTrue(MCPIntegrationHelper.isExactRepoPromptServerIdentifier("RepoPromptCE MCP Server"))
+        XCTAssertFalse(MCPIntegrationHelper.isExactRepoPromptServerIdentifier("not-RepoPromptCE"))
     }
 
     func testObservedInitializeFixtureRecordsIdentityWithoutEnablingResume() throws {
@@ -272,6 +393,76 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .ohMyPi))
     }
 
+    #if DEBUG
+        @MainActor
+        func testSmokeGateControlsOnlyIntendedDebugAvailabilityProjections() throws {
+            let modelRaw = "smoke-provider/exact-model"
+            let discovered = ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: modelRaw,
+                        displayName: "Exact Smoke Model",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: true
+                    )
+                ],
+                currentModelRaw: modelRaw
+            )
+            XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .ohMyPi))
+
+            XCTAssertFalse(OhMyPiAgentModeSmokeGate.shared.isEnabled)
+            XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
+            XCTAssertFalse(AgentModelCatalog.supportedCLIProviderAgents.contains(.ohMyPi))
+            XCTAssertFalse(AgentModelCatalog.selectableAgents().contains(.ohMyPi))
+            XCTAssertFalse(AgentModelCatalog.discoveryAgents().contains { $0.agent == .ohMyPi })
+
+            try OhMyPiAgentModeSmokeGate.shared.acquireForTesting()
+
+            XCTAssertTrue(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
+            XCTAssertTrue(AgentModelCatalog.supportedCLIProviderAgents.contains(.ohMyPi))
+            XCTAssertTrue(AgentModelCatalog.selectableAgents().contains(.ohMyPi))
+            let discovery = AgentModelCatalog.discoveryAgents()
+            let ohMyPi = discovery.first { $0.agent == .ohMyPi }
+            let exactModelID = AgentModelSelectionID(
+                agentRaw: AgentProviderKind.ohMyPi.rawValue,
+                modelRaw: modelRaw
+            ).rawValue
+            XCTAssertTrue(
+                ohMyPi?.models.flatMap(\.startTargets).map(\.selectionID.rawValue).contains(exactModelID) == true
+            )
+            let resolved = try AgentMCPSelectionResolver.resolve(modelID: exactModelID)
+            XCTAssertEqual(resolved.agentRaw, AgentProviderKind.ohMyPi.rawValue)
+            XCTAssertEqual(resolved.modelRaw, modelRaw)
+            XCTAssertFalse(AgentProviderKind.publicContextBuilderCases.contains(.ohMyPi))
+            XCTAssertFalse(AgentProviderBindingID.publicSettingsCases.contains(.ohMyPi))
+            XCTAssertThrowsError(
+                try AgentRuntimeProviderService.shared.makeProvider(
+                    for: .ohMyPi,
+                    modelString: modelRaw,
+                    runType: .discover
+                )
+            ) { error in
+                XCTAssertTrue(
+                    String(describing: error).contains("generic headless starts are disabled")
+                )
+            }
+            for kind in AgentModelCatalog.TaskLabelKind.allCases {
+                XCTAssertNotEqual(
+                    AgentModelCatalog.resolveTaskLabelKind(kind)?.agent,
+                    .ohMyPi
+                )
+            }
+
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+
+            XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
+            XCTAssertFalse(AgentModelCatalog.supportedCLIProviderAgents.contains(.ohMyPi))
+            XCTAssertFalse(AgentModelCatalog.selectableAgents().contains(.ohMyPi))
+            XCTAssertFalse(AgentModelCatalog.discoveryAgents().contains { $0.agent == .ohMyPi })
+        }
+    #endif
+
     @MainActor
     func testPermissionBindingMCPGrantAndDarkAvailability() throws {
         XCTAssertEqual(AgentProviderKind.ohMyPi.providerBindingID, .ohMyPi)
@@ -319,12 +510,75 @@ final class OhMyPiACPProviderTests: XCTestCase {
         )
         XCTAssertNotNil(prefixedKnownTool)
 
+        let openCodeCaptured = ACPAgentSessionController.repoPromptScopedAutoApprovalMatch(
+            providerID: .openCode,
+            requestToolName: "mcp__RepoPromptCE__read_file",
+            requestPayload: [
+                "toolCall": [
+                    "title": "mcp__RepoPromptCE__read_file",
+                    "kind": "read"
+                ]
+            ]
+        )
+        XCTAssertNotNil(openCodeCaptured)
+
+        let cursorCaptured = ACPAgentSessionController.repoPromptScopedAutoApprovalMatch(
+            providerID: .cursor,
+            requestToolName: "mcp__RepoPromptCE__get_file_tree",
+            requestPayload: [
+                "title": "mcp__RepoPromptCE__get_file_tree",
+                "server_name": MCPIntegrationHelper.repoPromptMCPServerName
+            ]
+        )
+        XCTAssertNotNil(cursorCaptured)
+
         let exactServerUnknownTool = ACPAgentSessionController.repoPromptScopedAutoApprovalMatch(
             providerID: .ohMyPi,
             requestToolName: "future_repo_prompt_tool",
             requestPayload: ["server_name": MCPIntegrationHelper.repoPromptMCPServerName]
         )
-        XCTAssertNotNil(exactServerUnknownTool)
+        XCTAssertNil(exactServerUnknownTool)
+
+        for providerID: ACPProviderID in [.openCode, .cursor, .ohMyPi] {
+            XCTAssertNil(
+                ACPAgentSessionController.repoPromptScopedAutoApprovalMatch(
+                    providerID: providerID,
+                    requestToolName: "bash",
+                    requestPayload: [
+                        "rawInput": [
+                            "server_name": MCPIntegrationHelper.repoPromptMCPServerName,
+                            "name": "mcp__RepoPromptCE__read_file"
+                        ]
+                    ]
+                )
+            )
+            XCTAssertNil(
+                ACPAgentSessionController.repoPromptScopedAutoApprovalMatch(
+                    providerID: providerID,
+                    requestToolName: "bash",
+                    requestPayload: [
+                        "toolCall": ["name": "mcp__RepoPromptCE__read_file"],
+                        "server_name": MCPIntegrationHelper.repoPromptMCPServerName
+                    ]
+                )
+            )
+            XCTAssertNil(
+                ACPAgentSessionController.repoPromptScopedAutoApprovalMatch(
+                    providerID: providerID,
+                    requestToolName: "mcp__repopromptce_get_file_tree",
+                    requestPayload: [:]
+                )
+            )
+            XCTAssertNil(
+                ACPAgentSessionController.repoPromptScopedAutoApprovalMatch(
+                    providerID: providerID,
+                    requestToolName: "bash",
+                    requestPayload: [
+                        "data": ["title": "mcp__RepoPromptCE__read_file"]
+                    ]
+                )
+            )
+        }
 
         let spoofedServer = ACPAgentSessionController.repoPromptScopedAutoApprovalMatch(
             providerID: .ohMyPi,
@@ -339,6 +593,44 @@ final class OhMyPiACPProviderTests: XCTestCase {
             requestPayload: ["rawInput": ["command": "echo unsafe"]]
         )
         XCTAssertNil(unknown)
+    }
+
+    func testPermissionEntryPointCanonicalizesCapturedOpenCodeAndCursorButRejectsOMPSingleUnderscore() {
+        let fixtures: [(ACPProviderID, String)] = [
+            (.openCode, "read_file (RepoPromptCE)"),
+            (.cursor, "read_file (RepoPromptCE MCP Server)")
+        ]
+        for (providerID, title) in fixtures {
+            let match = ACPAgentSessionController.testRepoPromptPermissionEntryPointMatch(
+                providerID: providerID,
+                params: [
+                    "sessionId": "captured-session",
+                    "toolCall": [
+                        "toolCallId": "captured-tool-call",
+                        "title": title,
+                        "kind": "read"
+                    ],
+                    "options": [["optionId": "always", "kind": "allow_always"]]
+                ]
+            )
+            XCTAssertEqual(match?.source, .topLevelToolName, providerID.rawValue)
+            XCTAssertEqual(match?.normalizedToolName, "read_file", providerID.rawValue)
+        }
+
+        XCTAssertNil(
+            ACPAgentSessionController.testRepoPromptPermissionEntryPointMatch(
+                providerID: .ohMyPi,
+                params: [
+                    "sessionId": "omp-session",
+                    "toolCall": [
+                        "toolCallId": "omp-tool-call",
+                        "title": "mcp__repopromptce_read_file",
+                        "kind": "read"
+                    ],
+                    "options": [["optionId": "always", "kind": "allow_always"]]
+                ]
+            )
+        )
     }
 
     func testHeadlessRequestDiscardsResumeCandidateAndRequiresRegistryModel() async {

@@ -474,11 +474,17 @@ public class APISettingsViewModel: ObservableObject {
     private let defaultZAIModels = ["glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-4.7", "glm-4.7-flash", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"]
 
     var agentModeAvailabilityContext: AgentModelCatalog.AvailabilityContext {
-        AgentModelCatalog.AvailabilityContext(
+        #if DEBUG
+            let ohMyPiAvailable = OhMyPiAgentModeSmokeGate.shared.isEnabled
+        #else
+            let ohMyPiAvailable = false
+        #endif
+        return AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: isClaudeCodeConnected,
             codexAvailable: isCodexConnected,
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
+            ohMyPiAvailable: ohMyPiAvailable,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -504,7 +510,7 @@ public class APISettingsViewModel: ObservableObject {
     /// paths without an explicit refresh still converge. The main-queue hop defers the
     /// recompute past `@Published`'s willSet emission, when the new value is readable.
     private func installAgentAvailabilityObservers() {
-        agentAvailabilityCancellable = Publishers.MergeMany([
+        let baseAvailabilityPublishers = [
             $isClaudeCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
@@ -512,11 +518,21 @@ public class APISettingsViewModel: ObservableObject {
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
-        ])
-        .receive(on: DispatchQueue.main)
-        .sink { [weak self] _ in
-            self?.refreshAgentAvailability()
-        }
+        ]
+        #if DEBUG
+            let availabilityPublishers = baseAvailabilityPublishers + [
+                NotificationCenter.default.publisher(for: .ohMyPiQualificationLeaseDidChange)
+                    .map { _ in () }
+                    .eraseToAnyPublisher()
+            ]
+        #else
+            let availabilityPublishers = baseAvailabilityPublishers
+        #endif
+        agentAvailabilityCancellable = Publishers.MergeMany(availabilityPublishers)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.refreshAgentAvailability()
+            }
     }
 
     /// Availability safe for restoring persisted Context Builder selections. A persisted
