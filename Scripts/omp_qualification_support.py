@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 MAX_COMMAND_OUTPUT = 1024 * 1024
@@ -230,25 +231,60 @@ def normalize_response(arguments: argparse.Namespace) -> None:
         handle.write("\n")
 
 
-def _validate_routing(value: dict[str, object], window_id: int, overlap_path: str) -> tuple[list[dict[str, object]], list[str]]:
+def _validate_routing(
+    value: object,
+    window_id: int,
+    overlap_path: str,
+) -> tuple[list[dict[str, object]], list[str], list[str]]:
+    if not isinstance(value, dict):
+        raise SupportError("routing snapshot top-level value must be an object")
     windows = value.get("windows")
     if value.get("ok") is not True or not isinstance(windows, list) or not all(isinstance(item, dict) for item in windows):
         raise SupportError("routing snapshot is invalid")
     typed_windows = windows
+    window_ids: list[int] = []
+    for window in typed_windows:
+        candidate = window.get("window_id")
+        if type(candidate) is not int or candidate <= 0:
+            raise SupportError("routing snapshot window_id values must be positive integers")
+        window_ids.append(candidate)
+    if len(set(window_ids)) != len(window_ids):
+        raise SupportError("routing snapshot window_id values must be unique")
     target = [window for window in typed_windows if window.get("window_id") == window_id]
-    if len(target) != 1 or not target[0].get("workspace_id") or not target[0].get("repo_paths"):
+    if len(target) != 1:
         raise SupportError("qualification target is unavailable")
-    roots = sorted({
-        os.path.realpath(root)
-        for window in typed_windows
-        for root in window.get("repo_paths", [])
-        if isinstance(root, str)
-    })
+    workspace_id = target[0].get("workspace_id")
+    try:
+        normalized_workspace_id = str(uuid.UUID(workspace_id)) if isinstance(workspace_id, str) else None
+    except ValueError as error:
+        raise SupportError("qualification target workspace UUID is invalid") from error
+    if normalized_workspace_id is None:
+        raise SupportError("qualification target workspace UUID is invalid")
+
+    all_roots: set[str] = set()
+    target_roots: set[str] = set()
+    for window in typed_windows:
+        repo_paths = window.get("repo_paths")
+        if repo_paths is None:
+            repo_paths = []
+        if not isinstance(repo_paths, list) or (window is target[0] and not repo_paths):
+            raise SupportError("routing snapshot repo_paths must be an array and the qualification target must be non-empty")
+        validated: set[str] = set()
+        for root in repo_paths:
+            if not isinstance(root, str) or not root or not os.path.isabs(root):
+                raise SupportError("routing snapshot repo_paths entries must be non-empty absolute strings")
+            validated.add(os.path.realpath(root))
+        all_roots.update(validated)
+        if window is target[0]:
+            target_roots = validated
+
+    roots = sorted(all_roots)
+    target[0]["workspace_id"] = normalized_workspace_id
     overlap = os.path.realpath(overlap_path)
     for root in roots:
         if os.path.commonpath([overlap, root]) in (overlap, root):
             raise SupportError("evidence path overlaps an active workspace")
-    return target, roots
+    return target, roots, sorted(target_roots)
 
 
 def preflight_routing(arguments: argparse.Namespace) -> None:
@@ -446,14 +482,20 @@ def _repository_snapshot(root: str, snapshot_seconds: float = MAX_SNAPSHOT_SECON
     }
 
 
+def _snapshot_roots(roots: list[str]) -> dict[str, dict[str, object]]:
+    return {root: _repository_snapshot(root) for root in roots}
+
+
 def snapshot(arguments: argparse.Namespace) -> None:
     with open(arguments.routing, encoding="utf-8") as handle:
         value = json.load(handle)
-    target, roots = _validate_routing(value, arguments.window_id, arguments.overlap)
+    target, roots, target_roots = _validate_routing(value, arguments.window_id, arguments.overlap)
     value["qualification_target"] = target[0]
-    value["active_workspace_content_snapshots"] = {
-        root: _repository_snapshot(root) for root in roots
-    }
+    content_snapshots = _snapshot_roots(roots)
+    missing_target_roots = sorted(set(target_roots) - set(content_snapshots))
+    if missing_target_roots:
+        raise SupportError("qualification target roots are missing from the content snapshot")
+    value["active_workspace_content_snapshots"] = content_snapshots
     with open(arguments.output, "w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, sort_keys=True)
         handle.write("\n")

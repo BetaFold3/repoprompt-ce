@@ -88,6 +88,28 @@ struct MCPBootstrapLeaseSpec {
 /// - `releaseWithoutRoutingWait()` — releases gate immediately (when no fresh connection is expected)
 /// - `releaseGateForDeferredRouting()` — releases the gate while retaining pending routing/policy state
 actor MCPBootstrapLease {
+    #if DEBUG
+        struct CleanupSnapshot {
+            let hasReleased: Bool
+            let didCleanupRouting: Bool
+            let didClearPolicy: Bool
+            let terminalCleanupRequestCount: Int
+            let terminalCleanupRawRequestCount: Int
+            let terminalCleanupRequestEntries: [String]
+        }
+
+        func debugCleanupSnapshot() -> CleanupSnapshot {
+            CleanupSnapshot(
+                hasReleased: hasReleased,
+                didCleanupRouting: didCleanupRouting,
+                didClearPolicy: didClearPolicy,
+                terminalCleanupRequestCount: terminalCleanupRequestCount,
+                terminalCleanupRawRequestCount: terminalCleanupRequestEntries.count,
+                terminalCleanupRequestEntries: terminalCleanupRequestEntries
+            )
+        }
+    #endif
+
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "BootstrapLease")
 
     private var spec: MCPBootstrapLeaseSpec
@@ -106,6 +128,18 @@ actor MCPBootstrapLease {
     private var didReleaseGate = false
     private var didCleanupRouting = false
     private var didClearPolicy = false
+    #if DEBUG
+        private var terminalCleanupRequestCount = 0
+        private var terminalCleanupRequestEntries: [String] = []
+        private var didRecordTerminalCleanupRequest = false
+
+        private func recordTerminalCleanupRequest(_ entry: String) {
+            terminalCleanupRequestEntries.append(entry)
+            guard !didRecordTerminalCleanupRequest else { return }
+            didRecordTerminalCleanupRequest = true
+            terminalCleanupRequestCount += 1
+        }
+    #endif
 
     /// Creates a unified bootstrap lease.
     ///
@@ -374,6 +408,9 @@ actor MCPBootstrapLease {
     /// Cleans up deferred routing state after a prompt-deferred provider reaches a terminal state
     /// without needing to report a bootstrap failure.
     func cleanupDeferredRouting() async {
+        #if DEBUG
+            recordTerminalCleanupRequest("cleanupDeferredRouting")
+        #endif
         if hasReleased {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) cleanupDeferredRouting() ignored because lease already released")
             return
@@ -388,6 +425,9 @@ actor MCPBootstrapLease {
 
     /// Hard failure path: signal routing failure and release gate immediately.
     func failAndRelease() async {
+        #if DEBUG
+            recordTerminalCleanupRequest("failAndRelease")
+        #endif
         if hasReleased {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() ignored because lease already released")
             return
@@ -399,6 +439,9 @@ actor MCPBootstrapLease {
 
     /// Hard failure path variant used by headless flows.
     func failAndCleanup() async {
+        #if DEBUG
+            recordTerminalCleanupRequest("failAndCleanup")
+        #endif
         cleanupRequested = true
         hasReleased = true
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndCleanup() signaling failure and clearing policy")
@@ -409,6 +452,9 @@ actor MCPBootstrapLease {
     /// clear installed policy, and clean up routing. Cleanup remains retryable while a
     /// queued gate acquisition is still suspended.
     func cancelAndCleanup() async {
+        #if DEBUG
+            recordTerminalCleanupRequest("cancelAndCleanup")
+        #endif
         cleanupRequested = true
         hasReleased = true
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) cancelAndCleanup() signaling failure and releasing gate")

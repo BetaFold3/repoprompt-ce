@@ -83,6 +83,84 @@ final class AgentManageMCPToolServiceListAgentsTests: XCTestCase {
         #endif
     }
 
+    func testFirstQualificationLedgerKeepsSharedGateIsolationContract() throws {
+        let ledgerURL = try RepoRoot.url()
+            .appendingPathComponent("Scripts/Fixtures/test-suite-contract-ledger.tsv")
+        let lines = try String(contentsOf: ledgerURL, encoding: .utf8)
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0).split(separator: "\t", omittingEmptySubsequences: false).map(String.init) }
+        let header = try XCTUnwrap(lines.first)
+        let fileIndex = try XCTUnwrap(header.firstIndex(of: "file"))
+        let methodIndex = try XCTUnwrap(header.firstIndex(of: "method"))
+        let sharedStateIndex = try XCTUnwrap(header.firstIndex(of: "shared_state_tags"))
+        let lifecycleIndex = try XCTUnwrap(header.firstIndex(of: "lifecycle_owner"))
+        let assertionIndex = try XCTUnwrap(header.firstIndex(of: "observable_oracle"))
+        let notesIndex = try XCTUnwrap(header.firstIndex(of: "notes"))
+        let target = try XCTUnwrap(lines.dropFirst().first {
+            $0.indices.contains(methodIndex)
+                && $0[methodIndex] == "testFirstQualificationListAgentsAdvertisesOnlyOhMyPiDefaultSentinel"
+        })
+
+        XCTAssertEqual(
+            Set(target[sharedStateIndex].split(separator: ";").map(String.init)),
+            ["process_local_omp_lease", "OhMyPiAgentModeSmokeGate.shared"]
+        )
+        XCTAssertEqual(target[lifecycleIndex], "test_case+tearDown_reset")
+
+        let lifecycleRows = lines.dropFirst().filter {
+            $0.indices.contains(fileIndex)
+                && $0[fileIndex] == "Tests/RepoPromptTests/AgentMode/AgentModeRunServiceLifecycleTests.swift"
+        }
+        XCTAssertFalse(lifecycleRows.isEmpty)
+        for row in lifecycleRows {
+            let method = row.indices.contains(methodIndex) ? row[methodIndex] : "<missing method>"
+            XCTAssertTrue(
+                row.indices.contains(sharedStateIndex)
+                    && row[sharedStateIndex].split(separator: ";").contains("OhMyPiAgentModeSmokeGate.shared"),
+                method
+            )
+            XCTAssertTrue(
+                row.indices.contains(lifecycleIndex)
+                    && row[lifecycleIndex].split(separator: "+").contains("tearDown_reset"),
+                method
+            )
+        }
+
+        let darkSelection = try XCTUnwrap(lines.dropFirst().first {
+            $0.indices.contains(methodIndex)
+                && $0[methodIndex] == "testDarkOhMyPiPersistedOrMCPConfiguredSelectionFailsBeforeProviderDispatch"
+        })
+        XCTAssertTrue(darkSelection[assertionIndex].contains("may construct the provider and controller"))
+        XCTAssertTrue(darkSelection[assertionIndex].contains("before controller.bootstrap()"))
+        XCTAssertTrue(darkSelection[assertionIndex].contains("never creates a provider process"))
+        XCTAssertTrue(darkSelection[notesIndex].contains("local synthetic qualification transaction"))
+        XCTAssertTrue(darkSelection[notesIndex].contains("injects denial"))
+        XCTAssertTrue(darkSelection[notesIndex].contains("suite teardown resets shared process state"))
+        XCTAssertTrue(darkSelection[notesIndex].contains("No provider process is created"))
+
+        let deadline = try XCTUnwrap(lines.dropFirst().first {
+            $0.indices.contains(methodIndex)
+                && $0[methodIndex] == "testOMPQualificationAuthorizationUsesSingleAbsoluteDeadline"
+        })
+        XCTAssertTrue(
+            deadline[sharedStateIndex].split(separator: ";").contains(
+                "AgentRunMCPToolService.ompQualificationAuthorizationDeadlineNanosecondsOverride"
+            )
+        )
+
+        let lifecycleSource = try String(
+            contentsOf: RepoRoot.url().appendingPathComponent(
+                "Tests/RepoPromptTests/AgentMode/AgentModeRunServiceLifecycleTests.swift"
+            ),
+            encoding: .utf8
+        )
+        XCTAssertTrue(lifecycleSource.contains("override func setUp() async throws"))
+        XCTAssertTrue(lifecycleSource.contains("OMPQualificationSharedGateTestIsolation.shared.acquire()"))
+        XCTAssertTrue(lifecycleSource.contains("override func tearDown() async throws"))
+        XCTAssertTrue(lifecycleSource.contains("OhMyPiAgentModeSmokeGate.shared.resetForTesting()"))
+        XCTAssertTrue(lifecycleSource.contains("OMPQualificationSharedGateTestIsolation.shared.release()"))
+    }
+
     private func makeWindow() async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

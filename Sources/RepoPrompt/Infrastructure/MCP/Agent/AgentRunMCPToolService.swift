@@ -203,6 +203,34 @@ struct AgentRunMCPToolService {
     static let defaultStartTaskLabelKind: AgentModelCatalog.TaskLabelKind = .pair
     nonisolated static let statusUpdateSliceSeconds: TimeInterval = 2
     #if DEBUG
+        static let ompQualificationAuthorizationCleanupDeadlineNanoseconds: UInt64 = 5_000_000_000
+        static let ompQualificationAuthorizationMinimumSeconds: TimeInterval = 5
+        static let ompQualificationAuthorizationMaximumSeconds: TimeInterval = 30
+        nonisolated(unsafe) static var ompQualificationAuthorizationDeadlineNanosecondsOverride: UInt64?
+
+        static func ompQualificationAuthorizationDeadlineNanoseconds(
+            requestTimeoutSeconds: TimeInterval
+        ) -> UInt64 {
+            if let override = ompQualificationAuthorizationDeadlineNanosecondsOverride {
+                return max(1, override)
+            }
+            let clamped = min(
+                max(requestTimeoutSeconds, ompQualificationAuthorizationMinimumSeconds),
+                ompQualificationAuthorizationMaximumSeconds
+            )
+            return UInt64(clamped * 1_000_000_000)
+        }
+
+        static func ompQualificationAuthorizationRemainingNanoseconds(
+            deadlineUptimeNanoseconds: UInt64?
+        ) -> UInt64 {
+            guard let deadlineUptimeNanoseconds else {
+                return ompQualificationAuthorizationCleanupDeadlineNanoseconds
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            return deadlineUptimeNanoseconds > now ? deadlineUptimeNanoseconds - now : 0
+        }
+
         /// Process-global DEBUG seam for fast status-update tests; reset in tearDown.
         /// Safe under serial XCTest execution only — would race if wait suites ever
         /// run parallel in-process.
@@ -289,9 +317,22 @@ struct AgentRunMCPToolService {
     var currentSnapshotProvider: (@Sendable (_ sessionID: UUID, _ agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot?)?
     #if DEBUG
         var testAgentModeViewModel: AgentModeViewModel?
+        var testAfterOMPQualificationInitialSnapshot: (() async -> Void)?
+        var testBeforeOMPQualificationConsume: (() async -> Void)?
         var testBeforeExplicitTabWorktreeValidation: (() -> Void)?
+        var testWorktreePreparationFailure: Error?
+        var testBeforeWorktreePreparationFailureCleanup: ((AgentModeViewModel.TabSession) async -> Void)?
+        var testBeforeOMPQualificationProviderDispatch: (() async -> Void)?
+        var testBeforeOMPQualificationContextIdentityCheck: ((
+            OhMyPiAgentModeSmokeGate.StartContext,
+            AgentModeViewModel.TabSession
+        ) async -> Void)?
+        var testAfterOMPQualificationPreDispatchIdentityCheck: (() async -> Void)?
+        var testBeforeOMPQualificationTargetDiscardCAS: ((AgentModeViewModel.TabSession?) async -> Void)?
+        var testBeforeProviderAvailabilityPreflight: (() -> Void)?
         var testBeforeProviderDispatch: (() async -> Void)?
         var testAfterProviderStartBeforeBookkeeping: (() async -> Void)?
+        var testOMPQualificationTerminalCategory: ((String) -> Void)?
         var testOMPQualificationOwnerVerifier: ((
             _ connectionID: UUID,
             _ ownerProcessID: Int32,
@@ -429,38 +470,67 @@ struct AgentRunMCPToolService {
         return .object(object)
     }
 
+    #if DEBUG
+        private static func cancelQualificationRun(
+            _ receipt: OhMyPiAgentModeSmokeGate.AuthorizedRunReceipt,
+            targetTabID: UUID,
+            agentModeVM: AgentModeViewModel
+        ) async {
+            guard let session = agentModeVM.session(for: targetTabID, createIfNeeded: false),
+                  session.runID == receipt.runID
+            else { return }
+            let exactTarget = AgentRunCancelTarget(
+                tabID: targetTabID,
+                expectedRunID: receipt.runID,
+                expectedActiveAgentSessionID: receipt.activeAgentSessionID,
+                expectedRunAttemptID: receipt.runAttemptID,
+                expectedPendingUserInputRequestID: nil
+            )
+            _ = await agentModeVM.cancelAgentRun(
+                target: exactTarget,
+                completion: .terminalPublished
+            )
+        }
+    #endif
+
     private func executeStart(args: [String: Value]) async throws -> Value {
         let metadata = await captureRequestMetadata()
         #if DEBUG
             var ompQualificationLease: OhMyPiAgentModeSmokeGate.Snapshot?
+            var ompQualificationRollbackSnapshot: OhMyPiAgentModeSmokeGate.Snapshot?
+            var ompQualificationStartTransaction: OhMyPiAgentModeSmokeGate.StartTransaction?
+            var ompQualificationStartContext: OhMyPiAgentModeSmokeGate.StartContext?
+            var ompQualificationInvocationContext: OhMyPiAgentModeSmokeGate.StartContext?
+            var ompQualificationProviderDispatchStarted = false
             var ompQualificationTransactionSucceeded = false
+            var ompQualificationAuthorizationDeadlineUptimeNanoseconds: UInt64?
             if let rawLeaseID = normalizedString(args["_omp_qualification_lease_id"]) {
                 let activeLease = OhMyPiAgentModeSmokeGate.shared.activeSnapshot()
-                let ownerVerified: Bool = if let connectionID = metadata.connectionID, let activeLease {
-                    if let testOMPQualificationOwnerVerifier {
-                        await testOMPQualificationOwnerVerifier(
-                            connectionID,
-                            activeLease.ownerProcessID,
-                            activeLease.ownerProcessStartSeconds,
-                            activeLease.ownerProcessStartMicroseconds
-                        )
-                    } else {
-                        await ServerNetworkManager.shared.debugQualificationOwnerIsAncestor(
-                            connectionID: connectionID,
-                            ownerProcessID: activeLease.ownerProcessID,
-                            ownerStartSeconds: activeLease.ownerProcessStartSeconds,
-                            ownerStartMicroseconds: activeLease.ownerProcessStartMicroseconds
-                        )
-                    }
-                } else {
-                    false
-                }
-                guard metadata.connectionID != nil,
-                      let leaseID = UUID(uuidString: rawLeaseID),
+                guard let leaseID = UUID(uuidString: rawLeaseID),
                       let activeLease,
                       activeLease.leaseID == leaseID,
-                      ownerVerified
+                      let connectionID = metadata.connectionID
                 else {
+                    throw MCPError.invalidParams(
+                        "The dedicated DEBUG OMP qualification lease parameter was invalid or its controller ownership could not be verified."
+                    )
+                }
+                let ownerVerified: Bool = if let testOMPQualificationOwnerVerifier {
+                    await testOMPQualificationOwnerVerifier(
+                        connectionID,
+                        activeLease.ownerProcessID,
+                        activeLease.ownerProcessStartSeconds,
+                        activeLease.ownerProcessStartMicroseconds
+                    )
+                } else {
+                    await ServerNetworkManager.shared.debugQualificationOwnerIsAncestor(
+                        connectionID: connectionID,
+                        ownerProcessID: activeLease.ownerProcessID,
+                        ownerStartSeconds: activeLease.ownerProcessStartSeconds,
+                        ownerStartMicroseconds: activeLease.ownerProcessStartMicroseconds
+                    )
+                }
+                guard ownerVerified else {
                     throw MCPError.invalidParams(
                         "The dedicated DEBUG OMP qualification lease parameter was invalid or its controller ownership could not be verified."
                     )
@@ -471,6 +541,8 @@ struct AgentRunMCPToolService {
                     )
                 }
                 ompQualificationLease = activeLease
+                ompQualificationRollbackSnapshot = activeLease
+                await testAfterOMPQualificationInitialSnapshot?()
             } else if normalizedString(args["model_id"])?.hasPrefix("ohMyPi:") == true {
                 throw MCPError.invalidParams(
                     "Fresh OMP qualification starts require _omp_qualification_lease_id."
@@ -479,11 +551,81 @@ struct AgentRunMCPToolService {
             // Rollback ownership begins only after the bound-lease guard above; hoisting this
             // defer would let a rejected replay release and cancel the earlier healthy run.
             defer {
-                if let ompQualificationLease, !ompQualificationTransactionSucceeded {
-                    _ = try? OhMyPiAgentModeSmokeGate.shared.release(
-                        leaseID: ompQualificationLease.leaseID,
-                        ownerProcessID: ompQualificationLease.ownerProcessID
+                if !ompQualificationTransactionSucceeded {
+                    if let ompQualificationStartTransaction {
+                        _ = OhMyPiAgentModeSmokeGate.shared.rollbackConsumedStartTransaction(
+                            ompQualificationStartTransaction
+                        )
+                    } else if let ompQualificationRollbackSnapshot {
+                        _ = OhMyPiAgentModeSmokeGate.shared.rollbackStartTransaction(
+                            ifCurrent: ompQualificationRollbackSnapshot
+                        )
+                    }
+                }
+            }
+            let rollbackConsumedQualificationStart: (AgentModeViewModel, UUID, Bool) async -> Void = { agentModeVM, targetTabID, clearSessionContext in
+                guard let transaction = ompQualificationStartTransaction else { return }
+                ompQualificationStartTransaction = nil
+                ompQualificationRollbackSnapshot = nil
+                let context = ompQualificationStartContext
+                ompQualificationStartContext = nil
+                let dispatchStarted = ompQualificationProviderDispatchStarted
+                let cleanup: @MainActor () async -> Void = {
+                    let authorizationOutcome: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome?
+                    if !dispatchStarted {
+                        authorizationOutcome = context?.authorizationReceipt.resolve(.denied)
+                    } else {
+                        let remainingNanoseconds = Self.ompQualificationAuthorizationRemainingNanoseconds(
+                            deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds
+                        )
+                        let observedOutcome: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome? = if let context,
+                                                                                                              remainingNanoseconds > 0
+                        {
+                            await context.authorizationReceipt.wait(timeoutNanoseconds: remainingNanoseconds)
+                        } else {
+                            nil
+                        }
+                        // The first absolute deadline owns the outcome. Once it expires, denial
+                        // wins immediately; cleanup must not open a second authorization window.
+                        authorizationOutcome = context?.authorizationReceipt.resolve(
+                            observedOutcome ?? .denied
+                        )
+                    }
+                    let released = OhMyPiAgentModeSmokeGate.shared.rollbackConsumedStartTransaction(
+                        transaction,
+                        cancelBoundRun: false
                     )
+                    if clearSessionContext,
+                       let session = agentModeVM.session(for: targetTabID, createIfNeeded: false),
+                       session.ompQualificationStartContext === context
+                    {
+                        session.ompQualificationStartContext = nil
+                    }
+                    if case let .authorized(receipt) = authorizationOutcome {
+                        await Self.cancelQualificationRun(
+                            receipt,
+                            targetTabID: targetTabID,
+                            agentModeVM: agentModeVM
+                        )
+                    } else if let runID = released?.runID {
+                        await Self.cancelQualificationRun(
+                            .init(
+                                runID: runID,
+                                activeAgentSessionID: nil,
+                                runAttemptID: nil
+                            ),
+                            targetTabID: targetTabID,
+                            agentModeVM: agentModeVM
+                        )
+                    }
+                }
+                if clearSessionContext {
+                    let cleanupTask = Task { @MainActor in
+                        await cleanup()
+                    }
+                    await cleanupTask.value
+                } else {
+                    await cleanup()
                 }
             }
         #endif
@@ -503,6 +645,17 @@ struct AgentRunMCPToolService {
         }
         let detach = parseBool(args["detach"]) ?? false
         let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(args["timeout"])
+        #if DEBUG
+            if ompQualificationLease != nil {
+                let budget = Self.ompQualificationAuthorizationDeadlineNanoseconds(
+                    requestTimeoutSeconds: timeoutSeconds
+                )
+                let now = DispatchTime.now().uptimeNanoseconds
+                ompQualificationAuthorizationDeadlineUptimeNanoseconds = now.addingReportingOverflow(budget).overflow
+                    ? UInt64.max
+                    : now + budget
+            }
+        #endif
 
         let targetWindow = try requireTargetWindow()
         guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
@@ -514,6 +667,9 @@ struct AgentRunMCPToolService {
         // Plan §6.6: explicit workspace selector — validated against the resolved
         // target window's active workspace. A mismatch is a structured failure
         // (no fallback resolution) so remote callers re-target explicitly.
+        #if DEBUG
+            let requestedWorkspaceUUID: UUID?
+        #endif
         if let requestedWorkspaceID = normalizedString(args["workspace_id"]) {
             guard let requestedUUID = UUID(uuidString: requestedWorkspaceID) else {
                 throw MCPError.invalidParams("workspace_id must be a workspace UUID.")
@@ -523,9 +679,39 @@ struct AgentRunMCPToolService {
                     "workspace_mismatch: the target window's active workspace is '\(workspace.name)' (\(workspace.id.uuidString)), not \(requestedUUID.uuidString). Pass the window_id of a window showing that workspace, or omit workspace_id."
                 )
             }
+            #if DEBUG
+                requestedWorkspaceUUID = requestedUUID
+            #endif
+        } else {
+            #if DEBUG
+                requestedWorkspaceUUID = nil
+            #endif
         }
 
         let agentModeVM = targetWindow.agentModeViewModel
+        let resolvedTabID = try resolveRequestedTabID(args)
+        let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
+        #if DEBUG
+            testBeforeProviderAvailabilityPreflight?()
+        #endif
+        let selection = try AgentMCPSelectionResolver.resolve(
+            modelID: normalizedString(args["model_id"]),
+            defaultTaskLabel: defaultTaskLabel,
+            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
+            workspaceID: workspace.id
+        )
+        #if DEBUG
+            let existingRequestedAgent = resolvedTabID.flatMap {
+                agentModeVM.session(for: $0, createIfNeeded: false)?.selectedAgent
+            }
+            let earlyEffectiveTargetIsOhMyPi = selection.agentRaw == AgentProviderKind.ohMyPi.rawValue
+                || (selection.agentRaw == nil && existingRequestedAgent == .ohMyPi)
+            if earlyEffectiveTargetIsOhMyPi, ompQualificationLease == nil {
+                throw MCPError.invalidParams(
+                    "Fresh OMP qualification starts require _omp_qualification_lease_id."
+                )
+            }
+        #endif
         let parentSourceTabID = await resolveSpawnParentSourceTabID(metadata)
         #if DEBUG
             AgentModePerfDiagnostics.event("mcp.routing.agentRunStartResolvedSource", tabID: parentSourceTabID, fields: [
@@ -547,7 +733,6 @@ struct AgentRunMCPToolService {
         } else {
             await resolveSpawnParentSessionID(metadata, targetWindow)
         }
-        let resolvedTabID = try resolveRequestedTabID(args)
         #if DEBUG
             AgentModePerfDiagnostics.event("mcp.routing.agentRunStartParentResolved", tabID: parentSourceTabID, fields: [
                 "connectionID": metadata.connectionID?.uuidString ?? "nil",
@@ -577,27 +762,6 @@ struct AgentRunMCPToolService {
                 )
             }
         }
-
-        // Compute the default task label before target creation. Omitted `model_id`
-        // for agent_run.start resolves through the effective workspace Pair role default.
-        let defaultTaskLabel = Self.defaultTaskLabelForStart(resolvedTabID: resolvedTabID, workflow: workflow)
-
-        // Validate model selection before creating a target. Role labels resolve through effective workspace/global role defaults.
-        let selection = try AgentMCPSelectionResolver.resolve(
-            modelID: normalizedString(args["model_id"]),
-            defaultTaskLabel: defaultTaskLabel,
-            availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext,
-            workspaceID: workspace.id
-        )
-        #if DEBUG
-            if selection.agentRaw == AgentProviderKind.ohMyPi.rawValue,
-               ompQualificationLease == nil
-            {
-                throw MCPError.invalidParams(
-                    "Fresh OMP qualification starts require _omp_qualification_lease_id."
-                )
-            }
-        #endif
 
         #if DEBUG
             if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
@@ -648,6 +812,26 @@ struct AgentRunMCPToolService {
             throw MCPError.internalError("agent_run.start target did not resolve a session ID.")
         }
         #if DEBUG
+            let mcpStartInvocationGenerationID = UUID()
+            guard agentModeVM.mcpInstallStartInvocationGeneration(
+                mcpStartInvocationGenerationID,
+                for: target,
+                expectedSessionID: targetSessionID
+            ) else {
+                throw MCPError.invalidParams(
+                    "The agent_run.start target is already claimed by an earlier transaction cleanup."
+                )
+            }
+            let discardUnconsumedTargetIfOwned: () async -> Void = {
+                _ = await agentModeVM.mcpDiscardSessionTarget(
+                    target,
+                    ifOwnedByStartGeneration: mcpStartInvocationGenerationID,
+                    expectedSessionID: targetSessionID,
+                    requireNoRun: true
+                )
+            }
+        #endif
+        #if DEBUG
             let existingTargetAgent = agentModeVM.session(
                 for: target.tabID,
                 createIfNeeded: false
@@ -655,30 +839,109 @@ struct AgentRunMCPToolService {
             let effectiveTargetIsOhMyPi = selection.agentRaw == AgentProviderKind.ohMyPi.rawValue
                 || (selection.agentRaw == nil && existingTargetAgent == .ohMyPi)
             if effectiveTargetIsOhMyPi {
+                await testBeforeOMPQualificationConsume?()
+                guard let requestedWorkspaceUUID else {
+                    await discardUnconsumedTargetIfOwned()
+                    throw MCPError.invalidParams(
+                        "OMP qualification starts require an explicit workspace_id matching the fingerprinted workspace."
+                    )
+                }
+                guard targetWindow.workspaceManager.activeWorkspace?.id == requestedWorkspaceUUID else {
+                    await discardUnconsumedTargetIfOwned()
+                    throw MCPError.invalidParams(
+                        "workspace_mismatch: the fingerprinted OMP qualification workspace changed before lease consumption."
+                    )
+                }
                 guard let ompQualificationLease,
                       let connectionID = metadata.connectionID
                 else {
-                    await agentModeVM.mcpDiscardSessionTarget(target)
+                    await discardUnconsumedTargetIfOwned()
                     throw MCPError.invalidParams(
                         "The effective OMP target requires _omp_qualification_lease_id, including when model_id is omitted."
                     )
                 }
+                let consumption: OhMyPiAgentModeSmokeGate.Consumption
                 do {
-                    _ = try OhMyPiAgentModeSmokeGate.shared.consume(
+                    consumption = try OhMyPiAgentModeSmokeGate.shared.consumeStartTransaction(
                         leaseID: ompQualificationLease.leaseID,
                         ownerConnectionID: connectionID,
                         ownerProcessID: ompQualificationLease.ownerProcessID,
                         sessionID: targetSessionID
                     )
                 } catch {
-                    await agentModeVM.mcpDiscardSessionTarget(target)
+                    await discardUnconsumedTargetIfOwned()
                     throw MCPError.invalidParams("The OMP qualification lease was expired, stolen, or already consumed.")
                 }
+                ompQualificationRollbackSnapshot = consumption.snapshot
+                ompQualificationStartTransaction = consumption.transaction
+                let context = OhMyPiAgentModeSmokeGate.StartContext(
+                    transaction: consumption.transaction,
+                    expectedWorkspaceID: requestedWorkspaceUUID,
+                    authorizationDeadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds
+                )
+                ompQualificationStartContext = context
+                ompQualificationInvocationContext = context
+                guard let targetSession = agentModeVM.session(
+                    for: target.tabID,
+                    createIfNeeded: false
+                ) else {
+                    await rollbackConsumedQualificationStart(agentModeVM, target.tabID, true)
+                    _ = await agentModeVM.mcpDiscardSessionTarget(
+                        target,
+                        ifOwnedByOMPQualification: context
+                    )
+                    throw MCPError.internalError(
+                        "OMP qualification could not install its transaction context because the resolved target session is unavailable."
+                    )
+                }
+                guard agentModeVM.mcpInstallStartInvocationGeneration(
+                    context.generationID,
+                    for: target,
+                    expectedSessionID: targetSessionID
+                ) else {
+                    await rollbackConsumedQualificationStart(agentModeVM, target.tabID, true)
+                    throw MCPError.invalidParams(
+                        "The OMP qualification target is already claimed by an earlier transaction cleanup."
+                    )
+                }
+                targetSession.ompQualificationStartContext = context
             } else if ompQualificationLease != nil {
-                await agentModeVM.mcpDiscardSessionTarget(target)
+                await discardUnconsumedTargetIfOwned()
                 throw MCPError.invalidParams(
                     "_omp_qualification_lease_id may only authorize an effective OMP target."
                 )
+            }
+        #endif
+        #if DEBUG
+            let discardQualificationTargetIfOwned: (
+                _ beforeDiscard: () -> Void
+            ) async -> AgentModeViewModel.OMPQualificationTargetDiscardOutcome = { beforeDiscard in
+                let liveTargetSession = agentModeVM.session(for: target.tabID, createIfNeeded: false)
+                await testBeforeOMPQualificationTargetDiscardCAS?(liveTargetSession)
+                if let context = ompQualificationInvocationContext {
+                    return await agentModeVM.mcpDiscardSessionTarget(
+                        target,
+                        ifOwnedByOMPQualification: context,
+                        beforeDiscard: beforeDiscard
+                    )
+                }
+                return await agentModeVM.mcpDiscardSessionTarget(
+                    target,
+                    ifOwnedByStartGeneration: mcpStartInvocationGenerationID,
+                    expectedSessionID: targetSessionID,
+                    beforeDiscard: beforeDiscard
+                )
+            }
+            let qualificationOwnershipCategory: (
+                AgentModeViewModel.OMPQualificationTargetDiscardOutcome,
+                String
+            ) -> String = { outcome, fallback in
+                switch outcome {
+                case .contextReplaced:
+                    "qualification_context_replaced"
+                case .aborted, .superseded, .discarded, .ineligible:
+                    fallback
+                }
             }
         #endif
         #if DEBUG
@@ -695,17 +958,21 @@ struct AgentRunMCPToolService {
                         correlationID: worktreeStartupCorrelationID
                     )
                 } catch {
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .discardRequested,
-                        errorCategory: "target_registration"
-                    )
-                    await agentModeVM.mcpDiscardSessionTarget(target)
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .discardCompleted,
-                        providerRunActive: false
-                    )
+                    await rollbackConsumedQualificationStart(agentModeVM, target.tabID, true)
+                    let discardOutcome = await discardQualificationTargetIfOwned {
+                        try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                            correlationID: worktreeStartupCorrelationID,
+                            phase: .discardRequested,
+                            errorCategory: "target_registration"
+                        )
+                    }
+                    if discardOutcome == .discarded {
+                        try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                            correlationID: worktreeStartupCorrelationID,
+                            phase: .discardCompleted,
+                            providerRunActive: false
+                        )
+                    }
                     throw error
                 }
             }
@@ -717,6 +984,62 @@ struct AgentRunMCPToolService {
             servingControl: worktreeStartupServingControl
         )
         WorktreeStartupInstrumentation.record(.agentRunStarted, context: worktreeStartupContext)
+        #if DEBUG
+            let performTerminalQualificationCleanup: (
+                _ category: String,
+                _ recordInstrumentationFailure: Bool,
+                _ fallback: WorkspaceRootSeedFallbackReason?
+            ) async -> Void = { category, recordInstrumentationFailure, fallback in
+                let cleanupTask = Task { @MainActor in
+                    await rollbackConsumedQualificationStart(agentModeVM, target.tabID, false)
+                    let discardOutcome = await discardQualificationTargetIfOwned {
+                        if worktreeStartupBenchmarkToken != nil {
+                            try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                                correlationID: worktreeStartupCorrelationID,
+                                phase: .failed,
+                                providerRunActive: false,
+                                errorCategory: category
+                            )
+                            try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                                correlationID: worktreeStartupCorrelationID,
+                                phase: .discardRequested
+                            )
+                        }
+                    }
+                    if let session = agentModeVM.session(for: target.tabID, createIfNeeded: false),
+                       session.ompQualificationStartContext === ompQualificationInvocationContext
+                    {
+                        session.ompQualificationStartContext = nil
+                    }
+                    let effectiveCategory = qualificationOwnershipCategory(discardOutcome, category)
+                    testOMPQualificationTerminalCategory?(effectiveCategory)
+                    if recordInstrumentationFailure {
+                        WorktreeStartupInstrumentation.record(
+                            .failed,
+                            context: worktreeStartupContext,
+                            fallback: fallback
+                        )
+                    }
+                    if worktreeStartupBenchmarkToken != nil {
+                        if discardOutcome == .discarded {
+                            try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                                correlationID: worktreeStartupCorrelationID,
+                                phase: .discardCompleted,
+                                providerRunActive: false
+                            )
+                        } else {
+                            try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
+                                correlationID: worktreeStartupCorrelationID,
+                                phase: .failed,
+                                providerRunActive: false,
+                                errorCategory: effectiveCategory
+                            )
+                        }
+                    }
+                }
+                await cleanupTask.value
+            }
+        #endif
         var expectedRoutedWorktreeBindings: [AgentSessionWorktreeBinding]?
         var expectedExplicitTabWorktreeSource: (
             tabID: UUID,
@@ -724,6 +1047,11 @@ struct AgentRunMCPToolService {
             bindings: [AgentSessionWorktreeBinding]
         )?
         do {
+            #if DEBUG
+                if let testWorktreePreparationFailure {
+                    throw testWorktreePreparationFailure
+                }
+            #endif
             if effectiveParentWorktreeInheritance,
                let parentSourceTabID,
                let spawnParentSessionID
@@ -818,44 +1146,27 @@ struct AgentRunMCPToolService {
                 )
             }
         } catch {
-            #if DEBUG
-                if ompQualificationLease != nil, let connectionID = metadata.connectionID {
-                    _ = OhMyPiAgentModeSmokeGate.shared.releaseOwned(by: connectionID)
-                }
-            #endif
             WorktreeStartupInstrumentation.record(
                 .failed,
                 context: worktreeStartupContext,
                 fallback: error is CancellationError ? .cancellation : nil
             )
             #if DEBUG
-                if worktreeStartupBenchmarkToken != nil {
-                    let category = error is CancellationError
-                        ? "cancellation"
-                        : (error as? DebugWorktreeStartupBenchmarkError) == .startAborted
-                        ? "abort_requested"
-                        : "worktree_preparation"
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .failed,
-                        providerRunActive: false,
-                        errorCategory: category
-                    )
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .discardRequested
-                    )
+                if let targetSession = agentModeVM.session(for: target.tabID, createIfNeeded: false) {
+                    await testBeforeWorktreePreparationFailureCleanup?(targetSession)
                 }
-            #endif
-            await agentModeVM.mcpDiscardSessionTarget(target)
-            #if DEBUG
-                if worktreeStartupBenchmarkToken != nil {
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .discardCompleted,
-                        providerRunActive: false
-                    )
-                }
+                let category = error is CancellationError
+                    ? "cancellation"
+                    : (error as? DebugWorktreeStartupBenchmarkError) == .startAborted
+                    ? "abort_requested"
+                    : "worktree_preparation"
+                await performTerminalQualificationCleanup(
+                    category,
+                    false,
+                    error is CancellationError ? .cancellation : nil
+                )
+            #else
+                await agentModeVM.mcpDiscardSessionTarget(target)
             #endif
             throw error
         }
@@ -871,6 +1182,62 @@ struct AgentRunMCPToolService {
                 "targetOrigin": String(describing: target.origin)
             ])
         #endif
+        #if DEBUG
+            let terminalQualificationFailure: (_ message: String, _ category: String) async -> MCPError = { message, category in
+                await performTerminalQualificationCleanup(category, true, nil)
+                return MCPError.invalidParams(message)
+            }
+
+            await testBeforeOMPQualificationProviderDispatch?()
+            if ompQualificationStartTransaction != nil {
+                guard let requestedWorkspaceUUID,
+                      targetWindow.workspaceManager.activeWorkspace?.id == requestedWorkspaceUUID
+                else {
+                    throw await terminalQualificationFailure(
+                        "workspace_mismatch: the fingerprinted OMP qualification workspace changed before provider dispatch.",
+                        "workspace_mismatch"
+                    )
+                }
+                guard let context = ompQualificationStartContext,
+                      Self.ompQualificationAuthorizationRemainingNanoseconds(
+                          deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds
+                      ) > 0
+                else {
+                    ompQualificationStartContext?.authorizationReceipt.resolve(.denied)
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification provider authorization deadline expired before provider dispatch.",
+                        "qualification_authorization_timeout"
+                    )
+                }
+                guard let liveSession = agentModeVM.session(for: target.tabID, createIfNeeded: false) else {
+                    context.authorizationReceipt.resolve(.denied)
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification transaction context was unavailable before provider dispatch.",
+                        "qualification_context_missing"
+                    )
+                }
+                await testBeforeOMPQualificationContextIdentityCheck?(context, liveSession)
+                guard liveSession.mcpStartInvocationGenerationID == context.generationID,
+                      liveSession.ompQualificationStartContext === context
+                else {
+                    context.authorizationReceipt.resolve(.denied)
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification transaction context was replaced before provider dispatch.",
+                        "qualification_context_replaced"
+                    )
+                }
+                await testAfterOMPQualificationPreDispatchIdentityCheck?()
+                guard liveSession.mcpStartInvocationGenerationID == context.generationID,
+                      liveSession.ompQualificationStartContext === context
+                else {
+                    context.authorizationReceipt.resolve(.denied)
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification transaction context was replaced before provider dispatch.",
+                        "qualification_context_replaced"
+                    )
+                }
+            }
+        #endif
         let outcome: AgentExternalMCPRunStarter.StartOutcome
         do {
             WorktreeStartupInstrumentation.record(.providerStart, context: worktreeStartupContext)
@@ -882,96 +1249,153 @@ struct AgentRunMCPToolService {
                     )
                 }
             #endif
-            outcome = try await startRun(
-                target,
-                message,
-                metadata,
-                bindCurrentRequestToTab,
-                agentModeVM,
-                selection.agentRaw,
-                selection.modelRaw,
-                nil,
-                selection.taskLabelKind,
-                workflow,
-                spawnParentSessionID,
-                oracleLaunchSource.source
-            )
+            #if DEBUG
+                ompQualificationProviderDispatchStarted = true
+            #endif
+            #if DEBUG
+                outcome = try await OhMyPiAgentModeSmokeGate.$invocationStartContext.withValue(
+                    ompQualificationStartContext
+                ) {
+                    try await startRun(
+                        target,
+                        message,
+                        metadata,
+                        bindCurrentRequestToTab,
+                        agentModeVM,
+                        selection.agentRaw,
+                        selection.modelRaw,
+                        nil,
+                        selection.taskLabelKind,
+                        workflow,
+                        spawnParentSessionID,
+                        oracleLaunchSource.source
+                    )
+                }
+            #else
+                outcome = try await startRun(
+                    target,
+                    message,
+                    metadata,
+                    bindCurrentRequestToTab,
+                    agentModeVM,
+                    selection.agentRaw,
+                    selection.modelRaw,
+                    nil,
+                    selection.taskLabelKind,
+                    workflow,
+                    spawnParentSessionID,
+                    oracleLaunchSource.source
+                )
+            #endif
             #if DEBUG
                 if worktreeStartupBenchmarkToken != nil {
                     await testAfterProviderStartBeforeBookkeeping?()
                     if WorktreeStartupBenchmarkDiagnostics.shared.recoverableStartAbortRequested(
                         correlationID: worktreeStartupCorrelationID
                     ) == true {
-                        await agentModeVM.cancelAgentRun(
-                            tabID: target.tabID,
-                            completion: .terminalPublished
-                        )
+                        if ompQualificationStartTransaction != nil {
+                            await rollbackConsumedQualificationStart(agentModeVM, target.tabID, true)
+                        } else {
+                            await agentModeVM.cancelAgentRun(
+                                tabID: target.tabID,
+                                completion: .terminalPublished
+                            )
+                        }
                         throw DebugWorktreeStartupBenchmarkError.startAborted
                     }
                 }
             #endif
         } catch {
-            #if DEBUG
-                if ompQualificationLease != nil, let connectionID = metadata.connectionID {
-                    _ = OhMyPiAgentModeSmokeGate.shared.releaseOwned(by: connectionID)
-                }
-            #endif
+            WorktreeStartupInstrumentation.record(
+                .failed,
+                context: worktreeStartupContext,
+                fallback: error is CancellationError ? .cancellation : nil
+            )
             let decoratedError = startWorktreeCoordinator.providerStartError(
                 error,
                 targetSessionID: target.sessionID,
                 agentModeVM: agentModeVM
             )
             #if DEBUG
-                if worktreeStartupBenchmarkToken != nil {
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .failed,
-                        providerRunActive: false,
-                        errorCategory: error is CancellationError ? "cancellation" : "provider_start"
-                    )
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .discardRequested
-                    )
+                ompQualificationStartContext?.authorizationReceipt.resolve(.denied)
+                let providerFailureCategory = if error is AgentExternalMCPRunStarter.OMPQualificationInvocationError {
+                    "qualification_context_replaced"
+                } else if error is CancellationError {
+                    "cancellation"
+                } else {
+                    "provider_start"
                 }
-            #endif
-            await agentModeVM.mcpDiscardSessionTarget(target)
-            #if DEBUG
-                if worktreeStartupBenchmarkToken != nil {
-                    try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
-                        correlationID: worktreeStartupCorrelationID,
-                        phase: .discardCompleted,
-                        providerRunActive: false
-                    )
-                }
+                await performTerminalQualificationCleanup(
+                    providerFailureCategory,
+                    false,
+                    error is CancellationError ? .cancellation : nil
+                )
+            #else
+                await agentModeVM.mcpDiscardSessionTarget(target)
             #endif
             throw decoratedError
         }
         #if DEBUG
             if let ompQualificationLease {
+                guard let context = ompQualificationStartContext else {
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification start lost its transaction context.",
+                        "qualification_context"
+                    )
+                }
+                let remainingNanoseconds = Self.ompQualificationAuthorizationRemainingNanoseconds(
+                    deadlineUptimeNanoseconds: ompQualificationAuthorizationDeadlineUptimeNanoseconds
+                )
+                let observedAuthorizationOutcome = remainingNanoseconds > 0
+                    ? await context.authorizationReceipt.wait(timeoutNanoseconds: remainingNanoseconds)
+                    : nil
+                let authorizationOutcome: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome
+                if let observedAuthorizationOutcome {
+                    authorizationOutcome = observedAuthorizationOutcome
+                } else {
+                    let effectiveOutcome = context.authorizationReceipt.resolve(.denied)
+                    guard case .authorized = effectiveOutcome else {
+                        throw await terminalQualificationFailure(
+                            "The OMP qualification provider authorization did not reach an actionable outcome before its deadline.",
+                            "qualification_authorization_timeout"
+                        )
+                    }
+                    // A prior authorization winner remains authoritative even if the
+                    // waiting task observes it at the absolute deadline boundary.
+                    authorizationOutcome = effectiveOutcome
+                }
+                guard case let .authorized(authorizedRun) = authorizationOutcome else {
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification provider start was not authorized for this transaction.",
+                        "qualification_authorization"
+                    )
+                }
                 guard let connectionID = metadata.connectionID,
                       let runID = outcome.snapshot.runID
                 else {
-                    await agentModeVM.cancelAgentRun(
-                        tabID: target.tabID,
-                        completion: .terminalPublished
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification start did not expose a bindable run identity.",
+                        "run_identity_missing"
                     )
-                    throw MCPError.invalidParams("The OMP qualification start did not expose a bindable run identity.")
+                }
+                guard runID == authorizedRun.runID else {
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification start returned a run identity that did not match the authorized run.",
+                        "run_identity_mismatch"
+                    )
                 }
                 do {
-                    _ = try OhMyPiAgentModeSmokeGate.shared.bindRun(
+                    ompQualificationRollbackSnapshot = try OhMyPiAgentModeSmokeGate.shared.bindRun(
                         leaseID: ompQualificationLease.leaseID,
                         ownerConnectionID: connectionID,
                         sessionID: outcome.snapshot.sessionID,
                         runID: runID
                     )
                 } catch {
-                    _ = OhMyPiAgentModeSmokeGate.shared.releaseOwned(by: connectionID)
-                    await agentModeVM.cancelAgentRun(
-                        tabID: target.tabID,
-                        completion: .terminalPublished
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification lease could not bind the created run.",
+                        "run_binding"
                     )
-                    throw MCPError.invalidParams("The OMP qualification lease could not bind the created run.")
                 }
             }
             if worktreeStartupBenchmarkToken != nil {
@@ -986,19 +1410,34 @@ struct AgentRunMCPToolService {
             #if DEBUG
                 ompQualificationTransactionSucceeded = ompQualificationLease == nil
                     || Self.ompQualificationTransactionCommits(status: outcome.snapshot.status)
+                if !ompQualificationTransactionSucceeded {
+                    await rollbackConsumedQualificationStart(agentModeVM, target.tabID, true)
+                } else if let session = agentModeVM.session(for: target.tabID, createIfNeeded: false),
+                          session.ompQualificationStartContext === ompQualificationStartContext
+                {
+                    session.ompQualificationStartContext = nil
+                }
             #endif
             return decoratedRunValue(snapshot: outcome.snapshot, workflow: workflow, delivery: outcome.delivery)
         }
-        let waitedValue = try await waitForInterestingState(
-            sessionID: outcome.snapshot.sessionID,
-            agentModeVM: agentModeVM,
-            metadata: metadata,
-            timeoutSeconds: timeoutSeconds,
-            stage: "starting",
-            message: "Waiting for the started run to finish or request input...",
-            workflow: workflow,
-            initialDelivery: outcome.delivery
-        )
+        let waitedValue: Value
+        do {
+            waitedValue = try await waitForInterestingState(
+                sessionID: outcome.snapshot.sessionID,
+                agentModeVM: agentModeVM,
+                metadata: metadata,
+                timeoutSeconds: timeoutSeconds,
+                stage: "starting",
+                message: "Waiting for the started run to finish or request input...",
+                workflow: workflow,
+                initialDelivery: outcome.delivery
+            )
+        } catch {
+            #if DEBUG
+                await rollbackConsumedQualificationStart(agentModeVM, target.tabID, true)
+            #endif
+            throw error
+        }
         #if DEBUG
             let committedStatus = await currentSnapshot(
                 sessionID: outcome.snapshot.sessionID,
@@ -1006,6 +1445,13 @@ struct AgentRunMCPToolService {
             ).status
             ompQualificationTransactionSucceeded = ompQualificationLease == nil
                 || Self.ompQualificationTransactionCommits(status: committedStatus)
+            if !ompQualificationTransactionSucceeded {
+                await rollbackConsumedQualificationStart(agentModeVM, target.tabID, true)
+            } else if let session = agentModeVM.session(for: target.tabID, createIfNeeded: false),
+                      session.ompQualificationStartContext === ompQualificationStartContext
+            {
+                session.ompQualificationStartContext = nil
+            }
         #endif
         return waitedValue
     }

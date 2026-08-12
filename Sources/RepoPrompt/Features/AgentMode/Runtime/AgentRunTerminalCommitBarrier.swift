@@ -39,6 +39,7 @@ final class AgentRunTerminalCommitBarrier {
         let completion: AgentModeRunService.CancellationCompletion
         let errorText: String?
         let attachmentReservationID: UUID?
+        let capturedAttachments: [AgentImageAttachment]
         let attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition
         let finalizeNonCodexUsage: Bool
         let supportsFollowUp: Bool
@@ -49,6 +50,7 @@ final class AgentRunTerminalCommitBarrier {
         let prepareProviderState: () -> (@MainActor () async -> Void)?
         let postCommit: () -> Void
 
+        @MainActor
         init(
             session: AgentModeViewModel.TabSession,
             ownership: AgentRunOwnership,
@@ -58,6 +60,7 @@ final class AgentRunTerminalCommitBarrier {
             completion: AgentModeRunService.CancellationCompletion = .terminalPublished,
             errorText: String? = nil,
             attachmentReservationID: UUID? = nil,
+            capturedAttachments: [AgentImageAttachment]? = nil,
             attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition,
             finalizeNonCodexUsage: Bool,
             supportsFollowUp: Bool,
@@ -76,6 +79,19 @@ final class AgentRunTerminalCommitBarrier {
             self.completion = completion
             self.errorText = errorText
             self.attachmentReservationID = attachmentReservationID
+            if let capturedAttachments {
+                self.capturedAttachments = capturedAttachments
+            } else if let attachmentReservationID {
+                self.capturedAttachments = switch session.attachmentTurnState {
+                case .idle:
+                    []
+                case let .reserved(storedID, attachments),
+                     let .consumed(storedID, attachments):
+                    attachmentReservationID == storedID ? attachments : []
+                }
+            } else {
+                self.capturedAttachments = []
+            }
             self.attachmentDisposition = attachmentDisposition
             self.finalizeNonCodexUsage = finalizeNonCodexUsage
             self.supportsFollowUp = supportsFollowUp
@@ -222,6 +238,7 @@ final class AgentRunTerminalCommitBarrier {
         hooks.finalizeAttachmentsForTurn(
             session,
             request.attachmentReservationID,
+            request.capturedAttachments,
             request.attachmentDisposition
         )
 

@@ -380,9 +380,19 @@ actor ACPAgentSessionController {
         provider.normalizeError(error)
     }
 
-    func setExpectedMCPRunID(_ runID: UUID?) {
-        expectedMCPRunID = runID
-    }
+    #if DEBUG
+        func setExpectedMCPRunID(
+            _ runID: UUID?,
+            testDuringSet: (() async -> Void)? = nil
+        ) async {
+            expectedMCPRunID = runID
+            await testDuringSet?()
+        }
+    #else
+        func setExpectedMCPRunID(_ runID: UUID?) {
+            expectedMCPRunID = runID
+        }
+    #endif
 
     func setAutoApproveAllToolPermissions(_ enabled: Bool) {
         autoApproveAllToolPermissions = enabled

@@ -111,6 +111,110 @@
             try await super.tearDown()
         }
 
+        func testAuthorizationReceiptSupportsMultipleWaiters() async {
+            let receipt = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt()
+            async let first = receipt.wait()
+            async let second = receipt.wait()
+            await Task.yield()
+            receipt.resolve(.denied)
+            let outcomes = await (first, second)
+            XCTAssertEqual(outcomes.0, .denied)
+            XCTAssertEqual(outcomes.1, .denied)
+        }
+
+        func testAuthorizationReceiptCancellationResolvesDenial() async {
+            let receipt = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt()
+            let waiter = Task { await receipt.wait() }
+            await Task.yield()
+            waiter.cancel()
+            let outcome = await waiter.value
+            XCTAssertEqual(outcome, .denied)
+        }
+
+        func testAuthorizationReceiptReturnsEffectiveOutcomeAfterPriorDenial() {
+            let receipt = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt()
+            let authorized = OhMyPiAgentModeSmokeGate.AuthorizedRunReceipt(
+                runID: UUID(),
+                activeAgentSessionID: UUID(),
+                runAttemptID: UUID()
+            )
+
+            XCTAssertEqual(receipt.resolve(.denied), .denied)
+            XCTAssertEqual(receipt.resolve(.authorized(authorized)), .denied)
+        }
+
+        func testAuthorizationReceiptRejectsAuthorizationAtAbsoluteDeadline() {
+            let permittedReceipt = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt(
+                authorizationDeadlineUptimeNanoseconds: 100,
+                monotonicNowNanoseconds: { 99 }
+            )
+            XCTAssertTrue(permittedReceipt.authorizationStillPermitted)
+            let receipt = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt(
+                authorizationDeadlineUptimeNanoseconds: 100,
+                monotonicNowNanoseconds: { 100 }
+            )
+            XCTAssertFalse(receipt.authorizationStillPermitted)
+
+            let proposed = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome.authorized(.init(
+                runID: UUID(),
+                activeAgentSessionID: nil,
+                runAttemptID: nil
+            ))
+            XCTAssertEqual(receipt.resolve(proposed), .denied)
+            XCTAssertEqual(receipt.resolve(.authorized(.init(
+                runID: UUID(),
+                activeAgentSessionID: nil,
+                runAttemptID: nil
+            ))), .denied, "Denial must remain the one-shot winner")
+        }
+
+        func testInvocationStartContextTaskLocalVisibilityIsScoped() async throws {
+            let gate = OhMyPiAgentModeSmokeGate(notificationCenter: NotificationCenter())
+            let ownerConnectionID = UUID()
+            let ownerProcessID = getpid()
+            let lease = try gate.acquire(
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: ownerProcessID,
+                duration: 60
+            )
+            let consumption = try gate.consumeStartTransaction(
+                leaseID: lease.leaseID,
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: ownerProcessID,
+                sessionID: UUID()
+            )
+            let context = OhMyPiAgentModeSmokeGate.StartContext(
+                transaction: consumption.transaction,
+                expectedWorkspaceID: UUID()
+            )
+
+            XCTAssertNil(OhMyPiAgentModeSmokeGate.invocationStartContext)
+            await OhMyPiAgentModeSmokeGate.$invocationStartContext.withValue(context) {
+                XCTAssertTrue(OhMyPiAgentModeSmokeGate.invocationStartContext === context)
+                await Task.yield()
+                XCTAssertTrue(OhMyPiAgentModeSmokeGate.invocationStartContext === context)
+            }
+            XCTAssertNil(OhMyPiAgentModeSmokeGate.invocationStartContext)
+        }
+
+        func testAuthorizationReceiptWaiterCancellationIsLocal() async {
+            let receipt = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt()
+            let cancelledWaiter = Task { await receipt.wait() }
+            await Task.yield()
+            cancelledWaiter.cancel()
+            let cancelledOutcome = await cancelledWaiter.value
+            XCTAssertEqual(cancelledOutcome, .denied)
+
+            let authorized = OhMyPiAgentModeSmokeGate.AuthorizedRunReceipt(
+                runID: UUID(),
+                activeAgentSessionID: UUID(),
+                runAttemptID: UUID()
+            )
+            XCTAssertEqual(receipt.resolve(.authorized(authorized)), .authorized(authorized))
+            let observedOutcome = await receipt.wait()
+            XCTAssertEqual(observedOutcome, .authorized(authorized))
+        }
+
         func testExclusiveLeasePublishesAvailabilityAndReleaseRestoresDarkness() async throws {
             let apiSettings = makeAPISettingsViewModel()
             let secondWindowAPISettings = makeAPISettingsViewModel()
@@ -212,16 +316,14 @@
             let startConnection = UUID()
             let sessionID = UUID()
             let runID = UUID()
-            XCTAssertFalse(gate.authorizeProviderStart(sessionID: sessionID, runID: runID))
-            _ = try gate.consume(
+            let consumption = try gate.consumeStartTransaction(
                 leaseID: lease.leaseID,
                 ownerConnectionID: startConnection,
                 ownerProcessID: ownerPID,
                 sessionID: sessionID
             )
-            XCTAssertTrue(gate.authorizeProviderStart(sessionID: sessionID, runID: runID))
-            XCTAssertFalse(gate.authorizeProviderStart(sessionID: sessionID, runID: UUID()))
-            XCTAssertFalse(gate.authorizeProviderStart(sessionID: UUID(), runID: UUID()))
+            XCTAssertTrue(gate.authorizeProviderStart(transaction: consumption.transaction, runID: runID))
+            XCTAssertFalse(gate.authorizeProviderStart(transaction: consumption.transaction, runID: UUID()))
             XCTAssertThrowsError(
                 try gate.consume(
                     leaseID: lease.leaseID,
@@ -239,10 +341,168 @@
                 runID: runID
             )
             XCTAssertEqual(bound.runID, runID)
-            XCTAssertFalse(gate.authorizeProviderStart(sessionID: sessionID, runID: UUID()))
+            XCTAssertFalse(gate.authorizeProviderStart(transaction: consumption.transaction, runID: UUID()))
             XCTAssertNil(gate.releaseOwned(by: UUID()))
             XCTAssertEqual(gate.releaseOwned(by: startConnection), bound)
             XCTAssertFalse(gate.isEnabled)
+        }
+
+        func testConcurrentStartLoserRollbackCannotReleaseOrCancelWinner() throws {
+            let recorder = QualificationCancellationRecorder()
+            let gate = OhMyPiAgentModeSmokeGate(
+                notificationCenter: NotificationCenter(),
+                cancellationHandler: recorder.recordCancellation
+            )
+            let ownerProcessID = getpid()
+            let initial = try gate.acquire(
+                ownerConnectionID: UUID(),
+                ownerProcessID: ownerProcessID,
+                duration: 60
+            )
+            let loserSnapshot = try XCTUnwrap(gate.activeSnapshot())
+            let winnerConnectionID = UUID()
+            let winnerSessionID = UUID()
+            let winnerRunID = UUID()
+            let winnerConsumption = try gate.consumeStartTransaction(
+                leaseID: initial.leaseID,
+                ownerConnectionID: winnerConnectionID,
+                ownerProcessID: ownerProcessID,
+                sessionID: winnerSessionID
+            )
+            XCTAssertTrue(gate.authorizeProviderStart(transaction: winnerConsumption.transaction, runID: winnerRunID))
+            let winner = try gate.bindRun(
+                leaseID: initial.leaseID,
+                ownerConnectionID: winnerConnectionID,
+                sessionID: winnerSessionID,
+                runID: winnerRunID
+            )
+
+            XCTAssertNil(gate.rollbackStartTransaction(ifCurrent: loserSnapshot))
+            XCTAssertEqual(gate.activeSnapshot(), winner)
+            XCTAssertTrue(recorder.cancellationRecords.isEmpty)
+        }
+
+        func testConsumedTransactionRollbackCancelsAuthorizedExactRun() throws {
+            let recorder = QualificationCancellationRecorder()
+            let gate = OhMyPiAgentModeSmokeGate(
+                notificationCenter: NotificationCenter(),
+                cancellationHandler: recorder.recordCancellation
+            )
+            let ownerConnectionID = UUID()
+            let lease = try gate.acquire(
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            let sessionID = UUID()
+            let runID = UUID()
+            let consumption = try gate.consumeStartTransaction(
+                leaseID: lease.leaseID,
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                sessionID: sessionID
+            )
+            XCTAssertTrue(gate.authorizeProviderStart(transaction: consumption.transaction, runID: runID))
+
+            let released = try XCTUnwrap(
+                gate.rollbackConsumedStartTransaction(consumption.transaction)
+            )
+            XCTAssertEqual(released.sessionID, sessionID)
+            XCTAssertEqual(released.runID, runID)
+            XCTAssertNil(gate.activeSnapshot())
+            XCTAssertEqual(recorder.cancellationRecords.count, 1)
+            XCTAssertEqual(recorder.cancellationRecords.first?.0.sessionID, sessionID)
+            XCTAssertEqual(recorder.cancellationRecords.first?.0.runID, runID)
+            XCTAssertEqual(
+                recorder.cancellationRecords.first?.1,
+                "qualification_consumed_start_rollback"
+            )
+        }
+
+        func testOldStartRollbackCannotReleaseReacquiredSameConnectionLease() throws {
+            let recorder = QualificationCancellationRecorder()
+            let gate = OhMyPiAgentModeSmokeGate(
+                notificationCenter: NotificationCenter(),
+                cancellationHandler: recorder.recordCancellation
+            )
+            let ownerConnectionID = UUID()
+            let old = try gate.acquire(
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            gate.forceExpiryForTesting()
+            XCTAssertNil(gate.activeSnapshot())
+            let replacementLease = try gate.acquire(
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            let replacementSessionID = UUID()
+            let replacementRunID = UUID()
+            let replacementConsumption = try gate.consumeStartTransaction(
+                leaseID: replacementLease.leaseID,
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                sessionID: replacementSessionID
+            )
+            XCTAssertTrue(
+                gate.authorizeProviderStart(
+                    transaction: replacementConsumption.transaction,
+                    runID: replacementRunID
+                )
+            )
+            let replacement = try XCTUnwrap(gate.activeSnapshot())
+
+            XCTAssertNil(gate.rollbackStartTransaction(ifCurrent: old))
+            XCTAssertEqual(gate.activeSnapshot(), replacement)
+            XCTAssertEqual(recorder.cancellationRecords.map(\.0.leaseID), [])
+        }
+
+        func testStaleTransactionCannotAuthorizeReacquiredSameSessionLease() throws {
+            let gate = OhMyPiAgentModeSmokeGate(notificationCenter: NotificationCenter())
+            let ownerConnectionID = UUID()
+            let sessionID = UUID()
+            let oldLease = try gate.acquire(
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            let oldConsumption = try gate.consumeStartTransaction(
+                leaseID: oldLease.leaseID,
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                sessionID: sessionID
+            )
+            gate.forceExpiryForTesting()
+            XCTAssertNil(gate.activeSnapshot())
+
+            let replacementLease = try gate.acquire(
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            let replacementConsumption = try gate.consumeStartTransaction(
+                leaseID: replacementLease.leaseID,
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: getpid(),
+                sessionID: sessionID
+            )
+            let replacementRunID = UUID()
+
+            XCTAssertFalse(
+                gate.authorizeProviderStart(
+                    transaction: oldConsumption.transaction,
+                    runID: UUID()
+                )
+            )
+            XCTAssertTrue(
+                gate.authorizeProviderStart(
+                    transaction: replacementConsumption.transaction,
+                    runID: replacementRunID
+                )
+            )
+            XCTAssertEqual(gate.activeSnapshot()?.runID, replacementRunID)
         }
 
         func testNilDeliverySnapshotOnAcquiringConnectionTeardownPreservesLease() async throws {

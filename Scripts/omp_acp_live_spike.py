@@ -651,8 +651,8 @@ def prepare_workspace(args: argparse.Namespace, output_dir: Path, repo_root: Pat
         created_path = Path(tempfile.mkdtemp(prefix="repoprompt-omp-acp-workspace."))
         try:
             workspace = created_path.resolve()
-            if is_within(workspace, repo_root):
-                raise ProbeError(f"refusing repository workspace: {workspace}")
+            if paths_overlap(workspace, repo_root):
+                raise ProbeError(f"refusing workspace that overlaps the repository root: {workspace}")
             if paths_overlap(workspace, output_dir):
                 raise ProbeError(f"workspace and evidence directory overlap: {workspace} / {output_dir}")
             return workspace, True
@@ -670,17 +670,18 @@ def prepare_workspace(args: argparse.Namespace, output_dir: Path, repo_root: Pat
     if not supplied.is_absolute():
         raise ProbeError(f"workspace must be an absolute disposable path: {supplied}")
     workspace = supplied.resolve()
-    if is_within(workspace, repo_root):
-        raise ProbeError(f"refusing repository workspace: {workspace}")
+    if paths_overlap(workspace, repo_root):
+        raise ProbeError(f"refusing workspace that overlaps the repository root: {workspace}")
     if paths_overlap(workspace, output_dir):
         raise ProbeError(f"workspace and evidence directory overlap: {workspace} / {output_dir}")
     if workspace.exists():
         if not workspace.is_dir():
             raise ProbeError(f"workspace is not a directory: {workspace}")
-        if any(workspace.iterdir()) and not args.unsafe_allow_nonempty_workspace:
+        if not args.unsafe_allow_nonempty_workspace:
             raise ProbeError(
-                "refusing non-empty supplied workspace; use a fresh empty disposable directory, "
-                "or pass --unsafe-allow-nonempty-workspace only if you accept the loss of exclusivity"
+                "refusing a pre-existing supplied workspace without proof of harness ownership; "
+                "use a nonexistent disposable path, or explicitly waive ownership/exclusivity with "
+                "--unsafe-allow-unverified-workspace"
             )
     else:
         workspace.mkdir(mode=0o700)
@@ -2056,52 +2057,60 @@ def capture_executable_file_identity(path: Path) -> dict[str, Any]:
     }
 
 
+def live_process_start_identity(pid: int) -> dict[str, int]:
+    class ProcBSDInfo(ctypes.Structure):
+        _fields_ = [
+            ("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
+            ("xstatus", ctypes.c_uint32), ("process_id", ctypes.c_uint32),
+            ("parent_pid", ctypes.c_uint32), ("uid", ctypes.c_uint32),
+            ("gid", ctypes.c_uint32), ("ruid", ctypes.c_uint32),
+            ("rgid", ctypes.c_uint32), ("svuid", ctypes.c_uint32),
+            ("svgid", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
+            ("command", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
+            ("open_files", ctypes.c_uint32), ("process_group", ctypes.c_uint32),
+            ("job_control", ctypes.c_uint32), ("terminal_device", ctypes.c_uint32),
+            ("terminal_process_group", ctypes.c_uint32), ("nice", ctypes.c_int32),
+            ("start_seconds", ctypes.c_uint64), ("start_microseconds", ctypes.c_uint64),
+        ]
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidinfo = libproc.proc_pidinfo
+        proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        proc_pidinfo.restype = ctypes.c_int
+        info = ProcBSDInfo()
+        size = proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
+    except (AttributeError, OSError) as error:
+        raise ProbeError(f"cannot capture process identity for PID {pid}: {error}") from error
+    if (
+        size != ctypes.sizeof(info)
+        or info.process_id != pid
+        or info.start_seconds <= 0
+        or info.start_microseconds >= 1_000_000
+    ):
+        raise ProbeError(f"process identity capture lost PID {pid}")
+    return {
+        "pid": pid,
+        "parentPID": int(info.parent_pid),
+        "startSeconds": int(info.start_seconds),
+        "startMicroseconds": int(info.start_microseconds),
+    }
+
+
 def capture_live_process_identity(
     pid: int,
     *,
-    snapshot_text: str | None = None,
     executable_resolver: Callable[[int], Path] = live_process_executable,
+    process_identity_resolver: Callable[[int], dict[str, int]] = live_process_start_identity,
 ) -> dict[str, Any]:
-    raw = snapshot_text
-    if raw is None:
-        class ProcBSDInfo(ctypes.Structure):
-            _fields_ = [
-                ("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
-                ("xstatus", ctypes.c_uint32), ("process_id", ctypes.c_uint32),
-                ("parent_pid", ctypes.c_uint32), ("uid", ctypes.c_uint32),
-                ("gid", ctypes.c_uint32), ("ruid", ctypes.c_uint32),
-                ("rgid", ctypes.c_uint32), ("svuid", ctypes.c_uint32),
-                ("svgid", ctypes.c_uint32), ("reserved", ctypes.c_uint32),
-                ("command", ctypes.c_char * 16), ("name", ctypes.c_char * 32),
-                ("open_files", ctypes.c_uint32), ("process_group", ctypes.c_uint32),
-                ("job_control", ctypes.c_uint32), ("terminal_device", ctypes.c_uint32),
-                ("terminal_process_group", ctypes.c_uint32), ("nice", ctypes.c_int32),
-                ("start_seconds", ctypes.c_uint64), ("start_microseconds", ctypes.c_uint64),
-            ]
-        try:
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            proc_pidinfo = libproc.proc_pidinfo
-            proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
-            proc_pidinfo.restype = ctypes.c_int
-            info = ProcBSDInfo()
-            size = proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-        except (AttributeError, OSError) as error:
-            raise ProbeError(f"cannot capture process identity for PID {pid}: {error}") from error
-        if size != ctypes.sizeof(info) or info.process_id != pid or info.start_seconds <= 0:
-            raise ProbeError(f"process identity capture lost PID {pid}")
-        row = {
-            "parent_pid": int(info.parent_pid),
-            "start_time": f"{info.start_seconds}.{info.start_microseconds:06d}",
-        }
-    else:
-        row = parse_process_snapshot(raw).get(pid)
-        if row is None:
-            raise ProbeError(f"process identity capture lost PID {pid}")
+    identity = process_identity_resolver(pid)
+    if identity.get("pid") != pid:
+        raise ProbeError(f"process identity capture lost PID {pid}")
     executable = executable_resolver(pid).resolve()
     return {
         "pid": pid,
-        "parentPID": row["parent_pid"],
-        "startTime": row["start_time"],
+        "parentPID": identity["parentPID"],
+        "startSeconds": identity["startSeconds"],
+        "startMicroseconds": identity["startMicroseconds"],
         "runtimeExecutable": str(executable),
         "runtimeExecutableFileIdentity": capture_executable_file_identity(executable),
     }
@@ -2117,6 +2126,7 @@ def inspect_helper_descendant(
     expected_helper_file_identity: dict[str, Any],
     snapshot_text: str | None = None,
     executable_resolver: Callable[[int], Path] = live_process_executable,
+    process_identity_resolver: Callable[[int], dict[str, int]] = live_process_start_identity,
 ) -> dict[str, Any]:
     raw = snapshot_text
     if raw is None:
@@ -2138,9 +2148,12 @@ def inspect_helper_descendant(
         raise ProbeError("OMP ACP PID disappeared during process inspection")
     if omp_process.poll() is not None:
         raise ProbeError("OMP ACP process exited during inspection; possible PID reuse")
+    current_omp_process_identity = process_identity_resolver(omp_pid)
     if (
         expected_omp_process_identity.get("pid") != omp_pid
-        or expected_omp_process_identity.get("startTime") != omp_row["start_time"]
+        or current_omp_process_identity.get("pid") != omp_pid
+        or expected_omp_process_identity.get("startSeconds") != current_omp_process_identity.get("startSeconds")
+        or expected_omp_process_identity.get("startMicroseconds") != current_omp_process_identity.get("startMicroseconds")
     ):
         raise ProbeError("OMP ACP process start identity changed during inspection")
     if capture_executable_file_identity(omp) != expected_omp_launch_file_identity:
@@ -2186,23 +2199,77 @@ def inspect_helper_descendant(
             {"matchingDescendantCount": len(descendant_chains)},
         )
     chain = descendant_chains[0]
+    process_identities: dict[int, dict[str, int]] = {omp_pid: current_omp_process_identity}
     for row in chain:
         if row["pid"] not in resolved_executables:
             resolved_executables[row["pid"]] = executable_resolver(row["pid"]).resolve()
+        if row["pid"] not in process_identities:
+            process_identities[row["pid"]] = process_identity_resolver(row["pid"])
+        if process_identities[row["pid"]].get("pid") != row["pid"]:
+            raise ProbeError("process identity changed during descendant inspection")
+
+    helper_pid = chain[0]["pid"]
+    authoritative_chain_pids: list[int] = []
+    current_pid = helper_pid
+    for _ in range(PROCESS_INSPECTION_ROW_LIMIT):
+        if current_pid in authoritative_chain_pids:
+            raise ProbeError("authoritative process identity chain is cyclic")
+        identity = process_identities.get(current_pid)
+        if identity is None:
+            identity = process_identity_resolver(current_pid)
+            process_identities[current_pid] = identity
+        if identity.get("pid") != current_pid:
+            raise ProbeError("authoritative process identity chain lost its PID")
+        if current_pid not in resolved_executables:
+            resolved_executables[current_pid] = executable_resolver(current_pid).resolve()
+        authoritative_chain_pids.append(current_pid)
+        if current_pid == omp_pid:
+            break
+        parent_pid = identity.get("parentPID")
+        if not isinstance(parent_pid, int) or parent_pid <= 1 or parent_pid == current_pid:
+            raise ProbeError(
+                "bundled helper was reparented and is no longer an authoritative OMP descendant"
+            )
+        current_pid = parent_pid
+    if not authoritative_chain_pids or authoritative_chain_pids[-1] != omp_pid:
+        raise ProbeError("bundled helper is not an authoritative OMP descendant")
+
     current_omp_runtime_identity = capture_executable_file_identity(resolved_executables[omp_pid])
     if (
         str(resolved_executables[omp_pid]) != expected_omp_process_identity.get("runtimeExecutable")
         or current_omp_runtime_identity != expected_omp_process_identity.get("runtimeExecutableFileIdentity")
     ):
         raise ProbeError("OMP ACP current runtime executable identity does not match launch-time process identity")
-    current_helper_identity = capture_executable_file_identity(resolved_executables[chain[0]["pid"]])
+    current_helper_identity = capture_executable_file_identity(resolved_executables[helper_pid])
     if current_helper_identity != expected_helper_file_identity:
         raise ProbeError("helper descendant current executable identity does not match the bundled helper")
+    identity_fields = ("pid", "parentPID", "startSeconds", "startMicroseconds")
+    resampled_identities: dict[int, dict[str, int]] = {}
+    for pid in authoritative_chain_pids:
+        before = process_identities[pid]
+        after = process_identity_resolver(pid)
+        if any(before.get(key) != after.get(key) for key in identity_fields):
+            raise ProbeError("authoritative parent-chain process identity drifted during executable inspection")
+        resampled_identities[pid] = after
+    for index, pid in enumerate(authoritative_chain_pids[:-1]):
+        if resampled_identities[pid]["parentPID"] != authoritative_chain_pids[index + 1]:
+            raise ProbeError("authoritative parent-chain linkage drifted during executable inspection")
+    if omp_process.poll() is not None:
+        raise ProbeError("OMP ACP process exited during descendant identity inspection")
+    current_omp_process_identity = process_identity_resolver(omp_pid)
+    if any(
+        resampled_identities[omp_pid].get(key) != current_omp_process_identity.get(key)
+        for key in identity_fields
+    ):
+        raise ProbeError("OMP ACP process identity drifted before evidence publication")
+    resampled_identities[omp_pid] = current_omp_process_identity
+    helper_identity_after = resampled_identities[helper_pid]
     return {
         "ompACPProcess": {
             "pid": omp_row["pid"],
-            "parentPID": omp_row["parent_pid"],
-            "startTime": omp_row["start_time"],
+            "parentPID": current_omp_process_identity["parentPID"],
+            "startSeconds": current_omp_process_identity["startSeconds"],
+            "startMicroseconds": current_omp_process_identity["startMicroseconds"],
             "launchedExecutable": str(omp.resolve()),
             "runtimeExecutable": str(resolved_executables[omp_pid]),
             "startIdentityMatch": True,
@@ -2212,20 +2279,22 @@ def inspect_helper_descendant(
         },
         "helperProcess": {
             "pid": chain[0]["pid"],
-            "parentPID": chain[0]["parent_pid"],
-            "startTime": chain[0]["start_time"],
-            "executable": str(resolved_executables[chain[0]["pid"]]),
+            "parentPID": helper_identity_after["parentPID"],
+            "startSeconds": helper_identity_after["startSeconds"],
+            "startMicroseconds": helper_identity_after["startMicroseconds"],
+            "executable": str(resolved_executables[helper_pid]),
             "currentExecutableIdentityMatch": True,
             "executableFileIdentity": current_helper_identity,
         },
         "parentChain": [
             {
-                "pid": row["pid"],
-                "parentPID": row["parent_pid"],
-                "startTime": row["start_time"],
-                "executable": str(resolved_executables[row["pid"]]),
+                "pid": pid,
+                "parentPID": resampled_identities[pid]["parentPID"],
+                "startSeconds": resampled_identities[pid]["startSeconds"],
+                "startMicroseconds": resampled_identities[pid]["startMicroseconds"],
+                "executable": str(resolved_executables[pid]),
             }
-            for row in chain
+            for pid in authoritative_chain_pids
         ],
         "inspectionBounds": {
             "timeoutSeconds": PROCESS_INSPECTION_TIMEOUT_SECONDS,
@@ -2287,6 +2356,11 @@ def production_transport_identity_evidence(
             if not isinstance(helper_pid, int) or connection.get("helper_peer_pid") != helper_pid:
                 raise ProbeError("production helper connection peer PID does not match the observed bundled helper")
             if (
+                connection.get("helper_peer_start_seconds") != helper_process.get("startSeconds")
+                or connection.get("helper_peer_start_microseconds") != helper_process.get("startMicroseconds")
+            ):
+                raise ProbeError("production helper connection peer start identity does not match the observed bundled helper")
+            if (
                 connection.get("total_tool_calls") != 0
                 or connection.get("has_in_flight_calls") is not False
                 or connection.get("active_tool_scope_count") != 0
@@ -2309,6 +2383,8 @@ def production_transport_identity_evidence(
                     "state": connection.get("state"),
                     "transport": connection.get("transport"),
                     "helper_peer_pid": connection.get("helper_peer_pid"),
+                    "helper_peer_start_seconds": connection.get("helper_peer_start_seconds"),
+                    "helper_peer_start_microseconds": connection.get("helper_peer_start_microseconds"),
                     "total_tool_calls": connection.get("total_tool_calls"),
                     "has_in_flight_calls": connection.get("has_in_flight_calls"),
                     "active_tool_scope_count": connection.get("active_tool_scope_count"),
@@ -2378,6 +2454,8 @@ def production_terminal_connection_evidence(
                 terminal.get("client_name") != "omp-coding-agent"
                 or terminal.get("normalized_client_id") != "omp-coding-agent"
                 or terminal.get("helper_peer_pid") != helper_pid
+                or terminal.get("helper_peer_start_seconds") != helper_process.get("startSeconds")
+                or terminal.get("helper_peer_start_microseconds") != helper_process.get("startMicroseconds")
                 or terminal.get("qualification_raw_tool_call_count") != 0
                 or terminal.get("qualification_raw_in_flight_call_count") != 0
                 or terminal.get("active_tool_scope_count") != 0
@@ -2462,8 +2540,6 @@ def acp_probe(
             "helperFile": capture_executable_file_identity(helper),
         }
     process = JSONLProcess([str(omp), *MANAGED_OMP_ARGUMENTS], workspace)
-    if session_open_inspector is not None:
-        launch_identities["ompProcess"] = capture_live_process_identity(process.process.pid)
     permission_events: list[dict[str, Any]] = []
     unexpected_inbound_request_records: list[dict[str, Any]] = []
     unknown_notification_records: list[dict[str, Any]] = []
@@ -2650,6 +2726,8 @@ def acp_probe(
     summary: dict[str, Any] = {}
     primary_error: BaseException | None = None
     try:
+        if session_open_inspector is not None:
+            launch_identities["ompProcess"] = capture_live_process_identity(process.process.pid)
         process.send(
             {
                 "jsonrpc": "2.0",
@@ -2873,8 +2951,61 @@ def validate_production_bootstrap_summary(acp: dict[str, Any]) -> None:
     if tool_activity_present(acp) or set(acp.get("observedUpdateKinds", [])) & PROMPT_ONLY_UPDATE_KINDS:
         raise ProbeError("production-bootstrap emitted a prompt, tool, or permission event")
     evidence = acp.get("productionTransportIdentityEvidence")
+    process_evidence = evidence.get("process") if isinstance(evidence, dict) else None
+    omp_process = process_evidence.get("ompACPProcess") if isinstance(process_evidence, dict) else None
+    helper_process = process_evidence.get("helperProcess") if isinstance(process_evidence, dict) else None
     terminal = evidence.get("terminalConnectionEvidence") if isinstance(evidence, dict) else None
     terminal_event = terminal.get("removed_event") if isinstance(terminal, dict) else None
+    connection = evidence.get("connection") if isinstance(evidence, dict) else None
+    parent_chain = process_evidence.get("parentChain") if isinstance(process_evidence, dict) else None
+
+    def has_numeric_start_identity(process: Any) -> bool:
+        return (
+            isinstance(process, dict)
+            and type(process.get("pid")) is int
+            and process["pid"] > 0
+            and type(process.get("parentPID")) is int
+            and process["parentPID"] >= 0
+            and type(process.get("startSeconds")) is int
+            and process["startSeconds"] > 0
+            and type(process.get("startMicroseconds")) is int
+            and 0 <= process["startMicroseconds"] < 1_000_000
+        )
+
+    def has_exact_peer_identity(record: Any) -> bool:
+        return (
+            isinstance(record, dict)
+            and type(record.get("helper_peer_pid")) is int
+            and record["helper_peer_pid"] > 0
+            and type(record.get("helper_peer_start_seconds")) is int
+            and record["helper_peer_start_seconds"] > 0
+            and type(record.get("helper_peer_start_microseconds")) is int
+            and 0 <= record["helper_peer_start_microseconds"] < 1_000_000
+        )
+
+    def has_linked_parent_chain() -> bool:
+        if (
+            not isinstance(parent_chain, list)
+            or len(parent_chain) < 2
+            or not all(has_numeric_start_identity(row) for row in parent_chain)
+        ):
+            return False
+        chain_pids = [row["pid"] for row in parent_chain]
+        if len(set(chain_pids)) != len(chain_pids):
+            return False
+        if parent_chain[0].get("pid") != helper_process.get("pid"):
+            return False
+        if parent_chain[-1].get("pid") != omp_process.get("pid"):
+            return False
+        for current, parent in zip(parent_chain, parent_chain[1:]):
+            if current.get("parentPID") != parent.get("pid"):
+                return False
+        for endpoint, process in ((parent_chain[0], helper_process), (parent_chain[-1], omp_process)):
+            for key in ("pid", "parentPID", "startSeconds", "startMicroseconds"):
+                if endpoint.get(key) != process.get(key):
+                    return False
+        return True
+
     if (
         not isinstance(evidence, dict)
         or evidence.get("evidenceLabel") != "production transport/identity evidence"
@@ -2882,12 +3013,19 @@ def validate_production_bootstrap_summary(acp: dict[str, Any]) -> None:
         or evidence.get("delta", {}).get("newReadyAttributableConnectionCount") != 1
         or evidence.get("connection", {}).get("client_name") != "omp-coding-agent"
         or evidence.get("connection", {}).get("normalized_client_id") != "omp-coding-agent"
-        or evidence.get("connection", {}).get("helper_peer_pid") != evidence.get("process", {}).get("helperProcess", {}).get("pid")
-        or evidence.get("process", {}).get("ompACPProcess", {}).get("startIdentityMatch") is not True
-        or evidence.get("process", {}).get("ompACPProcess", {}).get("currentExecutableIdentityMatch") is not True
-        or evidence.get("process", {}).get("ompACPProcess", {}).get("launchCommandExecutableIdentityMatch") is not True
-        or evidence.get("process", {}).get("helperProcess", {}).get("currentExecutableIdentityMatch") is not True
+        or not has_numeric_start_identity(omp_process)
+        or not has_numeric_start_identity(helper_process)
+        or omp_process.get("startIdentityMatch") is not True
+        or not has_linked_parent_chain()
+        or omp_process.get("pid") == helper_process.get("pid")
+        or not has_exact_peer_identity(connection)
+        or connection.get("helper_peer_pid") != helper_process.get("pid")
+        or connection.get("helper_peer_start_seconds") != helper_process.get("startSeconds")
+        or connection.get("helper_peer_start_microseconds") != helper_process.get("startMicroseconds")
         or evidence.get("connection", {}).get("total_tool_calls") != 0
+        or omp_process.get("currentExecutableIdentityMatch") is not True
+        or omp_process.get("launchCommandExecutableIdentityMatch") is not True
+        or helper_process.get("currentExecutableIdentityMatch") is not True
         or evidence.get("connection", {}).get("has_in_flight_calls") is not False
         or evidence.get("connection", {}).get("active_tool_scope_count") != 0
         or evidence.get("connection", {}).get("active_tool_scopes") != []
@@ -2901,7 +3039,10 @@ def validate_production_bootstrap_summary(acp: dict[str, Any]) -> None:
         or terminal_event.get("event") != "removed"
         or terminal_event.get("client_name") != "omp-coding-agent"
         or terminal_event.get("normalized_client_id") != "omp-coding-agent"
-        or terminal_event.get("helper_peer_pid") != evidence.get("process", {}).get("helperProcess", {}).get("pid")
+        or not has_exact_peer_identity(terminal_event)
+        or terminal_event.get("helper_peer_pid") != helper_process.get("pid")
+        or terminal_event.get("helper_peer_start_seconds") != helper_process.get("startSeconds")
+        or terminal_event.get("helper_peer_start_microseconds") != helper_process.get("startMicroseconds")
         or terminal_event.get("qualification_raw_tool_call_count") != 0
         or terminal_event.get("qualification_raw_in_flight_call_count") != 0
         or terminal_event.get("active_tool_scope_count") != 0
@@ -2985,9 +3126,11 @@ def parse_args() -> argparse.Namespace:
         help="absolute empty disposable workspace; defaults to a separate fresh private temporary directory",
     )
     parser.add_argument(
+        "--unsafe-allow-unverified-workspace",
         "--unsafe-allow-nonempty-workspace",
+        dest="unsafe_allow_nonempty_workspace",
         action="store_true",
-        help="UNSAFE: allow a non-empty supplied workspace and waive the normal exclusivity check",
+        help="UNSAFE: waive harness ownership and exclusivity for a pre-existing supplied workspace",
     )
     parser.add_argument(
         "--output-dir",
@@ -3054,7 +3197,7 @@ def main() -> int:
         "workspace": str(workspace),
         "workspaceFreshDefault": args.workspace is None,
         "workspaceOwnedByHarness": workspace_owned,
-        "unsafeNonemptyWorkspaceOverride": args.unsafe_allow_nonempty_workspace,
+        "unsafeUnverifiedWorkspaceOverride": args.unsafe_allow_nonempty_workspace,
         "managedOMPArguments": MANAGED_OMP_ARGUMENTS,
         "success": False,
     }

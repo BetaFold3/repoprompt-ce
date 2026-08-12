@@ -251,6 +251,7 @@
             let ordinal: Int
             let warmup: Bool
             let phase: DebugRecoverableStartPhase
+            let phaseHistory: [DebugRecoverableStartPhase]
             let abortRequested: Bool
             let agentSessionID: UUID?
             let targetTabID: UUID?
@@ -306,6 +307,7 @@
             let warmup: Bool
             let expiresAtNanoseconds: UInt64
             var phase: DebugRecoverableStartPhase = .armed
+            var phaseHistory: [DebugRecoverableStartPhase] = [.armed]
             var abortRequested = false
             var agentSessionID: UUID?
             var targetTabID: UUID?
@@ -1203,6 +1205,9 @@
         ) {
             if phase.rank >= record.phase.rank {
                 record.phase = phase
+                if record.phaseHistory.last != phase {
+                    record.phaseHistory.append(phase)
+                }
             }
         }
 
@@ -1223,6 +1228,7 @@
                 ordinal: record.ordinal,
                 warmup: record.warmup,
                 phase: record.phase,
+                phaseHistory: record.phaseHistory,
                 abortRequested: record.abortRequested,
                 agentSessionID: record.agentSessionID,
                 targetTabID: record.targetTabID,

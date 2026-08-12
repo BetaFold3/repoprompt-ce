@@ -117,14 +117,889 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testOhMyPiPreACPServiceFailureResolvesAuthorizationDenial() async throws {
+        let recorder = LifecycleRecorder()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: UUID(),
+            workspaceID: UUID()
+        )
+        let harness = makeHarness(recorder: recorder)
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "missing control context",
+            initialMessageForRun: "missing control context",
+            attachments: []
+        )
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertFalse(recorder.contains(prefix: "factory:"))
+    }
+
+    func testOhMyPiRunnerReleasedBeforeAgentTaskEntryResolvesAuthorizationDenial() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let taskEntryGate = LifecyclePublicationGate()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        var bootstrapLease: MCPBootstrapLease?
+        var stoppedTrackingRunIDs: [UUID] = []
+        var harness: LifecycleHarness? = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testBeforeOMPQualificationAgentTaskEntry: {
+                recorder.record("agent-task-entry")
+                await taskEntryGate.wait()
+            },
+            testOMPQualificationToolTrackingStopped: {
+                stoppedTrackingRunIDs.append($0)
+            },
+            testOMPQualificationLeaseCreated: {
+                bootstrapLease = $0
+            }
+        )
+        harness?.host.test_installLiveSession(session)
+        _ = harness?.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness?.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness?.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "release runner",
+            initialMessageForRun: "release runner",
+            attachments: []
+        )
+        try await waitUntil("agent task must pause before retaining the runner") {
+            recorder.contains("agent-task-entry")
+        }
+        harness = nil
+        await taskEntryGate.release()
+
+        let outcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(outcome, .denied)
+        try await waitUntil("runner release must terminalize and clear startup ownership") {
+            session.runState == .failed && session.acpController == nil && session.agentTask == nil
+        }
+        XCTAssertTrue(recorder.contains("attachments:deleteFiles"))
+        XCTAssertTrue(stoppedTrackingRunIDs.isEmpty, "Tracking cannot start before task entry")
+        try await waitUntilAsync("runner release must complete lease teardown") {
+            await bootstrapLease?.debugCleanupSnapshot().hasReleased == true
+        }
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+    }
+
+    func testOhMyPiSupersededDuringExpectedMCPRunIDSetPreservesSuccessor() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let successorRunID = UUID()
+        let successorAttemptID = UUID()
+        let successorTaskGate = LifecyclePublicationGate()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let successorController = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: ACPRunRequest(
+                agentKind: .ohMyPi,
+                modelString: nil,
+                workspacePath: FileManager.default.currentDirectoryPath,
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil
+            )
+        )
+        registerACPController(successorController)
+        var unpublishedController: ACPAgentSessionController?
+        var bootstrapLease: MCPBootstrapLease?
+        var successorTask: Task<Void, Never>?
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            acpControllerFactory: { provider, request in
+                let controller = try ACPAgentSessionController(
+                    provider: provider,
+                    runRequest: request
+                )
+                unpublishedController = controller
+                return controller
+            },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testDuringOMPQualificationExpectedMCPRunIDSet: {
+                session.runID = successorRunID
+                session.runState = .running
+                _ = session.beginRunAttempt(
+                    source: "test.expectedMCPRunIDSuccessor",
+                    attemptID: successorAttemptID
+                )
+                session.acpController = successorController
+                let task = Task { await successorTaskGate.wait() }
+                successorTask = task
+                session.agentTask = task
+            },
+            testOMPQualificationLeaseCreated: { bootstrapLease = $0 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "supersede during expected MCP run ID publication",
+            initialMessageForRun: "supersede during expected MCP run ID publication",
+            attachments: []
+        )
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertNotNil(unpublishedController)
+        XCTAssertFalse(session.acpController === unpublishedController)
+        XCTAssertTrue(session.acpController === successorController)
+        XCTAssertEqual(session.runID, successorRunID)
+        XCTAssertEqual(session.activeRunAttemptID, successorAttemptID)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertNotNil(session.agentTask)
+        XCTAssertFalse(successorTask?.isCancelled ?? true)
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.terminalCleanupRequestEntries, ["cancelAndCleanup"])
+        XCTAssertEqual(recorder.events.count(where: { $0 == "attachments:deleteFiles" }), 1)
+
+        successorTask?.cancel()
+        await successorTaskGate.release()
+        await successorTask?.value
+        session.agentTask = nil
+        session.acpController = nil
+        await successorController.shutdown()
+    }
+
+    func testPreDeniedOhMyPiReceiptPreventsBootstrapAfterGateAuthorization() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        context.authorizationReceipt.resolve(.denied)
+        var bootstrapEntries = 0
+        var bootstrapLease: MCPBootstrapLease?
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationProviderBootstrapEntry: {
+                bootstrapEntries += 1
+            },
+            testBeforeOMPQualificationAuthorizationLivenessCheck: {
+                session.agentTask?.cancel()
+            },
+            testOMPQualificationLeaseCreated: { bootstrapLease = $0 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "pre-denied",
+            initialMessageForRun: "pre-denied",
+            attachments: []
+        )
+
+        try await waitUntil("Pre-denied authorization should terminalize without bootstrap") {
+            !session.runState.isActive
+        }
+        XCTAssertEqual(bootstrapEntries, 0)
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertFalse(session.runState.isActive)
+        XCTAssertNil(session.acpController)
+        XCTAssertNil(session.agentTask)
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "attachments:deleteFiles" }), 1)
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.terminalCleanupRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRawRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRequestEntries, ["cancelAndCleanup"])
+    }
+
+    func testOhMyPiCancellationWhileBootstrapLeaseAcquireIsBlockedUsesOneTeardownClaim() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let blockerGateID = UUID()
+        await HeadlessAgentConnectionGate.beginConnection(blockerGateID)
+        addTeardownBlock {
+            await HeadlessAgentConnectionGate.completeConnection(blockerGateID)
+        }
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        var bootstrapLease: MCPBootstrapLease?
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationLeaseCreated: { bootstrapLease = $0 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "cancel blocked lease acquire",
+            initialMessageForRun: "cancel blocked lease acquire",
+            attachments: []
+        )
+        let startupTask = try XCTUnwrap(session.agentTask)
+        try await waitUntilAsync("OMP lease must queue behind the blocker") {
+            await HeadlessAgentConnectionGate.shared.debugWaitingCount() == 1
+        }
+        startupTask.cancel()
+        await HeadlessAgentConnectionGate.completeConnection(blockerGateID)
+        await startupTask.value
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "attachments:deleteFiles" }), 1)
+        XCTAssertNil(session.acpController)
+        XCTAssertFalse(session.runState.isActive)
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.terminalCleanupRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRawRequestCount, 3)
+        XCTAssertEqual(
+            cleanup?.terminalCleanupRequestEntries,
+            ["cancelAndCleanup", "cancelAndCleanup", "cancelAndCleanup"]
+        )
+    }
+
+    func testExpiredOhMyPiAuthorizationReceiptDeniesRunnerBeforeBootstrap() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID,
+            authorizationDeadlineUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds - 1
+        )
+        var gateAuthorizationCalls = 0
+        var bootstrapEntries = 0
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in
+                gateAuthorizationCalls += 1
+                return true
+            },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationProviderBootstrapEntry: { bootstrapEntries += 1 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "expired authorization",
+            initialMessageForRun: "expired authorization",
+            attachments: []
+        )
+        await session.agentTask?.value
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(gateAuthorizationCalls, 0)
+        XCTAssertEqual(bootstrapEntries, 0)
+        XCTAssertEqual(session.runState, .failed)
+    }
+
+    func testOhMyPiCancellationImmediatelyAfterBootstrapPreventsReadyAndPrompt() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let recordDirectory = try makeTemporaryDirectory()
+        let recordURL = recordDirectory.appendingPathComponent("post-bootstrap-cancellation.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var bootstrapEntries = 0
+        var bootstrapLease: MCPBootstrapLease?
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationProviderBootstrapEntry: {
+                bootstrapEntries += 1
+            },
+            testAfterOMPQualificationProviderBootstrap: {
+                withUnsafeCurrentTask { task in
+                    task?.cancel()
+                }
+            },
+            testOMPQualificationLeaseCreated: {
+                bootstrapLease = $0
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "cancel after bootstrap",
+            initialMessageForRun: "cancel after bootstrap",
+            attachments: []
+        )
+
+        let cancelledTask = session.agentTask
+        try await waitUntil("Post-bootstrap cancellation should terminalize the old run") {
+            !session.runState.isActive
+        }
+        await cancelledTask?.value
+        XCTAssertEqual(bootstrapEntries, 1)
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.acpController)
+        XCTAssertFalse(
+            recordedOpenCodeFlowRequests(at: recordURL).contains(where: { $0.method == "session/prompt" })
+        )
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+    }
+
+    func testOhMyPiControllerReplacementAfterBootstrapPreservesSuccessorAndSkipsPrompt() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let recordDirectory = try makeTemporaryDirectory()
+        let recordURL = recordDirectory.appendingPathComponent("post-bootstrap-replacement.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let successor = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: ACPRunRequest(
+                agentKind: .ohMyPi,
+                modelString: nil,
+                workspacePath: FileManager.default.currentDirectoryPath,
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil
+            )
+        )
+        registerACPController(successor)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var bootstrapLease: MCPBootstrapLease?
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testAfterOMPQualificationProviderBootstrap: {
+                session.acpController = successor
+            },
+            testOMPQualificationLeaseCreated: {
+                bootstrapLease = $0
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "replace after bootstrap",
+            initialMessageForRun: "replace after bootstrap",
+            attachments: []
+        )
+
+        let oldTask = session.agentTask
+        await oldTask?.value
+        XCTAssertTrue(session.acpController === successor)
+        XCTAssertTrue(session.runState.isActive)
+        XCTAssertFalse(
+            recordedOpenCodeFlowRequests(at: recordURL).contains(where: { $0.method == "session/prompt" })
+        )
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+    }
+
+    func testOhMyPiBootstrapThrowAfterControllerReplacementPreservesSuccessor() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let failingProvider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/false",
+            recorder: recorder
+        )
+        let successorProvider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let successor = try ACPAgentSessionController(
+            provider: successorProvider,
+            runRequest: ACPRunRequest(
+                agentKind: .ohMyPi,
+                modelString: nil,
+                workspacePath: FileManager.default.currentDirectoryPath,
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil
+            )
+        )
+        registerACPController(successor)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var bootstrapLease: MCPBootstrapLease?
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in failingProvider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationProviderBootstrapEntry: {
+                session.acpController = successor
+            },
+            testOMPQualificationLeaseCreated: { bootstrapLease = $0 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "replace before throwing bootstrap",
+            initialMessageForRun: "replace before throwing bootstrap",
+            attachments: []
+        )
+        await session.agentTask?.value
+
+        XCTAssertTrue(session.acpController === successor)
+        XCTAssertTrue(session.runState.isActive)
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 0)
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+    }
+
+    func testOhMyPiGenericStartupFailureAndCancellationUseSingleTeardownClaim() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/false",
+            recorder: recorder
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var bootstrapLease: MCPBootstrapLease?
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testBeforeOMPQualificationGenericStartupFailureTeardown: {
+                session.agentTask?.cancel()
+            },
+            testOMPQualificationLeaseCreated: { bootstrapLease = $0 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "fail and cancel startup",
+            initialMessageForRun: "fail and cancel startup",
+            attachments: []
+        )
+        await session.agentTask?.value
+
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "attachments:deleteFiles" }), 1)
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+        XCTAssertEqual(cleanup?.terminalCleanupRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRawRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRequestEntries, ["cancelAndCleanup"])
+    }
+
+    func testOhMyPiCancellationDuringProviderInitializationCompletionPreventsPrompt() async throws {
+        try await exerciseOhMyPiProviderInitializationCompletionInvalidation(replaceController: false)
+    }
+
+    func testOhMyPiControllerReplacementDuringProviderInitializationCompletionPreservesSuccessor() async throws {
+        try await exerciseOhMyPiProviderInitializationCompletionInvalidation(replaceController: true)
+    }
+
+    private func exerciseOhMyPiProviderInitializationCompletionInvalidation(
+        replaceController: Bool
+    ) async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let recordDirectory = try makeTemporaryDirectory()
+        let recordURL = recordDirectory.appendingPathComponent("provider-ready-hop.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let successor: ACPAgentSessionController? = if replaceController {
+            try ACPAgentSessionController(
+                provider: provider,
+                runRequest: ACPRunRequest(
+                    agentKind: .ohMyPi,
+                    modelString: nil,
+                    workspacePath: FileManager.default.currentDirectoryPath,
+                    resumeSessionID: nil,
+                    attachments: [],
+                    taskLabelKind: nil
+                )
+            )
+        } else {
+            nil
+        }
+        if let successor {
+            registerACPController(successor)
+        }
+        var bootstrapLease: MCPBootstrapLease?
+        var stoppedTrackingRunIDs: [UUID] = []
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testAfterOMPQualificationProviderInitializationCompleted: {
+                if let successor {
+                    session.acpController = successor
+                } else {
+                    session.agentTask?.cancel()
+                }
+            },
+            testOMPQualificationToolTrackingStopped: {
+                stoppedTrackingRunIDs.append($0)
+            },
+            testOMPQualificationLeaseCreated: {
+                bootstrapLease = $0
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "invalidate during provider ready publication",
+            initialMessageForRun: "invalidate during provider ready publication",
+            attachments: []
+        )
+
+        let oldRunID = try XCTUnwrap(session.runID)
+        let oldTask = session.agentTask
+        await oldTask?.value
+        XCTAssertFalse(
+            recordedOpenCodeFlowRequests(at: recordURL).contains(where: { $0.method == "session/prompt" })
+        )
+        try await waitUntilAsync("ready-hop invalidation must complete old-run teardown") {
+            let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+            return stoppedTrackingRunIDs == [oldRunID]
+                && cleanup?.hasReleased == true
+                && cleanup?.didCleanupRouting == true
+                && cleanup?.didClearPolicy == true
+        }
+        XCTAssertEqual(stoppedTrackingRunIDs, [oldRunID])
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+        if let successor {
+            XCTAssertTrue(session.acpController === successor)
+            XCTAssertTrue(session.runState.isActive)
+        } else {
+            XCTAssertEqual(session.runState, .cancelled)
+            XCTAssertNil(session.acpController)
+            XCTAssertNil(session.agentTask)
+        }
+    }
+
+    func testOhMyPiCancellationBeforePromptStartClaimPreventsPromptAndJoinsCleanup() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let recordDirectory = try makeTemporaryDirectory()
+        let recordURL = recordDirectory.appendingPathComponent("pre-prompt-claim.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var bootstrapLease: MCPBootstrapLease?
+        var stoppedTrackingRunIDs: [UUID] = []
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            autoSignalACPRouting: true,
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testBeforeOMPQualificationPromptStartClaim: {
+                session.agentTask?.cancel()
+            },
+            testOMPQualificationToolTrackingStopped: {
+                stoppedTrackingRunIDs.append($0)
+            },
+            testOMPQualificationLeaseCreated: { bootstrapLease = $0 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "cancel before prompt claim",
+            initialMessageForRun: "cancel before prompt claim",
+            attachments: []
+        )
+        let runID = try XCTUnwrap(session.runID)
+        let task = session.agentTask
+        await task?.value
+
+        XCTAssertFalse(
+            recordedOpenCodeFlowRequests(at: recordURL).contains(where: { $0.method == "session/prompt" })
+        )
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "attachments:deleteFiles" }), 1)
+        XCTAssertEqual(stoppedTrackingRunIDs, [runID])
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.acpController)
+        XCTAssertNil(session.agentTask)
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+        XCTAssertEqual(cleanup?.terminalCleanupRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRawRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRequestEntries, ["cancelAndCleanup"])
+    }
+
     func testAuthorizedOhMyPiProviderStartPreservesRunIDThroughDispatch() async throws {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
         var authorizedPair: (UUID, UUID)?
         var providerRunID: UUID?
-        var controllerRunID: UUID?
+        var providerBootstrapCount = 0
         let provider = LifecycleFakeACPProvider(
             providerID: .ohMyPi,
             commandPath: "/usr/bin/true",
@@ -138,14 +1013,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder.record("factory:acp-provider")
                 return provider
             },
-            acpControllerFactory: { _, _ in
-                controllerRunID = session.runID
-                recorder.record("factory:acp-controller")
-                throw LifecycleTestError.expectedACPDispatchStop
-            },
-            ompQualificationAuthorizer: { sessionID, runID in
-                authorizedPair = (sessionID, runID)
+            ompQualificationAuthorizer: { transaction, runID in
+                authorizedPair = (transaction.sessionID, runID)
                 return true
+            },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationProviderBootstrapEntry: {
+                providerBootstrapCount += 1
             }
         )
         harness.host.test_installLiveSession(session)
@@ -167,12 +1041,820 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             attachments: []
         )
 
+        try await waitUntil("OMP authorization should run at the provider launch boundary") {
+            authorizedPair != nil
+        }
         XCTAssertEqual(authorizedPair?.0, qualificationSessionID)
         XCTAssertNotNil(authorizedPair?.1)
         XCTAssertEqual(providerRunID, authorizedPair?.1)
-        XCTAssertEqual(controllerRunID, authorizedPair?.1)
         XCTAssertTrue(recorder.contains("factory:acp-provider"))
         XCTAssertTrue(recorder.contains("factory:acp-controller"))
+        XCTAssertEqual(providerBootstrapCount, 1)
+    }
+
+    func testOhMyPiWorkspaceSwitchAtProviderAuthorizationBoundaryPreventsLaunch() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let fingerprintedWorkspaceID = UUID()
+        let switchedWorkspaceID = UUID()
+        var activeWorkspaceID = fingerprintedWorkspaceID
+        var authorizationCalls = 0
+        var providerBootstrapCount = 0
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: fingerprintedWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in
+                authorizationCalls += 1
+                return true
+            },
+            ompQualificationActiveWorkspaceID: { activeWorkspaceID },
+            testBeforeOMPQualificationProviderAuthorization: {
+                activeWorkspaceID = switchedWorkspaceID
+            },
+            testOMPQualificationProviderBootstrapEntry: {
+                providerBootstrapCount += 1
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "reject switched workspace",
+            initialMessageForRun: "reject switched workspace",
+            attachments: []
+        )
+
+        try await waitUntil("Workspace mismatch should fail the provider-boundary start") {
+            !session.runState.isActive
+        }
+        XCTAssertEqual(activeWorkspaceID, switchedWorkspaceID)
+        XCTAssertEqual(authorizationCalls, 0)
+        XCTAssertEqual(providerBootstrapCount, 0)
+        XCTAssertEqual(session.runState, .failed)
+    }
+
+    func testOhMyPiMCPControlRebindAtProviderBoundaryDeniesBeforeBootstrap() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let replacementSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var authorizationCalls = 0
+        var bootstrapEntries = 0
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in
+                authorizationCalls += 1
+                return true
+            },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testBeforeOMPQualificationProviderAuthorization: {
+                guard let prior = session.mcpControlContext else {
+                    XCTFail("Expected installed MCP control context")
+                    return
+                }
+                session.mcpControlContext = .init(
+                    sessionID: replacementSessionID,
+                    activationID: UUID(),
+                    registration: prior.registration,
+                    currentEpoch: prior.currentEpoch,
+                    preparedEpoch: prior.preparedEpoch,
+                    pendingEpochTransition: prior.pendingEpochTransition,
+                    originatingConnectionID: prior.originatingConnectionID,
+                    interactionTransport: .mcp(
+                        sessionID: replacementSessionID,
+                        originatingConnectionID: prior.originatingConnectionID
+                    ),
+                    suppressUserNotifications: prior.suppressUserNotifications,
+                    forceAutoEditEnabled: prior.forceAutoEditEnabled,
+                    autoEditEnabledBeforeOverride: prior.autoEditEnabledBeforeOverride,
+                    taskLabelKind: prior.taskLabelKind
+                )
+            },
+            testOMPQualificationProviderBootstrapEntry: {
+                bootstrapEntries += 1
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "rebind control context",
+            initialMessageForRun: "rebind control context",
+            attachments: []
+        )
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(authorizationCalls, 0)
+        XCTAssertEqual(bootstrapEntries, 0)
+        XCTAssertEqual(session.mcpControlContext?.sessionID, replacementSessionID)
+        try await waitUntil("control rebind must terminalize stale startup") {
+            session.runState == .failed
+        }
+    }
+
+    func testOhMyPiSameSessionStartContextReplacementAtProviderBoundaryDeniesBootstrap() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let originalContext = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var replacementContext: OhMyPiAgentModeSmokeGate.StartContext?
+        var authorizationCalls = 0
+        var bootstrapEntries = 0
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in
+                authorizationCalls += 1
+                return true
+            },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testBeforeOMPQualificationProviderAuthorization: {
+                replacementContext = try? self.installOMPQualificationContext(
+                    on: session,
+                    sessionID: qualificationSessionID,
+                    workspaceID: qualificationWorkspaceID
+                )
+            },
+            testOMPQualificationProviderBootstrapEntry: { bootstrapEntries += 1 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "replace exact context",
+            initialMessageForRun: "replace exact context",
+            attachments: []
+        )
+        await session.agentTask?.value
+
+        let authorizationOutcome = await originalContext.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(authorizationCalls, 0)
+        XCTAssertEqual(bootstrapEntries, 0)
+        XCTAssertTrue(session.ompQualificationStartContext === replacementContext)
+    }
+
+    func testOhMyPiSameSessionContextReplacementBeforeServiceEntryDeniesOnlyInvocation() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let originalContext = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let replacementContext = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            ompQualificationInvocationContext: { _ in originalContext }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+        let originalRunState = session.runState
+        let originalItems = session.items
+        let originalRunID = session.runID
+        let originalAttemptID = session.activeRunAttemptID
+        let originalController = session.acpController
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "stale invocation context",
+            initialMessageForRun: "stale invocation context",
+            attachments: []
+        )
+
+        let originalOutcome = await originalContext.authorizationReceipt.wait()
+        XCTAssertEqual(originalOutcome, .denied)
+        let replacementAuthorization = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome.authorized(.init(
+            runID: UUID(),
+            activeAgentSessionID: UUID(),
+            runAttemptID: UUID()
+        ))
+        XCTAssertEqual(
+            replacementContext.authorizationReceipt.resolve(replacementAuthorization),
+            replacementAuthorization
+        )
+        XCTAssertTrue(session.ompQualificationStartContext === replacementContext)
+        XCTAssertEqual(session.runState, originalRunState)
+        XCTAssertEqual(session.items, originalItems)
+        XCTAssertEqual(session.runID, originalRunID)
+        XCTAssertEqual(session.activeRunAttemptID, originalAttemptID)
+        XCTAssertTrue(session.acpController === originalController)
+    }
+
+    func testOhMyPiClearedSuccessorContextBeforeServiceEntryDeniesOnlyStaleInvocation() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let originalContext = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let replacementContext = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let successorGenerationID = replacementContext.generationID
+        let successorRunID = UUID()
+        let successorAttemptID = UUID()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let successorController = try ACPAgentSessionController(
+            provider: provider,
+            runRequest: ACPRunRequest(
+                agentKind: .ohMyPi,
+                modelString: nil,
+                workspacePath: nil,
+                resumeSessionID: nil,
+                attachments: [],
+                taskLabelKind: nil
+            )
+        )
+        session.runID = successorRunID
+        session.runState = .running
+        _ = session.beginRunAttempt(source: "test.clearedSuccessor", attemptID: successorAttemptID)
+        session.acpController = successorController
+        session.ompQualificationStartContext = nil
+
+        let harness = makeHarness(
+            recorder: recorder,
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            ompQualificationInvocationContext: { _ in originalContext }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "stale invocation after successor commit",
+            initialMessageForRun: "stale invocation after successor commit",
+            attachments: []
+        )
+
+        let originalOutcome = await originalContext.authorizationReceipt.wait()
+        XCTAssertEqual(originalOutcome, .denied)
+        XCTAssertNil(session.ompQualificationStartContext)
+        XCTAssertEqual(session.mcpStartInvocationGenerationID, successorGenerationID)
+        XCTAssertEqual(session.runID, successorRunID)
+        XCTAssertEqual(session.activeRunAttemptID, successorAttemptID)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(session.acpController === successorController)
+        let replacementAuthorization = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome.authorized(.init(
+            runID: successorRunID,
+            activeAgentSessionID: qualificationSessionID,
+            runAttemptID: successorAttemptID
+        ))
+        XCTAssertEqual(
+            replacementContext.authorizationReceipt.resolve(replacementAuthorization),
+            replacementAuthorization
+        )
+        await successorController.shutdown()
+    }
+
+    func testOhMyPiCancellationAtAuthorizationBoundaryDeniesBeforeBootstrap() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var bootstrapEntries = 0
+        var bootstrapLease: MCPBootstrapLease?
+        var cancelledRunID: UUID?
+        var stoppedTrackingRunIDs: [UUID] = []
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testBeforeOMPQualificationProviderAuthorization: {
+                cancelledRunID = session.runID
+                session.agentTask?.cancel()
+            },
+            testOMPQualificationProviderBootstrapEntry: {
+                bootstrapEntries += 1
+            },
+            testOMPQualificationToolTrackingStopped: {
+                stoppedTrackingRunIDs.append($0)
+            },
+            testOMPQualificationLeaseCreated: {
+                bootstrapLease = $0
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "cancel at boundary",
+            initialMessageForRun: "cancel at boundary",
+            attachments: []
+        )
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(bootstrapEntries, 0)
+        try await waitUntil("cancelled boundary must finalize the exact attachment reservation") {
+            recorder.contains("attachments:deleteFiles")
+        }
+        let expectedCancelledRunID = try XCTUnwrap(cancelledRunID)
+        try await waitUntilAsync("authorization-boundary cancellation must finish exact-run teardown") {
+            let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+            return stoppedTrackingRunIDs == [expectedCancelledRunID]
+                && cleanup?.hasReleased == true
+                && cleanup?.didCleanupRouting == true
+                && cleanup?.didClearPolicy == true
+        }
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.acpController)
+        XCTAssertNil(session.agentTask)
+        XCTAssertEqual(stoppedTrackingRunIDs, [expectedCancelledRunID])
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+    }
+
+    func testOhMyPiDetachedControllerWithoutSuccessorCanonicalizesCancellation() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testBeforeOMPQualificationAuthorizationLivenessCheck: {
+                session.acpController = nil
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "detach controller",
+            initialMessageForRun: "detach controller",
+            attachments: []
+        )
+        await session.agentTask?.value
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.runID)
+        XCTAssertNil(session.agentTask)
+        XCTAssertNil(session.acpController)
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+    }
+
+    func testOhMyPiSupersededAttemptAtAuthorizationBoundaryDeniesBeforeBootstrap() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var bootstrapEntries = 0
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testBeforeOMPQualificationProviderAuthorization: {
+                if let ownership = session.activeRunOwnership {
+                    let teardown = session.claimRunAttemptTerminalTeardown(
+                        ownership: ownership,
+                        terminalState: .cancelled
+                    )
+                    Task { await teardown?() }
+                }
+                _ = session.beginRunAttempt(source: "test.supersedingAttempt")
+            },
+            testOMPQualificationProviderBootstrapEntry: {
+                bootstrapEntries += 1
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "supersede at boundary",
+            initialMessageForRun: "supersede at boundary",
+            attachments: []
+        )
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(bootstrapEntries, 0)
+    }
+
+    func testOhMyPiSessionLossAtAuthorizationBoundaryReleasesOwnedStartupResources() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let tabID = UUID()
+        var session: AgentModeViewModel.TabSession? = AgentModeViewModel.TabSession(tabID: tabID)
+        session?.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: XCTUnwrap(session),
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        weak var weakSession = session
+        let authorizationGate = LifecyclePublicationGate()
+        var bootstrapEntries = 0
+        var bootstrapLease: MCPBootstrapLease?
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationProviderBootstrapEntry: {
+                bootstrapEntries += 1
+            },
+            testBeforeOMPQualificationAuthorizationLivenessCheck: {
+                recorder.record("authorization-liveness-check")
+                await authorizationGate.wait()
+            },
+            testOMPQualificationLeaseCreated: {
+                bootstrapLease = $0
+            }
+        )
+        try harness.host.test_installLiveSession(XCTUnwrap(session))
+        _ = try harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: XCTUnwrap(session)
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        do {
+            let startedSession = try XCTUnwrap(session)
+            _ = await harness.service.startRun(
+                tabID: tabID,
+                session: startedSession,
+                initialUserMessage: "lose session at boundary",
+                initialMessageForRun: "lose session at boundary",
+                attachments: []
+            )
+        }
+        try await waitUntil("startup must pause before authorization liveness check") {
+            recorder.contains("authorization-liveness-check")
+        }
+        harness.host.test_removeLiveSession(tabID: tabID)
+        session = nil
+        await authorizationGate.release()
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(bootstrapEntries, 0)
+        try await waitUntil("removed session must deallocate") {
+            weakSession == nil
+        }
+        try await waitUntil("session loss must finalize abandoned startup resources") {
+            recorder.contains("attachments:abandoned")
+        }
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.hasReleased, true)
+        XCTAssertEqual(cleanup?.didCleanupRouting, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+        XCTAssertEqual(cleanup?.terminalCleanupRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRawRequestCount, 1)
+        XCTAssertEqual(cleanup?.terminalCleanupRequestEntries, ["cancelAndCleanup"])
+    }
+
+    func testOhMyPiDelayedBoundaryAuthorizationDeniesStaleTransactionAfterSameSessionReacquire() async throws {
+        let recorder = LifecycleRecorder()
+        let sessionID = UUID()
+        let workspaceID = UUID()
+        let ownerConnectionID = UUID()
+        let oldLease = try OhMyPiAgentModeSmokeGate.shared.acquire(
+            ownerConnectionID: ownerConnectionID,
+            ownerProcessID: getpid(),
+            duration: 60
+        )
+        let oldConsumption = try OhMyPiAgentModeSmokeGate.shared.consumeStartTransaction(
+            leaseID: oldLease.leaseID,
+            ownerConnectionID: ownerConnectionID,
+            ownerProcessID: getpid(),
+            sessionID: sessionID
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        session.ompQualificationStartContext = .init(
+            transaction: oldConsumption.transaction,
+            expectedWorkspaceID: workspaceID
+        )
+        var replacement: OhMyPiAgentModeSmokeGate.Snapshot?
+        var staleAuthorizationCalls = 0
+        var bootstrapEntries = 0
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationAuthorizer: { transaction, runID in
+                staleAuthorizationCalls += 1
+                return OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(
+                    transaction: transaction,
+                    runID: runID
+                )
+            },
+            ompQualificationActiveWorkspaceID: { workspaceID },
+            testBeforeOMPQualificationProviderAuthorization: {
+                OhMyPiAgentModeSmokeGate.shared.forceExpiryForTesting()
+                _ = OhMyPiAgentModeSmokeGate.shared.activeSnapshot()
+                do {
+                    let lease = try OhMyPiAgentModeSmokeGate.shared.acquire(
+                        ownerConnectionID: ownerConnectionID,
+                        ownerProcessID: getpid(),
+                        duration: 60
+                    )
+                    let consumption = try OhMyPiAgentModeSmokeGate.shared.consumeStartTransaction(
+                        leaseID: lease.leaseID,
+                        ownerConnectionID: ownerConnectionID,
+                        ownerProcessID: getpid(),
+                        sessionID: sessionID
+                    )
+                    let replacementRunID = UUID()
+                    XCTAssertTrue(OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(
+                        transaction: consumption.transaction,
+                        runID: replacementRunID
+                    ))
+                    replacement = try OhMyPiAgentModeSmokeGate.shared.bindRun(
+                        leaseID: lease.leaseID,
+                        ownerConnectionID: ownerConnectionID,
+                        sessionID: sessionID,
+                        runID: replacementRunID
+                    )
+                } catch {
+                    XCTFail("Could not install replacement transaction: \(error)")
+                }
+            },
+            testOMPQualificationProviderBootstrapEntry: {
+                bootstrapEntries += 1
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: ownerConnectionID
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "stale transaction",
+            initialMessageForRun: "stale transaction",
+            attachments: []
+        )
+
+        try await waitUntil("Stale transaction should be denied at the real runner boundary") {
+            !session.runState.isActive
+        }
+        XCTAssertEqual(staleAuthorizationCalls, 1)
+        XCTAssertEqual(bootstrapEntries, 0)
+        XCTAssertEqual(OhMyPiAgentModeSmokeGate.shared.activeSnapshot(), replacement)
+    }
+
+    func testHungOhMyPiBootstrapDoesNotRetainRemovedTabSession() async throws {
+        let recorder = LifecycleRecorder()
+        let workspaceID = UUID()
+        let controlSessionID = UUID()
+        let scriptURL = try makeHungACPBootstrapScript()
+        weak var weakSession: AgentModeViewModel.TabSession?
+        var bootstrapEntries = 0
+        var stoppedTrackingRunIDs: [UUID] = []
+
+        do {
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            weakSession = session
+            session.selectedAgent = .ohMyPi
+            _ = try installOMPQualificationContext(
+                on: session,
+                sessionID: controlSessionID,
+                workspaceID: workspaceID
+            )
+            let provider = LifecycleFakeACPProvider(
+                providerID: .ohMyPi,
+                commandPath: scriptURL.path,
+                recorder: recorder
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                acpProviderFactory: { _, _ in provider },
+                ompQualificationAuthorizer: { _, _ in true },
+                ompQualificationActiveWorkspaceID: { workspaceID },
+                testOMPQualificationProviderBootstrapEntry: {
+                    bootstrapEntries += 1
+                },
+                testOMPQualificationToolTrackingStopped: {
+                    stoppedTrackingRunIDs.append($0)
+                }
+            )
+            harness.host.test_installLiveSession(session)
+            _ = harness.host.test_installPersistentSessionBinding(
+                sessionID: controlSessionID,
+                on: session
+            )
+            try await harness.host.mcpActivateControlContext(
+                forTabID: session.tabID,
+                sessionID: controlSessionID,
+                originatingConnectionID: UUID()
+            )
+
+            _ = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "hung bootstrap",
+                initialMessageForRun: "hung bootstrap",
+                attachments: []
+            )
+            try await waitUntil("OMP provider should enter the hung bootstrap") {
+                bootstrapEntries == 1
+            }
+            session.agentTask?.cancel()
+            session.agentTask = nil
+            harness.host.test_removeLiveSession(tabID: session.tabID)
+        }
+
+        try await waitUntil("Hung provider task must not retain the removed tab session") {
+            weakSession == nil
+        }
+        try await waitUntil("Session-independent cleanup must stop removed-tab tool tracking") {
+            stoppedTrackingRunIDs.count == 1
+        }
     }
 
     func testDarkOhMyPiPersistedOrMCPConfiguredSelectionFailsBeforeProviderDispatch() async throws {
@@ -180,7 +1862,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
         var deniedAuthorization: (UUID, UUID)?
+        var bootstrapEntries = 0
         let provider = LifecycleFakeACPProvider(
             providerID: .ohMyPi,
             commandPath: "/usr/bin/true",
@@ -197,15 +1881,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 recorder.record("factory:acp-provider")
                 return provider
             },
-            acpControllerFactory: { _, _ in
-                recorder.record("factory:acp-controller")
-                throw LifecycleTestError.unexpectedACPControllerCreation
-            },
-            ompQualificationAuthorizer: { sessionID, runID in
-                deniedAuthorization = (sessionID, runID)
-                recorder.record("omp-authorization:\(sessionID.uuidString):\(runID.uuidString)")
+            ompQualificationAuthorizer: { transaction, runID in
+                deniedAuthorization = (transaction.sessionID, runID)
+                recorder.record("omp-authorization:\(transaction.sessionID.uuidString):\(runID.uuidString)")
                 return false
-            }
+            },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationProviderBootstrapEntry: { bootstrapEntries += 1 }
         )
         let persistedSelection = AgentModelCatalog.normalizePersistedSelection(
             agentRaw: AgentProviderKind.ohMyPi.rawValue,
@@ -217,6 +1899,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.hasLoadedPersistedState = true
         session.selectedAgent = persistedSelection.agent
         session.selectedModelRaw = persistedSelection.modelRaw
+        _ = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
         harness.host.test_installLiveSession(session)
         _ = harness.host.test_installPersistentSessionBinding(
             sessionID: qualificationSessionID,
@@ -244,18 +1931,23 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
 
         XCTAssertNil(outcome)
+        try await waitUntil("Denied OMP authorization should terminalize the run") {
+            !session.runState.isActive
+        }
         XCTAssertEqual(session.runState, .failed)
         XCTAssertNil(session.activeRunAttemptID)
         XCTAssertNil(session.agentTask)
         XCTAssertNil(session.acpController)
+        XCTAssertEqual(bootstrapEntries, 0)
         XCTAssertEqual(
             session.items.filter { $0.kind == .error }.map(\.text),
             ["Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session."]
         )
         XCTAssertEqual(deniedAuthorization?.0, qualificationSessionID)
         XCTAssertNotNil(deniedAuthorization?.1)
-        XCTAssertFalse(recorder.contains(prefix: "factory:"))
-        XCTAssertFalse(recorder.contains("provider:support"))
+        XCTAssertTrue(recorder.contains("factory:acp-provider"))
+        XCTAssertTrue(recorder.contains("factory:acp-controller"))
+        XCTAssertTrue(recorder.contains("provider:support"))
     }
 
     func testCodexRejectedSendOnlyEndsOwnershipCreatedByInvocation() async {
@@ -686,6 +2378,60 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    func testCursorMidPromptPublicationOnlyCancellationAllowsCleanupAndImmediateSuccessor() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let provider = try LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: makeFakeACPServerScript().path,
+            recorder: recorder
+        )
+        var leases: [MCPBootstrapLease] = []
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { _, _ in provider },
+            testOMPQualificationLeaseCreated: { leases.append($0) }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "cancel cursor prompt",
+            initialMessageForRun: "cancel cursor prompt",
+            attachments: []
+        )
+        try await waitUntil("Cursor prompt must enter its live turn") {
+            session.runState.isActive && session.acpController != nil && leases.count == 1
+        }
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalPublished
+        )
+
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "immediate successor",
+            initialMessageForRun: "immediate successor",
+            attachments: []
+        )
+        try await waitUntil("Immediate successor must acquire the bootstrap gate") {
+            leases.count == 2 && session.runState.isActive && session.acpController != nil
+        }
+        let firstCleanup = await leases[0].debugCleanupSnapshot()
+        XCTAssertEqual(firstCleanup.hasReleased, true)
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalTeardownCompleted
+        )
+    }
+
     func testCursorACPReusedSessionInstallsDeferredPolicyForFollowUpPrompt() async throws {
         let recorder = LifecycleRecorder()
         let workspace = try makeTemporaryDirectory()
@@ -881,6 +2627,191 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertFalse(Self.processIsRunning(processID))
         let remainsReusable = await controller.hasReusableSession
         XCTAssertFalse(remainsReusable)
+    }
+
+    func testAbandonedAttachmentFinalizerSurvivesViewModelAndSessionDeallocation() throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let storageRoot = AgentAttachmentStore.managedStorageRootURL(for: workspace)
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        let attachmentURL = storageRoot.appendingPathComponent("abandoned.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: attachmentURL)
+        let attachment = AgentImageAttachment(source: .localFile(path: attachmentURL.path))
+
+        var viewModel: AgentModeViewModel? = AgentModeViewModel(
+            testWindowID: 991,
+            testWorkspaceDirectory: workspace,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: recorder)
+            }
+        )
+        var session: AgentModeViewModel.TabSession? = .init(tabID: UUID())
+        weak var weakViewModel = viewModel
+        weak var weakSession = session
+        let finalizer = try XCTUnwrap(viewModel).test_abandonedAttachmentFinalizer()
+
+        session = nil
+        viewModel = nil
+        XCTAssertNil(weakSession)
+        XCTAssertNil(weakViewModel)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachmentURL.path))
+
+        finalizer([attachment])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentURL.path))
+    }
+
+    func testRetainedSessionDeletesAttachmentsAfterViewModelRelease() throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let storageRoot = AgentAttachmentStore.managedStorageRootURL(for: workspace)
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        let attachmentURL = storageRoot.appendingPathComponent("retained-session.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: attachmentURL)
+        let attachment = AgentImageAttachment(source: .localFile(path: attachmentURL.path))
+        let reservationID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.attachmentTurnState = .reserved(
+            reservationID: reservationID,
+            attachments: [attachment]
+        )
+
+        var viewModel: AgentModeViewModel? = AgentModeViewModel(
+            testWindowID: 992,
+            testWorkspaceDirectory: workspace,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: recorder)
+            }
+        )
+        weak var weakViewModel = viewModel
+        let finalizationHook = try XCTUnwrap(viewModel).test_attachmentFinalizationHook()
+
+        viewModel = nil
+        XCTAssertNil(weakViewModel)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachmentURL.path))
+
+        finalizationHook(session, reservationID, [attachment], .deleteFiles)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentURL.path))
+        XCTAssertEqual(session.attachmentTurnState, .idle)
+    }
+
+    func testReleasedViewModelStaleAttachmentFinalizationPreservesSuccessorReservation() throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let storageRoot = AgentAttachmentStore.managedStorageRootURL(for: workspace)
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        let staleURL = storageRoot.appendingPathComponent("stale-reservation.png")
+        let successorURL = storageRoot.appendingPathComponent("successor-reservation.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: staleURL)
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: successorURL)
+        let staleAttachment = AgentImageAttachment(source: .localFile(path: staleURL.path))
+        let successorAttachment = AgentImageAttachment(source: .localFile(path: successorURL.path))
+        let staleReservationID = UUID()
+        let successorReservationID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.attachmentTurnState = .consumed(
+            reservationID: successorReservationID,
+            attachments: [successorAttachment]
+        )
+        session.attachmentsPendingProviderConsumptionCleanup = [successorAttachment]
+
+        var viewModel: AgentModeViewModel? = AgentModeViewModel(
+            testWindowID: 993,
+            testWorkspaceDirectory: workspace,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: recorder)
+            }
+        )
+        weak var weakViewModel = viewModel
+        let finalizationHook = try XCTUnwrap(viewModel).test_attachmentFinalizationHook()
+
+        viewModel = nil
+        XCTAssertNil(weakViewModel)
+
+        finalizationHook(
+            session,
+            staleReservationID,
+            [staleAttachment],
+            .deleteFiles
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staleURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: successorURL.path))
+        XCTAssertEqual(
+            session.attachmentTurnState,
+            .consumed(
+                reservationID: successorReservationID,
+                attachments: [successorAttachment]
+            )
+        )
+        XCTAssertEqual(
+            session.attachmentsPendingProviderConsumptionCleanup,
+            [successorAttachment]
+        )
+    }
+
+    func testReleasedViewModelNilReservationFinalizationPreservesReservedSuccessor() throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let storageRoot = AgentAttachmentStore.managedStorageRootURL(for: workspace)
+        try FileManager.default.createDirectory(at: storageRoot, withIntermediateDirectories: true)
+        let staleURL = storageRoot.appendingPathComponent("nil-reservation-stale.png")
+        let successorURL = storageRoot.appendingPathComponent("nil-reservation-successor.png")
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: staleURL)
+        try Data([0x89, 0x50, 0x4E, 0x47]).write(to: successorURL)
+        let staleAttachment = AgentImageAttachment(source: .localFile(path: staleURL.path))
+        let successorAttachment = AgentImageAttachment(source: .localFile(path: successorURL.path))
+        let successorReservationID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.attachmentTurnState = .reserved(
+            reservationID: successorReservationID,
+            attachments: [successorAttachment]
+        )
+        session.attachmentsPendingProviderConsumptionCleanup = [successorAttachment]
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.nilReservationAttachmentCapture")
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .cancelled,
+            source: "test.nilReservationAttachmentCapture",
+            attachmentReservationID: nil,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        )
+        XCTAssertTrue(request.capturedAttachments.isEmpty)
+
+        var viewModel: AgentModeViewModel? = AgentModeViewModel(
+            testWindowID: 994,
+            testWorkspaceDirectory: workspace,
+            codexControllerFactory: { _, _, _, _, _, _ in
+                LifecycleNoopCodexController(recorder: recorder)
+            }
+        )
+        weak var weakViewModel = viewModel
+        let finalizationHook = try XCTUnwrap(viewModel).test_attachmentFinalizationHook()
+        viewModel = nil
+        XCTAssertNil(weakViewModel)
+
+        finalizationHook(session, nil, [staleAttachment], .deleteFiles)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staleURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: successorURL.path))
+        XCTAssertEqual(
+            session.attachmentTurnState,
+            .reserved(
+                reservationID: successorReservationID,
+                attachments: [successorAttachment]
+            )
+        )
+        XCTAssertEqual(
+            session.attachmentsPendingProviderConsumptionCleanup,
+            [successorAttachment]
+        )
     }
 
     func testWindowCloseShutsDownRetainedACPController() async throws {
@@ -1371,6 +3302,111 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testCursorTerminalPublishedCancellationDoesNotJoinHungACPBootstrapTeardown() async throws {
+        let recorder = LifecycleRecorder()
+        let teardownGate = LifecyclePublicationGate()
+        let harness = makeHarness(recorder: recorder)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        session.runState = .running
+        session.runID = UUID()
+        let ownership = session.beginRunAttempt(source: "test.hungCursorBootstrapTeardown")
+        session.installRunAttemptTerminalResources(ownership: ownership) { _ in
+            {
+                recorder.record("cursor-bootstrap-teardown:start")
+                await teardownGate.wait()
+                recorder.record("cursor-bootstrap-teardown:finish")
+            }
+        }
+
+        try await withLifecycleTimeout("Cursor publication-only hung bootstrap cancellation", timeoutSeconds: 0.2) {
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                completion: .terminalPublished
+            )
+        }
+
+        XCTAssertEqual(session.runState, .cancelled)
+        try await waitUntil("Cursor bootstrap teardown should start asynchronously") {
+            recorder.contains("cursor-bootstrap-teardown:start")
+        }
+        XCTAssertFalse(recorder.contains("cursor-bootstrap-teardown:finish"))
+
+        await teardownGate.release()
+        try await waitUntil("Cursor bootstrap teardown should finish after release") {
+            recorder.contains("cursor-bootstrap-teardown:finish")
+        }
+    }
+
+    func testOhMyPiQualificationPublicationOnlyCancellationJoinsUnreleasedStartupLeaseTeardown() async throws {
+        let recorder = LifecycleRecorder()
+        let teardownGate = LifecyclePublicationGate()
+        let harness = makeHarness(recorder: recorder)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        session.runState = .running
+        let runID = UUID()
+        session.runID = runID
+        let ownership = session.beginRunAttempt(source: "test.ompQualificationJoinedTeardown")
+        let lease = MCPBootstrapLease(
+            spec: MCPBootstrapLeaseSpec(
+                runID: runID,
+                gateID: UUID(),
+                windowID: 1,
+                tabID: session.tabID,
+                clientName: "omp-qualification-joined-teardown-test",
+                restrictedTools: [],
+                additionalTools: nil,
+                oneShot: true,
+                reason: "qualification joined teardown regression",
+                ttl: 10,
+                purpose: .agentModeRun,
+                taskLabelKind: nil,
+                allowsAgentExternalControlTools: false,
+                requiresExpectedAgentPID: true
+            ),
+            policyInstaller: { _ in },
+            expectedPIDPolicyArmer: { _ in true },
+            policyClearer: { _ in }
+        )
+        session.ompQualificationStartupLease = lease
+        session.installRunAttemptTerminalResources(ownership: ownership) { _ in
+            {
+                recorder.record("omp-qualification-teardown:start")
+                await teardownGate.wait()
+                await lease.cancelAndCleanup()
+                recorder.record("omp-qualification-teardown:finish")
+            }
+        }
+
+        let cancelTask = Task {
+            await harness.service.cancelRun(
+                tabID: session.tabID,
+                session: session,
+                completion: .terminalPublished
+            )
+            recorder.record("omp-qualification-cancel:return")
+        }
+        try await waitUntil("OMP qualification teardown should start after publication") {
+            recorder.contains(prefix: "commit:")
+                && recorder.contains("omp-qualification-teardown:start")
+        }
+        XCTAssertFalse(recorder.contains("omp-qualification-cancel:return"))
+
+        await teardownGate.release()
+        try await withLifecycleTimeout("OMP qualification joined teardown return") {
+            await cancelTask.value
+        }
+
+        XCTAssertTrue(recorder.contains("omp-qualification-teardown:finish"))
+        XCTAssertTrue(recorder.contains("omp-qualification-cancel:return"))
+        let cleanup = await lease.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup.terminalCleanupRequestCount, 1)
+        XCTAssertEqual(cleanup.terminalCleanupRawRequestCount, 1)
+        XCTAssertEqual(cleanup.terminalCleanupRequestEntries, ["cancelAndCleanup"])
+    }
+
     func testCancellationCanAwaitTrackedTerminalTeardownCompletion() async throws {
         let recorder = LifecycleRecorder()
         let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
@@ -1728,6 +3764,35 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    @discardableResult
+    private func installOMPQualificationContext(
+        on session: AgentModeViewModel.TabSession,
+        sessionID: UUID,
+        workspaceID: UUID,
+        authorizationDeadlineUptimeNanoseconds: UInt64? = nil
+    ) throws -> OhMyPiAgentModeSmokeGate.StartContext {
+        let gate = OhMyPiAgentModeSmokeGate(notificationCenter: NotificationCenter())
+        let ownerConnectionID = UUID()
+        let lease = try gate.acquire(
+            ownerConnectionID: ownerConnectionID,
+            ownerProcessID: getpid(),
+            duration: 60
+        )
+        let consumption = try gate.consumeStartTransaction(
+            leaseID: lease.leaseID,
+            ownerConnectionID: ownerConnectionID,
+            ownerProcessID: getpid(),
+            sessionID: sessionID
+        )
+        let context = OhMyPiAgentModeSmokeGate.StartContext(
+            transaction: consumption.transaction,
+            expectedWorkspaceID: workspaceID,
+            authorizationDeadlineUptimeNanoseconds: authorizationDeadlineUptimeNanoseconds
+        )
+        session.ompQualificationStartContext = context
+        return context
+    }
+
     func makeHarness(
         recorder: LifecycleRecorder,
         workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String? = { _ in FileManager.default.currentDirectoryPath },
@@ -1743,7 +3808,20 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
         autoSignalACPRouting: Bool = false,
-        ompQualificationAuthorizer: @escaping (UUID, UUID) -> Bool = { _, _ in false }
+        ompQualificationAuthorizer: @escaping (OhMyPiAgentModeSmokeGate.StartTransaction, UUID) -> Bool = { _, _ in false },
+        ompQualificationActiveWorkspaceID: @escaping () -> UUID? = { nil },
+        ompQualificationInvocationContext: ((AgentModeViewModel.TabSession) -> OhMyPiAgentModeSmokeGate.StartContext?)? = nil,
+        testBeforeOMPQualificationProviderAuthorization: @escaping () -> Void = {},
+        testOMPQualificationProviderBootstrapEntry: @escaping () -> Void = {},
+        testBeforeOMPQualificationAgentTaskEntry: @escaping () async -> Void = {},
+        testDuringOMPQualificationExpectedMCPRunIDSet: (() async -> Void)? = nil,
+        testBeforeOMPQualificationAuthorizationLivenessCheck: @escaping () async -> Void = {},
+        testAfterOMPQualificationProviderBootstrap: @escaping () async -> Void = {},
+        testAfterOMPQualificationProviderInitializationCompleted: @escaping () async -> Void = {},
+        testBeforeOMPQualificationPromptStartClaim: @escaping () async -> Void = {},
+        testBeforeOMPQualificationGenericStartupFailureTeardown: @escaping () async -> Void = {},
+        testOMPQualificationToolTrackingStopped: @escaping (UUID) -> Void = { _ in },
+        testOMPQualificationLeaseCreated: @escaping (MCPBootstrapLease) -> Void = { _ in }
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let claudeController = claudeController ?? LifecycleFakeNativeController(recorder: recorder)
@@ -1806,7 +3884,22 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             awaitNoActiveMCPTools: idleWaiter,
             activeAgentRunWaitQuery: { _ in false },
             childAgentRunWaitDrainTimeoutSeconds: 0.01,
-            ompQualificationAuthorizer: ompQualificationAuthorizer
+            ompQualificationAuthorizer: ompQualificationAuthorizer,
+            ompQualificationActiveWorkspaceID: ompQualificationActiveWorkspaceID,
+            ompQualificationInvocationContext: ompQualificationInvocationContext ?? { $0.ompQualificationStartContext },
+            testBeforeOMPQualificationProviderAuthorization: testBeforeOMPQualificationProviderAuthorization,
+            testOMPQualificationProviderBootstrapEntry: testOMPQualificationProviderBootstrapEntry,
+            ompQualificationStartupProbes: .init(
+                beforeAgentTaskEntry: testBeforeOMPQualificationAgentTaskEntry,
+                duringExpectedMCPRunIDSet: testDuringOMPQualificationExpectedMCPRunIDSet,
+                beforeAuthorizationLivenessCheck: testBeforeOMPQualificationAuthorizationLivenessCheck,
+                afterProviderBootstrap: testAfterOMPQualificationProviderBootstrap,
+                afterProviderInitializationCompleted: testAfterOMPQualificationProviderInitializationCompleted,
+                beforePromptStartClaim: testBeforeOMPQualificationPromptStartClaim,
+                beforeGenericStartupFailureTeardown: testBeforeOMPQualificationGenericStartupFailureTeardown,
+                toolTrackingStopped: testOMPQualificationToolTrackingStopped
+            ),
+            testOMPQualificationLeaseCreated: testOMPQualificationLeaseCreated
         )
         return LifecycleHarness(
             service: AgentModeRunService(
@@ -1855,7 +3948,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             markAttachmentsConsumed: { _, _ in },
             stageConsumedAttachmentFilesForDeferredCleanup: { _, _ in },
             consumeDeferredAttachmentCleanup: { _, _ in },
-            finalizeAttachmentsForTurn: { _, _, disposition in recorder.record("attachments:\(disposition)") },
+            finalizeAttachmentsForTurn: { _, _, _, disposition in recorder.record("attachments:\(disposition)") },
+            finalizeAbandonedAttachmentsForTurn: { _ in recorder.record("attachments:abandoned") },
             setAgentRunActive: { _, isActive in recorder.record("run-active:\(isActive)") },
             updateBindings: { _ in recorder.record("bindings") },
             requestUIRefresh: { _, _ in },
@@ -2185,6 +4279,20 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         return scriptURL
     }
 
+    private func makeHungACPBootstrapScript() throws -> URL {
+        let directory = try makeTemporaryDirectory()
+        let scriptURL = directory.appendingPathComponent("hung_acp_bootstrap.py")
+        let script = #"""
+        #!/usr/bin/env python3
+        import sys
+        for _ in sys.stdin:
+            pass
+        """#
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
     private func withACPController(
         _ controller: ACPAgentSessionController,
         operation: (ACPAgentSessionController) async throws -> Void
@@ -2284,6 +4392,17 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         throw LifecycleTimeoutError(operation: message, timeoutSeconds: 0.5)
+    }
+
+    private func waitUntilAsync(
+        _ message: String,
+        condition: @escaping @MainActor () async -> Bool
+    ) async throws {
+        for _ in 0 ..< 2000 {
+            if await condition() { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        throw LifecycleTimeoutError(operation: message, timeoutSeconds: 2)
     }
 
     func assertOrderedEvents(
@@ -2620,7 +4739,8 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
-        ACPLaunchConfiguration(
+        recorder?.record("provider:launch-configuration")
+        return ACPLaunchConfiguration(
             providerID: providerID,
             command: commandPath,
             arguments: [],
@@ -2635,7 +4755,8 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
         for request: ACPRunRequest,
         mcpServer: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
-        ACPSessionConfiguration(
+        recorder?.record("provider:session-configuration")
+        return ACPSessionConfiguration(
             mode: .new,
             workingDirectory: request.workspacePath ?? FileManager.default.temporaryDirectory.path,
             mcpServers: []

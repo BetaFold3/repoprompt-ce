@@ -736,10 +736,14 @@ import XCTest
             let manager = ServerNetworkManager()
             let connectionID = UUID()
             let helperPeerPID = 4242
+            let helperPeerStartSeconds: Int64 = 1_700_004_242
+            let helperPeerStartMicroseconds: Int32 = 424_242
             await manager.test_installQualificationTeardownConnection(
                 AdmissionEvictionTestConnection(idleSeconds: 0),
                 connectionID: connectionID,
-                helperPeerPID: helperPeerPID
+                helperPeerPID: helperPeerPID,
+                helperPeerStartSeconds: helperPeerStartSeconds,
+                helperPeerStartMicroseconds: helperPeerStartMicroseconds
             )
             await manager.debugRecordQualificationRawIngressForTesting(
                 connectionID: connectionID,
@@ -757,6 +761,8 @@ import XCTest
             let events = try XCTUnwrap(payload["events"] as? [[String: Any]])
             let removed = try XCTUnwrap(events.first { $0["event"] as? String == "removed" })
             XCTAssertEqual(removed["helper_peer_pid"] as? Int, helperPeerPID)
+            XCTAssertEqual(removed["helper_peer_start_seconds"] as? Int64, helperPeerStartSeconds)
+            XCTAssertEqual(removed["helper_peer_start_microseconds"] as? Int32, helperPeerStartMicroseconds)
             XCTAssertEqual(removed["qualification_raw_tool_call_count"] as? Int, 1)
             XCTAssertEqual(removed["qualification_raw_in_flight_call_count"] as? Int, 0)
             XCTAssertEqual(removed["qualification_raw_tool_names"] as? [String], ["set_status"])

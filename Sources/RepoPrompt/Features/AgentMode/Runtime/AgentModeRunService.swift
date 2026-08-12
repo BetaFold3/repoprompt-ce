@@ -27,9 +27,19 @@ final class AgentModeRunService {
         /// Bounded wait for child `agent_run.wait` scopes to drain before Claude native interrupt.
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
         #if DEBUG
-            var ompQualificationAuthorizer: (UUID, UUID) -> Bool = {
-                OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(sessionID: $0, runID: $1)
+            var ompQualificationAuthorizer: (OhMyPiAgentModeSmokeGate.StartTransaction, UUID) -> Bool = {
+                OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(transaction: $0, runID: $1)
             }
+
+            var ompQualificationActiveWorkspaceID: () -> UUID? = { nil }
+            var ompQualificationInvocationContext: (AgentModeViewModel.TabSession) -> OhMyPiAgentModeSmokeGate.StartContext? = { _ in
+                OhMyPiAgentModeSmokeGate.invocationStartContext
+            }
+
+            var testBeforeOMPQualificationProviderAuthorization: () -> Void = {}
+            var testOMPQualificationProviderBootstrapEntry: () -> Void = {}
+            var ompQualificationStartupProbes = ACPIntegratedAgentModeRunner.OMPQualificationStartupProbes()
+            var testOMPQualificationLeaseCreated: (MCPBootstrapLease) -> Void = { _ in }
         #endif
     }
 
@@ -61,7 +71,13 @@ final class AgentModeRunService {
         let markAttachmentsConsumed: (AgentModeViewModel.TabSession, UUID?) -> Void
         let stageConsumedAttachmentFilesForDeferredCleanup: ([AgentImageAttachment], AgentModeViewModel.TabSession) -> Void
         let consumeDeferredAttachmentCleanup: (AgentModeViewModel.TabSession, Bool) -> Void
-        let finalizeAttachmentsForTurn: (AgentModeViewModel.TabSession, UUID?, AgentModeViewModel.AttachmentTurnDisposition) -> Void
+        let finalizeAttachmentsForTurn: (
+            AgentModeViewModel.TabSession,
+            UUID?,
+            [AgentImageAttachment],
+            AgentModeViewModel.AttachmentTurnDisposition
+        ) -> Void
+        let finalizeAbandonedAttachmentsForTurn: ([AgentImageAttachment]) -> Void
         let setAgentRunActive: (UUID, Bool) -> Void
         let updateBindings: (AgentModeViewModel.TabSession) -> Void
         let requestUIRefresh: (UUID, Bool) -> Void
@@ -113,6 +129,17 @@ final class AgentModeRunService {
 
     private let dependencies: Dependencies
     private let hooks: Hooks
+
+    #if DEBUG
+        func test_attachmentFinalizationHook() -> (
+            AgentModeViewModel.TabSession,
+            UUID?,
+            [AgentImageAttachment],
+            AgentModeViewModel.AttachmentTurnDisposition
+        ) -> Void {
+            hooks.finalizeAttachmentsForTurn
+        }
+    #endif
     private let headlessRunner: HeadlessAgentModeRunner
     private let codexRunner: CodexIntegratedAgentModeRunner
     private let claudeRunner: ClaudeIntegratedAgentModeRunner
@@ -160,6 +187,9 @@ final class AgentModeRunService {
             providerFactory: dependencies.acpProviderFactory,
             controllerFactory: dependencies.acpControllerFactory
         )
+        #if DEBUG
+            acpRunner.installOMPQualificationStartupProbes(dependencies.ompQualificationStartupProbes)
+        #endif
     }
 
     @discardableResult
@@ -173,10 +203,39 @@ final class AgentModeRunService {
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         let selectedAgent = session.selectedAgent
+        #if DEBUG
+            let ompQualificationStartContext = session.ompQualificationStartContext
+            let invocationOMPQualificationStartContext = dependencies.ompQualificationInvocationContext(session)
+            var ompQualificationBoundaryHandedOff = false
+            defer {
+                if selectedAgent == .ohMyPi, !ompQualificationBoundaryHandedOff {
+                    invocationOMPQualificationStartContext?.authorizationReceipt.resolve(.denied)
+                }
+            }
+        #endif
         if selectedAgent == .ohMyPi {
             #if DEBUG
-                guard session.mcpControlContext?.sessionID != nil else {
-                    let message = "Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session."
+                if let invocationOMPQualificationStartContext,
+                   session.mcpStartInvocationGenerationID != invocationOMPQualificationStartContext.generationID
+                {
+                    invocationOMPQualificationStartContext.authorizationReceipt.resolve(.denied)
+                    return nil
+                }
+                guard let ompQualificationStartContext,
+                      let invocationOMPQualificationStartContext
+                else {
+                    let message = "Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session and its current workspace."
+                    await failBeforeProviderStartup(session: session, message: message)
+                    return nil
+                }
+                guard ompQualificationStartContext === invocationOMPQualificationStartContext else {
+                    invocationOMPQualificationStartContext.authorizationReceipt.resolve(.denied)
+                    return nil
+                }
+                guard session.mcpControlContext?.sessionID == ompQualificationStartContext.transaction.sessionID,
+                      dependencies.ompQualificationActiveWorkspaceID() == ompQualificationStartContext.expectedWorkspaceID
+                else {
+                    let message = "Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session and its current workspace."
                     await failBeforeProviderStartup(session: session, message: message)
                     return nil
                 }
@@ -249,12 +308,16 @@ final class AgentModeRunService {
                 taskLabelKind: taskLabelKind,
                 allowsAgentExternalControlTools: allowsAgentExternalControlTools
             )
-            return MCPBootstrapLease(
+            let lease = MCPBootstrapLease(
                 spec: leaseSpec,
                 mcpServerEnabler: mcpServerEnabler,
                 policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
                 expectedPIDPolicyArmer: expectedPIDPolicyArmer
             )
+            #if DEBUG
+                self.dependencies.testOMPQualificationLeaseCreated(lease)
+            #endif
+            return lease
         }
         if selectedAgent.usesClaudeNativeRuntime {
             await claudeRunner.startRun(
@@ -268,15 +331,58 @@ final class AgentModeRunService {
             return nil
         }
         if let acpRunRequest {
-            let providerStartAuthorizer: (UUID) -> Bool = { runID in
-                guard selectedAgent == .ohMyPi else { return true }
-                #if DEBUG
-                    guard let sessionID = session.mcpControlContext?.sessionID else { return false }
-                    return self.dependencies.ompQualificationAuthorizer(sessionID, runID)
-                #else
-                    return false
-                #endif
-            }
+            #if DEBUG
+                let ompQualificationActiveWorkspaceID = dependencies.ompQualificationActiveWorkspaceID
+                let ompQualificationAuthorizer = dependencies.ompQualificationAuthorizer
+                let testBeforeOMPQualificationProviderAuthorization = dependencies.testBeforeOMPQualificationProviderAuthorization
+                let providerStartBootstrapObserver = dependencies.testOMPQualificationProviderBootstrapEntry
+                let providerStartAuthorizer: (UUID) -> Bool = { [weak session] runID in
+                    guard selectedAgent == .ohMyPi else { return true }
+                    testBeforeOMPQualificationProviderAuthorization()
+                    guard let session,
+                          let ompQualificationStartContext,
+                          let invocationOMPQualificationStartContext,
+                          session.mcpStartInvocationGenerationID == invocationOMPQualificationStartContext.generationID,
+                          session.ompQualificationStartContext === invocationOMPQualificationStartContext,
+                          ompQualificationStartContext === invocationOMPQualificationStartContext,
+                          session.mcpControlContext?.sessionID == ompQualificationStartContext.transaction.sessionID,
+                          ompQualificationActiveWorkspaceID() == ompQualificationStartContext.expectedWorkspaceID,
+                          ompQualificationStartContext.authorizationReceipt.authorizationStillPermitted
+                    else {
+                        ompQualificationStartContext?.authorizationReceipt.resolve(.denied)
+                        return false
+                    }
+                    return ompQualificationAuthorizer(ompQualificationStartContext.transaction, runID)
+                }
+                let providerStartBoundaryReporter: (
+                    _ runID: UUID?,
+                    _ activeAgentSessionID: UUID?,
+                    _ runAttemptID: UUID?,
+                    _ authorized: Bool
+                ) -> Bool = { runID, activeAgentSessionID, runAttemptID, authorized in
+                    guard selectedAgent == .ohMyPi else { return true }
+                    guard let context = ompQualificationStartContext else { return false }
+                    let proposedOutcome: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome = if authorized, let runID {
+                        .authorized(.init(
+                            runID: runID,
+                            activeAgentSessionID: activeAgentSessionID,
+                            runAttemptID: runAttemptID
+                        ))
+                    } else {
+                        .denied
+                    }
+                    return context.authorizationReceipt.resolve(proposedOutcome) == proposedOutcome
+                }
+            #else
+                let providerStartAuthorizer: (UUID) -> Bool = { _ in selectedAgent != .ohMyPi }
+                let providerStartBoundaryReporter: (UUID?, UUID?, UUID?, Bool) -> Bool = { _, _, _, _ in true }
+                let providerStartBootstrapObserver: () -> Void = {}
+            #endif
+            #if DEBUG
+                if selectedAgent == .ohMyPi {
+                    ompQualificationBoundaryHandedOff = true
+                }
+            #endif
             await acpRunner.startRun(
                 tabID: tabID,
                 session: session,
@@ -285,7 +391,9 @@ final class AgentModeRunService {
                 attachments: attachments,
                 runRequest: acpRunRequest,
                 makeLease: makeLease,
-                providerStartAuthorizer: providerStartAuthorizer
+                providerStartAuthorizer: providerStartAuthorizer,
+                providerStartBoundaryReporter: providerStartBoundaryReporter,
+                providerStartBootstrapObserver: providerStartBootstrapObserver
             )
             return nil
         }
@@ -1060,6 +1168,22 @@ final class AgentModeRunService {
         let provider = session.provider
         let acpController = session.acpController
         let hasAttemptTerminalResources = session.runAttemptTerminalResources?.ownership == ownership
+        #if DEBUG
+            var shouldJoinOMPQualificationStartupTeardown = false
+            if completion == .terminalPublished,
+               session.selectedAgent == .ohMyPi,
+               hasAttemptTerminalResources,
+               let startupLease = session.ompQualificationStartupLease
+            {
+                let startupLeaseWasReleased = await startupLease.debugCleanupSnapshot().hasReleased
+                shouldJoinOMPQualificationStartupTeardown = !startupLeaseWasReleased
+            }
+            let effectiveCompletion: CancellationCompletion = shouldJoinOMPQualificationStartupTeardown
+                ? .terminalTeardownCompleted
+                : completion
+        #else
+            let effectiveCompletion = completion
+        #endif
         let codexCancellationTarget = session.selectedAgent == .codexExec
             ? dependencies.codexCoordinator.captureCodexCancellationTarget(
                 session,
@@ -1078,7 +1202,7 @@ final class AgentModeRunService {
             expectedRunID: expectedRunID,
             terminalState: .cancelled,
             source: "runService.cancel",
-            completion: completion,
+            completion: effectiveCompletion,
             attachmentDisposition: session.selectedAgent == .codexExec ? .restoreToPending : .deleteFiles,
             finalizeNonCodexUsage: session.selectedAgent != .codexExec,
             supportsFollowUp: false,

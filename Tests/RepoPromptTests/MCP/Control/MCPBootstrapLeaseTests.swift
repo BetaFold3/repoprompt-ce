@@ -268,6 +268,14 @@ final class MCPBootstrapLeaseTests: XCTestCase {
             let activeProbeID = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
             XCTAssertTrue(didAcquireProbe)
             XCTAssertEqual(activeProbeID, probeGateID)
+
+            await lease.failAndCleanup()
+            let activeProbeAfterFailedAcquireCleanup = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertEqual(
+                activeProbeAfterFailedAcquireCleanup,
+                probeGateID,
+                "Cleanup after a failed acquire must not release another holder"
+            )
             await HeadlessAgentConnectionGate.completeConnection(probeGateID)
             await MCPRoutingWaiter.cleanup(runID: runID)
         #else

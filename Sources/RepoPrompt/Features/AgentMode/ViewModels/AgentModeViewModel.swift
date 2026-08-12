@@ -752,6 +752,15 @@ final class AgentModeViewModel: ObservableObject {
             _ = runService
         }
 
+        func test_attachmentFinalizationHook() -> (
+            TabSession,
+            UUID?,
+            [AgentImageAttachment],
+            AttachmentTurnDisposition
+        ) -> Void {
+            runService.test_attachmentFinalizationHook()
+        }
+
         var test_isCursorModelPollingActive: Bool {
             cursorModelsSubscriptionTask != nil
         }
@@ -826,6 +835,10 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_installLiveSession(_ session: TabSession) {
             sessions[session.tabID] = session
+        }
+
+        func test_removeLiveSession(tabID: UUID) {
+            sessions.removeValue(forKey: tabID)
         }
 
         func test_setProvisionalClaudeConfiguredContextWindow(
@@ -2584,7 +2597,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func makeRunService() -> AgentModeRunService {
-        let dependencies = AgentModeRunService.Dependencies(
+        let baseDependencies = AgentModeRunService.Dependencies(
             windowID: windowID,
             headlessProviderFactory: headlessProviderFactory,
             acpProviderFactory: acpProviderFactory,
@@ -2626,6 +2639,18 @@ final class AgentModeViewModel: ObservableObject {
             },
             childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
         )
+        #if DEBUG
+            var dependencies = baseDependencies
+            dependencies.ompQualificationActiveWorkspaceID = { [weak self] in
+                self?.workspaceManager?.activeWorkspace?.id
+            }
+        #else
+            let dependencies = baseDependencies
+        #endif
+        let finalizeAbandonedAttachments = AgentAttachmentStore.abandonedAttachmentFinalizer(
+            clearConsumedAttachments: clearConsumedAttachmentsAfterProviderConsumption,
+            workspaceDirectoryProvider: attachmentWorkspaceDirectoryProvider
+        )
         let hooks = AgentModeRunService.Hooks(
             estimateRuntimeTokens: { text in
                 Self.estimateRuntimeTokens(for: text)
@@ -2648,9 +2673,49 @@ final class AgentModeViewModel: ObservableObject {
             consumeDeferredAttachmentCleanup: { [weak self] session, shouldDeleteFiles in
                 self?.consumeDeferredAttachmentCleanup(for: session, shouldDeleteFiles: shouldDeleteFiles)
             },
-            finalizeAttachmentsForTurn: { [weak self] session, reservationID, disposition in
-                self?.finalizeAttachmentsForTurn(for: session, reservationID: reservationID, disposition: disposition)
+            finalizeAttachmentsForTurn: { [weak self] session, reservationID, capturedAttachments, disposition in
+                guard let reservationID else {
+                    if disposition == .deleteFiles {
+                        finalizeAbandonedAttachments(capturedAttachments)
+                    }
+                    return
+                }
+                let ownsReservation = switch session.attachmentTurnState {
+                case .idle:
+                    false
+                case let .reserved(storedID, _),
+                     let .consumed(storedID, _):
+                    reservationID == storedID
+                }
+                guard ownsReservation else {
+                    if disposition == .deleteFiles {
+                        finalizeAbandonedAttachments(capturedAttachments)
+                    }
+                    return
+                }
+                if let self {
+                    finalizeAttachmentsForTurn(
+                        for: session,
+                        reservationID: reservationID,
+                        disposition: disposition
+                    )
+                    return
+                }
+                guard disposition == .deleteFiles else { return }
+                var abandoned = capturedAttachments
+                switch session.attachmentTurnState {
+                case .idle:
+                    break
+                case let .reserved(_, attachments),
+                     let .consumed(_, attachments):
+                    abandoned.append(contentsOf: attachments)
+                }
+                abandoned.append(contentsOf: session.attachmentsPendingProviderConsumptionCleanup)
+                session.attachmentsPendingProviderConsumptionCleanup.removeAll()
+                session.attachmentTurnState = .idle
+                finalizeAbandonedAttachments(abandoned)
             },
+            finalizeAbandonedAttachmentsForTurn: finalizeAbandonedAttachments,
             setAgentRunActive: { [weak self] tabID, isActive in
                 self?.setAgentRunActive(tabID, isActive: isActive)
             },
@@ -7185,6 +7250,7 @@ final class AgentModeViewModel: ObservableObject {
         return identities(source) == identities(target)
     }
 
+    @discardableResult
     func mcpActivateControlContext(
         forTabID tabID: UUID,
         sessionID: UUID,
@@ -7194,7 +7260,7 @@ final class AgentModeViewModel: ObservableObject {
         startPending: Bool = false,
         markSessionAsMCPOriginated: Bool = true,
         requireInactiveRunState: Bool = false
-    ) async throws {
+    ) async throws -> AgentMCPControlContext {
         let session = await ensureSessionReady(tabID: tabID)
         guard session.profile == .standard else {
             throw MCPError.invalidParams("Knowledge sessions cannot be converted into MCP-controlled coding sessions. Start a standard Agent session instead.")
@@ -7250,7 +7316,7 @@ final class AgentModeViewModel: ObservableObject {
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
             : session.autoEditEnabled
-        session.mcpControlContext = AgentMCPControlContext(
+        let activatedControlContext = AgentMCPControlContext(
             sessionID: sessionID,
             activationID: activationID,
             registration: registration,
@@ -7267,6 +7333,7 @@ final class AgentModeViewModel: ObservableObject {
             autoEditEnabledBeforeOverride: priorAutoEditEnabled,
             taskLabelKind: taskLabelKind
         )
+        session.mcpControlContext = activatedControlContext
         session.mcpFollowUpRunPending = startPending
         mcpControlledTabIDs.insert(tabID)
         if markSessionAsMCPOriginated {
@@ -7307,7 +7374,125 @@ final class AgentModeViewModel: ObservableObject {
             updateBindingsFromSession(session)
         }
         handleObservedMCPStateChange(for: session)
+        return activatedControlContext
     }
+
+    #if DEBUG
+        /// Installs start ownership only while the exact target is live and no discard owns it.
+        @discardableResult
+        func mcpInstallStartInvocationGeneration(
+            _ generationID: UUID,
+            for target: MCPSessionTarget,
+            expectedSessionID: UUID
+        ) -> Bool {
+            guard target.sessionID == expectedSessionID,
+                  let session = sessions[target.tabID],
+                  session.activeAgentSessionID == expectedSessionID,
+                  session.mcpStartDiscardClaimGenerationID == nil
+            else {
+                return false
+            }
+            session.mcpStartInvocationGenerationID = generationID
+            return true
+        }
+
+        enum OMPQualificationTargetDiscardOutcome: Equatable {
+            case discarded
+            case aborted
+            case contextReplaced
+            case superseded
+            case ineligible
+        }
+
+        /// Atomically claims a start-created target only while the exact durable generation and
+        /// optional authorized run still own it. The claim is installed on MainActor immediately
+        /// before destruction so a replacement cannot enter during asynchronous discard cleanup.
+        func mcpDiscardSessionTarget(
+            _ target: MCPSessionTarget,
+            ifOwnedByStartGeneration generationID: UUID,
+            expectedSessionID: UUID,
+            authorizedRun: OhMyPiAgentModeSmokeGate.AuthorizedRunReceipt? = nil,
+            requireNoRun: Bool = false,
+            generationMismatchOutcome: OMPQualificationTargetDiscardOutcome = .superseded,
+            beforeDiscard: () -> Void = {},
+            isDiscardAborted: () -> Bool = { Task.isCancelled }
+        ) async -> OMPQualificationTargetDiscardOutcome {
+            switch target.origin {
+            case .existingSession, .existingTab:
+                return .ineligible
+            case .createdNewTab, .createdForSessionResume:
+                break
+            }
+            guard target.sessionID == expectedSessionID,
+                  let session = sessions[target.tabID]
+            else {
+                return .superseded
+            }
+            guard session.mcpStartInvocationGenerationID == generationID else {
+                return generationMismatchOutcome
+            }
+            if let controlContext = session.mcpControlContext,
+               controlContext.sessionID != expectedSessionID
+            {
+                return .superseded
+            }
+            guard session.mcpStartDiscardClaimGenerationID == nil else {
+                return .superseded
+            }
+            if let authorizedRun {
+                guard session.runID == authorizedRun.runID,
+                      authorizedRun.activeAgentSessionID == nil
+                      || session.activeAgentSessionID == authorizedRun.activeAgentSessionID,
+                      authorizedRun.runAttemptID == nil || session.activeRunAttemptID == authorizedRun.runAttemptID
+                else {
+                    return .superseded
+                }
+            } else if requireNoRun, session.runID != nil {
+                return .superseded
+            }
+            session.mcpStartDiscardClaimGenerationID = generationID
+            beforeDiscard()
+            if isDiscardAborted() {
+                if sessions[target.tabID] === session,
+                   session.mcpStartDiscardClaimGenerationID == generationID
+                {
+                    session.mcpStartDiscardClaimGenerationID = nil
+                }
+                return .aborted
+            }
+            await mcpDiscardSessionTarget(target)
+            return .discarded
+        }
+
+        func mcpDiscardSessionTarget(
+            _ target: MCPSessionTarget,
+            ifOwnedByOMPQualification context: OhMyPiAgentModeSmokeGate.StartContext,
+            beforeDiscard: () -> Void = {}
+        ) async -> OMPQualificationTargetDiscardOutcome {
+            if let session = sessions[target.tabID] {
+                let contextWasReplaced = session.mcpStartInvocationGenerationID != context.generationID
+                    || session.ompQualificationStartContext.map { $0 !== context } == true
+                if contextWasReplaced {
+                    return .contextReplaced
+                }
+            }
+            let authorizedRun: OhMyPiAgentModeSmokeGate.AuthorizedRunReceipt? = switch context.authorizationReceipt
+                .resolvedOutcome
+            {
+            case let .authorized(receipt): receipt
+            case .denied, .none: nil
+            }
+            return await mcpDiscardSessionTarget(
+                target,
+                ifOwnedByStartGeneration: context.generationID,
+                expectedSessionID: context.transaction.sessionID,
+                authorizedRun: authorizedRun,
+                requireNoRun: authorizedRun == nil,
+                generationMismatchOutcome: .contextReplaced,
+                beforeDiscard: beforeDiscard
+            )
+        }
+    #endif
 
     /// Discard a session target created by `mcpResolveOrCreateSessionTarget` when a later step
     /// in start/create/resume/steer fails before the target becomes a real session. Only targets
@@ -7343,14 +7528,25 @@ final class AgentModeViewModel: ObservableObject {
 
     func mcpDeactivateControlContext(
         sessionID: UUID,
+        ifOwnedBy expectedContext: AgentMCPControlContext? = nil,
         cleanupSessionStore: Bool = false
     ) async {
-        mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
+        if expectedContext == nil {
+            mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
+        }
         guard let session = mcpControlledSession(sessionID: sessionID),
               let context = session.mcpControlContext,
-              context.sessionID == sessionID
+              context.sessionID == sessionID,
+              expectedContext == nil
+              || (
+                  context.activationID == expectedContext?.activationID
+                      && context.registration == expectedContext?.registration
+              )
         else {
             return
+        }
+        if expectedContext != nil {
+            mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
         }
 
         codexCoordinator.handleMCPControlReset(

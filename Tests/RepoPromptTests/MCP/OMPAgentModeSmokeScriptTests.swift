@@ -226,9 +226,35 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: state.appendingPathComponent("cleanup_verified").path))
         let calls = try String(contentsOf: state.appendingPathComponent("calls.log"), encoding: .utf8)
         XCTAssertFalse(calls.contains("resume_session"))
-        XCTAssertFalse(calls.contains("workspace"))
+        XCTAssertTrue(calls.contains(#""workspace_id":"55555555-5555-4555-8555-555555555555""#))
+        XCTAssertEqual(disallowedWorkspaceLifecycleCalls(in: calls), [])
         XCTAssertFalse(calls.contains("--launch-app"))
         XCTAssertFalse(calls.contains("\"op\":\"stop"))
+    }
+
+    func testWorkspaceLifecycleCallAllowlistRejectsSyntheticDisallowedCall() {
+        let calls = """
+        --raw-json -w 7 -c __repoprompt_debug_diagnostics -j {"op":"routing_snapshot"}
+        --raw-json -w 7 -c manage_workspaces -j {"op":"switch_workspace"}
+        --raw-json -w 7 -c __repoprompt_debug_diagnostics -j {"op":"relaunch_app"}
+        --raw-json -w 7 -c agent_run -j {"op":"start","workspace_action":{"verb":"switch_workspace"}}
+        --raw-json -w 7 -c agent_run -j {"op":"start","worktree":{"action":"create_worktree"}}
+        --raw-json -w 7 -c agent_run -j {"op":"start","message":{"switch_workspace":true}}
+        --raw-json -w 7 -c agent_run -j {"op":"start","message":{"external_path":"/tmp"}}
+        --raw-json --relaunch-app -w 7 -c agent_manage -j {"op":"list_agents"}
+        --raw-json -w 7 -w 8 -c agent_manage -j {"op":"list_agents"}
+        --raw-json -w 7 -c agent_manage -c agent_run -j {"op":"list_agents"}
+        --raw-json -w 7 -c agent_manage --external-path /tmp -j {"op":"list_agents"}
+        --raw-json -w 7 -c agent_manage --create-worktree -j {"op":"list_agents"}
+        """
+        let violations = disallowedWorkspaceLifecycleCalls(in: calls)
+        XCTAssertEqual(violations.count, 11)
+        XCTAssertTrue(violations.contains { $0.contains("manage_workspaces") })
+        XCTAssertTrue(violations.contains { $0.contains("relaunch_app") })
+        XCTAssertTrue(violations.contains { $0.contains("workspace_action") })
+        XCTAssertTrue(violations.contains { $0.contains("create_worktree") })
+        XCTAssertTrue(violations.contains { $0.contains("switch_workspace") })
+        XCTAssertTrue(violations.contains { $0.contains("external_path") })
     }
 
     func testSyntheticFlowRejectsRunScopedToolEventAndReleasesLease() throws {
@@ -268,6 +294,37 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
         )
         XCTAssertNotEqual(result.status, 0)
         XCTAssertTrue(FileManager.default.fileExists(atPath: state.appendingPathComponent("cleanup_verified").path))
+    }
+
+    func testSyntheticFlowRejectsMalformedHelperStartIdentityValues() throws {
+        let mutations = [
+            (#""helper_process_start_seconds":"123457""#, #""helper_process_start_seconds":"-1""#),
+            (#""helper_process_start_microseconds":"111""#, #""helper_process_start_microseconds":"1000000""#),
+            (#""helper_peer_start_seconds":123457"#, #""helper_peer_start_seconds":"123457""#)
+        ]
+        for (index, mutation) in mutations.enumerated() {
+            let fixture = try makeSyntheticFixture(
+                name: "OMPMalformedStartIdentity\(index)",
+                fakeCLI: fakeCLIContents.replacingOccurrences(of: mutation.0, with: mutation.1)
+            )
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            let result = try run(
+                executable: URL(fileURLWithPath: "/bin/bash"),
+                arguments: [
+                    fixture.script.path,
+                    "--window-id", "7",
+                    "--model-id", "ohMyPi:smoke-provider/exact-model",
+                    "--output-parent", fixture.output.path,
+                    "--timeout", "30"
+                ],
+                environment: fixture.environment
+            )
+            XCTAssertNotEqual(result.status, 0, "mutation \(index) unexpectedly passed")
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: fixture.state.appendingPathComponent("cleanup_verified").path),
+                "mutation \(index) did not complete cleanup"
+            )
+        }
     }
 
     func testTerminalRawSetStatusIsAcceptedAsBookkeeping() throws {
@@ -540,6 +597,140 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
         }
     }
 
+    private func disallowedWorkspaceLifecycleCalls(in calls: String) -> [String] {
+        let lifecycleVerbs = Set([
+            "launch_app", "relaunch_app", "stop", "stop_app",
+            "switch_workspace", "create_workspace", "delete_workspace", "manage_workspaces",
+            "resume", "resume_session", "create_worktree", "delete_worktree"
+        ])
+
+        func containsLifecycleMutation(_ value: Any) -> Bool {
+            if let text = value as? String {
+                return lifecycleVerbs.contains(text.lowercased())
+            }
+            if let values = value as? [Any] {
+                return values.contains(where: containsLifecycleMutation)
+            }
+            if let object = value as? [String: Any] {
+                return object.contains { key, child in
+                    let normalized = key.lowercased().replacingOccurrences(of: "-", with: "_")
+                    return lifecycleVerbs.contains(normalized)
+                        || normalized.contains("worktree")
+                        || normalized.contains("external_path")
+                        || containsLifecycleMutation(child)
+                }
+            }
+            return false
+        }
+
+        func hasExpectedValueTypes(tool: String, operation: String, payload: [String: Any]) -> Bool {
+            func strings(_ keys: [String]) -> Bool {
+                keys.allSatisfy { payload[$0] == nil || payload[$0] is String }
+            }
+            func booleans(_ keys: [String]) -> Bool {
+                keys.allSatisfy { payload[$0] == nil || payload[$0] is Bool }
+            }
+            func integers(_ keys: [String]) -> Bool {
+                keys.allSatisfy { key in
+                    guard let value = payload[key] else { return true }
+                    guard let number = value as? NSNumber else { return false }
+                    return CFGetTypeID(number) != CFBooleanGetTypeID()
+                        && number.doubleValue.rounded(.towardZero) == number.doubleValue
+                }
+            }
+            switch (tool, operation) {
+            case ("agent_manage", "list_agents"):
+                return true
+            case ("agent_run", "start"):
+                return strings(["model_id", "_omp_qualification_lease_id", "workspace_id", "session_name", "message"])
+                    && booleans(["detach"])
+            case ("agent_run", "wait"):
+                return strings(["session_id"]) && integers(["timeout"])
+            case ("agent_run", "cancel"):
+                return strings(["session_id", "run_id"])
+            case ("__repoprompt_debug_diagnostics", "routing_snapshot"):
+                return booleans(["include_records", "include_windows"])
+            case ("__repoprompt_debug_diagnostics", "routing_sequence_baseline"):
+                return true
+            case ("__repoprompt_debug_diagnostics", "run_routing_history"):
+                return strings(["run_id"]) && integers(["limit"])
+            case ("__repoprompt_debug_diagnostics", "connections"):
+                return booleans(["include_identity"])
+            case ("__repoprompt_debug_diagnostics", "connection_history"):
+                return strings(["connection_id"]) && integers(["limit"])
+            case ("__repoprompt_debug_diagnostics", "omp_qualification_lease"):
+                return strings(["action", "lease_id"]) && integers(["duration_seconds", "owner_pid"])
+            default:
+                return false
+            }
+        }
+
+        func allowedKeys(tool: String, operation: String, payload: [String: Any]) -> Set<String>? {
+            switch (tool, operation) {
+            case ("agent_manage", "list_agents"):
+                return ["op"]
+            case ("agent_run", "start"):
+                return [
+                    "op", "model_id", "_omp_qualification_lease_id", "workspace_id",
+                    "session_name", "message", "detach"
+                ]
+            case ("agent_run", "wait"):
+                return ["op", "session_id", "timeout"]
+            case ("agent_run", "cancel"):
+                return ["op", "session_id", "run_id"]
+            case ("__repoprompt_debug_diagnostics", "routing_snapshot"):
+                return ["op", "include_records", "include_windows"]
+            case ("__repoprompt_debug_diagnostics", "routing_sequence_baseline"):
+                return ["op"]
+            case ("__repoprompt_debug_diagnostics", "run_routing_history"):
+                return ["op", "run_id", "limit"]
+            case ("__repoprompt_debug_diagnostics", "connections"):
+                return ["op", "include_identity"]
+            case ("__repoprompt_debug_diagnostics", "connection_history"):
+                return ["op", "connection_id", "limit"]
+            case ("__repoprompt_debug_diagnostics", "omp_qualification_lease"):
+                guard let action = payload["action"] as? String,
+                      ["acquire", "release", "status"].contains(action)
+                else { return nil }
+                return ["op", "action", "duration_seconds", "owner_pid", "lease_id"]
+            default:
+                return nil
+            }
+        }
+
+        return calls.split(separator: "\n").compactMap { rawLine in
+            let line = String(rawLine)
+            let fields = line.split(separator: " ")
+            guard let toolFlag = fields.firstIndex(of: "-c"),
+                  fields.indices.contains(toolFlag + 1),
+                  let payloadRange = line.range(of: " -j ")
+            else {
+                return "unparseable CLI call: \(line)"
+            }
+            let tool = String(fields[toolFlag + 1])
+            let prefix = String(line[..<payloadRange.lowerBound])
+                .split(whereSeparator: \.isWhitespace)
+                .map(String.init)
+            // payloadRange starts at the separator before -j; the exact single -j
+            // delimiter is therefore validated separately from the argv prefix.
+            guard prefix == ["--raw-json", "-w", "7", "-c", tool] else {
+                return "disallowed CLI argv: \(prefix.joined(separator: " "))"
+            }
+            let payloadText = String(line[payloadRange.upperBound...])
+            guard let payloadData = payloadText.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+                  let operation = payload["op"] as? String,
+                  let permittedKeys = allowedKeys(tool: tool, operation: operation, payload: payload),
+                  Set(payload.keys).isSubset(of: permittedKeys),
+                  hasExpectedValueTypes(tool: tool, operation: operation, payload: payload),
+                  !containsLifecycleMutation(payload)
+            else {
+                return "disallowed smoke call: tool=\(tool) payload=\(payloadText)"
+            }
+            return nil
+        }
+    }
+
     private var bookkeepingTerminalFields: String {
         #""qualification_raw_tool_call_count":2,"qualification_raw_in_flight_call_count":0,"qualification_raw_tool_names":["bind_context","set_status"],"qualification_raw_canonical_tool_names":["bind_context","set_status"],"qualification_raw_nonbookkeeping_tool_call_count":0,"qualification_raw_nonbookkeeping_tool_names":[],"non_bookkeeping_tool_call_count":0,"non_bookkeeping_tool_names":[],"active_tool_scope_count":0"#
     }
@@ -652,7 +843,7 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
               printf '{"seq":20,"run_id":"%s","event":"expected_pid_cleared","connection_id":null,"fields":{"expected_pid":"321"}},' "$run_id"
               printf '{"seq":21,"run_id":"%s","event":"policy_cleared","connection_id":null,"fields":{"remaining_count":"0"}}]}\\n' "$run_id"
             elif [[ "$payload" == *'connection_history'* ]]; then
-              printf '{"ok":true,"op":"connection_history","events":[{"seq":21,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"initialized"},{"seq":22,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"removed","qualification_raw_tool_call_count":2,"qualification_raw_in_flight_call_count":0,"qualification_raw_tool_names":["bind_context","set_status"],"qualification_raw_canonical_tool_names":["bind_context","set_status"],"qualification_raw_nonbookkeeping_tool_call_count":0,"qualification_raw_nonbookkeeping_tool_names":[],"non_bookkeeping_tool_call_count":0,"non_bookkeeping_tool_names":[],"active_tool_scope_count":0,"helper_peer_pid":123}]}\\n' "$connection_id" "$connection_id"
+              printf '{"ok":true,"op":"connection_history","events":[{"seq":21,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"initialized"},{"seq":22,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"removed","qualification_raw_tool_call_count":2,"qualification_raw_in_flight_call_count":0,"qualification_raw_tool_names":["bind_context","set_status"],"qualification_raw_canonical_tool_names":["bind_context","set_status"],"qualification_raw_nonbookkeeping_tool_call_count":0,"qualification_raw_nonbookkeeping_tool_names":[],"non_bookkeeping_tool_call_count":0,"non_bookkeeping_tool_names":[],"active_tool_scope_count":0,"helper_peer_pid":123,"helper_peer_start_seconds":123457,"helper_peer_start_microseconds":111}]}\\n' "$connection_id" "$connection_id"
             else
               printf '{"ok":true,"op":"connections","connections":[]}\\n'
             fi

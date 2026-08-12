@@ -360,4 +360,13 @@ extension AgentModeViewModel {
         session.isDirty = true
         scheduleSave(for: session.tabID)
     }
+
+    #if DEBUG
+        func test_abandonedAttachmentFinalizer() -> ([AgentImageAttachment]) -> Void {
+            AgentAttachmentStore.abandonedAttachmentFinalizer(
+                clearConsumedAttachments: clearConsumedAttachmentsAfterProviderConsumption,
+                workspaceDirectoryProvider: attachmentWorkspaceDirectoryProvider
+            )
+        }
+    #endif
 }

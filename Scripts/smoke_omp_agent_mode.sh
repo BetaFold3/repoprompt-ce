@@ -295,6 +295,22 @@ call_tool __repoprompt_debug_diagnostics '{"op":"routing_snapshot","include_reco
 "$PYTHON" "$SUPPORT" snapshot "$EVIDENCE_DIR/workspace_before_raw.json" "$EVIDENCE_DIR/workspace_before.json" "$WINDOW_ID" "$EVIDENCE_DIR" \
   || fail "Target workspace identity, overlap check, or bounded content snapshot failed."
 rm -f "$EVIDENCE_DIR/workspace_before_raw.json"
+WORKSPACE_ID="$("$PYTHON" - "$EVIDENCE_DIR/workspace_before.json" "$WINDOW_ID" <<'PY'
+import json
+import sys
+import uuid
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+target = value.get("qualification_target")
+if not isinstance(target, dict) or target.get("window_id") != int(sys.argv[2]):
+    raise SystemExit(2)
+try:
+    workspace_id = str(uuid.UUID(target.get("workspace_id")))
+except Exception:
+    raise SystemExit(2)
+print(workspace_id)
+PY
+)" || fail "The fingerprinted qualification target did not expose one exact workspace UUID."
 
 call_tool __repoprompt_debug_diagnostics '{"op":"routing_sequence_baseline"}' "$EVIDENCE_DIR/routing_baseline.json"
 
@@ -366,13 +382,14 @@ if len(matches) != 1:
     raise SystemExit(2)
 PY
 
-START_ARGS="$("$PYTHON" - "$MODEL_ID" "$ACK" "$LEASE_ID" <<'PY'
+START_ARGS="$("$PYTHON" - "$MODEL_ID" "$ACK" "$LEASE_ID" "$WORKSPACE_ID" <<'PY'
 import json
 import sys
 print(json.dumps({
     "op": "start",
     "model_id": sys.argv[1],
     "_omp_qualification_lease_id": sys.argv[3],
+    "workspace_id": sys.argv[4],
     "session_name": "PRIVATE SYNTHETIC OMP Agent Mode smoke",
     "message": f"Reply exactly with {sys.argv[2]} and stop. Do not call tools. Do not edit files.",
     "detach": True,
@@ -525,22 +542,39 @@ if fields.get("authoritative_client_name") != sys.argv[4]:
 connection_id = identity.get("connection_id")
 helper_pid = fields.get("helper_peer_pid")
 expected_pid = events[positions[1]].get("fields", {}).get("expected_pid")
+def canonical_decimal(value, *, positive=False, microseconds=False):
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+        raise SystemExit(2)
+    if len(value) > 1 and value.startswith("0"):
+        raise SystemExit(2)
+    parsed = int(value)
+    if positive and parsed <= 0:
+        raise SystemExit(2)
+    if microseconds and not 0 <= parsed < 1_000_000:
+        raise SystemExit(2)
+    return parsed
+helper_pid = canonical_decimal(helper_pid, positive=True)
+expected_pid = canonical_decimal(expected_pid, positive=True)
+matched_expected_start_seconds = canonical_decimal(fields.get("matched_expected_start_seconds"), positive=True)
+matched_expected_start_microseconds = canonical_decimal(fields.get("matched_expected_start_microseconds"), microseconds=True)
+helper_start_seconds = canonical_decimal(fields.get("helper_process_start_seconds"), positive=True)
+helper_start_microseconds = canonical_decimal(fields.get("helper_process_start_microseconds"), microseconds=True)
 if (
     not connection_id
     or not helper_pid
     or not expected_pid
     or helper_pid == expected_pid
     or fields.get("process_correlation_ok") != "true"
-    or fields.get("matched_expected_pid") != expected_pid
+    or fields.get("matched_expected_pid") != str(expected_pid)
     or fields.get("omp_current_executable_identity_match") != "true"
     or fields.get("helper_bundled_identity_match") != "true"
     or fields.get("helper_current_executable_identity_match") != "true"
     or fields.get("helper_strict_descendant") != "true"
-    or not fields.get("matched_expected_start_seconds")
-    or fields.get("matched_expected_start_microseconds") is None
+    or fields.get("matched_expected_start_seconds") != str(matched_expected_start_seconds)
+    or fields.get("matched_expected_start_microseconds") != str(matched_expected_start_microseconds)
     or not fields.get("matched_expected_executable_path")
-    or not fields.get("helper_process_start_seconds")
-    or fields.get("helper_process_start_microseconds") is None
+    or fields.get("helper_process_start_seconds") != str(helper_start_seconds)
+    or fields.get("helper_process_start_microseconds") != str(helper_start_microseconds)
     or not fields.get("helper_executable_path")
 ):
     raise SystemExit(2)
@@ -553,15 +587,21 @@ if events[positions[7]].get("fields", {}).get("outcome") != "routed":
     raise SystemExit(2)
 if events[positions[8]].get("fields", {}).get("routed") != "true":
     raise SystemExit(2)
-if events[positions[9]].get("fields", {}).get("expected_pid") != expected_pid:
+if events[positions[9]].get("fields", {}).get("expected_pid") != str(expected_pid):
     raise SystemExit(2)
 if events[positions[10]].get("fields", {}).get("remaining_count") != "0":
     raise SystemExit(2)
-print(connection_id, helper_pid, expected_pid)
+print(
+    connection_id,
+    helper_pid,
+    expected_pid,
+    helper_start_seconds,
+    helper_start_microseconds,
+)
 PY
 )" || fail "run_routing_history did not prove one fresh, ordered, PID-consistent route with terminal cleanup and zero tool calls."
-read -r OMP_CONNECTION_ID OMP_HELPER_PID OMP_EXPECTED_PID <<< "$ROUTING_IDENTIFIERS"
-[[ -n "$OMP_CONNECTION_ID" && -n "$OMP_HELPER_PID" && -n "$OMP_EXPECTED_PID" ]] \
+read -r OMP_CONNECTION_ID OMP_HELPER_PID OMP_EXPECTED_PID OMP_HELPER_START_SECONDS OMP_HELPER_START_MICROSECONDS <<< "$ROUTING_IDENTIFIERS"
+[[ -n "$OMP_CONNECTION_ID" && -n "$OMP_HELPER_PID" && -n "$OMP_EXPECTED_PID" && -n "$OMP_HELPER_START_SECONDS" && -n "$OMP_HELPER_START_MICROSECONDS" ]] \
   || fail "The routing correlation identifiers were incomplete."
 
 call_tool __repoprompt_debug_diagnostics '{"op":"connections","include_identity":true}' "$EVIDENCE_DIR/connections.json"
@@ -601,7 +641,7 @@ PY
   sleep 0.25
 done
 
-"$PYTHON" - "$EVIDENCE_DIR/omp_connection_history.json" "$OMP_CLIENT_NAME" "$OMP_CONNECTION_ID" "$EVIDENCE_DIR/routing_baseline.json" "$OMP_HELPER_PID" "$MAX_BOOKKEEPING_RAW_CALLS" <<'PY' || fail "OMP connection_history did not prove terminal exact-connection zero non-bookkeeping calls, in-flight calls, and scopes."
+"$PYTHON" - "$EVIDENCE_DIR/omp_connection_history.json" "$OMP_CLIENT_NAME" "$OMP_CONNECTION_ID" "$EVIDENCE_DIR/routing_baseline.json" "$OMP_HELPER_PID" "$MAX_BOOKKEEPING_RAW_CALLS" "$OMP_HELPER_START_SECONDS" "$OMP_HELPER_START_MICROSECONDS" <<'PY' || fail "OMP connection_history did not prove terminal exact-connection zero non-bookkeeping calls, in-flight calls, and scopes."
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
@@ -677,7 +717,15 @@ if (
 if (
     final.get("qualification_raw_in_flight_call_count") != 0
     or final.get("active_tool_scope_count") != 0
+    or type(final.get("helper_peer_pid")) is not int
+    or final.get("helper_peer_pid") <= 0
+    or type(final.get("helper_peer_start_seconds")) is not int
+    or final.get("helper_peer_start_seconds") <= 0
+    or type(final.get("helper_peer_start_microseconds")) is not int
+    or not 0 <= final.get("helper_peer_start_microseconds") < 1_000_000
     or final.get("helper_peer_pid") != int(sys.argv[5])
+    or final.get("helper_peer_start_seconds") != int(sys.argv[7])
+    or final.get("helper_peer_start_microseconds") != int(sys.argv[8])
 ):
     raise SystemExit(2)
 PY

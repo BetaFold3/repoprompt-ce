@@ -3,6 +3,15 @@ import MCP
 
 @MainActor
 enum AgentExternalMCPRunStarter {
+    #if DEBUG
+        enum OMPQualificationInvocationError: LocalizedError {
+            case contextReplaced
+
+            var errorDescription: String? {
+                "The OMP qualification transaction context was replaced before instruction dispatch."
+            }
+        }
+    #endif
     struct StartOutcome: Equatable {
         let snapshot: AgentRunMCPSnapshot
         let delivery: AgentModeViewModel.MCPInstructionDispatch
@@ -138,6 +147,18 @@ enum AgentExternalMCPRunStarter {
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
         dispatchInstruction: DispatchInstruction? = nil
     ) async throws -> StartOutcome {
+        #if DEBUG
+            let ompQualificationInvocationContext = OhMyPiAgentModeSmokeGate.invocationStartContext
+            if let ompQualificationInvocationContext {
+                guard let liveSession = agentModeVM.session(for: target.tabID, createIfNeeded: false),
+                      liveSession.mcpStartInvocationGenerationID == ompQualificationInvocationContext.generationID,
+                      liveSession.ompQualificationStartContext === ompQualificationInvocationContext
+                else {
+                    ompQualificationInvocationContext.authorizationReceipt.resolve(.denied)
+                    throw OMPQualificationInvocationError.contextReplaced
+                }
+            }
+        #endif
         let resolved = try resolvedModelAndEffort(
             agentRaw: agentRaw,
             modelRaw: modelRaw,
@@ -161,7 +182,7 @@ enum AgentExternalMCPRunStarter {
                 "workflowName": workflow?.displayName ?? "nil"
             ])
         #endif
-        try await agentModeVM.mcpActivateControlContext(
+        let activatedControlContext = try await agentModeVM.mcpActivateControlContext(
             forTabID: target.tabID,
             sessionID: sessionID,
             originatingConnectionID: metadata.connectionID,
@@ -170,7 +191,7 @@ enum AgentExternalMCPRunStarter {
             startPending: true
         )
 
-        // All failures after activation must clean up MCP control context and session store.
+        // All failures after activation must clean up only this invocation's control context.
         do {
             if let oracleReviewSource {
                 try agentModeVM.mcpStageAgentRunOracleReviewSource(
@@ -195,9 +216,18 @@ enum AgentExternalMCPRunStarter {
                 ])
             #endif
 
-            guard agentModeVM.session(for: target.tabID, createIfNeeded: false) != nil else {
+            guard let liveSession = agentModeVM.session(for: target.tabID, createIfNeeded: false) else {
                 throw MCPError.internalError("Failed to resolve target agent session.")
             }
+            #if DEBUG
+                if let ompQualificationInvocationContext,
+                   liveSession.mcpStartInvocationGenerationID != ompQualificationInvocationContext.generationID
+                   || liveSession.ompQualificationStartContext !== ompQualificationInvocationContext
+                {
+                    ompQualificationInvocationContext.authorizationReceipt.resolve(.denied)
+                    throw OMPQualificationInvocationError.contextReplaced
+                }
+            #endif
 
             let delivery: AgentModeViewModel.MCPInstructionDispatch = if let dispatchInstruction {
                 try await dispatchInstruction(sessionID, target.tabID, message, workflow, agentModeVM)
@@ -222,6 +252,7 @@ enum AgentExternalMCPRunStarter {
         } catch {
             await agentModeVM.mcpDeactivateControlContext(
                 sessionID: sessionID,
+                ifOwnedBy: activatedControlContext,
                 cleanupSessionStore: true
             )
             throw error

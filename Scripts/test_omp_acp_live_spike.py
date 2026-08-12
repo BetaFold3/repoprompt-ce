@@ -749,13 +749,44 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             args = Namespace(workspace=None, unsafe_allow_nonempty_workspace=False)
             with (
                 mock.patch.object(spike.tempfile, "mkdtemp", side_effect=create_inside_repo),
-                self.assertRaisesRegex(spike.ProbeError, "repository workspace"),
+                self.assertRaisesRegex(spike.ProbeError, "overlaps the repository root"),
             ):
                 spike.prepare_workspace(args, output, repo)
 
             self.assertFalse(created.exists())
             for phase in ("preflight", "cli-prompt", "helper", "bootstrap", "prompt", "roundtrip"):
                 self.assertTrue(spike.phase_requires_workspace_snapshot(phase))
+
+    def test_supplied_workspace_requires_ownership_or_explicit_unsafe_waiver(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            output = root / "output"
+            repo.mkdir()
+            output.mkdir()
+
+            for workspace in (repo, repo / "inside", root):
+                args = Namespace(workspace=workspace, unsafe_allow_nonempty_workspace=True)
+                with self.assertRaisesRegex(spike.ProbeError, "overlaps the repository root"):
+                    spike.prepare_workspace(args, output, repo)
+
+            preexisting = root / "preexisting"
+            preexisting.mkdir()
+            args = Namespace(workspace=preexisting, unsafe_allow_nonempty_workspace=False)
+            with self.assertRaisesRegex(spike.ProbeError, "proof of harness ownership"):
+                spike.prepare_workspace(args, output, repo)
+
+            args.unsafe_allow_nonempty_workspace = True
+            workspace, owned = spike.prepare_workspace(args, output, repo)
+            self.assertEqual(workspace, preexisting.resolve())
+            self.assertFalse(owned)
+
+            fresh = root / "fresh-disposable"
+            args = Namespace(workspace=fresh, unsafe_allow_nonempty_workspace=False)
+            workspace, owned = spike.prepare_workspace(args, output, repo)
+            self.assertEqual(workspace, fresh.resolve())
+            self.assertTrue(owned)
+            self.assertEqual(workspace.stat().st_mode & 0o777, 0o700)
 
     def test_workspace_snapshot_detects_root_mode_and_helper_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1551,6 +1582,8 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
                     "client_name": "omp-coding-agent",
                     "normalized_client_id": "omp-coding-agent",
                     "helper_peer_pid": 42,
+                    "helper_peer_start_seconds": 1_700_000_001,
+                    "helper_peer_start_microseconds": 456,
                     "total_tool_calls": 0,
                     "has_in_flight_calls": False,
                     "active_tool_scope_count": 0,
@@ -1558,11 +1591,35 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
                 },
                 "process": {
                     "ompACPProcess": {
+                        "pid": 41,
+                        "parentPID": 1,
+                        "startSeconds": 1_700_000_000,
+                        "startMicroseconds": 123,
                         "startIdentityMatch": True,
                         "currentExecutableIdentityMatch": True,
                         "launchCommandExecutableIdentityMatch": True,
                     },
-                    "helperProcess": {"pid": 42, "currentExecutableIdentityMatch": True},
+                    "helperProcess": {
+                        "pid": 42,
+                        "parentPID": 41,
+                        "startSeconds": 1_700_000_001,
+                        "startMicroseconds": 456,
+                        "currentExecutableIdentityMatch": True,
+                    },
+                    "parentChain": [
+                        {
+                            "pid": 42,
+                            "parentPID": 41,
+                            "startSeconds": 1_700_000_001,
+                            "startMicroseconds": 456,
+                        },
+                        {
+                            "pid": 41,
+                            "parentPID": 1,
+                            "startSeconds": 1_700_000_000,
+                            "startMicroseconds": 123,
+                        },
+                    ],
                 },
                 "delta": {
                     "registrationHistorySequence": 10,
@@ -1580,6 +1637,8 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
                     "client_name": "omp-coding-agent",
                     "normalized_client_id": "omp-coding-agent",
                     "helper_peer_pid": 42,
+                    "helper_peer_start_seconds": 1_700_000_001,
+                    "helper_peer_start_microseconds": 456,
                     "qualification_raw_tool_call_count": 0,
                     "qualification_raw_in_flight_call_count": 0,
                     "active_tool_scope_count": 0,
@@ -1611,12 +1670,43 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             self.assertFalse(summary["promptDispatched"])
             self.assertEqual(summary["productionTransportIdentityEvidence"], evidence)
             spike.validate_production_bootstrap_summary(summary)
+            missing_numeric_identity = json.loads(json.dumps(summary))
+            del missing_numeric_identity["productionTransportIdentityEvidence"]["process"]["helperProcess"]["startSeconds"]
+            with self.assertRaisesRegex(spike.ProbeError, "bounded production transport/identity evidence"):
+                spike.validate_production_bootstrap_summary(missing_numeric_identity)
+            def install_duplicate_pid_chain(value: dict[str, object]) -> None:
+                value["productionTransportIdentityEvidence"]["process"]["parentChain"] = [
+                    {"pid": 42, "parentPID": 15, "startSeconds": 1_700_000_001, "startMicroseconds": 456},
+                    {"pid": 15, "parentPID": 16, "startSeconds": 1_700_000_002, "startMicroseconds": 100},
+                    {"pid": 16, "parentPID": 15, "startSeconds": 1_700_000_003, "startMicroseconds": 200},
+                    {"pid": 15, "parentPID": 41, "startSeconds": 1_700_000_004, "startMicroseconds": 300},
+                    {"pid": 41, "parentPID": 1, "startSeconds": 1_700_000_000, "startMicroseconds": 123},
+                ]
+
+            mutations = [
+                ("start-match", lambda value: value["productionTransportIdentityEvidence"]["process"]["ompACPProcess"].update(startIdentityMatch=False)),
+                ("duplicate-pid-chain", install_duplicate_pid_chain),
+                ("chain-link", lambda value: value["productionTransportIdentityEvidence"]["process"]["parentChain"][0].update(parentPID=99)),
+                ("peer-bool", lambda value: value["productionTransportIdentityEvidence"]["connection"].update(helper_peer_pid=True)),
+                ("seconds-string", lambda value: value["productionTransportIdentityEvidence"]["connection"].update(helper_peer_start_seconds="1700000001")),
+                ("seconds-zero", lambda value: value["productionTransportIdentityEvidence"]["connection"].update(helper_peer_start_seconds=0)),
+                ("micros-negative", lambda value: value["productionTransportIdentityEvidence"]["connection"].update(helper_peer_start_microseconds=-1)),
+                ("micros-range", lambda value: value["productionTransportIdentityEvidence"]["terminalConnectionEvidence"]["removed_event"].update(helper_peer_start_microseconds=1_000_000)),
+            ]
+            for label, mutate in mutations:
+                malformed = json.loads(json.dumps(summary))
+                mutate(malformed)
+                with self.subTest(label=label), self.assertRaisesRegex(
+                    spike.ProbeError,
+                    "bounded production transport/identity evidence",
+                ):
+                    spike.validate_production_bootstrap_summary(malformed)
 
     def test_production_terminal_connection_requires_one_clean_exact_removal(self) -> None:
         connection_id = "22222222-2222-4222-8222-222222222222"
         evidence = {
             "connection": {"connection_id": connection_id},
-            "process": {"helperProcess": {"pid": 42}},
+            "process": {"helperProcess": {"pid": 42, "startSeconds": 1_700_000_042, "startMicroseconds": 42}},
             "delta": {"registrationHistorySequence": 10},
         }
         registered = {
@@ -1631,6 +1721,8 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             "client_name": "omp-coding-agent",
             "normalized_client_id": "omp-coding-agent",
             "helper_peer_pid": 42,
+            "helper_peer_start_seconds": 1_700_000_042,
+            "helper_peer_start_microseconds": 42,
             "qualification_raw_tool_call_count": 0,
             "qualification_raw_in_flight_call_count": 0,
             "active_tool_scope_count": 0,
@@ -1737,6 +1829,8 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             "transport": "bootstrapSocket",
             "session_fingerprint": "sha256:0123456789abcdef",
             "helper_peer_pid": 42,
+            "helper_peer_start_seconds": 1_700_000_042,
+            "helper_peer_start_microseconds": 42,
             "total_tool_calls": 0,
             "has_in_flight_calls": False,
             "active_tool_scope_count": 0,
@@ -1748,7 +1842,7 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             mock.patch.object(
                 spike,
                 "inspect_helper_descendant",
-                return_value={"parentChain": [], "helperProcess": {"pid": 42}},
+                return_value={"parentChain": [], "helperProcess": {"pid": 42, "startSeconds": 1_700_000_042, "startMicroseconds": 42}},
             ),
         ):
             result = spike.production_transport_identity_evidence(
@@ -1777,6 +1871,8 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             "state": "ready",
             "transport": "bootstrapSocket",
             "helper_peer_pid": 42,
+            "helper_peer_start_seconds": 1_700_000_042,
+            "helper_peer_start_microseconds": 42,
             "total_tool_calls": 0,
             "has_in_flight_calls": False,
             "active_tool_scope_count": 0,
@@ -1786,6 +1882,11 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             ("wrong authoritative name", {"client_name": "oh-my-pi"}, "identity"),
             ("wrong normalized name", {"normalized_client_id": "oh-my-pi"}, "identity"),
             ("wrong peer", {"helper_peer_pid": 99}, "peer PID"),
+            (
+                "same peer PID with different start identity",
+                {"helper_peer_start_microseconds": 43},
+                "peer start identity",
+            ),
             ("historical call", {"total_tool_calls": 1}, "tool activity"),
             ("in flight", {"has_in_flight_calls": True}, "tool activity"),
             ("active scope", {"active_tool_scope_count": 1, "active_tool_scopes": [{"tool_name": "read_file"}]}, "tool activity"),
@@ -1799,7 +1900,7 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
                 mock.patch.object(
                     spike,
                     "inspect_helper_descendant",
-                    return_value={"helperProcess": {"pid": 42}, "parentChain": []},
+                    return_value={"helperProcess": {"pid": 42, "startSeconds": 1_700_000_042, "startMicroseconds": 42}, "parentChain": []},
                 ),
             ):
                 with self.assertRaisesRegex(spike.ProbeError, expected):
@@ -1952,6 +2053,192 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             with self.subTest(parser="spike", index=index):
                 with self.assertRaises(spike.ProbeError):
                     spike.strict_diagnostic_payload(value, "connection_history", "events")
+
+    def test_qualification_routing_rejects_malformed_paths_and_workspace_uuid_before_snapshot_or_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            routing = root / "routing.json"
+            output = root / "snapshot.json"
+            valid_root = str((root / "workspace").resolve())
+            invalid_cases: list[tuple[str, object, object]] = [
+                ("repo-paths-null", "55555555-5555-4555-8555-555555555555", None),
+                ("repo-paths-not-array", "55555555-5555-4555-8555-555555555555", valid_root),
+                ("target-empty-array", "55555555-5555-4555-8555-555555555555", []),
+                ("empty-entry", "55555555-5555-4555-8555-555555555555", [""]),
+                ("relative-entry", "55555555-5555-4555-8555-555555555555", ["relative"]),
+                ("numeric-entry", "55555555-5555-4555-8555-555555555555", [42]),
+                ("mixed-entry", "55555555-5555-4555-8555-555555555555", [valid_root, 42]),
+                ("invalid-workspace-uuid", "not-a-uuid", [valid_root]),
+            ]
+            for label, workspace_id, repo_paths in invalid_cases:
+                with self.subTest(label=label):
+                    routing.write_text(
+                        json.dumps({
+                            "ok": True,
+                            "windows": [{
+                                "window_id": 7,
+                                "workspace_id": workspace_id,
+                                "repo_paths": repo_paths,
+                            }],
+                        }),
+                        encoding="utf-8",
+                    )
+                    output.unlink(missing_ok=True)
+                    with mock.patch.object(qualification_support, "_repository_snapshot") as repository_snapshot:
+                        with self.assertRaises(qualification_support.SupportError):
+                            qualification_support.snapshot(Namespace(
+                                routing=routing,
+                                output=output,
+                                window_id=7,
+                                overlap=str(root / "evidence"),
+                            ))
+                    repository_snapshot.assert_not_called()
+                    self.assertFalse(output.exists())
+
+            overlap = str(root / "evidence")
+            for top_level in ([], "routing", 7, None):
+                with self.subTest(top_level=top_level), self.assertRaisesRegex(
+                    qualification_support.SupportError,
+                    "top-level value must be an object",
+                ):
+                    qualification_support._validate_routing(top_level, 7, overlap)
+            for malformed_id in (True, "7", 0, -1):
+                with self.subTest(window_id=malformed_id), self.assertRaisesRegex(
+                    qualification_support.SupportError,
+                    "window_id values must be positive integers",
+                ):
+                    qualification_support._validate_routing({
+                        "ok": True,
+                        "windows": [{
+                            "window_id": malformed_id,
+                            "workspace_id": "55555555-5555-4555-8555-555555555555",
+                            "repo_paths": [valid_root],
+                        }],
+                    }, 7, overlap)
+            with self.assertRaisesRegex(
+                qualification_support.SupportError,
+                "window_id values must be unique",
+            ):
+                qualification_support._validate_routing({
+                    "ok": True,
+                    "windows": [
+                        {
+                            "window_id": 7,
+                            "workspace_id": "55555555-5555-4555-8555-555555555555",
+                            "repo_paths": [valid_root],
+                        },
+                        {
+                            "window_id": 7,
+                            "workspace_id": "66666666-6666-4666-8666-666666666666",
+                            "repo_paths": [valid_root],
+                        },
+                    ],
+                }, 7, overlap)
+
+    def test_qualification_preflight_accepts_non_overlapping_output_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            output_parent = root / "evidence"
+            workspace.mkdir()
+            payload = json.dumps({
+                "ok": True,
+                "op": "routing_snapshot",
+                "windows": [{
+                    "window_id": 7,
+                    "workspace_id": "55555555-5555-4555-8555-555555555555",
+                    "repo_paths": [str(workspace.resolve())],
+                }],
+            }).encode()
+            arguments = Namespace(
+                cli="/tmp/rpce-cli-debug",
+                timeout=1,
+                window_id=7,
+                overlap=str(output_parent),
+            )
+            with mock.patch.object(
+                qualification_support,
+                "_bounded_process",
+                return_value=(0, payload, b""),
+            ):
+                qualification_support.preflight_routing(arguments)
+
+    def test_qualification_routing_snapshots_every_validated_target_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            routing = root / "routing.json"
+            output = root / "snapshot.json"
+            target_roots = [str(root / "target-b"), str(root / "target-a")]
+            other_root = str(root / "other")
+            routing.write_text(
+                json.dumps({
+                    "ok": True,
+                    "windows": [
+                        {
+                            "window_id": 7,
+                            "workspace_id": "55555555-5555-4555-8555-555555555555",
+                            "repo_paths": target_roots,
+                        },
+                        {
+                            "window_id": 8,
+                            "workspace_id": "66666666-6666-4666-8666-666666666666",
+                            "repo_paths": [other_root],
+                        },
+                        {
+                            "window_id": 9,
+                            "workspace_id": "77777777-7777-4777-8777-777777777777",
+                            "repo_paths": [],
+                        },
+                        {
+                            "window_id": 10,
+                            "workspace_id": "88888888-8888-4888-8888-888888888888",
+                        },
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                qualification_support,
+                "_repository_snapshot",
+                side_effect=lambda path: {"root": path},
+            ) as repository_snapshot:
+                qualification_support.snapshot(Namespace(
+                    routing=routing,
+                    output=output,
+                    window_id=7,
+                    overlap=str(root / "outside-evidence"),
+                ))
+            expected_roots = sorted(os.path.realpath(path) for path in [*target_roots, other_root])
+            self.assertEqual(
+                [call.args[0] for call in repository_snapshot.call_args_list],
+                expected_roots,
+            )
+            value = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(value["qualification_target"]["workspace_id"], "55555555-5555-4555-8555-555555555555")
+            self.assertEqual(sorted(value["active_workspace_content_snapshots"]), expected_roots)
+            for target_root in target_roots:
+                self.assertIn(os.path.realpath(target_root), value["active_workspace_content_snapshots"])
+
+            omitted_target = os.path.realpath(target_roots[0])
+            with mock.patch.object(
+                qualification_support,
+                "_snapshot_roots",
+                return_value={
+                    path: {"root": path}
+                    for path in expected_roots
+                    if path != omitted_target
+                },
+            ):
+                with self.assertRaisesRegex(
+                    qualification_support.SupportError,
+                    "target roots are missing",
+                ):
+                    qualification_support.snapshot(Namespace(
+                        routing=routing,
+                        output=output,
+                        window_id=7,
+                        overlap=str(root / "outside-evidence"),
+                    ))
 
     def test_qualification_snapshot_rejects_gitlinks_and_nested_repositories(self) -> None:
         def git(root: Path, *arguments: str) -> str:
@@ -2110,9 +2397,17 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
         concurrent_rows = spike.parse_process_snapshot(concurrent)
         launch_omp_identity = spike.capture_executable_file_identity(omp)
         launch_helper_identity = spike.capture_executable_file_identity(helper)
+        def process_identity(pid: int) -> dict[str, int]:
+            row = concurrent_rows[pid]
+            return {
+                "pid": pid,
+                "parentPID": row["parent_pid"],
+                "startSeconds": 1_700_000_000 + pid,
+                "startMicroseconds": pid,
+            }
+
         expected_process_identity = {
-            "pid": 10,
-            "startTime": prefix,
+            **process_identity(10),
             "runtimeExecutable": str(omp.resolve()),
             "runtimeExecutableFileIdentity": launch_omp_identity,
         }
@@ -2125,6 +2420,7 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             expected_helper_file_identity=launch_helper_identity,
             snapshot_text=concurrent,
             executable_resolver=lambda pid: Path(concurrent_rows[pid]["executable"]),
+            process_identity_resolver=process_identity,
         )
         self.assertEqual(result["helperProcess"]["pid"], 20)
         self.assertEqual(result["ompACPProcess"]["runtimeExecutable"], str(omp.resolve()))
@@ -2132,6 +2428,110 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
         self.assertTrue(result["ompACPProcess"]["currentExecutableIdentityMatch"])
         self.assertTrue(result["helperProcess"]["currentExecutableIdentityMatch"])
         self.assertEqual(result["ompACPProcess"]["launchedExecutable"], str(omp.resolve()))
+        self.assertEqual(result["ompACPProcess"]["parentPID"], process_identity(10)["parentPID"])
+
+        def libproc_skew_identity(pid: int) -> dict[str, int]:
+            identity = process_identity(pid)
+            return {**identity, "parentPID": 42} if pid == 10 else identity
+
+        skewed_result = spike.inspect_helper_descendant(
+            process,
+            omp,
+            helper,
+            expected_omp_process_identity={
+                **libproc_skew_identity(10),
+                "runtimeExecutable": str(omp.resolve()),
+                "runtimeExecutableFileIdentity": launch_omp_identity,
+            },
+            expected_omp_launch_file_identity=launch_omp_identity,
+            expected_helper_file_identity=launch_helper_identity,
+            snapshot_text=concurrent,
+            executable_resolver=lambda pid: Path(concurrent_rows[pid]["executable"]),
+            process_identity_resolver=libproc_skew_identity,
+        )
+        self.assertEqual(skewed_result["ompACPProcess"]["parentPID"], 42)
+        self.assertNotEqual(skewed_result["ompACPProcess"]["parentPID"], concurrent_rows[10]["parent_pid"])
+
+        helper_identity_samples = 0
+
+        def drifting_process_identity(pid: int) -> dict[str, int]:
+            nonlocal helper_identity_samples
+            identity = process_identity(pid)
+            if pid == 20:
+                helper_identity_samples += 1
+                if helper_identity_samples > 1:
+                    identity = {**identity, "startMicroseconds": identity["startMicroseconds"] + 1}
+            return identity
+
+        with self.assertRaisesRegex(spike.ProbeError, "process identity drifted"):
+            spike.inspect_helper_descendant(
+                process,
+                omp,
+                helper,
+                expected_omp_process_identity=expected_process_identity,
+                expected_omp_launch_file_identity=launch_omp_identity,
+                expected_helper_file_identity=launch_helper_identity,
+                snapshot_text=concurrent,
+                executable_resolver=lambda pid: Path(concurrent_rows[pid]["executable"]),
+                process_identity_resolver=drifting_process_identity,
+            )
+
+        def reparented_process_identity(pid: int) -> dict[str, int]:
+            identity = process_identity(pid)
+            return {**identity, "parentPID": 1} if pid == 20 else identity
+
+        with self.assertRaisesRegex(spike.ProbeError, "reparented.*no longer"):
+            spike.inspect_helper_descendant(
+                process,
+                omp,
+                helper,
+                expected_omp_process_identity=expected_process_identity,
+                expected_omp_launch_file_identity=launch_omp_identity,
+                expected_helper_file_identity=launch_helper_identity,
+                snapshot_text=concurrent,
+                executable_resolver=lambda pid: Path(concurrent_rows[pid]["executable"]),
+                process_identity_resolver=reparented_process_identity,
+            )
+
+        intermediate_snapshot = (
+            f"10 1 {prefix} {omp}\n"
+            f"15 10 {prefix} /bin/sh\n"
+            f"20 15 {prefix} {helper}\n"
+        )
+        intermediate_rows = spike.parse_process_snapshot(intermediate_snapshot)
+        intermediate_samples = 0
+
+        def drifting_intermediate_identity(pid: int) -> dict[str, int]:
+            nonlocal intermediate_samples
+            row = intermediate_rows[pid]
+            identity = {
+                "pid": pid,
+                "parentPID": row["parent_pid"],
+                "startSeconds": 1_700_000_000 + pid,
+                "startMicroseconds": pid,
+            }
+            if pid == 15:
+                intermediate_samples += 1
+                if intermediate_samples > 1:
+                    identity["startMicroseconds"] += 1
+            return identity
+
+        with self.assertRaisesRegex(spike.ProbeError, "parent-chain process identity drifted"):
+            spike.inspect_helper_descendant(
+                process,
+                omp,
+                helper,
+                expected_omp_process_identity={
+                    **drifting_intermediate_identity(10),
+                    "runtimeExecutable": str(omp.resolve()),
+                    "runtimeExecutableFileIdentity": launch_omp_identity,
+                },
+                expected_omp_launch_file_identity=launch_omp_identity,
+                expected_helper_file_identity=launch_helper_identity,
+                snapshot_text=intermediate_snapshot,
+                executable_resolver=lambda pid: Path(intermediate_rows[pid]["executable"]),
+                process_identity_resolver=drifting_intermediate_identity,
+            )
 
         cases = [
             (
@@ -2163,6 +2563,12 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
                         expected_helper_file_identity=launch_helper_identity,
                         snapshot_text=snapshot,
                         executable_resolver=lambda pid: Path(rows[pid]["executable"]),
+                        process_identity_resolver=lambda pid: {
+                            "pid": pid,
+                            "parentPID": rows[pid]["parent_pid"],
+                            "startSeconds": 1_700_000_000 + pid,
+                            "startMicroseconds": pid,
+                        },
                     )
 
     def test_process_inspection_rejects_start_exec_and_same_path_identity_drift(self) -> None:
@@ -2178,9 +2584,17 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             process.poll.return_value = None
             omp_file_identity = spike.capture_executable_file_identity(omp)
             helper_file_identity = spike.capture_executable_file_identity(helper)
+            def process_identity(pid: int) -> dict[str, int]:
+                row = rows[pid]
+                return {
+                    "pid": pid,
+                    "parentPID": row["parent_pid"],
+                    "startSeconds": 1_700_000_000 + pid,
+                    "startMicroseconds": pid,
+                }
+
             expected = {
-                "pid": 10,
-                "startTime": prefix,
+                **process_identity(10),
                 "runtimeExecutable": str(omp.resolve()),
                 "runtimeExecutableFileIdentity": omp_file_identity,
             }
@@ -2191,11 +2605,12 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
                 expected_omp_launch_file_identity=omp_file_identity,
                 expected_helper_file_identity=helper_file_identity,
                 snapshot_text=snapshot,
+                process_identity_resolver=process_identity,
             )
 
             with self.assertRaisesRegex(spike.ProbeError, "start identity"):
                 spike.inspect_helper_descendant(
-                    expected_omp_process_identity={**expected, "startTime": "Mon Aug 10 12:34:55 2026"},
+                    expected_omp_process_identity={**expected, "startSeconds": expected["startSeconds"] - 1},
                     executable_resolver=lambda pid: Path(rows[pid]["executable"]),
                     **arguments,
                 )
@@ -2214,6 +2629,86 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
                     executable_resolver=lambda pid: Path(rows[pid]["executable"]),
                     **arguments,
                 )
+
+    def test_real_spawned_process_and_helper_use_numeric_start_identity_and_reject_drift(self) -> None:
+        omp = Path("/bin/sh")
+        helper = Path("/bin/sleep")
+        with tempfile.TemporaryDirectory() as tmp:
+            helper_pid_file = Path(tmp) / "helper.pid"
+            environment = os.environ.copy()
+            environment["HELPER_PID_FILE"] = str(helper_pid_file)
+            process = subprocess.Popen(
+                [
+                    str(omp),
+                    "-c",
+                    f': > "$HELPER_PID_FILE"; sleep 0.05; {helper} 30 & echo $! > "$HELPER_PID_FILE"; wait',
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                env=environment,
+            )
+            try:
+                deadline = time.monotonic() + 3
+                helper_pid_text = ""
+                while time.monotonic() < deadline:
+                    if helper_pid_file.exists():
+                        helper_pid_text = helper_pid_file.read_text(encoding="utf-8").strip()
+                        if helper_pid_text.isdecimal():
+                            break
+                    time.sleep(0.01)
+                self.assertTrue(helper_pid_text.isdecimal(), "helper PID file did not contain a decimal PID before timeout")
+                helper_pid = int(helper_pid_text)
+                launch_omp_identity = spike.capture_executable_file_identity(omp)
+                launch_helper_identity = spike.capture_executable_file_identity(helper)
+                expected = spike.capture_live_process_identity(process.pid)
+                helper_identity = spike.live_process_start_identity(helper_pid)
+                self.assertEqual(helper_identity["parentPID"], process.pid)
+                prefix = "Mon Aug 10 12:34:56 2026"
+                snapshot = (
+                    f'{process.pid} {expected["parentPID"]} {prefix} {omp}\n'
+                    f"{helper_pid} {process.pid} {prefix} {helper}\n"
+                )
+                evidence = spike.inspect_helper_descendant(
+                    process,
+                    omp,
+                    helper,
+                    expected_omp_process_identity=expected,
+                    expected_omp_launch_file_identity=launch_omp_identity,
+                    expected_helper_file_identity=launch_helper_identity,
+                    snapshot_text=snapshot,
+                )
+                self.assertEqual(evidence["ompACPProcess"]["startSeconds"], expected["startSeconds"])
+                self.assertEqual(evidence["ompACPProcess"]["startMicroseconds"], expected["startMicroseconds"])
+                self.assertEqual(evidence["helperProcess"]["startSeconds"], helper_identity["startSeconds"])
+                self.assertNotEqual(evidence["helperProcess"]["pid"], process.pid)
+                with self.assertRaisesRegex(spike.ProbeError, "start identity"):
+                    spike.inspect_helper_descendant(
+                        process,
+                        omp,
+                        helper,
+                        expected_omp_process_identity={
+                            **expected,
+                            "startMicroseconds": expected["startMicroseconds"] + 1,
+                        },
+                        expected_omp_launch_file_identity=launch_omp_identity,
+                        expected_helper_file_identity=launch_helper_identity,
+                        snapshot_text=snapshot,
+                    )
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=2)
 
     def test_production_bootstrap_inspector_failure_still_closes_and_writes_error_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2266,6 +2761,37 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             self.assertEqual(partial["permissionEvents"], [])
             self.assertEqual(partial["unknownUpdateKinds"], [])
             self.assertEqual(partial["unexpectedInboundRequests"]["count"], 0)
+
+            capture_failure_output = root / "capture-failure-evidence"
+            capture_failure_output.mkdir()
+            close_results: list[int | None] = []
+            original_close = spike.JSONLProcess.close
+
+            def tracking_close(process: spike.JSONLProcess) -> None:
+                original_close(process)
+                close_results.append(process.process.poll())
+
+            with (
+                mock.patch.object(
+                    spike,
+                    "capture_live_process_identity",
+                    side_effect=spike.ProbeError("launch identity boom"),
+                ),
+                mock.patch.object(spike.JSONLProcess, "close", new=tracking_close),
+                self.assertRaisesRegex(spike.ProbeError, "launch identity boom"),
+            ):
+                spike.acp_probe(
+                    fake_omp,
+                    self.make_executable(root, "capture-helper", "print('helper')"),
+                    workspace,
+                    capture_failure_output,
+                    "production-bootstrap",
+                    1,
+                    session_open_inspector=lambda _process, _identities: {},
+                )
+            self.assertTrue(close_results)
+            self.assertTrue(all(result is not None for result in close_results))
+            self.assertTrue((capture_failure_output / "omp-acp.stdout.jsonl").exists())
 
     def test_workspace_names_are_bounded_in_success_and_partial_evidence(self) -> None:
         for interrupted in (False, True):

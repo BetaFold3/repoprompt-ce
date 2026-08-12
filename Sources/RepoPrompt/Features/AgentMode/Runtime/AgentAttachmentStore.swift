@@ -34,6 +34,19 @@ struct AgentAttachmentStore {
             .standardizedFileURL
     }
 
+    static func abandonedAttachmentFinalizer(
+        clearConsumedAttachments: Bool,
+        workspaceDirectoryProvider: @escaping () -> URL?
+    ) -> ([AgentImageAttachment]) -> Void {
+        let store = AgentAttachmentStore()
+        return { attachments in
+            guard clearConsumedAttachments, !attachments.isEmpty,
+                  let workspaceDirectory = workspaceDirectoryProvider()?.standardizedFileURL
+            else { return }
+            store.clearConsumedLocalFiles(attachments, workspaceDirectory: workspaceDirectory)
+        }
+    }
+
     func importImageFile(sourceURL: URL, workspaceDirectory: URL) throws -> ImportResult {
         let sourceURL = sourceURL.standardizedFileURL
         guard sourceURL.isFileURL else {

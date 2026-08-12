@@ -580,11 +580,19 @@ actor ServerNetworkManager {
         func test_installQualificationTeardownConnection(
             _ connection: any MCPServerConnection,
             connectionID: UUID,
-            helperPeerPID: Int? = nil
+            helperPeerPID: Int? = nil,
+            helperPeerStartSeconds: Int64? = nil,
+            helperPeerStartMicroseconds: Int32? = nil
         ) {
             connections[connectionID] = connection
             if let helperPeerPID {
                 bootstrapPeerPIDByConnectionID[connectionID] = helperPeerPID
+            }
+            if let helperPeerStartSeconds, let helperPeerStartMicroseconds {
+                debugHelperPeerIdentityByConnectionID[connectionID] = DebugHelperPeerIdentity(
+                    startSeconds: helperPeerStartSeconds,
+                    startMicroseconds: helperPeerStartMicroseconds
+                )
             }
         }
 
@@ -1024,6 +1032,8 @@ actor ServerNetworkManager {
             let qualificationRawNonBookkeepingToolNames: [String]
             let activeToolScopeCount: Int
             let helperPeerPID: Int?
+            let helperPeerStartSeconds: Int64?
+            let helperPeerStartMicroseconds: Int32?
         }
 
         private struct DebugRunRoutingEvent {
@@ -1070,7 +1080,13 @@ actor ServerNetworkManager {
             let executableIdentity: ExecutableFileIdentity?
         }
 
+        private struct DebugHelperPeerIdentity {
+            let startSeconds: Int64
+            let startMicroseconds: Int32
+        }
+
         private var debugExpectedProcessIdentityByRunID: [UUID: [pid_t: DebugExpectedProcessIdentity]] = [:]
+        private var debugHelperPeerIdentityByConnectionID: [UUID: DebugHelperPeerIdentity] = [:]
         private let debugQualificationRawIngress = OMPQualificationRawIngressRecorder()
     #endif
 
@@ -5116,6 +5132,14 @@ actor ServerNetworkManager {
 
         connections[connectionID] = manager
         bootstrapPeerPIDByConnectionID[connectionID] = clientPid
+        #if DEBUG
+            if let peerIdentity = processIdentity(of: pid_t(clientPid)) {
+                debugHelperPeerIdentityByConnectionID[connectionID] = DebugHelperPeerIdentity(
+                    startSeconds: peerIdentity.startSeconds,
+                    startMicroseconds: peerIdentity.startMicroseconds
+                )
+            }
+        #endif
         callLimiters[connectionID] = MCPConnectionCallLimiters(
             limit: limiterLimit(for: connectionID),
             controlLimit: controlLimiterLimit(for: connectionID),
@@ -5561,6 +5585,9 @@ actor ServerNetworkManager {
             connections.removeValue(forKey: id)
             connectionLifecycleGenerationByID.removeValue(forKey: id)
             bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
+            #if DEBUG
+                debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
+            #endif
             connectionTasks.removeValue(forKey: id)
             pendingConnections.removeValue(forKey: id)
             identityContextByConnection.removeValue(forKey: id)
@@ -6464,6 +6491,9 @@ actor ServerNetworkManager {
         connections.removeValue(forKey: id)
         connectionLifecycleGenerationByID.removeValue(forKey: id)
         bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
+        #if DEBUG
+            debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
+        #endif
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -7937,7 +7967,13 @@ actor ServerNetworkManager {
                     qualificationRawNonBookkeepingToolCallCount: rawIngress?.nonBookkeepingCalls ?? 0,
                     qualificationRawNonBookkeepingToolNames: rawIngress?.nonBookkeepingToolNames ?? [],
                     activeToolScopeCount: activeScopeCount,
-                    helperPeerPID: connectionID.flatMap { bootstrapPeerPIDByConnectionID[$0] }
+                    helperPeerPID: connectionID.flatMap { bootstrapPeerPIDByConnectionID[$0] },
+                    helperPeerStartSeconds: connectionID.flatMap {
+                        debugHelperPeerIdentityByConnectionID[$0]?.startSeconds
+                    },
+                    helperPeerStartMicroseconds: connectionID.flatMap {
+                        debugHelperPeerIdentityByConnectionID[$0]?.startMicroseconds
+                    }
                 )
                 debugConnectionHistory.append(entry)
                 if debugConnectionHistory.count > debugConnectionHistoryLimit {
@@ -7982,6 +8018,8 @@ actor ServerNetworkManager {
                     "non_bookkeeping_tool_names": event.qualificationRawNonBookkeepingToolNames,
                     "active_tool_scope_count": event.activeToolScopeCount,
                     "helper_peer_pid": event.helperPeerPID ?? NSNull(),
+                    "helper_peer_start_seconds": event.helperPeerStartSeconds ?? NSNull(),
+                    "helper_peer_start_microseconds": event.helperPeerStartMicroseconds ?? NSNull(),
                     "transport_ingress": event.transportIngress.map(debugTransportIngressObject) ?? NSNull()
                 ]
             }
@@ -8003,6 +8041,8 @@ actor ServerNetworkManager {
                     "last_tool_call_at_ms": entry.lastToolCallAt.map(debugDateMilliseconds) ?? NSNull(),
                     "total_tool_calls": entry.totalToolCalls,
                     "helper_peer_pid": bootstrapPeerPIDByConnectionID[entry.id] ?? NSNull(),
+                    "helper_peer_start_seconds": debugHelperPeerIdentityByConnectionID[entry.id]?.startSeconds ?? NSNull(),
+                    "helper_peer_start_microseconds": debugHelperPeerIdentityByConnectionID[entry.id]?.startMicroseconds ?? NSNull(),
                     "idle_seconds": entry.idleSeconds ?? NSNull(),
                     "has_in_flight_calls": entry.hasInFlightCalls,
                     "active_tool_scope_count": entry.activeToolScopeCount,

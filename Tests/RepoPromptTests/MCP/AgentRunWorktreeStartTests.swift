@@ -2851,6 +2851,119 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
     }
 
     #if DEBUG
+        func testOMPQualificationPredispatchFenceRecordsDualTokenDiscardSequence() async throws {
+            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false)
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            defer {
+                WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false)
+                OhMyPiAgentModeSmokeGate.shared.resetForTesting()
+            }
+
+            let fixture = try makeGitFixture()
+            let window = try await makeWindow(root: fixture.repo)
+            let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let contextID = try XCTUnwrap(workspace.activeComposeTabID)
+            let loadedRoots = await window.promptManager.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+            let logicalRoot = try XCTUnwrap(loadedRoots.first)
+            let sourceLayout = try XCTUnwrap(GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: fixture.repo))
+            let repository = GitWorktreeIdentity.repositoryIdentity(
+                commonGitDir: sourceLayout.commonDir,
+                mainWorktreeRoot: sourceLayout.knownMainWorktreeRoot
+            )
+            let scope = DebugWorktreeStartupBenchmarkScope(
+                windowID: window.windowID,
+                workspaceID: workspace.id,
+                contextID: contextID,
+                rootID: logicalRoot.id
+            )
+            let childBranch = "feature/omp-fenced-\(fixture.suffix)"
+            let expectedStart = DebugWorktreeStartupBenchmarkExpectedStart(
+                rootIdentity: DebugWorktreeStartupBenchmarkRootIdentity(
+                    scope: scope,
+                    standardizedLogicalRootPath: logicalRoot.standardizedFullPath,
+                    repositoryID: repository.repositoryID,
+                    repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: sourceLayout)
+                ),
+                requestedBranch: childBranch,
+                requestedBaseRef: nil
+            )
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+            let control = try diagnostics.setFlags(
+                scope: scope,
+                observe: true,
+                serve: true,
+                forceFullCrawl: false,
+                expiresSeconds: 120
+            )
+            let arm = try diagnostics.arm(
+                expectedStart: expectedStart,
+                controlID: control.controlID,
+                scenario: "omp_predispatch_workspace_fence",
+                invocation: 1,
+                ordinal: 1,
+                warmup: false,
+                expiresSeconds: 120
+            )
+
+            let replacementWorkspace = window.workspaceManager.createWorkspace(
+                name: "OMP Qualification Fence Replacement",
+                repoPaths: [fixture.repo.path],
+                ephemeral: true
+            )
+            let connectionID = UUID()
+            let lease = try OhMyPiAgentModeSmokeGate.shared.acquire(
+                ownerConnectionID: connectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            var service = makeAgentRunStartService(
+                window: window,
+                sourceTabID: nil,
+                connectionID: connectionID
+            )
+            service.testOMPQualificationOwnerVerifier = { candidateConnectionID, pid, _, _ in
+                candidateConnectionID == connectionID && pid == getpid()
+            }
+            service.testBeforeOMPQualificationProviderDispatch = {
+                _ = await window.workspaceManager.switchWorkspace(
+                    to: replacementWorkspace,
+                    saveState: false,
+                    reason: "ompQualificationDualTokenFence"
+                )
+            }
+
+            do {
+                _ = try await service.execute(args: [
+                    "op": .string("start"),
+                    "message": .string("Reject after consuming both private tokens."),
+                    "model_id": .string("ohMyPi:default"),
+                    "workspace_id": .string(workspace.id.uuidString),
+                    "worktree_create": .bool(true),
+                    "worktree_branch": .string(childBranch),
+                    "_worktree_startup_benchmark_token": .string(arm.token.uuidString),
+                    "_omp_qualification_lease_id": .string(lease.leaseID.uuidString)
+                ])
+                XCTFail("Expected the pre-dispatch workspace fence to fail")
+            } catch let error as MCPError {
+                XCTAssertTrue(String(describing: error).contains("workspace_mismatch"), String(describing: error))
+            }
+
+            let recovery = try diagnostics.recoverableStartSnapshot(
+                scope: scope,
+                correlationID: arm.correlationID,
+                controlID: control.controlID
+            )
+            XCTAssertEqual(
+                Array(recovery.phaseHistory.suffix(3)),
+                [.failed, .discardRequested, .discardCompleted]
+            )
+            XCTAssertEqual(recovery.phase, .discardCompleted)
+            XCTAssertEqual(recovery.providerRunActive, false)
+            XCTAssertEqual(recovery.errorCategory, "workspace_mismatch")
+            XCTAssertNil(OhMyPiAgentModeSmokeGate.shared.activeSnapshot())
+        }
+
         func testAgentRunStartFromLoadedLinkedBaseTransportsReceiptThroughAutomaticServing() async throws {
             let fixture = try makeGitFixture()
             let appManagedContainer = GitWorktreeDefaultPathPlanner.defaultContainer(forMainWorktreeRoot: fixture.repo)
@@ -3884,6 +3997,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
     private func makeAgentRunStartService(
         window: WindowState,
         sourceTabID: UUID?,
+        connectionID: UUID? = nil,
         fallbackParentSessionID: UUID? = nil,
         oracleLaunchRoute: AgentRunOracleReviewLaunchRoute? = nil,
         oracleLaunchSourceTabID: UUID? = nil,
@@ -3893,7 +4007,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
-                MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "agent-run-worktree-start", windowID: window.windowID)
+                MCPServerViewModel.RequestMetadata(connectionID: connectionID, clientName: "agent-run-worktree-start", windowID: window.windowID)
             },
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in nil },

@@ -19,6 +19,148 @@
             let runID: UUID?
         }
 
+        struct StartTransaction: Equatable {
+            fileprivate let transactionID: UUID
+            let leaseID: UUID
+            let ownerConnectionID: UUID
+            let sessionID: UUID
+        }
+
+        struct AuthorizedRunReceipt: Equatable {
+            let runID: UUID
+            let activeAgentSessionID: UUID?
+            let runAttemptID: UUID?
+        }
+
+        final class StartAuthorizationReceipt: @unchecked Sendable {
+            enum Outcome: Equatable {
+                case authorized(AuthorizedRunReceipt)
+                case denied
+            }
+
+            private let lock = NSLock()
+            private let authorizationDeadlineUptimeNanoseconds: UInt64?
+            private let monotonicNowNanoseconds: @Sendable () -> UInt64
+            private var outcome: Outcome?
+            private var continuations: [UUID: CheckedContinuation<Outcome, Never>] = [:]
+
+            init(
+                authorizationDeadlineUptimeNanoseconds: UInt64? = nil,
+                monotonicNowNanoseconds: @escaping @Sendable () -> UInt64 = {
+                    DispatchTime.now().uptimeNanoseconds
+                }
+            ) {
+                self.authorizationDeadlineUptimeNanoseconds = authorizationDeadlineUptimeNanoseconds
+                self.monotonicNowNanoseconds = monotonicNowNanoseconds
+            }
+
+            var authorizationStillPermitted: Bool {
+                lock.withLock {
+                    if let outcome {
+                        if case .authorized = outcome { return true }
+                        return false
+                    }
+                    guard let authorizationDeadlineUptimeNanoseconds else { return true }
+                    return monotonicNowNanoseconds() < authorizationDeadlineUptimeNanoseconds
+                }
+            }
+
+            @discardableResult
+            func resolve(_ proposedOutcome: Outcome) -> Outcome {
+                let resolution = lock.withLock { () -> (
+                    effective: Outcome,
+                    continuations: [CheckedContinuation<Outcome, Never>]
+                ) in
+                    if let outcome {
+                        return (outcome, [])
+                    }
+                    let effectiveProposal: Outcome = if case .authorized = proposedOutcome,
+                                                        let authorizationDeadlineUptimeNanoseconds,
+                                                        monotonicNowNanoseconds() >= authorizationDeadlineUptimeNanoseconds
+                    {
+                        .denied
+                    } else {
+                        proposedOutcome
+                    }
+                    outcome = effectiveProposal
+                    let continuations = Array(self.continuations.values)
+                    self.continuations.removeAll()
+                    return (effectiveProposal, continuations)
+                }
+                for continuation in resolution.continuations {
+                    continuation.resume(returning: resolution.effective)
+                }
+                return resolution.effective
+            }
+
+            func wait() async -> Outcome {
+                if let outcome = lock.withLock({ outcome }) {
+                    return outcome
+                }
+                let waiterID = UUID()
+                return await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        let resolved = lock.withLock { () -> Outcome? in
+                            if let outcome { return outcome }
+                            if Task.isCancelled { return .denied }
+                            continuations[waiterID] = continuation
+                            return nil
+                        }
+                        if let resolved {
+                            continuation.resume(returning: resolved)
+                        }
+                    }
+                } onCancel: {
+                    let continuation = self.lock.withLock {
+                        self.continuations.removeValue(forKey: waiterID)
+                    }
+                    continuation?.resume(returning: .denied)
+                }
+            }
+
+            var resolvedOutcome: Outcome? {
+                lock.withLock { outcome }
+            }
+
+            func wait(timeoutNanoseconds: UInt64) async -> Outcome? {
+                await withTaskGroup(of: Outcome?.self) { group in
+                    group.addTask { await self.wait() }
+                    group.addTask {
+                        try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                        return nil
+                    }
+                    let result = await group.next() ?? nil
+                    group.cancelAll()
+                    return result
+                }
+            }
+        }
+
+        final class StartContext: @unchecked Sendable {
+            let transaction: StartTransaction
+            let generationID: UUID
+            let expectedWorkspaceID: UUID
+            let authorizationReceipt: StartAuthorizationReceipt
+
+            init(
+                transaction: StartTransaction,
+                expectedWorkspaceID: UUID,
+                authorizationDeadlineUptimeNanoseconds: UInt64? = nil
+            ) {
+                self.transaction = transaction
+                generationID = transaction.transactionID
+                self.expectedWorkspaceID = expectedWorkspaceID
+                authorizationReceipt = StartAuthorizationReceipt(
+                    authorizationDeadlineUptimeNanoseconds: authorizationDeadlineUptimeNanoseconds
+                )
+            }
+        }
+
+        struct Consumption {
+            let snapshot: Snapshot
+            let transaction: StartTransaction
+        }
+
         enum LeaseError: Error, Equatable {
             case alreadyLeased
             case invalidDuration
@@ -29,10 +171,12 @@
 
         static let shared = OhMyPiAgentModeSmokeGate()
         static let maximumDuration: TimeInterval = 600
+        @TaskLocal static var invocationStartContext: StartContext?
 
         private struct StoredLease {
             var snapshot: Snapshot
             let monotonicDeadlineNanoseconds: UInt64
+            var startTransactionID: UUID?
         }
 
         private let lock = NSLock()
@@ -106,7 +250,11 @@
                     sessionID: nil,
                     runID: nil
                 )
-                lease = StoredLease(snapshot: snapshot, monotonicDeadlineNanoseconds: deadline.partialValue)
+                lease = StoredLease(
+                    snapshot: snapshot,
+                    monotonicDeadlineNanoseconds: deadline.partialValue,
+                    startTransactionID: nil
+                )
                 expiryGeneration &+= 1
                 return (snapshot, expired, expiryGeneration)
             }
@@ -123,7 +271,7 @@
             return result.acquired
         }
 
-        func authorizeProviderStart(sessionID: UUID, runID: UUID) -> Bool {
+        func authorizeProviderStart(transaction: StartTransaction, runID: UUID) -> Bool {
             let now = monotonicNowNanoseconds()
             let outcome = lock.withLock { () -> (authorized: Bool, expired: Snapshot?) in
                 guard var stored = lease else { return (false, nil) }
@@ -133,7 +281,12 @@
                     return (false, stored.snapshot)
                 }
                 let current = stored.snapshot
-                guard current.sessionID == sessionID, current.runID == nil else {
+                guard stored.startTransactionID == transaction.transactionID,
+                      current.leaseID == transaction.leaseID,
+                      current.ownerConnectionID == transaction.ownerConnectionID,
+                      current.sessionID == transaction.sessionID,
+                      current.runID == nil
+                else {
                     return (false, nil)
                 }
                 stored.snapshot = Snapshot(
@@ -143,7 +296,7 @@
                     ownerProcessStartSeconds: current.ownerProcessStartSeconds,
                     ownerProcessStartMicroseconds: current.ownerProcessStartMicroseconds,
                     expiresAt: current.expiresAt,
-                    sessionID: sessionID,
+                    sessionID: transaction.sessionID,
                     runID: runID
                 )
                 lease = stored
@@ -169,8 +322,22 @@
             ownerProcessID: Int32,
             sessionID: UUID
         ) throws -> Snapshot {
+            try consumeStartTransaction(
+                leaseID: leaseID,
+                ownerConnectionID: ownerConnectionID,
+                ownerProcessID: ownerProcessID,
+                sessionID: sessionID
+            ).snapshot
+        }
+
+        func consumeStartTransaction(
+            leaseID: UUID,
+            ownerConnectionID: UUID,
+            ownerProcessID: Int32,
+            sessionID: UUID
+        ) throws -> Consumption {
             let now = monotonicNowNanoseconds()
-            let outcome = lock.withLock { () -> (result: Result<Snapshot, LeaseError>, expired: Snapshot?) in
+            let outcome = lock.withLock { () -> (result: Result<Consumption, LeaseError>, expired: Snapshot?) in
                 guard var stored = lease else { return (.failure(.expired), nil) }
                 guard now < stored.monotonicDeadlineNanoseconds else {
                     lease = nil
@@ -194,9 +361,16 @@
                     sessionID: sessionID,
                     runID: nil
                 )
+                let transaction = StartTransaction(
+                    transactionID: UUID(),
+                    leaseID: current.leaseID,
+                    ownerConnectionID: ownerConnectionID,
+                    sessionID: sessionID
+                )
                 stored.snapshot = updated
+                stored.startTransactionID = transaction.transactionID
                 lease = stored
-                return (.success(updated), nil)
+                return (.success(Consumption(snapshot: updated, transaction: transaction)), nil)
             }
             if let expired = outcome.expired {
                 completeExpiredRemoval(expired)
@@ -268,6 +442,51 @@
             return released
         }
 
+        /// Rolls back only the exact qualification start phase observed by this transaction.
+        /// A concurrent consume/bind or a later lease generation makes the comparison fail.
+        @discardableResult
+        func rollbackStartTransaction(ifCurrent expected: Snapshot) -> Snapshot? {
+            let released = lock.withLock { () -> Snapshot? in
+                guard let stored = lease, stored.snapshot == expected else { return nil }
+                lease = nil
+                expiryGeneration &+= 1
+                return stored.snapshot
+            }
+            if let released {
+                publishChange()
+                cancelBoundRunIfNeeded(released, reason: "qualification_start_rollback")
+            }
+            return released
+        }
+
+        /// Removes the current snapshot owned by the exact consumed start transaction.
+        /// Provider authorization may add a run ID, but another lease generation or session
+        /// cannot match this private transaction identity.
+        @discardableResult
+        func rollbackConsumedStartTransaction(
+            _ transaction: StartTransaction,
+            cancelBoundRun: Bool = true
+        ) -> Snapshot? {
+            let released = lock.withLock { () -> Snapshot? in
+                guard let stored = lease,
+                      stored.startTransactionID == transaction.transactionID,
+                      stored.snapshot.leaseID == transaction.leaseID,
+                      stored.snapshot.ownerConnectionID == transaction.ownerConnectionID,
+                      stored.snapshot.sessionID == transaction.sessionID
+                else { return nil }
+                lease = nil
+                expiryGeneration &+= 1
+                return stored.snapshot
+            }
+            if let released {
+                publishChange()
+                if cancelBoundRun {
+                    cancelBoundRunIfNeeded(released, reason: "qualification_consumed_start_rollback")
+                }
+            }
+            return released
+        }
+
         @discardableResult
         func releaseOwned(by ownerConnectionID: UUID) -> Snapshot? {
             let released = lock.withLock { () -> Snapshot? in
@@ -308,7 +527,11 @@
                     sessionID: snapshot.sessionID,
                     runID: snapshot.runID
                 )
-                lease = StoredLease(snapshot: current.snapshot, monotonicDeadlineNanoseconds: 0)
+                lease = StoredLease(
+                    snapshot: current.snapshot,
+                    monotonicDeadlineNanoseconds: 0,
+                    startTransactionID: current.startTransactionID
+                )
                 expiryGeneration &+= 1
             }
         }

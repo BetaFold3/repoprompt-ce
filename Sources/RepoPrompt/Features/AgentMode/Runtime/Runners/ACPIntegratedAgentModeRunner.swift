@@ -15,6 +15,82 @@ final class ACPIntegratedAgentModeRunner {
         let errorText: String?
     }
 
+    private enum MCPBootstrapLeaseDisposition {
+        case none
+        case failAndRelease
+        case failAndCleanup
+        case cancelAndCleanup
+        case cleanupDeferredRouting
+
+        init(terminalState: AgentSessionRunState, agentKind: AgentProviderKind) {
+            switch terminalState {
+            case .failed:
+                self = agentKind.requiresPrePromptAgentModeMCPRouting ? .failAndRelease : .failAndCleanup
+            case .cancelled:
+                self = .cancelAndCleanup
+            case .completed:
+                self = agentKind.requiresPrePromptAgentModeMCPRouting ? .none : .cleanupDeferredRouting
+            default:
+                self = .none
+            }
+        }
+
+        func apply(to lease: MCPBootstrapLease?) async {
+            switch self {
+            case .none:
+                break
+            case .failAndRelease:
+                await lease?.failAndRelease()
+            case .failAndCleanup:
+                await lease?.failAndCleanup()
+            case .cancelAndCleanup:
+                await lease?.cancelAndCleanup()
+            case .cleanupDeferredRouting:
+                await lease?.cleanupDeferredRouting()
+            }
+        }
+    }
+
+    private final class WeakTabSession {
+        weak var value: AgentModeViewModel.TabSession?
+
+        init(_ value: AgentModeViewModel.TabSession) {
+            self.value = value
+        }
+    }
+
+    private final class StartupTeardownClaim: @unchecked Sendable {
+        private let lock = NSLock()
+        private var teardownTask: Task<Void, Never>?
+        private var promptStarted = false
+
+        func markPromptStartedIfUnclaimed() -> Bool {
+            lock.withLock {
+                guard teardownTask == nil else { return false }
+                promptStarted = true
+                return true
+            }
+        }
+
+        @discardableResult
+        func claim(
+            onlyBeforePrompt: Bool = false,
+            operation: @escaping @Sendable () async -> Void
+        ) -> Task<Void, Never>? {
+            lock.withLock {
+                if let teardownTask { return teardownTask }
+                if onlyBeforePrompt, promptStarted { return nil }
+                let task = Task { await operation() }
+                teardownTask = task
+                return task
+            }
+        }
+
+        var task: Task<Void, Never>? {
+            lock.withLock { teardownTask }
+        }
+    }
+
     private let hooks: AgentModeRunService.Hooks
     private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
@@ -24,6 +100,24 @@ final class ACPIntegratedAgentModeRunner {
     private var toolTrackingRunIDByTabID: [UUID: UUID] = [:]
     private var acpProviderInvocationByTrackerInvocationIDByTabID: [UUID: [UUID: UUID]] = [:]
     private var acpProviderPlaceholderInvocationIDsByTabID: [UUID: Set<UUID>] = [:]
+    #if DEBUG
+        struct OMPQualificationStartupProbes {
+            var beforeAgentTaskEntry: () async -> Void = {}
+            var duringExpectedMCPRunIDSet: (() async -> Void)?
+            var beforeAuthorizationLivenessCheck: () async -> Void = {}
+            var afterProviderBootstrap: () async -> Void = {}
+            var afterProviderInitializationCompleted: () async -> Void = {}
+            var beforePromptStartClaim: () async -> Void = {}
+            var beforeGenericStartupFailureTeardown: () async -> Void = {}
+            var toolTrackingStopped: (UUID) -> Void = { _ in }
+        }
+
+        private var ompQualificationStartupProbes = OMPQualificationStartupProbes()
+
+        func installOMPQualificationStartupProbes(_ probes: OMPQualificationStartupProbes) {
+            ompQualificationStartupProbes = probes
+        }
+    #endif
 
     private func log(_ message: String, runID: UUID) {
         guard AgentRuntimeProviderService.enableDebugLogging else { return }
@@ -97,8 +191,23 @@ final class ACPIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         runRequest: ACPRunRequest,
         makeLease: @escaping (_ runID: UUID) -> MCPBootstrapLease,
-        providerStartAuthorizer: (_ runID: UUID) -> Bool
+        providerStartAuthorizer: @escaping (_ runID: UUID) -> Bool,
+        providerStartBoundaryReporter: @escaping (
+            _ runID: UUID?,
+            _ activeAgentSessionID: UUID?,
+            _ runAttemptID: UUID?,
+            _ authorized: Bool
+        ) -> Bool,
+        providerStartBootstrapObserver: @escaping () -> Void
     ) async {
+        #if DEBUG
+            var providerBoundaryResponsibilityTransferred = false
+            defer {
+                if !providerBoundaryResponsibilityTransferred {
+                    _ = providerStartBoundaryReporter(nil, nil, nil, false)
+                }
+            }
+        #endif
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
         if initialMessageForRun != initialUserMessage,
@@ -130,6 +239,9 @@ final class ACPIntegratedAgentModeRunner {
             {
                 guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
                 guard providerStartAuthorizer(runID) else {
+                    #if DEBUG
+                        _ = providerStartBoundaryReporter(runID, session.activeAgentSessionID, runAttemptID, false)
+                    #endif
                     await failBeforeProviderSend(
                         tabID: tabID,
                         session: session,
@@ -140,6 +252,24 @@ final class ACPIntegratedAgentModeRunner {
                     )
                     return
                 }
+                #if DEBUG
+                    guard providerStartBoundaryReporter(
+                        runID,
+                        session.activeAgentSessionID,
+                        runAttemptID,
+                        true
+                    ) else {
+                        await failBeforeProviderSend(
+                            tabID: tabID,
+                            session: session,
+                            runID: runID,
+                            runAttemptID: runAttemptID,
+                            attachmentReservationID: attachmentReservationID,
+                            errorText: Self.ohMyPiAuthorizationFailureText
+                        )
+                        return
+                    }
+                #endif
                 let deferredLease = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
                     ? nil
                     : makeLease(runID)
@@ -147,16 +277,10 @@ final class ACPIntegratedAgentModeRunner {
                     let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
                     return {
                         await trackerTeardown?()
-                        switch terminalState {
-                        case .failed:
-                            await deferredLease?.failAndCleanup()
-                        case .cancelled:
-                            await deferredLease?.cancelAndCleanup()
-                        case .completed:
-                            await deferredLease?.cleanupDeferredRouting()
-                        default:
-                            break
-                        }
+                        await MCPBootstrapLeaseDisposition(
+                            terminalState: terminalState,
+                            agentKind: runRequest.agentKind
+                        ).apply(to: deferredLease)
                     }
                 }
                 session.agentTask = Task { [weak self, weak session] in
@@ -189,17 +313,6 @@ final class ACPIntegratedAgentModeRunner {
         }
         let runID = AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
-        guard providerStartAuthorizer(runID) else {
-            await failBeforeProviderSend(
-                tabID: tabID,
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                attachmentReservationID: attachmentReservationID,
-                errorText: Self.ohMyPiAuthorizationFailureText
-            )
-            return
-        }
         let lease = makeLease(runID)
 
         guard let provider = providerFactory(runRequest.agentKind, runRequest.modelString) else {
@@ -262,40 +375,121 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
 
-        await controller.setExpectedMCPRunID(runID)
+        #if DEBUG
+            await controller.setExpectedMCPRunID(
+                runID,
+                testDuringSet: runRequest.agentKind == .ohMyPi
+                    ? ompQualificationStartupProbes.duringExpectedMCPRunIDSet
+                    : nil
+            )
+        #else
+            await controller.setExpectedMCPRunID(runID)
+        #endif
+        let ownsUnpublishedControllerSlot = session.acpController == nil || session.acpController === controller
+        let ownsCurrentAttempt = isStartupStillCurrent(
+            session: session,
+            runID: runID,
+            runAttemptID: runAttemptID
+        ) && ownsUnpublishedControllerSlot
+        guard !Task.isCancelled, ownsCurrentAttempt else {
+            await finalizeUnpublishedControllerStartup(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
+                lease: lease,
+                attachments: attachments,
+                attachmentReservationID: attachmentReservationID,
+                ownsCurrentAttempt: ownsCurrentAttempt,
+                providerStartBoundaryReporter: providerStartBoundaryReporter
+            )
+            return
+        }
         session.acpController = controller
-        let requiresPrePromptMCPRouting = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
-        session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
-            let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
+        #if DEBUG
+            if runRequest.agentKind == .ohMyPi {
+                session.ompQualificationStartupLease = lease
+            }
+        #endif
+        session.installRunAttemptTerminalResources(ownership: ownership) { [weak self, weak session] terminalState in
+            let trackerTeardown = session.flatMap { self?.prepareToolTrackingTeardown(for: $0, matchingRunID: runID) }
             return {
                 await trackerTeardown?()
-                switch terminalState {
-                case .failed:
-                    if requiresPrePromptMCPRouting {
-                        await lease.failAndRelease()
-                    } else {
-                        await lease.failAndCleanup()
+                await MCPBootstrapLeaseDisposition(
+                    terminalState: terminalState,
+                    agentKind: runRequest.agentKind
+                ).apply(to: lease)
+                #if DEBUG
+                    if session?.ompQualificationStartupLease === lease {
+                        session?.ompQualificationStartupLease = nil
                     }
-                case .cancelled:
-                    await lease.cancelAndCleanup()
-                case .completed:
-                    if !requiresPrePromptMCPRouting {
-                        await lease.cleanupDeferredRouting()
-                    }
-                default:
-                    break
-                }
+                #endif
             }
         }
-        session.agentTask = Task { [weak self, weak session] in
-            guard let self, let session else { return }
+        #if DEBUG
+            providerBoundaryResponsibilityTransferred = true
+        #endif
+        let weakSession = WeakTabSession(session)
+        #if DEBUG
+            let beforeAgentTaskEntry = ompQualificationStartupProbes.beforeAgentTaskEntry
+        #endif
+        let terminalCommitBarrier = terminalCommitBarrier
+        let hooks = hooks
+        let startupTeardownClaim = StartupTeardownClaim()
+        session.agentTask = Task { [weak self] in
+            #if DEBUG
+                if runRequest.agentKind == .ohMyPi {
+                    await beforeAgentTaskEntry()
+                }
+            #endif
+            guard let self else {
+                #if DEBUG
+                    _ = providerStartBoundaryReporter(runID, nil, runAttemptID, false)
+                #endif
+                if let session = weakSession.value,
+                   let currentOwnership = session.activeRunOwnership,
+                   currentOwnership.attemptID == runAttemptID,
+                   session.runID == runID,
+                   session.acpController == nil || session.acpController === controller
+                {
+                    hooks.recordPendingHandoffSendOutcome(session, false)
+                    await terminalCommitBarrier.commit(.init(
+                        session: session,
+                        ownership: currentOwnership,
+                        expectedRunID: runID,
+                        terminalState: .failed,
+                        source: "acp.runnerReleasedBeforeTaskEntry",
+                        completion: .terminalTeardownCompleted,
+                        errorText: Self.ohMyPiAuthorizationFailureText,
+                        attachmentReservationID: attachmentReservationID,
+                        attachmentDisposition: .deleteFiles,
+                        finalizeNonCodexUsage: true,
+                        supportsFollowUp: false,
+                        notifyTurnComplete: false,
+                        prepareProviderState: {
+                            if session.acpController === controller {
+                                session.acpController = nil
+                            }
+                            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                            return { await controller.shutdown() }
+                        }
+                    ))
+                } else {
+                    hooks.finalizeAbandonedAttachmentsForTurn(attachments)
+                    await lease.failAndCleanup()
+                    await controller.shutdown()
+                }
+                return
+            }
             if let clientNameHint = runRequest.agentKind.mcpClientNameHint {
-                await startToolTracking(for: session, runID: runID, clientNameHint: clientNameHint)
+                if let session = weakSession.value {
+                    await startToolTracking(for: session, runID: runID, clientNameHint: clientNameHint)
+                }
             }
             await withTaskCancellationHandler {
                 await self.startFreshRun(
                     tabID: tabID,
-                    session: session,
+                    session: weakSession,
                     runID: runID,
                     runAttemptID: runAttemptID,
                     initialMessageForRun: initialMessageForRun,
@@ -303,9 +497,34 @@ final class ACPIntegratedAgentModeRunner {
                     controller: controller,
                     runRequest: freshRunRequest,
                     lease: lease,
-                    attachmentReservationID: attachmentReservationID
+                    providerStartAuthorizer: providerStartAuthorizer,
+                    providerStartBoundaryReporter: providerStartBoundaryReporter,
+                    providerStartBootstrapObserver: providerStartBootstrapObserver,
+                    attachmentReservationID: attachmentReservationID,
+                    startupTeardownClaim: startupTeardownClaim
                 )
-            } onCancel: {}
+            } onCancel: { [weak self] in
+                guard freshRunRequest.agentKind == .ohMyPi else { return }
+                // OMP bootstrap may not promptly cooperate with cancellation. The same
+                // one-shot task is joined below and claimed by in-body cancellation paths.
+                _ = startupTeardownClaim.claim(onlyBeforePrompt: true) { @MainActor [weak self] in
+                    guard let self else { return }
+                    await finalizeStartupDisposition(
+                        tabID: tabID,
+                        session: weakSession,
+                        runID: runID,
+                        runAttemptID: runAttemptID,
+                        lease: lease,
+                        attachments: attachments,
+                        attachmentReservationID: attachmentReservationID,
+                        controller: controller,
+                        runRequest: freshRunRequest,
+                        terminalState: .cancelled,
+                        errorText: nil
+                    )
+                }
+            }
+            await startupTeardownClaim.task?.value
         }
     }
 
@@ -415,6 +634,49 @@ final class ACPIntegratedAgentModeRunner {
         return true
     }
 
+    private func finalizeUnpublishedControllerStartup(
+        session: AgentModeViewModel.TabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        controller: ACPAgentSessionController,
+        lease: MCPBootstrapLease,
+        attachments: [AgentImageAttachment],
+        attachmentReservationID: UUID?,
+        ownsCurrentAttempt: Bool,
+        providerStartBoundaryReporter: (
+            _ runID: UUID?,
+            _ activeAgentSessionID: UUID?,
+            _ runAttemptID: UUID?,
+            _ authorized: Bool
+        ) -> Bool
+    ) async {
+        #if DEBUG
+            _ = providerStartBoundaryReporter(
+                runID,
+                session.activeAgentSessionID,
+                runAttemptID,
+                false
+            )
+        #endif
+        if ownsCurrentAttempt {
+            await cancelBeforeProviderSend(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                attachmentReservationID: attachmentReservationID
+            )
+        } else {
+            hooks.finalizeAttachmentsForTurn(
+                session,
+                attachmentReservationID,
+                attachments,
+                .deleteFiles
+            )
+        }
+        await lease.cancelAndCleanup()
+        await controller.shutdown()
+    }
+
     private func failBeforeProviderSend(
         tabID _: UUID,
         session: AgentModeViewModel.TabSession,
@@ -478,9 +740,263 @@ final class ACPIntegratedAgentModeRunner {
         ))
     }
 
+    private struct StartupBoundarySnapshot {
+        let activeAgentSessionID: UUID?
+    }
+
+    private enum StartupBoundaryStage: Equatable {
+        case beforeAuthorization
+        case beforeBootstrap
+        case afterBootstrap
+        case afterProviderInitializationCompleted
+
+        var reportsProviderInitializationCancellation: Bool {
+            self != .afterProviderInitializationCompleted
+        }
+
+        var reportsProviderBoundaryFailure: Bool {
+            self == .beforeBootstrap
+        }
+    }
+
+    private enum StartupBoundaryOutcome {
+        case current(StartupBoundarySnapshot)
+        case cancelled(StartupBoundaryStage)
+    }
+
+    private func revalidateStartupBoundary(
+        _ stage: StartupBoundaryStage,
+        session: WeakTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        controller: ACPAgentSessionController
+    ) -> StartupBoundaryOutcome {
+        guard let snapshot = startupBoundarySnapshot(
+            session: session,
+            runID: runID,
+            runAttemptID: runAttemptID,
+            controller: controller
+        ) else {
+            return .cancelled(stage)
+        }
+        return .current(snapshot)
+    }
+
+    private func reportInvalidStartupBoundaryIfNeeded(
+        _ stage: StartupBoundaryStage,
+        runID: UUID,
+        runAttemptID: UUID,
+        providerStartBoundaryReporter: (
+            _ runID: UUID?,
+            _ activeAgentSessionID: UUID?,
+            _ runAttemptID: UUID?,
+            _ authorized: Bool
+        ) -> Bool
+    ) -> Bool {
+        #if DEBUG
+            guard stage.reportsProviderBoundaryFailure else { return false }
+            _ = providerStartBoundaryReporter(runID, nil, runAttemptID, false)
+            return true
+        #else
+            return false
+        #endif
+    }
+
+    private func finalizeInvalidStartupBoundary(
+        _ stage: StartupBoundaryStage,
+        tabID: UUID,
+        session: WeakTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        providerName: String,
+        lease: MCPBootstrapLease,
+        attachments: [AgentImageAttachment],
+        attachmentReservationID: UUID?,
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest,
+        startupTeardownClaim: StartupTeardownClaim
+    ) async {
+        if stage.reportsProviderInitializationCancellation {
+            await lease.providerInitializationCompleted(provider: providerName, outcome: "cancelled")
+        }
+        await finalizeStartupBoundaryCancellation(
+            tabID: tabID,
+            session: session,
+            runID: runID,
+            runAttemptID: runAttemptID,
+            lease: lease,
+            attachments: attachments,
+            attachmentReservationID: attachmentReservationID,
+            controller: controller,
+            runRequest: runRequest,
+            startupTeardownClaim: startupTeardownClaim
+        )
+    }
+
+    private func startupBoundarySnapshot(
+        session: WeakTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        controller: ACPAgentSessionController
+    ) -> StartupBoundarySnapshot? {
+        guard !Task.isCancelled,
+              let session = session.value,
+              isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
+              session.acpController === controller
+        else {
+            return nil
+        }
+        return StartupBoundarySnapshot(activeAgentSessionID: session.activeAgentSessionID)
+    }
+
+    private func finalizeAfterSessionLoss(
+        tabID: UUID,
+        session: WeakTabSession,
+        runID: UUID,
+        lease: MCPBootstrapLease,
+        attachments: [AgentImageAttachment],
+        attachmentReservationID: UUID?,
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest,
+        terminalState: AgentSessionRunState
+    ) async {
+        await teardownToolTrackingAfterSessionLoss(tabID: tabID, runID: runID)
+        if let liveSession = session.value {
+            hooks.finalizeAttachmentsForTurn(
+                liveSession,
+                attachmentReservationID,
+                attachments,
+                .deleteFiles
+            )
+        } else {
+            hooks.finalizeAbandonedAttachmentsForTurn(attachments)
+        }
+        await MCPBootstrapLeaseDisposition(
+            terminalState: terminalState,
+            agentKind: runRequest.agentKind
+        ).apply(to: lease)
+        await controller.shutdown()
+    }
+
+    private func finalizeClaimedStartupDisposition(
+        tabID: UUID,
+        session: WeakTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        lease: MCPBootstrapLease,
+        attachments: [AgentImageAttachment],
+        attachmentReservationID: UUID?,
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest,
+        terminalState: AgentSessionRunState,
+        errorText: String?,
+        startupTeardownClaim: StartupTeardownClaim
+    ) async {
+        let task = startupTeardownClaim.claim { @MainActor [weak self] in
+            guard let self else { return }
+            await finalizeStartupDisposition(
+                tabID: tabID,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                lease: lease,
+                attachments: attachments,
+                attachmentReservationID: attachmentReservationID,
+                controller: controller,
+                runRequest: runRequest,
+                terminalState: terminalState,
+                errorText: errorText
+            )
+        }
+        await task?.value
+    }
+
+    private func finalizeStartupBoundaryCancellation(
+        tabID: UUID,
+        session: WeakTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        lease: MCPBootstrapLease,
+        attachments: [AgentImageAttachment],
+        attachmentReservationID: UUID?,
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest,
+        startupTeardownClaim: StartupTeardownClaim
+    ) async {
+        await finalizeClaimedStartupDisposition(
+            tabID: tabID,
+            session: session,
+            runID: runID,
+            runAttemptID: runAttemptID,
+            lease: lease,
+            attachments: attachments,
+            attachmentReservationID: attachmentReservationID,
+            controller: controller,
+            runRequest: runRequest,
+            terminalState: .cancelled,
+            errorText: nil,
+            startupTeardownClaim: startupTeardownClaim
+        )
+    }
+
+    private func finalizeStartupDisposition(
+        tabID: UUID,
+        session: WeakTabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        lease: MCPBootstrapLease,
+        attachments: [AgentImageAttachment],
+        attachmentReservationID: UUID?,
+        controller: ACPAgentSessionController,
+        runRequest: ACPRunRequest,
+        terminalState: AgentSessionRunState,
+        errorText: String?
+    ) async {
+        if let liveSession = session.value,
+           isStartupStillCurrent(session: liveSession, runID: runID, runAttemptID: runAttemptID),
+           liveSession.acpController == nil || liveSession.acpController === controller
+        {
+            await finalize(
+                session: liveSession,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
+                attachmentReservationID: attachmentReservationID,
+                terminalState: terminalState,
+                errorText: errorText,
+                notifyTurnComplete: false,
+                shouldShutdownController: true,
+                completion: .terminalTeardownCompleted
+            )
+            return
+        }
+        await finalizeAfterSessionLoss(
+            tabID: tabID,
+            session: session,
+            runID: runID,
+            lease: lease,
+            attachments: attachments,
+            attachmentReservationID: attachmentReservationID,
+            controller: controller,
+            runRequest: runRequest,
+            terminalState: terminalState
+        )
+    }
+
+    private func finalizeAcquireFailureAfterSessionLoss(
+        tabID: UUID,
+        runID: UUID,
+        attachments: [AgentImageAttachment],
+        controller: ACPAgentSessionController
+    ) async {
+        await teardownToolTrackingAfterSessionLoss(tabID: tabID, runID: runID)
+        hooks.finalizeAbandonedAttachmentsForTurn(attachments)
+        await controller.shutdown()
+    }
+
     private func startFreshRun(
         tabID: UUID,
-        session: AgentModeViewModel.TabSession,
+        session: WeakTabSession,
         runID: UUID,
         runAttemptID: UUID,
         initialMessageForRun: String,
@@ -488,8 +1004,25 @@ final class ACPIntegratedAgentModeRunner {
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
         lease: MCPBootstrapLease,
-        attachmentReservationID: UUID?
+        providerStartAuthorizer: (_ runID: UUID) -> Bool,
+        providerStartBoundaryReporter: (
+            _ runID: UUID?,
+            _ activeAgentSessionID: UUID?,
+            _ runAttemptID: UUID?,
+            _ authorized: Bool
+        ) -> Bool,
+        providerStartBootstrapObserver: () -> Void,
+        attachmentReservationID: UUID?,
+        startupTeardownClaim: StartupTeardownClaim
     ) async {
+        #if DEBUG
+            var providerBoundaryReported = false
+            defer {
+                if !providerBoundaryReported {
+                    _ = providerStartBoundaryReporter(runID, nil, runAttemptID, false)
+                }
+            }
+        #endif
         let modelDescription = runRequest.modelString ?? "default"
         let resumeDescription = runRequest.resumeSessionID ?? "nil"
         let workspaceDescription = runRequest.workspacePath ?? "nil"
@@ -497,15 +1030,29 @@ final class ACPIntegratedAgentModeRunner {
         let acquired = await lease.acquire()
         guard acquired else {
             log("lease acquire failed", runID: runID)
-            await handleAcquireFailure(
-                tabID: tabID,
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                controller: controller,
-                lease: lease,
-                attachmentReservationID: attachmentReservationID
-            )
+            let teardown = startupTeardownClaim.claim { @MainActor [self] in
+                if let liveSession = session.value {
+                    await handleAcquireFailure(
+                        tabID: tabID,
+                        session: liveSession,
+                        runID: runID,
+                        runAttemptID: runAttemptID,
+                        controller: controller,
+                        lease: lease,
+                        attachmentReservationID: attachmentReservationID
+                    )
+                } else {
+                    // acquire() owns its failure cleanup. This branch must not apply a second
+                    // generic lease disposition that could be mistaken for gate ownership.
+                    await finalizeAcquireFailureAfterSessionLoss(
+                        tabID: tabID,
+                        runID: runID,
+                        attachments: attachments,
+                        controller: controller
+                    )
+                }
+            }
+            await teardown?.value
             return
         }
 
@@ -513,15 +1060,228 @@ final class ACPIntegratedAgentModeRunner {
         do {
             let providerName = runRequest.agentKind.rawValue
             await lease.providerInitializationStarted(provider: providerName)
+            #if DEBUG
+                if runRequest.agentKind == .ohMyPi {
+                    await ompQualificationStartupProbes.beforeAuthorizationLivenessCheck()
+                }
+            #endif
+            if case let .cancelled(stage) = revalidateStartupBoundary(
+                .beforeAuthorization,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller
+            ) {
+                let reportedProviderBoundaryFailure = reportInvalidStartupBoundaryIfNeeded(
+                    stage,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    providerStartBoundaryReporter: providerStartBoundaryReporter
+                )
+                #if DEBUG
+                    providerBoundaryReported = providerBoundaryReported || reportedProviderBoundaryFailure
+                #else
+                    _ = reportedProviderBoundaryFailure
+                #endif
+                await finalizeInvalidStartupBoundary(
+                    stage,
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    providerName: providerName,
+                    lease: lease,
+                    attachments: attachments,
+                    attachmentReservationID: attachmentReservationID,
+                    controller: controller,
+                    runRequest: runRequest,
+                    startupTeardownClaim: startupTeardownClaim
+                )
+                return
+            }
+            guard providerStartAuthorizer(runID) else {
+                #if DEBUG
+                    providerBoundaryReported = true
+                    _ = providerStartBoundaryReporter(runID, session.value?.activeAgentSessionID, runAttemptID, false)
+                #endif
+                await lease.providerInitializationCompleted(provider: providerName, outcome: "failed")
+                await finalizeClaimedStartupDisposition(
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    lease: lease,
+                    attachments: attachments,
+                    attachmentReservationID: attachmentReservationID,
+                    controller: controller,
+                    runRequest: runRequest,
+                    terminalState: .failed,
+                    errorText: Self.ohMyPiAuthorizationFailureText,
+                    startupTeardownClaim: startupTeardownClaim
+                )
+                return
+            }
+            let boundarySnapshot: StartupBoundarySnapshot
+            switch revalidateStartupBoundary(
+                .beforeBootstrap,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller
+            ) {
+            case let .current(snapshot):
+                boundarySnapshot = snapshot
+            case let .cancelled(stage):
+                let reportedProviderBoundaryFailure = reportInvalidStartupBoundaryIfNeeded(
+                    stage,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    providerStartBoundaryReporter: providerStartBoundaryReporter
+                )
+                #if DEBUG
+                    providerBoundaryReported = providerBoundaryReported || reportedProviderBoundaryFailure
+                #else
+                    _ = reportedProviderBoundaryFailure
+                #endif
+                await finalizeInvalidStartupBoundary(
+                    stage,
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    providerName: providerName,
+                    lease: lease,
+                    attachments: attachments,
+                    attachmentReservationID: attachmentReservationID,
+                    controller: controller,
+                    runRequest: runRequest,
+                    startupTeardownClaim: startupTeardownClaim
+                )
+                return
+            }
             log("bootstrap begin", runID: runID)
+            #if DEBUG
+                providerBoundaryReported = true
+                guard providerStartBoundaryReporter(
+                    runID,
+                    boundarySnapshot.activeAgentSessionID,
+                    runAttemptID,
+                    true
+                ) else {
+                    await lease.providerInitializationCompleted(provider: providerName, outcome: "failed")
+                    await finalizeClaimedStartupDisposition(
+                        tabID: tabID,
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID,
+                        lease: lease,
+                        attachments: attachments,
+                        attachmentReservationID: attachmentReservationID,
+                        controller: controller,
+                        runRequest: runRequest,
+                        terminalState: .failed,
+                        errorText: Self.ohMyPiAuthorizationFailureText,
+                        startupTeardownClaim: startupTeardownClaim
+                    )
+                    return
+                }
+                providerStartBootstrapObserver()
+            #endif
             let bootstrap = try await controller.bootstrap()
+            #if DEBUG
+                if runRequest.agentKind == .ohMyPi {
+                    await ompQualificationStartupProbes.afterProviderBootstrap()
+                }
+            #endif
+            if case let .cancelled(stage) = revalidateStartupBoundary(
+                .afterBootstrap,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller
+            ) {
+                let reportedProviderBoundaryFailure = reportInvalidStartupBoundaryIfNeeded(
+                    stage,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    providerStartBoundaryReporter: providerStartBoundaryReporter
+                )
+                #if DEBUG
+                    providerBoundaryReported = providerBoundaryReported || reportedProviderBoundaryFailure
+                #else
+                    _ = reportedProviderBoundaryFailure
+                #endif
+                await finalizeInvalidStartupBoundary(
+                    stage,
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    providerName: providerName,
+                    lease: lease,
+                    attachments: attachments,
+                    attachmentReservationID: attachmentReservationID,
+                    controller: controller,
+                    runRequest: runRequest,
+                    startupTeardownClaim: startupTeardownClaim
+                )
+                return
+            }
             providerInitializationCompleted = true
             await lease.providerInitializationCompleted(provider: providerName, outcome: "ready")
+            #if DEBUG
+                if runRequest.agentKind == .ohMyPi {
+                    await ompQualificationStartupProbes.afterProviderInitializationCompleted()
+                }
+            #endif
+            if case let .cancelled(stage) = revalidateStartupBoundary(
+                .afterProviderInitializationCompleted,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller
+            ) {
+                let reportedProviderBoundaryFailure = reportInvalidStartupBoundaryIfNeeded(
+                    stage,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    providerStartBoundaryReporter: providerStartBoundaryReporter
+                )
+                #if DEBUG
+                    providerBoundaryReported = providerBoundaryReported || reportedProviderBoundaryFailure
+                #else
+                    _ = reportedProviderBoundaryFailure
+                #endif
+                await finalizeInvalidStartupBoundary(
+                    stage,
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    providerName: providerName,
+                    lease: lease,
+                    attachments: attachments,
+                    attachmentReservationID: attachmentReservationID,
+                    controller: controller,
+                    runRequest: runRequest,
+                    startupTeardownClaim: startupTeardownClaim
+                )
+                return
+            }
             log("bootstrap completed sessionID=\(bootstrap.sessionID)", runID: runID)
-            guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID
-            else {
-                await controller.shutdown()
+            guard let session = session.value else {
+                await finalizeStartupBoundaryCancellation(
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    lease: lease,
+                    attachments: attachments,
+                    attachmentReservationID: attachmentReservationID,
+                    controller: controller,
+                    runRequest: runRequest,
+                    startupTeardownClaim: startupTeardownClaim
+                )
                 return
             }
             var initialMessageForPromptTurn = initialMessageForRun
@@ -566,6 +1326,15 @@ final class ACPIntegratedAgentModeRunner {
                 log("deferred MCP routing until ACP prompt", runID: runID)
             }
 
+            #if DEBUG
+                if runRequest.agentKind == .ohMyPi {
+                    await ompQualificationStartupProbes.beforePromptStartClaim()
+                }
+            #endif
+            guard startupTeardownClaim.markPromptStartedIfUnclaimed() else {
+                await startupTeardownClaim.task?.value
+                return
+            }
             await runPromptTurn(
                 session: session,
                 runID: runID,
@@ -581,16 +1350,17 @@ final class ACPIntegratedAgentModeRunner {
                 await lease.providerInitializationCompleted(provider: runRequest.agentKind.rawValue, outcome: "cancelled")
             }
             log("fresh start cancelled", runID: runID)
-            await finalize(
+            await finalizeStartupBoundaryCancellation(
+                tabID: tabID,
                 session: session,
                 runID: runID,
                 runAttemptID: runAttemptID,
-                controller: controller,
+                lease: lease,
+                attachments: attachments,
                 attachmentReservationID: attachmentReservationID,
-                terminalState: .cancelled,
-                errorText: nil,
-                notifyTurnComplete: false,
-                shouldShutdownController: true
+                controller: controller,
+                runRequest: runRequest,
+                startupTeardownClaim: startupTeardownClaim
             )
         } catch {
             if !providerInitializationCompleted {
@@ -599,17 +1369,28 @@ final class ACPIntegratedAgentModeRunner {
             let normalized = await controller.normalizeError(error)
             let normalizedText = displayText(for: normalized)
             log("fresh start failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
-            await finalize(
-                session: session,
-                runID: runID,
-                runAttemptID: runAttemptID,
-                controller: controller,
-                attachmentReservationID: attachmentReservationID,
-                terminalState: .failed,
-                errorText: normalizedText,
-                notifyTurnComplete: false,
-                shouldShutdownController: true
-            )
+            #if DEBUG
+                if runRequest.agentKind == .ohMyPi {
+                    await ompQualificationStartupProbes.beforeGenericStartupFailureTeardown()
+                }
+            #endif
+            let teardown = startupTeardownClaim.claim { @MainActor [weak self] in
+                guard let self else { return }
+                await finalizeStartupDisposition(
+                    tabID: tabID,
+                    session: session,
+                    runID: runID,
+                    runAttemptID: runAttemptID,
+                    lease: lease,
+                    attachments: attachments,
+                    attachmentReservationID: attachmentReservationID,
+                    controller: controller,
+                    runRequest: runRequest,
+                    terminalState: .failed,
+                    errorText: normalizedText
+                )
+            }
+            await teardown?.value
         }
     }
 
@@ -985,7 +1766,8 @@ final class ACPIntegratedAgentModeRunner {
         terminalState: AgentSessionRunState,
         errorText: String?,
         notifyTurnComplete: Bool,
-        shouldShutdownController: Bool
+        shouldShutdownController: Bool,
+        completion: AgentModeRunService.CancellationCompletion = .terminalPublished
     ) async {
         let finalizeErrorDescription = errorText ?? "nil"
         log("finalize requested state=\(terminalState.rawValue) error=\(finalizeErrorDescription)", runID: runID)
@@ -1002,6 +1784,7 @@ final class ACPIntegratedAgentModeRunner {
             expectedRunID: runID,
             terminalState: terminalState,
             source: "acp.finalize",
+            completion: completion,
             errorText: errorText,
             attachmentReservationID: attachmentReservationID,
             attachmentDisposition: .deleteFiles,
@@ -1063,13 +1846,35 @@ final class ACPIntegratedAgentModeRunner {
         for session: AgentModeViewModel.TabSession,
         matchingRunID: UUID? = nil
     ) -> AgentRunAttemptTerminalResources.Teardown? {
-        if let matchingRunID, toolTrackingRunIDByTabID[session.tabID] != matchingRunID {
+        prepareToolTrackingTeardown(tabID: session.tabID, matchingRunID: matchingRunID)
+    }
+
+    private func prepareToolTrackingTeardown(
+        tabID: UUID,
+        matchingRunID: UUID? = nil
+    ) -> AgentRunAttemptTerminalResources.Teardown? {
+        if let matchingRunID, toolTrackingRunIDByTabID[tabID] != matchingRunID {
             return nil
         }
-        toolTrackingRunIDByTabID.removeValue(forKey: session.tabID)
-        guard let controller = toolTrackingByTabID.removeValue(forKey: session.tabID) else { return nil }
-        resetACPToolCorrelation(for: session.tabID)
-        return { await controller.stopTracking() }
+        let stoppedRunID = toolTrackingRunIDByTabID.removeValue(forKey: tabID)
+        guard let controller = toolTrackingByTabID.removeValue(forKey: tabID) else { return nil }
+        resetACPToolCorrelation(for: tabID)
+        #if DEBUG
+            let stoppedHook = ompQualificationStartupProbes.toolTrackingStopped
+        #endif
+        return {
+            await controller.stopTracking()
+            #if DEBUG
+                if let stoppedRunID {
+                    stoppedHook(stoppedRunID)
+                }
+            #endif
+        }
+    }
+
+    private func teardownToolTrackingAfterSessionLoss(tabID: UUID, runID: UUID) async {
+        let teardown = prepareToolTrackingTeardown(tabID: tabID, matchingRunID: runID)
+        await teardown?()
     }
 
     private func setRunningStatus(

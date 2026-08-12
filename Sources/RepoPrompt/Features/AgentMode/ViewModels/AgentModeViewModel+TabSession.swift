@@ -166,6 +166,22 @@ extension AgentModeViewModel {
         var worktreeMergeReviewContinuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>?
         var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
         var mcpControlContext: AgentMCPControlContext?
+        #if DEBUG
+            var ompQualificationStartContext: OhMyPiAgentModeSmokeGate.StartContext? {
+                didSet {
+                    if let ompQualificationStartContext {
+                        mcpStartInvocationGenerationID = ompQualificationStartContext.generationID
+                    }
+                }
+            }
+
+            /// Durable start ownership retained after any transient qualification context clears.
+            var mcpStartInvocationGenerationID: UUID?
+            /// Atomic MainActor discard claim; a later invocation may not replace a claimed target.
+            var mcpStartDiscardClaimGenerationID: UUID?
+            /// OMP qualification startup lease used only to join cancellation while still unreleased.
+            var ompQualificationStartupLease: MCPBootstrapLease?
+        #endif
         var mcpStateObservationCancellable: AnyCancellable?
         var mcpControlCleanupTask: Task<Void, Never>?
         var mcpControlActivationGeneration: UInt64 = 0
