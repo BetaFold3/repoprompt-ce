@@ -19,7 +19,9 @@ SUPPORT=""
 LEASE_ID=""
 SESSION_ID=""
 RUN_ID=""
+START_AGENT_MODEL=""
 RUN_COMPLETED=0
+SESSION_CLEANUP_COMPLETED=0
 
 usage() {
   cat <<'EOF'
@@ -141,6 +143,60 @@ cleanup_call_tool() {
   fi
 }
 
+cleanup_exact_session() {
+  local cleanup_args
+  cleanup_args="$("$PYTHON" - "$SESSION_ID" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "op": "cleanup_sessions",
+    "session_ids": [sys.argv[1]],
+}, separators=(",", ":")))
+PY
+)"
+  if ! cleanup_call_tool exact-session agent_manage "$cleanup_args" "$EVIDENCE_DIR/session_cleanup.json"; then
+    return 1
+  fi
+  if ! "$PYTHON" - "$EVIDENCE_DIR/session_cleanup.json" "$SESSION_ID" <<'PY'
+import json
+import sys
+import uuid
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+try:
+    expected_session_id = str(uuid.UUID(sys.argv[2]))
+except Exception:
+    raise SystemExit(2)
+deleted = value.get("deleted_sessions")
+skipped = value.get("skipped_sessions")
+if (
+    value.get("status") != "completed"
+    or type(value.get("deleted_count")) is not int
+    or value.get("deleted_count") != 1
+    or type(value.get("skipped_count")) is not int
+    or value.get("skipped_count") != 0
+    or not isinstance(deleted, list)
+    or len(deleted) != 1
+    or not isinstance(deleted[0], dict)
+    or not isinstance(deleted[0].get("name"), str)
+    or not deleted[0]["name"]
+    or skipped != []
+):
+    raise SystemExit(2)
+try:
+    deleted_session_id = str(uuid.UUID(deleted[0].get("session_id")))
+except Exception:
+    raise SystemExit(2)
+if deleted_session_id != expected_session_id:
+    raise SystemExit(2)
+PY
+  then
+    printf 'ERROR: exact-session cleanup did not prove deletion of only session %s; continuing remaining cleanup.\n' "$SESSION_ID" >&2
+    return 1
+  fi
+  SESSION_CLEANUP_COMPLETED=1
+}
+
 recover_rejected_acquire() {
   local status_path="$EVIDENCE_DIR/lease_acquire_recovery_status.json"
   local release_path="$EVIDENCE_DIR/lease_acquire_recovery_release.json"
@@ -231,6 +287,10 @@ print(json.dumps({
 PY
 )"
     cleanup_call_tool cancel agent_run "$cancel_args" "$EVIDENCE_DIR/run_cleanup_cancel.json" || cleanup_failed=1
+  fi
+
+  if [[ -n "$SESSION_ID" && "$SESSION_CLEANUP_COMPLETED" != "1" ]]; then
+    cleanup_exact_session || cleanup_failed=1
   fi
 
   if [[ -n "$LEASE_ID" ]]; then
@@ -398,37 +458,71 @@ PY
 )"
 call_tool agent_run "$START_ARGS" "$EVIDENCE_DIR/start.json"
 
-IDENTIFIERS="$("$PYTHON" - "$EVIDENCE_DIR/start.json" "$MODEL_ID" <<'PY'
+SESSION_ID="$("$PYTHON" - "$EVIDENCE_DIR/start.json" <<'PY'
 import json
 import sys
 import uuid
 with open(sys.argv[1], encoding="utf-8") as handle:
     value = json.load(handle)
-if value.get("status") not in {"starting", "running", "completed"}:
-    raise SystemExit(2)
 session_id = value.get("session_id")
-run_id = value.get("run_id")
+if not isinstance(session_id, str) or not session_id:
+    raise SystemExit(2)
 try:
     uuid.UUID(session_id)
 except Exception:
     raise SystemExit(2)
+print(session_id)
+PY
+)" || fail "agent_run start did not expose a valid session_id."
+
+RUN_ID="$("$PYTHON" - "$EVIDENCE_DIR/start.json" <<'PY'
+import json
+import sys
+import uuid
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+run_id = value.get("run_id")
 if not run_id:
-    print(session_id, "MISSING")
+    print("MISSING")
     raise SystemExit(0)
+if not isinstance(run_id, str):
+    raise SystemExit(2)
 try:
     uuid.UUID(run_id)
 except Exception:
     raise SystemExit(2)
-agent = value.get("agent", {})
-if agent.get("id") != "ohMyPi" or agent.get("model") != sys.argv[2].split(":", 1)[1]:
-    raise SystemExit(2)
-print(session_id, run_id)
+print(run_id)
 PY
-)" || fail "agent_run start returned an invalid response shape or status."
-SESSION_ID="${IDENTIFIERS%% *}"
-RUN_ID="${IDENTIFIERS#* }"
+)" || fail "agent_run start returned an invalid run_id."
 
 [[ "$RUN_ID" != "MISSING" ]] || fail "agent_run start did not expose an authoritative run_id; run_routing_history cannot be correlated safely. Update the app/CLI response contract before retrying."
+
+START_AGENT_MODEL="$("$PYTHON" - "$EVIDENCE_DIR/start.json" "$SESSION_ID" "$RUN_ID" "$MODEL_ID" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+agent = value.get("agent")
+requested_model = sys.argv[4].split(":", 1)[1]
+if (
+    value.get("status") not in {"starting", "running", "completed"}
+    or value.get("session_id") != sys.argv[2]
+    or value.get("run_id") != sys.argv[3]
+    or not isinstance(agent, dict)
+    or agent.get("id") != "ohMyPi"
+):
+    raise SystemExit(2)
+agent_model = agent.get("model")
+if requested_model == "default":
+    if agent_model != "default" and not (
+        isinstance(agent_model, str) and "/" in agent_model and all(agent_model.split("/", 1))
+    ):
+        raise SystemExit(2)
+elif agent_model != requested_model:
+    raise SystemExit(2)
+print(agent_model)
+PY
+)" || fail "agent_run start returned an invalid status or agent/model qualification."
 
 WAIT_ARGS="$("$PYTHON" - "$SESSION_ID" "$TIMEOUT_SECONDS" <<'PY'
 import json
@@ -450,23 +544,54 @@ print(value.get("_meta", {}).get("wait_result", ""))
 PY
 )"
 [[ "$WAIT_RESULT" != "timed_out" ]] || fail "agent_run wait returned app-side wait_result=timed_out."
-"$PYTHON" - "$EVIDENCE_DIR/wait.json" "$SESSION_ID" "$RUN_ID" "$ACK" "$MODEL_ID" <<'PY' || fail "agent_run wait did not complete with the exact deterministic acknowledgement."
+WAIT_STATUS="$("$PYTHON" - "$EVIDENCE_DIR/wait.json" "$SESSION_ID" "$RUN_ID" <<'PY'
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     value = json.load(handle)
-agent = value.get("agent", {})
+status = value.get("status")
+if (
+    not isinstance(status, str)
+    or value.get("session_id") != sys.argv[2]
+    or value.get("run_id") != sys.argv[3]
+):
+    raise SystemExit(2)
+print(status)
+PY
+)" || fail "agent_run wait returned mismatched identifiers or an invalid status."
+if [[ "$WAIT_STATUS" == "completed" ]]; then
+  RUN_COMPLETED=1
+else
+  fail "agent_run wait did not reach completed status."
+fi
+
+"$PYTHON" - "$EVIDENCE_DIR/wait.json" "$SESSION_ID" "$RUN_ID" "$ACK" "$MODEL_ID" "$START_AGENT_MODEL" <<'PY' || fail "agent_run wait did not complete with the exact deterministic acknowledgement and correlated model."
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+agent = value.get("agent")
+requested_model = sys.argv[5].split(":", 1)[1]
+start_model = sys.argv[6]
 if (
     value.get("status") != "completed"
     or value.get("session_id") != sys.argv[2]
     or value.get("run_id") != sys.argv[3]
     or value.get("assistant_text") != sys.argv[4]
+    or not isinstance(agent, dict)
     or agent.get("id") != "ohMyPi"
-    or agent.get("model") != sys.argv[5].split(":", 1)[1]
 ):
     raise SystemExit(2)
+wait_model = agent.get("model")
+if requested_model == "default":
+    wait_is_concrete = (
+        isinstance(wait_model, str) and "/" in wait_model and all(wait_model.split("/", 1))
+    )
+    if not wait_is_concrete or (start_model != "default" and wait_model != start_model):
+        raise SystemExit(2)
+elif start_model != requested_model or wait_model != requested_model:
+    raise SystemExit(2)
 PY
-RUN_COMPLETED=1
 
 call_tool __repoprompt_debug_diagnostics '{"op":"routing_snapshot","include_records":false,"include_windows":true}' "$EVIDENCE_DIR/workspace_after_raw.json"
 "$PYTHON" "$SUPPORT" snapshot "$EVIDENCE_DIR/workspace_after_raw.json" "$EVIDENCE_DIR/workspace_after.json" "$WINDOW_ID" "$EVIDENCE_DIR" \
@@ -475,14 +600,52 @@ rm -f "$EVIDENCE_DIR/workspace_after_raw.json"
 "$PYTHON" - "$EVIDENCE_DIR/workspace_before.json" "$EVIDENCE_DIR/workspace_after.json" <<'PY' \
   || fail "Workspace identity or tracked/index/existing-untracked content changed during the OMP run."
 import json
+import os
 import sys
+import uuid
 with open(sys.argv[1], encoding="utf-8") as handle:
     before = json.load(handle)
 with open(sys.argv[2], encoding="utf-8") as handle:
     after = json.load(handle)
+
+def stable_target(value):
+    if not isinstance(value, dict):
+        raise SystemExit(2)
+    window_id = value.get("window_id")
+    workspace_id = value.get("workspace_id")
+    workspace_instance_number = value.get("workspace_instance_number")
+    repo_paths = value.get("repo_paths")
+    if (
+        type(window_id) is not int
+        or window_id <= 0
+        or not isinstance(workspace_id, str)
+        or type(workspace_instance_number) is not int
+        or workspace_instance_number <= 0
+        or not isinstance(repo_paths, list)
+        or not repo_paths
+        or any(not isinstance(path, str) or not path or not os.path.isabs(path) for path in repo_paths)
+    ):
+        raise SystemExit(2)
+    try:
+        canonical_workspace_id = str(uuid.UUID(workspace_id))
+    except Exception:
+        raise SystemExit(2)
+    if workspace_id != canonical_workspace_id:
+        raise SystemExit(2)
+    return {
+        "window_id": window_id,
+        "workspace_id": canonical_workspace_id,
+        "workspace_instance_number": workspace_instance_number,
+        "repo_paths": repo_paths,
+    }
+
+before_snapshots = before.get("active_workspace_content_snapshots")
+after_snapshots = after.get("active_workspace_content_snapshots")
 if (
-    after.get("qualification_target") != before.get("qualification_target")
-    or after.get("active_workspace_content_snapshots") != before.get("active_workspace_content_snapshots")
+    not isinstance(before_snapshots, dict)
+    or not isinstance(after_snapshots, dict)
+    or stable_target(after.get("qualification_target")) != stable_target(before.get("qualification_target"))
+    or after_snapshots != before_snapshots
 ):
     raise SystemExit(2)
 PY
@@ -516,16 +679,13 @@ if any(event.get("event") in forbidden or "timeout" in str(event.get("event")) f
     raise SystemExit(2)
 ordered = [
     "policy_installed",
-    "expected_pid_registered",
     "expected_pid_policy_armed",
+    "expected_pid_registered",
     "client_identity_observed",
-    "pid_gate_wait_completed",
-    "policy_applied",
     "run_route_mapped",
     "routing_waiter_signalled",
+    "policy_applied",
     "route_wait_completed",
-    "expected_pid_cleared",
-    "policy_cleared",
 ]
 positions = []
 for name in ordered:
@@ -535,13 +695,23 @@ for name in ordered:
     positions.append(matches[0])
 if positions != sorted(positions) or len(set(positions)) != len(positions):
     raise SystemExit(2)
+pid_gate_started = [index for index, event in enumerate(events) if event.get("event") == "pid_gate_wait_started"]
+pid_gate_completed = [index for index, event in enumerate(events) if event.get("event") == "pid_gate_wait_completed"]
+if pid_gate_started or pid_gate_completed:
+    if (
+        len(pid_gate_started) != 1
+        or len(pid_gate_completed) != 1
+        or pid_gate_started[0] >= pid_gate_completed[0]
+        or pid_gate_completed[0] >= positions[4]
+    ):
+        raise SystemExit(2)
 identity = events[positions[3]]
 fields = identity.get("fields", {})
-if fields.get("authoritative_client_name") != sys.argv[4]:
+if fields.get("verified_client_name") != sys.argv[4]:
     raise SystemExit(2)
 connection_id = identity.get("connection_id")
 helper_pid = fields.get("helper_peer_pid")
-expected_pid = events[positions[1]].get("fields", {}).get("expected_pid")
+expected_pid = events[positions[2]].get("fields", {}).get("expected_pid")
 def canonical_decimal(value, *, positive=False, microseconds=False):
     if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
         raise SystemExit(2)
@@ -581,15 +751,11 @@ if (
 correlated = [event.get("connection_id") for event in events if event.get("connection_id") is not None]
 if any(candidate != connection_id for candidate in correlated):
     raise SystemExit(2)
-if events[positions[2]].get("fields", {}).get("armed") != "true":
+if events[positions[1]].get("fields", {}).get("armed") != "true":
     raise SystemExit(2)
-if events[positions[7]].get("fields", {}).get("outcome") != "routed":
+if events[positions[5]].get("fields", {}).get("outcome") != "routed":
     raise SystemExit(2)
-if events[positions[8]].get("fields", {}).get("routed") != "true":
-    raise SystemExit(2)
-if events[positions[9]].get("fields", {}).get("expected_pid") != str(expected_pid):
-    raise SystemExit(2)
-if events[positions[10]].get("fields", {}).get("remaining_count") != "0":
+if events[positions[7]].get("fields", {}).get("routed") != "true":
     raise SystemExit(2)
 print(
     connection_id,
@@ -599,7 +765,7 @@ print(
     helper_start_microseconds,
 )
 PY
-)" || fail "run_routing_history did not prove one fresh, ordered, PID-consistent route with terminal cleanup and zero tool calls."
+)" || fail "run_routing_history did not prove one fresh, ordered, PID-consistent route with zero tool calls."
 read -r OMP_CONNECTION_ID OMP_HELPER_PID OMP_EXPECTED_PID OMP_HELPER_START_SECONDS OMP_HELPER_START_MICROSECONDS <<< "$ROUTING_IDENTIFIERS"
 [[ -n "$OMP_CONNECTION_ID" && -n "$OMP_HELPER_PID" && -n "$OMP_EXPECTED_PID" && -n "$OMP_HELPER_START_SECONDS" && -n "$OMP_HELPER_START_MICROSECONDS" ]] \
   || fail "The routing correlation identifiers were incomplete."
@@ -613,6 +779,8 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 if value.get("ok") is not True or not isinstance(value.get("connections"), list):
     raise SystemExit(2)
 PY
+
+cleanup_exact_session || fail "Exact synthetic session cleanup failed or did not prove deletion of only the smoke-created session."
 
 CONNECTION_HISTORY_ARGS="$("$PYTHON" - "$OMP_CONNECTION_ID" <<'PY'
 import json
@@ -730,7 +898,7 @@ if (
     raise SystemExit(2)
 PY
 
-"$PYTHON" -   "$EVIDENCE_DIR/start.json"   "$EVIDENCE_DIR/wait.json"   "$EVIDENCE_DIR/run_routing_history.json"   "$EVIDENCE_DIR/connections.json"   "$EVIDENCE_DIR/omp_connection_history.json" <<'PY' || fail "Captured evidence failed privacy-safe JSON validation."
+"$PYTHON" -   "$EVIDENCE_DIR/start.json"   "$EVIDENCE_DIR/wait.json"   "$EVIDENCE_DIR/run_routing_history.json"   "$EVIDENCE_DIR/connections.json"   "$EVIDENCE_DIR/session_cleanup.json"   "$EVIDENCE_DIR/omp_connection_history.json" <<'PY' || fail "Captured evidence failed privacy-safe JSON validation."
 import json
 import sys
 sensitive_keys = {"authorization", "password", "secret", "token", "api_key", "private_key", "credential"}

@@ -47,6 +47,28 @@ struct WorkspaceCodemapPresentationWaiter {
     }
 }
 
+private actor WorkspaceCodemapDemandRecoveryState {
+    private var refreshedFileIDs: Set<UUID> = []
+    private var resetRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
+    private var retriedFileIDs: Set<UUID> = []
+
+    func claim(
+        _ recovery: WorkspaceCodemapArtifactDemandRecovery,
+        ticket: WorkspaceCodemapArtifactDemandTicket
+    ) -> Bool {
+        switch recovery {
+        case .refreshCurrentness:
+            refreshedFileIDs.insert(ticket.fileID).inserted
+        case .resetRootSession:
+            resetRootEpochs.insert(ticket.rootEpoch).inserted
+        case .retryFreshDemand:
+            retriedFileIDs.insert(ticket.fileID).inserted
+        case .terminal:
+            false
+        }
+    }
+}
+
 private actor WorkspaceCodemapOperationPresentationOwnership {
     struct Resources {
         let tickets: [WorkspaceCodemapArtifactDemandTicket]
@@ -104,6 +126,19 @@ private actor WorkspaceCodemapOperationPresentationOwnership {
         }
     }
 
+    func replaceConsumed(
+        _ oldTicket: WorkspaceCodemapArtifactDemandTicket,
+        with ownedResult: WorkspaceCodemapArtifactDemandOwnedResult
+    ) {
+        ticketsByRetainID.removeValue(forKey: oldTicket.retainID)
+        switch ownedResult.ownership {
+        case let .created(ticket), let .joined(ticket):
+            ticketsByRetainID[ticket.retainID] = ticket
+        case .notAcquired:
+            break
+        }
+    }
+
     func drain() -> Resources {
         let resources = Resources(
             tickets: ticketsByRetainID.values.sorted { $0.retainID.uuidString < $1.retainID.uuidString },
@@ -130,6 +165,7 @@ struct WorkspaceCodemapPresentationCoordinator {
 
     private struct DemandBatch {
         let resultsByFileID: [UUID: WorkspaceCodemapArtifactDemandResult]
+        let resetRootEpochs: Set<WorkspaceCodemapRootEpoch>
         let deadlineReached: Bool
         let defensiveRoundLimitReached: Bool
     }
@@ -910,7 +946,7 @@ struct WorkspaceCodemapPresentationCoordinator {
             }
             await ownership.record(owned)
             results[candidate.identity.fileID] = owned.result
-            ticketsByFileID[candidate.identity.fileID] = ticket(from: owned.result)
+            ticketsByFileID[candidate.identity.fileID] = ticket(from: owned)
         }
 
         for round in 0 ..< policy.maximumReadinessRounds {
@@ -1036,7 +1072,7 @@ struct WorkspaceCodemapPresentationCoordinator {
             await ownership.record(ownedResult)
             let fileID = candidate.identity.fileID
             results[fileID] = ownedResult.result
-            ticketsByFileID[fileID] = ticket(from: ownedResult.result)
+            ticketsByFileID[fileID] = ticket(from: ownedResult)
         }
 
         for round in 0 ..< policy.maximumReadinessRounds {
@@ -1086,7 +1122,7 @@ struct WorkspaceCodemapPresentationCoordinator {
                         rootScopeEpochs: plan.rootScopeEpochs,
                         coverageProofs: plan.coverageProofs
                     ) else { return nil }
-                    await ownership.replaceConsumed(existingTicket, with: retried.result)
+                    await ownership.replaceConsumed(existingTicket, with: retried)
                     ownedResult = retried
                 } else {
                     guard let requested = await store.requestAutomaticCodemapArtifactWithOwnership(
@@ -1099,7 +1135,7 @@ struct WorkspaceCodemapPresentationCoordinator {
                     ownedResult = requested
                 }
                 results[fileID] = ownedResult.result
-                ticketsByFileID[fileID] = ticket(from: ownedResult.result)
+                ticketsByFileID[fileID] = ticket(from: ownedResult)
             }
         }
         let stillWaiting = results.values.contains { result in
@@ -1111,6 +1147,7 @@ struct WorkspaceCodemapPresentationCoordinator {
         let deadlineReached = clock.now >= deadline
         return DemandBatch(
             resultsByFileID: results,
+            resetRootEpochs: [],
             deadlineReached: deadlineReached,
             defensiveRoundLimitReached: stillWaiting && !deadlineReached
         )
@@ -1174,7 +1211,8 @@ struct WorkspaceCodemapPresentationCoordinator {
         priority: CodeMapArtifactBuildPriority,
         ownership: WorkspaceCodemapOperationPresentationOwnership,
         clock: ContinuousClock,
-        deadline: ContinuousClock.Instant
+        deadline: ContinuousClock.Instant,
+        recoveryState: WorkspaceCodemapDemandRecoveryState? = nil
     ) async throws -> DemandBatch {
         var orderedFileIDs: [UUID] = []
         var seen = Set<UUID>()
@@ -1191,9 +1229,11 @@ struct WorkspaceCodemapPresentationCoordinator {
             )
             await ownership.record(ownedResult)
             results[fileID] = ownedResult.result
-            ticketsByFileID[fileID] = ticket(from: ownedResult.result)
+            ticketsByFileID[fileID] = ticket(from: ownedResult)
         }
 
+        var exhaustedRecoveryFileIDs: Set<UUID> = []
+        var resetRootEpochs: Set<WorkspaceCodemapRootEpoch> = []
         for round in 0 ..< policy.maximumReadinessRounds {
             try Task.checkCancellation()
             var hasPending = false
@@ -1204,14 +1244,26 @@ struct WorkspaceCodemapPresentationCoordinator {
                 case let .pending(ticket):
                     let refreshed = await store.codemapArtifactDemandStatus(ticket)
                     results[fileID] = refreshed
-                    if case .pending = refreshed { hasPending = true }
-                    if case let .unavailable(.busy(milliseconds)) = refreshed {
+                    switch refreshed {
+                    case .pending:
+                        hasPending = true
+                    case let .unavailable(.busy(milliseconds)):
                         hasPending = true
                         if let milliseconds { retryAfter.append(milliseconds) }
+                    case let .unavailable(.rejected(rejection))
+                        where WorkspaceCodemapArtifactDemandRecovery(rejection).isRetryable &&
+                        !exhaustedRecoveryFileIDs.contains(fileID):
+                        hasPending = recoveryState != nil
+                    case .ready, .unavailable:
+                        break
                     }
                 case let .unavailable(.busy(milliseconds)):
                     hasPending = true
                     if let milliseconds { retryAfter.append(milliseconds) }
+                case let .unavailable(.rejected(rejection))
+                    where WorkspaceCodemapArtifactDemandRecovery(rejection).isRetryable &&
+                    !exhaustedRecoveryFileIDs.contains(fileID):
+                    hasPending = recoveryState != nil
                 case .ready, .unavailable:
                     break
                 }
@@ -1227,28 +1279,97 @@ struct WorkspaceCodemapPresentationCoordinator {
                 deadline: deadline
             )
             for fileID in orderedFileIDs {
-                guard case .unavailable(.busy) = results[fileID] else { continue }
-                if let existingTicket = ticketsByFileID[fileID],
-                   await ownership.owns(existingTicket)
-                {
-                    let retried = await store.retryBusyCodemapArtifactDemand(
-                        existingTicket,
-                        priority: priority
-                    )
-                    let oldStatus = await store.codemapArtifactDemandStatus(existingTicket)
-                    if case .unavailable(.staleCurrentness) = oldStatus {
-                        await ownership.replaceConsumed(existingTicket, with: retried)
-                        ticketsByFileID[fileID] = ticket(from: retried)
+                if case .unavailable(.busy) = results[fileID] {
+                    if let existingTicket = ticketsByFileID[fileID],
+                       await ownership.owns(existingTicket)
+                    {
+                        let retried = await store.retryBusyCodemapArtifactDemand(
+                            existingTicket,
+                            priority: priority
+                        )
+                        let oldStatus = await store.codemapArtifactDemandStatus(existingTicket)
+                        if case .unavailable(.staleCurrentness) = oldStatus {
+                            await ownership.replaceConsumed(existingTicket, with: retried)
+                            ticketsByFileID[fileID] = ticket(from: retried)
+                        }
+                        results[fileID] = retried
+                    } else {
+                        let ownedResult = await store.requestCodemapArtifactWithOwnership(
+                            forFileID: fileID,
+                            priority: priority
+                        )
+                        await ownership.record(ownedResult)
+                        results[fileID] = ownedResult.result
+                        ticketsByFileID[fileID] = ticket(from: ownedResult)
                     }
-                    results[fileID] = retried
-                } else {
-                    let ownedResult = await store.requestCodemapArtifactWithOwnership(
-                        forFileID: fileID,
+                    continue
+                }
+                guard case let .unavailable(.rejected(rejection)) = results[fileID],
+                      let recoveryState,
+                      let existingTicket = ticketsByFileID[fileID],
+                      await ownership.owns(existingTicket)
+                else { continue }
+                let recovery = WorkspaceCodemapArtifactDemandRecovery(rejection)
+                guard await recoveryState.claim(recovery, ticket: existingTicket) else {
+                    exhaustedRecoveryFileIDs.insert(fileID)
+                    continue
+                }
+                if recovery == .refreshCurrentness {
+                    results[fileID] = .unavailable(.staleCurrentness)
+                    continue
+                }
+                let repaired: WorkspaceCodemapArtifactDemandOwnedResult? = switch recovery {
+                case .resetRootSession:
+                    await store.prepareCodemapRootSessionRetry(
+                        existingTicket,
+                        rejection: rejection,
+                        priority: priority,
+                        deadline: deadline
+                    )
+                case .retryFreshDemand:
+                    await store.retryRejectedCodemapArtifactDemand(
+                        existingTicket,
+                        rejection: rejection,
                         priority: priority
                     )
-                    await ownership.record(ownedResult)
-                    results[fileID] = ownedResult.result
-                    ticketsByFileID[fileID] = ticket(from: ownedResult.result)
+                case .refreshCurrentness, .terminal:
+                    nil
+                }
+                guard let repaired else {
+                    let refreshed = await store.codemapArtifactDemandStatus(existingTicket)
+                    results[fileID] = refreshed
+                    if case .unavailable(.staleCurrentness) = refreshed {
+                        ticketsByFileID[fileID] = nil
+                    } else {
+                        exhaustedRecoveryFileIDs.insert(fileID)
+                    }
+                    continue
+                }
+                await ownership.replaceConsumed(existingTicket, with: repaired)
+                results[fileID] = repaired.result
+                ticketsByFileID[fileID] = ticket(from: repaired)
+
+                guard recovery == .resetRootSession else { continue }
+                resetRootEpochs.insert(existingTicket.rootEpoch)
+                // Detaching a root invalidates every ticket from that root, not
+                // only the seed whose rejection triggered the repair. Reissue
+                // each sibling seed against the fresh session so a multi-file
+                // structure request cannot retain stale rejected/ready results.
+                for siblingFileID in orderedFileIDs where siblingFileID != fileID {
+                    guard let siblingTicket = ticketsByFileID[siblingFileID],
+                          siblingTicket.rootEpoch == existingTicket.rootEpoch,
+                          await ownership.owns(siblingTicket)
+                    else { continue }
+                    let siblingRepaired = await store.requestCodemapArtifactWithOwnership(
+                        forFileID: siblingFileID,
+                        priority: priority
+                    )
+                    await ownership.replaceConsumed(
+                        siblingTicket,
+                        with: siblingRepaired
+                    )
+                    results[siblingFileID] = siblingRepaired.result
+                    ticketsByFileID[siblingFileID] = ticket(from: siblingRepaired)
                 }
             }
         }
@@ -1261,9 +1382,21 @@ struct WorkspaceCodemapPresentationCoordinator {
         let deadlineReached = clock.now >= deadline
         return DemandBatch(
             resultsByFileID: results,
+            resetRootEpochs: resetRootEpochs,
             deadlineReached: deadlineReached,
             defensiveRoundLimitReached: stillWaiting && !deadlineReached
         )
+    }
+
+    private func ticket(
+        from ownedResult: WorkspaceCodemapArtifactDemandOwnedResult
+    ) -> WorkspaceCodemapArtifactDemandTicket? {
+        switch ownedResult.ownership {
+        case let .created(ticket), let .joined(ticket):
+            ticket
+        case .notAcquired:
+            ticket(from: ownedResult.result)
+        }
     }
 
     private func ticket(
@@ -1565,6 +1698,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: policy.maximumTotalWait)
         var lastStaleReason: WorkspaceCodemapStructurePublicationStaleReason?
+        let recoveryState = WorkspaceCodemapDemandRecoveryState()
 
         for attemptIndex in 0 ..< policy.maximumStructurePublicationAttempts {
             try Task.checkCancellation()
@@ -1580,7 +1714,8 @@ extension WorkspaceCodemapPresentationCoordinator {
                     logicalRootDisplayNamesByRootID: logicalRootDisplayNamesByRootID,
                     ownership: ownership,
                     clock: clock,
-                    deadline: deadline
+                    deadline: deadline,
+                    recoveryState: recoveryState
                 )
                 if let staleReason = attempt.staleReason {
                     lastStaleReason = staleReason
@@ -1594,9 +1729,11 @@ extension WorkspaceCodemapPresentationCoordinator {
                 }
                 guard let receipt = attempt.receipt else {
                     await release(ownership)
-                    if attemptIndex > 0, let lastStaleReason {
-                        return .stale(lastStaleReason, requestedSeedCount: seedFileIDs.count)
-                    }
+                    // A current attempt without a receipt can still carry an
+                    // authoritative busy, budget, unavailable, or terminal
+                    // result. Only attempt.staleReason above authorizes falling
+                    // back to stale; do not mask a definitive later diagnosis
+                    // with an earlier attempt's stale reason.
                     return attempt.presentation
                 }
                 await beforePublicationRevalidation(receipt.presentation)
@@ -1635,7 +1772,8 @@ extension WorkspaceCodemapPresentationCoordinator {
         logicalRootDisplayNamesByRootID: [UUID: String],
         ownership: WorkspaceCodemapOperationPresentationOwnership,
         clock: ContinuousClock,
-        deadline: ContinuousClock.Instant
+        deadline: ContinuousClock.Instant,
+        recoveryState: WorkspaceCodemapDemandRecoveryState
     ) async throws -> WorkspaceCodemapStructureAttempt {
         let seedDemandLimit = min(
             policy.maximumCandidateDemandCount,
@@ -1744,7 +1882,8 @@ extension WorkspaceCodemapPresentationCoordinator {
             priority: .demand,
             ownership: ownership,
             clock: clock,
-            deadline: deadline
+            deadline: deadline,
+            recoveryState: recoveryState
         )
         var readyTicketsByFileID: [UUID: WorkspaceCodemapArtifactDemandTicket] = [:]
         var graphSeeds: [WorkspaceCodemapStoreSelectionGraphSourceIdentity] = []
@@ -2106,8 +2245,29 @@ extension WorkspaceCodemapPresentationCoordinator {
                         priority: .explicit,
                         ownership: ownership,
                         clock: clock,
-                        deadline: deadline
+                        deadline: deadline,
+                        recoveryState: recoveryState
                     )
+                    if let resetRootEpoch = targetDemand.resetRootEpochs.sorted(
+                        by: workspaceCodemapRootEpochPrecedes
+                    ).first {
+                        // A target-phase reset invalidates seed tickets and the
+                        // graph receipt acquired earlier in this attempt. Restart
+                        // the whole attempt rather than mixing root generations.
+                        let staleFileID = graphSeeds.first {
+                            $0.ticket.rootEpoch == resetRootEpoch
+                        }?.ticket.fileID ?? targetIDs[0]
+                        return WorkspaceCodemapStructureAttempt(
+                            presentation: emptyStructurePresentation(
+                                outcome: .stale,
+                                issues: [],
+                                requestedSeedCount: seedFileIDs.count,
+                                resolvedSeedCount: 0
+                            ),
+                            receipt: nil,
+                            staleReason: .presentation(.catalog(fileID: staleFileID))
+                        )
+                    }
                     for fileID in targetIDs {
                         guard let result = targetDemand.resultsByFileID[fileID] else { continue }
                         switch result {

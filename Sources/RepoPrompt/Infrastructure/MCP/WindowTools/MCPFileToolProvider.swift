@@ -148,7 +148,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             - max_codemap_tokens (256...20000, default 6000)
 
             Results report literal ready, budget, busy, timeout, unavailable, or stale status
-            with stable issue codes. Readiness pressure never returns partial structure.
+            with stable issue codes. Git-terminal, binding, and overlay rejections include
+            stable leaf subtypes in issue detail. Readiness pressure never returns partial structure.
             Cancellation remains an MCP cancellation.
             Per-file paths are logical paths; traversal cannot cross a root epoch.
 

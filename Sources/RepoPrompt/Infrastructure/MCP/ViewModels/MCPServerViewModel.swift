@@ -5355,7 +5355,7 @@ final class MCPServerViewModel: ObservableObject {
             attempted: issue.attempted,
             limit: issue.limit,
             message: issue.message,
-            detail: issue.detail == "runtime_failure_parked" ? issue.detail : nil
+            detail: issue.detail
         )
     }
 
@@ -5449,6 +5449,70 @@ final class MCPServerViewModel: ObservableObject {
         )
     }
 
+    private static func codeStructureGitTerminalDetail(
+        _ reason: WorkspaceCodemapGitTerminalUnavailableReason
+    ) -> String {
+        let subtype = switch reason {
+        case .nonGit: "non_git"
+        case .bareRepository: "bare_repository"
+        case .unsupportedObjectFormat: "unsupported_object_format"
+        case .unsupportedGit: "unsupported_git"
+        case .invalidLayout: "invalid_layout"
+        case .invalidLoadedRootContainment: "invalid_loaded_root_containment"
+        case .namespaceUnavailable: "namespace_unavailable"
+        case .rootEpochBindingMismatch: "root_epoch_binding_mismatch"
+        case .releasedRootEpoch: "released_root_epoch"
+        }
+        return "git_terminal.\(subtype)"
+    }
+
+    private static func codeStructureRejectionDetail(
+        _ rejection: WorkspaceCodemapBindingDemandRejection
+    ) -> String {
+        switch rejection {
+        case let .overlayRejected(reason):
+            let subtype = switch reason {
+            case .rootNotRegistered: "root_not_registered"
+            case .rootAuthorityInvalid: "root_authority_invalid"
+            case .rootEpochMismatch: "root_epoch_mismatch"
+            case .catalogGenerationMismatch: "catalog_generation_mismatch"
+            case .repositoryAuthorityMismatch: "repository_authority_mismatch"
+            case .invalidToken: "invalid_token"
+            case .pathOutsideRoot: "path_outside_root"
+            case .staleRequestGeneration: "stale_request_generation"
+            case .requestGenerationConflict: "request_generation_conflict"
+            case .admissionReservationInvalid: "admission_reservation_invalid"
+            }
+            return "overlay_rejected.\(subtype)"
+        case .rootNotRegistered:
+            return "binding_rejected.root_not_registered"
+        case .capabilityUnavailable:
+            return "binding_rejected.capability_unavailable"
+        case .rootEpochMismatch:
+            return "binding_rejected.root_epoch_mismatch"
+        case .rootPathMismatch:
+            return "binding_rejected.root_path_mismatch"
+        case .invalidIdentity:
+            return "binding_rejected.invalid_identity"
+        case .catalogGenerationMismatch:
+            return "binding_rejected.catalog_generation_mismatch"
+        case .requestGenerationInvalid:
+            return "binding_rejected.request_generation_invalid"
+        case .stalePathGeneration:
+            return "binding_rejected.stale_path_generation"
+        case .staleIngressGeneration:
+            return "binding_rejected.stale_ingress_generation"
+        case .languageMismatch:
+            return "binding_rejected.language_mismatch"
+        case .classificationMismatch:
+            return "binding_rejected.classification_mismatch"
+        case .sourceAuthorityUnavailable:
+            return "binding_rejected.source_authority_unavailable"
+        case .staleCompletion:
+            return "binding_rejected.stale_completion"
+        }
+    }
+
     private static func codeStructureIssueDTO(
         _ issue: WorkspaceCodemapStructureIssue,
         logicalPathsByFileID: [UUID: String]
@@ -5512,12 +5576,13 @@ final class MCPServerViewModel: ObservableObject {
                     detail: "root_not_loaded"
                 )
             case let .gitTerminal(reason):
+                let detail = codeStructureGitTerminalDetail(reason)
                 return DTO(
                     code: "git_root_unavailable", phase: "seed_demand", path: path,
                     retryable: reason == .releasedRootEpoch, retryAfterMilliseconds: nil,
                     attempted: nil, limit: nil,
-                    message: "The Git root is unavailable for codemap generation. (reason=git_terminal)",
-                    detail: "git_terminal"
+                    message: "The Git root is unavailable for codemap generation. (reason=\(detail))",
+                    detail: detail
                 )
             case let .busy(retryAfterMilliseconds):
                 return DTO(
@@ -5556,13 +5621,15 @@ final class MCPServerViewModel: ObservableObject {
                     message: "A codemap artifact is unavailable. (reason=demand_unavailable)",
                     detail: "demand_unavailable"
                 )
-            case .rejected:
+            case let .rejected(rejection):
+                let detail = codeStructureRejectionDetail(rejection)
                 return DTO(
                     code: "artifact_unavailable", phase: "seed_demand", path: path,
-                    retryable: true, retryAfterMilliseconds: nil,
+                    retryable: WorkspaceCodemapArtifactDemandRecovery(rejection).isRetryable,
+                    retryAfterMilliseconds: nil,
                     attempted: nil, limit: nil,
-                    message: "A codemap artifact is unavailable. (reason=rejected)",
-                    detail: "rejected"
+                    message: "A codemap artifact is unavailable. (reason=\(detail))",
+                    detail: detail
                 )
             case .routeConflict:
                 return DTO(

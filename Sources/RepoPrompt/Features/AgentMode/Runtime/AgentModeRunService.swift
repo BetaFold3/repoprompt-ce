@@ -27,8 +27,11 @@ final class AgentModeRunService {
         /// Bounded wait for child `agent_run.wait` scopes to drain before Claude native interrupt.
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
         #if DEBUG
-            var ompQualificationAuthorizer: (OhMyPiAgentModeSmokeGate.StartTransaction, UUID) -> Bool = {
-                OhMyPiAgentModeSmokeGate.shared.authorizeProviderStart(transaction: $0, runID: $1)
+            var ompQualificationAuthorizer: (
+                OhMyPiAgentModeSmokeGate.StartTransaction,
+                UUID
+            ) -> OhMyPiAgentModeSmokeGate.ProviderStartAuthorizationDecision = {
+                OhMyPiAgentModeSmokeGate.shared.providerStartAuthorizationDecision(transaction: $0, runID: $1)
             }
 
             var ompQualificationActiveWorkspaceID: () -> UUID? = { nil }
@@ -209,7 +212,10 @@ final class AgentModeRunService {
             var ompQualificationBoundaryHandedOff = false
             defer {
                 if selectedAgent == .ohMyPi, !ompQualificationBoundaryHandedOff {
-                    invocationOMPQualificationStartContext?.authorizationReceipt.resolve(.denied)
+                    invocationOMPQualificationStartContext?.authorizationReceipt.resolve(
+                        .denied,
+                        startupFailureReason: "provider_start_boundary_not_reached"
+                    )
                 }
             }
         #endif
@@ -218,7 +224,10 @@ final class AgentModeRunService {
                 if let invocationOMPQualificationStartContext,
                    session.mcpStartInvocationGenerationID != invocationOMPQualificationStartContext.generationID
                 {
-                    invocationOMPQualificationStartContext.authorizationReceipt.resolve(.denied)
+                    invocationOMPQualificationStartContext.authorizationReceipt.resolve(
+                        .denied,
+                        startupFailureReason: "start_invocation_generation_mismatch"
+                    )
                     return nil
                 }
                 guard let ompQualificationStartContext,
@@ -229,7 +238,10 @@ final class AgentModeRunService {
                     return nil
                 }
                 guard ompQualificationStartContext === invocationOMPQualificationStartContext else {
-                    invocationOMPQualificationStartContext.authorizationReceipt.resolve(.denied)
+                    invocationOMPQualificationStartContext.authorizationReceipt.resolve(
+                        .denied,
+                        startupFailureReason: "qualification_context_identity_mismatch"
+                    )
                     return nil
                 }
                 guard session.mcpControlContext?.sessionID == ompQualificationStartContext.transaction.sessionID,
@@ -336,6 +348,7 @@ final class AgentModeRunService {
                 let ompQualificationAuthorizer = dependencies.ompQualificationAuthorizer
                 let testBeforeOMPQualificationProviderAuthorization = dependencies.testBeforeOMPQualificationProviderAuthorization
                 let providerStartBootstrapObserver = dependencies.testOMPQualificationProviderBootstrapEntry
+                var providerStartAuthorizationFailureReason: String?
                 let providerStartAuthorizer: (UUID) -> Bool = { [weak session] runID in
                     guard selectedAgent == .ohMyPi else { return true }
                     testBeforeOMPQualificationProviderAuthorization()
@@ -349,17 +362,23 @@ final class AgentModeRunService {
                           ompQualificationActiveWorkspaceID() == ompQualificationStartContext.expectedWorkspaceID,
                           ompQualificationStartContext.authorizationReceipt.authorizationStillPermitted
                     else {
-                        ompQualificationStartContext?.authorizationReceipt.resolve(.denied)
+                        ompQualificationStartContext?.authorizationReceipt.resolve(
+                            .denied,
+                            startupFailureReason: "qualification_authorizer_precondition_failed"
+                        )
                         return false
                     }
-                    return ompQualificationAuthorizer(ompQualificationStartContext.transaction, runID)
+                    let decision = ompQualificationAuthorizer(ompQualificationStartContext.transaction, runID)
+                    providerStartAuthorizationFailureReason = decision.refusalReason
+                    return decision.isAuthorized
                 }
                 let providerStartBoundaryReporter: (
                     _ runID: UUID?,
                     _ activeAgentSessionID: UUID?,
                     _ runAttemptID: UUID?,
-                    _ authorized: Bool
-                ) -> Bool = { runID, activeAgentSessionID, runAttemptID, authorized in
+                    _ authorized: Bool,
+                    _ startupFailureReason: String?
+                ) -> Bool = { runID, activeAgentSessionID, runAttemptID, authorized, startupFailureReason in
                     guard selectedAgent == .ohMyPi else { return true }
                     guard let context = ompQualificationStartContext else { return false }
                     let proposedOutcome: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome = if authorized, let runID {
@@ -371,11 +390,21 @@ final class AgentModeRunService {
                     } else {
                         .denied
                     }
-                    return context.authorizationReceipt.resolve(proposedOutcome) == proposedOutcome
+                    let effectiveStartupFailureReason = if authorized {
+                        startupFailureReason
+                    } else {
+                        startupFailureReason
+                            ?? providerStartAuthorizationFailureReason
+                            ?? "provider_boundary_failure_unspecified"
+                    }
+                    return context.authorizationReceipt.resolve(
+                        proposedOutcome,
+                        startupFailureReason: effectiveStartupFailureReason
+                    ) == proposedOutcome
                 }
             #else
                 let providerStartAuthorizer: (UUID) -> Bool = { _ in selectedAgent != .ohMyPi }
-                let providerStartBoundaryReporter: (UUID?, UUID?, UUID?, Bool) -> Bool = { _, _, _, _ in true }
+                let providerStartBoundaryReporter: (UUID?, UUID?, UUID?, Bool, String?) -> Bool = { _, _, _, _, _ in true }
                 let providerStartBootstrapObserver: () -> Void = {}
             #endif
             #if DEBUG

@@ -1336,6 +1336,11 @@ struct AgentRunMCPToolService {
             throw decoratedError
         }
         #if DEBUG
+            var effectiveSnapshot = outcome.snapshot
+        #else
+            let effectiveSnapshot = outcome.snapshot
+        #endif
+        #if DEBUG
             if let ompQualificationLease {
                 guard let context = ompQualificationStartContext else {
                     throw await terminalQualificationFailure(
@@ -1365,13 +1370,28 @@ struct AgentRunMCPToolService {
                     authorizationOutcome = effectiveOutcome
                 }
                 guard case let .authorized(authorizedRun) = authorizationOutcome else {
+                    let startupFailureSuffix = context.authorizationReceipt.resolvedStartupFailureReason.map {
+                        " Underlying startup failure: \($0)"
+                    } ?? ""
                     throw await terminalQualificationFailure(
-                        "The OMP qualification provider start was not authorized for this transaction.",
+                        "The OMP qualification provider start was not authorized for this transaction.\(startupFailureSuffix)",
                         "qualification_authorization"
                     )
                 }
+                if let dispatchedRunID = outcome.snapshot.runID,
+                   dispatchedRunID != authorizedRun.runID
+                {
+                    throw await terminalQualificationFailure(
+                        "The OMP qualification start returned a run identity that did not match the authorized run.",
+                        "run_identity_mismatch"
+                    )
+                }
+                let liveSnapshot = await currentSnapshot(
+                    sessionID: outcome.snapshot.sessionID,
+                    agentModeVM: agentModeVM
+                )
                 guard let connectionID = metadata.connectionID,
-                      let runID = outcome.snapshot.runID
+                      let runID = liveSnapshot.runID
                 else {
                     throw await terminalQualificationFailure(
                         "The OMP qualification start did not expose a bindable run identity.",
@@ -1388,9 +1408,10 @@ struct AgentRunMCPToolService {
                     ompQualificationRollbackSnapshot = try OhMyPiAgentModeSmokeGate.shared.bindRun(
                         leaseID: ompQualificationLease.leaseID,
                         ownerConnectionID: connectionID,
-                        sessionID: outcome.snapshot.sessionID,
+                        sessionID: liveSnapshot.sessionID,
                         runID: runID
                     )
+                    effectiveSnapshot = liveSnapshot
                 } catch {
                     throw await terminalQualificationFailure(
                         "The OMP qualification lease could not bind the created run.",
@@ -1402,14 +1423,14 @@ struct AgentRunMCPToolService {
                 try? WorktreeStartupBenchmarkDiagnostics.shared.recordRecoverableStartPhase(
                     correlationID: worktreeStartupCorrelationID,
                     phase: .responsePrepared,
-                    providerRunActive: outcome.snapshot.status == .running
+                    providerRunActive: effectiveSnapshot.status == .running
                 )
             }
         #endif
-        if detach || outcome.snapshot.status != .running || timeoutSeconds <= 0 {
+        if detach || effectiveSnapshot.status != .running || timeoutSeconds <= 0 {
             #if DEBUG
                 ompQualificationTransactionSucceeded = ompQualificationLease == nil
-                    || Self.ompQualificationTransactionCommits(status: outcome.snapshot.status)
+                    || Self.ompQualificationTransactionCommits(status: effectiveSnapshot.status)
                 if !ompQualificationTransactionSucceeded {
                     await rollbackConsumedQualificationStart(agentModeVM, target.tabID, true)
                 } else if let session = agentModeVM.session(for: target.tabID, createIfNeeded: false),
@@ -1418,12 +1439,12 @@ struct AgentRunMCPToolService {
                     session.ompQualificationStartContext = nil
                 }
             #endif
-            return decoratedRunValue(snapshot: outcome.snapshot, workflow: workflow, delivery: outcome.delivery)
+            return decoratedRunValue(snapshot: effectiveSnapshot, workflow: workflow, delivery: outcome.delivery)
         }
         let waitedValue: Value
         do {
             waitedValue = try await waitForInterestingState(
-                sessionID: outcome.snapshot.sessionID,
+                sessionID: effectiveSnapshot.sessionID,
                 agentModeVM: agentModeVM,
                 metadata: metadata,
                 timeoutSeconds: timeoutSeconds,
@@ -1440,7 +1461,7 @@ struct AgentRunMCPToolService {
         }
         #if DEBUG
             let committedStatus = await currentSnapshot(
-                sessionID: outcome.snapshot.sessionID,
+                sessionID: effectiveSnapshot.sessionID,
                 agentModeVM: agentModeVM
             ).status
             ompQualificationTransactionSucceeded = ompQualificationLease == nil

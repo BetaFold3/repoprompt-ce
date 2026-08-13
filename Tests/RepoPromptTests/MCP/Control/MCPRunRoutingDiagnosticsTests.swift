@@ -20,6 +20,7 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
                 connectionID: connectionID,
                 fields: [
                     "client_name": "opencode",
+                    "verified_client_name": "omp-coding-agent",
                     "session_token": "must-not-leak",
                     "auth_header": "Bearer must-not-leak",
                     "prompt_payload": "private prompt",
@@ -60,6 +61,7 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
             XCTAssertEqual(fields["safe_args"], "OPENAI_API_KEY=<redacted> --header <redacted>")
             XCTAssertEqual(fields["unsafe_args"], "<redacted>")
             XCTAssertEqual(fields["client_name"], "opencode")
+            XCTAssertEqual(fields["verified_client_name"], "omp-coding-agent")
             XCTAssertEqual(fields["pending_policy_key"], "opencode")
             XCTAssertEqual(fields["bounded"]?.count, 512)
             XCTAssertFalse(String(describing: payload).contains("must-not-leak"))

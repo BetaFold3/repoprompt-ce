@@ -4,6 +4,19 @@ import XCTest
 
 #if DEBUG
     final class InteractiveREPLSingleShotRoutingTests: XCTestCase {
+        func testStructurePositionalShorthandSuppliesRequiredPathsScope() throws {
+            let command = try MCPCommandParser.parseCommand(
+                "structure Sources/App.swift",
+                ctx: CommandParseContext(currentDirectory: "/workspace")
+            )
+            guard case let .aliasCall(toolName, args) = command else {
+                return XCTFail("Expected alias call")
+            }
+            XCTAssertEqual(toolName, "get_code_structure")
+            XCTAssertEqual(args["scope"]?.value as? String, "paths")
+            XCTAssertEqual(args["paths"]?.value as? [String], ["Sources/App.swift"])
+        }
+
         func testSingleShotCallWithInitialWindowInjectsHiddenWindowWithoutBinding() async throws {
             let fixture = try await makeFixture()
             addTeardownBlock { await fixture.cleanup() }

@@ -406,7 +406,7 @@ enum WorkspaceCodemapBindingDemandRejection: Equatable {
     case languageMismatch
     case classificationMismatch
     case sourceAuthorityUnavailable
-    case overlayRejected
+    case overlayRejected(WorkspaceCodemapLiveDemandRejection)
     case staleCompletion
 }
 

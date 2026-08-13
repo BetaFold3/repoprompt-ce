@@ -5901,8 +5901,8 @@ actor WorkspaceCodemapBindingEngine {
         case .busy:
             recordBusy(current.rootEpoch)
             return .result(.busy(retryAfterMilliseconds: nil))
-        case .rejected:
-            return .result(.rejected(.overlayRejected))
+        case let .rejected(reason):
+            return .result(.rejected(.overlayRejected(reason)))
         }
     }
 
@@ -5958,8 +5958,8 @@ actor WorkspaceCodemapBindingEngine {
         case .queued, .busy:
             recordBusy(current.rootEpoch)
             return .result(.busy(retryAfterMilliseconds: nil))
-        case .rejected:
-            return .result(.rejected(.overlayRejected))
+        case let .rejected(reason):
+            return .result(.rejected(.overlayRejected(reason)))
         }
     }
 

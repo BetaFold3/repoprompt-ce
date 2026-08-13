@@ -5,6 +5,8 @@ struct OhMyPiACPResolvedLaunch: Equatable {
     let arguments: [String]
     let additionalPathHints: [String]
     let executableIdentity: ExecutableFileIdentity
+    let processExecutablePath: String
+    let processExecutableIdentity: ExecutableFileIdentity
 }
 
 enum OhMyPiACPLaunchResolutionError: Error, Equatable, LocalizedError {
@@ -13,6 +15,7 @@ enum OhMyPiACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case exactPathNotFound(String)
     case noValidLaunchCandidate(String, [String], ShellEnvironmentSource?)
     case environmentDiscoveryRequired(String)
+    case invalidProcessExecutable(String)
 
     var errorDescription: String? {
         switch self {
@@ -29,6 +32,8 @@ enum OhMyPiACPLaunchResolutionError: Error, Equatable, LocalizedError {
             )
         case let .environmentDiscoveryRequired(command):
             "Oh My Pi CLI path discovery has not completed for \(command). Run the OMP support preflight or configure an absolute path."
+        case let .invalidProcessExecutable(reason):
+            "Unable to pin the Oh My Pi process executable: \(reason)"
         }
     }
 }
@@ -84,6 +89,13 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
         let launch = try resolveExplicitLaunch(for: config)
         cache(launch, key: key)
         return launch
+    }
+
+    func resolvedLaunch(
+        for config: OhMyPiAgentConfig,
+        environment: [String: String]
+    ) throws -> OhMyPiACPResolvedLaunch {
+        try resolveExplicitLaunch(for: config, environment: environment)
     }
 
     func probeSupport(for config: OhMyPiAgentConfig) async throws -> ACPSupportResult {
@@ -184,6 +196,7 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
             ),
             configuredCommand: configuredCommand,
             additionalPathHints: effectiveHints,
+            environment: environment,
             shellEnvironmentSource: launchEnvironment.shellEnvironmentSource
         )
     }
@@ -202,7 +215,8 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
             return try validatedLaunch(
                 entryPath: CommandPathResolver.expandPath(configuredCommand, environment: environment),
                 configuredCommand: configuredCommand,
-                additionalPathHints: effectiveHints
+                additionalPathHints: effectiveHints,
+                environment: environment
             )
         } catch {
             AgentCLILaunchDiagnostics.recordPathResolutionFailure(
@@ -229,7 +243,8 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
     private func validatedLaunch(
         entryPath: String,
         configuredCommand: String,
-        additionalPathHints: [String]
+        additionalPathHints: [String],
+        environment: [String: String]
     ) throws -> OhMyPiACPResolvedLaunch {
         guard entryPath.hasPrefix("/"),
               (entryPath as NSString).lastPathComponent.caseInsensitiveCompare("omp") == .orderedSame
@@ -237,12 +252,191 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
             throw OhMyPiACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
         let identity = try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: entryPath)
+        let processIdentity = try expectedProcessExecutableIdentity(
+            entryIdentity: identity,
+            environment: environment
+        )
         return OhMyPiACPResolvedLaunch(
             command: identity.canonicalPath,
             arguments: OhMyPiAgentConfig.managedArguments,
             additionalPathHints: additionalPathHints,
-            executableIdentity: identity
+            executableIdentity: identity,
+            processExecutablePath: processIdentity.canonicalPath,
+            processExecutableIdentity: processIdentity
         )
+    }
+
+    private func expectedProcessExecutableIdentity(
+        entryIdentity: ExecutableFileIdentity,
+        environment: [String: String]
+    ) throws -> ExecutableFileIdentity {
+        var visitedIdentities = Set<String>()
+        return try resolveProcessExecutableIdentity(
+            entryIdentity,
+            environment: environment,
+            remainingScriptDepth: 4,
+            visitedIdentities: &visitedIdentities
+        )
+    }
+
+    private func resolveProcessExecutableIdentity(
+        _ identity: ExecutableFileIdentity,
+        environment: [String: String],
+        remainingScriptDepth: Int,
+        visitedIdentities: inout Set<String>
+    ) throws -> ExecutableFileIdentity {
+        let identityKey = "\(identity.device):\(identity.inode)"
+        guard visitedIdentities.insert(identityKey).inserted else {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "interpreter script chain contains a cycle at \(identity.canonicalPath)"
+            )
+        }
+
+        let data: Data
+        do {
+            let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: identity.canonicalPath))
+            defer { try? handle.close() }
+            data = try handle.read(upToCount: 4096) ?? Data()
+        } catch {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "executable is unreadable at \(identity.canonicalPath)"
+            )
+        }
+        if Self.isMachOExecutable(data) {
+            return identity
+        }
+        guard remainingScriptDepth > 0 else {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "interpreter chain did not terminate at a Mach-O image within 3 script hops"
+            )
+        }
+
+        let tokens = try Self.shebangTokens(in: data, path: identity.canonicalPath)
+        guard let interpreter = tokens.first, interpreter.hasPrefix("/") else {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "shebang interpreter path must be absolute"
+            )
+        }
+
+        let interpreterIdentity: ExecutableFileIdentity
+        if interpreter == "/usr/bin/env" {
+            guard tokens.count == 2 else {
+                throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                    "/usr/bin/env shebang must contain exactly one interpreter command"
+                )
+            }
+            let command = tokens[1]
+            guard !command.hasPrefix("-"), !command.contains("/") else {
+                throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                    "/usr/bin/env interpreter must be a single command name without options"
+                )
+            }
+            interpreterIdentity = try resolveEnvironmentInterpreter(command, environment: environment)
+        } else {
+            do {
+                interpreterIdentity = try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: interpreter)
+            } catch {
+                throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(error.localizedDescription)
+            }
+        }
+
+        return try resolveProcessExecutableIdentity(
+            interpreterIdentity,
+            environment: environment,
+            remainingScriptDepth: remainingScriptDepth - 1,
+            visitedIdentities: &visitedIdentities
+        )
+    }
+
+    private func resolveEnvironmentInterpreter(
+        _ command: String,
+        environment: [String: String]
+    ) throws -> ExecutableFileIdentity {
+        guard let path = environment["PATH"] else {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "launch PATH is missing"
+            )
+        }
+        let components = path.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0.hasPrefix("/") })
+        else {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "launch PATH contains an empty or non-absolute component"
+            )
+        }
+
+        for directory in components {
+            let candidate = (directory as NSString).appendingPathComponent(command)
+            guard CommandPathResolver.launchability(of: candidate) == .launchable else { continue }
+            do {
+                return try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: candidate)
+            } catch {
+                throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(error.localizedDescription)
+            }
+        }
+        throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+            "interpreter \(command) is not resolvable on the launch PATH"
+        )
+    }
+
+    private static func shebangTokens(in data: Data, path: String) throws -> [String] {
+        let bytes = [UInt8](data)
+        guard bytes.count >= 2, bytes[0] == 0x23, bytes[1] == 0x21 else {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "non-Mach-O executable has no shebang at byte offset 0: \(path)"
+            )
+        }
+        let lineEnd = bytes.firstIndex(of: 0x0A) ?? bytes.endIndex
+        let line = Array(bytes[..<lineEnd])
+        guard !line.contains(0x0D) else {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "shebang line must not contain a carriage return"
+            )
+        }
+
+        var tokenData: [Data] = []
+        var current: [UInt8] = []
+        for byte in line.dropFirst(2) {
+            if byte == 0x20 || byte == 0x09 {
+                if !current.isEmpty {
+                    tokenData.append(Data(current))
+                    current.removeAll(keepingCapacity: true)
+                }
+            } else {
+                current.append(byte)
+            }
+        }
+        if !current.isEmpty {
+            tokenData.append(Data(current))
+        }
+        guard !tokenData.isEmpty else {
+            throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                "shebang line has no interpreter"
+            )
+        }
+
+        var tokens: [String] = []
+        for token in tokenData {
+            guard let decoded = String(data: token, encoding: .utf8) else {
+                throw OhMyPiACPLaunchResolutionError.invalidProcessExecutable(
+                    "shebang line is not valid UTF-8"
+                )
+            }
+            tokens.append(decoded)
+        }
+        return tokens
+    }
+
+    private static func isMachOExecutable(_ data: Data) -> Bool {
+        guard data.count >= 4 else { return false }
+        let magic = Array(data.prefix(4))
+        return [
+            [0xFE, 0xED, 0xFA, 0xCE], [0xCE, 0xFA, 0xED, 0xFE],
+            [0xFE, 0xED, 0xFA, 0xCF], [0xCF, 0xFA, 0xED, 0xFE],
+            [0xCA, 0xFE, 0xBA, 0xBE], [0xBE, 0xBA, 0xFE, 0xCA],
+            [0xCA, 0xFE, 0xBA, 0xBF], [0xBF, 0xBA, 0xFE, 0xCA]
+        ].contains(magic)
     }
 
     private func launchCandidates(
@@ -278,6 +472,7 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
         candidates: [String],
         configuredCommand: String,
         additionalPathHints: [String],
+        environment: [String: String],
         shellEnvironmentSource: ShellEnvironmentSource?
     ) throws -> OhMyPiACPResolvedLaunch {
         var failures: [String] = []
@@ -286,7 +481,8 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
                 return try validatedLaunch(
                     entryPath: candidate,
                     configuredCommand: configuredCommand,
-                    additionalPathHints: additionalPathHints
+                    additionalPathHints: additionalPathHints,
+                    environment: environment
                 )
             } catch {
                 failures.append("\(candidate): \(error.localizedDescription)")

@@ -97,6 +97,7 @@ RELEASE_BUILD_NUMBER_OVERRIDE="${REPOPROMPT_RELEASE_BUILD_NUMBER_OVERRIDE:-}"
 # so failed non-public packaging cannot leave stale release metadata behind.
 remove_stale_artifact_manifests
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
+phase "Loading release metadata"
 load_release_metadata "$ROOT_DIR"
 if [[ -n "$RELEASE_BUILD_NUMBER_OVERRIDE" ]]; then
     [[ "$RELEASE_BUILD_NUMBER_OVERRIDE" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]] ||

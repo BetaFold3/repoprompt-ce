@@ -488,6 +488,32 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private final class CodemapSharedTaskCancellationGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var race: CodemapSharedTaskDeadlineRace?
+        private var isCancelled = false
+
+        func install(_ race: CodemapSharedTaskDeadlineRace) {
+            lock.lock()
+            if isCancelled {
+                lock.unlock()
+                race.resolve(false)
+            } else {
+                self.race = race
+                lock.unlock()
+            }
+        }
+
+        func cancel() {
+            lock.lock()
+            isCancelled = true
+            let race = race
+            self.race = nil
+            lock.unlock()
+            race?.resolve(false)
+        }
+    }
+
     private struct CodemapGraphPublicationFlight {
         let id: UUID
         let authority: CodemapRootAuthority
@@ -2367,6 +2393,7 @@ actor WorkspaceFileContextStore {
         private var codeStructureSelectedMetadataResolutionRequestCountForTesting = 0
         private var codemapPresentationCandidateRequestCountForTesting = 0
         private var codemapArtifactDemandRequestCountForTesting = 0
+        private var codemapRootSessionRepairCountStorageForTesting = 0
         private var codemapPresentationFreezeRequestCountForTesting = 0
         private var codemapSetupTaskCreationCountForTesting = 0
         private var codemapDemandTaskCreationCountForTesting = 0
@@ -12619,20 +12646,24 @@ actor WorkspaceFileContextStore {
         deadline: ContinuousClock.Instant?
     ) async -> Bool {
         guard codemapDeadlineIsCurrent(deadline) else { return false }
-        guard let deadline else {
-            await task.value
-            return !Task.isCancelled
-        }
-        let completed = await withCheckedContinuation { continuation in
-            let race = CodemapSharedTaskDeadlineRace(continuation)
-            Task {
-                await task.value
-                race.resolve(ContinuousClock.now < deadline)
+        let cancellationGate = CodemapSharedTaskCancellationGate()
+        let completed = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let race = CodemapSharedTaskDeadlineRace(continuation)
+                cancellationGate.install(race)
+                Task {
+                    await task.value
+                    race.resolve(deadline.map { ContinuousClock.now < $0 } ?? true)
+                }
+                if let deadline {
+                    Task {
+                        try? await Task.sleep(until: deadline, clock: .continuous)
+                        race.resolve(false)
+                    }
+                }
             }
-            Task {
-                try? await Task.sleep(until: deadline, clock: .continuous)
-                race.resolve(false)
-            }
+        } onCancel: {
+            cancellationGate.cancel()
         }
         return completed && codemapDeadlineIsCurrent(deadline)
     }
@@ -14528,6 +14559,70 @@ actor WorkspaceFileContextStore {
         return await requestCodemapArtifact(forFileID: ticket.fileID, priority: priority)
     }
 
+    func retryRejectedCodemapArtifactDemand(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket,
+        rejection: WorkspaceCodemapBindingDemandRejection,
+        priority: CodeMapArtifactBuildPriority
+    ) async -> WorkspaceCodemapArtifactDemandOwnedResult? {
+        guard WorkspaceCodemapArtifactDemandRecovery(rejection) == .retryFreshDemand,
+              codemapDemandIsCurrent(ticket),
+              var session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+              let record = session.demandsByFileID[ticket.fileID],
+              codemapTicketsShareDemand(record.ticket, ticket),
+              record.retainIDs.contains(ticket.retainID),
+              case .unavailable(.rejected(rejection)) = record.result
+        else { return nil }
+
+        session.demandsByFileID.removeValue(forKey: ticket.fileID)
+        let bundle = session.bundlesByRequestID.removeValue(forKey: ticket.requestID)
+        codemapSessionsByRootEpoch[ticket.rootEpoch] = session
+        record.task?.cancel()
+        bundle?.close()
+        if let engine = session.engine {
+            _ = await engine.cancel(owner: record.owner)
+        }
+        guard !Task.isCancelled else { return nil }
+        return await requestCodemapArtifactWithOwnership(
+            forFileID: ticket.fileID,
+            priority: priority
+        )
+    }
+
+    func prepareCodemapRootSessionRetry(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket,
+        rejection: WorkspaceCodemapBindingDemandRejection,
+        priority: CodeMapArtifactBuildPriority,
+        deadline: ContinuousClock.Instant?
+    ) async -> WorkspaceCodemapArtifactDemandOwnedResult? {
+        guard WorkspaceCodemapArtifactDemandRecovery(rejection) == .resetRootSession,
+              codemapDeadlineIsCurrent(deadline),
+              codemapDemandIsCurrent(ticket),
+              let session = codemapSessionsByRootEpoch[ticket.rootEpoch],
+              let record = session.demandsByFileID[ticket.fileID],
+              codemapTicketsShareDemand(record.ticket, ticket),
+              record.retainIDs.contains(ticket.retainID),
+              case .unavailable(.rejected(rejection)) = record.result,
+              codemapAuthorityMatchesLoadedRoot(session.authority)
+        else { return nil }
+
+        #if DEBUG
+            codemapRootSessionRepairCountStorageForTesting += 1
+        #endif
+        let cleanup = detachCodemapSession(rootEpoch: ticket.rootEpoch)
+        if let cleanup {
+            guard await waitForCodemapSharedTask(cleanup.task, deadline: deadline) else {
+                return nil
+            }
+        }
+        guard codemapDeadlineIsCurrent(deadline),
+              rootStatesByID[ticket.rootEpoch.rootID]?.lifetimeID == ticket.rootEpoch.rootLifetimeID
+        else { return nil }
+        return await requestCodemapArtifactWithOwnership(
+            forFileID: ticket.fileID,
+            priority: priority
+        )
+    }
+
     func queryCodemapSelectionGraph(
         _ query: WorkspaceCodemapStoreSelectionGraphQuery
     ) async -> WorkspaceCodemapStoreSelectionGraphQueryDisposition {
@@ -15887,6 +15982,17 @@ actor WorkspaceFileContextStore {
             )
         }
 
+        func codemapRootSessionRepairCountForTesting() -> Int {
+            codemapRootSessionRepairCountStorageForTesting
+        }
+
+        func waitForCodemapSharedTaskForTesting(
+            _ task: Task<Void, Never>,
+            deadline: ContinuousClock.Instant?
+        ) async -> Bool {
+            await waitForCodemapSharedTask(task, deadline: deadline)
+        }
+
         func codemapPresentationOperationCountsForTesting() -> CodemapPresentationOperationCounts {
             CodemapPresentationOperationCounts(
                 structureSeedAdmissionRequests: codemapStructureSeedAdmissionRequestCountForTesting,
@@ -16261,9 +16367,11 @@ actor WorkspaceFileContextStore {
                 .unavailable(.busy(retryAfterMilliseconds: retryAfterMilliseconds)),
                 ticket: ticket
             )
-        case .rejected(.staleCompletion):
-            publishCodemapDemandResult(.unavailable(.staleCurrentness), ticket: ticket)
         case let .rejected(rejection):
+            // Preserve the leaf subtype in the stored result. Presentation
+            // recovery may translate the first currentness mismatch into a
+            // structure-attempt restart, but a persistent rejection must remain
+            // observable to the MCP caller.
             publishCodemapDemandResult(
                 .unavailable(.rejected(rejection)),
                 ticket: ticket
@@ -18095,7 +18203,9 @@ actor WorkspaceFileContextStore {
             reason != .transient
         case .runtimeFailureParked:
             true
-        case .gitTransient, .busy, .rejected, .routeConflict, .registrationFailed,
+        case let .rejected(rejection):
+            WorkspaceCodemapArtifactDemandRecovery(rejection) == .terminal
+        case .gitTransient, .busy, .routeConflict, .registrationFailed,
              .runtimeFailure, .staleCurrentness, .cancelled:
             false
         }

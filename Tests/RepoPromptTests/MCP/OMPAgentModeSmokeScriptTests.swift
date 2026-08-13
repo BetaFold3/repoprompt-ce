@@ -174,7 +174,7 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCLI.path)
 
         let script = try RepoRoot.url().appendingPathComponent("Scripts/smoke_omp_agent_mode.sh")
-        let modelID = "ohMyPi:smoke-provider/exact-model"
+        let modelID = "ohMyPi:default"
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = "\(bin.path):\(environment["PATH"] ?? "/usr/bin:/bin")"
         environment["FAKE_STATE_DIR"] = state.path
@@ -209,6 +209,7 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
             "lease_acquire.json",
             "run_routing_history.json",
             "connections.json",
+            "session_cleanup.json",
             "omp_connection_history.json",
             "lease_cleanup_release.json",
             "lease_cleanup_status.json"
@@ -223,13 +224,124 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
         XCTAssertEqual(manifest["caller_supplied_exact_model_id"] as? String, modelID)
         XCTAssertEqual(manifest["contains_raw_credentials_or_tokens"] as? Bool, false)
 
+        let beforeWorkspaceData = try Data(contentsOf: evidence.appendingPathComponent("workspace_before.json"))
+        let afterWorkspaceData = try Data(contentsOf: evidence.appendingPathComponent("workspace_after.json"))
+        let beforeWorkspace = try XCTUnwrap(JSONSerialization.jsonObject(with: beforeWorkspaceData) as? [String: Any])
+        let afterWorkspace = try XCTUnwrap(JSONSerialization.jsonObject(with: afterWorkspaceData) as? [String: Any])
+        let beforeTarget = try XCTUnwrap(beforeWorkspace["qualification_target"] as? [String: Any])
+        let afterTarget = try XCTUnwrap(afterWorkspace["qualification_target"] as? [String: Any])
+        XCTAssertEqual(beforeTarget["active_context_id"] as? String, "66666666-6666-4666-8666-666666666666")
+        XCTAssertEqual(beforeTarget["active_context_name"] as? String, "Existing user context")
+        XCTAssertEqual(afterTarget["active_context_id"] as? String, "77777777-7777-4777-8777-777777777777")
+        XCTAssertEqual(afterTarget["active_context_name"] as? String, "PRIVATE SYNTHETIC OMP Agent Mode smoke")
+
+        let cleanupData = try Data(contentsOf: evidence.appendingPathComponent("session_cleanup.json"))
+        let cleanup = try XCTUnwrap(JSONSerialization.jsonObject(with: cleanupData) as? [String: Any])
+        XCTAssertEqual(cleanup["status"] as? String, "completed")
+        XCTAssertEqual(cleanup["deleted_count"] as? Int, 1)
+        XCTAssertEqual(cleanup["skipped_count"] as? Int, 0)
+
         XCTAssertTrue(FileManager.default.fileExists(atPath: state.appendingPathComponent("cleanup_verified").path))
         let calls = try String(contentsOf: state.appendingPathComponent("calls.log"), encoding: .utf8)
+        let cleanupCalls = calls.split(separator: "\n").filter { $0.contains(#""op":"cleanup_sessions""#) }
+        XCTAssertEqual(
+            cleanupCalls.map(String.init),
+            [
+                #"--raw-json -w 7 -c agent_manage -j {"op":"cleanup_sessions","session_ids":["A1111111-ABCD-4A11-8B11-ABCDEFABCDEF"]}"#
+            ]
+        )
         XCTAssertFalse(calls.contains("resume_session"))
         XCTAssertTrue(calls.contains(#""workspace_id":"55555555-5555-4555-8555-555555555555""#))
         XCTAssertEqual(disallowedWorkspaceLifecycleCalls(in: calls), [])
         XCTAssertFalse(calls.contains("--launch-app"))
         XCTAssertFalse(calls.contains("\"op\":\"stop"))
+
+        let concreteDefaultFixture = try makeSyntheticFixture(
+            name: "OMPAgentModeConcreteDefaultSuccess",
+            fakeCLI: fakeCLIContents
+        )
+        defer { try? FileManager.default.removeItem(at: concreteDefaultFixture.root) }
+        var concreteDefaultEnvironment = concreteDefaultFixture.environment
+        concreteDefaultEnvironment["FAKE_START_MODEL"] = "smoke-provider/exact-model"
+        concreteDefaultEnvironment["FAKE_WAIT_MODEL"] = "smoke-provider/exact-model"
+        let concreteDefaultResult = try run(
+            executable: URL(fileURLWithPath: "/bin/bash"),
+            arguments: [
+                concreteDefaultFixture.script.path,
+                "--window-id", "7",
+                "--model-id", modelID,
+                "--output-parent", concreteDefaultFixture.output.path,
+                "--timeout", "30"
+            ],
+            environment: concreteDefaultEnvironment
+        )
+        XCTAssertEqual(concreteDefaultResult.status, 0, concreteDefaultResult.stderr)
+
+        let qualificationFailures: [(name: String, environment: [String: String], expectsCancel: Bool)] = [
+            (
+                "default concrete model mismatch",
+                ["FAKE_START_MODEL": "provider-a/model-a", "FAKE_WAIT_MODEL": "provider-b/model-b"],
+                false
+            ),
+            (
+                "completed wait bad acknowledgement",
+                ["FAKE_WAIT_ACK": "WRONG_ACK"],
+                false
+            ),
+            (
+                "start metadata mismatch after valid identifiers",
+                ["FAKE_START_AGENT_ID": "wrong-agent"],
+                true
+            )
+        ]
+        for scenario in qualificationFailures {
+            let fixture = try makeSyntheticFixture(
+                name: "OMPAgentModeQualificationFailure",
+                fakeCLI: fakeCLIContents
+            )
+            defer { try? FileManager.default.removeItem(at: fixture.root) }
+            var scenarioEnvironment = fixture.environment
+            scenario.environment.forEach { scenarioEnvironment[$0.key] = $0.value }
+            let scenarioResult = try run(
+                executable: URL(fileURLWithPath: "/bin/bash"),
+                arguments: [
+                    fixture.script.path,
+                    "--window-id", "7",
+                    "--model-id", modelID,
+                    "--output-parent", fixture.output.path,
+                    "--timeout", "30"
+                ],
+                environment: scenarioEnvironment
+            )
+            XCTAssertNotEqual(scenarioResult.status, 0, scenario.name)
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: fixture.state.appendingPathComponent("session_cleaned").path),
+                scenario.name
+            )
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: fixture.state.appendingPathComponent("cleanup_verified").path),
+                scenario.name
+            )
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: fixture.state.appendingPathComponent("lease_active").path),
+                scenario.name
+            )
+            let scenarioCalls = try String(
+                contentsOf: fixture.state.appendingPathComponent("calls.log"),
+                encoding: .utf8
+            )
+            XCTAssertEqual(
+                scenarioCalls.contains(#""op":"cancel""#),
+                scenario.expectsCancel,
+                scenario.name
+            )
+            XCTAssertTrue(
+                scenarioCalls.contains(
+                    #""op":"cleanup_sessions","session_ids":["A1111111-ABCD-4A11-8B11-ABCDEFABCDEF"]"#
+                ),
+                scenario.name
+            )
+        }
     }
 
     func testWorkspaceLifecycleCallAllowlistRejectsSyntheticDisallowedCall() {
@@ -270,8 +382,8 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
 
         let fakeCLI = bin.appendingPathComponent("rpce-cli-debug")
         let adversarial = fakeCLIContents.replacingOccurrences(
-            of: #"{"seq":15,"run_id":"%s","event":"pid_gate_wait_completed""#,
-            with: #"{"seq":15,"run_id":"%s","event":"tool_call_observed""#
+            of: #"{"seq":16,"run_id":"%s","event":"pid_gate_wait_completed""#,
+            with: #"{"seq":16,"run_id":"%s","event":"tool_call_observed""#
         )
         try adversarial.write(to: fakeCLI, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeCLI.path)
@@ -423,9 +535,7 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
         environment["PATH"] = "\(bin.path):\(environment["PATH"] ?? "/usr/bin:/bin")"
         environment["FAKE_STATE_DIR"] = state.path
         environment["FAKE_REPO_ROOT"] = try RepoRoot.url().path
-        environment["FAKE_FAIL_WAIT"] = "1"
-        environment["FAKE_FAIL_CANCEL"] = "1"
-        environment["FAKE_FAIL_RELEASE"] = "1"
+        environment["FAKE_CLEANUP_SKIPS_ACTIVE"] = "1"
 
         let result = try run(
             executable: URL(fileURLWithPath: "/bin/bash"),
@@ -440,16 +550,39 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
         )
 
         XCTAssertNotEqual(result.status, 0)
-        XCTAssertTrue(result.stderr.contains("cleanup action cancel failed"))
-        XCTAssertTrue(result.stderr.contains("cleanup action release failed"))
+        XCTAssertTrue(result.stderr.contains("exact-session cleanup did not prove deletion of only session"))
+        XCTAssertFalse(result.stderr.contains("cleanup action release failed"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: state.appendingPathComponent("cleanup_verified").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: state.appendingPathComponent("lease_active").path))
         let calls = try String(contentsOf: state.appendingPathComponent("calls.log"), encoding: .utf8)
             .split(separator: "\n")
             .map(String.init)
-        let cancelIndex = try XCTUnwrap(calls.firstIndex { $0.contains("\"op\":\"cancel\"") })
+        XCTAssertFalse(calls.contains { $0.contains("\"op\":\"cancel\"") })
+        let sessionCleanupIndices = calls.indices.filter {
+            calls[$0].contains("\"op\":\"cleanup_sessions\"")
+        }
+        XCTAssertEqual(sessionCleanupIndices.count, 2)
+        XCTAssertTrue(sessionCleanupIndices.allSatisfy {
+            calls[$0].contains(
+                #""session_ids":["A1111111-ABCD-4A11-8B11-ABCDEFABCDEF"]"#
+            )
+        })
         let releaseIndex = try XCTUnwrap(calls.firstIndex { $0.contains("\"action\":\"release\"") })
         let statusIndex = try XCTUnwrap(calls.lastIndex { $0.contains("\"action\":\"status\"") })
-        XCTAssertLessThan(cancelIndex, releaseIndex)
+        XCTAssertLessThan(try XCTUnwrap(sessionCleanupIndices.last), releaseIndex)
         XCTAssertLessThan(releaseIndex, statusIndex)
+
+        let prefix = "OMP_AGENT_MODE_EVIDENCE_DIR="
+        let evidenceLine = try XCTUnwrap(result.stdout.split(separator: "\n").first { $0.hasPrefix(prefix) })
+        let evidence = URL(fileURLWithPath: String(evidenceLine.dropFirst(prefix.count)), isDirectory: true)
+        let cleanupData = try Data(contentsOf: evidence.appendingPathComponent("session_cleanup.json"))
+        let cleanup = try XCTUnwrap(JSONSerialization.jsonObject(with: cleanupData) as? [String: Any])
+        XCTAssertEqual(cleanup["status"] as? String, "partial")
+        XCTAssertEqual(cleanup["deleted_count"] as? Int, 0)
+        XCTAssertEqual(cleanup["skipped_count"] as? Int, 1)
+        let skipped = try XCTUnwrap(cleanup["skipped_sessions"] as? [[String: Any]])
+        XCTAssertEqual(skipped.count, 1)
+        XCTAssertEqual(skipped[0]["reason"] as? String, "skipped_active")
     }
 
     func testRejectedAcquireResponseReleasesMatchingControllerLeaseAndVerifiesInactive() throws {
@@ -544,16 +677,31 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
         process.executableURL = executable
         process.arguments = arguments
         process.environment = environment ?? ProcessInfo.processInfo.environment
-        let stdout = Pipe()
-        let stderr = Pipe()
+        let captureRoot = FileManager.default.temporaryDirectory
+        let stdoutURL = captureRoot.appendingPathComponent("omp-smoke-stdout-\(UUID().uuidString)")
+        let stderrURL = captureRoot.appendingPathComponent("omp-smoke-stderr-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
+        FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
+        defer {
+            try? FileManager.default.removeItem(at: stdoutURL)
+            try? FileManager.default.removeItem(at: stderrURL)
+        }
+        let stdout = try FileHandle(forWritingTo: stdoutURL)
+        let stderr = try FileHandle(forWritingTo: stderrURL)
+        defer {
+            try? stdout.close()
+            try? stderr.close()
+        }
         process.standardOutput = stdout
         process.standardError = stderr
         try process.run()
         process.waitUntilExit()
-        return (
+        try stdout.synchronize()
+        try stderr.synchronize()
+        return try (
             process.terminationStatus,
-            String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
-            String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            String(decoding: Data(contentsOf: stdoutURL), as: UTF8.self),
+            String(decoding: Data(contentsOf: stderrURL), as: UTF8.self)
         )
     }
 
@@ -641,6 +789,8 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
             switch (tool, operation) {
             case ("agent_manage", "list_agents"):
                 return true
+            case ("agent_manage", "cleanup_sessions"):
+                return payload["session_ids"] as? [String] != nil
             case ("agent_run", "start"):
                 return strings(["model_id", "_omp_qualification_lease_id", "workspace_id", "session_name", "message"])
                     && booleans(["detach"])
@@ -669,6 +819,8 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
             switch (tool, operation) {
             case ("agent_manage", "list_agents"):
                 return ["op"]
+            case ("agent_manage", "cleanup_sessions"):
+                return ["op", "session_ids"]
             case ("agent_run", "start"):
                 return [
                     "op", "model_id", "_omp_qualification_lease_id", "workspace_id",
@@ -773,26 +925,47 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
             *) shift ;;
           esac
         done
-        session_id="11111111-1111-4111-8111-111111111111"
-        run_id="22222222-2222-4222-8222-222222222222"
+        session_id="A1111111-ABCD-4A11-8B11-ABCDEFABCDEF"
+        run_id="B2222222-BCDE-4B22-8C22-BCDEFABCDEF0"
         connection_id="33333333-3333-4333-8333-333333333333"
         lease_id="44444444-4444-4444-8444-444444444444"
         if [[ "${FAKE_FAIL_WAIT:-0}" == "1" && "$tool" == "agent_run" && "$payload" != *'"op":"start"'* && "$payload" != *'"op":"cancel"'* ]]; then
-          exit 90
+          printf 'invalid wait response\\n'
+          exit 0
         fi
         if [[ "${FAKE_FAIL_CANCEL:-0}" == "1" && "$tool" == "agent_run" && "$payload" == *'"op":"cancel"'* ]]; then
-          exit 91
+          printf 'invalid cancel response\\n'
+          exit 0
         fi
         if [[ "${FAKE_FAIL_RELEASE:-0}" == "1" && "$tool" == "__repoprompt_debug_diagnostics" && "$payload" == *'"action":"release"'* ]]; then
-          exit 92
+          printf 'invalid release response\\n'
+          exit 0
         fi
         case "$tool" in
           agent_manage)
-            printf '{"result":{"structuredContent":{"agents":[{"name":"Oh My Pi","available":true,"models":[{"model_id":"ohMyPi:smoke-provider/exact-model","agent_id":"ohMyPi"}]}],"task_labels":[]}}}\\n'
+            if [[ "$payload" == '{"op":"list_agents"}' ]]; then
+              printf '{"result":{"structuredContent":{"agents":[{"name":"Oh My Pi","available":true,"models":[{"model_id":"ohMyPi:default","agent_id":"ohMyPi"},{"model_id":"ohMyPi:smoke-provider/exact-model","agent_id":"ohMyPi"}]}],"task_labels":[]}}}\\n'
+            elif [[ "$payload" == '{"op":"cleanup_sessions","session_ids":["'"$session_id"'"]}' ]]; then
+              if [[ "${FAKE_CLEANUP_SKIPS_ACTIVE:-0}" == "1" ]]; then
+                printf '{"result":{"structuredContent":{"status":"partial","deleted_count":0,"skipped_count":1,"deleted_sessions":[],"skipped_sessions":[{"session_id":"%s","name":"PRIVATE SYNTHETIC OMP Agent Mode smoke","reason":"skipped_active"}]}}}\\n' "$session_id"
+              else
+                : > "$FAKE_STATE_DIR/session_cleaned"
+                printf '{"result":{"structuredContent":{"status":"completed","deleted_count":1,"skipped_count":0,"deleted_sessions":[{"session_id":"%s","name":"PRIVATE SYNTHETIC OMP Agent Mode smoke"}],"skipped_sessions":[]}}}\\n' "$session_id"
+              fi
+            else
+              exit 89
+            fi
             ;;
           agent_run)
             if [[ "$payload" == *'"op":"start"'* ]]; then
-              printf '{"status":"running","session_id":"%s","run_id":"%s","agent":{"id":"ohMyPi","model":"smoke-provider/exact-model"}}\\n' "$session_id" "$run_id"
+              : > "$FAKE_STATE_DIR/session_started"
+              start_agent_id="${FAKE_START_AGENT_ID:-ohMyPi}"
+              if [[ "$payload" == *'"model_id":"ohMyPi:default"'* ]]; then
+                start_model="${FAKE_START_MODEL:-default}"
+              else
+                start_model="${FAKE_START_MODEL:-smoke-provider/exact-model}"
+              fi
+              printf '{"status":"running","session_id":"%s","run_id":"%s","agent":{"id":"%s","model":"%s"}}\\n' "$session_id" "$run_id" "$start_agent_id" "$start_model"
             elif [[ "$payload" == *'"op":"cancel"'* ]]; then
               printf '{"status":"cancelled","session_id":"%s","run_id":"%s"}\\n' "$session_id" "$run_id"
             else
@@ -801,13 +974,22 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
                 sleep "$((app_timeout + 1))"
                 printf '{"status":"running","session_id":"%s","run_id":"%s","agent":{"id":"ohMyPi","model":"smoke-provider/exact-model"},"_meta":{"wait_result":"timed_out"}}\\n' "$session_id" "$run_id"
               else
-                printf '{"status":"completed","session_id":"%s","run_id":"%s","assistant_text":"OMP_AGENT_MODE_SMOKE_OK","agent":{"id":"ohMyPi","model":"smoke-provider/exact-model"}}\\n' "$session_id" "$run_id"
+                wait_ack="${FAKE_WAIT_ACK:-OMP_AGENT_MODE_SMOKE_OK}"
+                wait_model="${FAKE_WAIT_MODEL:-smoke-provider/exact-model}"
+                printf '{"status":"completed","session_id":"%s","run_id":"%s","assistant_text":"%s","agent":{"id":"ohMyPi","model":"%s"}}\\n' "$session_id" "$run_id" "$wait_ack" "$wait_model"
               fi
             fi
             ;;
           __repoprompt_debug_diagnostics)
             if [[ "$payload" == *'"op":"routing_snapshot"'* ]]; then
-              printf '{"ok":true,"op":"routing_snapshot","windows":[{"window_id":7,"workspace_id":"55555555-5555-4555-8555-555555555555","workspace_name":"fixture","workspace_instance_number":1,"active_context_id":null,"active_context_name":null,"repo_paths":["%s"]}]}\\n' "$FAKE_REPO_ROOT"
+              if [[ -f "$FAKE_STATE_DIR/session_started" ]]; then
+                active_context_id="77777777-7777-4777-8777-777777777777"
+                active_context_name="PRIVATE SYNTHETIC OMP Agent Mode smoke"
+              else
+                active_context_id="66666666-6666-4666-8666-666666666666"
+                active_context_name="Existing user context"
+              fi
+              printf '{"ok":true,"op":"routing_snapshot","windows":[{"window_id":7,"workspace_id":"55555555-5555-4555-8555-555555555555","workspace_name":"fixture","workspace_instance_number":1,"active_context_id":"%s","active_context_name":"%s","repo_paths":["%s"]}]}\\n' "$active_context_id" "$active_context_name" "$FAKE_REPO_ROOT"
             elif [[ "$payload" == *'"op":"routing_sequence_baseline"'* ]]; then
               printf '{"ok":true,"op":"routing_sequence_baseline","run_routing_sequence":10,"connection_sequence":20}\\n'
             elif [[ "$payload" == *'"op":"omp_qualification_lease"'* && "$payload" == *'"action":"acquire"'* ]]; then
@@ -832,18 +1014,21 @@ final class OMPAgentModeSmokeScriptTests: XCTestCase {
             elif [[ "$payload" == *'run_routing_history'* ]]; then
               printf '{"ok":true,"op":"run_routing_history","run_id":"%s","dropped_event_count":0,"events":[' "$run_id"
               printf '{"seq":11,"run_id":"%s","event":"policy_installed","connection_id":null,"fields":{"pending_policy_key":"omp-coding-agent"}},' "$run_id"
-              printf '{"seq":12,"run_id":"%s","event":"expected_pid_registered","connection_id":null,"fields":{"expected_pid":"321"}},' "$run_id"
-              printf '{"seq":13,"run_id":"%s","event":"expected_pid_policy_armed","connection_id":null,"fields":{"armed":"true"}},' "$run_id"
-              printf '{"seq":14,"run_id":"%s","event":"client_identity_observed","connection_id":"%s","fields":{"authoritative_client_name":"omp-coding-agent","helper_peer_pid":"123","process_correlation_ok":"true","matched_expected_pid":"321","matched_expected_start_seconds":"123456","matched_expected_start_microseconds":"789","matched_expected_executable_path":"/fixture/bin/omp","omp_current_executable_identity_match":"true","helper_process_start_seconds":"123457","helper_process_start_microseconds":"111","helper_executable_path":"/fixture/RepoPrompt.app/Contents/Helpers/repoprompt-mcp","helper_bundled_identity_match":"true","helper_current_executable_identity_match":"true","helper_strict_descendant":"true"}},' "$run_id" "$connection_id"
-              printf '{"seq":15,"run_id":"%s","event":"pid_gate_wait_completed","connection_id":"%s","fields":{}},' "$run_id" "$connection_id"
-              printf '{"seq":16,"run_id":"%s","event":"policy_applied","connection_id":"%s","fields":{}},' "$run_id" "$connection_id"
+              printf '{"seq":12,"run_id":"%s","event":"expected_pid_policy_armed","connection_id":null,"fields":{"armed":"true"}},' "$run_id"
+              printf '{"seq":13,"run_id":"%s","event":"expected_pid_registered","connection_id":null,"fields":{"expected_pid":"321"}},' "$run_id"
+              printf '{"seq":14,"run_id":"%s","event":"client_identity_observed","connection_id":"%s","fields":{"verified_client_name":"omp-coding-agent","helper_peer_pid":"123","process_correlation_ok":"true","matched_expected_pid":"321","matched_expected_start_seconds":"123456","matched_expected_start_microseconds":"789","matched_expected_executable_path":"/fixture/bin/omp","omp_current_executable_identity_match":"true","helper_process_start_seconds":"123457","helper_process_start_microseconds":"111","helper_executable_path":"/fixture/RepoPrompt.app/Contents/Helpers/repoprompt-mcp","helper_bundled_identity_match":"true","helper_current_executable_identity_match":"true","helper_strict_descendant":"true"}},' "$run_id" "$connection_id"
+              printf '{"seq":15,"run_id":"%s","event":"pid_gate_wait_started","connection_id":"%s","fields":{}},' "$run_id" "$connection_id"
+              printf '{"seq":16,"run_id":"%s","event":"pid_gate_wait_completed","connection_id":"%s","fields":{}},' "$run_id" "$connection_id"
               printf '{"seq":17,"run_id":"%s","event":"run_route_mapped","connection_id":"%s","fields":{}},' "$run_id" "$connection_id"
               printf '{"seq":18,"run_id":"%s","event":"routing_waiter_signalled","connection_id":"%s","fields":{"outcome":"routed"}},' "$run_id" "$connection_id"
-              printf '{"seq":19,"run_id":"%s","event":"route_wait_completed","connection_id":"%s","fields":{"routed":"true"}},' "$run_id" "$connection_id"
-              printf '{"seq":20,"run_id":"%s","event":"expected_pid_cleared","connection_id":null,"fields":{"expected_pid":"321"}},' "$run_id"
-              printf '{"seq":21,"run_id":"%s","event":"policy_cleared","connection_id":null,"fields":{"remaining_count":"0"}}]}\\n' "$run_id"
+              printf '{"seq":19,"run_id":"%s","event":"policy_applied","connection_id":"%s","fields":{}},' "$run_id" "$connection_id"
+              printf '{"seq":20,"run_id":"%s","event":"route_wait_completed","connection_id":"%s","fields":{"routed":"true"}}]}\\n' "$run_id" "$connection_id"
             elif [[ "$payload" == *'connection_history'* ]]; then
-              printf '{"ok":true,"op":"connection_history","events":[{"seq":21,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"initialized"},{"seq":22,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"removed","qualification_raw_tool_call_count":2,"qualification_raw_in_flight_call_count":0,"qualification_raw_tool_names":["bind_context","set_status"],"qualification_raw_canonical_tool_names":["bind_context","set_status"],"qualification_raw_nonbookkeeping_tool_call_count":0,"qualification_raw_nonbookkeeping_tool_names":[],"non_bookkeeping_tool_call_count":0,"non_bookkeeping_tool_names":[],"active_tool_scope_count":0,"helper_peer_pid":123,"helper_peer_start_seconds":123457,"helper_peer_start_microseconds":111}]}\\n' "$connection_id" "$connection_id"
+              if [[ -f "$FAKE_STATE_DIR/session_cleaned" ]]; then
+                printf '{"ok":true,"op":"connection_history","events":[{"seq":21,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"initialized"},{"seq":22,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"removed","qualification_raw_tool_call_count":2,"qualification_raw_in_flight_call_count":0,"qualification_raw_tool_names":["bind_context","set_status"],"qualification_raw_canonical_tool_names":["bind_context","set_status"],"qualification_raw_nonbookkeeping_tool_call_count":0,"qualification_raw_nonbookkeeping_tool_names":[],"non_bookkeeping_tool_call_count":0,"non_bookkeeping_tool_names":[],"active_tool_scope_count":0,"helper_peer_pid":123,"helper_peer_start_seconds":123457,"helper_peer_start_microseconds":111}]}\\n' "$connection_id" "$connection_id"
+              else
+                printf '{"ok":true,"op":"connection_history","events":[{"seq":21,"connection_id":"%s","client_name":"omp-coding-agent","normalized_client_id":"omp-coding-agent","event":"initialized"}]}\\n' "$connection_id"
+              fi
             else
               printf '{"ok":true,"op":"connections","connections":[]}\\n'
             fi

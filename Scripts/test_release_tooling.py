@@ -1009,6 +1009,7 @@ source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"""
         scripts = root / "Scripts"
         scripts.mkdir(parents=True)
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
+        shutil.copy2(SCRIPT_DIR / "parse_release_metadata.py", scripts / "parse_release_metadata.py")
         doctor = scripts / "doctor.sh"
         doctor.write_text("#!/usr/bin/env bash\nexit 42\n", encoding="utf-8")
         doctor.chmod(0o755)
@@ -2478,6 +2479,7 @@ label_generated_tip_appcast""",
             ],
             text=True,
             capture_output=True,
+            timeout=30,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2500,6 +2502,7 @@ label_generated_tip_appcast""",
             ],
             text=True,
             capture_output=True,
+            timeout=30,
         )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -2522,6 +2525,7 @@ label_generated_tip_appcast""",
             ],
             text=True,
             capture_output=True,
+            timeout=30,
         )
 
         self.assertNotEqual(result.returncode, 0)
@@ -2849,6 +2853,7 @@ extension Data {
             directory.mkdir(parents=True, exist_ok=True)
         for name in (
             "load_release_metadata.sh",
+            "parse_release_metadata.py",
             "validate_embedded_mcp_helper_layout.sh",
             "validate_app_architectures.sh",
             "write_app_artifact_manifest.py",

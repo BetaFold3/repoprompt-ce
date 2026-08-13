@@ -5350,7 +5350,7 @@ actor ServerNetworkManager {
                                     .joined(separator: ",")
                                 var identityFields = [
                                     "bootstrap_client_name": bootstrapClientName ?? "nil",
-                                    "authoritative_client_name": clientInfo.name,
+                                    "verified_client_name": clientInfo.name,
                                     "helper_peer_pid": String(clientPid),
                                     "ancestor_chain": self.pidAncestorChainDescription(from: pid_t(clientPid)),
                                     "expected_pids": expectedPIDs,
@@ -6757,7 +6757,13 @@ actor ServerNetworkManager {
         return mutableArgs
     }
 
-    func registerExpectedAgentPID(_ pid: pid_t, for clientName: String, runID: UUID? = nil) {
+    func registerExpectedAgentPID(
+        _ pid: pid_t,
+        for clientName: String,
+        runID: UUID? = nil,
+        expectedProcessExecutablePath: String? = nil,
+        expectedProcessExecutableIdentity: ExecutableFileIdentity? = nil
+    ) {
         let storageKey = Self.clientStorageKey(clientName)
         var pids = expectedAgentPIDsByClient[storageKey] ?? []
         pids.insert(pid)
@@ -6768,13 +6774,23 @@ actor ServerNetworkManager {
             expectedAgentPIDsByRunID[runID] = runPIDs
             #if DEBUG
                 if let identity = processIdentity(of: pid) {
+                    let hasSuppliedExecutable = expectedProcessExecutablePath != nil
+                        || expectedProcessExecutableIdentity != nil
+                    let suppliedExecutableIsValid = expectedProcessExecutablePath
+                        == expectedProcessExecutableIdentity?.canonicalPath
+                    let executablePath = hasSuppliedExecutable
+                        ? (suppliedExecutableIsValid ? expectedProcessExecutablePath : nil)
+                        : identity.executablePath
+                    let executableIdentity = hasSuppliedExecutable
+                        ? (suppliedExecutableIsValid ? expectedProcessExecutableIdentity : nil)
+                        : identity.executablePath.flatMap {
+                            try? ExecutableFileIdentity.capture(atPath: $0)
+                        }
                     debugExpectedProcessIdentityByRunID[runID, default: [:]][pid] = DebugExpectedProcessIdentity(
                         seconds: identity.startSeconds,
                         microseconds: identity.startMicroseconds,
-                        executablePath: identity.executablePath,
-                        executableIdentity: identity.executablePath.flatMap {
-                            try? ExecutableFileIdentity.capture(atPath: $0)
-                        }
+                        executablePath: executablePath,
+                        executableIdentity: executableIdentity
                     )
                 }
             #endif
@@ -7164,6 +7180,24 @@ actor ServerNetworkManager {
                 "helper_strict_descendant": String(strictDescendant),
                 "process_identity_chain": chain.joined(separator: "<-")
             ]
+        }
+
+        func debugExpectedProcessIdentity(
+            runID: UUID,
+            pid: pid_t
+        ) -> (
+            startSeconds: Int64,
+            startMicroseconds: Int32,
+            executablePath: String?,
+            executableIdentity: ExecutableFileIdentity?
+        )? {
+            guard let identity = debugExpectedProcessIdentityByRunID[runID]?[pid] else { return nil }
+            return (
+                identity.seconds,
+                identity.microseconds,
+                identity.executablePath,
+                identity.executableIdentity
+            )
         }
 
         nonisolated static func debugProcessIdentityMatches(

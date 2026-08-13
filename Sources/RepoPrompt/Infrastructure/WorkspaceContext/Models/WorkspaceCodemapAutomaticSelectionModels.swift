@@ -536,7 +536,7 @@ private func automaticSelectionDemandRejectionSortComponents(
     case .languageMismatch: ["languageMismatch"]
     case .classificationMismatch: ["classificationMismatch"]
     case .sourceAuthorityUnavailable: ["sourceAuthorityUnavailable"]
-    case .overlayRejected: ["overlayRejected"]
+    case let .overlayRejected(reason): ["overlayRejected", String(reflecting: reason)]
     case .staleCompletion: ["staleCompletion"]
     }
 }

@@ -6,6 +6,23 @@
     import RepoPromptShared
     import XCTest
 
+    private final class QualificationMonotonicClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: UInt64
+
+        init(_ value: UInt64) {
+            self.value = value
+        }
+
+        func now() -> UInt64 {
+            lock.withLock { value }
+        }
+
+        func set(_ value: UInt64) {
+            lock.withLock { self.value = value }
+        }
+    }
+
     private final class QualificationWallClock: @unchecked Sendable {
         private let lock = NSLock()
         private var value: Date
@@ -303,6 +320,92 @@
             XCTAssertNil(gate.activeSnapshot())
             XCTAssertEqual(recorder.cancellationRecords.map(\.0.leaseID), [bound.leaseID])
             XCTAssertEqual(recorder.cancellationRecords.map(\.1), ["qualification_lease_expired"])
+        }
+
+        func testProviderStartAuthorizationDecisionNamesRefusalBranches() throws {
+            let noLeaseGate = OhMyPiAgentModeSmokeGate(notificationCenter: NotificationCenter())
+            let sourceGate = OhMyPiAgentModeSmokeGate(notificationCenter: NotificationCenter())
+            let ownerProcessID = getpid()
+            let connectionID = UUID()
+            let sessionID = UUID()
+            let sourceLease = try sourceGate.acquire(
+                ownerConnectionID: connectionID,
+                ownerProcessID: ownerProcessID,
+                duration: 60
+            )
+            let sourceConsumption = try sourceGate.consumeStartTransaction(
+                leaseID: sourceLease.leaseID,
+                ownerConnectionID: connectionID,
+                ownerProcessID: ownerProcessID,
+                sessionID: sessionID
+            )
+            XCTAssertEqual(
+                noLeaseGate.providerStartAuthorizationDecision(
+                    transaction: sourceConsumption.transaction,
+                    runID: UUID()
+                ),
+                .refused(reason: "gate_refusal_no_lease")
+            )
+
+            let replacementLease = try noLeaseGate.acquire(
+                ownerConnectionID: connectionID,
+                ownerProcessID: ownerProcessID,
+                duration: 60
+            )
+            _ = try noLeaseGate.consumeStartTransaction(
+                leaseID: replacementLease.leaseID,
+                ownerConnectionID: connectionID,
+                ownerProcessID: ownerProcessID,
+                sessionID: sessionID
+            )
+            XCTAssertEqual(
+                noLeaseGate.providerStartAuthorizationDecision(
+                    transaction: sourceConsumption.transaction,
+                    runID: UUID()
+                ),
+                .refused(reason: "gate_refusal_transaction_id_mismatch")
+            )
+
+            let runID = UUID()
+            XCTAssertEqual(
+                sourceGate.providerStartAuthorizationDecision(
+                    transaction: sourceConsumption.transaction,
+                    runID: runID
+                ),
+                .authorized
+            )
+            XCTAssertEqual(
+                sourceGate.providerStartAuthorizationDecision(
+                    transaction: sourceConsumption.transaction,
+                    runID: UUID()
+                ),
+                .refused(reason: "gate_refusal_run_already_assigned")
+            )
+
+            let monotonicClock = QualificationMonotonicClock(0)
+            let expiredGate = OhMyPiAgentModeSmokeGate(
+                notificationCenter: NotificationCenter(),
+                monotonicNowNanoseconds: monotonicClock.now
+            )
+            let expiredLease = try expiredGate.acquire(
+                ownerConnectionID: connectionID,
+                ownerProcessID: ownerProcessID,
+                duration: 1
+            )
+            let expiredConsumption = try expiredGate.consumeStartTransaction(
+                leaseID: expiredLease.leaseID,
+                ownerConnectionID: connectionID,
+                ownerProcessID: ownerProcessID,
+                sessionID: sessionID
+            )
+            monotonicClock.set(1_000_000_000)
+            XCTAssertEqual(
+                expiredGate.providerStartAuthorizationDecision(
+                    transaction: expiredConsumption.transaction,
+                    runID: UUID()
+                ),
+                .refused(reason: "gate_refusal_expired")
+            )
         }
 
         func testLeaseConsumptionIsOneShotAndConnectionBound() throws {
@@ -721,6 +824,107 @@
                 currentStartMicroseconds: 200,
                 currentExecutablePath: replacement.path
             ))
+        }
+
+        func testRegisterExpectedAgentPIDLiveSamplesExecutableIdentityWhenNotSupplied() async throws {
+            let manager = ServerNetworkManager.shared
+            let runID = UUID()
+            let clientName = "omp-registration-live-sample-\(runID.uuidString)"
+            let pid = getpid()
+            await manager.registerExpectedAgentPID(pid, for: clientName, runID: runID)
+            addTeardownBlock {
+                await manager.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+            }
+
+            let recordedSnapshot = await manager.debugExpectedProcessIdentity(runID: runID, pid: pid)
+            let recorded = try XCTUnwrap(recordedSnapshot)
+            let executablePath = try XCTUnwrap(recorded.executablePath)
+
+            XCTAssertEqual(
+                recorded.executableIdentity,
+                try ExecutableFileIdentity.capture(atPath: executablePath)
+            )
+        }
+
+        func testSuppliedExpectedProcessIdentityMatchesPostExecImageInsteadOfTransientEnv() async throws {
+            let manager = ServerNetworkManager.shared
+            let pid = getpid()
+            let sampleRunID = UUID()
+            let sampleClientName = "omp-registration-sample-\(sampleRunID.uuidString)"
+            await manager.registerExpectedAgentPID(pid, for: sampleClientName, runID: sampleRunID)
+            let liveSampleSnapshot = await manager.debugExpectedProcessIdentity(runID: sampleRunID, pid: pid)
+            let liveSample = try XCTUnwrap(liveSampleSnapshot)
+            await manager.clearExpectedAgentPID(pid, for: sampleClientName, runID: sampleRunID)
+
+            let livePath = try XCTUnwrap(liveSample.executablePath)
+            let liveIdentity = try XCTUnwrap(liveSample.executableIdentity)
+            let suppliedIdentity = try ExecutableFileIdentity.capture(atPath: "/usr/bin/env")
+            XCTAssertNotEqual(liveIdentity, suppliedIdentity)
+
+            let runID = UUID()
+            let clientName = "omp-registration-supplied-\(runID.uuidString)"
+            await manager.registerExpectedAgentPID(
+                pid,
+                for: clientName,
+                runID: runID,
+                expectedProcessExecutablePath: suppliedIdentity.canonicalPath,
+                expectedProcessExecutableIdentity: suppliedIdentity
+            )
+            addTeardownBlock {
+                await manager.clearExpectedAgentPID(pid, for: clientName, runID: runID)
+            }
+            let recordedSnapshot = await manager.debugExpectedProcessIdentity(runID: runID, pid: pid)
+            let recorded = try XCTUnwrap(recordedSnapshot)
+
+            XCTAssertEqual(recorded.executablePath, suppliedIdentity.canonicalPath)
+            XCTAssertEqual(recorded.executableIdentity, suppliedIdentity)
+            XCTAssertNotEqual(recorded.executableIdentity, liveIdentity)
+            XCTAssertFalse(ServerNetworkManager.debugProcessIdentityMatches(
+                expectedStartSeconds: recorded.startSeconds,
+                expectedStartMicroseconds: recorded.startMicroseconds,
+                expectedExecutableIdentity: recorded.executableIdentity,
+                currentStartSeconds: recorded.startSeconds,
+                currentStartMicroseconds: recorded.startMicroseconds,
+                currentExecutablePath: livePath
+            ))
+
+            let malformedPairs: [(String, String?, ExecutableFileIdentity?)] = [
+                ("path-only", suppliedIdentity.canonicalPath, nil),
+                ("identity-only", nil, suppliedIdentity),
+                ("mismatched", livePath, suppliedIdentity)
+            ]
+            for (label, path, identity) in malformedPairs {
+                let malformedRunID = UUID()
+                let malformedClientName = "omp-registration-malformed-\(label)-\(malformedRunID.uuidString)"
+                await manager.registerExpectedAgentPID(
+                    pid,
+                    for: malformedClientName,
+                    runID: malformedRunID,
+                    expectedProcessExecutablePath: path,
+                    expectedProcessExecutableIdentity: identity
+                )
+                let malformedSnapshot = await manager.debugExpectedProcessIdentity(
+                    runID: malformedRunID,
+                    pid: pid
+                )
+                let malformed = try XCTUnwrap(malformedSnapshot)
+                await manager.clearExpectedAgentPID(
+                    pid,
+                    for: malformedClientName,
+                    runID: malformedRunID
+                )
+
+                XCTAssertNil(malformed.executablePath, label)
+                XCTAssertNil(malformed.executableIdentity, label)
+                XCTAssertFalse(ServerNetworkManager.debugProcessIdentityMatches(
+                    expectedStartSeconds: malformed.startSeconds,
+                    expectedStartMicroseconds: malformed.startMicroseconds,
+                    expectedExecutableIdentity: malformed.executableIdentity,
+                    currentStartSeconds: malformed.startSeconds,
+                    currentStartMicroseconds: malformed.startMicroseconds,
+                    currentExecutablePath: livePath
+                ), label)
+            }
         }
 
         private func bindLease(

@@ -1647,7 +1647,13 @@ actor ACPAgentSessionController {
 
     private func registerExpectedAgentPIDIfNeeded(_ pid: pid_t) async {
         guard let clientName = mcpClientNameHint else { return }
-        await ServerNetworkManager.shared.registerExpectedAgentPID(pid, for: clientName, runID: expectedMCPRunID)
+        await ServerNetworkManager.shared.registerExpectedAgentPID(
+            pid,
+            for: clientName,
+            runID: expectedMCPRunID,
+            expectedProcessExecutablePath: launchConfiguration.expectedProcessExecutablePath,
+            expectedProcessExecutableIdentity: launchConfiguration.expectedProcessExecutableIdentity
+        )
         registeredExpectedAgentPID = pid
         log("Registered expected MCP parent PID \(pid) for \(clientName) runID=\(expectedMCPRunID?.uuidString ?? "nil")")
     }

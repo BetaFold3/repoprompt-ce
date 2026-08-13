@@ -2910,7 +2910,7 @@ func printUsage() {
         get_code_structure (structure, map) - Get function/type signatures
           structure src/auth/                          Codemaps for directory (default considers up to 10 files)
           structure --scope selected                   Codemaps for selection (~6k token cap still applies)
-          get_code_structure paths=["src/"] max_results=50   Opt in to consider more files (response still capped)
+          get_code_structure scope=paths paths=["src/"] limits={"max_files":50}   Opt in to consider more files (response still capped)
 
         workspace_context (context) - Get workspace snapshot
           context                                      Default snapshot

@@ -62,7 +62,7 @@ Then use targeted searches to understand how the task maps to the codebase:
 	mcp: """
 ```json
 {"tool":"file_search","args":{"pattern":"<key term from task>","mode":"path"}}
-{"tool":"get_code_structure","args":{"paths":["RootName/likely/relevant/area"]}}
+{"tool":"get_code_structure","args":{"scope":"paths","paths":["RootName/likely/relevant/area"]}}
 ```
 """,
 	cli: """

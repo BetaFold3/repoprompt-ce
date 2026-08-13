@@ -60,7 +60,220 @@ final class OhMyPiACPProviderTests: XCTestCase {
 
         XCTAssertEqual(launch.arguments, OhMyPiAgentConfig.managedArguments)
         XCTAssertEqual(launch.providerID, .ohMyPi)
-        XCTAssertNotNil(launch.expectedExecutableIdentity)
+        let entryIdentity = try ExecutableFileIdentity.capture(atPath: executable.path)
+        XCTAssertEqual(launch.expectedExecutableIdentity, entryIdentity)
+        XCTAssertEqual(launch.expectedExecutableIdentity?.canonicalPath, entryIdentity.canonicalPath)
+        XCTAssertEqual(
+            launch.expectedProcessExecutableIdentity,
+            try ExecutableFileIdentity.capture(atPath: "/bin/sh")
+        )
+    }
+
+    func testEnvShebangPinsInterpreterFromLaunchEnvironmentPATH() throws {
+        let pathDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-env-path")
+        let interpreterName = "omp-test-shell-\(UUID().uuidString)"
+        let interpreter = pathDirectory.appendingPathComponent(interpreterName)
+        try FileManager.default.copyItem(atPath: "/bin/sh", toPath: interpreter.path)
+        let environment = [
+            "PATH": pathDirectory.path,
+            "HOME": FileManager.default.homeDirectoryForCurrentUser.path
+        ]
+        let interpreterIdentity = try ExecutableFileIdentity.capture(atPath: interpreter.path)
+
+        let entryDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-env-entry")
+        let executable = try makeOMPExecutable(
+            in: entryDirectory,
+            shebang: "#!/usr/bin/env \(interpreterName)"
+        )
+        let resolver = OhMyPiACPLaunchResolver()
+        let config = OhMyPiAgentConfig(commandName: executable.path, additionalPathHints: [])
+        let launch = try resolver.resolvedLaunch(for: config, environment: environment)
+        let entryIdentity = try ExecutableFileIdentity.capture(atPath: executable.path)
+
+        XCTAssertEqual(launch.executableIdentity, entryIdentity)
+        XCTAssertEqual(launch.executableIdentity.canonicalPath, entryIdentity.canonicalPath)
+        XCTAssertEqual(launch.processExecutablePath, interpreterIdentity.canonicalPath)
+        XCTAssertEqual(launch.processExecutableIdentity, interpreterIdentity)
+
+        let symlinkName = "omp-test-shell-link-\(UUID().uuidString)"
+        let symlink = pathDirectory.appendingPathComponent(symlinkName)
+        try FileManager.default.createSymbolicLink(
+            atPath: symlink.path,
+            withDestinationPath: interpreter.path
+        )
+        let symlinkEntryDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-env-symlink-entry")
+        let symlinkEntry = try makeOMPExecutable(
+            in: symlinkEntryDirectory,
+            shebang: "#!/usr/bin/env \(symlinkName)"
+        )
+        let symlinkResolver = OhMyPiACPLaunchResolver()
+        let symlinkConfig = OhMyPiAgentConfig(commandName: symlinkEntry.path, additionalPathHints: [])
+        let symlinkLaunch = try symlinkResolver.resolvedLaunch(
+            for: symlinkConfig,
+            environment: environment
+        )
+
+        XCTAssertEqual(symlinkLaunch.processExecutablePath, interpreterIdentity.canonicalPath)
+        XCTAssertEqual(symlinkLaunch.processExecutableIdentity, interpreterIdentity)
+
+        let shimName = "omp-test-shim-\(UUID().uuidString)"
+        let terminalName = "omp-test-terminal-\(UUID().uuidString)"
+        let shim = pathDirectory.appendingPathComponent(shimName)
+        let terminal = pathDirectory.appendingPathComponent(terminalName)
+        try FileManager.default.copyItem(atPath: "/bin/sh", toPath: terminal.path)
+        try writeExecutable(
+            Data("#!/usr/bin/env \(terminalName)\nexec /bin/sh \"$@\"\n".utf8),
+            to: shim
+        )
+        let shimEntryDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-shim-entry")
+        let shimEntry = try makeOMPExecutable(
+            in: shimEntryDirectory,
+            shebang: "#!/usr/bin/env \(shimName)"
+        )
+        let shimResolver = OhMyPiACPLaunchResolver()
+        let shimConfig = OhMyPiAgentConfig(commandName: shimEntry.path, additionalPathHints: [])
+        let shimLaunch = try shimResolver.resolvedLaunch(
+            for: shimConfig,
+            environment: environment
+        )
+        let terminalIdentity = try ExecutableFileIdentity.capture(atPath: terminal.path)
+
+        XCTAssertEqual(shimLaunch.processExecutablePath, terminalIdentity.canonicalPath)
+        XCTAssertEqual(shimLaunch.processExecutableIdentity, terminalIdentity)
+    }
+
+    func testDirectShebangPinsAbsoluteInterpreter() throws {
+        let directory = try makeTestDirectory(name: "OhMyPiACPProviderTests-direct-shebang")
+        let executable = try makeOMPExecutable(in: directory, shebang: "#!/bin/sh")
+        let launch = try OhMyPiACPAgentProvider(
+            config: OhMyPiAgentConfig(commandName: executable.path, additionalPathHints: [])
+        ).makeLaunchConfiguration(for: request(workspacePath: directory.path))
+        let interpreterIdentity = try ExecutableFileIdentity.capture(atPath: "/bin/sh")
+
+        XCTAssertEqual(launch.expectedProcessExecutablePath, interpreterIdentity.canonicalPath)
+        XCTAssertEqual(launch.expectedProcessExecutableIdentity, interpreterIdentity)
+
+        let binaryTailDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-binary-tail")
+        let binaryTailEntry = binaryTailDirectory.appendingPathComponent("omp")
+        var binaryTail = Data("#!/bin/sh\n".utf8)
+        binaryTail.append(contentsOf: [0xFF, 0xFE])
+        try writeExecutable(binaryTail, to: binaryTailEntry)
+        let binaryTailLaunch = try OhMyPiACPAgentProvider(
+            config: OhMyPiAgentConfig(commandName: binaryTailEntry.path, additionalPathHints: [])
+        ).makeLaunchConfiguration(for: request())
+
+        XCTAssertEqual(binaryTailLaunch.expectedProcessExecutableIdentity, interpreterIdentity)
+    }
+
+    func testMachOEntryPinsEntryAsProcessExecutable() throws {
+        let directory = try makeTestDirectory(name: "OhMyPiACPProviderTests-mach-o")
+        let executable = directory.appendingPathComponent("omp")
+        try FileManager.default.copyItem(atPath: "/bin/echo", toPath: executable.path)
+        let launch = try OhMyPiACPAgentProvider(
+            config: OhMyPiAgentConfig(commandName: executable.path, additionalPathHints: [])
+        ).makeLaunchConfiguration(for: request(workspacePath: directory.path))
+
+        XCTAssertEqual(launch.expectedExecutableIdentity, launch.expectedProcessExecutableIdentity)
+        XCTAssertEqual(launch.command, launch.expectedProcessExecutablePath)
+    }
+
+    func testProcessExecutableResolutionFailsClosed() throws {
+        let missingInterpreterDirectory = try makeTestDirectory(
+            name: "OhMyPiACPProviderTests-missing-interpreter"
+        )
+        let missingInterpreterEntry = try makeOMPExecutable(
+            in: missingInterpreterDirectory,
+            shebang: "#!/usr/bin/env absent-test-interpreter"
+        )
+        let missingResolver = OhMyPiACPLaunchResolver()
+        XCTAssertThrowsError(try missingResolver.resolvedLaunch(
+            for: OhMyPiAgentConfig(commandName: missingInterpreterEntry.path, additionalPathHints: []),
+            environment: ["PATH": missingInterpreterDirectory.path]
+        )) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("not resolvable on the launch PATH"),
+                error.localizedDescription
+            )
+        }
+
+        for (label, environment) in [
+            ("missing", [:]),
+            ("empty", ["PATH": "/bin:"]),
+            ("relative", ["PATH": "relative:/bin"])
+        ] {
+            let resolver = OhMyPiACPLaunchResolver()
+            XCTAssertThrowsError(try resolver.resolvedLaunch(
+                for: OhMyPiAgentConfig(commandName: missingInterpreterEntry.path, additionalPathHints: []),
+                environment: environment
+            ), label) { error in
+                XCTAssertTrue(error.localizedDescription.contains("launch PATH"), "\(label): \(error)")
+            }
+        }
+
+        let malformedShebangs: [(String, Data)] = [
+            ("relative", Data("#!bin/sh\n".utf8)),
+            ("missing", Data("echo no-shebang\n".utf8)),
+            ("bom", Data([0xEF, 0xBB, 0xBF]) + Data("#!/bin/sh\n".utf8)),
+            ("leading-newline", Data("\n#!/bin/sh\n".utf8)),
+            ("crlf", Data("#!/bin/sh\r\n".utf8)),
+            ("env-option", Data("#!/usr/bin/env -S sh\n".utf8)),
+            ("env-extra-argument", Data("#!/usr/bin/env sh ignored\n".utf8))
+        ]
+        for (label, contents) in malformedShebangs {
+            let directory = try makeTestDirectory(name: "OhMyPiACPProviderTests-malformed-\(label)")
+            let entry = directory.appendingPathComponent("omp")
+            try writeExecutable(contents, to: entry)
+            XCTAssertThrowsError(try OhMyPiACPAgentProvider(
+                config: OhMyPiAgentConfig(commandName: entry.path, additionalPathHints: [])
+            ).makeLaunchConfiguration(for: request()), label)
+        }
+
+        let chainDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-deep-chain")
+        let chainEnvironment = ["PATH": chainDirectory.path]
+        let chainNames = (1 ... 4).map { "shim-\($0)" }
+        for index in chainNames.indices {
+            let nextShebang = index == chainNames.index(before: chainNames.endIndex)
+                ? "#!/bin/sh"
+                : "#!/usr/bin/env \(chainNames[index + 1])"
+            try writeExecutable(
+                Data("\(nextShebang)\nexec /bin/sh \"$@\"\n".utf8),
+                to: chainDirectory.appendingPathComponent(chainNames[index])
+            )
+        }
+        let deepEntryDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-deep-entry")
+        let deepEntry = try makeOMPExecutable(
+            in: deepEntryDirectory,
+            shebang: "#!/usr/bin/env \(chainNames[0])"
+        )
+        let deepResolver = OhMyPiACPLaunchResolver()
+        XCTAssertThrowsError(try deepResolver.resolvedLaunch(
+            for: OhMyPiAgentConfig(commandName: deepEntry.path, additionalPathHints: []),
+            environment: chainEnvironment
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("within 3 script hops"), error.localizedDescription)
+        }
+
+        let cycleDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-cycle")
+        try writeExecutable(
+            Data("#!/usr/bin/env cycle-b\n".utf8),
+            to: cycleDirectory.appendingPathComponent("cycle-a")
+        )
+        try writeExecutable(
+            Data("#!/usr/bin/env cycle-a\n".utf8),
+            to: cycleDirectory.appendingPathComponent("cycle-b")
+        )
+        let cycleEntryDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-cycle-entry")
+        let cycleEntry = try makeOMPExecutable(
+            in: cycleEntryDirectory,
+            shebang: "#!/usr/bin/env cycle-a"
+        )
+        let cycleResolver = OhMyPiACPLaunchResolver()
+        XCTAssertThrowsError(try cycleResolver.resolvedLaunch(
+            for: OhMyPiAgentConfig(commandName: cycleEntry.path, additionalPathHints: []),
+            environment: ["PATH": cycleDirectory.path]
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("contains a cycle"), error.localizedDescription)
+        }
     }
 
     func testResolverRequiresEveryManagedFlagAndMinimumCapturedVersion() async throws {
@@ -808,18 +1021,23 @@ final class OhMyPiACPProviderTests: XCTestCase {
         return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
     }
 
+    private func writeExecutable(_ contents: Data, to url: URL) throws {
+        try contents.write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+
     @discardableResult
     private func makeOMPExecutable(
         in directory: URL,
         version: String = "17.2.12",
         rootHelpFlags: [String] = OhMyPiAgentConfig.requiredManagedFlags,
-        acpHelpExitStatus: Int = 0
+        acpHelpExitStatus: Int = 0,
+        shebang: String? = "#!/bin/sh"
     ) throws -> URL {
         let executable = directory.appendingPathComponent("omp")
         let rootHelp = rootHelpFlags.joined(separator: " ")
         let script = """
-        #!/bin/sh
-        if [ "$1" = "acp" ] && [ "$2" = "--help" ]; then
+        \(shebang.map { "\($0)\n" } ?? "")if [ "$1" = "acp" ] && [ "$2" = "--help" ]; then
           printf '%s\\n' 'Usage: omp acp [options]'
           exit \(acpHelpExitStatus)
         fi

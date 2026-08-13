@@ -209,6 +209,7 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         shutil.copy2(SCRIPT_DIR / "validate_packaged_legal.sh", scripts / "validate_packaged_legal.sh")
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
+        shutil.copy2(SCRIPT_DIR / "parse_release_metadata.py", scripts / "parse_release_metadata.py")
         shutil.copy2(SCRIPT_DIR / "verify_sparkle_signature.swift", scripts / "verify_sparkle_signature.swift")
         (scripts / "promote_release.sh").chmod(0o755)
         (scripts / "validate_embedded_mcp_helper_layout.sh").chmod(0o755)

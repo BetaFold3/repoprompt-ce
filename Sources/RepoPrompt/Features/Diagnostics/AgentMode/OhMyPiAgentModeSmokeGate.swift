@@ -42,6 +42,7 @@
             private let authorizationDeadlineUptimeNanoseconds: UInt64?
             private let monotonicNowNanoseconds: @Sendable () -> UInt64
             private var outcome: Outcome?
+            private var startupFailureReason: String?
             private var continuations: [UUID: CheckedContinuation<Outcome, Never>] = [:]
 
             init(
@@ -66,7 +67,10 @@
             }
 
             @discardableResult
-            func resolve(_ proposedOutcome: Outcome) -> Outcome {
+            func resolve(
+                _ proposedOutcome: Outcome,
+                startupFailureReason proposedStartupFailureReason: String? = nil
+            ) -> Outcome {
                 let resolution = lock.withLock { () -> (
                     effective: Outcome,
                     continuations: [CheckedContinuation<Outcome, Never>]
@@ -74,15 +78,20 @@
                     if let outcome {
                         return (outcome, [])
                     }
-                    let effectiveProposal: Outcome = if case .authorized = proposedOutcome,
-                                                        let authorizationDeadlineUptimeNanoseconds,
-                                                        monotonicNowNanoseconds() >= authorizationDeadlineUptimeNanoseconds
+                    let authorizationDeadlineExceeded: Bool = if case .authorized = proposedOutcome,
+                                                                 let authorizationDeadlineUptimeNanoseconds
                     {
-                        .denied
+                        monotonicNowNanoseconds() >= authorizationDeadlineUptimeNanoseconds
                     } else {
-                        proposedOutcome
+                        false
                     }
+                    let effectiveProposal: Outcome = authorizationDeadlineExceeded ? .denied : proposedOutcome
                     outcome = effectiveProposal
+                    if case .denied = effectiveProposal {
+                        startupFailureReason = authorizationDeadlineExceeded
+                            ? "authorization_deadline_exceeded"
+                            : proposedStartupFailureReason
+                    }
                     let continuations = Array(self.continuations.values)
                     self.continuations.removeAll()
                     return (effectiveProposal, continuations)
@@ -122,6 +131,10 @@
                 lock.withLock { outcome }
             }
 
+            var resolvedStartupFailureReason: String? {
+                lock.withLock { startupFailureReason }
+            }
+
             func wait(timeoutNanoseconds: UInt64) async -> Outcome? {
                 await withTaskGroup(of: Outcome?.self) { group in
                     group.addTask { await self.wait() }
@@ -159,6 +172,20 @@
         struct Consumption {
             let snapshot: Snapshot
             let transaction: StartTransaction
+        }
+
+        enum ProviderStartAuthorizationDecision: Equatable {
+            case authorized
+            case refused(reason: String)
+
+            var isAuthorized: Bool {
+                self == .authorized
+            }
+
+            var refusalReason: String? {
+                guard case let .refused(reason) = self else { return nil }
+                return reason
+            }
         }
 
         enum LeaseError: Error, Equatable {
@@ -271,23 +298,38 @@
             return result.acquired
         }
 
-        func authorizeProviderStart(transaction: StartTransaction, runID: UUID) -> Bool {
+        func providerStartAuthorizationDecision(
+            transaction: StartTransaction,
+            runID: UUID
+        ) -> ProviderStartAuthorizationDecision {
             let now = monotonicNowNanoseconds()
-            let outcome = lock.withLock { () -> (authorized: Bool, expired: Snapshot?) in
-                guard var stored = lease else { return (false, nil) }
+            let outcome = lock.withLock { () -> (
+                decision: ProviderStartAuthorizationDecision,
+                expired: Snapshot?
+            ) in
+                guard var stored = lease else {
+                    return (.refused(reason: "gate_refusal_no_lease"), nil)
+                }
                 guard now < stored.monotonicDeadlineNanoseconds else {
                     lease = nil
                     expiryGeneration &+= 1
-                    return (false, stored.snapshot)
+                    return (.refused(reason: "gate_refusal_expired"), stored.snapshot)
                 }
                 let current = stored.snapshot
-                guard stored.startTransactionID == transaction.transactionID,
-                      current.leaseID == transaction.leaseID,
-                      current.ownerConnectionID == transaction.ownerConnectionID,
-                      current.sessionID == transaction.sessionID,
-                      current.runID == nil
-                else {
-                    return (false, nil)
+                guard stored.startTransactionID == transaction.transactionID else {
+                    return (.refused(reason: "gate_refusal_transaction_id_mismatch"), nil)
+                }
+                guard current.leaseID == transaction.leaseID else {
+                    return (.refused(reason: "gate_refusal_lease_id_mismatch"), nil)
+                }
+                guard current.ownerConnectionID == transaction.ownerConnectionID else {
+                    return (.refused(reason: "gate_refusal_owner_connection_mismatch"), nil)
+                }
+                guard current.sessionID == transaction.sessionID else {
+                    return (.refused(reason: "gate_refusal_session_mismatch"), nil)
+                }
+                guard current.runID == nil else {
+                    return (.refused(reason: "gate_refusal_run_already_assigned"), nil)
                 }
                 stored.snapshot = Snapshot(
                     leaseID: current.leaseID,
@@ -300,14 +342,18 @@
                     runID: runID
                 )
                 lease = stored
-                return (true, nil)
+                return (.authorized, nil)
             }
             if let expired = outcome.expired {
                 completeExpiredRemoval(expired)
-            } else if outcome.authorized {
+            } else if outcome.decision.isAuthorized {
                 publishChange()
             }
-            return outcome.authorized
+            return outcome.decision
+        }
+
+        func authorizeProviderStart(transaction: StartTransaction, runID: UUID) -> Bool {
+            providerStartAuthorizationDecision(transaction: transaction, runID: runID).isAuthorized
         }
 
         func requireOwner(processID: Int32) throws -> Snapshot {

@@ -41,6 +41,50 @@ enum WorkspaceCodemapArtifactDemandResult {
     case ready(WorkspaceCodemapArtifactDemandReady)
 }
 
+enum WorkspaceCodemapArtifactDemandRecovery: Equatable {
+    case refreshCurrentness
+    case retryFreshDemand
+    case resetRootSession
+    case terminal
+
+    init(_ rejection: WorkspaceCodemapBindingDemandRejection) {
+        switch rejection {
+        case .rootNotRegistered, .capabilityUnavailable:
+            self = .resetRootSession
+        case .rootEpochMismatch, .rootPathMismatch, .catalogGenerationMismatch,
+             .requestGenerationInvalid, .stalePathGeneration, .staleIngressGeneration,
+             .staleCompletion:
+            self = .refreshCurrentness
+        case .sourceAuthorityUnavailable:
+            self = .retryFreshDemand
+        case .invalidIdentity, .languageMismatch, .classificationMismatch:
+            self = .terminal
+        case let .overlayRejected(reason):
+            self = switch reason {
+            case .rootNotRegistered, .rootAuthorityInvalid:
+                .resetRootSession
+            case .rootEpochMismatch, .catalogGenerationMismatch,
+                 .repositoryAuthorityMismatch, .staleRequestGeneration,
+                 .requestGenerationConflict:
+                .refreshCurrentness
+            case .invalidToken:
+                .retryFreshDemand
+            case .pathOutsideRoot, .admissionReservationInvalid:
+                .terminal
+            }
+        }
+    }
+
+    var isRetryable: Bool {
+        switch self {
+        case .refreshCurrentness, .retryFreshDemand, .resetRootSession:
+            true
+        case .terminal:
+            false
+        }
+    }
+}
+
 enum WorkspaceCodemapArtifactDemandOwnershipDisposition {
     case notAcquired
     case created(WorkspaceCodemapArtifactDemandTicket)

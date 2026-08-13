@@ -592,6 +592,118 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         #endif
     }
 
+    func testOMPQualificationAuthorizationFailureIncludesBoundaryStartupReason() async throws {
+        #if DEBUG
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("OMPQualificationStartupReason-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "OMP Qualification Startup Reason",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ompQualificationStartupReason"
+            )
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+
+            let connectionID = UUID()
+            let lease = try OhMyPiAgentModeSmokeGate.shared.acquire(
+                ownerConnectionID: connectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            let startupFailureReason = "qualification_authorizer_precondition_failed"
+            let viewModel = makeViewModel(windowID: window.windowID)
+            let liveSnapshots = LiveSnapshots()
+            let recorder = WaitScopeRecorder()
+            var service = makeService(
+                window: window,
+                viewModel: viewModel,
+                liveSnapshots: liveSnapshots,
+                recorder: recorder,
+                connectionID: connectionID,
+                startRun: { target, _, _, _, agentModeVM, _, _, _, _, _, _, _ in
+                    let session = try XCTUnwrap(agentModeVM.session(for: target.tabID, createIfNeeded: false))
+                    let context = try XCTUnwrap(session.ompQualificationStartContext)
+                    session.runState = .failed
+                    session.runID = nil
+                    context.authorizationReceipt.resolve(
+                        .denied,
+                        startupFailureReason: startupFailureReason
+                    )
+                    return try .init(
+                        snapshot: self.makeSnapshot(
+                            sessionID: XCTUnwrap(target.sessionID),
+                            runID: nil,
+                            status: .failed
+                        ),
+                        delivery: .startedRun
+                    )
+                }
+            )
+            service.testOMPQualificationOwnerVerifier = { candidateConnectionID, pid, _, _ in
+                candidateConnectionID == connectionID && pid == getpid()
+            }
+            service.resolveOracleReviewLaunchSource = { _, targetWindow in
+                let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
+                let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+                return ResolvedAgentRunOracleReviewLaunchSource(
+                    snapshot: AgentRunOracleReviewLaunchSnapshot(
+                        route: .windowOnlyActiveCompose,
+                        windowID: targetWindow.windowID,
+                        workspaceID: workspace.id,
+                        tabID: tabID,
+                        selectionRevision: targetWindow.workspaceManager.selectionRevisionForMCP(
+                            workspaceID: workspace.id,
+                            tabID: tabID
+                        ),
+                        promptText: "",
+                        selection: StoredSelection(),
+                        sourceAgentSessionID: nil,
+                        routedRunID: nil
+                    ),
+                    source: .unavailable(.init(
+                        delegationID: UUID(),
+                        sourceTabID: tabID,
+                        workspaceID: workspace.id,
+                        sourceAgentSessionID: nil,
+                        sourceAgentRunID: nil,
+                        reason: .sourceCaptureFailed("Startup reason fixture")
+                    ))
+                )
+            }
+
+            do {
+                _ = try await service.execute(args: [
+                    "op": .string("start"),
+                    "message": .string("Report the provider-boundary startup failure."),
+                    "model_id": .string("ohMyPi:default"),
+                    "workspace_id": .string(workspace.id.uuidString),
+                    "timeout": .int(10),
+                    "_omp_qualification_lease_id": .string(lease.leaseID.uuidString)
+                ])
+                XCTFail("Expected qualification authorization failure")
+            } catch let error as MCPError {
+                XCTAssertTrue(
+                    String(describing: error).contains(
+                        "The OMP qualification provider start was not authorized for this transaction. Underlying startup failure: \(startupFailureReason)"
+                    ),
+                    String(describing: error)
+                )
+            }
+            XCTAssertNil(OhMyPiAgentModeSmokeGate.shared.activeSnapshot())
+        #else
+            throw XCTSkip("OMP qualification transaction is DEBUG-only")
+        #endif
+    }
+
     func testOMPQualificationWorkspaceSwitchImmediatelyBeforeConsumeFailsUnconsumed() async throws {
         #if DEBUG
             try await exerciseOMPQualificationWorkspaceFence(switchBeforeConsume: true)
@@ -2096,7 +2208,15 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                         activeWorktreeMerges: []
                     )
                     await liveSnapshots.set(running)
-                    return AgentExternalMCPRunStarter.StartOutcome(snapshot: running, delivery: .startedRun)
+                    let staleDispatchSnapshot = self.makeSnapshot(
+                        sessionID: sessionID,
+                        runID: nil,
+                        status: .running
+                    )
+                    return AgentExternalMCPRunStarter.StartOutcome(
+                        snapshot: staleDispatchSnapshot,
+                        delivery: .startedRun
+                    )
                 }
             )
             service.testOMPQualificationOwnerVerifier = { candidateConnectionID, pid, seconds, microseconds in

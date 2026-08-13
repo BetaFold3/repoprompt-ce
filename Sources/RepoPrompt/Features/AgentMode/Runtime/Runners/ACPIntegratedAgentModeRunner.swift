@@ -196,15 +196,17 @@ final class ACPIntegratedAgentModeRunner {
             _ runID: UUID?,
             _ activeAgentSessionID: UUID?,
             _ runAttemptID: UUID?,
-            _ authorized: Bool
+            _ authorized: Bool,
+            _ startupFailureReason: String?
         ) -> Bool,
         providerStartBootstrapObserver: @escaping () -> Void
     ) async {
         #if DEBUG
             var providerBoundaryResponsibilityTransferred = false
+            var providerBoundaryFailureReason: String? = "provider_start_abandoned_before_authorization"
             defer {
                 if !providerBoundaryResponsibilityTransferred {
-                    _ = providerStartBoundaryReporter(nil, nil, nil, false)
+                    _ = providerStartBoundaryReporter(nil, nil, nil, false, providerBoundaryFailureReason)
                 }
             }
         #endif
@@ -240,7 +242,7 @@ final class ACPIntegratedAgentModeRunner {
                 guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
                 guard providerStartAuthorizer(runID) else {
                     #if DEBUG
-                        _ = providerStartBoundaryReporter(runID, session.activeAgentSessionID, runAttemptID, false)
+                        _ = providerStartBoundaryReporter(runID, session.activeAgentSessionID, runAttemptID, false, nil)
                     #endif
                     await failBeforeProviderSend(
                         tabID: tabID,
@@ -257,7 +259,8 @@ final class ACPIntegratedAgentModeRunner {
                         runID,
                         session.activeAgentSessionID,
                         runAttemptID,
-                        true
+                        true,
+                        nil
                     ) else {
                         await failBeforeProviderSend(
                             tabID: tabID,
@@ -316,6 +319,9 @@ final class ACPIntegratedAgentModeRunner {
         let lease = makeLease(runID)
 
         guard let provider = providerFactory(runRequest.agentKind, runRequest.modelString) else {
+            #if DEBUG
+                providerBoundaryFailureReason = "acp_provider_unavailable"
+            #endif
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
@@ -330,6 +336,9 @@ final class ACPIntegratedAgentModeRunner {
         do {
             support = try await provider.support(for: freshRunRequest)
         } catch is CancellationError {
+            #if DEBUG
+                providerBoundaryFailureReason = "acp_support_preflight_cancelled"
+            #endif
             await cancelBeforeProviderSend(
                 session: session,
                 runID: runID,
@@ -338,6 +347,9 @@ final class ACPIntegratedAgentModeRunner {
             )
             return
         } catch {
+            #if DEBUG
+                providerBoundaryFailureReason = "acp_support_preflight_failed"
+            #endif
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
@@ -350,6 +362,9 @@ final class ACPIntegratedAgentModeRunner {
         }
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
         guard support == .supported else {
+            #if DEBUG
+                providerBoundaryFailureReason = "acp_support_unsupported"
+            #endif
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
@@ -364,13 +379,17 @@ final class ACPIntegratedAgentModeRunner {
         do {
             controller = try controllerFactory(provider, freshRunRequest)
         } catch {
+            let errorText = displayText(for: error)
+            #if DEBUG
+                providerBoundaryFailureReason = "acp_controller_initialization_failed"
+            #endif
             await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
                 runID: runID,
                 runAttemptID: runAttemptID,
                 attachmentReservationID: attachmentReservationID,
-                errorText: "ACP controller init failed: \(error.localizedDescription)"
+                errorText: "ACP controller init failed: \(errorText)"
             )
             return
         }
@@ -444,7 +463,13 @@ final class ACPIntegratedAgentModeRunner {
             #endif
             guard let self else {
                 #if DEBUG
-                    _ = providerStartBoundaryReporter(runID, nil, runAttemptID, false)
+                    _ = providerStartBoundaryReporter(
+                        runID,
+                        nil,
+                        runAttemptID,
+                        false,
+                        "runner_released_before_authorization"
+                    )
                 #endif
                 if let session = weakSession.value,
                    let currentOwnership = session.activeRunOwnership,
@@ -647,7 +672,8 @@ final class ACPIntegratedAgentModeRunner {
             _ runID: UUID?,
             _ activeAgentSessionID: UUID?,
             _ runAttemptID: UUID?,
-            _ authorized: Bool
+            _ authorized: Bool,
+            _ startupFailureReason: String?
         ) -> Bool
     ) async {
         #if DEBUG
@@ -655,7 +681,8 @@ final class ACPIntegratedAgentModeRunner {
                 runID,
                 session.activeAgentSessionID,
                 runAttemptID,
-                false
+                false,
+                "startup_invalid_before_authorization"
             )
         #endif
         if ownsCurrentAttempt {
@@ -790,12 +817,19 @@ final class ACPIntegratedAgentModeRunner {
             _ runID: UUID?,
             _ activeAgentSessionID: UUID?,
             _ runAttemptID: UUID?,
-            _ authorized: Bool
+            _ authorized: Bool,
+            _ startupFailureReason: String?
         ) -> Bool
     ) -> Bool {
         #if DEBUG
             guard stage.reportsProviderBoundaryFailure else { return false }
-            _ = providerStartBoundaryReporter(runID, nil, runAttemptID, false)
+            _ = providerStartBoundaryReporter(
+                runID,
+                nil,
+                runAttemptID,
+                false,
+                "startup_boundary_invalid_before_bootstrap"
+            )
             return true
         #else
             return false
@@ -1009,7 +1043,8 @@ final class ACPIntegratedAgentModeRunner {
             _ runID: UUID?,
             _ activeAgentSessionID: UUID?,
             _ runAttemptID: UUID?,
-            _ authorized: Bool
+            _ authorized: Bool,
+            _ startupFailureReason: String?
         ) -> Bool,
         providerStartBootstrapObserver: () -> Void,
         attachmentReservationID: UUID?,
@@ -1017,9 +1052,16 @@ final class ACPIntegratedAgentModeRunner {
     ) async {
         #if DEBUG
             var providerBoundaryReported = false
+            var providerBoundaryFailureReason = "fresh_start_abandoned_before_authorization"
             defer {
                 if !providerBoundaryReported {
-                    _ = providerStartBoundaryReporter(runID, nil, runAttemptID, false)
+                    _ = providerStartBoundaryReporter(
+                        runID,
+                        nil,
+                        runAttemptID,
+                        false,
+                        providerBoundaryFailureReason
+                    )
                 }
             }
         #endif
@@ -1029,6 +1071,9 @@ final class ACPIntegratedAgentModeRunner {
         log("fresh start begin model=\(modelDescription) resume=\(resumeDescription) workspace=\(workspaceDescription)", runID: runID)
         let acquired = await lease.acquire()
         guard acquired else {
+            #if DEBUG
+                providerBoundaryFailureReason = "bootstrap_lease_acquisition_failed"
+            #endif
             log("lease acquire failed", runID: runID)
             let teardown = startupTeardownClaim.claim { @MainActor [self] in
                 if let liveSession = session.value {
@@ -1102,7 +1147,7 @@ final class ACPIntegratedAgentModeRunner {
             guard providerStartAuthorizer(runID) else {
                 #if DEBUG
                     providerBoundaryReported = true
-                    _ = providerStartBoundaryReporter(runID, session.value?.activeAgentSessionID, runAttemptID, false)
+                    _ = providerStartBoundaryReporter(runID, session.value?.activeAgentSessionID, runAttemptID, false, nil)
                 #endif
                 await lease.providerInitializationCompleted(provider: providerName, outcome: "failed")
                 await finalizeClaimedStartupDisposition(
@@ -1166,7 +1211,8 @@ final class ACPIntegratedAgentModeRunner {
                     runID,
                     boundarySnapshot.activeAgentSessionID,
                     runAttemptID,
-                    true
+                    true,
+                    nil
                 ) else {
                     await lease.providerInitializationCompleted(provider: providerName, outcome: "failed")
                     await finalizeClaimedStartupDisposition(

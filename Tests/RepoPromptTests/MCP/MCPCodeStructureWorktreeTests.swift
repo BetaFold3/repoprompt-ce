@@ -317,6 +317,14 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             $0.objectValue?["code"]?.stringValue
         }
         XCTAssertTrue(issueCodes?.contains("git_root_unavailable") == true)
+        let issue = try XCTUnwrap(object["issues"]?.arrayValue?.first {
+            $0.objectValue?["code"]?.stringValue == "git_root_unavailable"
+        }?.objectValue)
+        XCTAssertEqual(issue["detail"]?.stringValue, "git_terminal.non_git")
+        XCTAssertEqual(issue["retryable"]?.boolValue, false)
+        XCTAssertNil(object["retry"])
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 0)
         let invocations = MCPToolWorkCountDiagnostics.debugSnapshots().git
         XCTAssertEqual(invocations.count, 1)
         let invocation = try XCTUnwrap(invocations.first)
@@ -403,6 +411,422 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             )
         }
         XCTAssertNil(window.mcpServer.capturedCodeStructureRequestForTesting())
+
+        do {
+            _ = try await tool([:])
+            XCTFail("Expected required scope to be rejected")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("scope must be 'paths' or 'selected'"),
+                "Unexpected error: \(error)"
+            )
+        }
+    }
+
+    func testRecoverableRootRejectionResetsOnceAndBecomesReadyInSameRequest() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/App.swift": "protocol Service { func run() }\nstruct App: Service { func run() {} }\n"]
+        )
+        defer { repositories.cleanup() }
+        let counter = CodeStructureDemandHookCounter(persistent: false)
+        let window = try await makeWindow(root: root) { _, result in
+            await counter.transform(result)
+        }
+        let store = window.workspaceFileContextStore
+        let file = try await fileRecord(
+            at: root.appendingPathComponent("Sources/App.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let dto = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [file],
+            request: request(maximumFiles: 10),
+            includePathNotFoundIssue: true
+        )
+        XCTAssertEqual(dto.status, "ready")
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+    }
+
+    func testPersistentRecoverableRootRejectionResetsOnceAndReturnsExactSubtype() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/App.swift": "protocol Service { func run() }\nstruct App: Service { func run() {} }\n"]
+        )
+        defer { repositories.cleanup() }
+        let counter = CodeStructureDemandHookCounter(persistent: true)
+        let window = try await makeWindow(root: root) { _, result in
+            await counter.transform(result)
+        }
+        let store = window.workspaceFileContextStore
+        let file = try await fileRecord(
+            at: root.appendingPathComponent("Sources/App.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let dto = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [file],
+            request: request(maximumFiles: 10),
+            includePathNotFoundIssue: true
+        )
+        XCTAssertEqual(dto.status, "unavailable")
+        XCTAssertEqual(dto.issues.first?.detail, "binding_rejected.capability_unavailable")
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+    }
+
+    func testPersistentCurrentnessRejectionRetriesOnceThenPreservesExactSubtype() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/App.swift": "struct App { let value = 1 }\n"]
+        )
+        defer { repositories.cleanup() }
+        let window = try await makeWindow(root: root) { _, _ in
+            .rejected(.rootEpochMismatch)
+        }
+        let store = window.workspaceFileContextStore
+        let file = try await fileRecord(
+            at: root.appendingPathComponent("Sources/App.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+
+        let dto = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [file],
+            request: request(maximumFiles: 10),
+            includePathNotFoundIssue: true
+        )
+
+        XCTAssertEqual(dto.status, "unavailable")
+        XCTAssertEqual(dto.issues.first?.detail, "binding_rejected.root_epoch_mismatch")
+        XCTAssertEqual(dto.issues.first?.retryable, true)
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 0)
+    }
+
+    func testRootSessionRepairWithJoinedRetainersInvalidatesPeerAndReacquires() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/App.swift": "struct App { let value = 1 }\n"]
+        )
+        defer { repositories.cleanup() }
+        let window = try await makeWindow(root: root) { _, _ in
+            .rejected(.capabilityUnavailable)
+        }
+        let store = window.workspaceFileContextStore
+        let file = try await fileRecord(
+            at: root.appendingPathComponent("Sources/App.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let first = await store.requestCodemapArtifactWithOwnership(forFileID: file.id)
+        let second = await store.requestCodemapArtifactWithOwnership(forFileID: file.id)
+        guard case let .pending(firstTicket) = first.result,
+              case let .pending(secondTicket) = second.result
+        else {
+            return XCTFail("Expected joined pending demands.")
+        }
+        let rejected = await waitForDemandResult(store: store, ticket: firstTicket) {
+            if case .unavailable(.rejected(.capabilityUnavailable)) = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(rejected)
+        let retainCount = await store.codemapArtifactDemandRetainCountForTesting(firstTicket)
+        XCTAssertEqual(retainCount, 2)
+
+        let repaired = await store.prepareCodemapRootSessionRetry(
+            firstTicket,
+            rejection: .capabilityUnavailable,
+            priority: .demand,
+            deadline: ContinuousClock.now.advanced(by: .seconds(5))
+        )
+
+        XCTAssertNotNil(repaired)
+        let peerStatus = await store.codemapArtifactDemandStatus(secondTicket)
+        guard case .unavailable(.staleCurrentness) = peerStatus else {
+            return XCTFail("Expected the joined peer ticket to become stale.")
+        }
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+        if let repaired, let ticket = demandTicket(from: repaired.result) {
+            _ = await store.cancelCodemapArtifactDemand(ticket)
+        }
+    }
+
+    func testFreshDemandRetryWithJoinedRetainersInvalidatesPeerAndReacquires() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/App.swift": "struct App { let value = 1 }\n"]
+        )
+        defer { repositories.cleanup() }
+        let window = try await makeWindow(root: root) { _, _ in
+            .rejected(.sourceAuthorityUnavailable)
+        }
+        let store = window.workspaceFileContextStore
+        let file = try await fileRecord(
+            at: root.appendingPathComponent("Sources/App.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let first = await store.requestCodemapArtifactWithOwnership(forFileID: file.id)
+        let second = await store.requestCodemapArtifactWithOwnership(forFileID: file.id)
+        guard case let .pending(firstTicket) = first.result,
+              case let .pending(secondTicket) = second.result
+        else {
+            return XCTFail("Expected joined pending demands.")
+        }
+        let rejected = await waitForDemandResult(store: store, ticket: firstTicket) {
+            if case .unavailable(.rejected(.sourceAuthorityUnavailable)) = $0 { return true }
+            return false
+        }
+        XCTAssertTrue(rejected)
+        let retainCount = await store.codemapArtifactDemandRetainCountForTesting(firstTicket)
+        XCTAssertEqual(retainCount, 2)
+
+        let repaired = await store.retryRejectedCodemapArtifactDemand(
+            firstTicket,
+            rejection: .sourceAuthorityUnavailable,
+            priority: .demand
+        )
+
+        XCTAssertNotNil(repaired)
+        let peerStatus = await store.codemapArtifactDemandStatus(secondTicket)
+        guard case .unavailable(.staleCurrentness) = peerStatus else {
+            return XCTFail("Expected the joined peer ticket to become stale.")
+        }
+        if let repaired, let ticket = demandTicket(from: repaired.result) {
+            _ = await store.cancelCodemapArtifactDemand(ticket)
+        }
+    }
+
+    func testSharedCodemapCleanupWaitHonorsDeadlineAndCancellation() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: ["Sources/App.swift": "struct App {}\n"]
+        )
+        defer { repositories.cleanup() }
+        let window = try await makeWindow(root: root)
+        let store = window.workspaceFileContextStore
+        let sharedTask = Task<Void, Never> {
+            try? await Task.sleep(for: .seconds(5))
+        }
+
+        let expired = await store.waitForCodemapSharedTaskForTesting(
+            sharedTask,
+            deadline: ContinuousClock.now
+        )
+        XCTAssertFalse(expired)
+
+        let waiter = Task {
+            await store.waitForCodemapSharedTaskForTesting(
+                sharedTask,
+                deadline: ContinuousClock.now.advanced(by: .seconds(5))
+            )
+        }
+        await Task.yield()
+        waiter.cancel()
+        let cancelled = await waiter.value
+        XCTAssertFalse(cancelled)
+        sharedTask.cancel()
+        await sharedTask.value
+    }
+
+    func testRootSessionResetReissuesEverySameRootSeedOnce() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/App.swift": "struct App { let value = 1 }\n",
+                "Sources/Service.swift": "protocol Service { func run() }\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        let counter = CodeStructurePersistentDemandBarrier(expectedInitialFileCount: 2)
+        let window = try await makeWindow(root: root) { ticket, result in
+            await counter.transform(ticket: ticket, result: result)
+        }
+        let store = window.workspaceFileContextStore
+        let appFile = try await fileRecord(
+            at: root.appendingPathComponent("Sources/App.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let serviceFile = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Service.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let files = [appFile, serviceFile]
+
+        let dto = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: files,
+            request: request(maximumFiles: 10),
+            includePathNotFoundIssue: true
+        )
+
+        XCTAssertEqual(dto.status, "unavailable")
+        XCTAssertEqual(
+            Set(dto.issues.compactMap(\.detail)),
+            ["binding_rejected.capability_unavailable"]
+        )
+        let invocationCounts = await counter.invocationCounts()
+        XCTAssertEqual(Set(invocationCounts.keys), Set(files.map(\.id)))
+        XCTAssertTrue(invocationCounts.values.allSatisfy { $0 == 2 })
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+    }
+
+    func testTraversalTargetRootResetRestartsAttemptBeforeReusingSeedTickets() async throws {
+        let repositories = try ReviewGitRepositoryFixture(name: #function)
+        let root = try repositories.makeRepository(
+            named: "repository",
+            files: [
+                "Sources/Source.swift": "struct Source { let target: Target }\n",
+                "Sources/Target.swift": "struct Target { func run() {} }\n"
+            ]
+        )
+        defer { repositories.cleanup() }
+        let rejection = CodeStructureTargetDemandRejection()
+        let window = try await makeWindow(root: root) { ticket, result in
+            await rejection.transform(ticket: ticket, result: result)
+        }
+        let store = window.workspaceFileContextStore
+        let source = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Source.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        let target = try await fileRecord(
+            at: root.appendingPathComponent("Sources/Target.swift"),
+            store: store,
+            rootScope: .visibleWorkspace
+        )
+        await rejection.configure(targetFileID: target.id)
+
+        let dto = try await window.mcpServer.buildCodeStructureDTO(
+            fromRecords: [source],
+            request: request(
+                direction: .referencedDefinitions,
+                maximumDepth: 1,
+                maximumFiles: 10
+            ),
+            includePathNotFoundIssue: true
+        )
+
+        XCTAssertEqual(dto.status, "ready")
+        XCTAssertEqual(Set(dto.files.map(\.path)), [
+            "repository/Sources/Source.swift",
+            "repository/Sources/Target.swift"
+        ])
+        let rejectionCount = await rejection.rejectionCount()
+        XCTAssertEqual(rejectionCount, 1)
+        let repairCount = await store.codemapRootSessionRepairCountForTesting()
+        XCTAssertEqual(repairCount, 1)
+    }
+
+    func testBindingAndOverlayRejectionDTOsPreserveStableSubtypeAndRetryability() throws {
+        let bindingCases: [(WorkspaceCodemapBindingDemandRejection, String)] = [
+            (.rootNotRegistered, "binding_rejected.root_not_registered"),
+            (.capabilityUnavailable, "binding_rejected.capability_unavailable"),
+            (.rootEpochMismatch, "binding_rejected.root_epoch_mismatch"),
+            (.rootPathMismatch, "binding_rejected.root_path_mismatch"),
+            (.invalidIdentity, "binding_rejected.invalid_identity"),
+            (.catalogGenerationMismatch, "binding_rejected.catalog_generation_mismatch"),
+            (.requestGenerationInvalid, "binding_rejected.request_generation_invalid"),
+            (.stalePathGeneration, "binding_rejected.stale_path_generation"),
+            (.staleIngressGeneration, "binding_rejected.stale_ingress_generation"),
+            (.languageMismatch, "binding_rejected.language_mismatch"),
+            (.classificationMismatch, "binding_rejected.classification_mismatch"),
+            (.sourceAuthorityUnavailable, "binding_rejected.source_authority_unavailable"),
+            (.staleCompletion, "binding_rejected.stale_completion")
+        ]
+        let overlayCases: [(WorkspaceCodemapLiveDemandRejection, String)] = [
+            (.rootNotRegistered, "root_not_registered"),
+            (.rootAuthorityInvalid, "root_authority_invalid"),
+            (.rootEpochMismatch, "root_epoch_mismatch"),
+            (.catalogGenerationMismatch, "catalog_generation_mismatch"),
+            (.repositoryAuthorityMismatch, "repository_authority_mismatch"),
+            (.invalidToken, "invalid_token"),
+            (.pathOutsideRoot, "path_outside_root"),
+            (.staleRequestGeneration, "stale_request_generation"),
+            (.requestGenerationConflict, "request_generation_conflict"),
+            (.admissionReservationInvalid, "admission_reservation_invalid")
+        ]
+        let cases = bindingCases + overlayCases.map {
+            (.overlayRejected($0.0), "overlay_rejected.\($0.1)")
+        }
+
+        for (rejection, detail) in cases {
+            let fileID = UUID()
+            let dto = MCPServerViewModel.codeStructureReplyDTO(
+                presentation: WorkspaceCodemapStructurePresentation(
+                    outcome: .unavailable,
+                    entries: [],
+                    issues: [.artifactUnavailable(fileID: fileID, reason: .rejected(rejection))],
+                    requestedSeedCount: 1,
+                    resolvedSeedCount: 0,
+                    examinedEdgeCount: 0,
+                    codemapTokenCount: 0
+                ),
+                logicalPathsByFileID: [fileID: "Sources/App.swift"],
+                worktreeScope: nil
+            )
+            let issue = try XCTUnwrap(dto.issues.first)
+            XCTAssertEqual(issue.code, "artifact_unavailable")
+            XCTAssertEqual(issue.detail, detail)
+            XCTAssertEqual(issue.message, "A codemap artifact is unavailable. (reason=\(detail))")
+            XCTAssertEqual(
+                issue.retryable,
+                WorkspaceCodemapArtifactDemandRecovery(rejection).isRetryable
+            )
+            XCTAssertEqual(dto.retry != nil, issue.retryable)
+        }
+    }
+
+    func testGitTerminalDTOsPreserveStableSubtypeAndReleasedEpochRetryability() throws {
+        let cases: [(WorkspaceCodemapGitTerminalUnavailableReason, String)] = [
+            (.nonGit, "non_git"),
+            (.bareRepository, "bare_repository"),
+            (.unsupportedObjectFormat, "unsupported_object_format"),
+            (.unsupportedGit, "unsupported_git"),
+            (.invalidLayout, "invalid_layout"),
+            (.invalidLoadedRootContainment, "invalid_loaded_root_containment"),
+            (.namespaceUnavailable, "namespace_unavailable"),
+            (.rootEpochBindingMismatch, "root_epoch_binding_mismatch"),
+            (.releasedRootEpoch, "released_root_epoch")
+        ]
+        for (reason, subtype) in cases {
+            let fileID = UUID()
+            let detail = "git_terminal.\(subtype)"
+            let dto = MCPServerViewModel.codeStructureReplyDTO(
+                presentation: WorkspaceCodemapStructurePresentation(
+                    outcome: .unavailable,
+                    entries: [],
+                    issues: [.artifactUnavailable(fileID: fileID, reason: .gitTerminal(reason))],
+                    requestedSeedCount: 1,
+                    resolvedSeedCount: 0,
+                    examinedEdgeCount: 0,
+                    codemapTokenCount: 0
+                ),
+                logicalPathsByFileID: [fileID: "Sources/App.swift"],
+                worktreeScope: nil
+            )
+            let issue = try XCTUnwrap(dto.issues.first)
+            XCTAssertEqual(issue.detail, detail)
+            XCTAssertEqual(
+                issue.message,
+                "The Git root is unavailable for codemap generation. (reason=\(detail))"
+            )
+            XCTAssertEqual(issue.retryable, reason == .releasedRootEpoch)
+            XCTAssertEqual(dto.retry != nil, reason == .releasedRootEpoch)
+        }
     }
 
     func testParkedRuntimeFailureDTOIsTerminalWithStableReasonToken() throws {
@@ -1346,6 +1770,36 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
     }
 
+    private func demandTicket(
+        from result: WorkspaceCodemapArtifactDemandResult
+    ) -> WorkspaceCodemapArtifactDemandTicket? {
+        switch result {
+        case let .pending(ticket):
+            ticket
+        case let .ready(ready):
+            ready.ticket
+        case .unavailable:
+            nil
+        }
+    }
+
+    private func waitForDemandResult(
+        store: WorkspaceFileContextStore,
+        ticket: WorkspaceCodemapArtifactDemandTicket,
+        matches: (WorkspaceCodemapArtifactDemandResult) -> Bool
+    ) async -> Bool {
+        for _ in 0 ..< 200 {
+            let result = await store.codemapArtifactDemandStatus(ticket)
+            if matches(result) { return true }
+            if case .pending = result {
+                try? await Task.sleep(for: .milliseconds(10))
+                continue
+            }
+            return false
+        }
+        return false
+    }
+
     private func readyTicket(
         store: WorkspaceFileContextStore,
         fileID: UUID,
@@ -1474,8 +1928,17 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         throw NSError(domain: "MCPCodeStructureWorktreeTests", code: 5)
     }
 
-    private func makeWindow(root: URL) async throws -> WindowState {
-        let codemapFixture = try MCPCodeStructureCodemapRuntimeFixture(name: "MCPCodeStructureWorktreeTests")
+    private func makeWindow(
+        root: URL,
+        codemapDemandResultHook: @escaping @Sendable (
+            WorkspaceCodemapArtifactDemandTicket,
+            WorkspaceCodemapBindingDemandResult
+        ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result }
+    ) async throws -> WindowState {
+        let codemapFixture = try MCPCodeStructureCodemapRuntimeFixture(
+            name: "MCPCodeStructureWorktreeTests",
+            codemapDemandResultHook: codemapDemandResultHook
+        )
         addTeardownBlock {
             await codemapFixture.shutdown()
         }
@@ -1656,6 +2119,85 @@ private extension Sequence {
     }
 }
 
+private actor CodeStructureDemandHookCounter {
+    private let persistent: Bool
+    private var count = 0
+
+    init(persistent: Bool) {
+        self.persistent = persistent
+    }
+
+    func transform(
+        _ result: WorkspaceCodemapBindingDemandResult
+    ) -> WorkspaceCodemapBindingDemandResult {
+        count += 1
+        if persistent || count == 1 {
+            return .rejected(.capabilityUnavailable)
+        }
+        return result
+    }
+}
+
+private actor CodeStructureTargetDemandRejection {
+    private var targetFileID: UUID?
+    private var didReject = false
+
+    func configure(targetFileID: UUID) {
+        self.targetFileID = targetFileID
+    }
+
+    func transform(
+        ticket: WorkspaceCodemapArtifactDemandTicket,
+        result: WorkspaceCodemapBindingDemandResult
+    ) -> WorkspaceCodemapBindingDemandResult {
+        guard ticket.fileID == targetFileID, !didReject else { return result }
+        didReject = true
+        return .rejected(.rootNotRegistered)
+    }
+
+    func rejectionCount() -> Int {
+        didReject ? 1 : 0
+    }
+}
+
+private actor CodeStructurePersistentDemandBarrier {
+    private let expectedInitialFileCount: Int
+    private var firstInvocationFileIDs: Set<UUID> = []
+    private var countsByFileID: [UUID: Int] = [:]
+    private var initialBarrierReleased = false
+    private var initialWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(expectedInitialFileCount: Int) {
+        self.expectedInitialFileCount = expectedInitialFileCount
+    }
+
+    func transform(
+        ticket: WorkspaceCodemapArtifactDemandTicket,
+        result _: WorkspaceCodemapBindingDemandResult
+    ) async -> WorkspaceCodemapBindingDemandResult {
+        countsByFileID[ticket.fileID, default: 0] += 1
+        if firstInvocationFileIDs.insert(ticket.fileID).inserted {
+            if firstInvocationFileIDs.count == expectedInitialFileCount {
+                initialBarrierReleased = true
+                let waiters = initialWaiters
+                initialWaiters.removeAll()
+                for waiter in waiters {
+                    waiter.resume()
+                }
+            } else if !initialBarrierReleased {
+                await withCheckedContinuation { continuation in
+                    initialWaiters.append(continuation)
+                }
+            }
+        }
+        return .rejected(.capabilityUnavailable)
+    }
+
+    func invocationCounts() -> [UUID: Int] {
+        countsByFileID
+    }
+}
+
 private actor CodeStructureContentReadCounter {
     private(set) var value = 0
 
@@ -1667,8 +2209,19 @@ private actor CodeStructureContentReadCounter {
 private final class MCPCodeStructureCodemapRuntimeFixture: @unchecked Sendable {
     private let sandbox: URL
     private let provider: CodeMapArtifactRuntimeProvider
+    private let codemapDemandResultHook: @Sendable (
+        WorkspaceCodemapArtifactDemandTicket,
+        WorkspaceCodemapBindingDemandResult
+    ) async -> WorkspaceCodemapBindingDemandResult
 
-    init(name: String) throws {
+    init(
+        name: String,
+        codemapDemandResultHook: @escaping @Sendable (
+            WorkspaceCodemapArtifactDemandTicket,
+            WorkspaceCodemapBindingDemandResult
+        ) async -> WorkspaceCodemapBindingDemandResult = { _, result in result }
+    ) throws {
+        self.codemapDemandResultHook = codemapDemandResultHook
         let sandbox = try Self.makeSecureDirectory(name: name)
         do {
             let artifactRoot = try Self.makeSecureDirectory(in: sandbox, named: "artifacts")
@@ -1711,7 +2264,8 @@ private final class MCPCodeStructureCodemapRuntimeFixture: @unchecked Sendable {
             codemapRuntimeProvider: {
                 try provider.runtime()
             },
-            codemapProjectionPreloadLaunchPolicyForTesting: .disabled
+            codemapProjectionPreloadLaunchPolicyForTesting: .disabled,
+            codemapDemandResultHook: codemapDemandResultHook
         )
     }
 

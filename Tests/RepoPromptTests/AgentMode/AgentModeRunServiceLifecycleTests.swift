@@ -138,8 +138,241 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         let authorizationOutcome = await context.authorizationReceipt.wait()
         XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(
+            context.authorizationReceipt.resolvedStartupFailureReason,
+            "provider_start_boundary_not_reached"
+        )
         XCTAssertEqual(session.runState, .failed)
         XCTAssertFalse(recorder.contains(prefix: "factory:"))
+    }
+
+    func testOhMyPiControllerCreationFailurePublishesFailedSessionWithReason() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            acpControllerFactory: { _, _ in
+                throw LifecycleTestError.expectedACPDispatchStop
+            },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "controller creation failure",
+            initialMessageForRun: "controller creation failure",
+            attachments: []
+        )
+
+        XCTAssertEqual(context.authorizationReceipt.resolvedOutcome, .denied)
+        XCTAssertEqual(
+            context.authorizationReceipt.resolvedStartupFailureReason,
+            "acp_controller_initialization_failed"
+        )
+        XCTAssertEqual(session.activeAgentSessionID, qualificationSessionID)
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertEqual(
+            session.items.filter { $0.kind == .error }.map(\.text),
+            ["ACP controller init failed: Expected ACP dispatch stop."]
+        )
+    }
+
+    func testOhMyPiSupportPreflightFailureReportsStableReason() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            failSupport: true,
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "support preflight failure",
+            initialMessageForRun: "support preflight failure",
+            attachments: []
+        )
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(
+            context.authorizationReceipt.resolvedStartupFailureReason,
+            "acp_support_preflight_failed"
+        )
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertTrue(recorder.contains("provider:support"))
+        XCTAssertFalse(recorder.contains("factory:acp-controller"))
+    }
+
+    func testOhMyPiUnsupportedSupportReportsStableReason() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            supportResult: .unsupported(reason: "fixture provider detail"),
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "unsupported support",
+            initialMessageForRun: "unsupported support",
+            attachments: []
+        )
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(
+            context.authorizationReceipt.resolvedStartupFailureReason,
+            "acp_support_unsupported"
+        )
+        XCTAssertNotEqual(
+            context.authorizationReceipt.resolvedStartupFailureReason,
+            "fixture provider detail"
+        )
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertFalse(recorder.contains("factory:acp-controller"))
+    }
+
+    func testOhMyPiBootstrapLeaseAcquisitionFailureReportsStableReason() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        let context = try installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        var authorizationCalls = 0
+        var bootstrapEntries = 0
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            expectedPIDPolicyArmer: { _ in false },
+            ompQualificationAuthorizer: { _, _ in
+                authorizationCalls += 1
+                return true
+            },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationProviderBootstrapEntry: {
+                bootstrapEntries += 1
+            }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        _ = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "lease acquisition failure",
+            initialMessageForRun: "lease acquisition failure",
+            attachments: []
+        )
+
+        let authorizationOutcome = await context.authorizationReceipt.wait()
+        XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(
+            context.authorizationReceipt.resolvedStartupFailureReason,
+            "bootstrap_lease_acquisition_failed"
+        )
+        let agentTask = session.agentTask
+        await agentTask?.value
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNil(session.agentTask)
+        XCTAssertEqual(authorizationCalls, 0)
+        XCTAssertEqual(bootstrapEntries, 0)
+        XCTAssertTrue(recorder.contains("provider:support"))
+        XCTAssertTrue(recorder.contains("factory:acp-controller"))
     }
 
     func testOhMyPiRunnerReleasedBeforeAgentTaskEntryResolvesAuthorizationDenial() async throws {
@@ -203,6 +436,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         let outcome = await context.authorizationReceipt.wait()
         XCTAssertEqual(outcome, .denied)
+        XCTAssertEqual(
+            context.authorizationReceipt.resolvedStartupFailureReason,
+            "runner_released_before_authorization"
+        )
         try await waitUntil("runner release must terminalize and clear startup ownership") {
             session.runState == .failed && session.acpController == nil && session.agentTask == nil
         }
@@ -455,6 +692,21 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
+    func testOhMyPiAuthorizationReceiptDeadlineConversionRecordsReason() {
+        let receipt = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt(
+            authorizationDeadlineUptimeNanoseconds: 100,
+            monotonicNowNanoseconds: { 100 }
+        )
+        let proposed = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome.authorized(.init(
+            runID: UUID(),
+            activeAgentSessionID: nil,
+            runAttemptID: nil
+        ))
+
+        XCTAssertEqual(receipt.resolve(proposed), .denied)
+        XCTAssertEqual(receipt.resolvedStartupFailureReason, "authorization_deadline_exceeded")
+    }
+
     func testExpiredOhMyPiAuthorizationReceiptDeniesRunnerBeforeBootstrap() async throws {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()
@@ -506,6 +758,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         let authorizationOutcome = await context.authorizationReceipt.wait()
         XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(
+            context.authorizationReceipt.resolvedStartupFailureReason,
+            "qualification_authorizer_precondition_failed"
+        )
         XCTAssertEqual(gateAuthorizationCalls, 0)
         XCTAssertEqual(bootstrapEntries, 0)
         XCTAssertEqual(session.runState, .failed)
@@ -992,7 +1248,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let qualificationWorkspaceID = UUID()
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .ohMyPi
-        _ = try installOMPQualificationContext(
+        let context = try installOMPQualificationContext(
             on: session,
             sessionID: qualificationSessionID,
             workspaceID: qualificationWorkspaceID
@@ -1047,6 +1303,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(authorizedPair?.0, qualificationSessionID)
         XCTAssertNotNil(authorizedPair?.1)
         XCTAssertEqual(providerRunID, authorizedPair?.1)
+        guard case let .authorized(receipt)? = context.authorizationReceipt.resolvedOutcome else {
+            XCTFail("Expected provider start authorization")
+            return
+        }
+        XCTAssertEqual(receipt.runID, authorizedPair?.1)
+        XCTAssertNil(context.authorizationReceipt.resolvedStartupFailureReason)
         XCTAssertTrue(recorder.contains("factory:acp-provider"))
         XCTAssertTrue(recorder.contains("factory:acp-controller"))
         XCTAssertEqual(providerBootstrapCount, 1)
@@ -1256,6 +1518,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         let authorizationOutcome = await originalContext.authorizationReceipt.wait()
         XCTAssertEqual(authorizationOutcome, .denied)
+        XCTAssertEqual(
+            originalContext.authorizationReceipt.resolvedStartupFailureReason,
+            "qualification_authorizer_precondition_failed"
+        )
         XCTAssertEqual(authorizationCalls, 0)
         XCTAssertEqual(bootstrapEntries, 0)
         XCTAssertTrue(session.ompQualificationStartContext === replacementContext)
@@ -1277,6 +1543,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             sessionID: qualificationSessionID,
             workspaceID: qualificationWorkspaceID
         )
+        session.mcpStartInvocationGenerationID = originalContext.generationID
         let harness = makeHarness(
             recorder: recorder,
             ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
@@ -1308,6 +1575,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         let originalOutcome = await originalContext.authorizationReceipt.wait()
         XCTAssertEqual(originalOutcome, .denied)
+        XCTAssertEqual(
+            originalContext.authorizationReceipt.resolvedStartupFailureReason,
+            "qualification_context_identity_mismatch"
+        )
         let replacementAuthorization = OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome.authorized(.init(
             runID: UUID(),
             activeAgentSessionID: UUID(),
@@ -1392,6 +1663,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         let originalOutcome = await originalContext.authorizationReceipt.wait()
         XCTAssertEqual(originalOutcome, .denied)
+        XCTAssertEqual(
+            originalContext.authorizationReceipt.resolvedStartupFailureReason,
+            "start_invocation_generation_mismatch"
+        )
         XCTAssertNil(session.ompQualificationStartContext)
         XCTAssertEqual(session.mcpStartInvocationGenerationID, successorGenerationID)
         XCTAssertEqual(session.runID, successorRunID)
@@ -3808,6 +4083,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
         autoSignalACPRouting: Bool = false,
+        expectedPIDPolicyArmer: @escaping (MCPBootstrapLeaseSpec) async -> Bool = { _ in true },
         ompQualificationAuthorizer: @escaping (OhMyPiAgentModeSmokeGate.StartTransaction, UUID) -> Bool = { _, _ in false },
         ompQualificationActiveWorkspaceID: @escaping () -> UUID? = { nil },
         ompQualificationInvocationContext: ((AgentModeViewModel.TabSession) -> OhMyPiAgentModeSmokeGate.StartContext?)? = nil,
@@ -3870,7 +4146,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             acpProviderFactory: acpProviderFactory,
             acpControllerFactory: trackedACPControllerFactory,
             connectionPolicyInstaller: policyInstaller,
-            expectedPIDPolicyArmer: { _ in true },
+            expectedPIDPolicyArmer: expectedPIDPolicyArmer,
             mcpServerEnabler: serverEnabler,
             workspacePathProvider: workspacePathProvider,
             codexCoordinator: host.test_codexCoordinator,
@@ -3884,7 +4160,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             awaitNoActiveMCPTools: idleWaiter,
             activeAgentRunWaitQuery: { _ in false },
             childAgentRunWaitDrainTimeoutSeconds: 0.01,
-            ompQualificationAuthorizer: ompQualificationAuthorizer,
+            ompQualificationAuthorizer: { transaction, runID in
+                ompQualificationAuthorizer(transaction, runID)
+                    ? .authorized
+                    : .refused(reason: "test_qualification_authorizer_refused")
+            },
             ompQualificationActiveWorkspaceID: ompQualificationActiveWorkspaceID,
             ompQualificationInvocationContext: ompQualificationInvocationContext ?? { $0.ompQualificationStartContext },
             testBeforeOMPQualificationProviderAuthorization: testBeforeOMPQualificationProviderAuthorization,
@@ -4727,6 +5007,7 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
     let commandPath: String
     var environment: [String: String] = [:]
     var supportResult: ACPSupportResult = .supported
+    var failSupport = false
     var cancelSupport = false
     var recorder: LifecycleRecorder?
 
@@ -4734,6 +5015,9 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
         recorder?.record("provider:support")
         if cancelSupport {
             throw CancellationError()
+        }
+        if failSupport {
+            throw LifecycleTestError.expectedACPDispatchStop
         }
         return supportResult
     }

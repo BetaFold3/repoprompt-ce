@@ -43,7 +43,9 @@ struct OhMyPiACPAgentProvider: ACPAgentProvider {
             workingDirectory: workingDirectory,
             additionalPathHints: resolvedLaunch.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging,
-            expectedExecutableIdentity: resolvedLaunch.executableIdentity
+            expectedExecutableIdentity: resolvedLaunch.executableIdentity,
+            expectedProcessExecutablePath: resolvedLaunch.processExecutablePath,
+            expectedProcessExecutableIdentity: resolvedLaunch.processExecutableIdentity
         )
     }
 

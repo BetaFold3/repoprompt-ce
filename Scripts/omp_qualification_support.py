@@ -192,8 +192,17 @@ def _normalized_response(raw: object, expected_discriminator: str) -> dict[str, 
                 and isinstance(value.get("session_id"), str)
                 and bool(value["session_id"])
             )
-        if expected_discriminator == "agent_manage":
+        if expected_discriminator == "agent_manage:list_agents":
             return isinstance(value.get("agents"), list) and set(value).isdisjoint({"ok", "status", "session_id"})
+        if expected_discriminator == "agent_manage:cleanup_sessions":
+            return (
+                isinstance(value.get("status"), str)
+                and type(value.get("deleted_count")) is int
+                and type(value.get("skipped_count")) is int
+                and isinstance(value.get("deleted_sessions"), list)
+                and isinstance(value.get("skipped_sessions"), list)
+                and "agents" not in value
+            )
         return False
 
     reject_error_envelope(raw, "top-level")
@@ -221,8 +230,14 @@ def normalize_response(arguments: argparse.Namespace) -> None:
         if not isinstance(op, str) or not op:
             raise SupportError("diagnostic request lacks an exact op discriminator")
         discriminator = f"diagnostic:{op}"
-    elif arguments.tool in {"agent_run", "agent_manage"}:
+    elif arguments.tool == "agent_run":
         discriminator = arguments.tool
+    elif arguments.tool == "agent_manage":
+        request = json.loads(arguments.payload)
+        op = request.get("op") if isinstance(request, dict) else None
+        if op not in {"list_agents", "cleanup_sessions"}:
+            raise SupportError("unsupported qualification agent_manage operation")
+        discriminator = f"agent_manage:{op}"
     else:
         raise SupportError("unsupported qualification response tool")
     normalized = _normalized_response(raw, discriminator)

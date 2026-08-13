@@ -4,6 +4,39 @@ import Foundation
 import XCTest
 
 final class CodemapBindingEngineInvalidationTests: CodemapBindingEngineTestCase {
+    func testOverlayRejectionPreservesExactAssociatedReason() async throws {
+        let repository = try makeRepositoryFixture(name: #function)
+        let root = try repository.makeRepository(
+            named: "repository",
+            files: ["Sources/Overlay.swift": SwiftFixtureSource.emptyStruct("Overlay")]
+        )
+        let overlay = WorkspaceCodemapLiveOverlay()
+        let fixture = try await makeEngineFixture(
+            root: root,
+            runtime: CodeMapArtifactRuntime(
+                rootURL: makeSecureDirectory(in: repository.sandbox, named: "artifacts")
+            ),
+            overlay: overlay
+        )
+        guard case .registered = await fixture.engine.registerRoot(fixture.registration) else {
+            return XCTFail("Expected registration.")
+        }
+        let didUnregisterOverlay = await overlay.unregister(rootEpoch: fixture.rootEpoch)
+        XCTAssertTrue(didUnregisterOverlay)
+        try repository.write(
+            "struct Overlay { let dirty = true }\n",
+            to: "Sources/Overlay.swift",
+            at: root
+        )
+
+        guard case .rejected(.overlayRejected(.rootNotRegistered)) =
+            await fixture.engine.demand(fixture.demand(path: "Sources/Overlay.swift"))
+        else {
+            return XCTFail("Expected exact overlay rejection.")
+        }
+        await fixture.engine.shutdown()
+    }
+
     func testBulkCancellationTransitionsEmitExactPathFreeAggregateTelemetry() async throws {
         let repository = try makeRepositoryFixture(name: #function)
         let root = try repository.makeRepository(
