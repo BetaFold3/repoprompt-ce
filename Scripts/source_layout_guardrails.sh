@@ -370,6 +370,7 @@ allowed_tracked_docs=(
   "docs/context/archive/MANIFEST.md"
   "docs/context/plans/completed/quick-model-picker-and-handoff-hud.md"
   "docs/context/plans/omp-provider-integration.md"
+  "docs/context/plans/pi-provider-integration.md"
   "docs/context/quick-model-picker-and-handoff-hud.md"
   "docs/context/workflows/development.md"
   "docs/context/workflows/doc-gardening.md"

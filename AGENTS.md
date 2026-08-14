@@ -46,6 +46,7 @@ RepoPrompt CE is a Swift Package macOS app and agent orchestrator. Read only the
 | Agent-context maintenance | `AGENTS.md`, `CLAUDE.md`, `docs/context/**` | [doc gardening](docs/context/workflows/doc-gardening.md) | semantic freshness review |
 | Quick model picker or quick handoff shortcut work | `Sources/RepoPrompt/Features/AgentMode/**` | [quick model/handoff HUD](docs/context/quick-model-picker-and-handoff-hud.md) | implemented shortcuts, HUD, model selection, and handoff invariants |
 | Oh My Pi (OMP) ACP provider integration or managed ACP harness work | `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/**`, `Sources/RepoPrompt/Features/AgentMode/Providers/ACP/**` | [OMP provider plan](docs/context/plans/omp-provider-integration.md) | duel-settled managed ACP harness plan and invariants |
+| Pi native provider integration or native runtime seam neutralization | `Packages/RepoPromptAgentProviders/**`, `Sources/RepoPrompt/Infrastructure/AI/Providers/Pi/**`, `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/**` | [Pi provider plan](docs/context/plans/pi-provider-integration.md) | planned native RPC provider architecture and spike gates |
 
 ## Sources of truth
 Code and tests establish current behavior; `Authoritative` documents and explicit user requirements establish intended behavior. When they conflict, don't silently choose one; resolve within scope or report the conflict.
