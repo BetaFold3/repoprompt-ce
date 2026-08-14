@@ -50,6 +50,10 @@ final class OhMyPiACPProviderTests: XCTestCase {
             OhMyPiAgentConfig.managedArguments,
             ["acp", "--no-tools", "--no-extensions", "--no-skills", "--no-rules", "--approval-mode", "yolo"]
         )
+        XCTAssertEqual(
+            OhMyPiAgentConfig.managedEnvironment,
+            ["OMP_MCP_TIMEOUT_MS": "0"]
+        )
 
         let directory = try makeTestDirectory(name: "OhMyPiACPProviderTests-launch")
         let executable = try makeOMPExecutable(in: directory)
@@ -59,7 +63,24 @@ final class OhMyPiACPProviderTests: XCTestCase {
         let launch = try provider.makeLaunchConfiguration(for: request(workspacePath: directory.path))
 
         XCTAssertEqual(launch.arguments, OhMyPiAgentConfig.managedArguments)
+        XCTAssertEqual(launch.environment, OhMyPiAgentConfig.managedEnvironment)
         XCTAssertEqual(launch.providerID, .ohMyPi)
+
+        let resolvedEnvironment = ProcessEnvironmentBuilder.composedEnvironment(
+            base: [
+                "PATH": "/captured/bin",
+                "HOME": "/captured/home"
+            ],
+            inherited: [
+                "PATH": "/ambient/bin",
+                "HOME": "/ambient/home",
+                "OMP_MCP_TIMEOUT_MS": "45000"
+            ],
+            overrides: launch.environment
+        )
+        XCTAssertEqual(resolvedEnvironment["OMP_MCP_TIMEOUT_MS"], "0")
+        XCTAssertEqual(resolvedEnvironment["PATH"], "/captured/bin:/ambient/bin")
+        XCTAssertEqual(resolvedEnvironment["HOME"], "/captured/home")
         let entryIdentity = try ExecutableFileIdentity.capture(atPath: executable.path)
         XCTAssertEqual(launch.expectedExecutableIdentity, entryIdentity)
         XCTAssertEqual(launch.expectedExecutableIdentity?.canonicalPath, entryIdentity.canonicalPath)
@@ -316,6 +337,97 @@ final class OhMyPiACPProviderTests: XCTestCase {
             return XCTFail("Expected missing ACP subcommand to fail closed")
         }
         XCTAssertTrue(acpReason.localizedCaseInsensitiveContains("acp"), acpReason)
+    }
+
+    func testLaunchResolutionErrorsProvideActionableInstallAndExecutableRepairGuidance() async throws {
+        let missingDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-unavailable")
+        let missingPath = missingDirectory.appendingPathComponent("omp").path
+        guard case let .unsupported(missingReason) = try await OhMyPiACPLaunchResolver().probeSupport(
+            for: OhMyPiAgentConfig(commandName: missingPath, additionalPathHints: [])
+        ) else {
+            return XCTFail("Expected unavailable OMP entry to fail closed")
+        }
+        XCTAssertEqual(
+            missingReason,
+            "Oh My Pi CLI is unavailable at \(missingPath). Install or reinstall OMP, ensure omp is on PATH, or configure the correct absolute path."
+        )
+
+        let nonExecutableDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-non-executable")
+        let nonExecutable = nonExecutableDirectory.appendingPathComponent("omp")
+        try Data("#!/bin/sh\n".utf8).write(to: nonExecutable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: nonExecutable.path)
+        guard case let .unsupported(nonExecutableReason) = try await OhMyPiACPLaunchResolver().probeSupport(
+            for: OhMyPiAgentConfig(commandName: nonExecutable.path, additionalPathHints: [])
+        ) else {
+            return XCTFail("Expected non-executable OMP entry to fail closed")
+        }
+        let canonicalNonExecutablePath = try XCTUnwrap(FileSystemService.realpathString(nonExecutable.path))
+        XCTAssertEqual(
+            nonExecutableReason,
+            "Oh My Pi CLI is installed but not executable at \(canonicalNonExecutablePath). Run chmod u+x on the reported path or reinstall OMP."
+        )
+
+        let cachedDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-cached-mode")
+        let cachedExecutable = try makeOMPExecutable(in: cachedDirectory)
+        let cachedConfig = OhMyPiAgentConfig(commandName: cachedExecutable.path, additionalPathHints: [])
+        let cachedResolver = OhMyPiACPLaunchResolver()
+        let cachedSupport = try await cachedResolver.probeSupport(for: cachedConfig)
+        XCTAssertEqual(cachedSupport, .supported)
+        let canonicalCachedPath = try XCTUnwrap(FileSystemService.realpathString(cachedExecutable.path))
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: cachedExecutable.path)
+        XCTAssertThrowsError(try cachedResolver.resolvedLaunch(for: cachedConfig)) { error in
+            guard case let OhMyPiACPLaunchResolutionError.entryNotExecutable(path) = error else {
+                return XCTFail("Expected typed non-executable error, got \(error)")
+            }
+            XCTAssertEqual(path, canonicalCachedPath)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cachedExecutable.path)
+        XCTAssertEqual(try cachedResolver.resolvedLaunch(for: cachedConfig).command, canonicalCachedPath)
+
+        let pathDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-path-unavailable")
+        let pathResolver = OhMyPiACPLaunchResolver(environmentProvider: { _ in
+            ["PATH": pathDirectory.path, "HOME": FileManager.default.homeDirectoryForCurrentUser.path]
+        })
+        guard case let .unsupported(pathReason) = try await pathResolver.probeSupport(
+            for: OhMyPiAgentConfig(commandName: "omp", additionalPathHints: [])
+        ) else {
+            return XCTFail("Expected bare PATH discovery to fail closed")
+        }
+        let remediation = "Install or reinstall OMP, ensure omp is on PATH, or configure the correct absolute path."
+        XCTAssertEqual(pathReason.components(separatedBy: remediation).count - 1, 1, pathReason)
+        XCTAssertTrue(pathReason.contains("\(pathDirectory.path)/omp: Executable is unavailable:"), pathReason)
+        XCTAssertFalse(pathReason.contains("\(pathDirectory.path)/omp: Oh My Pi CLI is unavailable for omp"), pathReason)
+    }
+
+    func testAuthenticationNormalizationProvidesExactOMPSignInSteps() {
+        let provider = OhMyPiACPAgentProvider(config: OhMyPiAgentConfig())
+        let error = NSError(
+            domain: "OhMyPiACP",
+            code: 401,
+            userInfo: [NSLocalizedDescriptionKey: "ACP bootstrap failed: not authenticated"]
+        )
+
+        let normalized = provider.normalizeError(error)
+
+        guard case let AIProviderError.invalidConfiguration(detail) = normalized else {
+            return XCTFail("Expected typed invalid-configuration error, got \(normalized)")
+        }
+        XCTAssertEqual(
+            detail,
+            "Oh My Pi is not authenticated. Open the OMP TUI (omp), complete provider sign-in/authentication, then retry."
+        )
+
+        XCTAssertTrue(provider.normalizeError(CancellationError()) is CancellationError)
+
+        let transportError = NSError(
+            domain: "OhMyPiACP",
+            code: 503,
+            userInfo: [NSLocalizedDescriptionKey: "login-service transport unavailable"]
+        )
+        guard case let AIProviderError.apiError(source) = provider.normalizeError(transportError) else {
+            return XCTFail("Expected login-service transport failure to remain an API error")
+        }
+        XCTAssertEqual(source?.localizedDescription, "login-service transport unavailable")
     }
 
     func testVersionParserAcceptsObservedOutput() {
@@ -844,6 +956,31 @@ final class OhMyPiACPProviderTests: XCTestCase {
                 ]
             )
         )
+    }
+
+    @MainActor
+    func testHeadlessOMPProviderSessionIDDoesNotSuppressTranscriptHandoffOrEnableResume() {
+        let omp = AgentModeViewModel.test_headlessContinuityDecision(
+            agent: .ohMyPi,
+            providerSessionID: "advertised-but-fresh-only"
+        )
+        XCTAssertFalse(omp.shouldBypassHistoryReplay)
+        XCTAssertNil(omp.resumeSessionID)
+
+        let resumableACP = AgentModeViewModel.test_headlessContinuityDecision(
+            agent: .cursor,
+            providerSessionID: "cursor-session"
+        )
+        XCTAssertTrue(resumableACP.shouldBypassHistoryReplay)
+        XCTAssertEqual(resumableACP.resumeSessionID, "cursor-session")
+
+        let ompAttachment = AgentModeViewModel.test_headlessContinuityDecision(
+            agent: .ohMyPi,
+            providerSessionID: "advertised-but-fresh-only",
+            hasAttachments: true
+        )
+        XCTAssertTrue(ompAttachment.shouldBypassHistoryReplay)
+        XCTAssertNil(ompAttachment.resumeSessionID)
     }
 
     func testHeadlessRequestDiscardsResumeCandidateAndRequiresRegistryModel() async {

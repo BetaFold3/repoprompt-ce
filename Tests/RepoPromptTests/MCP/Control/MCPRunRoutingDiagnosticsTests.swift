@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import MCP
 @testable import RepoPromptApp
@@ -257,6 +258,134 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
         #endif
     }
 
+    @MainActor
+    func testSuccessfulOMPLiveRunMappingEmitsOneExactReconnectIdentityEvent() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let connectionID = UUID()
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            await manager.debugClearRunRoutingHistoryForTesting()
+            await manager.debugSeedLiveRunMappedIdentityForTesting(
+                connectionID: connectionID,
+                clientName: AgentProviderKind.ohMyPiMCPClientID,
+                helperPeerPID: 41001,
+                correlationFields: correlatedOMPFields(helperPeerPID: 41001)
+            )
+
+            let firstMapping = await manager.mapConnectionToRunID(
+                connectionID,
+                runID: runID,
+                windowID: window.windowID
+            )
+            let duplicateMapping = await manager.mapConnectionToRunID(
+                connectionID,
+                runID: runID,
+                windowID: window.windowID
+            )
+
+            XCTAssertTrue(firstMapping)
+            XCTAssertTrue(duplicateMapping)
+            let events = await identityEvents(runID: runID)
+            XCTAssertEqual(events.count, 1)
+            let event = try XCTUnwrap(events.first)
+            XCTAssertEqual(event["connection_id"] as? String, connectionID.uuidString)
+            let fields = try XCTUnwrap(event["fields"] as? [String: String])
+            XCTAssertEqual(fields["verified_client_name"], AgentProviderKind.ohMyPiMCPClientID)
+            XCTAssertEqual(fields["source"], "live_run_mapping")
+            XCTAssertEqual(fields["process_correlation_ok"], "true")
+            XCTAssertEqual(fields["helper_peer_pid"], "41001")
+            XCTAssertEqual(fields["helper_bundled_identity_match"], "true")
+            XCTAssertEqual(fields["omp_current_executable_identity_match"], "true")
+
+            await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+        #else
+            throw XCTSkip("OMP reconnect identity diagnostics are DEBUG-only.")
+        #endif
+    }
+
+    @MainActor
+    func testOMPLiveRunMappingIdentityRejectsFailedMappingAndNegativeCorrelation() async throws {
+        #if DEBUG
+            let failedRunID = UUID()
+            let failedConnectionID = UUID()
+            let missingWindowID = 619_991
+            await manager.debugClearRunRoutingHistoryForTesting()
+            await manager.debugSeedLiveRunMappedIdentityForTesting(
+                connectionID: failedConnectionID,
+                clientName: AgentProviderKind.ohMyPiMCPClientID,
+                helperPeerPID: 41002,
+                correlationFields: correlatedOMPFields(helperPeerPID: 41002)
+            )
+
+            let failedMapping = await manager.mapConnectionToRunID(
+                failedConnectionID,
+                runID: failedRunID,
+                windowID: missingWindowID
+            )
+            XCTAssertFalse(failedMapping)
+            let failedEvents = await identityEvents(runID: failedRunID)
+            XCTAssertTrue(failedEvents.isEmpty)
+
+            let negativeRunID = UUID()
+            let negativeConnectionID = UUID()
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            var negativeFields = correlatedOMPFields(helperPeerPID: 41003)
+            negativeFields["process_correlation_ok"] = "false"
+            negativeFields["helper_bundled_identity_match"] = "false"
+            await manager.debugSeedLiveRunMappedIdentityForTesting(
+                connectionID: negativeConnectionID,
+                clientName: AgentProviderKind.ohMyPiMCPClientID,
+                helperPeerPID: 41003,
+                correlationFields: negativeFields
+            )
+
+            let negativeMapping = await manager.mapConnectionToRunID(
+                negativeConnectionID,
+                runID: negativeRunID,
+                windowID: window.windowID
+            )
+            XCTAssertTrue(negativeMapping)
+            let negativeEvents = await identityEvents(runID: negativeRunID)
+            XCTAssertTrue(negativeEvents.isEmpty)
+
+            await manager.cleanupRunRoutingState(for: negativeRunID, windowID: window.windowID)
+        #else
+            throw XCTSkip("OMP reconnect identity diagnostics are DEBUG-only.")
+        #endif
+    }
+
+    @MainActor
+    func testLiveRunMappingIdentityRejectsNonOMPClient() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let connectionID = UUID()
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            await manager.debugClearRunRoutingHistoryForTesting()
+            await manager.debugSeedLiveRunMappedIdentityForTesting(
+                connectionID: connectionID,
+                clientName: AgentProviderKind.openCodeMCPClientID,
+                helperPeerPID: 41004,
+                correlationFields: correlatedOMPFields(helperPeerPID: 41004)
+            )
+
+            let mapped = await manager.mapConnectionToRunID(
+                connectionID,
+                runID: runID,
+                windowID: window.windowID
+            )
+            XCTAssertTrue(mapped)
+            let events = await identityEvents(runID: runID)
+            XCTAssertTrue(events.isEmpty)
+
+            await manager.cleanupRunRoutingState(for: runID, windowID: window.windowID)
+        #else
+            throw XCTSkip("OMP reconnect identity diagnostics are DEBUG-only.")
+        #endif
+    }
+
     func testRunRoutingHistoryToolAllowsOmittedRunIDAndBoundsLimit() async throws {
         #if DEBUG
             let firstRunID = UUID()
@@ -301,6 +430,41 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
     }
 
     #if DEBUG
+        @MainActor
+        private func makeWindow() -> WindowState {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            WindowStatesManager.shared.registerWindowState(window)
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            return window
+        }
+
+        private func correlatedOMPFields(helperPeerPID: pid_t) -> [String: String] {
+            [
+                "process_correlation_ok": "true",
+                "matched_expected_pid": "41000",
+                "matched_expected_start_seconds": "1700000000",
+                "matched_expected_start_microseconds": "123456",
+                "matched_expected_executable_path": "/fixture/omp",
+                "omp_current_executable_identity_match": "true",
+                "helper_peer_pid": String(helperPeerPID),
+                "helper_process_start_seconds": "1700000001",
+                "helper_process_start_microseconds": "234567",
+                "helper_executable_path": "/fixture/repoprompt-mcp",
+                "helper_bundled_identity_match": "true",
+                "helper_current_executable_identity_match": "true",
+                "helper_strict_descendant": "true",
+                "process_identity_chain": "\(helperPeerPID)@1700000001.234567<-41000@1700000000.123456"
+            ]
+        }
+
+        private func identityEvents(runID: UUID) async -> [[String: Any]] {
+            let payload = await manager.debugRunRoutingHistoryPayload(runID: runID, limit: 100)
+            let events = payload["events"] as? [[String: Any]] ?? []
+            return events.filter { $0["event"] as? String == "client_identity_observed" }
+        }
+
         private func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
             let text = result.content.compactMap { content -> String? in
                 if case let .text(text, _, _) = content { return text }

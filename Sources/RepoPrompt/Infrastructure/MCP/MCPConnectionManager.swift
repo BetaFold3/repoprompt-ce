@@ -1087,6 +1087,8 @@ actor ServerNetworkManager {
 
         private var debugExpectedProcessIdentityByRunID: [UUID: [pid_t: DebugExpectedProcessIdentity]] = [:]
         private var debugHelperPeerIdentityByConnectionID: [UUID: DebugHelperPeerIdentity] = [:]
+        private var debugLiveRunMappedOMPIdentityConnections: Set<UUID> = []
+        private var debugOMPProcessCorrelationFieldsByConnectionIDForTesting: [UUID: [String: String]] = [:]
         private let debugQualificationRawIngress = OMPQualificationRawIngressRecorder()
     #endif
 
@@ -3171,6 +3173,14 @@ actor ServerNetworkManager {
             windowID: windowID,
             purpose: runPurposeByConnection[connectionID] ?? runPolicyStateByRunID[runID]?.purpose
         )
+
+        #if DEBUG
+            // Record against the just-installed mapping before the first actor suspension.
+            debugRecordLiveRunMappedOMPIdentityIfCorrelated(
+                connectionID: connectionID,
+                runID: runID
+            )
+        #endif
 
         // Rehydrate run-scoped policy grants/restrictions on reconnect handovers.
         await applyRunPolicyStateIfAvailable(
@@ -5674,6 +5684,8 @@ actor ServerNetworkManager {
         expectedAgentPIDsByRunID.removeAll()
         #if DEBUG
             debugExpectedProcessIdentityByRunID.removeAll()
+            debugLiveRunMappedOMPIdentityConnections.removeAll()
+            debugOMPProcessCorrelationFieldsByConnectionIDForTesting.removeAll()
         #endif
         runPolicyStateByRunID.removeAll()
         admittedPolicyRunIDs.removeAll()
@@ -6493,6 +6505,8 @@ actor ServerNetworkManager {
         bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
         #if DEBUG
             debugHelperPeerIdentityByConnectionID.removeValue(forKey: id)
+            debugLiveRunMappedOMPIdentityConnections.remove(id)
+            debugOMPProcessCorrelationFieldsByConnectionIDForTesting.removeValue(forKey: id)
         #endif
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
@@ -7124,6 +7138,44 @@ actor ServerNetworkManager {
                 isBookkeeping: canonicalName == "set_status" || canonicalName == "bind_context"
             )
             lease.release()
+        }
+
+        private func debugRecordLiveRunMappedOMPIdentityIfCorrelated(
+            connectionID: UUID,
+            runID: UUID
+        ) {
+            guard !debugLiveRunMappedOMPIdentityConnections.contains(connectionID),
+                  clientIdentifier(forConnection: connectionID) == AgentProviderKind.ohMyPiMCPClientID,
+                  let helperPeerPID = bootstrapPeerPIDByConnectionID[connectionID]
+            else { return }
+
+            var identityFields = debugOMPProcessCorrelationFieldsByConnectionIDForTesting[connectionID]
+                ?? debugOMPProcessCorrelationFields(
+                    runID: runID,
+                    helperPeerPID: pid_t(helperPeerPID)
+                )
+            guard identityFields["process_correlation_ok"] == "true" else { return }
+
+            debugLiveRunMappedOMPIdentityConnections.insert(connectionID)
+            identityFields["verified_client_name"] = AgentProviderKind.ohMyPiMCPClientID
+            identityFields["source"] = "live_run_mapping"
+            debugRecordRunRoutingEvent(
+                runID: runID,
+                event: "client_identity_observed",
+                connectionID: connectionID,
+                fields: identityFields
+            )
+        }
+
+        func debugSeedLiveRunMappedIdentityForTesting(
+            connectionID: UUID,
+            clientName: String,
+            helperPeerPID: pid_t,
+            correlationFields: [String: String]
+        ) {
+            pendingConnections[connectionID] = clientName
+            bootstrapPeerPIDByConnectionID[connectionID] = Int(helperPeerPID)
+            debugOMPProcessCorrelationFieldsByConnectionIDForTesting[connectionID] = correlationFields
         }
 
         private func debugOMPProcessCorrelationFields(runID: UUID, helperPeerPID: pid_t) -> [String: String] {

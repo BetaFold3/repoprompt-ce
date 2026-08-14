@@ -13,6 +13,7 @@ enum OhMyPiACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case missingConfiguredCommand
     case unsafeConfiguredCommand(String)
     case exactPathNotFound(String)
+    case entryNotExecutable(String)
     case noValidLaunchCandidate(String, [String], ShellEnvironmentSource?)
     case environmentDiscoveryRequired(String)
     case invalidProcessExecutable(String)
@@ -24,10 +25,12 @@ enum OhMyPiACPLaunchResolutionError: Error, Equatable, LocalizedError {
         case let .unsafeConfiguredCommand(command):
             "Refusing Oh My Pi ACP command \(command). Configure the omp executable only."
         case let .exactPathNotFound(command):
-            "Oh My Pi CLI was not found as a valid executable regular file for \(command)."
+            "Oh My Pi CLI is unavailable at \(command). Install or reinstall OMP, ensure omp is on PATH, or configure the correct absolute path."
+        case let .entryNotExecutable(path):
+            "Oh My Pi CLI is installed but not executable at \(path). Run chmod u+x on the reported path or reinstall OMP."
         case let .noValidLaunchCandidate(command, failures, source):
             AgentCLILaunchDiagnostics.appendFallbackEnvironmentHint(
-                to: "Oh My Pi CLI was not found for \(command). Tried: \(failures.joined(separator: "; "))",
+                to: "Oh My Pi CLI is unavailable for \(command). Install or reinstall OMP, ensure omp is on PATH, or configure the correct absolute path. Tried: \(failures.joined(separator: "; "))",
                 source: source
             )
         case let .environmentDiscoveryRequired(command):
@@ -83,7 +86,7 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
                 return cached
             } catch {
                 invalidate(key: key)
-                throw error
+                throw Self.actionableEntryError(error, configuredCommand: cached.command)
             }
         }
         let launch = try resolveExplicitLaunch(for: config)
@@ -224,7 +227,7 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
                 shellEnvironmentSource: shellEnvironmentSource,
                 candidateCount: 1
             )
-            throw error
+            throw Self.actionableEntryError(error, configuredCommand: configuredCommand)
         }
     }
 
@@ -497,6 +500,23 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
             throw OhMyPiACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
         throw OhMyPiACPLaunchResolutionError.noValidLaunchCandidate(configuredCommand, failures, shellEnvironmentSource)
+    }
+
+    private static func actionableEntryError(_ error: Error, configuredCommand: String) -> Error {
+        guard let identityError = error as? ExecutableFileIdentityError else { return error }
+        switch identityError {
+        case .unavailable:
+            return OhMyPiACPLaunchResolutionError.exactPathNotFound(configuredCommand)
+        case let .notExecutable(path):
+            return OhMyPiACPLaunchResolutionError.entryNotExecutable(path)
+        case .pathMustBeAbsolute,
+             .notRegularFile,
+             .identityChanged,
+             .untrustedOwner,
+             .untrustedWritableFile,
+             .untrustedWritableDirectory:
+            return identityError
+        }
     }
 
     private static func combinedOutput(_ result: CLIProcessRunner.Result) -> String {

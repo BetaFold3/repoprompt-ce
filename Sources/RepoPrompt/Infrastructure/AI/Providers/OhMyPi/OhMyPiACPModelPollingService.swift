@@ -57,7 +57,7 @@ struct OhMyPiACPControllerModelDiscoveryClient: OhMyPiACPModelDiscoveryClient {
             return snapshot
         } catch {
             await controller.shutdown()
-            throw error
+            throw provider.normalizeError(error)
         }
     }
 }

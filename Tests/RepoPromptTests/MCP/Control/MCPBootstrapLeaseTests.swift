@@ -167,6 +167,390 @@ final class MCPBootstrapLeaseTests: XCTestCase {
         #endif
     }
 
+    func testTerminalRevocationRemainsIdempotentAfterSuccessfulRoutePolicyClear() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let leaseGateID = UUID()
+            let probeGateID = UUID()
+            let recorder = PolicyRecorder()
+
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+
+            let lease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: runID,
+                    gateID: leaseGateID,
+                    windowID: 1,
+                    tabID: nil,
+                    clientName: "bootstrap-lease-post-successful-clear-failure-test",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "post-route terminal failure cleanup regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: { _ in await recorder.recordInstall() },
+                successfulRoutingPolicyClearer: { _ in await recorder.recordSuccessfulRoutingClear() },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+
+            let release = Task { await lease.releaseWhenRouted(timeoutMs: 1000) }
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
+            let routed = await release.value
+            let successfulClearCountAfterRoute = await recorder.successfulRoutingClearCount
+            let revokingClearCountAfterRoute = await recorder.clearCount
+            let routedSnapshot = await lease.debugCleanupSnapshot()
+            XCTAssertTrue(routed)
+            XCTAssertEqual(successfulClearCountAfterRoute, 0)
+            XCTAssertEqual(revokingClearCountAfterRoute, 0)
+            XCTAssertTrue(routedSnapshot.didCleanupRouting)
+            XCTAssertFalse(routedSnapshot.didClearPolicy)
+            XCTAssertFalse(routedSnapshot.didClearSuccessfulRoutingPolicy)
+            XCTAssertFalse(routedSnapshot.didRevokePolicy)
+            XCTAssertEqual(routedSnapshot.routingCleanupCount, 1)
+
+            await lease.clearPolicyAfterSuccessfulRouting()
+            let successfulClearCount = await recorder.successfulRoutingClearCount
+            let revokingClearCountBeforeFailure = await recorder.clearCount
+            let successfulClearSnapshot = await lease.debugCleanupSnapshot()
+            XCTAssertEqual(successfulClearCount, 1)
+            XCTAssertEqual(revokingClearCountBeforeFailure, 0)
+            XCTAssertTrue(successfulClearSnapshot.didClearSuccessfulRoutingPolicy)
+            XCTAssertFalse(successfulClearSnapshot.didRevokePolicy)
+
+            let didAcquireProbe = await HeadlessAgentConnectionGate.acquire(probeGateID)
+            XCTAssertTrue(didAcquireProbe)
+
+            await lease.failAndRelease()
+            let clearCountAfterFailure = await recorder.clearCount
+            let failedSnapshot = await lease.debugCleanupSnapshot()
+            let activeGateAfterFailure = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertEqual(clearCountAfterFailure, 1)
+            XCTAssertTrue(failedSnapshot.didCleanupRouting)
+            XCTAssertTrue(failedSnapshot.didClearPolicy)
+            XCTAssertTrue(failedSnapshot.didClearSuccessfulRoutingPolicy)
+            XCTAssertTrue(failedSnapshot.didRevokePolicy)
+            XCTAssertEqual(failedSnapshot.routingCleanupCount, 1)
+            XCTAssertEqual(failedSnapshot.terminalCleanupRequestCount, 1)
+            XCTAssertEqual(failedSnapshot.terminalCleanupRawRequestCount, 1)
+            XCTAssertEqual(activeGateAfterFailure, probeGateID)
+
+            await lease.failAndRelease()
+            let clearCountAfterRepeat = await recorder.clearCount
+            let repeatedSnapshot = await lease.debugCleanupSnapshot()
+            let activeGateAfterRepeat = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            let successfulClearCountAfterRepeat = await recorder.successfulRoutingClearCount
+            XCTAssertEqual(successfulClearCountAfterRepeat, 1)
+            XCTAssertEqual(clearCountAfterRepeat, 1)
+            XCTAssertTrue(repeatedSnapshot.didCleanupRouting)
+            XCTAssertTrue(repeatedSnapshot.didClearSuccessfulRoutingPolicy)
+            XCTAssertTrue(repeatedSnapshot.didRevokePolicy)
+            XCTAssertEqual(repeatedSnapshot.routingCleanupCount, 1)
+            XCTAssertEqual(repeatedSnapshot.terminalCleanupRequestCount, 1)
+            XCTAssertEqual(repeatedSnapshot.terminalCleanupRawRequestCount, 2)
+            XCTAssertEqual(activeGateAfterRepeat, probeGateID)
+
+            await HeadlessAgentConnectionGate.completeConnection(probeGateID)
+            let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            let waitingGateCount = await HeadlessAgentConnectionGate.shared.debugWaitingCount()
+            let activeGateAfterCleanup = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertEqual(waiterCount, 0)
+            XCTAssertEqual(waitingGateCount, 0)
+            XCTAssertNil(activeGateAfterCleanup)
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testSuccessfulRoutePolicyClearIsIdempotentAndPreservesRoutingAndUnrelatedGate() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let leaseGateID = UUID()
+            let probeGateID = UUID()
+            let recorder = PolicyRecorder()
+
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+
+            let lease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: runID,
+                    gateID: leaseGateID,
+                    windowID: 1,
+                    tabID: nil,
+                    clientName: "bootstrap-lease-successful-route-policy-clear",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "successful routed completion policy clear regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: { _ in await recorder.recordInstall() },
+                successfulRoutingPolicyClearer: { _ in await recorder.recordSuccessfulRoutingClear() },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+            let release = Task { await lease.releaseWhenRouted(timeoutMs: 1000) }
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
+            let routed = await release.value
+            XCTAssertTrue(routed)
+
+            await MCPRoutingWaiter.register(runID: runID)
+            let retainedRoutingWait = Task {
+                await MCPRoutingWaiter.waitUntilRouted(runID: runID, timeoutSeconds: 0)
+            }
+            for _ in 0 ..< 100 {
+                if await MCPRoutingWaiter.debugContinuationCount(runID: runID) == 1 {
+                    break
+                }
+                await Task.yield()
+            }
+            let retainedWaiterCountBeforeClear = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            XCTAssertEqual(retainedWaiterCountBeforeClear, 1)
+
+            let acquiredProbe = await HeadlessAgentConnectionGate.acquire(probeGateID)
+            XCTAssertTrue(acquiredProbe)
+            await lease.clearPolicyAfterSuccessfulRouting()
+            await lease.clearPolicyAfterSuccessfulRouting()
+
+            let snapshot = await lease.debugCleanupSnapshot()
+            XCTAssertTrue(snapshot.didRouteSuccessfully)
+            XCTAssertTrue(snapshot.didCleanupRouting)
+            XCTAssertTrue(snapshot.didClearPolicy)
+            XCTAssertTrue(snapshot.didClearSuccessfulRoutingPolicy)
+            XCTAssertFalse(snapshot.didRevokePolicy)
+            let successfulRoutingClearCount = await recorder.successfulRoutingClearCount
+            let revokingClearCount = await recorder.clearCount
+            let retainedWaiterCountAfterClear = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            let activeGateAfterClear = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertEqual(successfulRoutingClearCount, 1)
+            XCTAssertEqual(revokingClearCount, 0)
+            XCTAssertEqual(retainedWaiterCountAfterClear, 1)
+            XCTAssertEqual(activeGateAfterClear, probeGateID)
+
+            await MCPRoutingWaiter.cleanup(runID: runID)
+            let retainedRoutingResult = await retainedRoutingWait.value
+            XCTAssertFalse(retainedRoutingResult)
+            await HeadlessAgentConnectionGate.completeConnection(probeGateID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testSuccessfulRouteDefaultPolicyClearerClearsPendingPolicyWithoutRevocation() async throws {
+        #if DEBUG
+            let manager = ServerNetworkManager.shared
+            let runID = UUID()
+            let clientName = "bootstrap-lease-default-successful-route-clear-\(runID.uuidString)"
+
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+            await manager.debugClearRunRoutingHistoryForTesting()
+
+            let lease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: runID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: nil,
+                    clientName: clientName,
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "default successful routed policy clear regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                )
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+            let release = Task { await lease.releaseWhenRouted(timeoutMs: 1000) }
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
+            let routed = await release.value
+            XCTAssertTrue(routed)
+
+            let pendingBeforeClear = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertTrue(pendingBeforeClear.contains { $0.runID == runID })
+
+            await lease.clearPolicyAfterSuccessfulRouting()
+            await lease.clearPolicyAfterSuccessfulRouting()
+
+            let pendingAfterClear = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertFalse(pendingAfterClear.contains { $0.runID == runID })
+            let history = await manager.debugRunRoutingHistoryPayload(runID: runID, limit: 100)
+            let events = try XCTUnwrap(history["events"] as? [[String: Any]])
+            let eventNames = events.compactMap { $0["event"] as? String }
+            XCTAssertEqual(eventNames.count(where: { $0 == "policy_cleared" }), 1)
+            XCTAssertFalse(eventNames.contains("policy_revoked"))
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Default policy diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testSuccessfulRoutePolicyClearAfterTerminalRevocationIsNoOp() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let recorder = PolicyRecorder()
+
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+
+            let lease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: runID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: nil,
+                    clientName: "bootstrap-lease-terminal-revoke-before-successful-clear",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "terminal revoke before successful clear regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: { _ in await recorder.recordInstall() },
+                successfulRoutingPolicyClearer: { _ in await recorder.recordSuccessfulRoutingClear() },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            XCTAssertTrue(acquired)
+            let release = Task { await lease.releaseWhenRouted(timeoutMs: 1000) }
+            await MCPRoutingWaiter.notifyRouted(runID: runID)
+            let routed = await release.value
+            XCTAssertTrue(routed)
+
+            await lease.failAndRelease()
+            await lease.clearPolicyAfterSuccessfulRouting()
+            await lease.clearPolicyAfterSuccessfulRouting()
+
+            let successfulClearCount = await recorder.successfulRoutingClearCount
+            let revokingClearCount = await recorder.clearCount
+            let snapshot = await lease.debugCleanupSnapshot()
+            XCTAssertEqual(successfulClearCount, 0)
+            XCTAssertEqual(revokingClearCount, 1)
+            XCTAssertFalse(snapshot.didClearSuccessfulRoutingPolicy)
+            XCTAssertTrue(snapshot.didRevokePolicy)
+            XCTAssertEqual(snapshot.terminalCleanupRequestCount, 1)
+            await MCPRoutingWaiter.cleanup(runID: runID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testSuccessfulRoutePolicyClearIsNoOpBeforeAcquireAndAfterNoRoute() async throws {
+        #if DEBUG
+            let preRouteRecorder = PolicyRecorder()
+            let preRouteLease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: UUID(),
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: nil,
+                    clientName: "bootstrap-lease-pre-route-policy-clear",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "pre-route policy clear no-op regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: true
+                ),
+                policyInstaller: { _ in await preRouteRecorder.recordInstall() },
+                expectedPIDPolicyArmer: { _ in true },
+                successfulRoutingPolicyClearer: { _ in await preRouteRecorder.recordSuccessfulRoutingClear() },
+                policyClearer: { _ in await preRouteRecorder.recordClear() }
+            )
+
+            let preRouteAcquired = await preRouteLease.acquire()
+            XCTAssertTrue(preRouteAcquired)
+            await preRouteLease.clearPolicyAfterSuccessfulRouting()
+            let preRouteSnapshot = await preRouteLease.debugCleanupSnapshot()
+            XCTAssertFalse(preRouteSnapshot.didRouteSuccessfully)
+            XCTAssertFalse(preRouteSnapshot.didCleanupRouting)
+            XCTAssertFalse(preRouteSnapshot.didClearPolicy)
+            XCTAssertFalse(preRouteSnapshot.didClearSuccessfulRoutingPolicy)
+            XCTAssertFalse(preRouteSnapshot.didRevokePolicy)
+            let preRouteSuccessfulClearCount = await preRouteRecorder.successfulRoutingClearCount
+            let preRouteRevokingClearCount = await preRouteRecorder.clearCount
+            XCTAssertEqual(preRouteSuccessfulClearCount, 0)
+            XCTAssertEqual(preRouteRevokingClearCount, 0)
+            await preRouteLease.cancelAndCleanup()
+
+            let noRouteRunID = UUID()
+            let noRouteRecorder = PolicyRecorder()
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: noRouteRunID)
+            let noRouteLease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: noRouteRunID,
+                    gateID: UUID(),
+                    windowID: 1,
+                    tabID: nil,
+                    clientName: "bootstrap-lease-no-route-policy-clear",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "no-route policy clear no-op regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: false
+                ),
+                policyInstaller: { _ in await noRouteRecorder.recordInstall() },
+                successfulRoutingPolicyClearer: { _ in await noRouteRecorder.recordSuccessfulRoutingClear() },
+                policyClearer: { _ in await noRouteRecorder.recordClear() }
+            )
+
+            let noRouteAcquired = await noRouteLease.acquire()
+            XCTAssertTrue(noRouteAcquired)
+            let routed = await noRouteLease.releaseWhenRouted(timeoutMs: 10)
+            XCTAssertFalse(routed)
+            await noRouteLease.clearPolicyAfterSuccessfulRouting()
+
+            let noRouteSnapshot = await noRouteLease.debugCleanupSnapshot()
+            XCTAssertFalse(noRouteSnapshot.didRouteSuccessfully)
+            XCTAssertTrue(noRouteSnapshot.didCleanupRouting)
+            XCTAssertTrue(noRouteSnapshot.didClearPolicy)
+            XCTAssertFalse(noRouteSnapshot.didClearSuccessfulRoutingPolicy)
+            XCTAssertTrue(noRouteSnapshot.didRevokePolicy)
+            let noRouteSuccessfulClearCount = await noRouteRecorder.successfulRoutingClearCount
+            let noRouteRevokingClearCount = await noRouteRecorder.clearCount
+            XCTAssertEqual(noRouteSuccessfulClearCount, 0)
+            XCTAssertEqual(noRouteRevokingClearCount, 1)
+            await MCPRoutingWaiter.cleanup(runID: noRouteRunID)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
     func testPIDOwnedAcquireFailsClosedWhenPolicyCannotBeArmed() async throws {
         #if DEBUG
             let runID = UUID()
@@ -528,6 +912,7 @@ private extension MCPBootstrapLeaseTests {
 private actor PolicyRecorder {
     private(set) var installCount = 0
     private(set) var armCount = 0
+    private(set) var successfulRoutingClearCount = 0
     private(set) var clearCount = 0
 
     func recordInstall() {
@@ -537,6 +922,10 @@ private actor PolicyRecorder {
     func recordArm() -> Bool {
         armCount += 1
         return true
+    }
+
+    func recordSuccessfulRoutingClear() {
+        successfulRoutingClearCount += 1
     }
 
     func recordClear() {

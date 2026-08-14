@@ -204,6 +204,8 @@
             var snapshot: Snapshot
             let monotonicDeadlineNanoseconds: UInt64
             var startTransactionID: UUID?
+            var qualificationWorkspaceID: UUID?
+            var permitsApplyEditsReview: Bool
         }
 
         private let lock = NSLock()
@@ -280,7 +282,9 @@
                 lease = StoredLease(
                     snapshot: snapshot,
                     monotonicDeadlineNanoseconds: deadline.partialValue,
-                    startTransactionID: nil
+                    startTransactionID: nil,
+                    qualificationWorkspaceID: nil,
+                    permitsApplyEditsReview: false
                 )
                 expiryGeneration &+= 1
                 return (snapshot, expired, expiryGeneration)
@@ -380,7 +384,9 @@
             leaseID: UUID,
             ownerConnectionID: UUID,
             ownerProcessID: Int32,
-            sessionID: UUID
+            sessionID: UUID,
+            qualificationWorkspaceID: UUID? = nil,
+            permitsApplyEditsReview: Bool = false
         ) throws -> Consumption {
             let now = monotonicNowNanoseconds()
             let outcome = lock.withLock { () -> (result: Result<Consumption, LeaseError>, expired: Snapshot?) in
@@ -415,6 +421,8 @@
                 )
                 stored.snapshot = updated
                 stored.startTransactionID = transaction.transactionID
+                stored.qualificationWorkspaceID = qualificationWorkspaceID
+                stored.permitsApplyEditsReview = permitsApplyEditsReview && qualificationWorkspaceID != nil
                 lease = stored
                 return (.success(Consumption(snapshot: updated, transaction: transaction)), nil)
             }
@@ -469,6 +477,37 @@
                 completeExpiredRemoval(expired)
             }
             return try outcome.result.get()
+        }
+
+        func permitsApplyEditsReviewActivation(
+            transaction: StartTransaction,
+            workspaceID: UUID
+        ) -> Bool {
+            guard activeSnapshot() != nil else { return false }
+            return lock.withLock {
+                guard let stored = lease else { return false }
+                return stored.permitsApplyEditsReview
+                    && stored.startTransactionID == transaction.transactionID
+                    && stored.snapshot.leaseID == transaction.leaseID
+                    && stored.snapshot.sessionID == transaction.sessionID
+                    && stored.snapshot.runID == nil
+                    && stored.qualificationWorkspaceID == workspaceID
+            }
+        }
+
+        func permitsApplyEditsReviewResponse(
+            sessionID: UUID,
+            runID: UUID,
+            workspaceID: UUID
+        ) -> Bool {
+            guard activeSnapshot() != nil else { return false }
+            return lock.withLock {
+                guard let stored = lease else { return false }
+                return stored.permitsApplyEditsReview
+                    && stored.snapshot.sessionID == sessionID
+                    && stored.snapshot.runID == runID
+                    && stored.qualificationWorkspaceID == workspaceID
+            }
         }
 
         @discardableResult
@@ -576,7 +615,9 @@
                 lease = StoredLease(
                     snapshot: current.snapshot,
                     monotonicDeadlineNanoseconds: 0,
-                    startTransactionID: current.startTransactionID
+                    startTransactionID: current.startTransactionID,
+                    qualificationWorkspaceID: current.qualificationWorkspaceID,
+                    permitsApplyEditsReview: current.permitsApplyEditsReview
                 )
                 expiryGeneration &+= 1
             }

@@ -15,6 +15,7 @@ struct OhMyPiAgentConfig {
         "--approval-mode",
         "yolo"
     ]
+    static let managedEnvironment = ["OMP_MCP_TIMEOUT_MS": "0"]
     static let requiredManagedFlags = [
         "--no-tools",
         "--no-extensions",

@@ -91,8 +91,13 @@ actor MCPBootstrapLease {
     #if DEBUG
         struct CleanupSnapshot {
             let hasReleased: Bool
+            let didRouteSuccessfully: Bool
             let didCleanupRouting: Bool
+            /// Aggregate compatibility flag: either successful policy clear or terminal revocation ran.
             let didClearPolicy: Bool
+            let didClearSuccessfulRoutingPolicy: Bool
+            let didRevokePolicy: Bool
+            let routingCleanupCount: Int
             let terminalCleanupRequestCount: Int
             let terminalCleanupRawRequestCount: Int
             let terminalCleanupRequestEntries: [String]
@@ -101,8 +106,12 @@ actor MCPBootstrapLease {
         func debugCleanupSnapshot() -> CleanupSnapshot {
             CleanupSnapshot(
                 hasReleased: hasReleased,
+                didRouteSuccessfully: didRouteSuccessfully,
                 didCleanupRouting: didCleanupRouting,
-                didClearPolicy: didClearPolicy,
+                didClearPolicy: didClearSuccessfulRoutingPolicy || didRevokePolicy,
+                didClearSuccessfulRoutingPolicy: didClearSuccessfulRoutingPolicy,
+                didRevokePolicy: didRevokePolicy,
+                routingCleanupCount: routingCleanupCount,
                 terminalCleanupRequestCount: terminalCleanupRequestCount,
                 terminalCleanupRawRequestCount: terminalCleanupRequestEntries.count,
                 terminalCleanupRequestEntries: terminalCleanupRequestEntries
@@ -116,6 +125,7 @@ actor MCPBootstrapLease {
     private let mcpServerEnabler: (() async -> Void)?
     private let policyInstaller: (MCPBootstrapLeaseSpec) async -> Void
     private let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
+    private let successfulRoutingPolicyClearer: (MCPBootstrapLeaseSpec) async -> Void
     private let policyClearer: (MCPBootstrapLeaseSpec) async -> Void
 
     private var hasAcquired = false
@@ -124,11 +134,14 @@ actor MCPBootstrapLease {
     private var ownsGate = false
     private var routingRegistered = false
     private var policyInstalled = false
+    private var didRouteSuccessfully = false
     private var didSignalRoutingFailure = false
     private var didReleaseGate = false
     private var didCleanupRouting = false
-    private var didClearPolicy = false
+    private var didClearSuccessfulRoutingPolicy = false
+    private var didRevokePolicy = false
     #if DEBUG
+        private var routingCleanupCount = 0
         private var terminalCleanupRequestCount = 0
         private var terminalCleanupRequestEntries: [String] = []
         private var didRecordTerminalCleanupRequest = false
@@ -150,19 +163,22 @@ actor MCPBootstrapLease {
     ///   - policyInstaller: Installs the per-run connection policy. Defaults to calling
     ///     `ServerNetworkManager.shared.installClientConnectionPolicy(...)`.
     ///   - expectedPIDPolicyArmer: Confirms the intended pending policy is uniquely PID-owned.
-    ///   - policyClearer: Clears the per-run connection policy on failure/timeout. Defaults to calling
-    ///     `ServerNetworkManager.shared.clearClientConnectionPolicy(...)`.
+    ///   - successfulRoutingPolicyClearer: Clears only the pending per-run policy after successful routing.
+    ///   - policyClearer: Revokes the per-run policy and routing state on failure/timeout.
     init(
         spec: MCPBootstrapLeaseSpec,
         mcpServerEnabler: (() async -> Void)? = nil,
         policyInstaller: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         expectedPIDPolicyArmer: ((MCPBootstrapLeaseSpec) async -> Bool)? = nil,
+        successfulRoutingPolicyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil,
         policyClearer: ((MCPBootstrapLeaseSpec) async -> Void)? = nil
     ) {
         self.spec = spec
         self.mcpServerEnabler = mcpServerEnabler
         self.policyInstaller = policyInstaller ?? Self.defaultPolicyInstaller
         self.expectedPIDPolicyArmer = expectedPIDPolicyArmer ?? Self.defaultExpectedPIDPolicyArmer
+        self.successfulRoutingPolicyClearer =
+            successfulRoutingPolicyClearer ?? Self.defaultSuccessfulRoutingPolicyClearer
         self.policyClearer = policyClearer ?? Self.defaultPolicyClearer
     }
 
@@ -340,6 +356,9 @@ actor MCPBootstrapLease {
         )
         ownsGate = false
         let routed = releaseResult.routed
+        if routed {
+            didRouteSuccessfully = true
+        }
         if ownedGateBeforeWait || releaseResult.gateRelease.released {
             await recordGateRelease(
                 releaseResult.gateRelease,
@@ -361,13 +380,28 @@ actor MCPBootstrapLease {
 
         if !routed {
             acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) routing wait failed or timed out; clearing connection policy")
+            didRevokePolicy = true
             await policyClearer(spec)
-            didClearPolicy = true
         }
         await AgentRunCoordinator.shared.cleanupRouting(runID: spec.runID)
         didCleanupRouting = true
+        #if DEBUG
+            routingCleanupCount += 1
+        #endif
 
         return routed
+    }
+
+    /// Clears only this run's installed policy after routing completed successfully.
+    /// This preserves retained routing, affinity, mappings, gate state, and provider reuse.
+    func clearPolicyAfterSuccessfulRouting() async {
+        guard policyInstalled,
+              didRouteSuccessfully,
+              !didClearSuccessfulRoutingPolicy,
+              !didRevokePolicy
+        else { return }
+        didClearSuccessfulRoutingPolicy = true
+        await successfulRoutingPolicyClearer(spec)
     }
 
     /// Releases the global connection gate without waiting for a routing signal.
@@ -382,6 +416,9 @@ actor MCPBootstrapLease {
         await releaseOwnedGate(reason: "without_routing_wait")
         await AgentRunCoordinator.shared.cleanupRouting(runID: spec.runID)
         didCleanupRouting = true
+        #if DEBUG
+            routingCleanupCount += 1
+        #endif
     }
 
     /// Releases only the serialized bootstrap gate while retaining the pending run policy.
@@ -429,7 +466,9 @@ actor MCPBootstrapLease {
             recordTerminalCleanupRequest("failAndRelease")
         #endif
         if hasReleased {
-            acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() ignored because lease already released")
+            cleanupRequested = true
+            acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() performing terminal cleanup after release")
+            await performCancellationCleanup(reason: "failed")
             return
         }
         acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) failAndRelease() signaling routing failure")
@@ -552,13 +591,16 @@ actor MCPBootstrapLease {
             await MCPRoutingWaiter.notifyFailed(runID: spec.runID)
         }
         await releaseOwnedGate(reason: reason)
-        if policyInstalled, !didClearPolicy {
-            didClearPolicy = true
+        if policyInstalled, !didRevokePolicy {
+            didRevokePolicy = true
             await policyClearer(spec)
         }
         if routingRegistered, !didCleanupRouting {
             didCleanupRouting = true
             await AgentRunCoordinator.shared.cleanupRouting(runID: spec.runID)
+            #if DEBUG
+                routingCleanupCount += 1
+            #endif
         }
         #if DEBUG
             await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
@@ -571,7 +613,9 @@ actor MCPBootstrapLease {
                     "gate_released": String(didReleaseGate),
                     "routing_cleaned": String(didCleanupRouting),
                     "policy_installed": String(policyInstalled),
-                    "policy_cleared": String(didClearPolicy)
+                    "policy_cleared": String(didClearSuccessfulRoutingPolicy || didRevokePolicy),
+                    "successful_policy_cleared": String(didClearSuccessfulRoutingPolicy),
+                    "policy_revoked": String(didRevokePolicy)
                 ]
             )
         #endif
@@ -590,13 +634,16 @@ actor MCPBootstrapLease {
             )
         #endif
         await releaseOwnedGate(reason: reason)
-        if policyInstalled, !didClearPolicy {
-            didClearPolicy = true
+        if policyInstalled, !didRevokePolicy {
+            didRevokePolicy = true
             await policyClearer(spec)
         }
         if routingRegistered, !didCleanupRouting {
             didCleanupRouting = true
             await AgentRunCoordinator.shared.cleanupRouting(runID: spec.runID)
+            #if DEBUG
+                routingCleanupCount += 1
+            #endif
         }
         #if DEBUG
             await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
@@ -609,7 +656,9 @@ actor MCPBootstrapLease {
                     "gate_released": String(didReleaseGate),
                     "routing_cleaned": String(didCleanupRouting),
                     "policy_installed": String(policyInstalled),
-                    "policy_cleared": String(didClearPolicy)
+                    "policy_cleared": String(didClearSuccessfulRoutingPolicy || didRevokePolicy),
+                    "successful_policy_cleared": String(didClearSuccessfulRoutingPolicy),
+                    "policy_revoked": String(didRevokePolicy)
                 ]
             )
         #endif
@@ -646,6 +695,15 @@ actor MCPBootstrapLease {
             taskLabelKind: spec.taskLabelKind,
             allowsAgentExternalControlTools: spec.allowsAgentExternalControlTools,
             requiresExpectedAgentPID: spec.requiresExpectedAgentPID
+        )
+    }
+
+    private static let defaultSuccessfulRoutingPolicyClearer: (MCPBootstrapLeaseSpec) async -> Void = { spec in
+        guard let clientName = spec.clientName else { return }
+        await ServerNetworkManager.shared.clearClientConnectionPolicy(
+            for: clientName,
+            windowID: spec.windowID,
+            runID: spec.runID
         )
     }
 

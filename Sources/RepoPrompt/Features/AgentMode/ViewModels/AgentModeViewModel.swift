@@ -5856,8 +5856,37 @@ final class AgentModeViewModel: ObservableObject {
                 details: details
             )
         }
-        // Note: pendingApplyEditsReview is not surfaced here because MCP-controlled sessions
-        // always have autoEditEnabled=true, so apply_edits reviews never appear on this path.
+        #if DEBUG
+            if let review = session.pendingApplyEditsReview,
+               let sessionID = session.activeAgentSessionID,
+               let runID = session.runID,
+               let workspaceID = workspaceManager?.activeWorkspace?.id,
+               OhMyPiAgentModeSmokeGate.shared.permitsApplyEditsReviewResponse(
+                   sessionID: sessionID,
+                   runID: runID,
+                   workspaceID: workspaceID
+               )
+            {
+                return .init(
+                    id: review.id,
+                    kind: .approval,
+                    responseType: .decision,
+                    title: "Apply Edits Review",
+                    prompt: "Review the exact apply_edits change before it is applied.",
+                    context: nil,
+                    allowsMultiple: nil,
+                    options: [
+                        .init(label: "accept", description: "Apply this exact edit"),
+                        .init(label: "reject", description: "Reject without mutating the file")
+                    ],
+                    fields: [],
+                    details: [
+                        .init(label: "Path", value: review.path, isCode: true),
+                        .init(label: "Unified Diff", value: review.unifiedDiff, isCode: true)
+                    ]
+                )
+            }
+        #endif
         if let approval = session.pendingApproval {
             var details: [AgentRunMCPSnapshot.Interaction.Detail] = []
             details.append(.init(label: "Approval Type", value: approval.kind.rawValue, isCode: false))
@@ -7316,6 +7345,24 @@ final class AgentModeViewModel: ObservableObject {
         let priorAutoEditEnabled = existingContext?.sessionID == sessionID
             ? existingContext?.autoEditEnabledBeforeOverride ?? session.autoEditEnabled
             : session.autoEditEnabled
+        #if DEBUG
+            let permitsQualificationApplyEditsReview: Bool = if let qualification = session.ompQualificationStartContext,
+                                                                let activeWorkspaceID = workspaceManager?.activeWorkspace?.id
+            {
+                qualification.expectedWorkspaceID == activeWorkspaceID
+                    && OhMyPiAgentModeSmokeGate.shared.permitsApplyEditsReviewActivation(
+                        transaction: qualification.transaction,
+                        workspaceID: activeWorkspaceID
+                    )
+            } else {
+                false
+            }
+            let mcpForceAutoEditEnabled = permitsQualificationApplyEditsReview
+                ? priorAutoEditEnabled
+                : true
+        #else
+            let mcpForceAutoEditEnabled = true
+        #endif
         let activatedControlContext = AgentMCPControlContext(
             sessionID: sessionID,
             activationID: activationID,
@@ -7329,7 +7376,7 @@ final class AgentModeViewModel: ObservableObject {
                 originatingConnectionID: originatingConnectionID
             ),
             suppressUserNotifications: true,
-            forceAutoEditEnabled: true,
+            forceAutoEditEnabled: mcpForceAutoEditEnabled,
             autoEditEnabledBeforeOverride: priorAutoEditEnabled,
             taskLabelKind: taskLabelKind
         )
@@ -7362,14 +7409,26 @@ final class AgentModeViewModel: ObservableObject {
                 "selectedModel": session.selectedModelRaw
             ])
         #endif
-        if priorAutoEditEnabled != true {
-            session.autoEditEnabled = true
-            await applyEditsApprovalStore.setAutoEditEnabled(
-                true,
-                for: applyEditsScope(for: tabID),
-                updateGlobalDefault: false
-            )
-        }
+        #if DEBUG
+            let activationAutoEditEnabled = !permitsQualificationApplyEditsReview
+            if priorAutoEditEnabled != activationAutoEditEnabled {
+                session.autoEditEnabled = activationAutoEditEnabled
+                await applyEditsApprovalStore.setAutoEditEnabled(
+                    activationAutoEditEnabled,
+                    for: applyEditsScope(for: tabID),
+                    updateGlobalDefault: false
+                )
+            }
+        #else
+            if priorAutoEditEnabled != true {
+                session.autoEditEnabled = true
+                await applyEditsApprovalStore.setAutoEditEnabled(
+                    true,
+                    for: applyEditsScope(for: tabID),
+                    updateGlobalDefault: false
+                )
+            }
+        #endif
         if tabID == currentTabID {
             updateBindingsFromSession(session)
         }
@@ -7927,6 +7986,36 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    #if DEBUG
+        func mcpOMPQualificationApplyEditsReviewDecisionMetadata(
+            sessionID: UUID,
+            interactionID: UUID,
+            rawDecision: String?
+        ) -> String? {
+            guard let session = mcpControlledSession(sessionID: sessionID),
+                  session.pendingApplyEditsReview?.id == interactionID,
+                  let activeSessionID = session.activeAgentSessionID,
+                  let runID = session.runID,
+                  let workspaceID = workspaceManager?.activeWorkspace?.id,
+                  OhMyPiAgentModeSmokeGate.shared.permitsApplyEditsReviewResponse(
+                      sessionID: activeSessionID,
+                      runID: runID,
+                      workspaceID: workspaceID
+                  )
+            else {
+                return nil
+            }
+            switch rawDecision?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "accept", "approve":
+                return "accepted"
+            case "decline", "reject":
+                return "rejected"
+            default:
+                return nil
+            }
+        }
+    #endif
+
     func mcpResolvePendingInteraction(
         sessionID: UUID,
         interactionID: UUID,
@@ -8084,6 +8173,40 @@ final class AgentModeViewModel: ObservableObject {
             return nil
         case .approval:
             let rawDecision = payload.decisionRaw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+            #if DEBUG
+                if let review = session.pendingApplyEditsReview,
+                   review.id == interactionID,
+                   let activeSessionID = session.activeAgentSessionID,
+                   let runID = session.runID,
+                   let workspaceID = workspaceManager?.activeWorkspace?.id,
+                   OhMyPiAgentModeSmokeGate.shared.permitsApplyEditsReviewResponse(
+                       sessionID: activeSessionID,
+                       runID: runID,
+                       workspaceID: workspaceID
+                   )
+                {
+                    let decision: ApplyEditsReviewDecision
+                    switch rawDecision {
+                    case "accept", "approve":
+                        decision = .accept
+                    case "decline", "reject":
+                        let reason = payload.text?.trimmingCharacters(in: .whitespacesAndNewlines)
+                        decision = .reject(reason: reason?.isEmpty == false ? reason! : "Apply edits review rejected.")
+                    default:
+                        throw MCPError.invalidParams("decision must be one of: accept, reject.")
+                    }
+                    await applyEditsApprovalStore.resolveReview(
+                        scope: applyEditsScope(for: session.tabID),
+                        reviewID: review.id,
+                        decision: decision
+                    )
+                    session.pendingApplyEditsReview = nil
+                    reconcileInteractiveRunState(session)
+                    recordMCPInteractionResolution(for: session, interactionID: review.id)
+                    handleObservedMCPStateChange(for: session)
+                    return nil
+                }
+            #endif
             if let review = session.pendingWorktreeMergeReview,
                review.id == interactionID
             {
@@ -15271,28 +15394,61 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    private static func headlessContinuityDecision(
+        agent: AgentProviderKind,
+        providerSessionID: String?,
+        hasAttachments: Bool,
+        hasPendingHandoff: Bool
+    ) -> (shouldBypassHistoryReplay: Bool, resumeSessionID: String?) {
+        // OMP advertises loadSession, but product runs intentionally remain fresh-only.
+        let supportsSessionResume = agent.usesClaudeNativeRuntime
+            || (agent.acpProviderID != nil && agent != .ohMyPi)
+        let keepsAttachmentsAtTopLevel = agent.usesClaudeNativeRuntime || agent.acpProviderID != nil
+        let shouldBypassHistoryReplay = hasPendingHandoff
+            || (supportsSessionResume && providerSessionID != nil)
+            || (keepsAttachmentsAtTopLevel && hasAttachments)
+        return (
+            shouldBypassHistoryReplay,
+            shouldBypassHistoryReplay && supportsSessionResume ? providerSessionID : nil
+        )
+    }
+
+    #if DEBUG
+        static func test_headlessContinuityDecision(
+            agent: AgentProviderKind,
+            providerSessionID: String?,
+            hasAttachments: Bool = false,
+            hasPendingHandoff: Bool = false
+        ) -> (shouldBypassHistoryReplay: Bool, resumeSessionID: String?) {
+            headlessContinuityDecision(
+                agent: agent,
+                providerSessionID: providerSessionID,
+                hasAttachments: hasAttachments,
+                hasPendingHandoff: hasPendingHandoff
+            )
+        }
+    #endif
+
     private func buildHeadlessAgentMessage(
         session: TabSession,
         initialMessageForRun: String,
         runID: UUID,
         attachments: [AgentImageAttachment]
     ) -> AgentMessage {
-        // Build initial message - for providers with resumable sessions, use --resume when available.
-        let supportsSessionResume = session.selectedAgent.usesClaudeNativeRuntime || session.selectedAgent.acpProviderID != nil
-        // Fresh handoff tabs already carry their continuity inside the staged
-        // <forked_session> payload injected into the first user turn. Replaying
-        // the migrated local transcript as <previous_conversation> would duplicate
-        // that context for the model.
-        let shouldBypassHistoryReplay = session.pendingHandoff.hasPayload
-            || (supportsSessionResume && (session.providerSessionID != nil || !attachments.isEmpty))
+        let continuity = Self.headlessContinuityDecision(
+            agent: session.selectedAgent,
+            providerSessionID: session.providerSessionID,
+            hasAttachments: !attachments.isEmpty,
+            hasPendingHandoff: session.pendingHandoff.hasPayload
+        )
         let fullMessage: String
         let resumeSessionID: String?
 
-        if shouldBypassHistoryReplay {
+        if continuity.shouldBypassHistoryReplay {
             // Resumable providers handle conversation continuity natively.
             // Also keep attachment references at top-level (not wrapped) for image turns.
             fullMessage = initialMessageForRun
-            resumeSessionID = session.providerSessionID
+            resumeSessionID = continuity.resumeSessionID
         } else {
             // Non-resumable agents: include conversation history in prompt.
             let conversationHistory = buildConversationHistory(for: session)

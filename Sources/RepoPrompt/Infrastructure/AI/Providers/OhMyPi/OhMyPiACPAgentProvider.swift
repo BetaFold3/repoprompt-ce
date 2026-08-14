@@ -39,7 +39,7 @@ struct OhMyPiACPAgentProvider: ACPAgentProvider {
             providerID: providerID,
             command: resolvedLaunch.command,
             arguments: resolvedLaunch.arguments,
-            environment: [:],
+            environment: OhMyPiAgentConfig.managedEnvironment,
             workingDirectory: workingDirectory,
             additionalPathHints: resolvedLaunch.additionalPathHints,
             enableDebugLogging: config.enableDebugLogging,
@@ -90,6 +90,9 @@ struct OhMyPiACPAgentProvider: ACPAgentProvider {
     }
 
     func normalizeError(_ error: Error) -> Error {
+        if error is CancellationError {
+            return error
+        }
         if error is AIProviderError {
             return error
         }
@@ -105,9 +108,16 @@ struct OhMyPiACPAgentProvider: ACPAgentProvider {
         }
         let description = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = description.lowercased()
-        if lower.contains("unauthorized") || lower.contains("not authenticated") || lower.contains("login") {
+        let authenticationPhrases = [
+            "not authenticated",
+            "unauthorized",
+            "authentication required",
+            "login required",
+            "requires login"
+        ]
+        if authenticationPhrases.contains(where: lower.contains) {
             return AIProviderError.invalidConfiguration(
-                detail: "Oh My Pi is not authenticated. Authenticate in OMP before using its ACP provider."
+                detail: "Oh My Pi is not authenticated. Open the OMP TUI (omp), complete provider sign-in/authentication, then retry."
             )
         }
         return AIProviderError.apiError(source: error)

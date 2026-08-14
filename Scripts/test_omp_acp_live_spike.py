@@ -48,6 +48,43 @@ class DelayedPumpJSONLProcess(spike.JSONLProcess):
 
 
 class OMPACPLiveSpikeTests(unittest.TestCase):
+    def test_managed_omp_environment_matches_production_swift_constant(self) -> None:
+        swift = (
+            SCRIPT_DIR.parent
+            / "Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/OhMyPiAgentConfig.swift"
+        ).read_text(encoding="utf-8")
+        managed_environment_lines = [
+            line.strip() for line in swift.splitlines() if "static let managedEnvironment" in line
+        ]
+        self.assertEqual(
+            managed_environment_lines,
+            ['static let managedEnvironment = ["OMP_MCP_TIMEOUT_MS": "0"]'],
+        )
+        self.assertEqual(spike.MANAGED_OMP_ENVIRONMENT, {"OMP_MCP_TIMEOUT_MS": "0"})
+        expected_fingerprint = "sha256:" + hashlib.sha256(
+            b'{"OMP_MCP_TIMEOUT_MS":"0"}'
+        ).hexdigest()
+        self.assertEqual(spike.MANAGED_OMP_ENVIRONMENT_FINGERPRINT, expected_fingerprint)
+
+    def test_managed_omp_environment_is_explicit_last_wins_over_ambient(self) -> None:
+        ambient = {"PATH": "/private/test", "OMP_MCP_TIMEOUT_MS": "12345"}
+        environment = spike.managed_omp_subprocess_environment(ambient)
+        self.assertEqual(environment, {"PATH": "/private/test", "OMP_MCP_TIMEOUT_MS": "0"})
+        self.assertEqual(ambient["OMP_MCP_TIMEOUT_MS"], "12345")
+
+    def test_bounded_omp_subprocess_receives_managed_timeout_override(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['OMP_MCP_TIMEOUT_MS'])",
+        ]
+        process = spike.BoundedTextProcess(
+            command,
+            environment=spike.managed_omp_subprocess_environment({"OMP_MCP_TIMEOUT_MS": "999"}),
+        )
+        return_code, stdout, stderr = process.wait(5)
+        self.assertEqual((return_code, stdout.strip(), stderr), (0, "0", ""))
+
     @staticmethod
     def pid_exists(pid: int) -> bool:
         try:
@@ -61,6 +98,196 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
         path.write_text("#!/usr/bin/env python3\n" + textwrap.dedent(body), encoding="utf-8")
         path.chmod(0o755)
         return path
+
+    def make_cancel_mid_call_omp(self, root: Path) -> Path:
+        return self.make_executable(
+            root,
+            "cancel-mid-call-omp.py",
+            f"""
+            import json
+            import subprocess
+            import sys
+
+            proxy = None
+            for line in sys.stdin:
+                message = json.loads(line)
+                request_id = message.get("id")
+                method = message.get("method")
+                if method == "initialize":
+                    result = {{"authMethods": [], "agentCapabilities": {{}}}}
+                elif method == "session/new":
+                    server = message["params"]["mcpServers"][0]
+                    proxy = subprocess.Popen(
+                        [server["command"], *server["args"]],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    )
+                    assert proxy.stdin is not None and proxy.stdout is not None
+                    proxy.stdin.write(json.dumps({{
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {{
+                            "protocolVersion": {spike.MCP_PROTOCOL_VERSION!r},
+                            "capabilities": {{}},
+                            "clientInfo": {{"name": "cancel-test", "version": "1"}},
+                        }},
+                    }}) + "\\n")
+                    proxy.stdin.flush()
+                    json.loads(proxy.stdout.readline())
+                    proxy.stdin.write(json.dumps({{
+                        "jsonrpc": "2.0",
+                        "method": "notifications/initialized",
+                        "params": {{}},
+                    }}) + "\\n")
+                    proxy.stdin.write(json.dumps({{
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "tools/list",
+                        "params": {{}},
+                    }}) + "\\n")
+                    proxy.stdin.flush()
+                    json.loads(proxy.stdout.readline())
+                    result = {{"sessionId": "cancel-session"}}
+                elif method == "session/prompt":
+                    assert proxy is not None and proxy.stdin is not None
+                    proxy.stdin.write(json.dumps({{
+                        "jsonrpc": "2.0",
+                        "id": 3,
+                        "method": "tools/call",
+                        "params": {{"name": "get_file_tree"}},
+                    }}) + "\\n")
+                    proxy.stdin.flush()
+                    for control_line in sys.stdin:
+                        control = json.loads(control_line)
+                        control_method = control.get("method")
+                        if control_method == "session/cancel":
+                            print(json.dumps({{
+                                "jsonrpc": "2.0",
+                                "id": request_id,
+                                "result": {{"stopReason": "cancelled"}},
+                            }}), flush=True)
+                        elif control_method == "session/close":
+                            print(json.dumps({{
+                                "jsonrpc": "2.0",
+                                "id": control["id"],
+                                "result": {{}},
+                            }}), flush=True)
+                            proxy.terminate()
+                            proxy.wait(timeout=2)
+                            break
+                    break
+                else:
+                    continue
+                print(json.dumps({{"jsonrpc": "2.0", "id": request_id, "result": result}}), flush=True)
+            """,
+        )
+
+    def make_helper_loss_omp(self, root: Path, *, prompt_error: bool = False) -> tuple[Path, Path]:
+        close_marker = root / ("helper-loss-error.closed" if prompt_error else "helper-loss.closed")
+        executable = self.make_executable(
+            root,
+            "helper-loss-error-omp.py" if prompt_error else "helper-loss-omp.py",
+            f"""
+            import json
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            proxy = None
+            for line in sys.stdin:
+                message = json.loads(line)
+                request_id = message.get("id")
+                method = message.get("method")
+                if method == "initialize":
+                    result = {{"authMethods": [], "agentCapabilities": {{}}}}
+                elif method == "session/new":
+                    server = message["params"]["mcpServers"][0]
+                    proxy = subprocess.Popen(
+                        [server["command"], *server["args"]],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    )
+                    assert proxy.stdin is not None and proxy.stdout is not None
+                    proxy.stdin.write(json.dumps({{
+                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                        "params": {{
+                            "protocolVersion": {spike.MCP_PROTOCOL_VERSION!r},
+                            "capabilities": {{}},
+                            "clientInfo": {{"name": "helper-loss-test", "version": "1"}},
+                        }},
+                    }}) + "\\n")
+                    proxy.stdin.flush()
+                    json.loads(proxy.stdout.readline())
+                    proxy.stdin.write(json.dumps({{
+                        "jsonrpc": "2.0", "method": "notifications/initialized", "params": {{}},
+                    }}) + "\\n")
+                    proxy.stdin.write(json.dumps({{
+                        "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {{}},
+                    }}) + "\\n")
+                    proxy.stdin.flush()
+                    json.loads(proxy.stdout.readline())
+                    result = {{"sessionId": "helper-loss-session"}}
+                elif method == "session/prompt":
+                    assert proxy is not None and proxy.stdin is not None and proxy.stdout is not None
+                    print(json.dumps({{
+                        "jsonrpc": "2.0", "method": "session/update", "params": {{
+                            "sessionId": "helper-loss-session", "update": {{
+                                "sessionUpdate": "tool_call", "toolCallId": "tool-1",
+                                "title": "Inspecting disposable workspace root", "status": "pending",
+                            }},
+                        }},
+                    }}), flush=True)
+                    proxy.stdin.write(json.dumps({{
+                        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                        "params": {{"name": "get_file_tree"}},
+                    }}) + "\\n")
+                    proxy.stdin.flush()
+                    proxy.stdout.readline()
+                    proxy.wait(timeout=2)
+                    if {prompt_error!r}:
+                        print(json.dumps({{
+                            "jsonrpc": "2.0", "id": request_id,
+                            "error": {{"code": -32000, "message": "generic prompt failure"}},
+                        }}), flush=True)
+                        continue
+                    print(json.dumps({{
+                        "jsonrpc": "2.0", "method": "session/update", "params": {{
+                            "sessionId": "helper-loss-session", "update": {{
+                                "sessionUpdate": "tool_call_update", "toolCallId": "tool-1",
+                                "status": "failed",
+                                "rawOutput": {{"details": {{"mcpToolName": "get_file_tree"}}}},
+                                "content": [{{"type": "content", "content": {{
+                                    "type": "text", "text": {spike.HELPER_LOSS_FAILURE_TEXT!r},
+                                }}}}],
+                            }},
+                        }},
+                    }}), flush=True)
+                    for chunk in ("OMP_REPOPROMPT_MCP_", "HELD_CALL_OK"):
+                        print(json.dumps({{
+                            "jsonrpc": "2.0", "method": "session/update", "params": {{
+                                "sessionId": "helper-loss-session", "update": {{
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {{"type": "text", "text": chunk}},
+                                }},
+                            }},
+                        }}), flush=True)
+                    result = {{"stopReason": "end_turn"}}
+                elif method == "session/close":
+                    Path({str(close_marker)!r}).write_text("closed", encoding="utf-8")
+                    result = {{}}
+                else:
+                    continue
+                print(json.dumps({{"jsonrpc": "2.0", "id": request_id, "result": result}}), flush=True)
+                if method == "session/close":
+                    break
+            """,
+        )
+        return executable, close_marker
 
     def make_retained_jsonl_process(
         self,
@@ -290,6 +517,408 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             audit, _ = self.run_proxy(root, messages)
             self.assertEqual(audit["observedToolArguments"], {})
             self.assertGreater(audit["rejectedRequestCount"], 0)
+
+    def test_held_proxy_requires_harness_release_and_records_scaled_monotonic_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            audit = root / "audit.json"
+            inflight_audit = root / "inflight.json"
+            release = root / "release"
+            token = "harness-owned-release"
+            command = [
+                sys.executable,
+                str(SCRIPT_DIR / "omp_acp_live_spike.py"),
+                "--readonly-mcp-proxy",
+                "--mode", "held-call",
+                "--workspace", str(workspace),
+                "--audit-file", str(audit),
+                "--inflight-audit-file", str(inflight_audit),
+                "--release-file", str(release),
+                "--release-token", token,
+                "--minimum-hold-seconds", "0.15",
+                "--held-call-timeout", "2",
+                "--exit-on-complete",
+            ]
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert process.stdin is not None
+            process.stdin.write(b"".join(json.dumps(message).encode() + b"\n" for message in self.valid_proxy_messages()))
+            process.stdin.flush()
+            inflight = spike.wait_for_held_call_inflight(inflight_audit, 1)
+            self.assertEqual(inflight["allowedToolCallCount"], 1)
+            self.assertEqual(inflight["inFlightToolCallCount"], 1)
+            self.assertEqual(inflight["settledToolCallCount"], 0)
+            spike.release_held_call(release, token)
+            self.assertEqual(process.wait(timeout=2), 0)
+            process.stdin.close()
+            settled = spike.load_readonly_proxy_audit(
+                audit,
+                "held-call",
+                require_exit_on_complete=True,
+            )
+            self.assertTrue(settled["exitedOnComplete"])
+            self.assertGreaterEqual(settled["heldDurationSeconds"], 0.15)
+            self.assertEqual(settled["inFlightToolCallCount"], 0)
+            self.assertEqual(settled["settledToolCallCount"], 1)
+            self.assertTrue(settled["releaseObserved"])
+
+    def test_release_held_call_wires_completion_exit_into_scaled_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            output = root / "evidence"
+            workspace.mkdir()
+            output.mkdir()
+            capture = root / "server.json"
+            fake_omp = self.make_executable(
+                root,
+                "release-held-call-omp.py",
+                f"""
+                import json
+                import subprocess
+                import sys
+                from pathlib import Path
+
+                proxy = None
+                for line in sys.stdin:
+                    message = json.loads(line)
+                    request_id = message.get("id")
+                    method = message.get("method")
+                    if method == "initialize":
+                        result = {{"authMethods": [], "agentCapabilities": {{}}}}
+                    elif method == "session/new":
+                        server = message["params"]["mcpServers"][0]
+                        Path({str(capture)!r}).write_text(json.dumps(server), encoding="utf-8")
+                        proxy = subprocess.Popen(
+                            [server["command"], *server["args"]],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,
+                            text=True,
+                        )
+                        assert proxy.stdin is not None and proxy.stdout is not None
+                        proxy.stdin.write(json.dumps({{
+                            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {{
+                                "protocolVersion": {spike.MCP_PROTOCOL_VERSION!r},
+                                "capabilities": {{}},
+                                "clientInfo": {{"name": "held-release-test", "version": "1"}},
+                            }},
+                        }}) + "\\n")
+                        proxy.stdin.flush()
+                        json.loads(proxy.stdout.readline())
+                        proxy.stdin.write(json.dumps({{
+                            "jsonrpc": "2.0", "method": "notifications/initialized", "params": {{}},
+                        }}) + "\\n")
+                        proxy.stdin.write(json.dumps({{
+                            "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {{}},
+                        }}) + "\\n")
+                        proxy.stdin.flush()
+                        json.loads(proxy.stdout.readline())
+                        result = {{"sessionId": "held-release-session"}}
+                    elif method == "session/prompt":
+                        assert proxy is not None and proxy.stdin is not None and proxy.stdout is not None
+                        print(json.dumps({{
+                            "jsonrpc": "2.0", "method": "session/update", "params": {{
+                                "sessionId": "held-release-session", "update": {{
+                                    "sessionUpdate": "tool_call", "toolCallId": "tool-1",
+                                    "title": "mcp__repopromptce_get_file_tree",
+                                }},
+                            }},
+                        }}), flush=True)
+                        proxy.stdin.write(json.dumps({{
+                            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                            "params": {{"name": "get_file_tree"}},
+                        }}) + "\\n")
+                        proxy.stdin.flush()
+                        json.loads(proxy.stdout.readline())
+                        proxy.wait(timeout=2)
+                        print(json.dumps({{
+                            "jsonrpc": "2.0", "method": "session/update", "params": {{
+                                "sessionId": "held-release-session", "update": {{
+                                    "sessionUpdate": "tool_call_update", "toolCallId": "tool-1",
+                                    "status": "completed",
+                                }},
+                            }},
+                        }}), flush=True)
+                        print(json.dumps({{
+                            "jsonrpc": "2.0", "method": "session/update", "params": {{
+                                "sessionId": "held-release-session", "update": {{
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": {{"text": {spike.HELD_CALL_SENTINEL!r}}},
+                                }},
+                            }},
+                        }}), flush=True)
+                        result = {{"stopReason": "end_turn"}}
+                    elif method == "session/close":
+                        result = {{}}
+                    else:
+                        continue
+                    print(json.dumps({{"jsonrpc": "2.0", "id": request_id, "result": result}}), flush=True)
+                    if method == "session/close":
+                        break
+                """,
+            )
+
+            summary = spike.acp_probe(
+                fake_omp,
+                root / "unused-helper",
+                workspace,
+                output,
+                "held-call",
+                3,
+                held_call_seconds=0.05,
+                held_call_action="release",
+            )
+
+            server = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertIn("--exit-on-complete", server["args"])
+            self.assertEqual(summary["heldCallProxy"]["exitCode"], 0)
+            self.assertTrue(summary["heldCallProxy"]["protocolComplete"])
+            self.assertTrue(summary["heldCallProxy"]["exitedOnComplete"])
+
+    def test_cancel_mid_call_uses_immutable_inflight_evidence_without_releasing_proxy(self) -> None:
+        for mutate_inflight in (False, True):
+            with self.subTest(mutate_inflight=mutate_inflight), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                output = root / "evidence"
+                workspace.mkdir()
+                output.mkdir()
+                fake_omp = self.make_cancel_mid_call_omp(root)
+                release = output / "held-mcp-proxy.release"
+                final_audit = output / "held-mcp-proxy.audit.json"
+                original_wait = spike.wait_for_held_call_inflight
+
+                def wait_and_optionally_mutate(path: Path, timeout: float) -> dict[str, Any]:
+                    inflight = original_wait(path, timeout)
+                    if mutate_inflight:
+                        changed = dict(inflight)
+                        changed["pingCount"] = 1
+                        path.write_text(json.dumps(changed), encoding="utf-8")
+                    return inflight
+
+                context = (
+                    mock.patch.object(
+                        spike,
+                        "wait_for_held_call_inflight",
+                        side_effect=wait_and_optionally_mutate,
+                    )
+                    if mutate_inflight
+                    else mock.patch.object(
+                        spike,
+                        "wait_for_held_call_inflight",
+                        wraps=original_wait,
+                    )
+                )
+                with context:
+                    if mutate_inflight:
+                        with self.assertRaisesRegex(
+                            spike.ProbeError,
+                            "exact one-call in-flight terminal evidence",
+                        ):
+                            spike.acp_probe(
+                                fake_omp,
+                                root / "unused-helper",
+                                workspace,
+                                output,
+                                "cancel-mid-call",
+                                3,
+                                held_call_seconds=0.05,
+                                held_call_action="cancel",
+                            )
+                    else:
+                        summary = spike.acp_probe(
+                            fake_omp,
+                            root / "unused-helper",
+                            workspace,
+                            output,
+                            "cancel-mid-call",
+                            3,
+                            held_call_seconds=0.05,
+                            held_call_action="cancel",
+                        )
+                        self.assertEqual(summary["promptStopReason"], "cancelled")
+                        self.assertEqual(summary["heldCallProxy"]["allowedToolCallCount"], 1)
+                        self.assertEqual(summary["heldCallProxy"]["inFlightToolCallCount"], 1)
+                        self.assertEqual(summary["heldCallProxy"]["settledToolCallCount"], 0)
+                        self.assertFalse(summary["heldCallProxy"]["releaseObserved"])
+                self.assertFalse(release.exists())
+                self.assertFalse(final_audit.exists())
+
+    @staticmethod
+    def valid_helper_loss_adjudication_inputs() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        observations = [
+            {"kind": "agent_message_chunk", "text": "I will inspect the workspace."},
+            {"kind": "tool_call", "toolCallId": "tool-1"},
+            {"kind": "tool_call_update", "toolCallId": "tool-1", "status": "in_progress"},
+            {
+                "kind": "tool_call_update",
+                "toolCallId": "tool-1",
+                "status": "failed",
+                "failureText": spike.HELPER_LOSS_FAILURE_TEXT,
+                "canonicalToolName": "get_file_tree",
+            },
+            {"kind": "agent_message_chunk", "text": "OMP_REPOPROMPT_MCP_"},
+            {"kind": "agent_message_chunk", "text": "HELD_CALL_OK"},
+        ]
+        inflight = {
+            "mode": "held-call",
+            "allowedToolCallCount": 1,
+            "inFlightToolCallCount": 1,
+            "settledToolCallCount": 0,
+            "releaseObserved": False,
+        }
+        return observations, inflight
+
+    def test_helper_loss_validator_accepts_exact_ordered_same_id_sequence(self) -> None:
+        observations, inflight = self.valid_helper_loss_adjudication_inputs()
+        result = spike.validate_helper_loss_adjudication(
+            observations,
+            "end_turn",
+            inflight,
+            dict(inflight),
+            release_file_exists=False,
+            release_file_is_symlink=False,
+        )
+        self.assertEqual(result["toolCallId"], "tool-1")
+        self.assertEqual(result["canonicalToolName"], "get_file_tree")
+        self.assertEqual(result["terminalStatus"], "failed")
+        self.assertEqual(result["failureText"], spike.HELPER_LOSS_FAILURE_TEXT)
+        self.assertEqual(result["promptStopReason"], "end_turn")
+        self.assertTrue(result["exactSentinelObserved"])
+        self.assertTrue(result["inFlightEvidenceUnchanged"])
+        self.assertTrue(result["releaseFileAbsent"])
+        self.assertEqual(result["openingToolCallCount"], 1)
+        self.assertEqual(result["failedTerminalUpdateCount"], 1)
+
+    def test_helper_loss_validator_rejects_protocol_and_proxy_mutations(self) -> None:
+        def mutation(label: str) -> tuple[
+            list[dict[str, Any]], str, dict[str, Any], dict[str, Any], bool, bool
+        ]:
+            observations, inflight = self.valid_helper_loss_adjudication_inputs()
+            final = dict(inflight)
+            exists = False
+            symlink = False
+            if label == "changed-tool-id":
+                observations[3]["toolCallId"] = "tool-2"
+            elif label == "non-failed-status":
+                observations[3]["status"] = "completed"
+            elif label == "prefixed-error":
+                observations[3]["failureText"] = "error: " + spike.HELPER_LOSS_FAILURE_TEXT
+            elif label == "suffixed-error":
+                observations[3]["failureText"] = spike.HELPER_LOSS_FAILURE_TEXT + "."
+            elif label == "altered-error":
+                observations[3]["failureText"] = "MCP error: transport closed"
+            elif label == "duplicate-failure":
+                observations.insert(4, dict(observations[3]))
+            elif label == "missing-sentinel":
+                del observations[4:]
+            elif label == "wrong-sentinel":
+                observations[-1]["text"] = "WRONG"
+            elif label == "later-success":
+                observations.insert(4, {
+                    "kind": "tool_call_update", "toolCallId": "tool-1", "status": "completed",
+                })
+            elif label == "second-opening":
+                observations.insert(4, {"kind": "tool_call", "toolCallId": "tool-2"})
+            elif label == "new-id-update":
+                observations[2]["toolCallId"] = "tool-2"
+            elif label == "changed-final-audit":
+                final["pingCount"] = 1
+            elif label == "release-observed":
+                inflight["releaseObserved"] = True
+                final["releaseObserved"] = True
+            elif label == "release-file":
+                exists = True
+            elif label == "release-symlink":
+                symlink = True
+            stop_reason = "cancelled" if label == "wrong-stop-reason" else "end_turn"
+            return observations, stop_reason, inflight, final, exists, symlink
+
+        labels = (
+            "changed-tool-id", "non-failed-status", "prefixed-error", "suffixed-error",
+            "altered-error", "duplicate-failure", "missing-sentinel", "wrong-sentinel",
+            "wrong-stop-reason", "later-success", "second-opening", "new-id-update",
+            "changed-final-audit", "release-observed", "release-file", "release-symlink",
+        )
+        for label in labels:
+            with self.subTest(label=label):
+                observations, stop_reason, original, final, exists, symlink = mutation(label)
+                with self.assertRaises(spike.ProbeError):
+                    spike.validate_helper_loss_adjudication(
+                        observations,
+                        stop_reason,
+                        original,
+                        final,
+                        release_file_exists=exists,
+                        release_file_is_symlink=symlink,
+                    )
+
+    def test_kill_helper_requires_successful_prompt_and_clean_close(self) -> None:
+        for prompt_error in (False, True):
+            with self.subTest(prompt_error=prompt_error), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / "workspace"
+                output = root / "evidence"
+                workspace.mkdir()
+                output.mkdir()
+                fake_omp, close_marker = self.make_helper_loss_omp(root, prompt_error=prompt_error)
+                if prompt_error:
+                    with self.assertRaisesRegex(spike.ProbeError, "generic prompt failure"):
+                        spike.acp_probe(
+                            fake_omp, root / "unused-helper", workspace, output,
+                            "kill-helper-mid-call", 3,
+                            held_call_action="kill-helper",
+                        )
+                else:
+                    summary = spike.acp_probe(
+                        fake_omp, root / "unused-helper", workspace, output,
+                        "kill-helper-mid-call", 3,
+                        held_call_action="kill-helper",
+                    )
+                    self.assertEqual(summary["promptStopReason"], "end_turn")
+                    self.assertEqual(summary["helperLossAdjudication"]["toolCallId"], "tool-1")
+                    self.assertEqual(
+                        summary["helperLossAdjudication"]["failureText"],
+                        spike.HELPER_LOSS_FAILURE_TEXT,
+                    )
+                self.assertTrue(close_marker.exists())
+                release = output / "held-mcp-proxy.release"
+                self.assertFalse(release.exists())
+                self.assertFalse(release.is_symlink())
+
+    def test_exact_captured_process_signal_revalidates_identity_and_never_targets_by_name(self) -> None:
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        captured = {
+            "pid": process.pid,
+            "parentPID": 7,
+            "startSeconds": 11,
+            "startMicroseconds": 13,
+        }
+        resolver = lambda pid: {**captured, "pid": pid}
+        try:
+            spike.signal_exact_captured_process(captured, signal.SIGTERM, identity_resolver=resolver)
+            self.assertEqual(process.wait(timeout=2), -signal.SIGTERM)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+
+        survivor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        mismatched = {**captured, "pid": survivor.pid}
+        try:
+            with self.assertRaises(spike.ProbeError):
+                spike.signal_exact_captured_process(
+                    mismatched,
+                    signal.SIGKILL,
+                    identity_resolver=lambda pid: {**mismatched, "startMicroseconds": 14},
+                )
+            self.assertIsNone(survivor.poll())
+        finally:
+            survivor.kill()
+            survivor.wait(timeout=2)
 
     def test_readonly_proxy_rejects_newline_free_oversized_frame_with_bounded_audit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -547,6 +1176,170 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
 
             self.assertLessEqual(sum(len(line.encode()) + 1 for line in process.stdout_lines), 128)
             self.assertFalse(spike.process_group_exists(process_group_id))
+
+    def test_cross_process_load_preserves_session_reregisters_helper_and_never_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            output = root / "evidence"
+            captures = root / "captures"
+            workspace.mkdir()
+            output.mkdir()
+            captures.mkdir()
+            state_file = root / "saved-session.json"
+            fake_omp = self.make_executable(
+                root,
+                "fake-cross-process-omp.py",
+                f"""
+                import json
+                import os
+                import subprocess
+                import sys
+                from pathlib import Path
+
+                state_file = Path({str(state_file)!r})
+                capture_file = Path({str(captures)!r}) / f"{{os.getpid()}}.jsonl"
+
+                def emit(payload):
+                    print(json.dumps(payload, separators=(",", ":")), flush=True)
+
+                def capture(message):
+                    with capture_file.open("a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(message, separators=(",", ":")) + "\\n")
+
+                def register_helper(server):
+                    child = subprocess.Popen(
+                        [server["command"], *server["args"]],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    assert child.stdin is not None and child.stdout is not None
+                    requests = [
+                        {{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{
+                            "protocolVersion":{spike.MCP_PROTOCOL_VERSION!r},
+                            "capabilities":{{}},
+                            "clientInfo":{{"name":"fake-omp","version":"1"}},
+                        }}}},
+                        {{"jsonrpc":"2.0","method":"notifications/initialized","params":{{}}}},
+                        {{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}},
+                    ]
+                    for request in requests:
+                        child.stdin.write(json.dumps(request) + "\\n")
+                        child.stdin.flush()
+                        if "id" in request:
+                            response = json.loads(child.stdout.readline())
+                            assert response["id"] == request["id"] and "result" in response
+                    child.stdin.close()
+                    assert child.wait(timeout=5) == 0
+
+                for line in sys.stdin:
+                    message = json.loads(line)
+                    capture(message)
+                    request_id = message.get("id")
+                    method = message.get("method")
+                    if method == "initialize":
+                        emit({{"jsonrpc":"2.0","id":request_id,"result":{{
+                            "authMethods":[],
+                            "agentCapabilities":{{"loadSession":True}},
+                        }}}})
+                    elif method == "session/new":
+                        params = message["params"]
+                        assert len(params["mcpServers"]) == 1
+                        register_helper(params["mcpServers"][0])
+                        state_file.write_text(json.dumps({{
+                            "sessionId":"persisted-session",
+                            "shared":{{"cwd":params["cwd"],"mcpServers":params["mcpServers"]}},
+                        }}, separators=(",", ":")), encoding="utf-8")
+                        emit({{"jsonrpc":"2.0","id":request_id,"result":{{"sessionId":"persisted-session"}}}})
+                    elif method == "session/load":
+                        saved = json.loads(state_file.read_text(encoding="utf-8"))
+                        params = message["params"]
+                        assert params["sessionId"] == saved["sessionId"]
+                        assert {{"cwd":params["cwd"],"mcpServers":params["mcpServers"]}} == saved["shared"]
+                        register_helper(params["mcpServers"][0])
+                        emit({{"jsonrpc":"2.0","method":"session/update","params":{{
+                            "sessionId":"persisted-session",
+                            "update":{{"sessionUpdate":"session_info_update","title":"loaded"}},
+                        }}}})
+                        emit({{"jsonrpc":"2.0","id":request_id,"result":{{}}}})
+                    elif method == "session/prompt":
+                        emit({{"jsonrpc":"2.0","method":"session/update","params":{{
+                            "sessionId":"persisted-session",
+                            "update":{{"sessionUpdate":"agent_message_chunk","content":{{
+                                "text":"OMP_ACP_CROSS_PROCESS_LOAD_OK"
+                            }}}},
+                        }}}})
+                        emit({{"jsonrpc":"2.0","id":request_id,"result":{{"stopReason":"end_turn"}}}})
+                    elif method == "session/close":
+                        emit({{"jsonrpc":"2.0","id":request_id,"result":{{}}}})
+                        break
+                """,
+            )
+
+            self.assertTrue(spike.phase_requires_workspace_snapshot("cross-process-load"))
+            summary = spike.cross_process_load_probe(
+                fake_omp,
+                root / "unused-helper",
+                workspace,
+                output,
+                prompt_timeout=3,
+            )
+
+            transcripts = []
+            for path in captures.iterdir():
+                transcripts.append([
+                    json.loads(line)
+                    for line in path.read_text(encoding="utf-8").splitlines()
+                ])
+            process_a = next(items for items in transcripts if any(item.get("method") == "session/new" for item in items))
+            process_b = next(items for items in transcripts if any(item.get("method") == "session/load" for item in items))
+            self.assertEqual(
+                [item.get("method") for item in process_a],
+                ["initialize", "session/new"],
+            )
+            self.assertEqual(
+                [item.get("method") for item in process_b],
+                ["initialize", "session/load", "session/prompt", "session/close"],
+            )
+            new_params = next(item["params"] for item in process_a if item.get("method") == "session/new")
+            load_params = next(item["params"] for item in process_b if item.get("method") == "session/load")
+            self.assertEqual(
+                {"cwd": load_params["cwd"], "mcpServers": load_params["mcpServers"]},
+                new_params,
+            )
+            self.assertFalse(summary["newFallbackDispatched"])
+            self.assertTrue(summary["processA"]["sessionPreservedAcrossProcessTermination"])
+            self.assertTrue(summary["processB"]["agentAcknowledgementObserved"])
+            self.assertEqual(
+                summary["processB"]["sessionEventRecords"][0]["lifecyclePhase"],
+                "session-loading",
+            )
+            self.assertTrue((output / "cross-process-load-process-a-mcp-proxy.audit.json").exists())
+            self.assertTrue((output / "cross-process-load-process-b-mcp-proxy.audit.json").exists())
+
+            adversarial = []
+            helper_ambiguity = json.loads(json.dumps(summary))
+            helper_ambiguity["helperRegistrations"]["B"]["rejectedRequestCount"] = 1
+            adversarial.append(("helper registration", helper_ambiguity))
+            replay_ambiguity = json.loads(json.dumps(summary))
+            replay_ambiguity["processB"]["sessionEventRecords"] = [{
+                "eventIndex": 0,
+                "kind": "agent_message_chunk",
+                "lifecyclePhase": "session-loading",
+            }]
+            adversarial.append(("history replay", replay_ambiguity))
+            order_ambiguity = json.loads(json.dumps(summary))
+            order_ambiguity["processB"]["sessionEventRecords"][0]["eventIndex"] = 9
+            adversarial.append(("event order", order_ambiguity))
+            fallback = json.loads(json.dumps(summary))
+            fallback["processB"]["sessionOpenMethod"] = "session/new"
+            adversarial.append(("fallback", fallback))
+
+            for label, candidate in adversarial:
+                with self.subTest(label=label), self.assertRaises(spike.ProbeError):
+                    spike.validate_cross_process_load_summary(candidate)
 
     def test_prompt_injects_no_mcp_and_tool_event_invalidates_acknowledgement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2053,6 +2846,63 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
             with self.subTest(parser="spike", index=index):
                 with self.assertRaises(spike.ProbeError):
                     spike.strict_diagnostic_payload(value, "connection_history", "events")
+
+    def test_list_sessions_envelope_parser_accepts_only_documented_payloads(self) -> None:
+        payload = {
+            "sessions": [{"session_id": "f18ee497-6d75-4ce3-a534-ee7697ef59d1"}],
+            "workspace": {
+                "id": "11be4fa4-168a-4e26-8e9c-291c50eb5c5b",
+                "name": "Scratch",
+            },
+        }
+        documented = [
+            payload,
+            {"result": payload},
+            {"result": {"structuredContent": payload}},
+            {"structured_content": payload},
+        ]
+        for index, value in enumerate(documented):
+            with self.subTest(index=index):
+                self.assertEqual(
+                    qualification_support._normalized_response(
+                        value, "agent_manage:list_sessions",
+                    ),
+                    payload,
+                )
+
+        adversarial = [
+            {"sessions": [], "workspace": None},
+            {"sessions": None, "workspace": payload["workspace"]},
+            {"sessions": [], "workspace": {"id": payload["workspace"]["id"]}},
+            {"sessions": [], "workspace": {"id": "", "name": "Scratch"}},
+            {**payload, "agents": []},
+            {**payload, "status": "completed"},
+            {**payload, "result": payload},
+            {"error": "failed", "result": payload},
+            {"result": {"structuredContent": payload, "structured_content": payload}},
+        ]
+        for index, value in enumerate(adversarial):
+            with self.subTest(index=index), self.assertRaises(qualification_support.SupportError):
+                qualification_support._normalized_response(
+                    value, "agent_manage:list_sessions",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_path = root / "input.json"
+            output_path = root / "output.json"
+            input_path.write_text(json.dumps({"result": payload}), encoding="utf-8")
+            qualification_support.normalize_response(Namespace(
+                input=str(input_path),
+                output=str(output_path),
+                tool="agent_manage",
+                payload=json.dumps({
+                    "op": "list_sessions",
+                    "workspace_id": payload["workspace"]["id"],
+                    "limit": 1000,
+                }),
+            ))
+            self.assertEqual(json.loads(output_path.read_text(encoding="utf-8")), payload)
 
     def test_qualification_routing_rejects_malformed_paths_and_workspace_uuid_before_snapshot_or_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4284,6 +5134,137 @@ class OMPACPLiveSpikeTests(unittest.TestCase):
         self.assertEqual(causes[2]["message"], "evidence failed")
         process.drain.assert_called_once()
         process.write_evidence.assert_called_once()
+
+
+    def test_poisoned_workspace_uses_upstream_paths_fixed_argv_and_unchanged_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            output = root / "evidence"
+            workspace.mkdir(mode=0o700)
+            output.mkdir(mode=0o700)
+            audit = spike.populate_poisoned_workspace(workspace)
+            expected_paths = {
+                "AGENTS.md",
+                ".agents/AGENTS.md",
+                ".agents/rules/poison.md",
+                ".agents/skills/poison-skill/SKILL.md",
+                ".omp/AGENTS.md",
+                ".omp/rules/poison.md",
+                ".omp/skills/poison-skill/SKILL.md",
+                ".omp/mcp.json",
+                ".omp/extensions/poison.ts",
+                ".omp/settings.json",
+                "poison-default-extension/index.ts",
+            }
+            self.assertEqual(
+                {str(path.relative_to(workspace)) for path in workspace.rglob("*") if path.is_file()},
+                expected_paths,
+            )
+            capture = root / "argv.json"
+            fake_omp = self.make_executable(
+                root,
+                "poisoned-omp.py",
+                f"""
+                import json
+                import sys
+                from pathlib import Path
+                Path({str(capture)!r}).write_text(json.dumps(sys.argv[1:]), encoding="utf-8")
+                for line in sys.stdin:
+                    message = json.loads(line)
+                    request_id = message.get("id")
+                    method = message.get("method")
+                    if method == "initialize":
+                        result = {{"authMethods": [], "agentCapabilities": {{}}}}
+                    elif method == "session/new":
+                        assert message["params"]["mcpServers"] == []
+                        result = {{"sessionId": "poisoned"}}
+                    elif method == "session/prompt":
+                        update = dict(
+                            jsonrpc="2.0",
+                            method="session/update",
+                            params=dict(
+                                sessionId="poisoned",
+                                update=dict(
+                                    sessionUpdate="agent_message_chunk",
+                                    content=dict(text={spike.POISONED_WORKSPACE_SENTINEL!r}),
+                                ),
+                            ),
+                        )
+                        print(json.dumps(update), flush=True)
+                        result = {{"stopReason": "end_turn"}}
+                    elif method == "session/close":
+                        result = {{}}
+                    else:
+                        continue
+                    print(json.dumps({{"jsonrpc":"2.0","id":request_id,"result":result}}), flush=True)
+                    if method == "session/close":
+                        break
+                """,
+            )
+            before = spike.snapshot_workspace(workspace)
+            summary = spike.acp_probe(fake_omp, root / "unused-helper", workspace, output, "poisoned-workspace", 2)
+            after = spike.snapshot_workspace(workspace)
+
+            self.assertEqual(json.loads(capture.read_text(encoding="utf-8")), spike.MANAGED_OMP_ARGUMENTS)
+            self.assertEqual(spike.changed_snapshot_paths(before, after), [])
+            self.assertFalse(audit.exists())
+            self.assertTrue(spike.phase_requires_workspace_snapshot("poisoned-workspace"))
+            spike.validate_poisoned_workspace_summary(summary, audit)
+
+    def test_poisoned_workspace_preparation_failure_removes_owned_fixtures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            output = root / "evidence"
+            workspace.mkdir(mode=0o700)
+            output.mkdir(mode=0o700)
+            args = Namespace(
+                phase="poisoned-workspace",
+                omp="fake",
+                app_bundle=None,
+                workspace=None,
+                unsafe_allow_nonempty_workspace=False,
+                output_dir=None,
+                prompt_timeout=1,
+                held_call_seconds=0.0,
+                allow_long_held_call=False,
+            )
+            with (
+                mock.patch.object(spike, "parse_args", return_value=args),
+                mock.patch.object(spike, "prepare_output_directory", return_value=output),
+                mock.patch.object(spike, "prepare_workspace", return_value=(workspace, True)),
+                mock.patch.object(spike, "snapshot_workspace", side_effect=spike.ProbeError("snapshot failed")),
+            ):
+                self.assertEqual(spike.main(), 2)
+            self.assertFalse(workspace.exists())
+            self.assertFalse(output.exists())
+
+    def test_poisoned_workspace_validator_rejects_audit_canary_and_tool_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            audit = Path(tmp) / "ambient.audit"
+            valid = {
+                "agentAcknowledgementObserved": True,
+                "agentText": spike.POISONED_WORKSPACE_SENTINEL,
+                "unknownUpdateKinds": [],
+                "unexpectedInboundRequests": {"count": 0, "records": []},
+                "observedUpdateKinds": ["agent_message_chunk"],
+                "observedToolTitles": [],
+                "toolEventRecords": [],
+                "permissionEvents": [],
+                "sessionEventRecords": [],
+            }
+            spike.validate_poisoned_workspace_summary(valid, audit)
+            audit.write_text("launched", encoding="utf-8")
+            with self.assertRaisesRegex(spike.ProbeError, "MCP canary"):
+                spike.validate_poisoned_workspace_summary(valid, audit)
+            audit.unlink()
+            leaked = dict(valid, agentText=f"{spike.POISONED_WORKSPACE_SENTINEL} OMP_POISON_RULES_CANARY")
+            with self.assertRaises(spike.ProbeError):
+                spike.validate_poisoned_workspace_summary(leaked, audit)
+            tool = dict(valid, observedUpdateKinds=["tool_call"])
+            with self.assertRaisesRegex(spike.ProbeError, "tool or permission"):
+                spike.validate_poisoned_workspace_summary(tool, audit)
 
 
 if __name__ == "__main__":

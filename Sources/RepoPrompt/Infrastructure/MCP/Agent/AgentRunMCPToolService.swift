@@ -368,6 +368,9 @@ struct AgentRunMCPToolService {
             if op != "start", args["_omp_qualification_lease_id"] != nil {
                 throw MCPError.invalidParams("The OMP qualification lease parameter is only supported with agent_run op=start.")
             }
+            if op != "start", args["_omp_qualification_apply_edits_review"] != nil {
+                throw MCPError.invalidParams("The OMP qualification apply_edits review parameter is only supported with agent_run op=start.")
+            }
         #endif
         if op != "start", startWorktreeCoordinator.containsArguments(args) {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
@@ -504,6 +507,15 @@ struct AgentRunMCPToolService {
             var ompQualificationProviderDispatchStarted = false
             var ompQualificationTransactionSucceeded = false
             var ompQualificationAuthorizationDeadlineUptimeNanoseconds: UInt64?
+            let ompQualificationApplyEditsReviewRequested: Bool
+            if let rawReviewRequest = args["_omp_qualification_apply_edits_review"] {
+                guard rawReviewRequest.boolValue == true else {
+                    throw MCPError.invalidParams("_omp_qualification_apply_edits_review must be true when present.")
+                }
+                ompQualificationApplyEditsReviewRequested = true
+            } else {
+                ompQualificationApplyEditsReviewRequested = false
+            }
             if let rawLeaseID = normalizedString(args["_omp_qualification_lease_id"]) {
                 let activeLease = OhMyPiAgentModeSmokeGate.shared.activeSnapshot()
                 guard let leaseID = UUID(uuidString: rawLeaseID),
@@ -543,7 +555,9 @@ struct AgentRunMCPToolService {
                 ompQualificationLease = activeLease
                 ompQualificationRollbackSnapshot = activeLease
                 await testAfterOMPQualificationInitialSnapshot?()
-            } else if normalizedString(args["model_id"])?.hasPrefix("ohMyPi:") == true {
+            } else if normalizedString(args["model_id"])?.hasPrefix("ohMyPi:") == true
+                || ompQualificationApplyEditsReviewRequested
+            {
                 throw MCPError.invalidParams(
                     "Fresh OMP qualification starts require _omp_qualification_lease_id."
                 )
@@ -866,7 +880,9 @@ struct AgentRunMCPToolService {
                         leaseID: ompQualificationLease.leaseID,
                         ownerConnectionID: connectionID,
                         ownerProcessID: ompQualificationLease.ownerProcessID,
-                        sessionID: targetSessionID
+                        sessionID: targetSessionID,
+                        qualificationWorkspaceID: requestedWorkspaceUUID,
+                        permitsApplyEditsReview: ompQualificationApplyEditsReviewRequested
                     )
                 } catch {
                     await discardUnconsumedTargetIfOwned()
@@ -1919,6 +1935,14 @@ struct AgentRunMCPToolService {
         let interactionID = try requireUUID(args["interaction_id"], name: "interaction_id")
         let workflow = try resolveWorkflow(args: args)
         let payload = try parseResponsePayload(args: args)
+        #if DEBUG
+            let ompQualificationApplyEditsReviewDecision = agentModeVM
+                .mcpOMPQualificationApplyEditsReviewDecisionMetadata(
+                    sessionID: sessionID,
+                    interactionID: interactionID,
+                    rawDecision: payload.decisionRaw
+                )
+        #endif
         let metadata = await captureRequestMetadata()
         // Attribute `resolved_by` to the resolving MCP client identity. Remote gateway
         // devices connect through per-device app links named `remote:<device8>`, so
@@ -1932,11 +1956,27 @@ struct AgentRunMCPToolService {
             resolvedBy: resolvedBy
         )
         await Task.yield()
-        return await decoratedRunValue(
+        let decorated = await decoratedRunValue(
             snapshot: currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM),
             workflow: workflow,
             delivery: dispatch
         )
+        #if DEBUG
+            guard let ompQualificationApplyEditsReviewDecision,
+                  var object = decorated.objectValue
+            else {
+                return decorated
+            }
+            var responseMetadata = object["_meta"]?.objectValue ?? [:]
+            responseMetadata["omp_qualification_apply_edits_review"] = .object([
+                "decision": .string(ompQualificationApplyEditsReviewDecision),
+                "interaction_id": .string(interactionID.uuidString)
+            ])
+            object["_meta"] = .object(responseMetadata)
+            return .object(object)
+        #else
+            return decorated
+        #endif
     }
 
     private func waitForInterestingState(

@@ -194,6 +194,17 @@ def _normalized_response(raw: object, expected_discriminator: str) -> dict[str, 
             )
         if expected_discriminator == "agent_manage:list_agents":
             return isinstance(value.get("agents"), list) and set(value).isdisjoint({"ok", "status", "session_id"})
+        if expected_discriminator == "agent_manage:list_sessions":
+            workspace = value.get("workspace")
+            return (
+                set(value) == {"sessions", "workspace"}
+                and isinstance(value.get("sessions"), list)
+                and isinstance(workspace, dict)
+                and set(workspace) == {"id", "name"}
+                and isinstance(workspace.get("id"), str)
+                and bool(workspace["id"])
+                and isinstance(workspace.get("name"), str)
+            )
         if expected_discriminator == "agent_manage:cleanup_sessions":
             return (
                 isinstance(value.get("status"), str)
@@ -203,7 +214,23 @@ def _normalized_response(raw: object, expected_discriminator: str) -> dict[str, 
                 and isinstance(value.get("skipped_sessions"), list)
                 and "agents" not in value
             )
+        if expected_discriminator == "agent_manage:get_log":
+            return (
+                isinstance(value.get("session_id"), str)
+                and isinstance(value.get("transcript_xml"), str)
+                and type(value.get("returned_turn_count")) is int
+            )
         return False
+
+    if expected_discriminator == "agent_manage:list_sessions":
+        wrapper_keys = {"result", "structuredContent", "structured_content"}
+        for value, label in ((raw, "top-level"), (raw.get("result"), "result")):
+            if (
+                isinstance(value, dict)
+                and set(value).intersection({"sessions", "workspace"})
+                and set(value).intersection(wrapper_keys)
+            ):
+                raise SupportError(f"CLI response contains a nested wrapper hybrid in {label}")
 
     reject_error_envelope(raw, "top-level")
 
@@ -235,7 +262,7 @@ def normalize_response(arguments: argparse.Namespace) -> None:
     elif arguments.tool == "agent_manage":
         request = json.loads(arguments.payload)
         op = request.get("op") if isinstance(request, dict) else None
-        if op not in {"list_agents", "cleanup_sessions"}:
+        if op not in {"list_agents", "list_sessions", "cleanup_sessions", "get_log"}:
             raise SupportError("unsupported qualification agent_manage operation")
         discriminator = f"agent_manage:{op}"
     else:

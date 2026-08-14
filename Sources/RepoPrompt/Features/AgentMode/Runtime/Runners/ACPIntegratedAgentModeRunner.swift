@@ -17,6 +17,7 @@ final class ACPIntegratedAgentModeRunner {
 
     private enum MCPBootstrapLeaseDisposition {
         case none
+        case clearPolicyAfterSuccessfulRouting
         case failAndRelease
         case failAndCleanup
         case cancelAndCleanup
@@ -29,7 +30,9 @@ final class ACPIntegratedAgentModeRunner {
             case .cancelled:
                 self = .cancelAndCleanup
             case .completed:
-                self = agentKind.requiresPrePromptAgentModeMCPRouting ? .none : .cleanupDeferredRouting
+                self = agentKind.requiresPrePromptAgentModeMCPRouting
+                    ? .clearPolicyAfterSuccessfulRouting
+                    : .cleanupDeferredRouting
             default:
                 self = .none
             }
@@ -39,6 +42,8 @@ final class ACPIntegratedAgentModeRunner {
             switch self {
             case .none:
                 break
+            case .clearPolicyAfterSuccessfulRouting:
+                await lease?.clearPolicyAfterSuccessfulRouting()
             case .failAndRelease:
                 await lease?.failAndRelease()
             case .failAndCleanup:

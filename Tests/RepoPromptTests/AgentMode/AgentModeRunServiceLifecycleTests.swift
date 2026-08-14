@@ -1314,6 +1314,72 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(providerBootstrapCount, 1)
     }
 
+    func testCompletedOhMyPiClearsRoutedPolicyAndRetainsReusableController() async throws {
+        let recorder = LifecycleRecorder()
+        let qualificationSessionID = UUID()
+        let qualificationWorkspaceID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+        try _ = installOMPQualificationContext(
+            on: session,
+            sessionID: qualificationSessionID,
+            workspaceID: qualificationWorkspaceID
+        )
+        var bootstrapLease: MCPBootstrapLease?
+        let provider = try LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: makeOpenCodeModeFlowServerScript().path,
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            autoSignalACPRouting: true,
+            ompQualificationAuthorizer: { _, _ in true },
+            ompQualificationActiveWorkspaceID: { qualificationWorkspaceID },
+            testOMPQualificationLeaseCreated: { bootstrapLease = $0 }
+        )
+        harness.host.test_installLiveSession(session)
+        _ = harness.host.test_installPersistentSessionBinding(
+            sessionID: qualificationSessionID,
+            on: session
+        )
+        try await harness.host.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: qualificationSessionID,
+            originatingConnectionID: UUID()
+        )
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "complete routed OMP prompt",
+            initialMessageForRun: "complete routed OMP prompt",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("completed Oh My Pi routed policy cleanup") {
+            await session.agentTask?.value
+        }
+
+        XCTAssertEqual(session.runState, .completed)
+        try await waitUntilAsync("completed Oh My Pi terminal resource teardown") {
+            let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+            return session.ompQualificationStartupLease == nil
+                && cleanup?.didClearPolicy == true
+        }
+        let controller = try XCTUnwrap(session.acpController)
+        let hasReusableSession = await controller.hasReusableSession
+        XCTAssertTrue(hasReusableSession)
+        XCTAssertNil(session.ompQualificationStartupLease)
+
+        let cleanup = await bootstrapLease?.debugCleanupSnapshot()
+        XCTAssertEqual(cleanup?.didRouteSuccessfully, true)
+        XCTAssertEqual(cleanup?.didClearPolicy, true)
+        XCTAssertEqual(cleanup?.terminalCleanupRawRequestCount, 0)
+    }
+
     func testOhMyPiWorkspaceSwitchAtProviderAuthorizationBoundaryPreventsLaunch() async throws {
         let recorder = LifecycleRecorder()
         let qualificationSessionID = UUID()

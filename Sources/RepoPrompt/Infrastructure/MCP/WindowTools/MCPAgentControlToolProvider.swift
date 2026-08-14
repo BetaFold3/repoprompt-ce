@@ -120,6 +120,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
         #if DEBUG
             properties["_worktree_startup_benchmark_token"] = .string(description: "[DEBUG start] Single-use token from the scoped worktree startup benchmark diagnostics surface.")
             properties["_omp_qualification_lease_id"] = .string(description: "[DEBUG start] Private single-use OMP qualification lease UUID. Accepted only for the fail-closed qualification smoke path.")
+            properties["_omp_qualification_apply_edits_review"] = .boolean(description: "[DEBUG start] Permit Auto Edit=false only for the exact lease/workspace/run-bound OMP qualification start.")
         #endif
         return runtime.tool(
             name: MCPWindowToolName.agentRun,

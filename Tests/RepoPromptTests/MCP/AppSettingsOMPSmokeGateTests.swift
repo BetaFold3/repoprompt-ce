@@ -450,6 +450,90 @@
             XCTAssertFalse(gate.isEnabled)
         }
 
+        func testApplyEditsReviewPermissionIsOptInWorkspaceAndRunBound() throws {
+            let gate = OhMyPiAgentModeSmokeGate(notificationCenter: NotificationCenter())
+            let connectionID = UUID()
+            let sessionID = UUID()
+            let workspaceID = UUID()
+            let runID = UUID()
+            let lease = try gate.acquire(
+                ownerConnectionID: connectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            let consumption = try gate.consumeStartTransaction(
+                leaseID: lease.leaseID,
+                ownerConnectionID: connectionID,
+                ownerProcessID: getpid(),
+                sessionID: sessionID,
+                qualificationWorkspaceID: workspaceID,
+                permitsApplyEditsReview: true
+            )
+
+            XCTAssertTrue(gate.permitsApplyEditsReviewActivation(
+                transaction: consumption.transaction,
+                workspaceID: workspaceID
+            ))
+            XCTAssertFalse(gate.permitsApplyEditsReviewActivation(
+                transaction: consumption.transaction,
+                workspaceID: UUID()
+            ))
+            XCTAssertTrue(gate.authorizeProviderStart(transaction: consumption.transaction, runID: runID))
+            _ = try gate.bindRun(
+                leaseID: lease.leaseID,
+                ownerConnectionID: connectionID,
+                sessionID: sessionID,
+                runID: runID
+            )
+            XCTAssertFalse(gate.permitsApplyEditsReviewActivation(
+                transaction: consumption.transaction,
+                workspaceID: workspaceID
+            ))
+            XCTAssertTrue(gate.permitsApplyEditsReviewResponse(
+                sessionID: sessionID,
+                runID: runID,
+                workspaceID: workspaceID
+            ))
+            XCTAssertFalse(gate.permitsApplyEditsReviewResponse(
+                sessionID: sessionID,
+                runID: UUID(),
+                workspaceID: workspaceID
+            ))
+            XCTAssertFalse(gate.permitsApplyEditsReviewResponse(
+                sessionID: sessionID,
+                runID: runID,
+                workspaceID: UUID()
+            ))
+            XCTAssertEqual(gate.releaseOwned(by: connectionID)?.runID, runID)
+            XCTAssertFalse(gate.permitsApplyEditsReviewResponse(
+                sessionID: sessionID,
+                runID: runID,
+                workspaceID: workspaceID
+            ))
+        }
+
+        func testApplyEditsReviewPermissionDefaultsOff() throws {
+            let gate = OhMyPiAgentModeSmokeGate(notificationCenter: NotificationCenter())
+            let connectionID = UUID()
+            let sessionID = UUID()
+            let workspaceID = UUID()
+            let lease = try gate.acquire(
+                ownerConnectionID: connectionID,
+                ownerProcessID: getpid(),
+                duration: 60
+            )
+            let consumption = try gate.consumeStartTransaction(
+                leaseID: lease.leaseID,
+                ownerConnectionID: connectionID,
+                ownerProcessID: getpid(),
+                sessionID: sessionID
+            )
+            XCTAssertFalse(gate.permitsApplyEditsReviewActivation(
+                transaction: consumption.transaction,
+                workspaceID: workspaceID
+            ))
+        }
+
         func testConcurrentStartLoserRollbackCannotReleaseOrCancelWinner() throws {
             let recorder = QualificationCancellationRecorder()
             let gate = OhMyPiAgentModeSmokeGate(
