@@ -35,7 +35,8 @@ extension Notification.Name {
     /// Posted when OpenCode CLI connection status changes
     /// userInfo mirrors `claudeCodeConnectionChanged`
     static let openCodeConnectionChanged = Notification.Name("openCodeConnectionChanged")
-    /// Posted when the diagnostic Oh My Pi ACP probe changes state; public provider availability remains gated.
+    /// Posted when Oh My Pi CLI connection status changes.
+    /// userInfo mirrors `claudeCodeConnectionChanged`.
     static let ohMyPiConnectionChanged = Notification.Name("ohMyPiConnectionChanged")
     /// Posted when Cursor CLI connection status changes
     /// userInfo mirrors `claudeCodeConnectionChanged`

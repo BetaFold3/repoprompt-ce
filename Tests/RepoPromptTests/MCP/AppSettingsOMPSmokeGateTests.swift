@@ -232,11 +232,39 @@
             XCTAssertEqual(observedOutcome, .authorized(authorized))
         }
 
-        func testExclusiveLeasePublishesAvailabilityAndReleaseRestoresDarkness() async throws {
+        func testOhMyPiConnectionPublishesWindowAvailabilityWithoutQualificationLease() async {
+            let apiSettings = makeAPISettingsViewModel()
+            XCTAssertFalse(apiSettings.agentModeAvailabilityContext.ohMyPiAvailable)
+
+            let enabled = expectation(description: "connection availability enabled")
+            let cancellable = apiSettings.$agentAvailability
+                .map(\.ohMyPiAvailable)
+                .removeDuplicates()
+                .sink { value in
+                    if value { enabled.fulfill() }
+                }
+            defer { cancellable.cancel() }
+
+            apiSettings.isOhMyPiConnected = true
+            await fulfillment(of: [enabled], timeout: 1)
+
+            XCTAssertTrue(apiSettings.agentModeAvailabilityContext.ohMyPiAvailable)
+            XCTAssertTrue(apiSettings.agentAvailability.ohMyPiAvailable)
+            XCTAssertTrue(AgentModelCatalog.selectableAgents(
+                availability: apiSettings.agentModeAvailabilityContext
+            ).contains(.ohMyPi))
+            XCTAssertTrue(AgentModelCatalog.discoveryAgents(
+                availability: apiSettings.agentModeAvailabilityContext
+            ).contains { $0.agent == .ohMyPi })
+        }
+
+        func testExclusiveLeasePublishesAvailabilityAndReleaseRestoresConnectionGatedState() async throws {
             let apiSettings = makeAPISettingsViewModel()
             let secondWindowAPISettings = makeAPISettingsViewModel()
             XCTAssertFalse(apiSettings.agentAvailability.ohMyPiAvailable)
             XCTAssertFalse(secondWindowAPISettings.agentAvailability.ohMyPiAvailable)
+            XCTAssertFalse(apiSettings.isContextBuilderProviderRuntimeReady(.ohMyPi))
+            XCTAssertFalse(secondWindowAPISettings.isContextBuilderProviderRuntimeReady(.ohMyPi))
 
             let enabled = expectation(description: "availability enabled")
             let disabled = expectation(description: "availability disabled")
@@ -267,6 +295,8 @@
             await fulfillment(of: [enabled], timeout: 1)
             XCTAssertTrue(apiSettings.agentAvailability.ohMyPiAvailable)
             XCTAssertTrue(secondWindowAPISettings.agentAvailability.ohMyPiAvailable)
+            XCTAssertTrue(apiSettings.isContextBuilderProviderRuntimeReady(.ohMyPi))
+            XCTAssertTrue(secondWindowAPISettings.isContextBuilderProviderRuntimeReady(.ohMyPi))
             XCTAssertThrowsError(
                 try OhMyPiAgentModeSmokeGate.shared.acquire(
                     ownerConnectionID: UUID(),
@@ -284,6 +314,8 @@
             await fulfillment(of: [disabled], timeout: 1)
             XCTAssertFalse(apiSettings.agentAvailability.ohMyPiAvailable)
             XCTAssertFalse(secondWindowAPISettings.agentAvailability.ohMyPiAvailable)
+            XCTAssertFalse(apiSettings.isContextBuilderProviderRuntimeReady(.ohMyPi))
+            XCTAssertFalse(secondWindowAPISettings.isContextBuilderProviderRuntimeReady(.ohMyPi))
         }
 
         func testLeaseExpiresAndFailureCleanupIsFailClosed() async throws {

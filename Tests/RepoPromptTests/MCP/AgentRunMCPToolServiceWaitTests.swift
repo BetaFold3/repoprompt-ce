@@ -534,61 +534,139 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         #endif
     }
 
-    func testDeniedExplicitOMPStartHasNoRoutingOrSessionSideEffects() async throws {
+    func testPublicOMPStartWithoutQualificationLeaseReachesProviderDispatch() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OMPPublicStart-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "OMP Public Start",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "ompPublicStart"
+        )
+        let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+        let tabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+        window.apiSettingsViewModel.isOhMyPiConnected = true
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let session = AgentModeViewModel.TabSession(tabID: tabID)
+        session.selectedAgent = .ohMyPi
+        viewModel.test_installLiveSession(session)
+        var providerDispatchCount = 0
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        var service = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder,
+            resolveRequestedTabID: { _ in session.tabID },
+            startRun: { target, _, _, _, agentModeVM, agentRaw, _, _, _, _, _, _ in
+                providerDispatchCount += 1
+                XCTAssertEqual(agentRaw, AgentProviderKind.ohMyPi.rawValue)
+                let liveSession = try XCTUnwrap(agentModeVM.session(for: target.tabID, createIfNeeded: false))
+                liveSession.runState = .completed
+                return try .init(
+                    snapshot: self.makeSnapshot(
+                        sessionID: XCTUnwrap(target.sessionID),
+                        status: .completed
+                    ),
+                    delivery: .startedRun
+                )
+            }
+        )
+        service.resolveOracleReviewLaunchSource = { _, targetWindow in
+            let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
+            let tabID = try XCTUnwrap(workspace.activeComposeTabID)
+            return ResolvedAgentRunOracleReviewLaunchSource(
+                snapshot: AgentRunOracleReviewLaunchSnapshot(
+                    route: .windowOnlyActiveCompose,
+                    windowID: targetWindow.windowID,
+                    workspaceID: workspace.id,
+                    tabID: tabID,
+                    selectionRevision: targetWindow.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: workspace.id,
+                        tabID: tabID
+                    ),
+                    promptText: "",
+                    selection: StoredSelection(),
+                    sourceAgentSessionID: nil,
+                    routedRunID: nil
+                ),
+                source: .unavailable(.init(
+                    delegationID: UUID(),
+                    sourceTabID: tabID,
+                    workspaceID: workspace.id,
+                    sourceAgentSessionID: nil,
+                    sourceAgentRunID: nil,
+                    reason: .sourceCaptureFailed("Public OMP start fixture")
+                ))
+            )
+        }
+
+        let response = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("public omp"),
+            "model_id": .string("ohMyPi:default"),
+            "detach": .bool(true)
+        ])
+
+        XCTAssertEqual(providerDispatchCount, 1)
+        XCTAssertEqual(response.objectValue?["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
+    }
+
+    func testExplicitMalformedOMPQualificationLeaseNeverFallsBackToPublicStart() async throws {
         #if DEBUG
-            let root = FileManager.default.temporaryDirectory
-                .appendingPathComponent("OMPEarlyDeniedStart-\(UUID().uuidString)", isDirectory: true)
-            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-            defer { try? FileManager.default.removeItem(at: root) }
             let window = makeWindow()
             defer { WindowStatesManager.shared.unregisterWindowState(window) }
-            let workspace = window.workspaceManager.createWorkspace(
-                name: "OMP Early Denial",
-                repoPaths: [root.path],
-                ephemeral: true
-            )
-            await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "ompEarlyDenial")
             let viewModel = makeViewModel(windowID: window.windowID)
-            let session = AgentModeViewModel.TabSession(tabID: UUID())
-            session.selectedAgent = .ohMyPi
-            viewModel.test_installLiveSession(session)
-            var routingResolutionCount = 0
-            var providerAvailabilityPreflightCount = 0
             let liveSnapshots = LiveSnapshots()
             let recorder = WaitScopeRecorder()
-            var service = makeService(
+            var providerDispatchCount = 0
+            let service = makeService(
                 window: window,
                 viewModel: viewModel,
                 liveSnapshots: liveSnapshots,
                 recorder: recorder,
-                resolveRequestedTabID: { _ in session.tabID },
-                resolveSpawnParentSourceTabID: { _ in
-                    routingResolutionCount += 1
-                    return nil
+                startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
+                    providerDispatchCount += 1
+                    throw MCPError.internalError("Malformed qualification input reached provider dispatch")
                 }
             )
-            service.testBeforeProviderAvailabilityPreflight = {
-                providerAvailabilityPreflightCount += 1
-            }
 
-            do {
-                _ = try await service.execute(args: [
-                    "op": .string("start"),
-                    "message": .string("must deny before routing"),
-                    "model_id": .string("ohMyPi:default"),
-                    "workspace_id": .string(workspace.id.uuidString)
-                ])
-                XCTFail("Expected an explicit OMP start without a lease to fail")
-            } catch let error as MCPError {
-                XCTAssertTrue(String(describing: error).contains("_omp_qualification_lease_id"))
+            let malformedValues: [Value] = [
+                .string(""),
+                .string("   \n\t"),
+                .string("not-a-uuid"),
+                .int(42),
+                .null
+            ]
+            for malformedValue in malformedValues {
+                do {
+                    _ = try await service.execute(args: [
+                        "op": .string("start"),
+                        "message": .string("must fail closed"),
+                        "model_id": .string("ohMyPi:default"),
+                        "_omp_qualification_lease_id": malformedValue
+                    ])
+                    XCTFail("Expected malformed qualification lease rejection for \(malformedValue)")
+                } catch let error as MCPError {
+                    XCTAssertTrue(
+                        String(describing: error).contains("must be a nonblank UUID string"),
+                        String(describing: error)
+                    )
+                }
             }
-            XCTAssertEqual(routingResolutionCount, 0)
-            XCTAssertEqual(providerAvailabilityPreflightCount, 0)
-            XCTAssertNil(session.mcpControlContext)
-            XCTAssertNil(session.runID)
-            XCTAssertEqual(session.runState, .idle)
+            XCTAssertEqual(providerDispatchCount, 0)
         #else
-            throw XCTSkip("OMP qualification transaction is DEBUG-only")
+            throw XCTSkip("OMP qualification input is DEBUG-only")
         #endif
     }
 

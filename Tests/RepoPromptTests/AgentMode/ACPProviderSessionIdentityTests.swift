@@ -86,6 +86,38 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         XCTAssertEqual(recordedSessionLoadIDs(at: recordURL), ["stale-session-id"])
     }
 
+    func testOhMyPiLoadFailureFailsClosedWithoutOpeningFreshSession() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let scriptURL = try makeFakeACPServerScript()
+        let recordURL = try makeTemporaryDirectory().appendingPathComponent("record.jsonl")
+        let request = makeRunRequest(
+            agentKind: .ohMyPi,
+            workspacePath: workspace.path,
+            resumeSessionID: "missing-omp-session"
+        )
+        let provider = FakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: scriptURL.path,
+            environment: [
+                "ACP_RECORD_PATH": recordURL.path,
+                "ACP_FAIL_LOAD": "1",
+                "ACP_RUNTIME_SESSION_ID": "must-not-open"
+            ]
+        )
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+
+        do {
+            _ = try await controller.bootstrap()
+            XCTFail("Expected missing OMP session/load to fail closed")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("session not found: missing-omp-session"))
+        }
+        await controller.shutdown()
+
+        XCTAssertEqual(recordedMethods(at: recordURL).count(where: { $0 == "session/load" }), 1)
+        XCTAssertFalse(recordedMethods(at: recordURL).contains("session/new"))
+    }
+
     func testProviderSessionIdentityNormalizesEmptyIDs() {
         let identity = ACPProviderSessionIdentity(
             providerID: .cursor,
@@ -191,17 +223,26 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
     }
 
     private func recordedSessionLoadIDs(at url: URL) -> [String] {
-        guard let data = try? Data(contentsOf: url),
-              let text = String(data: data, encoding: .utf8) else { return [] }
-        return text.split(whereSeparator: { $0.isNewline }).compactMap { line in
-            guard let data = String(line).data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  object["method"] as? String == "session/load",
+        recordedObjects(at: url).compactMap { object in
+            guard object["method"] as? String == "session/load",
                   let params = object["params"] as? [String: Any]
             else {
                 return nil
             }
             return params["sessionId"] as? String
+        }
+    }
+
+    private func recordedMethods(at url: URL) -> [String] {
+        recordedObjects(at: url).compactMap { $0["method"] as? String }
+    }
+
+    private func recordedObjects(at url: URL) -> [[String: Any]] {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        return text.split(whereSeparator: { $0.isNewline }).compactMap { line in
+            guard let data = String(line).data(using: .utf8) else { return nil }
+            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         }
     }
 }

@@ -516,10 +516,18 @@ struct AgentRunMCPToolService {
             } else {
                 ompQualificationApplyEditsReviewRequested = false
             }
-            if let rawLeaseID = normalizedString(args["_omp_qualification_lease_id"]) {
+            if let suppliedLeaseID = args["_omp_qualification_lease_id"] {
+                let rawLeaseID = suppliedLeaseID.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let rawLeaseID,
+                      !rawLeaseID.isEmpty,
+                      let leaseID = UUID(uuidString: rawLeaseID)
+                else {
+                    throw MCPError.invalidParams(
+                        "The dedicated DEBUG OMP qualification lease parameter must be a nonblank UUID string."
+                    )
+                }
                 let activeLease = OhMyPiAgentModeSmokeGate.shared.activeSnapshot()
-                guard let leaseID = UUID(uuidString: rawLeaseID),
-                      let activeLease,
+                guard let activeLease,
                       activeLease.leaseID == leaseID,
                       let connectionID = metadata.connectionID
                 else {
@@ -555,9 +563,7 @@ struct AgentRunMCPToolService {
                 ompQualificationLease = activeLease
                 ompQualificationRollbackSnapshot = activeLease
                 await testAfterOMPQualificationInitialSnapshot?()
-            } else if normalizedString(args["model_id"])?.hasPrefix("ohMyPi:") == true
-                || ompQualificationApplyEditsReviewRequested
-            {
+            } else if ompQualificationApplyEditsReviewRequested {
                 throw MCPError.invalidParams(
                     "Fresh OMP qualification starts require _omp_qualification_lease_id."
                 )
@@ -720,9 +726,9 @@ struct AgentRunMCPToolService {
             }
             let earlyEffectiveTargetIsOhMyPi = selection.agentRaw == AgentProviderKind.ohMyPi.rawValue
                 || (selection.agentRaw == nil && existingRequestedAgent == .ohMyPi)
-            if earlyEffectiveTargetIsOhMyPi, ompQualificationLease == nil {
+            if ompQualificationLease != nil, !earlyEffectiveTargetIsOhMyPi {
                 throw MCPError.invalidParams(
-                    "Fresh OMP qualification starts require _omp_qualification_lease_id."
+                    "_omp_qualification_lease_id may only authorize an effective OMP target."
                 )
             }
         #endif
@@ -852,7 +858,7 @@ struct AgentRunMCPToolService {
             )?.selectedAgent
             let effectiveTargetIsOhMyPi = selection.agentRaw == AgentProviderKind.ohMyPi.rawValue
                 || (selection.agentRaw == nil && existingTargetAgent == .ohMyPi)
-            if effectiveTargetIsOhMyPi {
+            if effectiveTargetIsOhMyPi, ompQualificationLease != nil {
                 await testBeforeOMPQualificationConsume?()
                 guard let requestedWorkspaceUUID else {
                     await discardUnconsumedTargetIfOwned()

@@ -1832,12 +1832,13 @@ class GlobalSettingsStore: ObservableObject {
         return (agentRaw, modelRaw?.isEmpty == false ? modelRaw : nil)
     }
 
-    /// Returns a normalized global Context Builder agent and model selection.
-    /// Callers performing startup restoration should use
-    /// `persistedGlobalContextBuilderAgentSelection()` and validate against current availability.
+    /// Returns a normalized global Context Builder agent and model selection while preserving
+    /// an explicitly persisted supported provider that is not statically available. Persistence
+    /// is not runtime readiness: startup and execution callers must still validate the provider
+    /// against their current-window availability context.
     func globalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
         let persisted = persistedGlobalContextBuilderAgentSelection()
-        let normalized = AgentModelCatalog.normalizeSelection(
+        let normalized = AgentModelCatalog.normalizePersistedSelection(
             agentRaw: persisted.agentRaw,
             modelRaw: persisted.modelRaw
         )
@@ -1846,8 +1847,8 @@ class GlobalSettingsStore: ObservableObject {
 
     /// Returns the remembered raw model for a specific global Context Builder agent slot.
     /// This intentionally exposes only the per-agent memory entry needed by
-    /// allowlisted settings surfaces; callers that need an executable selection
-    /// should continue using `globalContextBuilderAgentSelection()`.
+    /// allowlisted settings surfaces; callers that need an executable selection must
+    /// additionally resolve the stored choice against their current-window availability.
     func globalContextBuilderRememberedModelRaw(for agentRaw: String) -> String? {
         let trimmedAgentRaw = agentRaw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard AgentProviderKind(rawValue: trimmedAgentRaw) != nil else { return nil }
@@ -1877,7 +1878,7 @@ class GlobalSettingsStore: ObservableObject {
     ) {
         let oldSelection = globalContextBuilderAgentSelection()
         let globalDefaultsBeforeMutation = globalDefaults
-        let normalized = AgentModelCatalog.normalizeSelection(agentRaw: agentRaw, modelRaw: modelRaw)
+        let normalized = AgentModelCatalog.normalizePersistedSelection(agentRaw: agentRaw, modelRaw: modelRaw)
         globalDefaults.discoverAgentRaw = normalized.agent.rawValue
         if globalDefaults.discoverModelsByAgent == nil {
             globalDefaults.discoverModelsByAgent = [:]
@@ -1929,7 +1930,7 @@ class GlobalSettingsStore: ObservableObject {
         let trimmedModelRaw = modelRaw?.trimmingCharacters(in: .whitespacesAndNewlines)
         let newModelRaw: String?
         if let trimmedModelRaw, !trimmedModelRaw.isEmpty {
-            let normalized = AgentModelCatalog.normalizeSelection(
+            let normalized = AgentModelCatalog.normalizePersistedSelection(
                 agentRaw: agent.rawValue,
                 modelRaw: trimmedModelRaw
             )

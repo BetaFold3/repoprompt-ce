@@ -53,8 +53,15 @@ struct OhMyPiACPAgentProvider: ACPAgentProvider {
         for request: ACPRunRequest,
         mcpServer _: RepoPromptMCPServerConfiguration
     ) throws -> ACPSessionConfiguration {
-        ACPSessionConfiguration(
-            mode: .new,
+        let resumeSessionID = request.resumeSessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let mode: ACPSessionConfiguration.Mode = if let resumeSessionID, !resumeSessionID.isEmpty {
+            .load(existingSessionID: resumeSessionID)
+        } else {
+            .new
+        }
+        return ACPSessionConfiguration(
+            mode: mode,
             workingDirectory: standardizedWorkingDirectory(from: request.workspacePath),
             mcpServers: config.includeRepoPromptMCPServer ? [repoPromptMCPConfiguration] : []
         )
@@ -64,9 +71,12 @@ struct OhMyPiACPAgentProvider: ACPAgentProvider {
         for message: AgentMessage,
         request: ACPRunRequest
     ) throws -> [[String: Any]] {
+        let isFollowUp = request.resumeSessionID?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty == false
         let systemPrompt = message.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let userMessage = message.userMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        let text: String = if systemPrompt.isEmpty {
+        let text: String = if isFollowUp || systemPrompt.isEmpty {
             userMessage.isEmpty ? message.userMessage : userMessage
         } else if userMessage.isEmpty {
             systemPrompt

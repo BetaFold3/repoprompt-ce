@@ -29,6 +29,53 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
         XCTAssertEqual(resolved.modelRaw, AgentModel.gpt56SolLow.rawValue)
     }
 
+    func testExplicitOhMyPiSelectionPersistsWhileStaticAvailabilityRemainsFailClosed() throws {
+        let fixture = try makeStoreFixture()
+        XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
+
+        fixture.store.setGlobalContextBuilderAgentSelection(
+            agentRaw: AgentProviderKind.ohMyPi.rawValue,
+            modelRaw: AgentModel.defaultModel.rawValue,
+            markUserDefined: true
+        )
+
+        XCTAssertEqual(fixture.store.persistedGlobalContextBuilderAgentSelection().agentRaw, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(fixture.store.globalContextBuilderAgentSelection().agentRaw, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(fixture.store.globalContextBuilderAgentSelection().modelRaw, AgentModel.defaultModel.rawValue)
+
+        let reloadedStore = GlobalSettingsStore(defaults: fixture.defaults, fileStore: fixture.fileStore)
+        let persisted = reloadedStore.persistedGlobalContextBuilderAgentSelection()
+        XCTAssertEqual(persisted.agentRaw, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(persisted.modelRaw, AgentModel.defaultModel.rawValue)
+
+        let unavailable = try XCTUnwrap(AutoRecommendationEngine.resolveContextBuilderSelection(
+            persistedAgentRaw: persisted.agentRaw,
+            persistedModelRaw: persisted.modelRaw,
+            availability: .init(
+                claudeCodeAvailable: false,
+                codexAvailable: true,
+                openCodeAvailable: false,
+                cursorAvailable: false,
+                ohMyPiAvailable: false
+            )
+        ))
+        XCTAssertEqual(unavailable.agent, .codexExec)
+
+        let connected = try XCTUnwrap(AutoRecommendationEngine.resolveContextBuilderSelection(
+            persistedAgentRaw: persisted.agentRaw,
+            persistedModelRaw: persisted.modelRaw,
+            availability: .init(
+                claudeCodeAvailable: false,
+                codexAvailable: true,
+                openCodeAvailable: false,
+                cursorAvailable: false,
+                ohMyPiAvailable: true
+            )
+        ))
+        XCTAssertEqual(connected.agent, .ohMyPi)
+        XCTAssertEqual(connected.modelRaw, AgentModel.defaultModel.rawValue)
+    }
+
     func testUnavailablePersistedSelectionFallsBackToRecommendedAvailableProvider() throws {
         let resolved = try XCTUnwrap(AutoRecommendationEngine.resolveContextBuilderSelection(
             persistedAgentRaw: AgentProviderKind.claudeCode.rawValue,
@@ -316,7 +363,7 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
     }
 
     func testCachedCLIFlagIsNotReadyUntilCurrentProcessVerification() {
-        let keys = ["ClaudeCodeConnected", "CodexCLIConnected", "OpenCodeCLIConnected", "CursorCLIConnected"]
+        let keys = ["ClaudeCodeConnected", "CodexCLIConnected", "OpenCodeCLIConnected", "OhMyPiCLIConnected", "CursorCLIConnected"]
         let previous = Dictionary(uniqueKeysWithValues: keys.map { ($0, UserDefaults.standard.object(forKey: $0)) })
         defer {
             for (key, value) in previous {
@@ -331,6 +378,7 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
         UserDefaults.standard.set(true, forKey: "ClaudeCodeConnected")
         UserDefaults.standard.set(false, forKey: "CodexCLIConnected")
         UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
+        UserDefaults.standard.set(true, forKey: "OhMyPiCLIConnected")
         UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
 
         let keyManager = KeyManager(secureService: SecureKeysService(secureStorage: TestSecureStorageBackend()))
@@ -341,15 +389,105 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
         )
 
         XCTAssertEqual(viewModel.recommendationProviderStatusSnapshot.claudeCodeCLI, .configured)
+        XCTAssertTrue(viewModel.agentModeAvailabilityContext.ohMyPiAvailable)
         XCTAssertFalse(viewModel.contextBuilderRestorationAvailabilityContext.claudeCodeAvailable)
+        XCTAssertFalse(viewModel.contextBuilderRestorationAvailabilityContext.ohMyPiAvailable)
+        XCTAssertFalse(viewModel.isContextBuilderProviderRuntimeReady(.ohMyPi))
 
         viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [])
         XCTAssertEqual(viewModel.recommendationProviderStatusSnapshot.claudeCodeCLI, .notConfigured)
         XCTAssertTrue(UserDefaults.standard.bool(forKey: "ClaudeCodeConnected"))
 
-        viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.claudeCode])
+        viewModel.test_completeContextBuilderProviderValidation(verifiedProviders: [.claudeCode, .ohMyPi])
         XCTAssertEqual(viewModel.recommendationProviderStatusSnapshot.claudeCodeCLI, .ready)
         XCTAssertTrue(viewModel.contextBuilderRestorationAvailabilityContext.claudeCodeAvailable)
+        XCTAssertTrue(viewModel.contextBuilderRestorationAvailabilityContext.ohMyPiAvailable)
+        XCTAssertTrue(viewModel.isContextBuilderProviderRuntimeReady(.ohMyPi))
+
+        viewModel.isOhMyPiConnected = false
+        XCTAssertFalse(viewModel.isContextBuilderProviderRuntimeReady(.ohMyPi))
+        XCTAssertTrue(viewModel.isContextBuilderProviderRuntimeReady(.codexExec))
+    }
+
+    func testOhMyPiRuntimeReadinessBlocksLaunchAndRechecksBeforeProviderConstruction() async throws {
+        let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        var providerCreationCount = 0
+        let composition = WindowStateCompositionFactory.make(
+            windowID: -901,
+            deferredInitialAgentSystemWorkspaceRefresh: true,
+            sharedMCPService: MCPService(),
+            contextBuilderProviderFactory: { _, _, _ in
+                providerCreationCount += 1
+                throw CocoaError(.featureUnsupported)
+            },
+            loadStoredAPISettingsDataOnInit: false
+        )
+        GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)
+        try await composition.workspaceManager.awaitInitialized(timeout: .seconds(60))
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContextBuilderOMPRuntimeReadiness-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspace = composition.workspaceManager.createWorkspace(
+            name: "Context Builder OMP readiness",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        await composition.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "ContextBuilderModelStartupSelectionTests.ompRuntimeReadiness"
+        )
+
+        let apiSettings = composition.apiSettingsViewModel
+        let viewModel = composition.contextBuilderAgentViewModel
+        apiSettings.isOhMyPiConnected = true
+        apiSettings.test_resetContextBuilderProviderValidation()
+        viewModel.selectedAgent = .ohMyPi
+        viewModel.runContextBuilderAgent()
+
+        let tabID = try XCTUnwrap(composition.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let rejectedSession = try XCTUnwrap(viewModel.sessions[tabID])
+        guard case let .failed(rejection) = rejectedSession.agentRunState else {
+            XCTFail("Expected cached-but-unverified OMP launch rejection")
+            return
+        }
+        XCTAssertTrue(rejection.contains("must pass a connection check"), rejection)
+        XCTAssertEqual(providerCreationCount, 0)
+        XCTAssertNil(viewModel.activeRunIDForTesting(tabID: tabID))
+
+        apiSettings.test_completeContextBuilderProviderValidation(verifiedProviders: [.ohMyPi])
+        XCTAssertTrue(apiSettings.isContextBuilderProviderRuntimeReady(.ohMyPi))
+        var readinessRevoked = false
+        viewModel.installRunTestHooks(
+            ContextBuilderAgentViewModel.RunTestHooks(
+                beforeProcessingProviderEvent: nil,
+                providerEventDisposition: nil,
+                teardownCompleted: nil,
+                beforeProviderConstructionReadinessCheck: {
+                    readinessRevoked = true
+                    apiSettings.test_completeContextBuilderProviderValidation(verifiedProviders: [])
+                }
+            )
+        )
+        let providerBoundaryError = await viewModel.providerConstructionRuntimeReadinessErrorForTesting(
+            agent: .ohMyPi
+        )
+        XCTAssertTrue(readinessRevoked)
+        XCTAssertEqual(
+            providerBoundaryError,
+            "Oh My Pi must pass a connection check in this app launch before Context Builder can run."
+        )
+        XCTAssertEqual(providerCreationCount, 0)
+
+        viewModel.installRunTestHooks(nil)
+        viewModel.prepareForWindowClose()
+        apiSettings.prepareForWindowClose()
+        composition.workspaceManager.prepareForWindowClose()
+        await composition.mcpServer.stopServer()
+        await composition.mcpServer.shutdownListener()
     }
 
     private func awaitFirstEvent(

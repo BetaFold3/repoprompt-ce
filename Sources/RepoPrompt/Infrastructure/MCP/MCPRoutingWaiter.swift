@@ -8,6 +8,12 @@ import OSLog
 /// This replaces the polling loop in `releaseGateWhenRouted` with an event-driven wait.
 /// Follows the same continuation-based pattern as `HeadlessAgentConnectionGate`.
 actor MCPRoutingWaiter {
+    enum WaitOutcome: Equatable {
+        case routed
+        case notRouted
+        case unregistered
+    }
+
     static let shared = MCPRoutingWaiter()
 
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "RoutingWaiter")
@@ -49,21 +55,28 @@ actor MCPRoutingWaiter {
     ///     A timeout affects only this waiter; other waiters remain pending for the run-level signal.
     /// - Returns: `true` if routing succeeded, `false` on failure, cancellation, or this waiter's timeout.
     func waitUntilRouted(runID: UUID, timeoutSeconds: TimeInterval) async -> Bool {
+        await waitUntilRoutedOutcome(runID: runID, timeoutSeconds: timeoutSeconds) == .routed
+    }
+
+    /// Preserves the distinction between a registered run that failed or timed out and a run whose
+    /// waiter receipt was already cleaned up. Late pre-prompt barriers revalidate current live-route
+    /// authority for both successful states; known routing failure remains terminal and fail closed.
+    func waitUntilRoutedOutcome(runID: UUID, timeoutSeconds: TimeInterval) async -> WaitOutcome {
         // Fast path: already resolved
         if let state = waitersByRunID[runID], state.isTerminal {
             log.info("waitUntilRouted fast-path: runID=\(runID.uuidString) didRoute=\(state.didRoute)")
-            return state.didRoute
+            return state.didRoute ? .routed : .notRouted
         }
 
         // Safety check: runID must be registered before waiting.
         guard waitersByRunID[runID] != nil else {
-            log.warning("waitUntilRouted: unregistered runID \(runID.uuidString) - returning false")
-            return false
+            log.warning("waitUntilRouted: unregistered runID \(runID.uuidString) - returning unregistered")
+            return .unregistered
         }
 
         // Wait via continuation with per-waiter identity for targeted timeout/cancellation.
         let waiterID = UUID()
-        return await withTaskCancellationHandler {
+        let routed = await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
                 // Check again in case resolved while setting up
                 if let state = waitersByRunID[runID], state.isTerminal {
@@ -93,6 +106,7 @@ actor MCPRoutingWaiter {
         } onCancel: {
             Task { await self.handleCancellation(runID: runID, waiterID: waiterID) }
         }
+        return routed ? .routed : .notRouted
     }
 
     /// Called when a runID is successfully bound to a connection/window.
@@ -237,6 +251,10 @@ extension MCPRoutingWaiter {
     ///   - timeoutSeconds: Maximum time to wait. If <= 0, waits indefinitely.
     static func waitUntilRouted(runID: UUID, timeoutSeconds: TimeInterval) async -> Bool {
         await shared.waitUntilRouted(runID: runID, timeoutSeconds: timeoutSeconds)
+    }
+
+    static func waitUntilRoutedOutcome(runID: UUID, timeoutSeconds: TimeInterval) async -> WaitOutcome {
+        await shared.waitUntilRoutedOutcome(runID: runID, timeoutSeconds: timeoutSeconds)
     }
 
     /// Notify that a runID was successfully routed (async version).

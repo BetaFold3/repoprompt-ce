@@ -166,7 +166,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 externalMCP: "RepoPrompt MCP only",
                 search: "RepoPrompt MCP only",
                 approvalModeDescription: "OMP yolo; strict RepoPrompt-only duplicate approval",
-                warnings: ["Dark integration: poisoned-workspace isolation and server-side deny behavior are not yet proven live."]
+                warnings: []
             )
         case .cursor:
             let level = cursorPermissionLevel(profile: profile)

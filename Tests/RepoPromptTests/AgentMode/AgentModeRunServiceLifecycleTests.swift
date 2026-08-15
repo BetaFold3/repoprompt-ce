@@ -2198,7 +2198,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
-    func testDarkOhMyPiPersistedOrMCPConfiguredSelectionFailsBeforeProviderDispatch() async throws {
+    func testQualifiedOhMyPiDeniedAuthorizationFailsBeforeBootstrap() async throws {
         XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
 
         let recorder = LifecycleRecorder()
@@ -2232,7 +2232,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
         let persistedSelection = AgentModelCatalog.normalizePersistedSelection(
             agentRaw: AgentProviderKind.ohMyPi.rawValue,
-            modelRaw: AgentModel.defaultModel.rawValue
+            modelRaw: AgentModel.defaultModel.rawValue,
+            availability: .init(ohMyPiAvailable: true)
         )
         XCTAssertEqual(persistedSelection.agent, .ohMyPi)
 
@@ -2282,7 +2283,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(bootstrapEntries, 0)
         XCTAssertEqual(
             session.items.filter { $0.kind == .error }.map(\.text),
-            ["Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session."]
+            ["Oh My Pi provider start authorization was denied."]
         )
         XCTAssertEqual(deniedAuthorization?.0, qualificationSessionID)
         XCTAssertNotNil(deniedAuthorization?.1)
@@ -2369,6 +2370,46 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertEqual(session.runState, .running, "\(behavior)")
             _ = session.endRunAttempt(ifCurrent: ownership, source: "test.cleanup")
         }
+    }
+
+    func testNormalOhMyPiStartWithoutQualificationContextReachesACPProvider() async {
+        let recorder = LifecycleRecorder()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in
+                recorder.record("factory:acp-provider")
+                return provider
+            },
+            acpControllerFactory: { _, _ in
+                recorder.record("factory:acp-controller")
+                throw LifecycleTestError.expectedACPDispatchStop
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "public omp",
+            initialMessageForRun: "public omp",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        XCTAssertEqual(session.runState, .failed)
+        XCTAssertTrue(recorder.contains("factory:acp-provider"))
+        XCTAssertTrue(recorder.contains("provider:support"))
+        XCTAssertTrue(recorder.contains("factory:acp-controller"))
+        assertOrderedEvents(
+            ["factory:acp-provider", "provider:support", "factory:acp-controller"],
+            in: recorder
+        )
     }
 
     func testStartRunDispatchesCurrentProviderFamiliesWithoutHeadlessFallback() async throws {

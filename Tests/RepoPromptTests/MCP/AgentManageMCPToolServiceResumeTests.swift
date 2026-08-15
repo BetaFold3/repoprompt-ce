@@ -102,76 +102,71 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         )
     }
 
-    #if DEBUG
-        func testResumeRejectsOhMyPiWhileSmokeGateEnabled() async throws {
-            try OhMyPiAgentModeSmokeGate.shared.acquireForTesting()
-            defer {
-                AgentACPModelRegistry.shared.reset(providerID: .ohMyPi)
-                OhMyPiAgentModeSmokeGate.shared.resetForTesting()
-            }
-
-            let modelRaw = "smoke-provider/exact-model"
-            let discovered = ACPDiscoveredSessionModels(
-                options: [
-                    AgentModelOption(
-                        rawValue: modelRaw,
-                        displayName: "Exact Smoke Model",
-                        description: nil,
-                        isPlaceholderDefault: false,
-                        isProviderDefault: true
-                    )
-                ],
-                currentModelRaw: modelRaw
-            )
-            XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .ohMyPi))
-
-            let window = try await makeWindow()
-            defer { WindowStatesManager.shared.unregisterWindowState(window) }
-            window.apiSettingsViewModel.isOhMyPiConnected = true
-
-            let sessionID = UUID()
-            let tabID = UUID()
-            let session = await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
-            _ = window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
-            let modelID = AgentModelSelectionID(
-                agentRaw: AgentProviderKind.ohMyPi.rawValue,
-                modelRaw: modelRaw
-            ).rawValue
-
-            session.selectedAgent = .ohMyPi
-            session.selectedModelRaw = modelRaw
-            let service = makeService(window: window, connectionID: UUID())
-            let resumeArguments: [[String: Value]] = [
-                [
-                    "op": .string("resume_session"),
-                    "session_id": .string(sessionID.uuidString),
-                    "model_id": .string(modelID)
-                ],
-                [
-                    "op": .string("resume_session"),
-                    "session_id": .string(sessionID.uuidString)
-                ]
-            ]
-            for arguments in resumeArguments {
-                do {
-                    _ = try await service.execute(args: arguments)
-                    XCTFail("Expected OMP resume to be rejected")
-                } catch let error as MCPError {
-                    guard case let .invalidParams(message) = error else {
-                        return XCTFail("Expected invalidParams, got \(error)")
-                    }
-                    XCTAssertEqual(
-                        message,
-                        "Oh My Pi sessions cannot be resumed. Start a fresh OMP session with agent_run op=start or agent_manage op=create_session."
-                    )
-                }
-                XCTAssertTrue(window.agentModeViewModel.session(for: tabID, createIfNeeded: false) === session)
-                XCTAssertEqual(window.agentModeViewModel.test_bindingResolution(sessionID: sessionID), .unique(tabID: tabID))
-                XCTAssertEqual(session.selectedAgent, .ohMyPi)
-                XCTAssertEqual(session.selectedModelRaw, modelRaw)
-            }
+    func testResumeAcceptsConnectedOhMyPiWithoutQualificationLease() async throws {
+        defer {
+            AgentACPModelRegistry.shared.reset(providerID: .ohMyPi)
         }
-    #endif
+
+        let modelRaw = "smoke-provider/exact-model"
+        let discovered = ACPDiscoveredSessionModels(
+            options: [
+                AgentModelOption(
+                    rawValue: modelRaw,
+                    displayName: "Exact Smoke Model",
+                    description: nil,
+                    isPlaceholderDefault: false,
+                    isProviderDefault: true
+                )
+            ],
+            currentModelRaw: modelRaw
+        )
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .ohMyPi))
+
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        window.apiSettingsViewModel.isOhMyPiConnected = true
+
+        let sessionID = UUID()
+        let tabID = UUID()
+        let session = await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        let modelID = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.ohMyPi.rawValue,
+            modelRaw: modelRaw
+        ).rawValue
+
+        session.selectedAgent = .ohMyPi
+        session.selectedModelRaw = modelRaw
+        let service = makeService(window: window, connectionID: UUID())
+        let resumeArguments: [[String: Value]] = [
+            [
+                "op": .string("resume_session"),
+                "session_id": .string(sessionID.uuidString),
+                "model_id": .string(modelID)
+            ],
+            [
+                "op": .string("resume_session"),
+                "session_id": .string(sessionID.uuidString)
+            ]
+        ]
+        for arguments in resumeArguments {
+            let result = try await service.execute(args: arguments)
+            XCTAssertEqual(result.objectValue?["session_id"]?.stringValue, sessionID.uuidString)
+            XCTAssertEqual(
+                result.objectValue?["agent"]?.objectValue?["id"]?.stringValue,
+                AgentProviderKind.ohMyPi.rawValue
+            )
+            XCTAssertTrue(window.agentModeViewModel.session(for: tabID, createIfNeeded: false) === session)
+            XCTAssertEqual(window.agentModeViewModel.test_bindingResolution(sessionID: sessionID), .unique(tabID: tabID))
+            XCTAssertEqual(session.selectedAgent, .ohMyPi)
+            XCTAssertEqual(session.selectedModelRaw, modelRaw)
+        }
+
+        await window.agentModeViewModel.mcpDeactivateControlContext(
+            sessionID: sessionID,
+            cleanupSessionStore: true
+        )
+    }
 
     func testGetLogHostRowIDAttributesAreFeatureGatedAndLegacyOutputIsByteIdentical() async throws {
         let window = try await makeWindow()

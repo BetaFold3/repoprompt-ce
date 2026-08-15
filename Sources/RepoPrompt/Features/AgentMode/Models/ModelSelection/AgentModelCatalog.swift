@@ -37,17 +37,12 @@ enum AgentModelCatalog {
 
         static var current: AvailabilityContext {
             let store = ClaudeCodeCompatibleBackendStore.shared
-            #if DEBUG
-                let ohMyPiAvailable = OhMyPiAgentModeSmokeGate.shared.isEnabled
-            #else
-                let ohMyPiAvailable = false
-            #endif
             return AvailabilityContext(
                 claudeCodeAvailable: true,
                 codexAvailable: true,
                 openCodeAvailable: true,
                 cursorAvailable: false,
-                ohMyPiAvailable: ohMyPiAvailable,
+                ohMyPiAvailable: false,
                 zaiConfigured: backendIsAvailable(.glmZAI, store: store),
                 kimiConfigured: backendIsAvailable(.kimi, store: store),
                 customClaudeCompatibleConfigured: backendIsAvailable(.custom, store: store)
@@ -188,39 +183,31 @@ enum AgentModelCatalog {
     }
 
     static var supportedCLIProviderAgents: [AgentProviderKind] {
-        let baseAgents: [AgentProviderKind] = [
+        [
             .codexExec,
             .claudeCode,
             .openCode,
-            .cursor
+            .cursor,
+            .ohMyPi
         ]
-        #if DEBUG
-            let agents = OhMyPiAgentModeSmokeGate.shared.isEnabled ? baseAgents + [.ohMyPi] : baseAgents
-        #else
-            let agents = baseAgents
-        #endif
-        return agents
     }
 
     static func selectableAgents(
         availability: AvailabilityContext = .current,
         surface: AgentSelectionSurface = .general
     ) -> [AgentProviderKind] {
-        let baseAgents: [AgentProviderKind] = [
+        [
             .codexExec,
             .claudeCode,
             .openCode,
             .cursor,
+            .ohMyPi,
             .claudeCodeGLM,
             .kimiCode,
             .customClaudeCompatible
-        ]
-        #if DEBUG
-            let agents = baseAgents + [.ohMyPi]
-        #else
-            let agents = baseAgents
-        #endif
-        return agents.filter { surface.allows($0) && isAgentAvailable($0, availability: availability) }
+        ].filter {
+            surface.allows($0) && isAgentAvailable($0, availability: availability)
+        }
     }
 
     static func hasUnconfiguredSupportedCLIProviders(
@@ -2098,14 +2085,9 @@ enum AgentModelCatalog {
     static func discoveryAgents(
         availability: AvailabilityContext = .current
     ) -> [DiscoveryAgent] {
-        #if DEBUG
-            let agents = AgentProviderKind.allCases.filter {
-                $0 != .ohMyPi || availability.ohMyPiAvailable
-            }
-        #else
-            let agents = AgentProviderKind.allCases.filter { $0 != .ohMyPi }
-        #endif
-        return agents.map { agent in
+        AgentProviderKind.allCases.filter {
+            $0 != .ohMyPi || availability.ohMyPiAvailable
+        }.map { agent in
             discoveryAgent(agent, availability: availability)
         }
     }

@@ -385,7 +385,7 @@ public class APISettingsViewModel: ObservableObject {
     @Published var openCodeError: String? = nil
     @Published private(set) var availableOpenCodeModelOptions: [AgentModelOption] = []
     private var openCodeLogCollector: CLIProcessLogCollector?
-    // Oh My Pi CLI / ACP (connection state is diagnostic only; public availability stays false)
+    // Oh My Pi CLI / ACP
     @Published var isOhMyPiConnected: Bool = UserDefaults.standard.bool(forKey: "OhMyPiCLIConnected")
     @Published var ohMyPiError: String? = nil
     @Published private(set) var availableOhMyPiModelOptions: [AgentModelOption] = []
@@ -475,9 +475,9 @@ public class APISettingsViewModel: ObservableObject {
 
     var agentModeAvailabilityContext: AgentModelCatalog.AvailabilityContext {
         #if DEBUG
-            let ohMyPiAvailable = OhMyPiAgentModeSmokeGate.shared.isEnabled
+            let ohMyPiAvailable = isOhMyPiConnected || OhMyPiAgentModeSmokeGate.shared.isEnabled
         #else
-            let ohMyPiAvailable = false
+            let ohMyPiAvailable = isOhMyPiConnected
         #endif
         return AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: isClaudeCodeConnected,
@@ -514,6 +514,7 @@ public class APISettingsViewModel: ObservableObject {
             $isClaudeCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isOhMyPiConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
@@ -545,10 +546,22 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isVerifiedContextBuilderProvider(.codexExec) && isCodexConnected,
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
+            ohMyPiAvailable: isVerifiedContextBuilderProvider(.ohMyPi) && isOhMyPiConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
         )
+    }
+
+    /// Runtime launch authority for Context Builder. Existing providers retain their established
+    /// launch behavior; OMP additionally requires a current-process verification immediately at
+    /// each launch boundary. The hidden DEBUG qualification lease remains the only strict override.
+    func isContextBuilderProviderRuntimeReady(_ provider: AgentProviderKind) -> Bool {
+        guard provider == .ohMyPi else { return true }
+        #if DEBUG
+            if OhMyPiAgentModeSmokeGate.shared.isEnabled { return true }
+        #endif
+        return isOhMyPiConnected && isVerifiedContextBuilderProvider(.ohMyPi)
     }
 
     var recommendationProviderStatusSnapshot: ProviderStatusSnapshot {
@@ -597,7 +610,9 @@ public class APISettingsViewModel: ObservableObject {
             isOpenCodeConnected
         case .cursor:
             isCursorConnected
-        case .ohMyPi, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .ohMyPi:
+            isOhMyPiConnected
+        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
     }
@@ -643,6 +658,7 @@ public class APISettingsViewModel: ObservableObject {
             NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
             NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
             NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
+            NotificationCenter.default.publisher(for: .ohMyPiConnectionChanged).map { _ in AgentProviderKind.ohMyPi },
             NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor }
         ])
         .receive(on: DispatchQueue.main)
@@ -658,6 +674,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func reloadCLIConnectionFlagsFromDefaults() {
+        let wasOhMyPiConnected = isOhMyPiConnected
         let wasCursorConnected = isCursorConnected
         isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
         if isClaudeCodeConnected {
@@ -665,13 +682,23 @@ public class APISettingsViewModel: ObservableObject {
         }
         isCodexConnected = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
+        isOhMyPiConnected = UserDefaults.standard.bool(forKey: "OhMyPiCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
-        guard wasCursorConnected != isCursorConnected else { return }
-        if isCursorConnected {
-            startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
-        } else {
-            stopCursorModelsSubscription(clearModels: true)
+        if wasOhMyPiConnected != isOhMyPiConnected {
+            if isOhMyPiConnected {
+                startOhMyPiModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopOhMyPiModelsSubscription(clearModels: true)
+            }
         }
+        if wasCursorConnected != isCursorConnected {
+            if isCursorConnected {
+                startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopCursorModelsSubscription(clearModels: true)
+            }
+        }
+        guard wasOhMyPiConnected != isOhMyPiConnected || wasCursorConnected != isCursorConnected else { return }
         Task { await updateAvailableModels() }
     }
 
@@ -1650,6 +1677,7 @@ public class APISettingsViewModel: ObservableObject {
         let shouldValidateClaudeBinary = hasActiveClaudeCompatibleBackend
         let shouldValidateCodex = isCodexConnected
         let shouldValidateOpenCode = isOpenCodeConnected
+        let shouldValidateOhMyPi = isOhMyPiConnected
         let shouldValidateCursor = isCursorConnected
 
         let task = Task { @MainActor [weak self] in
@@ -1661,14 +1689,16 @@ public class APISettingsViewModel: ObservableObject {
             )
             async let codexReady = probeCachedCodexConnection(ifNeeded: shouldValidateCodex)
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
+            async let ohMyPiReady = probeCachedOhMyPiConnection(ifNeeded: shouldValidateOhMyPi)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
-            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady)
+            let readiness = await (claudeReady, codexReady, openCodeReady, ohMyPiReady, cursorReady)
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
             applyContextBuilderProviderValidationResult(readiness.1, provider: .codexExec)
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
-            applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
+            applyContextBuilderProviderValidationResult(readiness.3, provider: .ohMyPi)
+            applyContextBuilderProviderValidationResult(readiness.4, provider: .cursor)
             if isCodexConnected, isVerifiedContextBuilderProvider(.codexExec) {
                 startCodexModelsSubscriptionIfNeeded()
             }
@@ -1752,6 +1782,16 @@ public class APISettingsViewModel: ObservableObject {
             return true
         }
         return await OpenCodeACPModelPollingService.shared.refreshNow(workspacePath: nil)
+    }
+
+    private func probeCachedOhMyPiConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await OhMyPiACPModelPollingService.shared.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        return await OhMyPiACPModelPollingService.shared.refreshNow(workspacePath: nil)
     }
 
     private func probeCachedCursorConnection(ifNeeded: Bool) async -> Bool {
@@ -3849,7 +3889,6 @@ public class APISettingsViewModel: ObservableObject {
 
     // MARK: - Oh My Pi CLI / ACP
 
-    /// Diagnostic preflight only. A successful probe does not enable public OMP availability.
     func testOhMyPiConnection() async throws -> Bool {
         let collector = CLIProcessLogCollector()
         collector.append("Oh My Pi CLI connection test started")
@@ -3865,15 +3904,17 @@ public class APISettingsViewModel: ObservableObject {
             }
             availableOhMyPiModelOptions = snapshot.models.options
             isOhMyPiConnected = true
+            setContextBuilderProviderVerified(.ohMyPi, verified: true)
             ohMyPiError = nil
             UserDefaults.standard.set(true, forKey: "OhMyPiCLIConnected")
             startOhMyPiModelsSubscriptionIfNeeded(workspacePath: nil)
-            collector.append("Discovered \(snapshot.models.options.count) Oh My Pi model option(s); public availability remains disabled")
+            collector.append("Discovered \(snapshot.models.options.count) Oh My Pi model option(s); provider is available")
             ohMyPiLogCollector = nil
             NotificationCenter.default.post(name: .ohMyPiConnectionChanged, object: nil, userInfo: ["windowID": 0])
             return true
         } catch {
             isOhMyPiConnected = false
+            setContextBuilderProviderVerified(.ohMyPi, verified: false)
             ohMyPiError = friendlyOhMyPiMessage(for: error)
             UserDefaults.standard.set(false, forKey: "OhMyPiCLIConnected")
             stopOhMyPiModelsSubscription(clearModels: true)
@@ -3885,6 +3926,7 @@ public class APISettingsViewModel: ObservableObject {
 
     func disconnectOhMyPi() {
         isOhMyPiConnected = false
+        setContextBuilderProviderVerified(.ohMyPi, verified: false)
         ohMyPiError = nil
         UserDefaults.standard.set(false, forKey: "OhMyPiCLIConnected")
         stopOhMyPiModelsSubscription(clearModels: true)
@@ -3937,8 +3979,13 @@ public class APISettingsViewModel: ObservableObject {
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
-                    self?.availableOhMyPiModelOptions = snapshot.models.options
+                    guard let self else { return }
+                    availableOhMyPiModelOptions = snapshot.models.options
+                    if snapshot.isLiveDiscovery {
+                        setContextBuilderProviderVerified(.ohMyPi, verified: true)
+                    }
                 }
+                await self?.updateAvailableModels()
             }
         }
     }

@@ -52,9 +52,9 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     /// Captured and verified production MCP `clientInfo.name`; independent of ACP `agentInfo.name`.
     static let ohMyPiMCPClientID = "omp-coding-agent"
 
-    /// Provider values exposed by public Context Builder settings while dark providers remain unavailable.
+    /// Provider values exposed by public Context Builder settings.
     static var publicContextBuilderCases: [Self] {
-        allCases.filter { $0 != .ohMyPi }
+        allCases
     }
 
     var commandName: String {
@@ -162,7 +162,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         case .cursor:
             return "Cursor CLI ACP agent. Uses Cursor's ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
         case .ohMyPi:
-            return "Oh My Pi ACP agent. Runs a fixed barebones profile with RepoPrompt MCP as its sole tool surface; public availability remains gated."
+            return "Oh My Pi ACP agent. Runs a fixed barebones profile with RepoPrompt MCP as its sole tool surface."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -256,11 +256,6 @@ final class AgentRuntimeProviderService {
         workspacePath: String? = nil,
         defaults: UserDefaults = .standard
     ) throws -> HeadlessAgentProvider {
-        if agent == .ohMyPi {
-            throw AIProviderError.invalidConfiguration(
-                detail: "Oh My Pi generic headless starts are disabled. Model discovery uses the dedicated ACP polling path; qualification runs require the fresh-session Agent Mode transaction."
-            )
-        }
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
         }

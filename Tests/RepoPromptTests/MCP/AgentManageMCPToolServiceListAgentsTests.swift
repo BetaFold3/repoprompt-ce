@@ -7,17 +7,17 @@ import XCTest
 final class AgentManageMCPToolServiceListAgentsTests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
         #if DEBUG
             await OMPQualificationSharedGateTestIsolation.shared.acquire()
             OhMyPiAgentModeSmokeGate.shared.resetForTesting()
-            AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
         #endif
     }
 
     override func tearDown() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
         #if DEBUG
             OhMyPiAgentModeSmokeGate.shared.resetForTesting()
-            AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
             await OMPQualificationSharedGateTestIsolation.shared.release()
         #endif
         try await super.tearDown()
@@ -59,31 +59,27 @@ final class AgentManageMCPToolServiceListAgentsTests: XCTestCase {
         XCTAssertNotEqual(effortModel["name"]?.stringValue, effortModel["model_display_name"]?.stringValue)
     }
 
-    func testFirstQualificationListAgentsAdvertisesOnlyOhMyPiDefaultSentinel() async throws {
-        #if DEBUG
-            let window = try await makeWindow()
-            defer { WindowStatesManager.shared.unregisterWindowState(window) }
-            _ = try OhMyPiAgentModeSmokeGate.shared.acquireForTesting()
+    func testConnectedOhMyPiListAgentsAdvertisesDefaultSentinel() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        window.apiSettingsViewModel.isOhMyPiConnected = true
 
-            let value = try await makeService(window: window).execute(args: ["op": .string("list_agents")])
-            let agents = try XCTUnwrap(value.objectValue?["agents"]?.arrayValue)
-            let ohMyPi = try XCTUnwrap(agents.compactMap(\.objectValue).first { agent in
-                agent["models"]?.arrayValue?.contains { model in
-                    model.objectValue?["agent_id"]?.stringValue == AgentProviderKind.ohMyPi.rawValue
-                } == true
-            })
-            XCTAssertEqual(ohMyPi["name"]?.stringValue, "Oh My Pi")
-            XCTAssertEqual(ohMyPi["available"]?.boolValue, true)
-            let models = try XCTUnwrap(ohMyPi["models"]?.arrayValue).compactMap(\.objectValue)
-            XCTAssertEqual(models.count, 1)
-            XCTAssertEqual(models[0]["model_id"]?.stringValue, "ohMyPi:default")
-            XCTAssertEqual(ohMyPi["default_model_id"]?.stringValue, "ohMyPi:default")
-        #else
-            throw XCTSkip("OMP qualification discovery is DEBUG-only")
-        #endif
+        let value = try await makeService(window: window).execute(args: ["op": .string("list_agents")])
+        let agents = try XCTUnwrap(value.objectValue?["agents"]?.arrayValue)
+        let ohMyPi = try XCTUnwrap(agents.compactMap(\.objectValue).first { agent in
+            agent["models"]?.arrayValue?.contains { model in
+                model.objectValue?["agent_id"]?.stringValue == AgentProviderKind.ohMyPi.rawValue
+            } == true
+        })
+        XCTAssertEqual(ohMyPi["name"]?.stringValue, "Oh My Pi")
+        XCTAssertEqual(ohMyPi["available"]?.boolValue, true)
+        let models = try XCTUnwrap(ohMyPi["models"]?.arrayValue).compactMap(\.objectValue)
+        XCTAssertEqual(models.count, 1)
+        XCTAssertEqual(models[0]["model_id"]?.stringValue, "ohMyPi:default")
+        XCTAssertEqual(ohMyPi["default_model_id"]?.stringValue, "ohMyPi:default")
     }
 
-    func testFirstQualificationLedgerKeepsSharedGateIsolationContract() throws {
+    func testQualificationLedgerKeepsSharedGateIsolationContract() throws {
         let ledgerURL = try RepoRoot.url()
             .appendingPathComponent("Scripts/Fixtures/test-suite-contract-ledger.tsv")
         let lines = try String(contentsOf: ledgerURL, encoding: .utf8)
@@ -98,7 +94,7 @@ final class AgentManageMCPToolServiceListAgentsTests: XCTestCase {
         let notesIndex = try XCTUnwrap(header.firstIndex(of: "notes"))
         let target = try XCTUnwrap(lines.dropFirst().first {
             $0.indices.contains(methodIndex)
-                && $0[methodIndex] == "testFirstQualificationListAgentsAdvertisesOnlyOhMyPiDefaultSentinel"
+                && $0[methodIndex] == "testConnectedOhMyPiListAgentsAdvertisesDefaultSentinel"
         })
 
         XCTAssertEqual(
@@ -126,17 +122,17 @@ final class AgentManageMCPToolServiceListAgentsTests: XCTestCase {
             )
         }
 
-        let darkSelection = try XCTUnwrap(lines.dropFirst().first {
+        let qualifiedSelection = try XCTUnwrap(lines.dropFirst().first {
             $0.indices.contains(methodIndex)
-                && $0[methodIndex] == "testDarkOhMyPiPersistedOrMCPConfiguredSelectionFailsBeforeProviderDispatch"
+                && $0[methodIndex] == "testQualifiedOhMyPiDeniedAuthorizationFailsBeforeBootstrap"
         })
-        XCTAssertTrue(darkSelection[assertionIndex].contains("may construct the provider and controller"))
-        XCTAssertTrue(darkSelection[assertionIndex].contains("before controller.bootstrap()"))
-        XCTAssertTrue(darkSelection[assertionIndex].contains("never creates a provider process"))
-        XCTAssertTrue(darkSelection[notesIndex].contains("local synthetic qualification transaction"))
-        XCTAssertTrue(darkSelection[notesIndex].contains("injects denial"))
-        XCTAssertTrue(darkSelection[notesIndex].contains("suite teardown resets shared process state"))
-        XCTAssertTrue(darkSelection[notesIndex].contains("No provider process is created"))
+        XCTAssertTrue(qualifiedSelection[assertionIndex].contains("may construct the provider and controller"))
+        XCTAssertTrue(qualifiedSelection[assertionIndex].contains("before controller.bootstrap()"))
+        XCTAssertTrue(qualifiedSelection[assertionIndex].contains("never creates a provider process"))
+        XCTAssertTrue(qualifiedSelection[notesIndex].contains("local synthetic qualification transaction"))
+        XCTAssertTrue(qualifiedSelection[notesIndex].contains("injects denial"))
+        XCTAssertTrue(qualifiedSelection[notesIndex].contains("suite teardown resets shared process state"))
+        XCTAssertTrue(qualifiedSelection[notesIndex].contains("No provider process is created"))
 
         let deadline = try XCTUnwrap(lines.dropFirst().first {
             $0.indices.contains(methodIndex)

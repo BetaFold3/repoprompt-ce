@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 
 final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
-    func testReleaseProjectionOmitsBenchmarkPhasesSchemaAndDiagnosticSurface() throws {
+    func testReleaseProjectionOmitsDebugQualificationAndPermitsPublicOhMyPiStart() throws {
         let root = try RepoRoot.url()
         let files = [
             "Sources/RepoPrompt/Features/Diagnostics/App/WorktreeStartupInstrumentation.swift",
@@ -70,10 +70,6 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
                 "Release-absence assertion is vacuous for \(sourceBackedIdentifier)"
             )
         }
-        XCTAssertTrue(
-            projection.contains("selectedAgent != .ohMyPi"),
-            "RELEASE must retain the provider-start fail-closed OMP barrier"
-        )
         let runnerSource = try String(
             contentsOf: root.appendingPathComponent(
                 "Sources/RepoPrompt/Features/AgentMode/Runtime/Runners/ACPIntegratedAgentModeRunner.swift"
@@ -107,15 +103,16 @@ final class WorktreeStartupBenchmarkReleaseAbsenceTests: XCTestCase {
             encoding: .utf8
         )
         let releaseService = releaseProjection(serviceSource)
-        let darknessStart = try XCTUnwrap(releaseService.range(of: "if selectedAgent == .ohMyPi"))
-        let darknessTail = releaseService[darknessStart.lowerBound...]
-        let failure = try XCTUnwrap(darknessTail.range(of: "await failBeforeProviderStartup"))
-        let terminalReturn = try XCTUnwrap(darknessTail.range(of: "return nil"))
-        XCTAssertLessThan(failure.lowerBound, terminalReturn.lowerBound)
+        XCTAssertTrue(
+            releaseService.contains("let providerStartAuthorizer: (UUID) -> Bool = { _ in true }"),
+            "RELEASE must permit normal public OMP starts without a hidden qualification context"
+        )
+        XCTAssertFalse(releaseService.contains("Oh My Pi support is not enabled in this build."))
+        XCTAssertFalse(releaseService.contains("if selectedAgent == .ohMyPi"))
         XCTAssertTrue(
             releaseRunner[freshAuthorization.lowerBound ..< bootstrap.lowerBound]
                 .contains("return"),
-            "A denied RELEASE OMP authorizer must return before controller.bootstrap()"
+            "A caller-supplied denied authorizer must still return before controller.bootstrap()"
         )
         for forbidden in [
             "firstBenchmarkSearchStarted",

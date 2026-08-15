@@ -1,12 +1,14 @@
 import Foundation
 
-/// Fresh-session-only headless adapter for OMP.
+/// Headless ACP adapter for OMP.
 ///
-/// Resume identifiers are intentionally discarded until cross-process session/load with
-/// MCP re-registration is proven. Transcript handoff remains part of the fresh prompt.
+/// Persisted provider session identifiers are forwarded to OMP's session/load path. Load
+/// failures remain fail-closed so a missing transcript is never replaced by a silent fresh session.
 final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
     typealias ProviderFactory = @Sendable (_ config: OhMyPiAgentConfig) -> any ACPAgentProvider
     typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
+    typealias RoutingOutcomeWaiter = @Sendable (UUID, TimeInterval) async -> MCPRoutingWaiter.WaitOutcome
+    typealias LiveRouteVerifier = @Sendable (UUID) async -> Bool
 
     private let config: OhMyPiAgentConfig
     private let bridge: ACPHeadlessAgentProviderBridge
@@ -43,17 +45,14 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
             },
             makeController: controllerFactory,
             beforePrompt: { controller, _, runID in
-                let routed = await MCPRoutingWaiter.waitUntilRouted(
-                    runID: runID,
-                    timeoutSeconds: Double(ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds) / 1000
-                )
+                if let model = Self.selectedModelToApply(config: config) {
+                    try await controller.setSessionModel(model)
+                }
+                let routed = await Self.prePromptMCPRouteIsReady(runID: runID)
                 guard routed else {
                     throw AIProviderError.invalidConfiguration(
                         detail: "Oh My Pi MCP routing did not complete before prompt dispatch."
                     )
-                }
-                if let model = Self.selectedModelToApply(config: config) {
-                    try await controller.setSessionModel(model)
                 }
             },
             approvalPolicy: .declineUnsupported
@@ -74,16 +73,42 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
     static func makeRunRequest(
         config: OhMyPiAgentConfig,
         workspacePath: String?,
-        message _: AgentMessage
+        message: AgentMessage
     ) -> ACPRunRequest {
         ACPRunRequest(
             agentKind: .ohMyPi,
             modelString: config.modelString,
             workspacePath: workspacePath,
-            resumeSessionID: nil,
+            resumeSessionID: message.resumeSessionID,
             attachments: [],
             taskLabelKind: nil
         )
+    }
+
+    static func prePromptMCPRouteIsReady(
+        runID: UUID,
+        timeoutSeconds: TimeInterval = Double(ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds) / 1000,
+        waitForRoutingOutcome: @escaping RoutingOutcomeWaiter = { runID, timeoutSeconds in
+            await MCPRoutingWaiter.waitUntilRoutedOutcome(
+                runID: runID,
+                timeoutSeconds: timeoutSeconds
+            )
+        },
+        verifyLiveRoute: @escaping LiveRouteVerifier = { runID in
+            await ServerNetworkManager.shared.hasAuthoritativeLiveRunRoute(
+                runID: runID,
+                expectedClientName: AgentProviderKind.ohMyPiMCPClientID
+            )
+        }
+    ) async -> Bool {
+        switch await waitForRoutingOutcome(runID, timeoutSeconds) {
+        case .notRouted:
+            return false
+        case .routed, .unregistered:
+            guard !Task.isCancelled else { return false }
+            let hasLiveRoute = await verifyLiveRoute(runID)
+            return hasLiveRoute && !Task.isCancelled
+        }
     }
 
     static func selectedModelToApply(config: OhMyPiAgentConfig) -> String? {

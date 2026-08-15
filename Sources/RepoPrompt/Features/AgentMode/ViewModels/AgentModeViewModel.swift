@@ -15400,16 +15400,18 @@ final class AgentModeViewModel: ObservableObject {
         hasAttachments: Bool,
         hasPendingHandoff: Bool
     ) -> (shouldBypassHistoryReplay: Bool, resumeSessionID: String?) {
-        // OMP advertises loadSession, but product runs intentionally remain fresh-only.
+        let normalizedProviderSessionID = providerSessionID
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.isEmpty ? nil : $0 }
         let supportsSessionResume = agent.usesClaudeNativeRuntime
-            || (agent.acpProviderID != nil && agent != .ohMyPi)
+            || agent.acpProviderID != nil
         let keepsAttachmentsAtTopLevel = agent.usesClaudeNativeRuntime || agent.acpProviderID != nil
         let shouldBypassHistoryReplay = hasPendingHandoff
-            || (supportsSessionResume && providerSessionID != nil)
+            || (supportsSessionResume && normalizedProviderSessionID != nil)
             || (keepsAttachmentsAtTopLevel && hasAttachments)
         return (
             shouldBypassHistoryReplay,
-            shouldBypassHistoryReplay && supportsSessionResume ? providerSessionID : nil
+            shouldBypassHistoryReplay && supportsSessionResume ? normalizedProviderSessionID : nil
         )
     }
 

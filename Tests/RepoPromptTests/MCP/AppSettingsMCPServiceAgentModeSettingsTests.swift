@@ -1,6 +1,6 @@
 import Foundation
 import MCP
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 @MainActor
@@ -60,7 +60,7 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertFalse(store.codexReasoningSummariesEnabled())
     }
 
-    func testContextBuilderAgentAllowedValuesExcludeDarkOhMyPi() async throws {
+    func testContextBuilderAgentAllowedValuesAndExplicitOhMyPiSelectionRoundTrip() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -70,12 +70,29 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        let service = AppSettingsMCPService(
-            store: GlobalSettingsStore(
-                defaults: defaults,
-                fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
-            )
+        let providerID = ACPProviderID.ohMyPi
+        let modelRaw = "google-antigravity/gemini-3.6-flash"
+        AgentACPModelRegistry.shared.test_reset(providerID: providerID)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: providerID) }
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [AgentModelOption(
+                    rawValue: modelRaw,
+                    displayName: "Gemini 3.6 Flash",
+                    description: nil,
+                    isPlaceholderDefault: false,
+                    isProviderDefault: true
+                )],
+                currentModelRaw: modelRaw
+            ),
+            for: providerID
+        ))
+
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: root.appendingPathComponent("globalSettings.json"))
         )
+        let service = AppSettingsMCPService(store: store)
         let listed = try await service.handleForTesting([
             "op": .string("list"),
             "group": .string("context_builder"),
@@ -90,7 +107,25 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
 
         XCTAssertTrue(allowedValues.contains(AgentProviderKind.openCode.rawValue))
         XCTAssertTrue(allowedValues.contains(AgentProviderKind.cursor.rawValue))
-        XCTAssertFalse(allowedValues.contains(AgentProviderKind.ohMyPi.rawValue))
+        XCTAssertTrue(allowedValues.contains(AgentProviderKind.ohMyPi.rawValue))
+        XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
+
+        let setAgent = try await service.handleForTesting([
+            "op": .string("set"),
+            "key": .string("context_builder.agent"),
+            "value": .string(AgentProviderKind.ohMyPi.rawValue)
+        ])
+        XCTAssertEqual(setAgent.objectValue?["new_value"]?.stringValue, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(store.globalContextBuilderAgentSelection().agentRaw, AgentProviderKind.ohMyPi.rawValue)
+
+        let setModel = try await service.handleForTesting([
+            "op": .string("set"),
+            "key": .string("context_builder.model"),
+            "value": .string(modelRaw)
+        ])
+        XCTAssertEqual(setModel.objectValue?["new_value"]?.stringValue, modelRaw)
+        XCTAssertEqual(store.globalContextBuilderAgentSelection().agentRaw, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(store.globalContextBuilderAgentSelection().modelRaw, modelRaw)
     }
 
     func testSetWarnsWhenGlobalSettingsPersistenceIsBlocked() async throws {

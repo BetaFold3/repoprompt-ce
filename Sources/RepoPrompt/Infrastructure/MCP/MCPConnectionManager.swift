@@ -631,6 +631,138 @@ actor ServerNetworkManager {
         return resolvedWindowID
     }
 
+    struct LiveRunRouteActorEvidence {
+        let expectedRunID: UUID
+        let connectionRunID: UUID?
+        let policyWindowID: Int?
+        let cachedWindowID: Int?
+        let connectionWindowID: Int?
+        let assignedWindowID: Int?
+        let admittedClientName: String?
+        let connectionIsActive: Bool
+        let runWasAdmitted: Bool
+        let hasExpectedPIDAuthority: Bool
+    }
+
+    /// Verifies a route that has already been committed to the window's exact bidirectional run
+    /// mapping. This is intentionally stronger than a cached policy lookup: the connection must
+    /// still be active, carry the expected admitted client identity and PID-gated admission, and
+    /// match both the installed policy window and actor-local run window. The actor receipts are
+    /// sampled again after the final MainActor mapping hop so actor reentrancy cannot validate stale
+    /// policy, identity, connection, or expected-PID state.
+    func hasAuthoritativeLiveRunRoute(
+        runID: UUID,
+        expectedClientName: String
+    ) async -> Bool {
+        let liveMapping = await MainActor.run { () -> (windowID: Int, connectionID: UUID)? in
+            for window in WindowStatesManager.shared.allWindows {
+                guard let connectionID = window.mcpServer.liveConnectionID(forRunID: runID) else {
+                    continue
+                }
+                return (window.windowID, connectionID)
+            }
+            return nil
+        }
+        guard let liveMapping else { return false }
+
+        let initialActorEvidence = liveRunRouteActorEvidence(
+            runID: runID,
+            connectionID: liveMapping.connectionID
+        )
+        guard Self.validatedLiveRunRouteEvidence(
+            mappedWindowID: liveMapping.windowID,
+            expectedClientName: expectedClientName,
+            evidence: initialActorEvidence
+        ) else {
+            return false
+        }
+
+        let finalMappingIsLive = await MainActor.run {
+            guard let window = WindowStatesManager.shared.window(withID: liveMapping.windowID) else {
+                return false
+            }
+            return window.mcpServer.liveConnectionID(forRunID: runID) == liveMapping.connectionID
+        }
+        let finalActorEvidence = liveRunRouteActorEvidence(
+            runID: runID,
+            connectionID: liveMapping.connectionID
+        )
+        return Self.validatedLiveRunRouteAcrossFinalMappingHop(
+            mappedWindowID: liveMapping.windowID,
+            expectedClientName: expectedClientName,
+            initialEvidence: initialActorEvidence,
+            finalMappingIsLive: finalMappingIsLive,
+            finalEvidence: finalActorEvidence
+        )
+    }
+
+    private func liveRunRouteActorEvidence(
+        runID: UUID,
+        connectionID: UUID
+    ) -> LiveRunRouteActorEvidence {
+        LiveRunRouteActorEvidence(
+            expectedRunID: runID,
+            connectionRunID: runIDByConnectionID[connectionID],
+            policyWindowID: runPolicyStateByRunID[runID]?.windowID,
+            cachedWindowID: windowIDByRunID[runID],
+            connectionWindowID: connectionWindowMap[connectionID],
+            assignedWindowID: windowAssignmentByConnection[connectionID],
+            admittedClientName: clientIDByConnection[connectionID],
+            connectionIsActive: connections[connectionID] != nil,
+            runWasAdmitted: admittedPolicyRunIDs.contains(runID),
+            hasExpectedPIDAuthority: expectedAgentPIDsByRunID[runID]?.isEmpty == false
+        )
+    }
+
+    nonisolated static func validatedLiveRunRouteEvidence(
+        mappedWindowID: Int,
+        expectedClientName: String,
+        evidence: LiveRunRouteActorEvidence
+    ) -> Bool {
+        guard evidence.connectionIsActive,
+              evidence.connectionRunID == evidence.expectedRunID,
+              evidence.runWasAdmitted,
+              evidence.hasExpectedPIDAuthority,
+              MCPClientIdentity.matches(evidence.admittedClientName, expectedClientName)
+        else {
+            return false
+        }
+        guard let policyWindowID = evidence.policyWindowID,
+              policyWindowID == mappedWindowID,
+              let cachedWindowID = evidence.cachedWindowID,
+              cachedWindowID == mappedWindowID,
+              let connectionWindowID = evidence.connectionWindowID,
+              connectionWindowID == mappedWindowID,
+              let assignedWindowID = evidence.assignedWindowID,
+              assignedWindowID == mappedWindowID
+        else {
+            return false
+        }
+        return true
+    }
+
+    nonisolated static func validatedLiveRunRouteAcrossFinalMappingHop(
+        mappedWindowID: Int,
+        expectedClientName: String,
+        initialEvidence: LiveRunRouteActorEvidence,
+        finalMappingIsLive: Bool,
+        finalEvidence: LiveRunRouteActorEvidence
+    ) -> Bool {
+        guard validatedLiveRunRouteEvidence(
+            mappedWindowID: mappedWindowID,
+            expectedClientName: expectedClientName,
+            evidence: initialEvidence
+        ), finalMappingIsLive
+        else {
+            return false
+        }
+        return validatedLiveRunRouteEvidence(
+            mappedWindowID: mappedWindowID,
+            expectedClientName: expectedClientName,
+            evidence: finalEvidence
+        )
+    }
+
     static func sanitizedRoutingRestrictedTools(_ names: Set<String>) -> Set<String> {
         guard !names.isEmpty else { return [] }
         return names

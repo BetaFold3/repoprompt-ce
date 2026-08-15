@@ -3,12 +3,8 @@ import MCP
 
 @MainActor
 final class ACPIntegratedAgentModeRunner {
-    #if DEBUG
-        private static let ohMyPiAuthorizationFailureText =
-            "Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session."
-    #else
-        private static let ohMyPiAuthorizationFailureText = "Oh My Pi support is not enabled in this build."
-    #endif
+    private static let ohMyPiAuthorizationFailureText =
+        "Oh My Pi provider start authorization was denied."
 
     private struct ConsumeEventsOutcome {
         let terminalState: AgentSessionRunState

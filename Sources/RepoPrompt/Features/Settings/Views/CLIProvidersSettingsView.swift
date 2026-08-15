@@ -1945,18 +1945,18 @@ struct CLIProvidersSettingsView: View {
         return count == 1 ? "1 model discovered." : "\(count) models discovered."
     }
 
-    // MARK: - Oh My Pi Diagnostics Card
+    // MARK: - Oh My Pi CLI Card
 
     private var ohMyPiCard: some View {
         providerCard(
-            title: "Oh My Pi CLI (Preview Diagnostics)",
-            subtitle: "Validates the managed OMP ACP profile and dynamic model discovery. This provider remains unavailable for user runs.",
+            title: "Oh My Pi CLI",
+            subtitle: "Connects the managed OMP ACP profile and discovers available models.",
             infoURL: "https://github.com/can1357/oh-my-pi",
             isConnected: viewModel.isOhMyPiConnected,
             isExpanded: $isOhMyPiExpanded
         ) {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Dark integration only: a successful diagnostic does not enable Oh My Pi in Agent Mode, chat, recommendations, or delegated tasks.")
+                Text("Oh My Pi uses RepoPrompt MCP as its sole tool surface and becomes available in Agent Mode, delegated runs, and Context Builder after a successful connection test.")
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1968,7 +1968,7 @@ struct CLIProvidersSettingsView: View {
                                 .scaleEffect(0.6)
                                 .frame(height: 16)
                         } else {
-                            Label(viewModel.isOhMyPiConnected ? "Test Again" : "Run Diagnostic", systemImage: "stethoscope")
+                            Label(viewModel.isOhMyPiConnected ? "Test Again" : "Connect", systemImage: "bolt.horizontal.circle")
                         }
                     }
                     .disabled(isLoadingOhMyPi)
@@ -1983,7 +1983,7 @@ struct CLIProvidersSettingsView: View {
                     Spacer()
 
                     if viewModel.isOhMyPiConnected {
-                        Button("Clear Diagnostic State") {
+                        Button("Disconnect") {
                             viewModel.disconnectOhMyPi()
                         }
                         .buttonStyle(CustomButtonStyle())
@@ -2448,7 +2448,7 @@ struct CLIProvidersSettingsView: View {
                 await MainActor.run {
                     isLoadingOhMyPi = false
                     if ok {
-                        alertMessage = "Oh My Pi diagnostic passed. Public availability remains disabled."
+                        alertMessage = "Oh My Pi connected successfully."
                         showOhMyPiTraceDump = false
                     }
                     showAlert = true

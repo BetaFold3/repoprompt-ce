@@ -446,6 +446,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)?
             let runMCPFollowUp: MCPFollowUpRunner?
             let validateContextBuilderProviders: (@MainActor @Sendable () async -> Void)?
+            let beforeProviderConstructionReadinessCheck: (@MainActor @Sendable () async -> Void)?
             /// Captures the exact committed tab snapshot at the commit seam so tests can assert the
             /// authoritative provider provenance instead of the racy live compose-tab UI projection.
             let committedTabSnapshotCaptured: (
@@ -460,6 +461,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)? = nil,
                 runMCPFollowUp: MCPFollowUpRunner? = nil,
                 validateContextBuilderProviders: (@MainActor @Sendable () async -> Void)? = nil,
+                beforeProviderConstructionReadinessCheck: (@MainActor @Sendable () async -> Void)? = nil,
                 committedTabSnapshotCaptured: (
                     (_ runID: UUID, _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot) -> Void
                 )? = nil
@@ -471,6 +473,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 self.resolveMCPFollowUpModel = resolveMCPFollowUpModel
                 self.runMCPFollowUp = runMCPFollowUp
                 self.validateContextBuilderProviders = validateContextBuilderProviders
+                self.beforeProviderConstructionReadinessCheck = beforeProviderConstructionReadinessCheck
                 self.committedTabSnapshotCaptured = committedTabSnapshotCaptured
             }
         }
@@ -892,6 +895,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var tabCloseListenerToken: UUID?
     private var codexModelsSubscriptionTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
+    private var ohMyPiModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
     private let codexModelPollingService: CodexModelPollingService
     private var hasPreparedForWindowClose = false
@@ -1015,6 +1019,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         pendingBackgroundPlanRefreshTabIDs.removeAll()
         stopCodexModelsSubscription()
         stopOpenCodeModelsSubscription()
+        stopOhMyPiModelsSubscription()
         stopCursorModelsSubscription()
         if let tabCloseListenerToken {
             promptManager.removeComposeTabsWillCloseListener(tabCloseListenerToken)
@@ -1026,6 +1031,31 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var agentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
         promptManager.apiSettingsViewModel?.agentModeAvailabilityContext ?? .current
     }
+
+    private func contextBuilderRuntimeReadinessError(for agent: AgentProviderKind) -> String? {
+        guard agent == .ohMyPi else { return nil }
+        guard promptManager.apiSettingsViewModel?.isContextBuilderProviderRuntimeReady(agent) == true else {
+            return "Oh My Pi must pass a connection check in this app launch before Context Builder can run."
+        }
+        return nil
+    }
+
+    private func providerConstructionRuntimeReadinessError(
+        for agent: AgentProviderKind
+    ) async -> String? {
+        #if DEBUG
+            await runTestHooks?.beforeProviderConstructionReadinessCheck?()
+        #endif
+        return contextBuilderRuntimeReadinessError(for: agent)
+    }
+
+    #if DEBUG
+        func providerConstructionRuntimeReadinessErrorForTesting(
+            agent: AgentProviderKind
+        ) async -> String? {
+            await providerConstructionRuntimeReadinessError(for: agent)
+        }
+    #endif
 
     private func defaultModelRaw(for agent: AgentProviderKind) -> String {
         AgentModelCatalog.defaultModelRaw(for: agent, availability: agentAvailabilityContext, codexDynamicModels: codexDynamicModels)
@@ -1098,6 +1128,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func updateDynamicModelPolling(startCursorPolling: Bool = true) {
         updateCodexModelPolling()
         updateOpenCodeModelPolling()
+        updateOhMyPiModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
     }
 
@@ -1176,6 +1207,37 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func stopOpenCodeModelsSubscription() {
         openCodeModelsSubscriptionTask?.cancel()
         openCodeModelsSubscriptionTask = nil
+    }
+
+    private func updateOhMyPiModelPolling() {
+        if selectedAgent == .ohMyPi {
+            startOhMyPiModelsSubscriptionIfNeeded()
+        } else {
+            stopOhMyPiModelsSubscription()
+        }
+    }
+
+    private func startOhMyPiModelsSubscriptionIfNeeded() {
+        guard !hasPreparedForWindowClose else { return }
+        guard ohMyPiModelsSubscriptionTask == nil else { return }
+        let workspacePath = currentWorkspacePath
+        ohMyPiModelsSubscriptionTask = Task { [weak self, workspacePath] in
+            let stream = await OhMyPiACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
+            for await _ in stream {
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    acpDynamicModelRevision &+= 1
+                    handleAgentProviderAvailabilityChanged()
+                    syncSelectedACPModelFromRegistryIfNeeded(for: .ohMyPi)
+                }
+            }
+        }
+    }
+
+    private func stopOhMyPiModelsSubscription() {
+        ohMyPiModelsSubscriptionTask?.cancel()
+        ohMyPiModelsSubscriptionTask = nil
     }
 
     private func updateCursorModelPolling(startPolling: Bool = true) {
@@ -1468,6 +1530,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) {
         stopCodexModelsSubscription()
         stopOpenCodeModelsSubscription()
+        stopOhMyPiModelsSubscription()
         stopCursorModelsSubscription()
 
         let activeRecords = sessions.keys.compactMap { runRegistry.activeRecord(tabID: $0) }
@@ -2421,6 +2484,18 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             return
         }
 
+        let runAgent = selectedAgent
+        let runModelRaw = selectedModelRaw
+        if let readinessError = contextBuilderRuntimeReadinessError(for: runAgent) {
+            debugLog("Run blocked: \(readinessError)")
+            session.appendLogEntry(
+                AgentLogEntry(timestamp: Date(), type: .error, message: readinessError)
+            )
+            session.agentRunState = .failed(readinessError)
+            updateRuntimeBindings(from: session)
+            return
+        }
+
         session.resetLog()
         session.generatedPlanChatID = nil
         session.backgroundPlanError = nil
@@ -2430,8 +2505,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         clearBackgroundPlanState(forTabID: tabID)
         captureRunStartState(for: session)
 
-        let runAgent = selectedAgent
-        let runModelRaw = selectedModelRaw
         session.lastRunAgentKind = runAgent
         session.lastRunModelRaw = runModelRaw
 
@@ -2569,6 +2642,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             } catch {
                 await lease.failAndCleanup()
                 return .failed(error.localizedDescription)
+            }
+
+            if let readinessError = await providerConstructionRuntimeReadinessError(for: record.agentKind) {
+                await lease.failAndCleanup()
+                return .failed(readinessError)
             }
 
             let modelString = record.modelRaw == AgentModel.defaultModel.rawValue ? nil : record.modelRaw

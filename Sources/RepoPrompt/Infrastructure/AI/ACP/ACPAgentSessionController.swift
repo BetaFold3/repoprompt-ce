@@ -2013,6 +2013,9 @@ actor ACPAgentSessionController {
     }
 
     private func shouldFallbackToNewSessionAfterLoadFailure(_ error: Error, existingSessionID _: String) -> Bool {
+        // OMP resume is exact-or-error: once history replay is bypassed for session/load,
+        // opening a fresh session would silently lose the prior transcript.
+        guard provider.providerID != .ohMyPi else { return false }
         guard case let ControllerError.requestFailed(message, code) = error else { return false }
         let lowercased = message.lowercased()
         let looksLikeMissingSession = lowercased.contains("session")

@@ -219,8 +219,10 @@ final class AgentModeRunService {
                 }
             }
         #endif
-        if selectedAgent == .ohMyPi {
-            #if DEBUG
+        #if DEBUG
+            if selectedAgent == .ohMyPi,
+               ompQualificationStartContext != nil || invocationOMPQualificationStartContext != nil
+            {
                 if let invocationOMPQualificationStartContext,
                    session.mcpStartInvocationGenerationID != invocationOMPQualificationStartContext.generationID
                 {
@@ -233,7 +235,7 @@ final class AgentModeRunService {
                 guard let ompQualificationStartContext,
                       let invocationOMPQualificationStartContext
                 else {
-                    let message = "Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session and its current workspace."
+                    let message = "Oh My Pi qualification state is incomplete or is not bound to this session and workspace."
                     await failBeforeProviderStartup(session: session, message: message)
                     return nil
                 }
@@ -247,16 +249,12 @@ final class AgentModeRunService {
                 guard session.mcpControlContext?.sessionID == ompQualificationStartContext.transaction.sessionID,
                       dependencies.ompQualificationActiveWorkspaceID() == ompQualificationStartContext.expectedWorkspaceID
                 else {
-                    let message = "Oh My Pi requires an active DEBUG qualification authorization bound to this fresh session and its current workspace."
+                    let message = "Oh My Pi qualification state is incomplete or is not bound to this session and workspace."
                     await failBeforeProviderStartup(session: session, message: message)
                     return nil
                 }
-            #else
-                let message = "Oh My Pi support is not enabled in this build."
-                await failBeforeProviderStartup(session: session, message: message)
-                return nil
-            #endif
-        }
+            }
+        #endif
         if session.profile == .knowledge,
            !KnowledgeSessionPolicy.supportedProviders.contains(selectedAgent)
         {
@@ -351,6 +349,9 @@ final class AgentModeRunService {
                 var providerStartAuthorizationFailureReason: String?
                 let providerStartAuthorizer: (UUID) -> Bool = { [weak session] runID in
                     guard selectedAgent == .ohMyPi else { return true }
+                    if ompQualificationStartContext == nil, invocationOMPQualificationStartContext == nil {
+                        return true
+                    }
                     testBeforeOMPQualificationProviderAuthorization()
                     guard let session,
                           let ompQualificationStartContext,
@@ -380,7 +381,12 @@ final class AgentModeRunService {
                     _ startupFailureReason: String?
                 ) -> Bool = { runID, activeAgentSessionID, runAttemptID, authorized, startupFailureReason in
                     guard selectedAgent == .ohMyPi else { return true }
-                    guard let context = ompQualificationStartContext else { return false }
+                    if ompQualificationStartContext == nil, invocationOMPQualificationStartContext == nil {
+                        return true
+                    }
+                    guard let context = ompQualificationStartContext,
+                          invocationOMPQualificationStartContext != nil
+                    else { return false }
                     let proposedOutcome: OhMyPiAgentModeSmokeGate.StartAuthorizationReceipt.Outcome = if authorized, let runID {
                         .authorized(.init(
                             runID: runID,
@@ -403,7 +409,7 @@ final class AgentModeRunService {
                     ) == proposedOutcome
                 }
             #else
-                let providerStartAuthorizer: (UUID) -> Bool = { _ in selectedAgent != .ohMyPi }
+                let providerStartAuthorizer: (UUID) -> Bool = { _ in true }
                 let providerStartBoundaryReporter: (UUID?, UUID?, UUID?, Bool, String?) -> Bool = { _, _, _, _, _ in true }
                 let providerStartBootstrapObserver: () -> Void = {}
             #endif

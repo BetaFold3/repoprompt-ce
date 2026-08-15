@@ -7,7 +7,7 @@ enum AgentProviderBindingID: String, CaseIterable, Hashable {
     case cursor
     case ohMyPi
 
-    /// User-facing provider rows exclude dark integrations without weakening exhaustive persistence sweeps.
+    /// User-facing generic setting rows exclude the fixed managed OMP profile, which has no mutable binding.
     static var publicSettingsCases: [Self] {
         allCases.filter { $0 != .ohMyPi }
     }

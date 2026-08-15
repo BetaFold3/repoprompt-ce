@@ -2,6 +2,25 @@ import Foundation
 @testable import RepoPromptApp
 import XCTest
 
+private final class OMPRouteVerifierRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let result: Bool
+    private var calls = 0
+
+    init(result: Bool) {
+        self.result = result
+    }
+
+    func verify(_: UUID) async -> Bool {
+        lock.withLock { calls += 1 }
+        return result
+    }
+
+    var callCount: Int {
+        lock.withLock { calls }
+    }
+}
+
 final class OhMyPiACPProviderTests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
@@ -20,20 +39,11 @@ final class OhMyPiACPProviderTests: XCTestCase {
         try await super.tearDown()
     }
 
-    func testGenericHeadlessFactoryRejectsOhMyPiWhileDark() {
-        XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
-
-        XCTAssertThrowsError(
+    func testGenericHeadlessFactoryConstructsOhMyPiProvider() throws {
+        XCTAssertTrue(
             try AgentRuntimeProviderService.shared.makeProvider(for: .ohMyPi)
-        ) { error in
-            guard case let AIProviderError.invalidConfiguration(detail) = error else {
-                return XCTFail("Expected typed invalid-configuration error, got \(error)")
-            }
-            XCTAssertEqual(
-                detail,
-                "Oh My Pi generic headless starts are disabled. Model discovery uses the dedicated ACP polling path; qualification runs require the fresh-session Agent Mode transaction."
-            )
-        }
+                is OhMyPiACPHeadlessAgentProvider
+        )
     }
 
     func testIdentityAndManagedArgumentsAreExact() throws {
@@ -435,21 +445,21 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertNil(OhMyPiACPLaunchResolver.parseVersion("omp unknown"))
     }
 
-    func testSessionConfigurationAlwaysStartsFreshWithExactlyOneRepoPromptServer() throws {
+    func testSessionConfigurationChoosesNewOrLoadAndInjectsSameRepoPromptServer() throws {
         let provider = OhMyPiACPAgentProvider(config: OhMyPiAgentConfig())
         let fresh = try provider.makeSessionConfiguration(
-            for: request(resumeSessionID: nil),
+            for: request(resumeSessionID: "  "),
             mcpServer: .repoPrompt
         )
-        let attemptedResume = try provider.makeSessionConfiguration(
-            for: request(resumeSessionID: "candidate-session"),
+        let resumed = try provider.makeSessionConfiguration(
+            for: request(resumeSessionID: "  candidate-session  "),
             mcpServer: .repoPrompt
         )
 
         XCTAssertEqual(fresh.mode, .new)
-        XCTAssertEqual(attemptedResume.mode, .new)
-        XCTAssertEqual(fresh.mcpServers.count, 1)
-        XCTAssertEqual(attemptedResume.mcpServers.count, 1)
+        XCTAssertEqual(resumed.mode, .load(existingSessionID: "candidate-session"))
+        XCTAssertEqual(fresh.mcpServers, [.repoPrompt])
+        XCTAssertEqual(resumed.mcpServers, fresh.mcpServers)
 
         let discoveryProvider = OhMyPiACPAgentProvider(
             config: OhMyPiAgentConfig(includeRepoPromptMCPServer: false)
@@ -462,23 +472,33 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertTrue(discovery.mcpServers.isEmpty)
     }
 
-    func testPromptCombinesSystemUserAndImageWithoutThinkingMutation() throws {
+    func testPromptIncludesSystemOnlyForFreshSessionAndPreservesAttachments() throws {
         let provider = OhMyPiACPAgentProvider(config: OhMyPiAgentConfig())
         let attachment = AgentImageAttachment(
             source: .url("https://example.com/reference.png"),
             title: "reference.png"
         )
-        let blocks = try provider.buildPromptBlocks(
-            for: AgentMessage(systemPrompt: "System context", userMessage: "User task"),
-            request: request(attachments: [attachment], resumeSessionID: "ignored")
+        let message = AgentMessage(systemPrompt: "System context", userMessage: "User task")
+        let fresh = try provider.buildPromptBlocks(
+            for: message,
+            request: request(attachments: [attachment], resumeSessionID: "  ")
+        )
+        let resumed = try provider.buildPromptBlocks(
+            for: message,
+            request: request(attachments: [attachment], resumeSessionID: "  loaded-session  ")
         )
 
-        XCTAssertEqual(blocks.count, 2)
-        XCTAssertEqual(blocks[0]["type"] as? String, "text")
-        XCTAssertEqual(blocks[0]["text"] as? String, "System context\n\nUser task")
-        XCTAssertEqual(blocks[1]["type"] as? String, "image")
-        XCTAssertEqual(blocks[1]["mimeType"] as? String, "image/png")
-        XCTAssertEqual(blocks[1]["uri"] as? String, "https://example.com/reference.png")
+        XCTAssertEqual(fresh.count, 2)
+        XCTAssertEqual(fresh[0]["type"] as? String, "text")
+        XCTAssertEqual(fresh[0]["text"] as? String, "System context\n\nUser task")
+        XCTAssertEqual(resumed.count, 2)
+        XCTAssertEqual(resumed[0]["type"] as? String, "text")
+        XCTAssertEqual(resumed[0]["text"] as? String, "User task")
+        for blocks in [fresh, resumed] {
+            XCTAssertEqual(blocks[1]["type"] as? String, "image")
+            XCTAssertEqual(blocks[1]["mimeType"] as? String, "image/png")
+            XCTAssertEqual(blocks[1]["uri"] as? String, "https://example.com/reference.png")
+        }
     }
 
     func testThinNormalizerHandlesRepresentativeStandardACPShape() throws {
@@ -583,7 +603,7 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertFalse(MCPIntegrationHelper.isExactRepoPromptServerIdentifier("not-RepoPromptCE"))
     }
 
-    func testObservedInitializeFixtureRecordsIdentityWithoutEnablingResume() throws {
+    func testObservedInitializeFixtureRecordsLoadSessionCapability() throws {
         let payload = try fixtureJSONObject(named: "initialize")
         let agentInfo = try XCTUnwrap(payload["agentInfo"] as? [String: Any])
         XCTAssertEqual(agentInfo["name"] as? String, "oh-my-pi")
@@ -591,15 +611,6 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertEqual(agentInfo["version"] as? String, "17.2.12")
         let capabilities = try XCTUnwrap(payload["agentCapabilities"] as? [String: Any])
         XCTAssertEqual(capabilities["loadSession"] as? Bool, true)
-
-        let provider = OhMyPiACPAgentProvider(config: OhMyPiAgentConfig())
-        XCTAssertEqual(
-            try provider.makeSessionConfiguration(
-                for: request(resumeSessionID: "advertised-only"),
-                mcpServer: .repoPrompt
-            ).mode,
-            .new
-        )
     }
 
     func testDynamicCatalogUsesDefaultSentinelAndPreservesRawModels() {
@@ -718,78 +729,83 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertNil(AgentACPModelRegistry.shared.resolvedSnapshot(for: .ohMyPi))
     }
 
-    #if DEBUG
-        @MainActor
-        func testSmokeGateControlsOnlyIntendedDebugAvailabilityProjections() throws {
-            let modelRaw = "smoke-provider/exact-model"
-            let discovered = ACPDiscoveredSessionModels(
-                options: [
-                    AgentModelOption(
-                        rawValue: modelRaw,
-                        displayName: "Exact Smoke Model",
-                        description: nil,
-                        isPlaceholderDefault: false,
-                        isProviderDefault: true
-                    )
-                ],
-                currentModelRaw: modelRaw
+    @MainActor
+    func testPublicCatalogIncludesOhMyPiInEstablishedProviderOrder() throws {
+        let modelRaw = "public-provider/exact-model"
+        let discovered = ACPDiscoveredSessionModels(
+            options: [
+                AgentModelOption(
+                    rawValue: modelRaw,
+                    displayName: "Exact Public Model",
+                    description: nil,
+                    isPlaceholderDefault: false,
+                    isProviderDefault: true
+                )
+            ],
+            currentModelRaw: modelRaw
+        )
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .ohMyPi))
+
+        XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
+        XCTAssertEqual(
+            AgentModelCatalog.supportedCLIProviderAgents,
+            [.codexExec, .claudeCode, .openCode, .cursor, .ohMyPi]
+        )
+        let allAvailable = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            codexAvailable: true,
+            openCodeAvailable: true,
+            cursorAvailable: true,
+            ohMyPiAvailable: true,
+            zaiConfigured: true,
+            kimiConfigured: true,
+            customClaudeCompatibleConfigured: true
+        )
+        XCTAssertEqual(
+            AgentModelCatalog.selectableAgents(availability: allAvailable),
+            [
+                .codexExec,
+                .claudeCode,
+                .openCode,
+                .cursor,
+                .ohMyPi,
+                .claudeCodeGLM,
+                .kimiCode,
+                .customClaudeCompatible
+            ]
+        )
+
+        let discovery = AgentModelCatalog.discoveryAgents(availability: allAvailable)
+        let ohMyPi = discovery.first { $0.agent == .ohMyPi }
+        let exactModelID = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.ohMyPi.rawValue,
+            modelRaw: modelRaw
+        ).rawValue
+        XCTAssertTrue(
+            ohMyPi?.models.flatMap(\.startTargets).map(\.selectionID.rawValue).contains(exactModelID) == true
+        )
+        let resolved = try AgentMCPSelectionResolver.resolve(modelID: exactModelID, availability: allAvailable)
+        XCTAssertEqual(resolved.agentRaw, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(resolved.modelRaw, modelRaw)
+        XCTAssertTrue(AgentProviderKind.publicContextBuilderCases.contains(.ohMyPi))
+        XCTAssertFalse(AgentProviderBindingID.publicSettingsCases.contains(.ohMyPi))
+        XCTAssertTrue(
+            try AgentRuntimeProviderService.shared.makeProvider(
+                for: .ohMyPi,
+                modelString: modelRaw,
+                runType: .discover
+            ) is OhMyPiACPHeadlessAgentProvider
+        )
+        for kind in AgentModelCatalog.TaskLabelKind.allCases {
+            XCTAssertNotEqual(
+                AgentModelCatalog.resolveTaskLabelKind(kind)?.agent,
+                .ohMyPi
             )
-            XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .ohMyPi))
-
-            XCTAssertFalse(OhMyPiAgentModeSmokeGate.shared.isEnabled)
-            XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
-            XCTAssertFalse(AgentModelCatalog.supportedCLIProviderAgents.contains(.ohMyPi))
-            XCTAssertFalse(AgentModelCatalog.selectableAgents().contains(.ohMyPi))
-            XCTAssertFalse(AgentModelCatalog.discoveryAgents().contains { $0.agent == .ohMyPi })
-
-            try OhMyPiAgentModeSmokeGate.shared.acquireForTesting()
-
-            XCTAssertTrue(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
-            XCTAssertTrue(AgentModelCatalog.supportedCLIProviderAgents.contains(.ohMyPi))
-            XCTAssertTrue(AgentModelCatalog.selectableAgents().contains(.ohMyPi))
-            let discovery = AgentModelCatalog.discoveryAgents()
-            let ohMyPi = discovery.first { $0.agent == .ohMyPi }
-            let exactModelID = AgentModelSelectionID(
-                agentRaw: AgentProviderKind.ohMyPi.rawValue,
-                modelRaw: modelRaw
-            ).rawValue
-            XCTAssertTrue(
-                ohMyPi?.models.flatMap(\.startTargets).map(\.selectionID.rawValue).contains(exactModelID) == true
-            )
-            let resolved = try AgentMCPSelectionResolver.resolve(modelID: exactModelID)
-            XCTAssertEqual(resolved.agentRaw, AgentProviderKind.ohMyPi.rawValue)
-            XCTAssertEqual(resolved.modelRaw, modelRaw)
-            XCTAssertFalse(AgentProviderKind.publicContextBuilderCases.contains(.ohMyPi))
-            XCTAssertFalse(AgentProviderBindingID.publicSettingsCases.contains(.ohMyPi))
-            XCTAssertThrowsError(
-                try AgentRuntimeProviderService.shared.makeProvider(
-                    for: .ohMyPi,
-                    modelString: modelRaw,
-                    runType: .discover
-                )
-            ) { error in
-                XCTAssertTrue(
-                    String(describing: error).contains("generic headless starts are disabled")
-                )
-            }
-            for kind in AgentModelCatalog.TaskLabelKind.allCases {
-                XCTAssertNotEqual(
-                    AgentModelCatalog.resolveTaskLabelKind(kind)?.agent,
-                    .ohMyPi
-                )
-            }
-
-            OhMyPiAgentModeSmokeGate.shared.resetForTesting()
-
-            XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
-            XCTAssertFalse(AgentModelCatalog.supportedCLIProviderAgents.contains(.ohMyPi))
-            XCTAssertFalse(AgentModelCatalog.selectableAgents().contains(.ohMyPi))
-            XCTAssertFalse(AgentModelCatalog.discoveryAgents().contains { $0.agent == .ohMyPi })
         }
-    #endif
+    }
 
     @MainActor
-    func testPermissionBindingMCPGrantAndDarkAvailability() throws {
+    func testPermissionBindingMCPGrantAndPublicCatalogAvailability() throws {
         XCTAssertEqual(AgentProviderKind.ohMyPi.providerBindingID, .ohMyPi)
         XCTAssertEqual(
             AgentProviderPermissionLevelID.subagentDefault(for: .ohMyPi),
@@ -809,9 +825,9 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertFalse(binding.autoApproveAllACPToolPermissions)
         XCTAssertFalse(AgentModelCatalog.AvailabilityContext.current.ohMyPiAvailable)
         XCTAssertFalse(AgentModelCatalog.selectableAgents().contains(.ohMyPi))
-        XCTAssertFalse(AgentModelCatalog.supportedCLIProviderAgents.contains(.ohMyPi))
+        XCTAssertTrue(AgentModelCatalog.supportedCLIProviderAgents.contains(.ohMyPi))
         XCTAssertTrue(AgentProviderKind.allCases.contains(.ohMyPi))
-        XCTAssertFalse(AgentProviderKind.publicContextBuilderCases.contains(.ohMyPi))
+        XCTAssertTrue(AgentProviderKind.publicContextBuilderCases.contains(.ohMyPi))
         XCTAssertTrue(AgentProviderBindingID.allCases.contains(.ohMyPi))
         XCTAssertFalse(AgentProviderBindingID.publicSettingsCases.contains(.ohMyPi))
 
@@ -819,6 +835,10 @@ final class OhMyPiACPProviderTests: XCTestCase {
             AgentModelCatalog.discoveryAgents().contains { $0.agent == .ohMyPi }
         )
         let onlyOhMyPi = AgentModelCatalog.AvailabilityContext(ohMyPiAvailable: true)
+        XCTAssertTrue(AgentModelCatalog.selectableAgents(availability: onlyOhMyPi).contains(.ohMyPi))
+        XCTAssertTrue(
+            AgentModelCatalog.discoveryAgents(availability: onlyOhMyPi).contains { $0.agent == .ohMyPi }
+        )
         for kind in AgentModelCatalog.TaskLabelKind.allCases {
             XCTAssertNotEqual(
                 AgentModelCatalog.resolveTaskLabelKind(kind, availability: onlyOhMyPi)?.agent,
@@ -959,13 +979,22 @@ final class OhMyPiACPProviderTests: XCTestCase {
     }
 
     @MainActor
-    func testHeadlessOMPProviderSessionIDDoesNotSuppressTranscriptHandoffOrEnableResume() {
+    func testHeadlessOMPProviderSessionIDBypassesTranscriptReplayAndEnablesResume() {
+        for providerSessionID in [nil, "", "   \n\t"] as [String?] {
+            let ompWithoutSession = AgentModeViewModel.test_headlessContinuityDecision(
+                agent: .ohMyPi,
+                providerSessionID: providerSessionID
+            )
+            XCTAssertFalse(ompWithoutSession.shouldBypassHistoryReplay)
+            XCTAssertNil(ompWithoutSession.resumeSessionID)
+        }
+
         let omp = AgentModeViewModel.test_headlessContinuityDecision(
             agent: .ohMyPi,
-            providerSessionID: "advertised-but-fresh-only"
+            providerSessionID: "  persisted-omp-session  "
         )
-        XCTAssertFalse(omp.shouldBypassHistoryReplay)
-        XCTAssertNil(omp.resumeSessionID)
+        XCTAssertTrue(omp.shouldBypassHistoryReplay)
+        XCTAssertEqual(omp.resumeSessionID, "persisted-omp-session")
 
         let resumableACP = AgentModeViewModel.test_headlessContinuityDecision(
             agent: .cursor,
@@ -976,14 +1005,236 @@ final class OhMyPiACPProviderTests: XCTestCase {
 
         let ompAttachment = AgentModeViewModel.test_headlessContinuityDecision(
             agent: .ohMyPi,
-            providerSessionID: "advertised-but-fresh-only",
+            providerSessionID: "persisted-omp-session",
             hasAttachments: true
         )
         XCTAssertTrue(ompAttachment.shouldBypassHistoryReplay)
-        XCTAssertNil(ompAttachment.resumeSessionID)
+        XCTAssertEqual(ompAttachment.resumeSessionID, "persisted-omp-session")
     }
 
-    func testHeadlessRequestDiscardsResumeCandidateAndRequiresRegistryModel() async {
+    func testHeadlessPrePromptRoutingRecoversOnlyCleanedSuccessfulWaiterFromExactLiveRoute() async {
+        let expectedRunID = UUID()
+        func evidence(
+            connectionRunMapping: Bool? = true,
+            policyWindowID: Int? = 3,
+            cachedWindowID: Int? = 3,
+            connectionWindowID: Int? = 3,
+            assignedWindowID: Int? = 3,
+            admittedClientName: String? = AgentProviderKind.ohMyPiMCPClientID,
+            connectionIsActive: Bool = true,
+            runWasAdmitted: Bool = true,
+            hasExpectedPIDAuthority: Bool = true
+        ) -> ServerNetworkManager.LiveRunRouteActorEvidence {
+            ServerNetworkManager.LiveRunRouteActorEvidence(
+                expectedRunID: expectedRunID,
+                connectionRunID: connectionRunMapping.map { $0 ? expectedRunID : UUID() },
+                policyWindowID: policyWindowID,
+                cachedWindowID: cachedWindowID,
+                connectionWindowID: connectionWindowID,
+                assignedWindowID: assignedWindowID,
+                admittedClientName: admittedClientName,
+                connectionIsActive: connectionIsActive,
+                runWasAdmitted: runWasAdmitted,
+                hasExpectedPIDAuthority: hasExpectedPIDAuthority
+            )
+        }
+
+        let cleanedRunID = UUID()
+        await MCPRoutingWaiter.register(runID: cleanedRunID)
+        await MCPRoutingWaiter.notifyRouted(runID: cleanedRunID)
+        await MCPRoutingWaiter.cleanup(runID: cleanedRunID)
+        let legacyUnregisteredResult = await MCPRoutingWaiter.waitUntilRouted(
+            runID: cleanedRunID,
+            timeoutSeconds: 0
+        )
+        XCTAssertFalse(legacyUnregisteredResult)
+
+        let recoveredVerifier = OMPRouteVerifierRecorder(result: true)
+        let recovered = await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
+            runID: cleanedRunID,
+            timeoutSeconds: 0,
+            verifyLiveRoute: { await recoveredVerifier.verify($0) }
+        )
+        XCTAssertTrue(recovered)
+        XCTAssertEqual(recoveredVerifier.callCount, 1)
+
+        let routedVerifier = OMPRouteVerifierRecorder(result: true)
+        let currentRouted = await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
+            runID: UUID(),
+            waitForRoutingOutcome: { _, _ in .routed },
+            verifyLiveRoute: { await routedVerifier.verify($0) }
+        )
+        XCTAssertTrue(currentRouted)
+        XCTAssertEqual(routedVerifier.callCount, 1)
+
+        let staleRoutedVerifier = OMPRouteVerifierRecorder(result: false)
+        let staleRouted = await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
+            runID: UUID(),
+            waitForRoutingOutcome: { _, _ in .routed },
+            verifyLiveRoute: { await staleRoutedVerifier.verify($0) }
+        )
+        XCTAssertFalse(staleRouted)
+        XCTAssertEqual(staleRoutedVerifier.callCount, 1)
+
+        let notRoutedVerifier = OMPRouteVerifierRecorder(result: true)
+        let notRouted = await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
+            runID: UUID(),
+            waitForRoutingOutcome: { _, _ in .notRouted },
+            verifyLiveRoute: { await notRoutedVerifier.verify($0) }
+        )
+        XCTAssertFalse(notRouted)
+        XCTAssertEqual(notRoutedVerifier.callCount, 0)
+
+        let cancelledVerifier = OMPRouteVerifierRecorder(result: true)
+        let cancelledTask = Task {
+            await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
+                runID: UUID(),
+                waitForRoutingOutcome: { _, _ in
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    return .routed
+                },
+                verifyLiveRoute: { await cancelledVerifier.verify($0) }
+            )
+        }
+        let cancelledResult = await cancelledTask.value
+        XCTAssertFalse(cancelledResult)
+        XCTAssertEqual(cancelledVerifier.callCount, 0)
+
+        let failedRunID = UUID()
+        await MCPRoutingWaiter.register(runID: failedRunID)
+        await MCPRoutingWaiter.notifyFailed(runID: failedRunID)
+        let failedVerifier = OMPRouteVerifierRecorder(result: true)
+        let rejectedFailure = await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(
+            runID: failedRunID,
+            timeoutSeconds: 0,
+            verifyLiveRoute: { await failedVerifier.verify($0) }
+        )
+        XCTAssertFalse(rejectedFailure, "A known routing failure must not be overridden by a live-route fallback")
+        XCTAssertEqual(failedVerifier.callCount, 0)
+        await MCPRoutingWaiter.cleanup(runID: failedRunID)
+
+        let validEvidence = evidence()
+        XCTAssertTrue(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: validEvidence
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(admittedClientName: AgentProviderKind.cursorMCPClientID)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(policyWindowID: 2)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(connectionRunMapping: nil)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(connectionRunMapping: false)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(cachedWindowID: nil)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(cachedWindowID: 2)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(connectionWindowID: nil)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(connectionWindowID: 2)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(assignedWindowID: nil)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(assignedWindowID: 2)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(policyWindowID: nil)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(connectionIsActive: false)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(runWasAdmitted: false)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteEvidence(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            evidence: evidence(hasExpectedPIDAuthority: false)
+        ))
+
+        XCTAssertTrue(ServerNetworkManager.validatedLiveRunRouteAcrossFinalMappingHop(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            initialEvidence: validEvidence,
+            finalMappingIsLive: true,
+            finalEvidence: validEvidence
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteAcrossFinalMappingHop(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            initialEvidence: validEvidence,
+            finalMappingIsLive: true,
+            finalEvidence: evidence(connectionIsActive: false)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteAcrossFinalMappingHop(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            initialEvidence: validEvidence,
+            finalMappingIsLive: true,
+            finalEvidence: evidence(hasExpectedPIDAuthority: false)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteAcrossFinalMappingHop(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            initialEvidence: validEvidence,
+            finalMappingIsLive: true,
+            finalEvidence: evidence(connectionRunMapping: false)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteAcrossFinalMappingHop(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            initialEvidence: validEvidence,
+            finalMappingIsLive: true,
+            finalEvidence: evidence(connectionWindowID: nil)
+        ))
+        XCTAssertFalse(ServerNetworkManager.validatedLiveRunRouteAcrossFinalMappingHop(
+            mappedWindowID: 3,
+            expectedClientName: AgentProviderKind.ohMyPiMCPClientID,
+            initialEvidence: validEvidence,
+            finalMappingIsLive: false,
+            finalEvidence: validEvidence
+        ))
+    }
+
+    func testHeadlessRequestPropagatesResumeCandidateAndRequiresRegistryModel() async {
         var ordering: [String] = []
         do {
             try await ACPHeadlessAgentProviderBridge.performPromptAfterBarrier(
@@ -1014,7 +1265,7 @@ final class OhMyPiACPProviderTests: XCTestCase {
             workspacePath: "/tmp/workspace",
             message: AgentMessage(userMessage: "handoff", resumeSessionID: "candidate")
         )
-        XCTAssertNil(request.resumeSessionID)
+        XCTAssertEqual(request.resumeSessionID, "candidate")
 
         XCTAssertNil(OhMyPiACPHeadlessAgentProvider.selectedModelToApply(config: config))
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(
