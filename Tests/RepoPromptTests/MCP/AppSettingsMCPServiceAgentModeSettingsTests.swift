@@ -128,6 +128,60 @@ final class AppSettingsMCPServiceAgentModeSettingsTests: XCTestCase {
         XCTAssertEqual(store.globalContextBuilderAgentSelection().modelRaw, modelRaw)
     }
 
+    func testOhMyPiModelCandidatesRequireEffectiveAvailabilityAndStayProviderFiltered() throws {
+        let providerID = ACPProviderID.ohMyPi
+        let modelRaw = "cursor/gpt-5.6-sol-max-fast"
+        AgentACPModelRegistry.shared.test_reset(providerID: providerID)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: providerID) }
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [AgentModelOption(
+                    rawValue: modelRaw,
+                    displayName: "OMP Cursor Fast",
+                    description: nil,
+                    isPlaceholderDefault: false,
+                    isProviderDefault: true
+                )],
+                currentModelRaw: modelRaw
+            ),
+            for: providerID
+        ))
+
+        let disconnected = try AppSettingsMCPService.aiModelRawCandidateValuesForTesting(
+            agentFilter: .ohMyPi,
+            effectiveOhMyPiAvailable: false
+        )
+        XCTAssertTrue(disconnected.isEmpty)
+
+        let available = try AppSettingsMCPService.aiModelRawCandidateValuesForTesting(
+            agentFilter: .ohMyPi,
+            effectiveOhMyPiAvailable: true
+        )
+        XCTAssertEqual(available.count, 1)
+        XCTAssertEqual(available[0].objectValue?["value"]?.stringValue, "ohmypi_custom_\(modelRaw)")
+        XCTAssertEqual(available[0].objectValue?["provider"]?.stringValue, "ohMyPi")
+        XCTAssertTrue(available.allSatisfy {
+            $0.objectValue?["provider"]?.stringValue == "ohMyPi"
+        })
+
+        let suiteName = "AppSettingsMCPServiceAgentModeSettingsTests.OMPAvailability.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        XCTAssertFalse(OhMyPiConnectionAvailability.isEffectivelyConnected(
+            userDefaults: defaults,
+            debugOverride: false
+        ))
+        XCTAssertTrue(OhMyPiConnectionAvailability.isEffectivelyConnected(
+            userDefaults: defaults,
+            debugOverride: true
+        ))
+        defaults.set(true, forKey: "OhMyPiCLIConnected")
+        XCTAssertTrue(OhMyPiConnectionAvailability.isEffectivelyConnected(
+            userDefaults: defaults,
+            debugOverride: false
+        ))
+    }
+
     func testSetWarnsWhenGlobalSettingsPersistenceIsBlocked() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("AppSettingsMCPServiceAgentModeSettingsTests-\(UUID().uuidString)", isDirectory: true)

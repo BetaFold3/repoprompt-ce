@@ -33,14 +33,18 @@ struct OptimizedModelPicker: View {
             if let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: match) {
                 return compatibleClaudeBackendOptionDisplayName(for: descriptor)
             }
-            return cursorDisplayName(match) ?? match.displayName
+            return OhMyPiModelMenuBuilder.collapsedLabel(for: match)
+                ?? cursorDisplayName(match)
+                ?? match.displayName
         }
         // 2. Try parsing (handles tier variants not in current list)
         if let parsed = AIModel.fromModelName(currentValue) {
             if let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: parsed) {
                 return compatibleClaudeBackendOptionDisplayName(for: descriptor)
             }
-            return cursorDisplayName(parsed) ?? parsed.displayName
+            return OhMyPiModelMenuBuilder.collapsedLabel(for: parsed)
+                ?? cursorDisplayName(parsed)
+                ?? parsed.displayName
         }
         // 3. Fallback
         return currentValue.isEmpty ? "Select a model" : currentValue
@@ -138,7 +142,9 @@ struct OptimizedModelPicker: View {
     private func stableMenuItems(for allModels: [AIModel]) -> [StableMenuItem] {
         let grouped = Dictionary(grouping: allModels, by: { $0.providerType })
         let providers = grouped.keys.sorted {
-            AIProviderType.displayName(for: $0) < AIProviderType.displayName(for: $1)
+            if $0 == .ohMyPi { return false }
+            if $1 == .ohMyPi { return true }
+            return AIProviderType.displayName(for: $0) < AIProviderType.displayName(for: $1)
         }
 
         return providers.flatMap { provider -> [StableMenuItem] in
@@ -220,6 +226,16 @@ struct OptimizedModelPicker: View {
                 return providerGroup.rendersAsSubmenu
                     ? [.submenu(providerGroup.displayName, items: items)]
                     : items
+            }
+        }
+        if provider == .ohMyPi {
+            return OhMyPiModelMenuBuilder.groups(for: models).map { group in
+                .submenu(
+                    group.namespace,
+                    items: group.leaves.map { leaf in
+                        stableModelItem(leaf.model, title: leaf.title)
+                    }
+                )
             }
         }
         return models.map { stableModelItem($0) }

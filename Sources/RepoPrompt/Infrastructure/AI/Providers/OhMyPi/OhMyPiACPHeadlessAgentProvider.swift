@@ -9,6 +9,8 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
     typealias ControllerFactory = ACPHeadlessAgentProviderBridge.ControllerFactory
     typealias RoutingOutcomeWaiter = @Sendable (UUID, TimeInterval) async -> MCPRoutingWaiter.WaitOutcome
     typealias LiveRouteVerifier = @Sendable (UUID) async -> Bool
+    typealias RouteCheck = @Sendable (UUID) async -> Bool
+    typealias ModelSetter = @Sendable (String) async throws -> Void
 
     private let config: OhMyPiAgentConfig
     private let bridge: ACPHeadlessAgentProviderBridge
@@ -23,6 +25,9 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
         config: OhMyPiAgentConfig,
         workspacePath: String? = nil,
         providerFactory: ProviderFactory? = nil,
+        routeCheck: @escaping RouteCheck = { runID in
+            await OhMyPiACPHeadlessAgentProvider.prePromptMCPRouteIsReady(runID: runID)
+        },
         controllerFactory: @escaping ControllerFactory = { provider, request, diagnosticSink in
             try ACPAgentSessionController(
                 provider: provider,
@@ -45,15 +50,14 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
             },
             makeController: controllerFactory,
             beforePrompt: { controller, _, runID in
-                if let model = Self.selectedModelToApply(config: config) {
-                    try await controller.setSessionModel(model)
-                }
-                let routed = await Self.prePromptMCPRouteIsReady(runID: runID)
-                guard routed else {
-                    throw AIProviderError.invalidConfiguration(
-                        detail: "Oh My Pi MCP routing did not complete before prompt dispatch."
-                    )
-                }
+                try await Self.prepareForPrompt(
+                    config: config,
+                    runID: runID,
+                    setModel: { model in
+                        try await controller.setSessionModel(model)
+                    },
+                    routeCheck: routeCheck
+                )
             },
             approvalPolicy: .declineUnsupported
         )
@@ -85,6 +89,24 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
         )
     }
 
+    static func prepareForPrompt(
+        config: OhMyPiAgentConfig,
+        runID: UUID,
+        setModel: @escaping ModelSetter,
+        routeCheck: @escaping RouteCheck
+    ) async throws {
+        if let model = selectedModelToApply(config: config) {
+            try await setModel(model)
+        }
+        guard config.includeRepoPromptMCPServer else { return }
+        let routed = await routeCheck(runID)
+        guard routed else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Oh My Pi MCP routing did not complete before prompt dispatch."
+            )
+        }
+    }
+
     static func prePromptMCPRouteIsReady(
         runID: UUID,
         timeoutSeconds: TimeInterval = Double(ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds) / 1000,
@@ -112,15 +134,23 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
     }
 
     static func selectedModelToApply(config: OhMyPiAgentConfig) -> String? {
-        guard let model = config.modelString?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !model.isEmpty,
-              model.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
+        guard let configuredModel = config.modelString else { return nil }
+        let trimmedModel = configuredModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModel.isEmpty,
+              trimmedModel.caseInsensitiveCompare(AgentModel.defaultModel.rawValue) != .orderedSame
         else {
             return nil
         }
+
+        // Tool-free Oracle requests already resolved this exact canonical wire ID
+        // against a warmed registry snapshot. Do not re-read mutable registry state.
+        if !config.includeRepoPromptMCPServer {
+            return configuredModel
+        }
+
         guard let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .ohMyPi) else {
             return nil
         }
-        return snapshot.contains(rawModel: model) ? model : nil
+        return snapshot.contains(rawModel: trimmedModel) ? trimmedModel : nil
     }
 }

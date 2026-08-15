@@ -153,7 +153,9 @@ struct AIModelDropdown: View {
 
         let groupedModels = Dictionary(grouping: allModels, by: { $0.providerType })
         let sortedProviders = groupedModels.keys.sorted {
-            AIProviderType.displayName(for: $0) < AIProviderType.displayName(for: $1)
+            if $0 == .ohMyPi { return false }
+            if $1 == .ohMyPi { return true }
+            return AIProviderType.displayName(for: $0) < AIProviderType.displayName(for: $1)
         }
 
         return sortedProviders.flatMap { provider -> [StableMenuItem] in
@@ -178,6 +180,15 @@ struct AIModelDropdown: View {
                     let modelItems = providerGroup.groups.map(aiModelOpenCodeMenuItem)
                     guard providerGroup.rendersAsSubmenu else { return modelItems }
                     return [.submenu(providerGroup.displayName, items: modelItems)]
+                }
+            } else if provider == .ohMyPi {
+                OhMyPiModelMenuBuilder.groups(for: models).map { group in
+                    .submenu(
+                        group.namespace,
+                        items: group.leaves.map { leaf in
+                            aiModelMenuItem(leaf.model, title: leaf.title)
+                        }
+                    )
                 }
             } else {
                 models.map(aiModelMenuItem)
@@ -502,6 +513,11 @@ struct AIModelDropdown: View {
         customOpenRouterModels: [String],
         compatibleClaudeBackendDisplayName: (AIModel) -> String? = { _ in nil }
     ) -> String {
+        if let parsed = AIModel.fromModelName(currentModel),
+           let ohMyPiLabel = OhMyPiModelMenuBuilder.collapsedLabel(for: parsed)
+        {
+            return ohMyPiLabel
+        }
         if availableModels.isEmpty {
             return "No models available"
         }
@@ -513,7 +529,8 @@ struct AIModelDropdown: View {
 
         // Check available models
         if let selectedModel = availableModels.first(where: { $0.rawValue == currentModel }) {
-            return cursorDisplayName(selectedModel)
+            return OhMyPiModelMenuBuilder.collapsedLabel(for: selectedModel)
+                ?? cursorDisplayName(selectedModel)
                 ?? compatibleClaudeBackendDisplayName(selectedModel)
                 ?? selectedModel.displayName
         }

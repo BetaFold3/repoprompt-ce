@@ -182,6 +182,7 @@ public enum AIModel: Equatable, Hashable {
     case codexCustom(name: String)
     case openCodeCustom(name: String)
     case cursorCustom(name: String)
+    case ohMyPiCustom(name: String)
 
     // Custom Provider Models
     case customProvider(name: String, provider: String, model: String)
@@ -239,8 +240,14 @@ public enum AIModel: Equatable, Hashable {
         static let codex = 11
         static let openCode = 12
         static let cursor = 13
+        static let ohMyPi = 14
         static let special = -1
     }
+
+    #if DEBUG
+        static let test_cursorProviderIndex = ProviderIndex.cursor
+        static let test_ohMyPiProviderIndex = ProviderIndex.ohMyPi
+    #endif
 
     private struct ModelInfo {
         let model: AIModel
@@ -456,7 +463,7 @@ public enum AIModel: Equatable, Hashable {
     }()
 
     private static let modelGroups: [Set<AIModel>] = {
-        var groups: [Set<AIModel>] = Array(repeating: [], count: 14) // Includes CLI provider groups through Cursor
+        var groups: [Set<AIModel>] = Array(repeating: [], count: 15) // Includes CLI provider groups through Oh My Pi
         for info in modelDefinitions where info.provider >= 0 {
             groups[info.provider].insert(info.model)
         }
@@ -542,6 +549,8 @@ public enum AIModel: Equatable, Hashable {
             return "opencode_custom_\(n)"
         case let .cursorCustom(n):
             return "cursor_custom_\(n)"
+        case let .ohMyPiCustom(n):
+            return "ohmypi_custom_\(n)"
         case let .customProvider(_, _, model):
             return "custom_provider_\(model)"
         case let .customProviderUser(name):
@@ -610,6 +619,9 @@ public enum AIModel: Equatable, Hashable {
                 includeCursorParameterSuffix: true
             )
         }
+        if case let .ohMyPiCustom(n) = self {
+            return ACPAIModelCatalog.ohMyPiModelOption(for: n)?.displayName ?? n
+        }
         if case let .customProviderUser(name) = self { return "Custom/\(name)" }
         if case .ollama = self {
             return "local/" + modelName
@@ -638,6 +650,7 @@ public enum AIModel: Equatable, Hashable {
         case .codex: CodexCLIProvider.self
         case .openCode: OpenCodeCLIProvider.self
         case .cursor: CursorCLIProvider.self
+        case .ohMyPi: OhMyPiCLIProvider.self
         }
     }
 
@@ -666,6 +679,7 @@ public enum AIModel: Equatable, Hashable {
         case .codexCustom: return .codex
         case .openCodeCustom: return .openCode
         case .cursorCustom: return .cursor
+        case .ohMyPiCustom: return .ohMyPi
         case .customProviderUser: return .customProvider
         // or, if you prefer the old modelGroups approach:
         default:
@@ -723,6 +737,8 @@ public enum AIModel: Equatable, Hashable {
              let .openCodeCustom(n),
              let .cursorCustom(n):
             return n
+        case let .ohMyPiCustom(n):
+            return ACPAIModelCatalog.ohMyPiModelOption(for: n)?.rawValue ?? n
         case let .customProviderUser(name):
             return name
         case let .customProvider(_, _, model):
@@ -1177,7 +1193,7 @@ public enum AIModel: Equatable, Hashable {
             return SwiftOpenAI.Model.custom(modelName)
         case .anthropic:
             return SwiftAnthropic.Model.other(modelName)
-        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor:
+        case .azure, .openRouter, .customProvider, .claudeCode, .codex, .openCode, .cursor, .ohMyPi:
             // For these providers, use the actual model name when available
             if let modelInfo = Self.modelDefinitions.first(where: { $0.model == self }),
                let actualName = modelInfo.actualName
@@ -1268,6 +1284,11 @@ public enum AIModel: Equatable, Hashable {
         }
         if normalizedRawValue.starts(with: "cursor_custom_") {
             return .cursorCustom(name: String(normalizedRawValue.dropFirst("cursor_custom_".count)))
+        }
+        if normalizedRawValue.starts(with: "ohmypi_custom_") {
+            let name = String(normalizedRawValue.dropFirst("ohmypi_custom_".count))
+            guard !name.isEmpty else { return nil }
+            return .ohMyPiCustom(name: name)
         }
 
         if normalizedRawValue.hasPrefix(OpenAIConfiguredModelSelection.rawPrefix)
@@ -1388,6 +1409,8 @@ public enum AIModel: Equatable, Hashable {
             models = ACPAIModelCatalog.openCodeModelsFromStore()
         case .cursor:
             models = ACPAIModelCatalog.cursorModelsFromStore()
+        case .ohMyPi:
+            models = ACPAIModelCatalog.ohMyPiModelsFromStore()
         }
 
         // Filter out models that are not yet available based on their release date
@@ -1995,6 +2018,7 @@ public enum AIModel: Equatable, Hashable {
         case codexCustom(name: String)
         case openCodeCustom(name: String)
         case cursorCustom(name: String)
+        case ohMyPiCustom(name: String)
         case customProvider(name: String, provider: String, model: String)
         case customProviderUser(name: String)
         case claudeCodeModel(normalizedSpecifier: String)
@@ -2153,6 +2177,8 @@ public enum AIModel: Equatable, Hashable {
             .openCodeCustom(name: name)
         case let .cursorCustom(name):
             .cursorCustom(name: name)
+        case let .ohMyPiCustom(name):
+            .ohMyPiCustom(name: name)
         case let .customProvider(name, provider, model):
             .customProvider(name: name, provider: provider, model: model)
         case let .customProviderUser(name):
@@ -2493,7 +2519,7 @@ public enum AIModel: Equatable, Hashable {
         case .customProvider:
             // CustomProviderConfiguration uses 0.3 as default (line 10 in CustomProviderConfiguration.swift)
             return 0.3
-        case .openAI, .azure, .openRouter, .gemini, .deepseek, .fireworks, .grok, .groq, .zAI, .claudeCode, .codex, .ollama, .openCode, .cursor:
+        case .openAI, .azure, .openRouter, .gemini, .deepseek, .fireworks, .grok, .groq, .zAI, .claudeCode, .codex, .ollama, .openCode, .cursor, .ohMyPi:
             // These providers don't set temperature when nil - API uses its own default (typically 1.0)
             // But we can't be certain what the API actually used
             return nil

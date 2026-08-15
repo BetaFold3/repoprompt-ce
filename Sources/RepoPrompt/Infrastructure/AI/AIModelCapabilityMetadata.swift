@@ -88,7 +88,7 @@ enum AIModelCapabilityMetadata {
              .openaiCustomReasoning, .openAIConfigured, .anthropicCustom,
              .geminiCustom, .deepseekCustom, .fireworksCustom, .azureCustom,
              .grokCustom, .groqCustom, .zaiCustom, .codexCustom,
-             .openCodeCustom, .cursorCustom, .customProvider, .customProviderUser:
+             .openCodeCustom, .cursorCustom, .ohMyPiCustom, .customProvider, .customProviderUser:
             return (nil, nil)
         default:
             break
@@ -108,7 +108,7 @@ enum AIModelCapabilityMetadata {
             1_000_000
         case .openRouter, .deepseek, .fireworks, .grok, .groq, .zAI, .openCode, .cursor:
             128_000
-        case .ollama, .customProvider:
+        case .ollama, .customProvider, .ohMyPi:
             nil
         }
         return (tokens, tokens == nil ? nil : .providerFallback)

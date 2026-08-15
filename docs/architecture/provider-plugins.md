@@ -1,6 +1,6 @@
 # Agent Provider Plugin Seam
 
-Current as of 2026-08-09. This document is contributor-facing: use it when you are wiring a new autonomous-agent provider, editing the Claude-compatible runtime, or moving code across the core ↔ plugin boundary.
+Current as of 2026-08-15. This document is contributor-facing: use it when you are wiring a new autonomous-agent provider, editing the Claude-compatible runtime, or moving code across the core ↔ plugin boundary.
 
 ## Scope and goals
 
@@ -232,7 +232,7 @@ The associated event/session/turn types are currently `typealias`es over the Cla
 
 Oh My Pi (OMP) is implemented as an app-internal ACP provider under `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/`, not through the Claude-compatible package seam. Its stable identities are `ACPProviderID.ohMyPi`, `AgentProviderKind.ohMyPi`, and `AgentProviderBindingID.ohMyPi` (raw `"ohMyPi"`); the executable is `omp`, the runtime kind is `"omp_acp"`, and the verified MCP `clientInfo.name` is `"omp-coding-agent"`. OMP preserves expected-PID and pre-prompt Agent Mode MCP routing.
 
-RepoPrompt owns the launch profile. New processes receive exactly:
+RepoPrompt owns one fixed OMP launch/preflight profile shared by Agent Mode and Oracle one-shots. New processes receive exactly:
 
 ```text
 omp acp --no-tools --no-extensions --no-skills --no-rules --approval-mode yolo
@@ -240,11 +240,13 @@ omp acp --no-tools --no-extensions --no-skills --no-rules --approval-mode yolo
 
 There is no argument passthrough or per-flag opt-out. Preflight resolves a trusted executable (including the OMP/Bun home-bin hint), separately requires `omp acp --help` to exit successfully, validates every managed global flag in `omp --help`, and rejects versions older than the locally captured `17.2.12` baseline. OMP 17.2.12's ACP subcommand help contains only subcommand usage, so it is not used as evidence for global flags.
 
-Interactive and headless runs inject exactly one command-shaped RepoPrompt stdio MCP server; model discovery uses no MCP server. A nonblank persisted provider session ID selects `session/load`, while a blank or absent ID selects `session/new`. OMP resume is exact-or-error: a failed load never falls back to a fresh session after transcript replay has been withheld. Models are dynamic ACP `configOptions` data stored in `AgentACPModelRegistry`, with `Default` as the sole static sentinel. RepoPrompt does not set OMP's `thinking` option.
+Interactive Agent Mode and Agent Mode headless runs inject exactly one command-shaped RepoPrompt stdio MCP server; model discovery uses no MCP server and does not dispatch a prompt. Oracle one-shots instead use `OhMyPiCLIProvider` through the same trusted-executable resolver, fixed argv, managed-flag validation, and version floor, but with RepoPrompt MCP disabled, no workspace or resume, a no-tools system suffix, and ACP approval requests rejected by the headless `.declineUnsupported` policy. A nonblank persisted Agent Mode provider session ID selects `session/load`, while a blank or absent ID selects `session/new`. OMP resume is exact-or-error: a failed load never falls back to a fresh session after transcript replay has been withheld. Models are dynamic ACP `configOptions` data stored in `AgentACPModelRegistry`; the Agent Mode catalog retains `Default` as its sole static sentinel, while the Oracle `AIModel` catalog has no static OMP fallback. RepoPrompt does not set OMP's `thinking` option.
 
 The OMP permission binding has its own RepoPrompt MCP capability grant and a fixed managed-barebones profile. ACP duplicate approval is allowed only for an exact known RepoPrompt server identity and/or an explicit server-prefixed canonical RepoPrompt tool name; substring server matches and unrecognized requests retain the existing interactive behavior. This optimization does not change the server-side MCP permission decision.
 
-OMP is a supported catalog provider in DEBUG and RELEASE. Window availability is gated by `APISettingsViewModel.isOhMyPiConnected`; a DEBUG qualification lease is an OR override. A successful connection test enables Agent Mode, MCP `list_agents`/`agent_run`, and Context Builder, including current-process cached-provider validation and dynamic model subscriptions. `AgentProviderBindingID.publicSettingsCases` remains excluded because the fixed managed OMP profile has no mutable generic setting. Recommendations and task-label resolution remain excluded. Headless OMP waits for the already-registered MCP routing signal before sending its first prompt, while `MCPBootstrapLease` remains the routing cleanup owner.
+OMP is a supported catalog provider in DEBUG and RELEASE. Window availability is gated by `APISettingsViewModel.isOhMyPiConnected`; a DEBUG qualification lease is an OR override. A successful connection test enables Agent Mode, MCP `list_agents`/`agent_run`, Context Builder, and registry-backed Oracle picker entries, including current-process cached-provider validation and dynamic model subscriptions. The Oracle picker is empty when no dynamic OMP snapshot exists; it never manufactures `Default`, and a persisted OMP selection still decodes and displays while disconnected. `AgentProviderBindingID.publicSettingsCases` remains excluded because the fixed managed OMP profile has no mutable generic setting. Recommendations and task-label resolution remain excluded. MCP-enabled Agent Mode headless OMP waits for the already-registered routing signal before sending its first prompt, while `MCPBootstrapLease` remains the routing cleanup owner. For prompt dispatch, the route check is skipped exactly when `includeRepoPromptMCPServer` is false; model discovery does not send a prompt and therefore never traverses this pre-prompt gate.
+
+Focused Oracle coverage lives in `OhMyPiModelCatalogTests`, `OhMyPiCLIProviderTests`, `OhMyPiACPHeadlessAgentProviderTests`, `HeadlessCLIStreamBridgeTests`, and `CursorCLIProviderTests`.
 
 The hidden DEBUG qualification path remains strict and separate from ordinary public starts. If any qualification lease/context is supplied, owner process, connection, workspace, generation, receipt, Apply Edits scope, and provider identity checks all fail closed; a lease never authorizes a non-OMP target. The six live qualification gates and cross-process `session/load` MCP re-registration have passed. OMP has no supported CE timeout override today; do not add a speculative one.
 
@@ -261,7 +263,7 @@ The recommended pattern when adding (for example) a hypothetical `acmeAgent` fam
 
 1. **Decide the runtime shape.**
    - Interactive native CLI: implement `NativeAgentRuntimeControlling` for the new family, building an adapter analogous to `ClaudeCompatibleNativeSessionAdapter`.
-   - Headless-only CLI: build a `HeadlessAgentProvider` and (optionally) wrap it in a per-family adapter for parity.
+   - Headless-only CLI: build a `HeadlessAgentProvider` and (optionally) wrap it in a per-family adapter for parity. One-shot AI-query adapters can reuse `HeadlessCLIStreamBridge` while retaining provider-specific prompt, config, model, and event semantics.
    - ACP-based: follow `Sources/RepoPrompt/Features/AgentMode/Providers/ACP/ACPAgentProvider.swift` instead — ACP runtimes do not yet flow through the Claude-compatible plugin seam.
 
 2. **Add (or reuse) a provider package.**
@@ -317,6 +319,7 @@ Add the relevant focused suite before any catalog/codec change, and snapshot mod
 - `Packages/RepoPromptAgentProviders/Package.swift` — provider package manifest.
 - `Packages/RepoPromptAgentProviders/Sources/RepoPromptClaudeCompatibleProvider/` — plugin DTOs, codec, translator, prompt delivery, environment builder, catalog, headless arg builder, launch-env resolver.
 - `Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/ClaudeCompatibleProviderRuntimeBridge.swift` — single package import point.
+- `Sources/RepoPrompt/Infrastructure/AI/Providers/HeadlessCLIStreamBridge.swift` and `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/OhMyPiCLIProvider.swift` — shared one-shot lifecycle plus the tool-free OMP Oracle adapter.
 - `Sources/RepoPrompt/Features/AgentMode/Providers/ClaudeCompatible/` — Agent-Mode facade and adapter trio.
 - `Sources/RepoPrompt/Features/AgentMode/Runtime/Native/NativeAgentRuntimeContracts.swift` — provider-neutral runtime contract.
 - `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/` — provider-neutral RepoPrompt workflow prompt catalog, metadata, variants, and renderers shared by installs and MCP prompt registration.

@@ -303,10 +303,25 @@ enum ACPAIModelCatalog {
         cursorModelOptionsFromStore().map { .cursorCustom(name: $0.rawValue) }
     }
 
+    static func ohMyPiModelOptionsFromStore() -> [AgentModelOption] {
+        AgentACPModelRegistry.shared.resolvedSnapshot(for: .ohMyPi)?.options ?? []
+    }
+
+    static func ohMyPiModelsFromStore() -> [AIModel] {
+        ohMyPiModelOptionsFromStore().map { .ohMyPiCustom(name: $0.rawValue) }
+    }
+
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
         return openCodeModelOptionsFromStore()
+            .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+    }
+
+    static func ohMyPiModelOption(for rawValue: String) -> AgentModelOption? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        return ohMyPiModelOptionsFromStore()
             .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
     }
 

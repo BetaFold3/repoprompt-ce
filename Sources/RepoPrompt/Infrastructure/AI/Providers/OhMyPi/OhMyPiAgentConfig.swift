@@ -3,7 +3,8 @@ import Foundation
 /// Fixed RepoPrompt-managed configuration for Oh My Pi's ACP runtime.
 ///
 /// OMP is intentionally launched without native tools, extensions, skills, or rules.
-/// These arguments are not user-overridable: RepoPrompt MCP is the sole tool surface.
+/// These arguments are not user-overridable. Agent Mode injects RepoPrompt MCP as its
+/// sole tool surface; tool-free Oracle requests explicitly disable that injection.
 struct OhMyPiAgentConfig {
     static let minimumSupportedVersion = [17, 2, 12]
     static let managedArguments = [

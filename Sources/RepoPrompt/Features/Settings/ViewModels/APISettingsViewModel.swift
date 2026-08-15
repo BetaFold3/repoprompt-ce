@@ -502,7 +502,11 @@ public class APISettingsViewModel: ObservableObject {
     private func refreshAgentAvailability() {
         let next = agentModeAvailabilityContext
         guard next != agentAvailability else { return }
+        let ohMyPiAvailabilityChanged = next.ohMyPiAvailable != agentAvailability.ohMyPiAvailable
         agentAvailability = next
+        if ohMyPiAvailabilityChanged {
+            Task { await updateAvailableModels() }
+        }
     }
 
     /// Safety net behind the explicit `refreshAgentAvailability()` calls: recompute
@@ -2319,6 +2323,10 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.cursor))
         }
 
+        if agentModeAvailabilityContext.ohMyPiAvailable {
+            modelSet.formUnion(AIModel.modelsForProvider(.ohMyPi))
+        }
+
         // ── Custom provider (OpenAI compatible) ────────────────────────────────
         if isCustomProviderValid,
            let config = try? CustomProviderConfiguration.load()
@@ -2336,13 +2344,17 @@ public class APISettingsViewModel: ObservableObject {
             modelSet.formUnion(AIModel.modelsForProvider(.ollama))
         }
 
-        let groupedByProvider = Dictionary(grouping: modelSet, by: \.providerType)
+        let ohMyPiModels = AIModel.sortedForPicker(modelSet.filter { $0.providerType == .ohMyPi })
+        let groupedByProvider = Dictionary(
+            grouping: modelSet.filter { $0.providerType != .ohMyPi },
+            by: \.providerType
+        )
         let sortedProviders = groupedByProvider.keys.sorted {
             AIProviderType.displayName(for: $0).localizedCaseInsensitiveCompare(AIProviderType.displayName(for: $1)) == .orderedAscending
         }
         availableModels = sortedProviders.flatMap { provider in
             AIModel.sortedForPicker(Array(groupedByProvider[provider] ?? []))
-        }
+        } + ohMyPiModels
     }
 
     func updateOllamaModel(_ newModel: String) {
@@ -2383,6 +2395,7 @@ public class APISettingsViewModel: ObservableObject {
         case .customProvider: "custom"
         case .azure: "azure"
         case .cursor: "cursor"
+        case .ohMyPi: "oh_my_pi"
         case .ollama: "ollama"
         case .claudeCode: "claude_code"
         case .codex: "codex"
@@ -2461,6 +2474,8 @@ public class APISettingsViewModel: ObservableObject {
                 break
             case .cursor:
                 break
+            case .ohMyPi:
+                break
             }
 
             await updateAvailableModels()
@@ -2529,6 +2544,8 @@ public class APISettingsViewModel: ObservableObject {
             break
         case .cursor:
             break
+        case .ohMyPi:
+            break
         }
         await updateAvailableModels()
         resetPreferredModelIfNeeded(for: provider)
@@ -2579,6 +2596,7 @@ public class APISettingsViewModel: ObservableObject {
         case .groq: condition = { $0.providerType == .groq }
         case .zAI: condition = { $0.providerType == .zAI }
         case .cursor: condition = { $0.providerType == .cursor }
+        case .ohMyPi: condition = { $0.providerType == .ohMyPi }
         // Add other providers if needed (Ollama usually doesn't need key resets this way)
         default: return // No reset needed for this provider type
         }

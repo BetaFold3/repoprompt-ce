@@ -108,6 +108,25 @@ final class AppSettingsMCPService: Service {
         func handleForTesting(_ args: [String: Value]) async throws -> Value {
             try await handle(args)
         }
+
+        @MainActor
+        static func aiModelRawCandidateValuesForTesting(
+            agentFilter: AgentProviderKind?,
+            effectiveOhMyPiAvailable: Bool
+        ) throws -> [Value] {
+            let request = AppSettingCandidateRequest(
+                key: "models.planning_model",
+                agentFilter: agentFilter,
+                detailed: true,
+                limit: 200,
+                availability: .none
+            )
+            let result = try AppSettingsMCPRegistry.aiModelRawCandidates(
+                request: request,
+                effectiveOhMyPiAvailable: effectiveOhMyPiAvailable
+            )
+            return result.options.map { $0.toValue(detailed: true) }
+        }
     #endif
 
     private func list(_ args: [String: Value]) async throws -> Value {
@@ -1470,7 +1489,7 @@ private enum AppSettingsMCPRegistry {
         case .cursor:
             .cursor
         case .ohMyPi:
-            nil
+            .ohMyPi
         }
     }
 
@@ -1492,6 +1511,7 @@ private enum AppSettingsMCPRegistry {
         case .codex: "codex"
         case .openCode: "openCode"
         case .cursor: "cursor"
+        case .ohMyPi: "ohMyPi"
         }
     }
 
@@ -1568,8 +1588,22 @@ private enum AppSettingsMCPRegistry {
     static func aiModelRawCandidates(
         request: AppSettingCandidateRequest
     ) throws -> AppSettingCandidatesResult {
+        try aiModelRawCandidates(
+            request: request,
+            effectiveOhMyPiAvailable: OhMyPiConnectionAvailability.isEffectivelyConnected()
+        )
+    }
+
+    static func aiModelRawCandidates(
+        request: AppSettingCandidateRequest,
+        effectiveOhMyPiAvailable: Bool
+    ) throws -> AppSettingCandidatesResult {
         let filteredProvider = request.agentFilter.flatMap(aiProviderType(for:))
-        let models = AIModel.allModels()
+        var candidateModels = AIModel.allModels()
+        if effectiveOhMyPiAvailable {
+            candidateModels.append(contentsOf: AIModel.modelsForProvider(.ohMyPi))
+        }
+        let models = candidateModels
             .filter(\.isAvailable)
             .filter { model in
                 guard let filteredProvider else { return true }

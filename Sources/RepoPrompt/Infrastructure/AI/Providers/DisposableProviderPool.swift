@@ -38,6 +38,16 @@ actor DisposableProviderPool {
             // For Azure, parse the stored JSON configuration
             return try await createAzureProvider(for: providerType, ollamaURL: ollamaURL, azureConfiguration: azureConfiguration)
 
+        case .ohMyPi:
+            // OMP is CLI-authenticated and intentionally has no keychain account.
+            return try await AIProviderFactory.createProvider(
+                for: providerType,
+                key: "",
+                ollamaURL: ollamaURL,
+                azureConfiguration: azureConfiguration,
+                model: model.rawValue
+            )
+
         default:
             // For all other providers, pass the retrieved value as the API key
             return try await createStandardProvider(
