@@ -14325,6 +14325,22 @@ actor WorkspaceFileContextStore {
     func codemapArtifactDemandStatus(
         _ ticket: WorkspaceCodemapArtifactDemandTicket
     ) -> WorkspaceCodemapArtifactDemandResult {
+        let result = codemapArtifactDemandRawStatus(ticket)
+        if case .unavailable(.rejected(.staleCompletion)) = result {
+            return .unavailable(.staleCurrentness)
+        }
+        return result
+    }
+
+    func codemapArtifactDemandRecoveryStatus(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket
+    ) -> WorkspaceCodemapArtifactDemandResult {
+        codemapArtifactDemandRawStatus(ticket)
+    }
+
+    private func codemapArtifactDemandRawStatus(
+        _ ticket: WorkspaceCodemapArtifactDemandTicket
+    ) -> WorkspaceCodemapArtifactDemandResult {
         guard codemapDemandIsCurrent(ticket),
               let record = codemapSessionsByRootEpoch[ticket.rootEpoch]?
               .demandsByFileID[ticket.fileID],

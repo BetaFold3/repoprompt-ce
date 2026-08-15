@@ -1242,7 +1242,7 @@ struct WorkspaceCodemapPresentationCoordinator {
                 guard let current = results[fileID] else { continue }
                 switch current {
                 case let .pending(ticket):
-                    let refreshed = await store.codemapArtifactDemandStatus(ticket)
+                    let refreshed = await store.codemapArtifactDemandRecoveryStatus(ticket)
                     results[fileID] = refreshed
                     switch refreshed {
                     case .pending:
@@ -1336,7 +1336,7 @@ struct WorkspaceCodemapPresentationCoordinator {
                     nil
                 }
                 guard let repaired else {
-                    let refreshed = await store.codemapArtifactDemandStatus(existingTicket)
+                    let refreshed = await store.codemapArtifactDemandRecoveryStatus(existingTicket)
                     results[fileID] = refreshed
                     if case .unavailable(.staleCurrentness) = refreshed {
                         ticketsByFileID[fileID] = nil
@@ -1675,6 +1675,11 @@ private struct WorkspaceCodemapStructureAttempt {
     let staleReason: WorkspaceCodemapStructurePublicationStaleReason?
 }
 
+private struct WorkspaceCodemapStructurePublicationRevocation {
+    let reason: WorkspaceCodemapStructurePublicationStaleReason
+    let outputFileIDs: Set<UUID>
+}
+
 extension WorkspaceCodemapPresentationCoordinator {
     func structurePresentation(
         seedFileIDs: [UUID],
@@ -1698,6 +1703,7 @@ extension WorkspaceCodemapPresentationCoordinator {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: policy.maximumTotalWait)
         var lastStaleReason: WorkspaceCodemapStructurePublicationStaleReason?
+        var publicationRevocationForRetry: WorkspaceCodemapStructurePublicationRevocation?
         let recoveryState = WorkspaceCodemapDemandRecoveryState()
 
         for attemptIndex in 0 ..< policy.maximumStructurePublicationAttempts {
@@ -1719,6 +1725,7 @@ extension WorkspaceCodemapPresentationCoordinator {
                 )
                 if let staleReason = attempt.staleReason {
                     lastStaleReason = staleReason
+                    publicationRevocationForRetry = nil
                     await release(ownership)
                     if attemptIndex + 1 < policy.maximumStructurePublicationAttempts,
                        clock.now < deadline
@@ -1729,11 +1736,21 @@ extension WorkspaceCodemapPresentationCoordinator {
                 }
                 guard let receipt = attempt.receipt else {
                     await release(ownership)
+                    if let publicationRevocationForRetry,
+                       receiptlessRetryWasEmptiedByPublicationRevocation(
+                           attempt.presentation,
+                           revokedOutputFileIDs: publicationRevocationForRetry.outputFileIDs
+                       )
+                    {
+                        return .stale(
+                            publicationRevocationForRetry.reason,
+                            requestedSeedCount: seedFileIDs.count
+                        )
+                    }
                     // A current attempt without a receipt can still carry an
                     // authoritative busy, budget, unavailable, or terminal
-                    // result. Only attempt.staleReason above authorizes falling
-                    // back to stale; do not mask a definitive later diagnosis
-                    // with an earlier attempt's stale reason.
+                    // result. Do not mask it unless the revoked receipt's files
+                    // are now the only candidate-admission failures.
                     return attempt.presentation
                 }
                 await beforePublicationRevalidation(receipt.presentation)
@@ -1746,6 +1763,10 @@ extension WorkspaceCodemapPresentationCoordinator {
                     return attempt.presentation
                 case let .stale(reason):
                     lastStaleReason = reason
+                    publicationRevocationForRetry = .init(
+                        reason: reason,
+                        outputFileIDs: Set(receipt.outputFileIDs)
+                    )
                     await release(ownership)
                     if attemptIndex + 1 < policy.maximumStructurePublicationAttempts,
                        clock.now < deadline
@@ -1761,6 +1782,25 @@ extension WorkspaceCodemapPresentationCoordinator {
             }
         }
         return .stale(lastStaleReason ?? .output, requestedSeedCount: seedFileIDs.count)
+    }
+
+    private func receiptlessRetryWasEmptiedByPublicationRevocation(
+        _ presentation: WorkspaceCodemapStructurePresentation,
+        revokedOutputFileIDs: Set<UUID>
+    ) -> Bool {
+        guard presentation.outcome == .unavailable,
+              presentation.entries.isEmpty,
+              !presentation.issues.isEmpty
+        else { return false }
+        return presentation.issues.allSatisfy { issue in
+            switch issue {
+            case let .candidate(.fileNotCataloged(fileID)),
+                 let .candidate(.fileOutsideRootScope(fileID)):
+                revokedOutputFileIDs.contains(fileID)
+            default:
+                false
+            }
+        }
     }
 
     private func makeStructureAttempt(
