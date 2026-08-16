@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 struct CLIProvidersSettingsView: View {
@@ -31,6 +32,9 @@ struct CLIProvidersSettingsView: View {
         self.closeAction = closeAction
         self.onNavigate = onNavigate
         _providerPermissionsVM = StateObject(wrappedValue: providerPermissionsViewModel())
+        _cursorModelParameterCatalogStatus = State(
+            initialValue: CursorModelParameterCatalog.shared.status()
+        )
     }
 
     @State private var showAlert = false
@@ -61,6 +65,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isOhMyPiExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
+    @State private var cursorModelParameterCatalogStatus: CursorModelParameterCatalog.Status
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -142,6 +147,7 @@ struct CLIProvidersSettingsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
+            cursorModelParameterCatalogStatus = CursorModelParameterCatalog.shared.status()
             Task {
                 await viewModel.loadCompatibleBackendState()
                 await viewModel.refreshClaudeCodeBinaryStatus()
@@ -190,6 +196,12 @@ struct CLIProvidersSettingsView: View {
                     dismissButton: .default(Text("OK"))
                 )
             }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: Self.cursorParameterCatalogStatusNotification)
+                .receive(on: RunLoop.main)
+        ) { _ in
+            cursorModelParameterCatalogStatus = CursorModelParameterCatalog.shared.status()
         }
         .onChange(of: showAlert) { newValue in
             if !newValue {
@@ -2083,9 +2095,19 @@ struct CLIProvidersSettingsView: View {
                         }
                     }
                 }
+
+                Text(CursorModelParameterCatalogStatusPresentation.message(
+                    for: cursorModelParameterCatalogStatus
+                ))
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
+
+    static let cursorParameterCatalogStatusNotification =
+        Notification.Name.cursorModelParameterCatalogStatusDidChange
 
     private var cursorModelSummary: String {
         let options = viewModel.availableCursorModelOptions
@@ -2532,5 +2554,75 @@ struct CLIProvidersSettingsView: View {
         showCursorTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
+    }
+}
+
+enum CursorModelParameterCatalogStatusPresentation {
+    static func message(for status: CursorModelParameterCatalog.Status) -> String {
+        message(for: status, formatDate: formattedDate)
+    }
+
+    static func message(
+        for status: CursorModelParameterCatalog.Status,
+        formatDate: (Date) -> String
+    ) -> String {
+        let savedDate = status.lastSuccessfulRefresh.map {
+            " from \(formatDate($0))"
+        } ?? ""
+
+        switch status.state {
+        case .live:
+            return status.hasUsableCatalog
+                ? "Cursor model parameters are up to date."
+                : "Cursor currently exposes no parameterized models."
+        case .cached:
+            return status.hasUsableCatalog
+                ? "Using saved Cursor model parameters\(savedDate); background refresh is pending."
+                : "No saved Cursor model parameters are available; background refresh is pending."
+        case .refreshing:
+            return status.hasUsableCatalog
+                ? "Refreshing Cursor model parameters; using the saved copy\(savedDate)."
+                : "Refreshing Cursor model parameters…"
+        case let .stale(kind):
+            let reason = failureReason(for: kind)
+            return status.hasUsableCatalog
+                ? "Using saved Cursor model parameters\(savedDate) — last refresh failed: \(reason)."
+                : "Cursor model parameters are unavailable — last refresh failed: \(reason)."
+        case .unsupported:
+            return "This Cursor version doesn't expose model parameters."
+        case .disabled:
+            return status.hasUsableCatalog
+                ? "Cursor model parameter refresh is disabled; using the saved copy\(savedDate)."
+                : "Cursor model parameter discovery is disabled."
+        case .idle:
+            return status.hasUsableCatalog
+                ? "Using saved Cursor model parameters\(savedDate); background refresh has not started."
+                : "Cursor model parameter discovery has not started."
+        }
+    }
+
+    private static func failureReason(
+        for kind: CursorModelParameterCatalog.FailureKind
+    ) -> String {
+        switch kind {
+        case .authentication:
+            "Cursor authentication needs attention"
+        case .timeout:
+            "the refresh timed out"
+        case .malformedResponse:
+            "Cursor returned malformed model parameter data"
+        case .discovery:
+            "model discovery failed"
+        case .extension:
+            "the parameter request failed"
+        }
+    }
+
+    private static func formattedDate(_ date: Date) -> String {
+        DateFormatter.localizedString(
+            from: date,
+            dateStyle: .medium,
+            timeStyle: .short
+        )
     }
 }

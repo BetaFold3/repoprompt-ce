@@ -2328,6 +2328,170 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.endRunAttempt(ifCurrent: reusedOwnership, source: "test.cleanup")
     }
 
+    func testCodexHandoffWithMigratedHistoryStartsFreshWhenNoNativeThreadMetadataExists() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexNeedsReconnect = true
+        session.appendItem(.user("source question", sequenceIndex: session.nextSequenceIndex))
+        session.appendItem(.assistant("source answer", sequenceIndex: session.nextSequenceIndex))
+        session.pendingHandoff = .init(
+            payload: "<forked_session>migrated history</forked_session>",
+            defersProviderLockUntilSend: true,
+            isStagedForSend: true
+        )
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "continue",
+            initialMessageForRun: "continue",
+            attachments: []
+        )
+
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(controller.startReferences.count, 1)
+        XCTAssertNil(controller.startReferences[0])
+        XCTAssertEqual(session.codexConversationID, "lifecycle")
+        XCTAssertFalse(session.codexNeedsReconnect)
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexHandoffRetriesThreadStartAfterFirstStartFailure() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(
+            recorder: recorder,
+            startFailuresBeforeSuccess: 1
+        )
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.appendItem(.user("source question", sequenceIndex: session.nextSequenceIndex))
+        session.appendItem(.assistant("source answer", sequenceIndex: session.nextSequenceIndex))
+        session.pendingHandoff = .init(
+            payload: "<forked_session>retry me</forked_session>",
+            defersProviderLockUntilSend: true,
+            isStagedForSend: true
+        )
+
+        let firstOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "first attempt",
+            initialMessageForRun: "first attempt",
+            attachments: []
+        )
+
+        guard case .failed? = firstOutcome else {
+            return XCTFail("Expected the first Codex thread start to fail")
+        }
+        XCTAssertTrue(session.codexNeedsReconnect)
+        XCTAssertNil(session.codexConversationID)
+        XCTAssertNil(session.codexRolloutPath)
+        XCTAssertEqual(session.pendingHandoff.payload, "<forked_session>retry me</forked_session>")
+        XCTAssertEqual(controller.startReferences.count, 1)
+        XCTAssertNil(controller.startReferences[0])
+
+        let retryOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "retry",
+            initialMessageForRun: "retry",
+            attachments: []
+        )
+
+        XCTAssertEqual(retryOutcome, .sent)
+        XCTAssertEqual(controller.startReferences.count, 2)
+        XCTAssertTrue(controller.startReferences.compactMap(\.self).isEmpty)
+        XCTAssertEqual(session.codexConversationID, "lifecycle")
+        XCTAssertFalse(session.codexNeedsReconnect)
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexDisconnectedThreadResumesFromSavedIDRegardlessOfTranscriptShape() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "saved-thread"
+        session.codexRolloutPath = "/tmp/saved-thread.jsonl"
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(controller.startReferences.count, 1)
+        XCTAssertEqual(controller.startReferences[0]?.conversationID, "saved-thread")
+        XCTAssertEqual(controller.startReferences[0]?.rolloutPath, "/tmp/saved-thread.jsonl")
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+    }
+
+    func testCodexRolloutWithoutThreadIDSurfacesResumeIntegrityError() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexRolloutPath = "/tmp/missing-thread-id.jsonl"
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+
+        guard case .failed? = outcome else {
+            return XCTFail("Expected rollout-only Codex metadata to fail integrity validation")
+        }
+        XCTAssertEqual(controller.startReferences.count, 1)
+        XCTAssertEqual(controller.startReferences[0]?.conversationID, "")
+        XCTAssertEqual(controller.startReferences[0]?.rolloutPath, "/tmp/missing-thread-id.jsonl")
+        XCTAssertTrue(session.items.contains {
+            $0.kind == .error
+                && $0.text.hasPrefix("Codex native resume failed: Cannot resume this Codex thread")
+        })
+    }
+
+    func testCodexRolloutWithoutThreadIDCannotUseRepeatedTimeoutFreshStartFallback() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        let harness = makeHarness(recorder: recorder, codexController: controller)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.codexRolloutPath = "/tmp/missing-thread-id.jsonl"
+        session.codexResumeTimeoutState = .init(
+            conversationID: nil,
+            rolloutPath: "/tmp/missing-thread-id.jsonl",
+            consecutiveTimeouts: 2
+        )
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "resume",
+            initialMessageForRun: "resume",
+            attachments: []
+        )
+
+        guard case .failed? = outcome else {
+            return XCTFail("Expected rollout-only metadata to bypass fresh-start fallback")
+        }
+        XCTAssertEqual(controller.startReferences.count, 1)
+        XCTAssertEqual(controller.startReferences[0]?.conversationID, "")
+        XCTAssertEqual(controller.startReferences[0]?.rolloutPath, "/tmp/missing-thread-id.jsonl")
+        XCTAssertNil(session.codexConversationID)
+    }
+
     func testCodexFallbackAndRejectedSendVariantsPreserveReusedOwnership() async {
         let rows: [(LifecycleNoopCodexController.SendBehavior, Bool)] = [
             (.failure, true),
@@ -4883,6 +5047,7 @@ enum LifecycleTestError: LocalizedError {
     case unexpectedACPControllerCreation
     case expectedClaudeSendFailure
     case expectedCodexSendFailure
+    case expectedCodexStartFailure
 
     var errorDescription: String? {
         switch self {
@@ -4896,6 +5061,8 @@ enum LifecycleTestError: LocalizedError {
             "Expected Claude send failure."
         case .expectedCodexSendFailure:
             "Expected Codex send failure."
+        case .expectedCodexStartFailure:
+            "Expected Codex thread start failure."
         }
     }
 }
@@ -5005,18 +5172,31 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     private let recorder: LifecycleRecorder
     private let sendBehavior: SendBehavior
     private let activatesThread: Bool
+    private var remainingStartFailures: Int
+    private(set) var startReferences: [CodexNativeSessionController.SessionRef?] = []
     private(set) var hasActiveThread = false
 
-    init(recorder: LifecycleRecorder, failSend: Bool = false) {
+    init(
+        recorder: LifecycleRecorder,
+        failSend: Bool = false,
+        startFailuresBeforeSuccess: Int = 0
+    ) {
         self.recorder = recorder
         sendBehavior = failSend ? .failure : .success
         activatesThread = true
+        remainingStartFailures = max(0, startFailuresBeforeSuccess)
     }
 
-    init(recorder: LifecycleRecorder, sendBehavior: SendBehavior, activatesThread: Bool) {
+    init(
+        recorder: LifecycleRecorder,
+        sendBehavior: SendBehavior,
+        activatesThread: Bool,
+        startFailuresBeforeSuccess: Int = 0
+    ) {
         self.recorder = recorder
         self.sendBehavior = sendBehavior
         self.activatesThread = activatesThread
+        remainingStartFailures = max(0, startFailuresBeforeSuccess)
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -5026,18 +5206,41 @@ final class LifecycleNoopCodexController: CodexSessionControlling {
     func ensureEventsStreamReady() {}
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String) async throws -> CodexNativeSessionController.SessionRef {
-        hasActiveThread = activatesThread
-        return CodexNativeSessionController.SessionRef(conversationID: "lifecycle", rolloutPath: nil, model: nil, reasoningEffort: nil)
+        try establishThread(existing: existing, model: nil, reasoningEffort: nil)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?) async throws -> CodexNativeSessionController.SessionRef {
-        hasActiveThread = activatesThread
-        return CodexNativeSessionController.SessionRef(conversationID: "lifecycle", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
+        try establishThread(existing: existing, model: model, reasoningEffort: reasoningEffort)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexNativeSessionController.SessionRef {
+        try establishThread(existing: existing, model: model, reasoningEffort: reasoningEffort)
+    }
+
+    private func establishThread(
+        existing: CodexNativeSessionController.SessionRef?,
+        model: String?,
+        reasoningEffort: String?
+    ) throws -> CodexNativeSessionController.SessionRef {
+        startReferences.append(existing)
+        if let existing,
+           existing.conversationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            hasActiveThread = false
+            throw CodexSessionControllerError.invalidResumeReferenceMissingThreadID
+        }
+        if remainingStartFailures > 0 {
+            remainingStartFailures -= 1
+            hasActiveThread = false
+            throw LifecycleTestError.expectedCodexStartFailure
+        }
         hasActiveThread = activatesThread
-        return CodexNativeSessionController.SessionRef(conversationID: "lifecycle", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
+        return CodexNativeSessionController.SessionRef(
+            conversationID: "lifecycle",
+            rolloutPath: nil,
+            model: model,
+            reasoningEffort: reasoningEffort
+        )
     }
 
     func readThreadSnapshot(includeTurns: Bool, timeout: TimeInterval?) async throws -> CodexNativeSessionController.ThreadSnapshot {

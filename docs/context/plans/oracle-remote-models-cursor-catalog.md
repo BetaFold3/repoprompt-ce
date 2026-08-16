@@ -4,7 +4,7 @@ Scope: read when the task touches Oracle remote-client models for Cursor or Oh M
 Authority: Authoritative
 Last-verified: 2026-08-15
 
-Status: **Phase A implemented and locally validated; Phases B/C remain planned and out of scope.**
+Status: **Phases A and B implemented and locally validated; Phase C remains planned and out of scope.**
 Date: 2026-08-15
 Provenance: an investigation independently verified every load-bearing claim (live `cursor-agent` ACP probe with `parameterizedModelPicker`, RPCE parser replay against the live catalog response, persisted `ACPDynamicModelProviders` inspection in both CE app domains, and commit-by-commit diff review since `cf6b5f30`). Two independent Oracle plans (presets OracleB, OracleC) were produced over a curated selection, then one adversarial duel round on every material disagreement and one final committed-verdict round. Preset identity (`model_preset_id`/`model_preset_name`) was verified on every send. The referee (session agent) adjudicated the single point still contested after round 2.
 
@@ -15,6 +15,18 @@ Phase A is implemented without Phase B/C changes. OMP Oracle selections are dyna
 OMP's direct `streamMessage` boundary and `completeMessage` both fail on ACP error events, all tool event types, and clean EOF without `message_stop`; partial text may be emitted but is never converted into success. `HeadlessCLIStreamBridge` owns shared one-shot lifecycle and exactly-once disposal for OMP and Cursor, including noncancelled cleanup ownership on normal/error paths and start-failure cleanup. Cursor retains its nonempty-text-without-`message_stop` acceptance and legacy empty-completion diagnostic.
 
 Latest focused and combined validation passed: `OhMyPiModelCatalogTests` 3/3, `OhMyPiCLIProviderTests` 7/7, `OhMyPiACPHeadlessAgentProviderTests` 4/4, `HeadlessCLIStreamBridgeTests` 4/4, `CursorCLIProviderTests` 1/1, and `AppSettingsMCPServiceAgentModeSettingsTests` 5/5; the combined root rerun passed 24/24. `make dev-build`, `make dev-lint`, and `make dev-format-check` remain green. The agent-context checker remains green with 0 warnings and 23 tests. The surgical ledger rows are present; repository-wide `verify-ledger` remains blocked by the unchanged unrelated mismatch (286 missing IDs, 3 stale IDs), and `make guardrails` remains blocked because it treats this user-required active-plan update as an unexpected tracked document.
+
+## Phase B outcome (2026-08-15)
+
+Phase B is implemented and locally validated; Phase C remains untouched, planned, and out of scope. `CursorModelParameterCatalogV1` is a versioned UserDefaults store with atomic retain-last-good parsing, preservation of corrupt and future-version envelopes, authoritative clears, synchronous launch hydration plus lazy hydration, and a status snapshot carried on a separate status notification from catalog-data changes.
+
+Polling now uses typed outcomes with one enforced catalog owner. Transient failures retain both bare models and the last-good parameter catalog; failures are classified, logs are sanitized and transition-rate-limited, and retry backoff grows from 15s to a 300s cap and resets on success. Cancellation and shutdown do not record spurious failures, including both `refreshNow` and `discoverOnce` shutdown paths. Launch hydration is wired, Cursor settings render exactly one status row, pickers render no status rows, and Phase C was not changed.
+
+OracleA was resolved to exact preset `61D024A4-CCFB-4C9C-A614-CC65E0A1864C`, reviewed the completed code, and all four P1 plus three P2 findings were remediated in one pass.
+
+Final validation passed: `make dev-build` (ticket `3345c705-1f0b-4297-9eea-addf53855216`); focused suites 86/86 (`CursorModelParameterStoreTests` 9, `CursorModelParameterCatalogTests` 17, `CursorACPModelPollingServiceTests` 10, `CursorModelMenuBuilderTests` 5, `CursorModelParameterCatalogStatusPresentationTests` 5, `ContextBuilderModelStartupSelectionTests` 14, `CursorParameterizedModelControllerTests` 21, `WindowCloseCoordinatorLifecycleTests` 5); broad `make dev-test FILTER=Cursor` (ticket `67d16417-7f83-4e43-8ef7-a144eb6b60d7`); `make dev-lint` (ticket `65a36f8b-300f-4dad-9833-4074994a78eb`); and `make dev-format-check` (ticket `e15ac22e-6686-471f-8881-233a7e80ed01`). No full-root test run or live app validation occurred.
+
+The Phase B surgical ledger IDs are present. Repository-wide `verify-ledger` remains at the unchanged unrelated baseline of 286 missing IDs and 3 stale IDs. `make guardrails` remains blocked only by its existing rule flagging this authoritative active plan. `Scripts/check-agent-context` passed with 0 warnings.
 
 ## Motivating incident (verified)
 

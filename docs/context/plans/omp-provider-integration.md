@@ -181,7 +181,7 @@ Enum/seam sweeps (all compiler-enforced arms plus an `rg` inventory for string-k
 - **Phase 4 — Headless adapter + settings (implemented; live DEBUG qualification closed).** The shared headless bridge, native resume propagation, diagnostic probe/model refresh/reset surface, normal MCP discovery/start, and Context Builder construction are wired. Dynamic discovered models plus the Default sentinel remain authoritative.
 - **Phase 5 — Live-gate hardening qualification complete.** All six live gates passed on 2026-08-14. The DEBUG qualification path remains strict and absent from RELEASE.
 - **Phase B — Public enablement (implemented).** OMP is a supported catalog provider in every build; connection-gated Agent Mode, MCP, and Context Builder paths are enabled in DEBUG and RELEASE without requiring a hidden lease.
-- **Phase 6 — Fast-follow (separately gated).** Thinking selector per §4.3.
+- **Phase 6 — Fast-follow (separately gated).** Thinking selector per §4.3. Detailed follow-up design (transcript authority, hierarchical OMP menus, thinking selector mechanism/state/UI) is duel-settled in [omp-transcript-authority-and-model-ux](omp-transcript-authority-and-model-ux.md), which supersedes §4.3's open mechanism choice and §4.5's reuse-first stance for OMP.
 
 Total ≈ 3–4.5 weeks, one engineer, including the spike.
 

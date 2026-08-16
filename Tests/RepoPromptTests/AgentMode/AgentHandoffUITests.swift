@@ -109,7 +109,10 @@ final class AgentHandoffUITests: XCTestCase {
 
     func testCursorHandoffPreservesBracketedSelectionReconcilesAndRendersMenu() throws {
         installCursorModel()
-        XCTAssertTrue(CursorModelParameterCatalog.shared.apply(response: cursorParameterResponse()))
+        XCTAssertEqual(
+            CursorModelParameterCatalog.shared.apply(response: cursorParameterResponse()),
+            .applied(didChange: true)
+        )
 
         let baseOption = AgentModelOption(
             rawValue: "gpt-5.6-sol",
@@ -405,7 +408,10 @@ final class AgentHandoffUITests: XCTestCase {
 
     func testAgentModelsSettingsRoutesBracketedCursorLabels() {
         installCursorModel()
-        XCTAssertTrue(CursorModelParameterCatalog.shared.apply(response: cursorParameterResponse()))
+        XCTAssertEqual(
+            CursorModelParameterCatalog.shared.apply(response: cursorParameterResponse()),
+            .applied(didChange: true)
+        )
         let raw = AIModel.cursorCustom(
             name: "gpt-5.6-sol[context=1m,thinking_mode=high,fast=false]"
         ).rawValue

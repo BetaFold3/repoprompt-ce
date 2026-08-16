@@ -2858,25 +2858,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         return candidates.contains { isMissingRolloutErrorMessage($0) }
     }
 
-    private static func hasResumeEligibleCodexHistory(_ items: [AgentChatItem]) -> Bool {
-        items.contains { item in
-            switch item.kind {
-            case .assistant, .assistantInline, .toolCall, .toolResult, .system, .error, .thinking:
-                true
-            case .user:
-                false
-            }
-        }
-    }
-
     private static func normalizedCodexResumeTimeoutTarget(
         conversationID: String?,
         rolloutPath: String?
     ) -> AgentModeViewModel.CodexResumeTimeoutState? {
         let normalizedConversationID = conversationID?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedConversationID = normalizedConversationID?.isEmpty == false ? normalizedConversationID : nil
-        guard resolvedConversationID != nil || rolloutPath != nil else {
+        guard let resolvedConversationID = normalizedConversationID,
+              !resolvedConversationID.isEmpty
+        else {
             return nil
         }
         return AgentModeViewModel.CodexResumeTimeoutState(
@@ -2886,12 +2876,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
     }
 
+    /// Message classification follows the requested operation. Timeout accounting remains
+    /// stricter because it requires a usable target identity.
     private static func isCodexResumeAttempt(_ existingRef: CodexNativeSessionController.SessionRef?) -> Bool {
-        guard let existingRef else { return false }
-        return normalizedCodexResumeTimeoutTarget(
-            conversationID: existingRef.conversationID,
-            rolloutPath: existingRef.rolloutPath
-        ) != nil
+        existingRef != nil
     }
 
     private static func codexNativeSessionFailurePrefix(attemptedResume: Bool) -> String {
@@ -3737,7 +3725,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         allowResumeTimeoutFallback: Bool = true,
         deferReconnectForCurrentActiveTurn: Bool = false,
         preserveExistingRunID: Bool = false,
-        skipResumeWhenNoPriorCodexHistory: Bool = false,
         semanticRunState: AgentSessionRunState? = nil
     ) async {
         guard session.selectedAgent == .codexExec else { return }
@@ -3765,7 +3752,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     policyAlreadyInstalled: false,
                     allowMissingRolloutFallback: allowMissingRolloutFallback,
                     allowResumeTimeoutFallback: allowResumeTimeoutFallback,
-                    skipResumeWhenNoPriorCodexHistory: false,
                     semanticRunState: semanticRunState
                 )
                 return
@@ -3981,7 +3967,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 policyAlreadyInstalled: false,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback,
-                skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState
             )
             return
@@ -4009,7 +3994,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 policyAlreadyInstalled: true,
                 allowMissingRolloutFallback: allowMissingRolloutFallback,
                 allowResumeTimeoutFallback: allowResumeTimeoutFallback,
-                skipResumeWhenNoPriorCodexHistory: skipResumeWhenNoPriorCodexHistory,
                 semanticRunState: semanticRunState
             )
 
@@ -4049,15 +4033,23 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             sessionProfile: session.profile
         )
         let resumeCandidate: CodexNativeSessionController.SessionRef? = {
-            guard session.codexNeedsReconnect else { return nil }
-            if skipResumeWhenNoPriorCodexHistory,
-               !Self.hasResumeEligibleCodexHistory(session.items)
-            {
+            let threadID = session.codexConversationID?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedThreadID = threadID?.isEmpty == false ? threadID : nil
+            let rolloutPath = session.codexRolloutPath?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedRolloutPath = rolloutPath?.isEmpty == false ? rolloutPath : nil
+
+            // Native metadata, not transcript contents or a reconnect request, establishes
+            // whether a Codex thread already exists. A rollout without its required thread
+            // ID deliberately remains an invalid resume reference so the controller reports
+            // the persisted-state integrity error before launching Codex.
+            guard normalizedThreadID != nil || normalizedRolloutPath != nil else {
                 return nil
             }
             return CodexNativeSessionController.SessionRef(
-                conversationID: session.codexConversationID ?? "",
-                rolloutPath: session.codexRolloutPath,
+                conversationID: normalizedThreadID ?? "",
+                rolloutPath: normalizedRolloutPath,
                 model: session.codexModel,
                 reasoningEffort: session.codexReasoningEffort
             )
@@ -4315,7 +4307,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 return .stale(reason: "Codex did not send because the active run changed while waiting for child agent_run.wait scopes to drain.")
             }
         }
-        let hadResumeEligibleCodexHistoryBeforeSend = Self.hasResumeEligibleCodexHistory(session.items)
         session.waitingPrompt = nil
         clearCodexNativeToolLiveness(session)
         setRunningStatus("Initializing…", source: .transport, session: session, urgent: true)
@@ -4343,8 +4334,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         await ensureCodexNativeSession(
             session: session,
             policyAlreadyInstalled: policyAlreadyInstalled,
-            deferReconnectForCurrentActiveTurn: wasRunAlreadyActive,
-            skipResumeWhenNoPriorCodexHistory: !wasRunAlreadyActive && !hadResumeEligibleCodexHistoryBeforeSend
+            deferReconnectForCurrentActiveTurn: wasRunAlreadyActive
         )
         guard let controller = session.codexController,
               controller.hasActiveThread

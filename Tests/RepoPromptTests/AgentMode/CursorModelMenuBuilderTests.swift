@@ -83,11 +83,14 @@ final class CursorModelMenuBuilderTests: XCTestCase {
         ))
 
         let fastOnlyCatalog = CursorModelParameterCatalog()
-        XCTAssertTrue(fastOnlyCatalog.apply(response: response(
-            includeThought: false,
-            includeContext: true,
-            includeFast: true
-        )))
+        XCTAssertEqual(
+            fastOnlyCatalog.apply(response: response(
+                includeThought: false,
+                includeContext: true,
+                includeFast: true
+            )),
+            .applied(didChange: true)
+        )
         let fastOnlyLeaves = try XCTUnwrap(CursorModelMenuBuilder.leaves(
             forModelRaw: "gpt-5.6-sol",
             dimensionSet: .agentReasoning,
@@ -152,11 +155,14 @@ final class CursorModelMenuBuilderTests: XCTestCase {
         )
 
         let contextOnlyCatalog = CursorModelParameterCatalog()
-        XCTAssertTrue(contextOnlyCatalog.apply(response: response(
-            includeThought: false,
-            includeFast: false,
-            contextID: "token_window"
-        )))
+        XCTAssertEqual(
+            contextOnlyCatalog.apply(response: response(
+                includeThought: false,
+                includeFast: false,
+                contextID: "token_window"
+            )),
+            .applied(didChange: true)
+        )
         let contextOnlyLeaves = try XCTUnwrap(CursorModelMenuBuilder.leaves(
             forModelRaw: "gpt-5.6-sol",
             dimensionSet: .preset,
@@ -171,10 +177,13 @@ final class CursorModelMenuBuilderTests: XCTestCase {
         XCTAssertTrue(contextOnlyLeaves.filter { $0.section == .reasoning }.isEmpty)
 
         let fastOnlyCatalog = CursorModelParameterCatalog()
-        XCTAssertTrue(fastOnlyCatalog.apply(response: response(
-            includeThought: false,
-            includeContext: false
-        )))
+        XCTAssertEqual(
+            fastOnlyCatalog.apply(response: response(
+                includeThought: false,
+                includeContext: false
+            )),
+            .applied(didChange: true)
+        )
         let fastOnlyLeaves = try XCTUnwrap(CursorModelMenuBuilder.leaves(
             forModelRaw: "gpt-5.6-sol",
             dimensionSet: .preset,
@@ -193,15 +202,21 @@ final class CursorModelMenuBuilderTests: XCTestCase {
         let catalog = makeCatalog()
         let emptyCatalog = CursorModelParameterCatalog()
         let noThoughtCatalog = CursorModelParameterCatalog()
-        XCTAssertTrue(noThoughtCatalog.apply(response: response(
-            includeThought: false,
-            includeFast: false
-        )))
+        XCTAssertEqual(
+            noThoughtCatalog.apply(response: response(
+                includeThought: false,
+                includeFast: false
+            )),
+            .applied(didChange: true)
+        )
         let composerCatalog = CursorModelParameterCatalog()
-        XCTAssertTrue(composerCatalog.apply(response: response(
-            includeThought: true,
-            modelRaw: AgentModel.cursorComposer2.rawValue
-        )))
+        XCTAssertEqual(
+            composerCatalog.apply(response: response(
+                includeThought: true,
+                modelRaw: AgentModel.cursorComposer2.rawValue
+            )),
+            .applied(didChange: true)
+        )
 
         XCTAssertNil(CursorModelMenuBuilder.leaves(
             forModelRaw: "gpt-5.6-sol",
@@ -280,9 +295,56 @@ final class CursorModelMenuBuilderTests: XCTestCase {
         XCTAssertFalse(CursorModelMenuBuilder.hasFastEnabled("gpt[fast=true"))
     }
 
+    func testPersistedHydrationProducesIdenticalLeavesToLiveCatalog() throws {
+        let suiteName = "CursorModelMenuBuilderTests.Hydration.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = CursorModelParameterStore(defaults: defaults)
+        let liveCatalog = CursorModelParameterCatalog(
+            store: store,
+            notificationCenter: NotificationCenter()
+        )
+        let applyResult: CursorModelParameterCatalog.ApplyResult =
+            liveCatalog.apply(response: response(includeThought: true))
+        XCTAssertEqual(applyResult, .applied(didChange: true))
+
+        let hydratedCatalog = CursorModelParameterCatalog(
+            store: CursorModelParameterStore(defaults: defaults),
+            notificationCenter: NotificationCenter()
+        )
+        hydratedCatalog.hydrateSynchronously()
+        XCTAssertEqual(hydratedCatalog.status().state, .cached)
+
+        for dimensionSet in [
+            CursorModelMenuBuilder.DimensionSet.agentReasoning,
+            .preset
+        ] {
+            let liveLeaves = CursorModelMenuBuilder.leaves(
+                forModelRaw: "cursor:gpt-5.6-sol",
+                dimensionSet: dimensionSet,
+                selectedModelRaw: "cursor:gpt-5.6-sol[context=1m,thinking_mode=high,fast=true]",
+                catalog: liveCatalog,
+                isEnabled: true
+            )
+            let hydratedLeaves = CursorModelMenuBuilder.leaves(
+                forModelRaw: "cursor:gpt-5.6-sol",
+                dimensionSet: dimensionSet,
+                selectedModelRaw: "cursor:gpt-5.6-sol[context=1m,thinking_mode=high,fast=true]",
+                catalog: hydratedCatalog,
+                isEnabled: true
+            )
+            XCTAssertEqual(hydratedLeaves, liveLeaves)
+        }
+    }
+
     private func makeCatalog() -> CursorModelParameterCatalog {
         let catalog = CursorModelParameterCatalog()
-        XCTAssertTrue(catalog.apply(response: response(includeThought: true)))
+        XCTAssertEqual(
+            catalog.apply(response: response(includeThought: true)),
+            .applied(didChange: true)
+        )
         return catalog
     }
 

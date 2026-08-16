@@ -46,7 +46,12 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
     func testOptimizedPickerStableMenuTreeRoutesProviderSelections() throws {
         let cursorSnapshot = CursorModelParameterCatalog.shared.currentSnapshot()
         defer { CursorModelParameterCatalog.shared.test_restoreSnapshot(cursorSnapshot) }
-        XCTAssertTrue(CursorModelParameterCatalog.shared.apply(response: optimizedPickerCursorParameterResponse()))
+        XCTAssertEqual(
+            CursorModelParameterCatalog.shared.apply(
+                response: optimizedPickerCursorParameterResponse()
+            ),
+            .applied(didChange: true)
+        )
 
         let codexLow = AIModel.codexCustom(name: "gpt-5.6-sol-low")
         let codexHigh = AIModel.codexCustom(name: "gpt-5.6-sol-high")

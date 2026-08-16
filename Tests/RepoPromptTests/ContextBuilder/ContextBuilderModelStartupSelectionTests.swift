@@ -316,8 +316,16 @@ final class ContextBuilderModelStartupSelectionTests: XCTestCase {
         }
 
         let gate = DiscoveryGate()
-        let client = GatedCursorDiscoveryClient(result: nil, gate: gate)
-        let service = CursorACPModelPollingService(client: client, intervalNanos: 60_000_000_000)
+        let catalog = CursorModelParameterCatalog()
+        let client = GatedCursorDiscoveryClient(
+            result: nil,
+            gate: gate,
+            parameterCatalog: catalog
+        )
+        let service = CursorACPModelPollingService(
+            client: client,
+            intervalNanos: 60_000_000_000
+        )
         addTeardownBlock { await service.shutdown() }
         let discoveryStartedEvents = await gate.discoveryStartedEvents()
         let joinEvents = await service.test_refreshNowInFlightJoinEvents()
@@ -641,16 +649,22 @@ private actor GatedOpenCodeDiscoveryClient: OpenCodeACPModelDiscoveryClient {
 }
 
 private actor GatedCursorDiscoveryClient: CursorACPModelDiscoveryClient {
+    nonisolated let parameterCatalog: CursorModelParameterCatalog
     private let result: ACPDiscoveredSessionModels?
     private let gate: DiscoveryGate
 
-    init(result: ACPDiscoveredSessionModels?, gate: DiscoveryGate) {
+    init(
+        result: ACPDiscoveredSessionModels?,
+        gate: DiscoveryGate,
+        parameterCatalog: CursorModelParameterCatalog
+    ) {
         self.result = result
         self.gate = gate
+        self.parameterCatalog = parameterCatalog
     }
 
-    func discoverModels(workspacePath _: String?) async throws -> ACPDiscoveredSessionModels? {
+    func discoverModels(workspacePath _: String?) async -> CursorACPModelDiscoveryOutcome {
         await gate.waitForReleaseAfterRecordingDiscoveryStarted()
-        return result
+        return .completed(models: result, parameterRefresh: .live)
     }
 }

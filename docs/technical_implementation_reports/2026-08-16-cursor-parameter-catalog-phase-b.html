@@ -1,0 +1,1218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Human-friendly technical implementation report for Phase B of the Cursor parameter catalog plan in RepoPrompt CE.">
+  <title>Cursor Parameter Catalog Phase B — Technical Implementation Report</title>
+  <style>
+    :root {
+      --page: #f4f7fa;
+      --surface: #ffffff;
+      --surface-alt: #f7f9fb;
+      --ink: #17212b;
+      --muted: #586876;
+      --line: #d6e0e8;
+      --blue: #1d5db8;
+      --blue-soft: #e9f1ff;
+      --green: #16724b;
+      --green-soft: #e7f7ee;
+      --amber: #8a5a00;
+      --amber-soft: #fff3d9;
+      --red: #a43b45;
+      --red-soft: #ffeaed;
+      --purple: #6541a0;
+      --purple-soft: #f0e9ff;
+      --shadow: 0 15px 40px rgba(20, 47, 70, .08);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #0d141b;
+        --surface: #16202a;
+        --surface-alt: #1d2934;
+        --ink: #eef4f8;
+        --muted: #b4c0ca;
+        --line: #34434f;
+        --blue: #9abaff;
+        --blue-soft: #26385f;
+        --green: #80dbab;
+        --green-soft: #173e2d;
+        --amber: #edc772;
+        --amber-soft: #4b3b1d;
+        --red: #ffa2aa;
+        --red-soft: #4d2a2f;
+        --purple: #cbb4ff;
+        --purple-soft: #3c2e58;
+        --shadow: none;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+
+    a:focus-visible,
+    button:focus-visible {
+      outline: 3px solid var(--amber);
+      outline-offset: 3px;
+    }
+
+    code,
+    pre { font-family: var(--mono); }
+
+    code {
+      padding: .1rem .32rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--surface-alt);
+      font-size: .88em;
+      overflow-wrap: anywhere;
+    }
+
+    pre {
+      margin: 12px 0;
+      padding: 14px 16px;
+      overflow-x: auto;
+      border: 1px solid #2d3d4c;
+      border-radius: 12px;
+      background: #101923;
+      color: #edf5fa;
+      font-size: .84rem;
+      line-height: 1.56;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .skip-link {
+      position: fixed;
+      top: -60px;
+      left: 12px;
+      z-index: 10;
+      padding: 8px 12px;
+      border-radius: 8px;
+      background: var(--surface);
+      color: var(--ink);
+    }
+
+    .skip-link:focus { top: 12px; }
+
+    .page {
+      width: min(1140px, calc(100% - 28px));
+      margin: 0 auto;
+      padding: 28px 0 72px;
+    }
+
+    .hero {
+      padding: clamp(28px, 5vw, 52px);
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: linear-gradient(135deg, var(--surface), var(--blue-soft));
+      box-shadow: var(--shadow);
+    }
+
+    .eyebrow,
+    .label {
+      margin: 0 0 8px;
+      color: var(--blue);
+      font-size: .76rem;
+      font-weight: 800;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 { line-height: 1.2; }
+
+    h1 {
+      max-width: 900px;
+      margin: 0;
+      font-size: clamp(2.2rem, 5.3vw, 4.15rem);
+      letter-spacing: -.045em;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: clamp(1.55rem, 3vw, 2.1rem);
+      letter-spacing: -.025em;
+    }
+
+    h3 {
+      margin: 20px 0 8px;
+      font-size: 1.13rem;
+    }
+
+    h4 {
+      margin: 14px 0 6px;
+      font-size: 1rem;
+    }
+
+    p { margin: 9px 0; }
+
+    ul,
+    ol { padding-left: 1.3rem; }
+
+    li + li { margin-top: .42rem; }
+
+    .subtitle {
+      max-width: 880px;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 1.1rem;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 22px;
+    }
+
+    .badge,
+    .source {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-weight: 750;
+    }
+
+    .badge {
+      padding: 6px 10px;
+      background: var(--surface);
+      color: var(--muted);
+      font-size: .8rem;
+    }
+
+    .badge.good,
+    .source.test {
+      border-color: var(--green);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .badge.info,
+    .source.code {
+      border-color: var(--blue);
+      background: var(--blue-soft);
+      color: var(--blue);
+    }
+
+    .badge.warn,
+    .source.session {
+      border-color: var(--amber);
+      background: var(--amber-soft);
+      color: var(--amber);
+    }
+
+    .badge.review,
+    .source.review {
+      border-color: var(--purple);
+      background: var(--purple-soft);
+      color: var(--purple);
+    }
+
+    .source {
+      margin-left: 4px;
+      padding: 2px 7px;
+      font-size: .66rem;
+      letter-spacing: .02em;
+      vertical-align: middle;
+    }
+
+    .toc {
+      position: sticky;
+      top: 10px;
+      z-index: 2;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin: 18px 0 28px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .toc a {
+      padding: 5px 8px;
+      border-radius: 8px;
+      color: var(--muted);
+      font-size: .8rem;
+      font-weight: 720;
+      text-decoration: none;
+    }
+
+    .toc a:hover {
+      background: var(--blue-soft);
+      color: var(--blue);
+    }
+
+    section {
+      margin-top: 24px;
+      padding: clamp(20px, 3vw, 34px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .lead {
+      max-width: 920px;
+      color: var(--muted);
+      font-size: 1.03rem;
+    }
+
+    .grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .card {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--surface-alt);
+    }
+
+    .card h3,
+    .card h4 { margin-top: 0; }
+
+    .card p:last-child,
+    .card ul:last-child { margin-bottom: 0; }
+
+    .value {
+      margin-top: 4px;
+      font-size: 1.42rem;
+      font-weight: 840;
+      letter-spacing: -.025em;
+    }
+
+    .callout {
+      margin: 16px 0;
+      padding: 14px 16px;
+      border-left: 4px solid var(--blue);
+      border-radius: 0 12px 12px 0;
+      background: var(--blue-soft);
+    }
+
+    .callout.good {
+      border-left-color: var(--green);
+      background: var(--green-soft);
+    }
+
+    .callout.warn {
+      border-left-color: var(--amber);
+      background: var(--amber-soft);
+    }
+
+    .callout.review {
+      border-left-color: var(--purple);
+      background: var(--purple-soft);
+    }
+
+    .before-after {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .before,
+    .after {
+      padding: 17px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+    }
+
+    .before { background: var(--red-soft); }
+    .after { background: var(--green-soft); }
+
+    .before h3,
+    .after h3 { margin-top: 0; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin: 18px 0;
+    }
+
+    .node {
+      padding: 15px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: var(--surface-alt);
+    }
+
+    .arrow {
+      align-self: center;
+      color: var(--blue);
+      font-size: 1.35rem;
+      font-weight: 900;
+    }
+
+    .timeline {
+      margin: 16px 0 0 10px;
+      padding-left: 24px;
+      border-left: 2px solid var(--line);
+    }
+
+    .turn {
+      position: relative;
+      margin-bottom: 22px;
+    }
+
+    .turn::before {
+      position: absolute;
+      top: 5px;
+      left: -31px;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--blue);
+      box-shadow: 0 0 0 5px var(--blue-soft);
+      content: "";
+    }
+
+    .turn h3 { margin: 0 0 5px; }
+
+    .step {
+      display: grid;
+      grid-template-columns: 34px 1fr;
+      gap: 13px;
+      margin: 16px 0;
+    }
+
+    .number {
+      display: grid;
+      width: 30px;
+      height: 30px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--blue);
+      color: #fff;
+      font-weight: 850;
+    }
+
+    .step h3 { margin: 3px 0 5px; }
+
+    .table-wrap {
+      margin-top: 14px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--surface);
+      font-size: .92rem;
+    }
+
+    caption {
+      padding: 12px 14px;
+      color: var(--muted);
+      text-align: left;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      text-align: left;
+    }
+
+    th {
+      background: var(--surface-alt);
+      font-size: .78rem;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+    }
+
+    tbody tr:last-child td { border-bottom: 0; }
+
+    .checklist {
+      list-style: none;
+      padding-left: 0;
+    }
+
+    .checklist li {
+      position: relative;
+      padding-left: 1.7rem;
+    }
+
+    .checklist li::before {
+      position: absolute;
+      left: 0;
+      color: var(--green);
+      font-weight: 900;
+      content: "✓";
+    }
+
+    .not-tested li::before {
+      color: var(--amber);
+      content: "–";
+    }
+
+    details {
+      margin-top: 13px;
+      padding: 0 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface-alt);
+    }
+
+    summary {
+      padding: 12px 0;
+      cursor: pointer;
+      font-weight: 760;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: .9rem;
+    }
+
+    .footer {
+      margin-top: 24px;
+      color: var(--muted);
+      font-size: .87rem;
+      text-align: center;
+    }
+
+    @media (max-width: 760px) {
+      .grid.two,
+      .grid.three,
+      .grid.four,
+      .before-after { grid-template-columns: 1fr; }
+
+      .flow { grid-template-columns: 1fr; }
+
+      .arrow {
+        justify-self: center;
+        transform: rotate(90deg);
+      }
+
+      .toc { position: static; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .page { width: auto; padding: 0; }
+      .hero,
+      section,
+      .toc { box-shadow: none; }
+      .toc { position: static; }
+      a { color: inherit; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to report</a>
+
+  <div class="page">
+    <header class="hero">
+      <p class="eyebrow">Technical implementation report · RepoPrompt CE</p>
+      <h1>Cursor parameter catalog: Phase B</h1>
+      <p class="subtitle">
+        Phase B keeps Cursor model parameter choices available when a temporary refresh fails.
+        It saves the last valid choices, tells the user what happened, and tries again with a
+        controlled delay.
+      </p>
+      <div class="badges" aria-label="Report status">
+        <span class="badge good">Implemented and locally validated</span>
+        <span class="badge info">Phase B only</span>
+        <span class="badge review">Independent OracleA review complete</span>
+        <span class="badge warn">No live app smoke test</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="Report sections">
+      <a href="#summary">Summary</a>
+      <a href="#evidence">Evidence and scope</a>
+      <a href="#expect">Implementation</a>
+      <a href="#use">See it</a>
+      <a href="#changes">Changes</a>
+      <a href="#decisions">Decisions</a>
+      <a href="#review">Review</a>
+      <a href="#validation">Validation</a>
+      <a href="#limits">Limits and actions</a>
+    </nav>
+
+    <main id="main">
+      <section id="summary">
+        <p class="eyebrow">Executive summary</p>
+        <h2>The model parameter menu now keeps a safe saved copy.</h2>
+        <p class="lead">
+          Cursor publishes basic model names and parameter choices through different ACP calls.
+          Before this work, a temporary error could leave the model names visible but remove the
+          parameter choices for the rest of the app session. Phase B stores a valid set of choices
+          locally and uses it until Cursor supplies a newer valid set.
+          <span class="source session">Session and plan</span>
+        </p>
+
+        <p class="label">Metrics</p>
+        <div class="grid four" aria-label="Scope facts">
+          <div class="card">
+            <p class="label">Phase B patch</p>
+            <p class="value">14 files</p>
+            <p>Four new files and ten modified files.</p>
+          </div>
+          <div class="card">
+            <p class="label">Patch size</p>
+            <p class="value">+2,290 / −212</p>
+            <p>Lines in the Phase B paths only.</p>
+          </div>
+          <div class="card">
+            <p class="label">Focused tests</p>
+            <p class="value">86 / 86</p>
+            <p>Eight focused test suites passed.</p>
+          </div>
+          <div class="card">
+            <p class="label">Retry range</p>
+            <p class="value">15 s → 300 s</p>
+            <p>The delay grows after repeated failures.</p>
+          </div>
+        </div>
+
+        <div class="callout good">
+          <strong>What changes for users:</strong>
+          A temporary Cursor login, network, timeout, or malformed-response problem should not
+          make an already known parameter menu disappear. The Cursor settings card shows a short
+          status message instead.
+        </div>
+
+        <div class="before-after">
+          <div class="before">
+            <h3>Before Phase B</h3>
+            <ul>
+              <li>Parameter choices lived only in memory.</li>
+              <li>A failed refresh could remove all parameter submenus.</li>
+              <li>The failure had no clear settings message.</li>
+              <li>The next app launch had no saved parameter choices.</li>
+            </ul>
+          </div>
+          <div class="after">
+            <h3>After Phase B</h3>
+            <ul>
+              <li>A valid nonempty parameter list is saved in its own versioned store.</li>
+              <li>Bad or temporary results keep the last valid list.</li>
+              <li>Settings show the saved-copy state and the safe failure reason.</li>
+              <li>The app loads the saved list before it starts background refresh.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="evidence">
+        <p class="eyebrow">Evidence and scope</p>
+        <h2>What this report covers</h2>
+        <p class="lead">
+          The original request was to implement Phase B of the Cursor parameter-catalog plan,
+          use scoped workers, and request an OracleA code review. The follow-up request is for
+          this HTML report. Phase C is not part of this work.
+          <span class="source session">User and session evidence</span>
+        </p>
+
+        <div class="grid two">
+          <div class="card">
+            <h3>Evidence used</h3>
+            <ul>
+              <li>The supplied implementation handoff and OracleA review summary.</li>
+              <li>The authoritative Phase B plan.</li>
+              <li>The current Phase B source, test, and ledger files.</li>
+              <li>The current Git summary for the 14 Phase B paths.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Limits of this report</h3>
+            <ul>
+              <li>There is no clean Phase B-only Git baseline in this report run.</li>
+              <li>The repository also has 13 modified and 93 untracked files. This report does not assign them to Phase B.</li>
+              <li>The recorded Phase B tests were not run again while this report was written.</li>
+              <li>No live app smoke test is recorded.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section id="expect">
+        <p class="eyebrow">Implementation details and expected result</p>
+        <h2>How the implementation behaves</h2>
+        <p class="lead">
+          In this report, a <em>parameter catalog</em> is the saved list of per-model choices,
+          such as context, reasoning, and fast mode. It is separate from the basic model list.
+          <span class="source code">Observed in code</span>
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <caption>Phase B behavior for the Cursor parameter catalog</caption>
+            <thead>
+              <tr>
+                <th scope="col">Situation</th>
+                <th scope="col">What the app does</th>
+                <th scope="col">What a user can see</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Cursor returns a valid nonempty list</td>
+                <td>Replace the old list and save it with a time stamp.</td>
+                <td>Parameter choices are current. Settings say that they are up to date.</td>
+              </tr>
+              <tr>
+                <td>App starts after a previous valid result</td>
+                <td>Load the saved list first. Refresh in the background.</td>
+                <td>Choices can remain available while the refresh is pending, when the feature is enabled.</td>
+              </tr>
+              <tr>
+                <td>Authentication, discovery, timeout, extension, or malformed-response failure</td>
+                <td>Keep both the basic model list and the last valid parameter list. Record a safe failure type. Retry later.</td>
+                <td>The existing choices remain. Settings say that a saved copy is in use and give a short reason.</td>
+              </tr>
+              <tr>
+                <td>Cursor says the extension method does not exist</td>
+                <td>Clear the parameter list. This is an authoritative signal that the Cursor version does not support it.</td>
+                <td>Settings say: “This Cursor version doesn't expose model parameters.”</td>
+              </tr>
+              <tr>
+                <td>Cursor returns a valid empty model list</td>
+                <td>Clear the parameter list. This is an authoritative result.</td>
+                <td>Settings say that Cursor currently exposes no parameterized models.</td>
+              </tr>
+              <tr>
+                <td>Saved data is corrupt or has a newer unknown version</td>
+                <td>Do not use it and do not delete it. A later valid nonempty result may replace it.</td>
+                <td>No unsupported data is shown. There is no migration prompt.</td>
+              </tr>
+              <tr>
+                <td>Refresh stops because the app is shutting down</td>
+                <td>Stop cleanly. Do not turn shutdown into a failure.</td>
+                <td>No false “last refresh failed” status from normal shutdown.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Where the information flows</h3>
+        <div class="flow" aria-label="Cursor data flow">
+          <div class="node">
+            <strong>Cursor ACP</strong><br>
+            Sends model names and parameter choices.
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <strong>Polling service</strong><br>
+            Classifies the result and controls retry delay.
+          </div>
+          <div class="arrow" aria-hidden="true">→</div>
+          <div class="node">
+            <strong>Catalog and store</strong><br>
+            Keep a valid list, publish status, and update the menu.
+          </div>
+        </div>
+      </section>
+
+      <section id="use">
+        <p class="eyebrow">How to test and see the effect</p>
+        <h2>Use the app for a quick manual check</h2>
+        <p class="lead">
+          These steps do not require a special account setup. They show the normal success path
+          and the saved-copy state after a restart. No live app check was done during the
+          implementation session.
+          <span class="source session">Session record</span>
+        </p>
+
+        <div class="step">
+          <div class="number" aria-hidden="true">1</div>
+          <div>
+            <h3>Build and start a debug app</h3>
+            <p>From the repository root, run the normal coordinated command:</p>
+            <pre><code>make dev-build
+make dev-run</code></pre>
+            <p class="small">
+              This report gives commands for a user to run. It does not state that the app was
+              started during this report.
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="number" aria-hidden="true">2</div>
+          <div>
+            <h3>Connect Cursor and wait for its background refresh</h3>
+            <p>
+              Open <strong>Settings → CLI Providers → Cursor CLI</strong>. Connect Cursor if it
+              is not connected. Wait for model discovery to finish.
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="number" aria-hidden="true">3</div>
+          <div>
+            <h3>Open a Cursor model selector</h3>
+            <p>
+              Use an Agent Mode or Oracle model selector that shows Cursor models. For a model
+              that Cursor describes with choices, inspect the existing context, reasoning, or
+              fast-mode choices.
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="number" aria-hidden="true">4</div>
+          <div>
+            <h3>Check the status row</h3>
+            <p>
+              On the Cursor settings card, find the one parameter status row. A normal live
+              refresh shows <q>Cursor model parameters are up to date.</q>
+            </p>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="number" aria-hidden="true">5</div>
+          <div>
+            <h3>Restart the app to check saved choices</h3>
+            <p>
+              Close and reopen the debug app after a successful refresh. Before the next
+              background refresh finishes, the settings row can say that it is using a saved copy.
+              The parameter choices should remain available when the feature is enabled.
+            </p>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <strong>Do not force an authentication failure only for this check.</strong>
+          The automated tests simulate authentication, timeout, malformed data, discovery error,
+          extension error, cancellation, and method-not-found cases. Use those tests for controlled
+          failure checks.
+        </div>
+
+        <h3>Run the focused automated checks</h3>
+        <pre><code>make dev-test FILTER=CursorModelParameterStoreTests
+make dev-test FILTER=CursorModelParameterCatalogTests
+make dev-test FILTER=CursorACPModelPollingServiceTests
+make dev-test FILTER=CursorModelMenuBuilderTests
+make dev-test FILTER=CursorModelParameterCatalogStatusPresentationTests
+make dev-test FILTER=ContextBuilderModelStartupSelectionTests
+make dev-test FILTER=CursorParameterizedModelControllerTests
+make dev-test FILTER=WindowCloseCoordinatorLifecycleTests</code></pre>
+        <p>
+          The source session records that these suites passed, for a total of 86 tests.
+          <span class="source test">Test evidence</span>
+        </p>
+      </section>
+
+      <section id="changes">
+        <p class="eyebrow">Change inventory</p>
+        <h2>What changed in the Phase B patch</h2>
+        <p class="lead">
+          The current repository has additional worktree files. This table covers only the
+          14 paths identified as Phase B in the supplied session evidence. It does not assign the
+          other current worktree files to Phase B.
+          <span class="source session">Scope limit</span>
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <caption>Observed Phase B patch: four untracked new files and ten modified files</caption>
+            <thead>
+              <tr>
+                <th scope="col">Git state</th>
+                <th scope="col">Files</th>
+                <th scope="col">Role</th>
+                <th scope="col">Purpose</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>New / untracked</td>
+                <td><code>CursorModelParameterStore.swift</code></td>
+                <td>Source</td>
+                <td>Save and load a versioned, nonempty parameter catalog in its own <code>UserDefaults</code> key.</td>
+              </tr>
+              <tr>
+                <td>Modified</td>
+                <td><code>CursorModelParameterCatalog.swift</code></td>
+                <td>Source</td>
+                <td>Validate all input as one unit, keep the last valid list, hydrate it at startup, and publish separate data and status notifications.</td>
+              </tr>
+              <tr>
+                <td>Modified</td>
+                <td><code>CursorACPModelPollingService.swift</code></td>
+                <td>Source</td>
+                <td>Use typed outcomes, classify failures, preserve valid results, rate-limit safe logs, and use retry backoff.</td>
+              </tr>
+              <tr>
+                <td>Modified</td>
+                <td><code>APISettingsViewModel.swift</code><br><code>CLIProvidersSettingsView.swift</code></td>
+                <td>Source / UI</td>
+                <td>Load saved choices before provider validation and show one Cursor status row in Settings.</td>
+              </tr>
+              <tr>
+                <td>New / untracked</td>
+                <td><code>CursorModelParameterStoreTests.swift</code><br><code>CursorACPModelPollingServiceTests.swift</code><br><code>CursorModelParameterCatalogStatusPresentationTests.swift</code></td>
+                <td>Tests</td>
+                <td>Cover storage, refresh failures, cancellation, retry delay, and user-facing status text.</td>
+              </tr>
+              <tr>
+                <td>Modified</td>
+                <td><code>CursorModelParameterCatalogTests.swift</code><br><code>CursorModelMenuBuilderTests.swift</code><br><code>CursorParameterizedModelControllerTests.swift</code><br><code>ContextBuilderModelStartupSelectionTests.swift</code></td>
+                <td>Tests</td>
+                <td>Cover retain-last-good parsing, saved-list menu output, extension results, and startup behavior.</td>
+              </tr>
+              <tr>
+                <td>Modified</td>
+                <td><code>Scripts/Fixtures/test-suite-contract-ledger.tsv</code></td>
+                <td>Test ledger</td>
+                <td>Add or update 44 Phase B test-contract entries.</td>
+              </tr>
+              <tr>
+                <td>Modified</td>
+                <td><code>docs/context/plans/oracle-remote-models-cursor-catalog.md</code></td>
+                <td>Authoritative plan</td>
+                <td>Record that Phase B is complete and Phase C remains outside this work.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <details>
+          <summary>Key implementation files and their responsibilities</summary>
+          <ul>
+            <li>
+              <code>CursorModelParameterStore</code> owns the
+              <code>CursorModelParameterCatalogV1</code> data format. It writes only valid,
+              nonempty lists. It keeps corrupt or unknown-version bytes until a future valid
+              nonempty write replaces them.
+            </li>
+            <li>
+              <code>CursorModelParameterCatalog</code> owns the in-memory list, its status, and
+              the all-or-nothing parser. It sends a data notification only when the list changes.
+              It sends a separate status notification for state changes.
+            </li>
+            <li>
+              <code>CursorACPModelPollingService</code> owns polling. It keeps normal model
+              discovery useful even when only parameter enrichment fails.
+            </li>
+            <li>
+              <code>CLIProvidersSettingsView</code> shows the status text. It does not put
+              status rows inside model pickers.
+            </li>
+          </ul>
+        </details>
+      </section>
+
+      <section id="decisions">
+        <p class="eyebrow">Major decisions and reasoning</p>
+        <h2>Why the work takes this shape</h2>
+
+        <div class="grid two">
+          <article class="card">
+            <h3>Use a separate versioned store</h3>
+            <p>
+              The parameter list uses <code>CursorModelParameterCatalogV1</code>. It does not
+              change the existing basic-model store. This limits migration risk and lets old
+              builds ignore the new key.
+            </p>
+            <p class="small"><strong>Result:</strong> base models and parameter choices can change independently.</p>
+          </article>
+
+          <article class="card">
+            <h3>Reject a bad reply as one whole unit</h3>
+            <p>
+              If one model entry or one select choice is structurally invalid, the catalog does
+              not use any part of that reply. It keeps the prior valid list.
+            </p>
+            <p class="small"><strong>Reason:</strong> a partial list could remove valid choices without proof that Cursor removed them.</p>
+          </article>
+
+          <article class="card">
+            <h3>Clear only on authoritative signals</h3>
+            <p>
+              The app clears the saved list only when Cursor says the method does not exist or
+              when Cursor sends a valid empty list.
+            </p>
+            <p class="small"><strong>Reason:</strong> these signals say that the old list is no longer valid.</p>
+          </article>
+
+          <article class="card">
+            <h3>Show status in Settings, not in a picker</h3>
+            <p>
+              The design uses one settings row. A separate status notification does not force
+              menu rebuilding when only the message changes.
+            </p>
+            <p class="small"><strong>Reason:</strong> this gives an explanation without adding noise to every picker.</p>
+          </article>
+
+          <article class="card">
+            <h3>Keep retry controlled and safe</h3>
+            <p>
+              Failure logs use fixed, safe phrases. The first retry delay is about 15 seconds.
+              Repeated failures increase the delay to a 300-second limit. A success resets it.
+            </p>
+            <p class="small"><strong>Result:</strong> the app can recover after re-authentication without an app restart.</p>
+          </article>
+
+          <article class="card">
+            <h3>Keep Phase C separate</h3>
+            <p>
+              The work does not add Cursor parameter metadata to
+              <code>agent_manage list_agents</code>. The plan keeps that as Phase C.
+            </p>
+            <p class="small"><strong>Reason:</strong> the metadata is dependable only after this persistence work is in place.</p>
+          </article>
+        </div>
+
+        <div class="timeline" aria-label="Major implementation turns">
+          <div class="turn">
+            <h3>1. Define the failure boundary</h3>
+            <p>
+              The phase plan records the key incident: basic Cursor models remained visible after
+              a refresh error, but the in-memory parameter choices disappeared. The implementation
+              treats a valid saved parameter list as separate data that needs its own lifecycle.
+              <span class="source session">Plan evidence</span>
+            </p>
+          </div>
+          <div class="turn">
+            <h3>2. Make the parser all-or-nothing</h3>
+            <p>
+              The chosen rule is retain-last-good. A malformed reply records a failure but does
+              not replace memory or saved data.
+              <span class="source code">Observed in code</span>
+            </p>
+          </div>
+          <div class="turn">
+            <h3>3. Add an understandable status surface</h3>
+            <p>
+              The status moves to the Cursor settings card. It can say that data is live, saved,
+              refreshing, unavailable, unsupported, or disabled.
+              <span class="source code">Observed in code</span>
+            </p>
+          </div>
+          <div class="turn">
+            <h3>4. Review and remediate</h3>
+            <p>
+              The requested independent OracleA review found four high-priority and three
+              medium-priority items. The supplied session record says that all seven were fixed
+              and the focused checks were run again.
+              <span class="source review">Review record</span>
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section id="review">
+        <p class="eyebrow">Independent review</p>
+        <h2>OracleA review and fixes</h2>
+        <p class="lead">
+          The user asked for an OracleA code review after implementation. The supplied session
+          record identifies OracleA with preset
+          <code>61D024A4-CCFB-4C9C-A614-CC65E0A1864C</code>. The review found seven items:
+          four high-priority and three medium-priority items.
+          <span class="source review">Session evidence</span>
+        </p>
+
+        <div class="grid two">
+          <div class="card">
+            <h3>Items addressed</h3>
+            <ul>
+              <li>Keep corrupt or newer storage records without changing their unknown parts.</li>
+              <li>Prevent test state from leaking between tests.</li>
+              <li>Use one clear owner for the parameter catalog.</li>
+              <li>Propagate cancellation correctly.</li>
+              <li>Remove an unnecessary overload.</li>
+              <li>Keep shutdown from leaving an incorrect refresh status.</li>
+              <li>Remove a settings notification subscription race.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>What this means</h3>
+            <p>
+              The review did not change the Phase B goal. It tightened data preservation,
+              lifecycle handling, test isolation, and UI update timing.
+            </p>
+            <p>
+              The report does not reproduce the full review text. It reports only the findings
+              and remediation that are present in the supplied session record.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <section id="validation">
+        <p class="eyebrow">Validation and testing</p>
+        <h2>Checks recorded for the implementation</h2>
+        <p class="lead">
+          The checks below are recorded in the Phase B outcome of the authoritative plan and in
+          the supplied session handoff. They were not rerun while this HTML report was written.
+          <span class="source session">Session evidence</span>
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <caption>Recorded validation results</caption>
+            <thead>
+              <tr>
+                <th scope="col">Check</th>
+                <th scope="col">Recorded result</th>
+                <th scope="col">What it covers</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>make dev-build</code></td>
+                <td>Passed</td>
+                <td>The app builds with the new source.</td>
+              </tr>
+              <tr>
+                <td>Eight focused suites</td>
+                <td>Passed: 86 / 86 tests</td>
+                <td>Store, parser, polling, menu hydration, status text, startup, parameter controller, and window-close lifecycle.</td>
+              </tr>
+              <tr>
+                <td><code>make dev-test FILTER=Cursor</code></td>
+                <td>Passed</td>
+                <td>Broader Cursor-focused test selection.</td>
+              </tr>
+              <tr>
+                <td><code>make dev-lint</code></td>
+                <td>Passed</td>
+                <td>Lint rules.</td>
+              </tr>
+              <tr>
+                <td><code>make dev-format-check</code></td>
+                <td>Passed</td>
+                <td>Non-mutating Swift format check.</td>
+              </tr>
+              <tr>
+                <td><code>git diff --check</code></td>
+                <td>Passed</td>
+                <td>Whitespace errors in the patch.</td>
+              </tr>
+              <tr>
+                <td><code>Scripts/check-agent-context</code></td>
+                <td>Passed with 0 warnings</td>
+                <td>Agent-context structure after the plan update.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Focused test coverage in plain language</h3>
+        <ul class="checklist">
+          <li>The store keeps a round trip, does not write an empty list, and preserves unknown data.</li>
+          <li>The catalog keeps the old list when a reply is malformed and clears only on valid authoritative signals.</li>
+          <li>The polling service classifies errors, keeps usable data, increases delay after repeated errors, and handles shutdown cleanly.</li>
+          <li>The menu produces the same choices from saved data as it does from a live result.</li>
+          <li>The settings messages match each status state.</li>
+          <li>Startup loads the saved list before normal provider validation continues.</li>
+        </ul>
+
+        <h3>Checks not recorded as complete</h3>
+        <ul class="checklist not-tested">
+          <li>No full-root test run is recorded.</li>
+          <li>No live app validation is recorded.</li>
+          <li>No production Cursor account exercise is recorded.</li>
+        </ul>
+      </section>
+
+      <section id="limits">
+        <p class="eyebrow">Risks, limits, and actions</p>
+        <h2>No urgent action is required, but one live check is recommended.</h2>
+
+        <div class="grid two">
+          <div class="card">
+            <h3>Action for you</h3>
+            <ol>
+              <li>Run the quick manual check in this report before a release or merge.</li>
+              <li>Confirm that a saved menu survives one normal app restart after a successful Cursor refresh.</li>
+              <li>Review the one Settings status row for clear text in your normal Cursor setup.</li>
+            </ol>
+          </div>
+          <div class="card">
+            <h3>Follow-up work</h3>
+            <ol>
+              <li>Phase C can add optional Cursor parameter metadata to <code>list_agents</code>.</li>
+              <li>Before Phase C, measure the real metadata payload as required by the plan.</li>
+              <li>Keep the existing test ledger baseline work separate from this phase.</li>
+            </ol>
+          </div>
+        </div>
+
+        <div class="callout warn">
+          <strong>Known repository limits:</strong>
+          The recorded repository-wide ledger check still has an unrelated baseline of 286 missing
+          IDs and 3 stale IDs. The recorded <code>make guardrails</code> result is blocked because
+          it flags the active authoritative plan document. The Phase B ledger entries are present.
+          These limits do not change the Phase B focused validation result, but they are not a
+          clean repository-wide validation result.
+        </div>
+
+        <h3>Operational impact</h3>
+        <div class="grid three">
+          <div class="card">
+            <h4>Dependencies</h4>
+            <p>None observed.</p>
+          </div>
+          <div class="card">
+            <h4>Configuration</h4>
+            <p>No new user setting, environment variable, or account action is required.</p>
+          </div>
+          <div class="card">
+            <h4>Data and compatibility</h4>
+            <p>A new local <code>UserDefaults</code> key is used. Existing basic-model storage is not changed.</p>
+          </div>
+        </div>
+
+        <h3>Maintainer notes</h3>
+        <ul>
+          <li>Do not change a malformed-response path into a clear path. The keep-last-good rule is the main safety behavior.</li>
+          <li>Keep data-change and status-change notifications separate. The menu should not rebuild only because status text changed.</li>
+          <li>Do not treat shutdown cancellation as a provider failure.</li>
+          <li>Do not merge Phase C work into this implementation without its payload measurement and dedicated tests.</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>
+        Report date: 2026-08-16. Implementation and validation date recorded in the Phase B plan:
+        2026-08-15. Evidence sources: supplied session handoff, current Phase B source and test
+        files, current Git summary, and
+        <a href="../context/plans/oracle-remote-models-cursor-catalog.md">the authoritative Phase B plan</a>.
+      </p>
+    </footer>
+  </div>
+</body>
+</html>

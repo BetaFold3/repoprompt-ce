@@ -3,17 +3,20 @@ import Foundation
 import XCTest
 
 final class CursorParameterizedModelControllerTests: XCTestCase {
+    private var originalSharedCatalogSnapshot: [String: [CursorModelParameterCatalog.ParameterSpec]] = [:]
+
     override func setUp() {
         super.setUp()
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        CursorModelParameterCatalog.shared.clearForMethodNotFound()
+        originalSharedCatalogSnapshot = CursorModelParameterCatalog.shared.currentSnapshot()
+        CursorModelParameterCatalog.shared.test_restoreSnapshot([:])
     }
 
     override func tearDown() {
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
         AgentACPModelRegistry.shared.test_reset(providerID: .openCode)
-        CursorModelParameterCatalog.shared.clearForMethodNotFound()
+        CursorModelParameterCatalog.shared.test_restoreSnapshot(originalSharedCatalogSnapshot)
         super.tearDown()
     }
 
@@ -468,11 +471,15 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
         }
     }
 
-    func testDiscoveryAvoidsModelMutationAndCatalogFailurePreservesSnapshot() async throws {
+    func testDiscoveryAvoidsModelMutationAndReportsExtensionOutcome() async throws {
         let successful = try makeDiscoveryClientFixture()
-        let successfulSnapshot = try await successful.client.discoverModels(workspacePath: nil)
+        let successfulOutcome = await successful.client.discoverModels(workspacePath: nil)
+        guard case let .completed(successfulSnapshot, successfulRefresh) = successfulOutcome else {
+            return XCTFail("Expected successful Cursor discovery")
+        }
         XCTAssertFalse(successfulSnapshot?.options.isEmpty ?? true)
-        XCTAssertFalse(CursorModelParameterCatalog.shared.currentSnapshot().isEmpty)
+        XCTAssertEqual(successfulRefresh, .live)
+        XCTAssertFalse(successful.catalog.currentSnapshot().isEmpty)
         XCTAssertTrue(recordedRequests(at: successful.recordURL).contains {
             $0["method"] as? String == "cursor/list_available_models"
         })
@@ -480,29 +487,90 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
             $0["method"] as? String == "session/set_config_option"
         })
 
-        let failed = try makeDiscoveryClientFixture(
+        let unsupported = try makeDiscoveryClientFixture(
             extraEnvironment: ["ACP_EXTENSION_ERROR_CODE": "-32601"]
         )
-        let failedSnapshot = try await failed.client.discoverModels(workspacePath: nil)
-        XCTAssertEqual(failedSnapshot, successfulSnapshot)
-        XCTAssertTrue(CursorModelParameterCatalog.shared.currentSnapshot().isEmpty)
-        XCTAssertFalse(recordedRequests(at: failed.recordURL).contains {
+        let unsupportedOutcome = await unsupported.client.discoverModels(workspacePath: nil)
+        guard case let .completed(unsupportedSnapshot, unsupportedRefresh) = unsupportedOutcome else {
+            return XCTFail("Expected bare models with unsupported extension")
+        }
+        XCTAssertEqual(unsupportedSnapshot, successfulSnapshot)
+        XCTAssertEqual(unsupportedRefresh, .unsupported)
+        XCTAssertFalse(recordedRequests(at: unsupported.recordURL).contains {
             $0["method"] as? String == "session/set_config_option"
         })
     }
 
+    func testDiscoveryServiceCompositionUsesClientCatalogForLiveAndValidEmpty() async throws {
+        let live = try makeDiscoveryClientFixture()
+        XCTAssertTrue(live.client.parameterCatalog === live.catalog)
+        let liveService = CursorACPModelPollingService(client: live.client)
+        addTeardownBlock { await liveService.shutdown() }
+
+        let liveRefreshed = await liveService.refreshNow(workspacePath: nil)
+        XCTAssertTrue(liveRefreshed)
+        XCTAssertEqual(live.catalog.status().state, .live)
+        XCTAssertTrue(live.catalog.status().hasUsableCatalog)
+        XCTAssertFalse(live.catalog.currentSnapshot().isEmpty)
+
+        let empty = try makeDiscoveryClientFixture(
+            extraEnvironment: ["ACP_EXTENSION_EMPTY_MODELS": "1"]
+        )
+        installSyntheticCatalog(in: empty.catalog)
+        XCTAssertTrue(empty.client.parameterCatalog === empty.catalog)
+        let emptyService = CursorACPModelPollingService(client: empty.client)
+        addTeardownBlock { await emptyService.shutdown() }
+
+        let emptyRefreshed = await emptyService.refreshNow(workspacePath: nil)
+        XCTAssertTrue(emptyRefreshed)
+        XCTAssertEqual(empty.catalog.status().state, .live)
+        XCTAssertFalse(empty.catalog.status().hasUsableCatalog)
+        XCTAssertTrue(empty.catalog.currentSnapshot().isEmpty)
+    }
+
+    func testParameterExtensionCancellationPropagatesAsCancelledDiscovery() async throws {
+        let fixture = try makeDiscoveryClientFixture(
+            extraEnvironment: ["ACP_EXTENSION_NO_RESPONSE": "1"],
+            extensionTimeoutSeconds: 30
+        )
+        installSyntheticCatalog(in: fixture.catalog)
+        let retained = fixture.catalog.currentSnapshot()
+        let discovery = Task {
+            await fixture.client.discoverModels(workspacePath: nil)
+        }
+
+        try await AsyncTestWait.waitUntil("Cursor parameter extension request started") {
+            self.recordedRequests(at: fixture.recordURL).contains {
+                $0["method"] as? String == "cursor/list_available_models"
+            }
+        }
+        discovery.cancel()
+
+        let outcome = await discovery.value
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(fixture.catalog.currentSnapshot(), retained)
+        XCTAssertNotEqual(
+            fixture.catalog.status().state,
+            .stale(.extension)
+        )
+    }
+
     func testTransientCatalogExtensionFailureRetainsCatalog() async throws {
-        installSyntheticCatalog()
-        let retainedCatalog = CursorModelParameterCatalog.shared.currentSnapshot()
         let fixture = try makeDiscoveryClientFixture(
             extraEnvironment: ["ACP_EXTENSION_NO_RESPONSE": "1"],
             extensionTimeoutSeconds: 0.1
         )
+        installSyntheticCatalog(in: fixture.catalog)
+        let retainedCatalog = fixture.catalog.currentSnapshot()
 
-        let snapshot = try await fixture.client.discoverModels(workspacePath: nil)
+        let outcome = await fixture.client.discoverModels(workspacePath: nil)
 
+        guard case let .completed(snapshot, parameterRefresh) = outcome else {
+            return XCTFail("Expected bare models with failed extension")
+        }
         XCTAssertFalse(snapshot?.options.isEmpty ?? true)
-        XCTAssertEqual(CursorModelParameterCatalog.shared.currentSnapshot(), retainedCatalog)
+        XCTAssertEqual(parameterRefresh, .stale(.timeout))
+        XCTAssertEqual(fixture.catalog.currentSnapshot(), retainedCatalog)
     }
 
     @MainActor
@@ -518,8 +586,12 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
         XCTAssertNil(resolved.effort)
 
         let fixture = try makeDiscoveryClientFixture(parameterizedModelsEnabled: false)
-        let snapshot = try await fixture.client.discoverModels(workspacePath: nil)
+        let outcome = await fixture.client.discoverModels(workspacePath: nil)
+        guard case let .completed(snapshot, parameterRefresh) = outcome else {
+            return XCTFail("Expected bare models with parameterization disabled")
+        }
         XCTAssertFalse(snapshot?.options.isEmpty ?? true)
+        XCTAssertEqual(parameterRefresh, .disabled)
         XCTAssertFalse(recordedRequests(at: fixture.recordURL).contains {
             $0["method"] as? String == "cursor/list_available_models"
         })
@@ -690,6 +762,7 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
 
     private struct DiscoveryFixture {
         let client: CursorACPControllerModelDiscoveryClient
+        let catalog: CursorModelParameterCatalog
         let recordURL: URL
     }
 
@@ -767,15 +840,17 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
             providerID: .cursor,
             initializeClientCapabilityMetadata: ["parameterizedModelPicker": true]
         )
+        let catalog = CursorModelParameterCatalog()
         let client = CursorACPControllerModelDiscoveryClient(
             providerFactory: { _, _ in provider },
             controllerFactory: { provider, request in
                 try ACPAgentSessionController(provider: provider, runRequest: request)
             },
+            parameterCatalog: catalog,
             parameterizedModelsEnabled: { parameterizedModelsEnabled },
             extensionTimeoutSeconds: extensionTimeoutSeconds
         )
-        return DiscoveryFixture(client: client, recordURL: recordURL)
+        return DiscoveryFixture(client: client, catalog: catalog, recordURL: recordURL)
     }
 
     private var fixtureDirectory: URL {
@@ -860,21 +935,20 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
         }
     }
 
-    private func installSyntheticCatalog() {
-        CursorModelParameterCatalog.shared.apply(response: [
-            "models": [[
-                "value": "custom-model",
-                "configOptions": [[
-                    "id": "thinking_mode",
-                    "category": "thought_level",
-                    "type": "select",
-                    "currentValue": "low",
-                    "options": [
-                        ["value": "low", "name": "Low"],
-                        ["value": "high", "name": "High"]
-                    ]
-                ]]
-            ]]
+    private func installSyntheticCatalog(
+        in catalog: CursorModelParameterCatalog = .shared
+    ) {
+        catalog.test_restoreSnapshot([
+            "custom-model": [.init(
+                id: "thinking_mode",
+                category: "thought_level",
+                defaultValue: "low",
+                options: [
+                    .init(value: "low", name: "Low"),
+                    .init(value: "high", name: "High")
+                ],
+                description: nil
+            )]
         ])
     }
 
@@ -972,6 +1046,9 @@ final class CursorParameterizedModelControllerTests: XCTestCase {
             continue
         if method == "cursor/list_available_models":
             if os.environ.get("ACP_EXTENSION_NO_RESPONSE") == "1":
+                continue
+            if os.environ.get("ACP_EXTENSION_EMPTY_MODELS") == "1":
+                respond(request_id, {"models": []})
                 continue
             extension_error_code = os.environ.get("ACP_EXTENSION_ERROR_CODE")
             if extension_error_code:

@@ -4,6 +4,9 @@ extension Notification.Name {
     static let cursorModelParameterCatalogDidChange = Notification.Name(
         "RepoPromptCursorModelParameterCatalogDidChange"
     )
+    static let cursorModelParameterCatalogStatusDidChange = Notification.Name(
+        "RepoPromptCursorModelParameterCatalogStatusDidChange"
+    )
 }
 
 final class CursorModelParameterCatalog: @unchecked Sendable {
@@ -20,17 +23,91 @@ final class CursorModelParameterCatalog: @unchecked Sendable {
         let description: String?
     }
 
-    static let shared = CursorModelParameterCatalog()
+    enum ApplyResult: Equatable {
+        case applied(didChange: Bool)
+        case rejectedMalformed
+    }
+
+    enum FailureKind: String, Equatable {
+        case authentication
+        case timeout
+        case malformedResponse
+        case discovery
+        case `extension`
+    }
+
+    enum State: Equatable {
+        case idle
+        case cached
+        case refreshing
+        case live
+        case stale(FailureKind)
+        case unsupported
+        case disabled
+    }
+
+    struct Status: Equatable {
+        let state: State
+        let hasUsableCatalog: Bool
+        let lastSuccessfulRefresh: Date?
+        let lastAttempt: Date?
+    }
+
+    static let shared = CursorModelParameterCatalog(
+        store: CursorModelParameterStore(defaults: .standard)
+    )
 
     private let lock = NSLock()
+    private let mutationLock = NSLock()
+    private let hydrationLock = NSLock()
     private let notificationCenter: NotificationCenter
+    private let store: CursorModelParameterStore
     private var parametersByBase: [String: [ParameterSpec]] = [:]
+    private var statusSnapshot = Status(
+        state: .idle,
+        hasUsableCatalog: false,
+        lastSuccessfulRefresh: nil,
+        lastAttempt: nil
+    )
+    private var isHydrated = false
 
-    init(notificationCenter: NotificationCenter = .default) {
+    init(
+        store: CursorModelParameterStore = .transient(),
+        notificationCenter: NotificationCenter = .default
+    ) {
+        self.store = store
         self.notificationCenter = notificationCenter
     }
 
+    func hydrateSynchronously() {
+        hydrationLock.lock()
+        defer { hydrationLock.unlock() }
+
+        lock.lock()
+        let alreadyHydrated = isHydrated
+        lock.unlock()
+        guard !alreadyHydrated else { return }
+
+        if let stored = store.load() {
+            _ = replace(
+                with: stored.models,
+                persist: false,
+                updatedAt: stored.updatedAt,
+                statusState: .cached,
+                successfulRefresh: stored.updatedAt,
+                attempt: nil,
+                markHydrated: true,
+                shouldPostNotifications: false
+            )
+        } else {
+            lock.lock()
+            isHydrated = true
+            lock.unlock()
+        }
+    }
+
     func parameterSpecs(forModel rawModel: String) -> [ParameterSpec]? {
+        hydrateSynchronously()
         let base = Self.normalizedBase(rawModel)
         lock.lock()
         defer { lock.unlock() }
@@ -38,14 +115,48 @@ final class CursorModelParameterCatalog: @unchecked Sendable {
     }
 
     func currentSnapshot() -> [String: [ParameterSpec]] {
+        hydrateSynchronously()
         lock.lock()
         defer { lock.unlock() }
         return parametersByBase
     }
 
+    func status() -> Status {
+        hydrateSynchronously()
+        lock.lock()
+        defer { lock.unlock() }
+        return statusSnapshot
+    }
+
     @discardableResult
     func test_restoreSnapshot(_ snapshot: [String: [ParameterSpec]]) -> Bool {
-        replace(with: snapshot)
+        hydrationLock.lock()
+
+        lock.lock()
+        let previousStatus = statusSnapshot
+        lock.unlock()
+
+        let didChange = replace(
+            with: snapshot,
+            persist: false,
+            updatedAt: nil,
+            statusState: nil,
+            successfulRefresh: nil,
+            attempt: nil,
+            markHydrated: true,
+            shouldPostNotifications: false
+        )
+
+        lock.lock()
+        let statusDidChange = statusSnapshot != previousStatus
+        lock.unlock()
+
+        hydrationLock.unlock()
+        postNotifications(
+            dataDidChange: didChange,
+            statusDidChange: statusDidChange
+        )
+        return didChange
     }
 
     func uniqueThoughtLevelParameterSpec(forModel rawModel: String) -> ParameterSpec? {
@@ -59,36 +170,171 @@ final class CursorModelParameterCatalog: @unchecked Sendable {
     }
 
     @discardableResult
-    func apply(response: Any) -> Bool {
+    func apply(response: Any) -> ApplyResult {
+        hydrateSynchronously()
+        let attemptedAt = Date()
+
         switch Self.parse(response: response) {
         case let .valid(parsed):
-            replace(with: parsed)
+            let didChange = replace(
+                with: parsed,
+                persist: true,
+                updatedAt: attemptedAt,
+                statusState: .live,
+                successfulRefresh: attemptedAt,
+                attempt: attemptedAt
+            )
+            return .applied(didChange: didChange)
         case .malformed:
-            replace(with: [:])
+            markStale(.malformedResponse, at: attemptedAt)
+            return .rejectedMalformed
         }
     }
 
     @discardableResult
-    func clearForMethodNotFound() -> Bool {
-        replace(with: [:])
+    func clearForMethodNotFound(at attemptedAt: Date = Date()) -> Bool {
+        hydrateSynchronously()
+        return replace(
+            with: [:],
+            persist: true,
+            updatedAt: attemptedAt,
+            statusState: .unsupported,
+            successfulRefresh: nil,
+            attempt: attemptedAt
+        )
     }
 
-    private func replace(with updated: [String: [ParameterSpec]]) -> Bool {
+    func markRefreshing(at attemptedAt: Date = Date()) {
+        transitionStatus(to: .refreshing, attempt: attemptedAt)
+    }
+
+    func markLive(at refreshedAt: Date = Date()) {
+        transitionStatus(
+            to: .live,
+            successfulRefresh: refreshedAt,
+            attempt: refreshedAt
+        )
+    }
+
+    func markStale(_ kind: FailureKind, at attemptedAt: Date = Date()) {
+        transitionStatus(to: .stale(kind), attempt: attemptedAt)
+    }
+
+    func markUnsupported(at attemptedAt: Date = Date()) {
+        transitionStatus(to: .unsupported, attempt: attemptedAt)
+    }
+
+    func markDisabled() {
+        transitionStatus(to: .disabled)
+    }
+
+    func markIdle() {
+        transitionStatus(to: .idle)
+    }
+
+    private func replace(
+        with updated: [String: [ParameterSpec]],
+        persist: Bool,
+        updatedAt: Date?,
+        statusState: State?,
+        successfulRefresh: Date?,
+        attempt: Date?,
+        markHydrated: Bool = false,
+        shouldPostNotifications: Bool = true
+    ) -> Bool {
+        mutationLock.lock()
+
         lock.lock()
-        let didChange = parametersByBase != updated
-        if didChange {
+        let dataDidChange = parametersByBase != updated
+        if dataDidChange {
             parametersByBase = updated
+        }
+        if markHydrated {
+            isHydrated = true
+        }
+
+        let updatedStatus = Status(
+            state: statusState ?? statusSnapshot.state,
+            hasUsableCatalog: !updated.isEmpty,
+            lastSuccessfulRefresh: successfulRefresh ?? statusSnapshot.lastSuccessfulRefresh,
+            lastAttempt: attempt ?? statusSnapshot.lastAttempt
+        )
+        let statusDidChange = statusSnapshot != updatedStatus
+        if statusDidChange {
+            statusSnapshot = updatedStatus
         }
         lock.unlock()
 
+        if persist {
+            if updated.isEmpty {
+                store.clear()
+            } else {
+                _ = store.save(updated, updatedAt: updatedAt ?? Date())
+            }
+        }
+
+        mutationLock.unlock()
+
+        if shouldPostNotifications {
+            postNotifications(
+                dataDidChange: dataDidChange,
+                statusDidChange: statusDidChange
+            )
+        }
+        return dataDidChange
+    }
+
+    private func transitionStatus(
+        to state: State,
+        successfulRefresh: Date? = nil,
+        attempt: Date? = nil
+    ) {
+        hydrateSynchronously()
+        mutationLock.lock()
+
+        lock.lock()
+        let updated = Status(
+            state: state,
+            hasUsableCatalog: !parametersByBase.isEmpty,
+            lastSuccessfulRefresh: successfulRefresh ?? statusSnapshot.lastSuccessfulRefresh,
+            lastAttempt: attempt ?? statusSnapshot.lastAttempt
+        )
+        let didChange = statusSnapshot != updated
         if didChange {
+            statusSnapshot = updated
+        }
+        lock.unlock()
+
+        mutationLock.unlock()
+
+        if didChange {
+            notificationCenter.post(
+                name: .cursorModelParameterCatalogStatusDidChange,
+                object: self
+            )
+        }
+    }
+
+    private func postNotifications(dataDidChange: Bool, statusDidChange: Bool) {
+        if dataDidChange {
             notificationCenter.post(name: .cursorModelParameterCatalogDidChange, object: self)
         }
-        return didChange
+        if statusDidChange {
+            notificationCenter.post(
+                name: .cursorModelParameterCatalogStatusDidChange,
+                object: self
+            )
+        }
     }
 
     private enum ParseResult {
         case valid([String: [ParameterSpec]])
+        case malformed
+    }
+
+    private enum ParameterParseResult {
+        case select(ParameterSpec)
+        case skip
         case malformed
     }
 
@@ -97,7 +343,8 @@ final class CursorModelParameterCatalog: @unchecked Sendable {
         if let models = response as? [Any] {
             rawModels = models
         } else if let object = response as? [String: Any],
-                  let models = object["models"] as? [Any]
+                  let modelsValue = object["models"],
+                  let models = modelsValue as? [Any]
         {
             rawModels = models
         } else {
@@ -105,58 +352,94 @@ final class CursorModelParameterCatalog: @unchecked Sendable {
         }
 
         var parsed: [String: [ParameterSpec]] = [:]
-        var parsedModelCount = 0
         for rawModel in rawModels {
             guard let model = rawModel as? [String: Any],
-                  let rawBase = nonemptyString(model["value"]),
-                  parsed[normalizedBase(rawBase)] == nil,
-                  let rawConfigOptions = model["configOptions"] as? [Any]
+                  let rawBase = nonemptyString(model["value"])
             else {
-                continue
+                return .malformed
             }
 
-            parsedModelCount += 1
-            let specs = rawConfigOptions.compactMap(parseParameterSpec)
-            parsed[normalizedBase(rawBase)] = specs
-        }
-        guard rawModels.isEmpty || parsedModelCount > 0 else {
-            return .malformed
+            let base = normalizedBase(rawBase)
+            guard !base.isEmpty, parsed[base] == nil else {
+                return .malformed
+            }
+
+            let rawConfigOptions: [Any]
+            if let configOptions = model["configOptions"] {
+                guard let options = configOptions as? [Any] else {
+                    return .malformed
+                }
+                rawConfigOptions = options
+            } else {
+                rawConfigOptions = []
+            }
+
+            var specs: [ParameterSpec] = []
+            var selectIDs = Set<String>()
+            for rawOption in rawConfigOptions {
+                switch parseParameterSpec(rawOption) {
+                case let .select(spec):
+                    guard selectIDs.insert(spec.id.lowercased()).inserted else {
+                        return .malformed
+                    }
+                    specs.append(spec)
+                case .skip:
+                    continue
+                case .malformed:
+                    return .malformed
+                }
+            }
+            parsed[base] = specs
         }
         return .valid(parsed)
     }
 
-    private static func parseParameterSpec(_ raw: Any) -> ParameterSpec? {
+    private static func parseParameterSpec(_ raw: Any) -> ParameterParseResult {
         guard let object = raw as? [String: Any],
-              object["type"] as? String == "select",
-              let id = nonemptyString(object["id"]),
+              let type = nonemptyString(object["type"])
+        else {
+            return .malformed
+        }
+        guard type == "select" else { return .skip }
+
+        guard let id = nonemptyString(object["id"]),
               let category = nonemptyString(object["category"]),
               let defaultValue = nonemptyString(object["currentValue"]),
               let rawOptions = object["options"] as? [Any]
         else {
-            return nil
+            return .malformed
         }
 
-        let options = rawOptions.compactMap { rawOption -> Option? in
+        if let rawDescription = object["description"], !(rawDescription is String) {
+            return .malformed
+        }
+
+        var options: [Option] = []
+        var optionValues = Set<String>()
+        for rawOption in rawOptions {
             guard let option = rawOption as? [String: Any],
                   let value = nonemptyString(option["value"]),
-                  let name = nonemptyString(option["name"])
+                  let name = nonemptyString(option["name"]),
+                  optionValues.insert(value).inserted
             else {
-                return nil
+                return .malformed
             }
-            return Option(value: value, name: name)
+            options.append(Option(value: value, name: name))
         }
-        guard !options.isEmpty else { return nil }
+        guard !options.isEmpty, options.contains(where: { $0.value == defaultValue }) else {
+            return .malformed
+        }
 
-        return ParameterSpec(
+        return .select(ParameterSpec(
             id: id,
             category: category,
             defaultValue: defaultValue,
             options: options,
             description: nonemptyString(object["description"])
-        )
+        ))
     }
 
-    private static func normalizedBase(_ raw: String) -> String {
+    static func normalizedBase(_ raw: String) -> String {
         let stripped = CursorBracketModelID.strippingCursorPrefix(raw)
         return (CursorBracketModelID.parse(stripped)?.base ?? stripped)
             .trimmingCharacters(in: .whitespacesAndNewlines)

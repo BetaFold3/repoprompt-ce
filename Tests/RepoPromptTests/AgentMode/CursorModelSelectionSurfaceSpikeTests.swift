@@ -156,7 +156,10 @@ final class CursorModelSelectionSurfaceSpikeTests: XCTestCase {
             $0.style == .warning && $0.toolTip != nil
         })
 
-        XCTAssertTrue(CursorModelParameterCatalog.shared.apply(response: menuParameterResponse()))
+        XCTAssertEqual(
+            CursorModelParameterCatalog.shared.apply(response: menuParameterResponse()),
+            .applied(didChange: true)
+        )
         let roleItems = AgentModelStableMenuItems.modelItems(
             agentKind: .cursor,
             options: [
@@ -187,21 +190,24 @@ final class CursorModelSelectionSurfaceSpikeTests: XCTestCase {
             ["None", "Low", "High"]
         )
 
-        XCTAssertTrue(CursorModelParameterCatalog.shared.apply(response: [
-            "models": [[
-                "value": "gpt-5.6-sol",
-                "configOptions": [[
-                    "id": "fast",
-                    "category": "speed",
-                    "type": "select",
-                    "currentValue": "true",
-                    "options": [
-                        ["value": "false", "name": "Off"],
-                        ["value": "true", "name": "On"]
-                    ]
+        XCTAssertEqual(
+            CursorModelParameterCatalog.shared.apply(response: [
+                "models": [[
+                    "value": "gpt-5.6-sol",
+                    "configOptions": [[
+                        "id": "fast",
+                        "category": "speed",
+                        "type": "select",
+                        "currentValue": "true",
+                        "options": [
+                            ["value": "false", "name": "Off"],
+                            ["value": "true", "name": "On"]
+                        ]
+                    ]]
                 ]]
-            ]]
-        ]))
+            ]),
+            .applied(didChange: true)
+        )
         let fastDefaultItems = AgentModelStableMenuItems.modelItems(
             agentKind: .cursor,
             options: [
@@ -415,7 +421,10 @@ final class CursorModelSelectionSurfaceSpikeTests: XCTestCase {
 
     private func makeMenuCatalog() -> CursorModelParameterCatalog {
         let catalog = CursorModelParameterCatalog()
-        XCTAssertTrue(catalog.apply(response: menuParameterResponse()))
+        XCTAssertEqual(
+            catalog.apply(response: menuParameterResponse()),
+            .applied(didChange: true)
+        )
         return catalog
     }
 
