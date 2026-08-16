@@ -2869,9 +2869,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         else {
             return nil
         }
+        let normalizedRolloutPath = rolloutPath?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return AgentModeViewModel.CodexResumeTimeoutState(
             conversationID: resolvedConversationID,
-            rolloutPath: rolloutPath,
+            rolloutPath: normalizedRolloutPath?.isEmpty == false ? normalizedRolloutPath : nil,
             consecutiveTimeouts: 0
         )
     }
@@ -3162,8 +3164,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         if let ref = startResult.sessionRef {
             cancelCodexTransportClosedFallback(for: session.tabID)
-            session.codexConversationID = ref.conversationID
-            session.codexRolloutPath = ref.rolloutPath
+            let normalizedThreadID = ref.conversationID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if normalizedThreadID.isEmpty {
+                // Never persist resume metadata without a usable thread ID: a stored
+                // rollout path whose thread ID is missing would strand every later
+                // send on the persisted-state integrity error. Drop both fields so
+                // the next transport start classifies as a fresh thread/start.
+                logCodex("[AgentModeVM][CodexReconnect] start result carried no usable thread ID for tab \(session.tabID); clearing native thread metadata instead of persisting an invalid resume reference")
+                session.codexConversationID = nil
+                session.codexRolloutPath = nil
+            } else {
+                session.codexConversationID = normalizedThreadID
+                session.codexRolloutPath = ref.rolloutPath
+            }
             session.codexModel = ref.model
             session.codexReasoningEffort = ref.reasoningEffort
             // Always clear the reconnect flag after a successful start/resume.

@@ -487,7 +487,9 @@ struct RemoteCommandTranslator {
         "timeout"
     ]
 
-    private static let listAgentsPayloadKeys: Set<String> = []
+    private static let listAgentsPayloadKeys: Set<String> = [
+        "include_model_parameters"
+    ]
 
     private static let openWorkspacePayloadKeys: Set<String> = [
         "workspace_id",

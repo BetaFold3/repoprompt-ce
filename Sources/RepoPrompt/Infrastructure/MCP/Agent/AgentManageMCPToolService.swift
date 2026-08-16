@@ -12,6 +12,7 @@ struct AgentManageMCPToolService {
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     let bindCurrentRequestToTab: (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void
     let restrictDiscoveryToRoleLabels: @MainActor (_ workspaceID: UUID?) -> Bool
+    let cursorParameterMetadataBuilder: CursorAgentParameterMetadataBuilder
 
     init(
         toolName: String,
@@ -22,7 +23,8 @@ struct AgentManageMCPToolService {
         bindCurrentRequestToTab: @escaping (_ tabID: UUID, _ metadata: RequestMetadata) async throws -> Void,
         restrictDiscoveryToRoleLabels: @escaping @MainActor (_ workspaceID: UUID?) -> Bool = { workspaceID in
             GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: workspaceID).restrictMCPAgentDiscoveryToRoleLabels
-        }
+        },
+        cursorParameterMetadataBuilder: CursorAgentParameterMetadataBuilder = CursorAgentParameterMetadataBuilder()
     ) {
         self.toolName = toolName
         self.captureRequestMetadata = captureRequestMetadata
@@ -31,6 +33,7 @@ struct AgentManageMCPToolService {
         self.resolveSpawnParentSessionID = resolveSpawnParentSessionID
         self.bindCurrentRequestToTab = bindCurrentRequestToTab
         self.restrictDiscoveryToRoleLabels = restrictDiscoveryToRoleLabels
+        self.cursorParameterMetadataBuilder = cursorParameterMetadataBuilder
     }
 
     private struct HandoffSessionInfo {
@@ -88,6 +91,11 @@ struct AgentManageMCPToolService {
         let availability = targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
         let workspaceID = targetWindow.workspaceManager.activeWorkspace?.id
         let rolesOnly = try parseBool(args["roles_only"], name: "roles_only", defaultValue: false)
+        let includeModelParameters = try parseBool(
+            args[CursorAgentParameterMetadataBuilder.includeParametersFlag],
+            name: CursorAgentParameterMetadataBuilder.includeParametersFlag,
+            defaultValue: false
+        )
         let restrictedDiscovery = restrictDiscoveryToRoleLabels(workspaceID)
         let omitAgentCatalog = rolesOnly || restrictedDiscovery
         let agents: [Value] = omitAgentCatalog ? [] : AgentModelCatalog.discoveryAgents(availability: availability).map { entry -> Value in
@@ -106,7 +114,8 @@ struct AgentManageMCPToolService {
                             agent: entry.agent,
                             model: model,
                             target: target,
-                            legacyName: target.name
+                            legacyName: target.name,
+                            includeModelParameters: includeModelParameters
                         )))
                     }
                 } else if let target = model.startTargets.first {
@@ -114,7 +123,8 @@ struct AgentManageMCPToolService {
                         agent: entry.agent,
                         model: model,
                         target: target,
-                        legacyName: model.name
+                        legacyName: model.name,
+                        includeModelParameters: includeModelParameters
                     )))
                 } else {
                     var obj: [String: Value] = [
@@ -176,10 +186,12 @@ struct AgentManageMCPToolService {
         agent: AgentProviderKind,
         model: AgentModelCatalog.DiscoveryModel,
         target: AgentModelCatalog.DiscoveryStartTarget,
-        legacyName: String
+        legacyName: String,
+        includeModelParameters: Bool
     ) -> [String: Value] {
+        let targetID = target.selectionID.rawValue
         var obj: [String: Value] = [
-            "model_id": .string(target.selectionID.rawValue),
+            "model_id": .string(targetID),
             "name": .string(legacyName),
             "agent_id": .string(agent.rawValue),
             "base_model_id": .string(model.id),
@@ -190,6 +202,13 @@ struct AgentManageMCPToolService {
             obj["effort"] = .string(effort)
             obj["effort_display_name"] = .string(RemoteHostAgentCatalog.displayName(forEffort: effort))
             obj["reasoning_effort"] = .string(effort)
+        }
+        if let parameterization = cursorParameterMetadataBuilder.metadata(
+            agent: agent,
+            targetID: targetID,
+            includeParameters: includeModelParameters
+        ) {
+            obj["parameterization"] = parameterization
         }
         return obj
     }

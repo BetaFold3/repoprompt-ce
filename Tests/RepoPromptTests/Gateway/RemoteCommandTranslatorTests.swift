@@ -78,6 +78,26 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         }
     }
 
+    func testListAgentsForwardsCursorParameterOptInAndRejectsUnknownKeys() throws {
+        let call = try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "list_agents",
+            payload: .object(["include_model_parameters": .bool(true)])
+        ))
+        XCTAssertEqual(call.toolName, "agent_manage")
+        XCTAssertEqual(call.arguments["op"], .string("list_agents"))
+        XCTAssertEqual(call.arguments["include_model_parameters"], .bool(true))
+
+        XCTAssertThrowsError(try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "list_agents",
+            payload: .object(["verbose": .bool(true)])
+        ))) { error in
+            XCTAssertEqual(
+                error as? RemoteCommandTranslatorError,
+                .unsupportedPayloadKey(operation: "list_agents", key: "verbose")
+            )
+        }
+    }
+
     func testGetLogForwardsOptionalRowMetadataAndStillRejectsUnknownKeys() throws {
         let sid = "11111111-1111-1111-1111-111111111111"
         let call = try RemoteCommandTranslator().translate(RemoteClientFrame(

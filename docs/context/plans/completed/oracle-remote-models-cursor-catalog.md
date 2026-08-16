@@ -1,3 +1,17 @@
+# Completion record
+
+Outcome: **Phases A, B, and C completed through 2026-08-16.**
+
+The original plan body below is preserved verbatim as historical context; its embedded Status and Authority metadata is superseded by this completion record and the durable owner.
+
+Durable decisions are distilled into the [Oracle remote-models and Cursor catalog contract](../../oracle-remote-models-cursor-catalog.md). OMP Oracle models remain exact registry-backed selections with connection gating, fail-closed execution, prompt-only/no-MCP safety, and strict terminal handling on the shared exactly-once headless lifecycle bridge. The Cursor parameter catalog remains its own versioned retain-last-good authority with atomic parsing, authoritative clears only, synchronous hydration, typed status/diagnostics, and bounded polling recovery.
+
+Phase C added the app-local `CursorAgentParameterMetadataBuilder` and an additive `parameterization` envelope on eligible bare Cursor `list_agents` targets. Compact grammar metadata is always present when the Cursor parameterized-model feature gate is enabled and the catalog entry is nonempty; full axes require `include_model_parameters: true`. Metadata is omitted when `CursorParameterizedModels` is disabled, for absent or empty catalog entries, already bracketed targets, and all non-Cursor targets. The gateway forwards the opt-in without weakening its payload allowlist. Target count, order, IDs, and non-Cursor serialization remain unchanged; targets are never Cartesian-expanded.
+
+Against the captured 33-model Cursor ACP fixture, compact `list_agents` projection measured **10,943 bytes** and full-axis projection measured **24,497 bytes** (**+13,554 bytes**), retaining the opt-in design. Phase C validation passed: `AgentManageListAgentsCursorParameterMetadataTests` **5/5**, existing adjacent suites **63/63**, `make dev-build` ticket `c573569d-8620-4c6a-baa8-d2ca372f325d`, `make dev-lint` ticket `3841be49-edcb-4890-b194-1a3c51bb8f72`, and `make dev-format-check` ticket `5cbc6755-87b2-4d0d-940b-101440cd95c8`. No full-root test or live app validation was performed.
+
+---
+
 # Plan: OMP Oracle Model Presets + Cursor Parameter-Catalog Durability + MCP Parameter Metadata
 
 Scope: read when the task touches Oracle remote-client models for Cursor or Oh My Pi, `CursorModelParameterCatalog`/`CursorACPModelPollingService` durability or diagnostics, OMP models in Oracle preset pickers, or Cursor parameter metadata in `agent_manage list_agents`.

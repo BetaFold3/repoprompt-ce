@@ -185,7 +185,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
 
             **Operations**: list_agents | list_sessions | get_log | extract_handoff | handoff | fork_session | create_session | resume_session | stop_session | cleanup_sessions | list_workflows
 
-            - `list_agents`: Returns top-level `task_labels` as the authoritative role-label→model mapping (explore, engineer, pair, design), plus `agents[].models[]` with explicit compound `model_id` targets for callers that want to pin a specific agent/model/effort. Use `task_labels` entries for role-based routing; use `agents[].models[].model_id` for exact selections. Pass `roles_only=true` to return only `task_labels` and omit the explicit per-agent target catalog.
+            - `list_agents`: Returns top-level `task_labels` as the authoritative role-label→model mapping (explore, engineer, pair, design), plus `agents[].models[]` with explicit compound `model_id` targets for callers that want to pin a specific agent/model/effort. Use `task_labels` entries for role-based routing; use `agents[].models[].model_id` for exact selections. Cursor targets with parameter axes include compact `parameterization` metadata; pass `include_model_parameters=true` to include full axes and options. Pass `roles_only=true` to return only `task_labels` and omit the explicit per-agent target catalog.
             - `list_sessions`: Browse sessions. Returns `session_id` for each session. Filter by MCP-facing `state` (e.g. `running`, `waiting_for_input`, `completed`, `failed`). When called from agent mode, automatically scopes to sessions spawned by the current agent session.
             - `get_log`: Read faithful transcript XML for a session, preserving visible assistant/tool order without handoff compaction or narration pruning. Use `offset`/`limit` to page by turns.
             - `extract_handoff` (`handoff` alias): Export the full `<forked_session ...>` handoff XML for a live or persisted session. Persisted sessions export transcript-only payloads; `include_file_contents` is accepted only for a live source tab that is currently active so file selection can be snapshotted reliably. Use `output_path` to write to a file; inline XML is returned by default only when no output path is provided.
@@ -200,7 +200,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 description: """
                 Provide `op` plus operation-specific fields.
 
-                **list_agents**: roles_only?
+                **list_agents**: roles_only?, include_model_parameters?
                 **list_workflows**: no additional fields
                 **list_sessions**: agent?, state?, limit?, parent_session_id?
                 **get_log**: session_id (required), offset?, limit?
@@ -233,7 +233,8 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                     "parent_session_id": .string(description: "[list_sessions] Only return sessions whose parent session UUID matches. Never widens connection-scoped visibility; a mismatch with the connection's scoped parent yields an empty list."),
                     "offset": .integer(description: "[get_log] Turn offset."),
                     "session_ids": .array(description: "[cleanup_sessions] Array of session UUIDs to delete.", items: .string()),
-                    "roles_only": .boolean(description: "[list_agents] When true, return only the authoritative role-label mapping (task_labels) and omit the explicit per-agent target catalog. Default false.")
+                    "roles_only": .boolean(description: "[list_agents] When true, return only the authoritative role-label mapping (task_labels) and omit the explicit per-agent target catalog. Default false."),
+                    "include_model_parameters": .boolean(description: "[list_agents] Include full Cursor parameter axes, options, defaults, and descriptions in parameterization metadata. Default false.")
                 ],
                 required: ["op"]
             )
