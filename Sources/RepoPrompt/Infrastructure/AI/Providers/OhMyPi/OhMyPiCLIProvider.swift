@@ -33,8 +33,14 @@ final class OhMyPiCLIProvider: AIProvider {
     }
 
     #if DEBUG
-        static func test_makeHeadlessConfig(modelName: String) -> OhMyPiAgentConfig {
-            makeHeadlessConfig(modelName: modelName)
+        static func test_makeHeadlessConfig(
+            modelName: String,
+            additionalConfigOptionValues: [ACPConfigOptionAssignment] = []
+        ) -> OhMyPiAgentConfig {
+            makeHeadlessConfig(
+                modelName: modelName,
+                additionalConfigOptionValues: additionalConfigOptionValues
+            )
         }
 
         func test_makeAgentMessage(from aiMessage: AIMessage) -> AgentMessage {
@@ -65,7 +71,10 @@ final class OhMyPiCLIProvider: AIProvider {
 
         let canonicalModel = canonicalOption.rawValue
         let provider = headlessProviderFactory(
-            Self.makeHeadlessConfig(modelName: canonicalModel),
+            Self.makeHeadlessConfig(
+                modelName: canonicalModel,
+                additionalConfigOptionValues: aiMessage.executionMetadata.additionalACPConfigOptionValues
+            ),
             nil
         )
         let message = makeAgentMessage(from: aiMessage)
@@ -150,9 +159,13 @@ final class OhMyPiCLIProvider: AIProvider {
         }
     }
 
-    private static func makeHeadlessConfig(modelName: String) -> OhMyPiAgentConfig {
+    private static func makeHeadlessConfig(
+        modelName: String,
+        additionalConfigOptionValues: [ACPConfigOptionAssignment]
+    ) -> OhMyPiAgentConfig {
         OhMyPiAgentConfig(
             modelString: modelName,
+            additionalConfigOptionValues: additionalConfigOptionValues,
             enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
             includeRepoPromptMCPServer: false
         )

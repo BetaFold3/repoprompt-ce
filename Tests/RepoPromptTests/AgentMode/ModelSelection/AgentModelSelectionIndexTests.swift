@@ -103,6 +103,25 @@ final class AgentModelSelectionIndexTests: XCTestCase {
         XCTAssertNil(reasoningEffortRaw)
     }
 
+    func testOMPDefaultAndFastDefaultHaveDistinctQuickSelectionTitles() {
+        let base = "cursor/gpt-5.2-codex"
+        let fast = "cursor/gpt-5.2-codex-fast"
+        let index = AgentModelSelectionIndex.local(
+            agents: [.ohMyPi],
+            optionsByAgent: [
+                .ohMyPi: [
+                    AgentModelOption(rawValue: base, displayName: "Base", description: nil, isDefault: true),
+                    AgentModelOption(rawValue: fast, displayName: "Fast", description: nil, isDefault: false)
+                ]
+            ],
+            selected: nil,
+            selectionDefaults: .standard
+        )
+
+        XCTAssertEqual(index.leaves.map(\.title), ["gpt-5.2-codex", "gpt-5.2-codex Fast"])
+        XCTAssertEqual(index.leaves.map(\.id.modelRaw), [base, fast])
+    }
+
     func testLocalIndexPreservesParameterizedCursorCurrentRawForValidBaseOption() throws {
         let baseRaw = "gpt-5.6-sol"
         let selectedRaw = "cursor:gpt-5.6-sol[context=1m,thinking_mode=high,fast=false]"

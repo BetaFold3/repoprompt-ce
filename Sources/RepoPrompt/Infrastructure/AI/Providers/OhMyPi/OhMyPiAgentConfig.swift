@@ -28,6 +28,7 @@ struct OhMyPiAgentConfig {
     let commandName: String
     let additionalPathHints: [String]
     let modelString: String?
+    let additionalConfigOptionValues: [ACPConfigOptionAssignment]
     let enableDebugLogging: Bool
     let includeRepoPromptMCPServer: Bool
 
@@ -35,12 +36,14 @@ struct OhMyPiAgentConfig {
         commandName: String = "omp",
         additionalPathHints: [String] = CLIPathHints.ohMyPi,
         modelString: String? = nil,
+        additionalConfigOptionValues: [ACPConfigOptionAssignment] = [],
         enableDebugLogging: Bool = false,
         includeRepoPromptMCPServer: Bool = true
     ) {
         self.commandName = commandName
         self.additionalPathHints = additionalPathHints
         self.modelString = modelString
+        self.additionalConfigOptionValues = additionalConfigOptionValues
         self.enableDebugLogging = enableDebugLogging
         self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
     }

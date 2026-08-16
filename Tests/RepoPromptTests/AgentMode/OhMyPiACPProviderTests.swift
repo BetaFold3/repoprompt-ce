@@ -46,6 +46,28 @@ final class OhMyPiACPProviderTests: XCTestCase {
         )
     }
 
+    func testGenericHeadlessFactoryRejectsOMPAssignmentsForNonOMPProviders() throws {
+        for agent in [
+            AgentProviderKind.claudeCode,
+            .codexExec,
+            .openCode,
+            .cursor
+        ] {
+            XCTAssertThrowsError(
+                try AgentRuntimeProviderService.shared.makeProvider(
+                    for: agent,
+                    additionalConfigOptionValues: [.ohMyPiThinking("high")]
+                ),
+                agent.rawValue
+            ) { error in
+                XCTAssertTrue(
+                    error.localizedDescription.contains("only valid for Oh My Pi"),
+                    "\(agent.rawValue): \(error)"
+                )
+            }
+        }
+    }
+
     func testIdentityAndManagedArgumentsAreExact() throws {
         XCTAssertEqual(ACPProviderID.ohMyPi.rawValue, "ohMyPi")
         XCTAssertEqual(AgentProviderKind.ohMyPi.rawValue, "ohMyPi")
@@ -601,6 +623,24 @@ final class OhMyPiACPProviderTests: XCTestCase {
         XCTAssertTrue(MCPIntegrationHelper.isExactRepoPromptServerIdentifier("RepoPromptCE"))
         XCTAssertTrue(MCPIntegrationHelper.isExactRepoPromptServerIdentifier("RepoPromptCE MCP Server"))
         XCTAssertFalse(MCPIntegrationHelper.isExactRepoPromptServerIdentifier("not-RepoPromptCE"))
+    }
+
+    func testOMPCancelledToolUpdateNormalizesAsTerminalFailure() throws {
+        let events = OhMyPiACPEventNormalizer.normalize([
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "omp-cancelled-call",
+            "title": "Opaque provider title",
+            "status": "cancelled",
+            "rawInput": ["path": "/tmp/a"]
+        ])
+        guard case let .stream(result) = try XCTUnwrap(events.first) else {
+            return XCTFail("Expected cancelled OMP tool update")
+        }
+        XCTAssertEqual(result.type, "tool_result")
+        XCTAssertEqual(result.toolName, "Opaque provider title")
+        XCTAssertEqual(result.toolIsError, true)
+        XCTAssertNotNil(result.toolInvocationID)
+        XCTAssertNotNil(result.toolArgsJSON)
     }
 
     func testObservedInitializeFixtureRecordsLoadSessionCapability() throws {
@@ -1259,13 +1299,18 @@ final class OhMyPiACPProviderTests: XCTestCase {
         } catch {}
         XCTAssertEqual(ordering, ["routing"])
 
-        let config = OhMyPiAgentConfig(modelString: "openrouter/model")
+        let thinking = ACPConfigOptionAssignment.ohMyPiThinking("high")
+        let config = OhMyPiAgentConfig(
+            modelString: "openrouter/model",
+            additionalConfigOptionValues: [thinking]
+        )
         let request = OhMyPiACPHeadlessAgentProvider.makeRunRequest(
             config: config,
             workspacePath: "/tmp/workspace",
             message: AgentMessage(userMessage: "handoff", resumeSessionID: "candidate")
         )
         XCTAssertEqual(request.resumeSessionID, "candidate")
+        XCTAssertEqual(request.additionalConfigOptionValues, [thinking])
 
         XCTAssertNil(OhMyPiACPHeadlessAgentProvider.selectedModelToApply(config: config))
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(

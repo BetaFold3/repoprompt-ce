@@ -155,6 +155,7 @@ actor AgentSessionDataService {
         let lastUserMessageAt: Date?
         let agentKind: String?
         let agentModel: String?
+        let ohMyPiThinkingSelections: OhMyPiThinkingSelections?
         let agentReasoningEffort: String?
         let lastRunState: String?
         let providerSessionID: String?
@@ -191,6 +192,7 @@ actor AgentSessionDataService {
             case lastUserMessageAt
             case agentKind
             case agentModel
+            case ohMyPiThinkingSelections
             case agentReasoningEffort
             case lastRunState
             case providerSessionID
@@ -232,6 +234,10 @@ actor AgentSessionDataService {
             lastUserMessageAt = try container.decodeIfPresent(Date.self, forKey: .lastUserMessageAt)
             agentKind = try container.decodeIfPresent(String.self, forKey: .agentKind)
             agentModel = try container.decodeIfPresent(String.self, forKey: .agentModel)
+            ohMyPiThinkingSelections = try container.decodeIfPresent(
+                OhMyPiThinkingSelections.self,
+                forKey: .ohMyPiThinkingSelections
+            )?.nilIfEmpty
             agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
             lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
             providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
@@ -1193,6 +1199,7 @@ actor AgentSessionDataService {
                 lastUserMessageAt: recoveredLastUserMessageAt,
                 agentKind: header.agentKind,
                 agentModel: header.agentModel,
+                ohMyPiThinkingSelections: header.ohMyPiThinkingSelections,
                 agentReasoningEffort: header.agentReasoningEffort,
                 lastRunState: AgentSessionRestoreSupport.coldRestoredLastRunStateRaw(header.lastRunState),
                 providerSessionID: header.providerSessionID,

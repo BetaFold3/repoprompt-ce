@@ -116,6 +116,25 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         _ workspacePath: String?
     ) throws -> HeadlessAgentProvider
 
+    private typealias ConfiguredProviderFactory = (
+        _ agent: AgentProviderKind,
+        _ modelString: String?,
+        _ workspacePath: String?,
+        _ additionalConfigOptionValues: [ACPConfigOptionAssignment]
+    ) throws -> HeadlessAgentProvider
+
+    static func ohMyPiConfigAssignments(
+        agent: AgentProviderKind,
+        exactWireModelID: String?,
+        profile: AgentModelsSettingsProfile
+    ) -> [ACPConfigOptionAssignment] {
+        AgentModeRunService.ohMyPiConfigAssignments(
+            agent: agent,
+            exactWireModelID: exactWireModelID,
+            selections: profile.contextBuilderOhMyPiThinkingSelections
+        )
+    }
+
     private func debugLog(_ message: @autoclosure () -> String) {
         #if DEBUG
             if AgentRuntimeProviderService.enableDebugLogging {
@@ -870,7 +889,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private let promptManager: PromptViewModel
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private let mcpServer: MCPServerViewModel
-    private let providerFactory: ProviderFactory
+    private let providerFactory: ConfiguredProviderFactory
 
     /// Chat VM used for headless plan generation from discovery.
     /// Weak to avoid accidental strong cycles with the view layer.
@@ -915,12 +934,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         self.mcpServer = mcpServer
         self.oracleViewModel = oracleViewModel
         self.codexModelPollingService = codexModelPollingService
-        self.providerFactory = providerFactory ?? { agent, modelString, workspacePath in
-            try AgentRuntimeProviderService.shared.makeProvider(
-                for: agent,
-                modelString: modelString,
-                workspacePath: workspacePath
-            )
+        if let providerFactory {
+            self.providerFactory = { agent, modelString, workspacePath, _ in
+                try providerFactory(agent, modelString, workspacePath)
+            }
+        } else {
+            self.providerFactory = { agent, modelString, workspacePath, additionalConfigOptionValues in
+                try AgentRuntimeProviderService.shared.makeProvider(
+                    for: agent,
+                    modelString: modelString,
+                    workspacePath: workspacePath,
+                    additionalConfigOptionValues: additionalConfigOptionValues
+                )
+            }
         }
         refreshAvailableAgents()
 
@@ -2653,9 +2679,25 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let providerWorkspacePath = record.mcpConfiguration?.providerWorkspacePath
                 ?? record.workspaceContext?.providerWorkspacePath
                 ?? currentWorkspacePath
+            let sourceWorkspaceID = record.mcpConfiguration?.identity.workspaceID
+                ?? record.workspaceContext?.frozenTabContext.workspaceID
+                ?? currentWorkspaceID
+            let sourceProfile = settingsManager.effectiveAgentModelsProfile(
+                workspaceID: sourceWorkspaceID
+            )
+            let additionalConfigOptionValues = Self.ohMyPiConfigAssignments(
+                agent: record.agentKind,
+                exactWireModelID: modelString,
+                profile: sourceProfile
+            )
             let provider: HeadlessAgentProvider
             do {
-                provider = try providerFactory(record.agentKind, modelString, providerWorkspacePath)
+                provider = try providerFactory(
+                    record.agentKind,
+                    modelString,
+                    providerWorkspacePath,
+                    additionalConfigOptionValues
+                )
             } catch {
                 await lease.failAndCleanup()
                 return .failed(error.localizedDescription)
@@ -4339,6 +4381,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         model: AIModel,
         chatPresetID: UUID?,
         modelPresetID: UUID? = nil,
+        ohMyPiThinkingSelections: OhMyPiThinkingSelections,
         mcpSessionUIState: OracleViewModel.MCPSessionUIState? = nil,
         gitScopeOverride: GitInclusion? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
@@ -4427,6 +4470,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 sessionID: createdSession.id,
                 overrideModel: model,
                 overrideModelPresetID: modelPresetID,
+                overrideOhMyPiThinkingSelections: ohMyPiThinkingSelections,
                 overrideChatPresetID: chatPresetID,
                 overrideMode: promptMode,
                 gitInclusionOverride: mode == .review ? gitScopeOverride : nil,
@@ -4607,6 +4651,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     workspaceID: identity.workspaceID,
                     lookupContext: lookupContext,
                     resolvedModel: modelSelection.model,
+                    resolvedModelPresetID: modelSelection.modelPresetID,
                     finalReviewAuthorization: finalReviewAuthorization,
                     agentModeSessionID: agentModeSessionID,
                     agentModeRunID: agentModeRunID,
@@ -4647,6 +4692,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             model: modelSelection.model,
             chatPresetID: modelSelection.chatPresetID,
             modelPresetID: modelSelection.modelPresetID,
+            ohMyPiThinkingSelections: modelSelection.modelPresetID
+                .flatMap { ModelPresetsManager.shared.preset(withID: $0)?.ohMyPiThinkingSelections }
+                ?? settingsManager.effectiveAgentModelsProfile(
+                    workspaceID: identity.workspaceID
+                ).planningModelOhMyPiThinkingSelections,
             mcpSessionUIState: mcpSessionUIState,
             gitScopeOverride: gitScopeOverride,
             progressReporter: progressReporter,
@@ -4796,6 +4846,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             chatName: chatName ?? defaultChatName,
             model: promptManager.preferredAIModel,
             chatPresetID: nil,
+            ohMyPiThinkingSelections: promptManager.preferredModelOhMyPiThinkingSelections,
             onProgress: onProgress
         )
     }

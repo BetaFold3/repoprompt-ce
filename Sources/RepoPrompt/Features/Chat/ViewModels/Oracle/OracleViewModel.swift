@@ -3243,6 +3243,7 @@ class OracleViewModel: ObservableObject {
         sessionID: UUID? = nil,
         overrideModel: AIModel? = nil,
         overrideModelPresetID: UUID? = nil,
+        overrideOhMyPiThinkingSelections: OhMyPiThinkingSelections? = nil,
         overrideChatPresetID: UUID? = nil,
         overrideMode: PromptViewModel.PlanActMode? = nil,
         gitInclusionOverride: GitInclusion? = nil,
@@ -3294,6 +3295,7 @@ class OracleViewModel: ObservableObject {
             targetSessionID: targetSessionID,
             overrideModel: overrideModel,
             overrideModelPresetID: overrideModelPresetID,
+            overrideOhMyPiThinkingSelections: overrideOhMyPiThinkingSelections,
             overrideChatPresetID: overrideChatPresetID,
             overrideMode: overrideMode,
             gitInclusionOverride: gitInclusionOverride,
@@ -3318,6 +3320,7 @@ class OracleViewModel: ObservableObject {
         targetSessionID: UUID,
         overrideModel: AIModel? = nil,
         overrideModelPresetID: UUID? = nil,
+        overrideOhMyPiThinkingSelections: OhMyPiThinkingSelections? = nil,
         overrideChatPresetID: UUID? = nil,
         overrideMode: PromptViewModel.PlanActMode? = nil,
         gitInclusionOverride: GitInclusion? = nil,
@@ -3347,6 +3350,18 @@ class OracleViewModel: ObservableObject {
         let presetModel = promptViewModel.modelFromCurrentChatPreset()
         let model = overrideModel ?? presetModel ?? promptViewModel.preferredAIModel
         let modelDisplayName = model.displayName
+        let resolvedModelPreset = overrideModelPresetID.flatMap {
+            ModelPresetsManager.shared.preset(withID: $0)
+        }
+        let ohMyPiThinkingSelections: OhMyPiThinkingSelections = if let overrideOhMyPiThinkingSelections {
+            overrideOhMyPiThinkingSelections
+        } else if let resolvedModelPreset {
+            resolvedModelPreset.ohMyPiThinkingSelections
+        } else if origin == .mcp {
+            promptViewModel.planningModelOhMyPiThinkingSelections
+        } else {
+            promptViewModel.preferredModelOhMyPiThinkingSelections
+        }
 
         // Check if the selected model is actually available (provider configured).
         if !promptViewModel.isModelAvailable(model) {
@@ -3508,25 +3523,28 @@ class OracleViewModel: ObservableObject {
                         reviewGitContextOverride: reviewGitContextOverride
                     )
                 }
+                let assembledAIMessage = aiMessage.replacingExecutionMetadata(
+                    ohMyPiThinkingSelections.executionMetadata(for: model)
+                )
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
                 }
                 recordOracleRequestInputTokenEstimate(
-                    for: aiMessage,
+                    for: assembledAIMessage,
                     assistantMessageID: aiResponseId
                 )
                 #if DEBUG
-                    OracleReviewPackagingDiagnostics.recordSubmission(aiMessage)
+                    OracleReviewPackagingDiagnostics.recordSubmission(assembledAIMessage)
                     let (streamID, stream) = if let transportOverride =
                         oraclePostPackagingTransportOverrideForTesting
                     {
-                        try await transportOverride(aiMessage, model)
+                        try await transportOverride(assembledAIMessage, model)
                     } else {
-                        try await aiQueriesService.sendPrompt(aiMessage, model: model)
+                        try await aiQueriesService.sendPrompt(assembledAIMessage, model: model)
                     }
                 #else
                     let (streamID, stream) = try await aiQueriesService.sendPrompt(
-                        aiMessage,
+                        assembledAIMessage,
                         model: model
                     )
                 #endif

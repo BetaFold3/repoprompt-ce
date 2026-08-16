@@ -92,6 +92,7 @@ struct ACPRunRequest {
     let attachments: [AgentImageAttachment]
     let taskLabelKind: AgentModelCatalog.TaskLabelKind?
     let sessionModeID: String?
+    let additionalConfigOptionValues: [ACPConfigOptionAssignment]
     let autoApproveAllToolPermissions: Bool
 
     init(
@@ -102,6 +103,7 @@ struct ACPRunRequest {
         attachments: [AgentImageAttachment],
         taskLabelKind: AgentModelCatalog.TaskLabelKind?,
         sessionModeID: String? = nil,
+        additionalConfigOptionValues: [ACPConfigOptionAssignment] = [],
         autoApproveAllToolPermissions: Bool = false
     ) {
         self.agentKind = agentKind
@@ -111,6 +113,7 @@ struct ACPRunRequest {
         self.attachments = attachments
         self.taskLabelKind = taskLabelKind
         self.sessionModeID = sessionModeID
+        self.additionalConfigOptionValues = additionalConfigOptionValues
         self.autoApproveAllToolPermissions = autoApproveAllToolPermissions
     }
 }

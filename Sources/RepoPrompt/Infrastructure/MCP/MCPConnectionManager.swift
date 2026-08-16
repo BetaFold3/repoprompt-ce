@@ -1329,7 +1329,18 @@ actor ServerNetworkManager {
     struct ToolEventObserver: @unchecked Sendable {
         let onCalled: @Sendable (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?) async -> Void
         let onCompleted: (@Sendable (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?, _ resultJSON: String, _ isError: Bool) async -> Void)?
+        let observationPolicy: AgentToolTrackingObservationPolicy
         fileprivate let deliveryBarrier = ToolEventObserverDeliveryBarrier()
+
+        init(
+            onCalled: @escaping @Sendable (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?) async -> Void,
+            onCompleted: (@Sendable (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?, _ resultJSON: String, _ isError: Bool) async -> Void)? = nil,
+            observationPolicy: AgentToolTrackingObservationPolicy = .executionOnly
+        ) {
+            self.onCalled = onCalled
+            self.onCompleted = onCompleted
+            self.observationPolicy = observationPolicy
+        }
     }
 
     private var toolEventObservers: [UUID: [UUID: ToolEventObserver]] = [:]
@@ -3853,7 +3864,13 @@ actor ServerNetworkManager {
     /// Notify observers when a tool is called (with args).
     /// Deliver synchronously to preserve ordering with completion callbacks in the same turn.
     @discardableResult
-    func fireToolCalledObservers(runID: UUID, invocationID: UUID, toolName: String, args: [String: Value]?) async -> Int {
+    func fireToolCalledObservers(
+        runID: UUID,
+        invocationID: UUID,
+        toolName: String,
+        args: [String: Value]?,
+        isPreExecutionDenial: Bool = false
+    ) async -> Int {
         guard let observers = toolEventObservers[runID], !observers.isEmpty else {
             if MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(toolName) {
                 mcpToolTrackingDiagnostic(
@@ -3863,7 +3880,10 @@ actor ServerNetworkManager {
             }
             return 0
         }
-        let observerEntries = Array(observers)
+        let observerEntries = observers.filter { entry in
+            !isPreExecutionDenial || entry.value.observationPolicy.observesPreExecutionDenials
+        }
+        guard !observerEntries.isEmpty else { return 0 }
         observerEntries.forEach { $0.value.deliveryBarrier.beginDeliveries() }
         defer { observerEntries.forEach { $0.value.deliveryBarrier.endDelivery() } }
         #if DEBUG
@@ -3912,14 +3932,22 @@ actor ServerNetworkManager {
                 await observer.onCalled(invocationID, toolName, args)
             #endif
         }
-        connectionLog("Tool called observers fired for runID \(runID) tool \(toolName) count \(observers.count)")
-        return observers.count
+        connectionLog("Tool called observers fired for runID \(runID) tool \(toolName) count \(observerEntries.count)")
+        return observerEntries.count
     }
 
     /// Notify observers when a tool completes (with result).
     /// Deliver synchronously so tool cards can finalize before run-end fallback logic executes.
     @discardableResult
-    func fireToolCompletedObservers(runID: UUID, invocationID: UUID, toolName: String, args: [String: Value]?, resultJSON: String, isError: Bool) async -> Int {
+    func fireToolCompletedObservers(
+        runID: UUID,
+        invocationID: UUID,
+        toolName: String,
+        args: [String: Value]?,
+        resultJSON: String,
+        isError: Bool,
+        isPreExecutionDenial: Bool = false
+    ) async -> Int {
         guard let observers = toolEventObservers[runID], !observers.isEmpty else {
             if MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(toolName) {
                 mcpToolTrackingDiagnostic(
@@ -3929,7 +3957,10 @@ actor ServerNetworkManager {
             }
             return 0
         }
-        let observerEntries = Array(observers)
+        let observerEntries = observers.filter { entry in
+            !isPreExecutionDenial || entry.value.observationPolicy.observesPreExecutionDenials
+        }
+        guard !observerEntries.isEmpty else { return 0 }
         observerEntries.forEach { $0.value.deliveryBarrier.beginDeliveries() }
         defer { observerEntries.forEach { $0.value.deliveryBarrier.endDelivery() } }
         #if DEBUG
@@ -3981,6 +4012,93 @@ actor ServerNetworkManager {
         }
         connectionLog("Tool completed observers fired for runID \(runID) tool \(toolName) count \(firedCount)")
         return firedCount
+    }
+
+    /// Deliver a pre-execution denial as one indivisible observer pair. Eligible observers
+    /// are snapshotted once, and their barriers are leased before the first suspension so
+    /// unregistration cannot split `onCalled` from `onCompleted`.
+    @discardableResult
+    private func fireDeniedToolCallObservers(
+        runID: UUID,
+        invocationID: UUID,
+        toolName: String,
+        args: [String: Value]?,
+        resultJSON: String
+    ) async -> Int {
+        guard let observers = toolEventObservers[runID], !observers.isEmpty else { return 0 }
+        let observerEntries = observers.filter { entry in
+            entry.value.observationPolicy.observesPreExecutionDenials
+                && entry.value.onCompleted != nil
+        }
+        guard !observerEntries.isEmpty else { return 0 }
+        observerEntries.forEach { $0.value.deliveryBarrier.beginDeliveries() }
+        defer { observerEntries.forEach { $0.value.deliveryBarrier.endDelivery() } }
+        #if DEBUG
+            await debugBeforeToolEventObserverDeliveryForTesting?()
+        #endif
+        for (_, observer) in observerEntries {
+            await observer.onCalled(invocationID, toolName, args)
+            await observer.onCompleted?(invocationID, toolName, args, resultJSON, true)
+        }
+        connectionLog(
+            "Denied tool observer pairs fired for runID \(runID) tool \(toolName) count \(observerEntries.count)"
+        )
+        return observerEntries.count
+    }
+
+    // `toolErrorResult` inventory (T1): all attributable direct returns before the normal
+    // call observer are funneled here. Exclusions are: server-deallocated/pre-identity returns;
+    // DEBUG diagnostics (not Agent Mode tool dispatch); the synchronous limiter-cancellation
+    // fallback (no async attribution point); tool-card ownership conflict (after admission and
+    // ledger acquisition, therefore not a pre-execution policy denial); and all handler/contract
+    // results after `fireToolCalledObservers`, which already complete through the execution path.
+
+    /// Observationally reports an attributable call rejected before dispatch, then returns
+    /// the already-built MCP result unchanged. This path never acquires execution-resource
+    /// or tool-card ownership leases and cannot alter the policy decision.
+    private func denyToolCall(
+        connectionID: UUID,
+        invocationID: UUID,
+        toolName: String,
+        args: [String: Value]?,
+        code: String,
+        message: String,
+        result: CallTool.Result
+    ) async -> CallTool.Result {
+        guard let runID = await runIDForConnection(connectionID) else { return result }
+        return await denyToolCall(
+            runID: runID,
+            invocationID: invocationID,
+            toolName: toolName,
+            args: args,
+            code: code,
+            message: message,
+            result: result
+        )
+    }
+
+    private func denyToolCall(
+        runID: UUID,
+        invocationID: UUID,
+        toolName: String,
+        args: [String: Value]?,
+        code: String,
+        message: String,
+        result: CallTool.Result
+    ) async -> CallTool.Result {
+        let errorJSON = ToolOutputFormatter.rawJSONString(.object([
+            "code": .string(code),
+            "error": .string(message),
+            "tool": .string(toolName)
+        ]))
+        _ = await fireDeniedToolCallObservers(
+            runID: runID,
+            invocationID: invocationID,
+            toolName: toolName,
+            args: args,
+            resultJSON: errorJSON
+        )
+        return result
     }
 
     #if DEBUG
@@ -9910,18 +10028,40 @@ actor ServerNetworkManager {
             debugBeforeToolEventObserverDeliveryForTesting = handler
         }
 
+        func debugDenyToolCallForTesting(
+            runID: UUID,
+            invocationID: UUID,
+            toolName: String,
+            args: [String: Value]? = nil,
+            code: String,
+            message: String,
+            result: CallTool.Result
+        ) async -> CallTool.Result {
+            await denyToolCall(
+                runID: runID,
+                invocationID: invocationID,
+                toolName: toolName,
+                args: args,
+                code: code,
+                message: message,
+                result: result
+            )
+        }
+
         @discardableResult
         func debugFireToolCalledObservers(
             runID: UUID,
             invocationID: UUID,
             toolName: String,
-            args: [String: Value]? = nil
+            args: [String: Value]? = nil,
+            isPreExecutionDenial: Bool = false
         ) async -> Int {
             await fireToolCalledObservers(
                 runID: runID,
                 invocationID: invocationID,
                 toolName: toolName,
-                args: args
+                args: args,
+                isPreExecutionDenial: isPreExecutionDenial
             )
         }
 
@@ -9932,7 +10072,8 @@ actor ServerNetworkManager {
             toolName: String,
             args: [String: Value]? = nil,
             resultJSON: String,
-            isError: Bool
+            isError: Bool,
+            isPreExecutionDenial: Bool = false
         ) async -> Int {
             await fireToolCompletedObservers(
                 runID: runID,
@@ -9940,7 +10081,8 @@ actor ServerNetworkManager {
                 toolName: toolName,
                 args: args,
                 resultJSON: resultJSON,
-                isError: isError
+                isError: isError,
+                isPreExecutionDenial: isPreExecutionDenial
             )
         }
 
@@ -11355,6 +11497,7 @@ actor ServerNetworkManager {
 
             let originalName = params.name
             let toolName = Self.canonicalToolName(for: originalName)
+            let prePolicyInvocationID = UUID()
             #if DEBUG
                 let qualificationCanonicalToolName = Self.qualificationCanonicalToolName(for: originalName)
                 let qualificationRawIngressLease = debugQualificationRawIngress.begin(
@@ -11379,15 +11522,32 @@ actor ServerNetworkManager {
                 forCanonicalToolName: toolName,
                 allowedToolsOverride: earlyPolicy.allowedToolsOverride
             ) {
-                return CallTool.Result.err(denialMessage)
+                let result = CallTool.Result.err(denialMessage)
+                return await denyToolCall(
+                    connectionID: connectionID,
+                    invocationID: prePolicyInvocationID,
+                    toolName: toolName,
+                    args: params.arguments,
+                    code: "profile_tool_not_allowed",
+                    message: denialMessage,
+                    result: result
+                )
             }
             if earlyPolicy.allowedToolsOverride != nil {
                 let disabledTools = await MainActor.run {
                     ToolAvailabilityStore.shared.effectiveDisabledTools
                 }
                 guard !disabledTools.contains(toolName) else {
-                    return CallTool.Result.err(
-                        "Tool '\(toolName)' is disabled in global MCP settings."
+                    let message = "Tool '\(toolName)' is disabled in global MCP settings."
+                    let result = CallTool.Result.err(message)
+                    return await denyToolCall(
+                        connectionID: connectionID,
+                        invocationID: prePolicyInvocationID,
+                        toolName: toolName,
+                        args: params.arguments,
+                        code: "global_tool_disabled",
+                        message: message,
+                        result: result
                     )
                 }
             }
@@ -11442,7 +11602,7 @@ actor ServerNetworkManager {
                     appInvocationID: inheritedRequestIdentity?.appInvocationID,
                     requestOrdinal: inheritedRequestIdentity?.requestOrdinal
                 )
-                let invocationID = requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? UUID()
+                let invocationID = requestIdentity.appInvocationID.flatMap { UUID(uuidString: $0) } ?? prePolicyInvocationID
                 let resolvedRequestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineIdentity(
                     jsonRPCRequestID: requestIdentity.jsonRPCRequestID,
                     connectionID: requestIdentity.connectionID,
@@ -11469,7 +11629,7 @@ actor ServerNetworkManager {
                     ))
                 }
             #else
-                let invocationID = UUID()
+                let invocationID = prePolicyInvocationID
                 let resolvedRequestIdentity: MCPRequestTimelineIdentity? = nil
                 let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
             #endif
@@ -11563,16 +11723,33 @@ actor ServerNetworkManager {
                     } catch {
                         let routePolicy = await effectivePolicyState(for: connectionID)
                         if routePolicy.purpose == .agentModeRun || routePolicy.restricted.contains("bind_context") {
-                            return Self.toolErrorResult(
-                                rawJSON: capturedRawJSON,
-                                message: "Unable to resolve the requested RepoPrompt context for this restricted connection. " +
-                                    Self.multiWindowSelectionGuidance(
-                                        purpose: routePolicy.purpose,
-                                        restrictedTools: routePolicy.restricted
-                                    )
+                            let message = "Unable to resolve the requested RepoPrompt context for this restricted connection. " +
+                                Self.multiWindowSelectionGuidance(
+                                    purpose: routePolicy.purpose,
+                                    restrictedTools: routePolicy.restricted
+                                )
+                            let result = Self.toolErrorResult(rawJSON: capturedRawJSON, message: message)
+                            return await denyToolCall(
+                                connectionID: connectionID,
+                                invocationID: invocationID,
+                                toolName: toolName,
+                                args: cleanedArguments,
+                                code: "context_resolution_failed",
+                                message: message,
+                                result: result
                             )
                         }
-                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: error.localizedDescription)
+                        let message = error.localizedDescription
+                        let result = Self.toolErrorResult(rawJSON: capturedRawJSON, message: message)
+                        return await denyToolCall(
+                            connectionID: connectionID,
+                            invocationID: invocationID,
+                            toolName: toolName,
+                            args: cleanedArguments,
+                            code: "context_resolution_failed",
+                            message: message,
+                            result: result
+                        )
                     }
                 }
             }
@@ -11597,7 +11774,17 @@ actor ServerNetworkManager {
                                 "reason": "missing_additional_tool_grant"
                             ])
                         #endif
-                        return CallTool.Result.err("Tool '\(toolName)' is only available during discovery or agent mode runs.")
+                        let message = "Tool '\(toolName)' is only available during discovery or agent mode runs."
+                        let result = CallTool.Result.err(message)
+                        return await denyToolCall(
+                            connectionID: connectionID,
+                            invocationID: invocationID,
+                            toolName: toolName,
+                            args: cleanedArguments,
+                            code: "missing_additional_tool_grant",
+                            message: message,
+                            result: result
+                        )
                     }
                 }
             }
@@ -11652,7 +11839,17 @@ actor ServerNetworkManager {
                 defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.policyGating, policyState) }
                 if policy.restricted.contains(toolName) {
                     log.notice("Connection \(connectionID) attempted to call restricted tool \(toolName)")
-                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool '\(toolName)' is disabled for this connection.")
+                    let message = "Tool '\(toolName)' is disabled for this connection."
+                    let result = Self.toolErrorResult(rawJSON: capturedRawJSON, message: message)
+                    return await denyToolCall(
+                        connectionID: connectionID,
+                        invocationID: invocationID,
+                        toolName: toolName,
+                        args: dispatchArguments,
+                        code: "policy_restricted",
+                        message: message,
+                        result: result
+                    )
                 }
                 if MCPToolCapabilities.capabilities(for: toolName).contains(.agentExploreControl),
                    !AgentModeMCPToolAdvertisementPolicy.shouldAdvertise(
@@ -11661,9 +11858,16 @@ actor ServerNetworkManager {
                        allowsAgentExternalControlTools: policy.allowsAgentExternalControlTools
                    )
                 {
-                    return Self.toolErrorResult(
-                        rawJSON: capturedRawJSON,
-                        message: "Tool 'agent_explore' is only available to MCP-started non-explore Agent Mode runs."
+                    let message = "Tool 'agent_explore' is only available to MCP-started non-explore Agent Mode runs."
+                    let result = Self.toolErrorResult(rawJSON: capturedRawJSON, message: message)
+                    return await denyToolCall(
+                        connectionID: connectionID,
+                        invocationID: invocationID,
+                        toolName: toolName,
+                        args: dispatchArguments,
+                        code: "agent_explore_control_denied",
+                        message: message,
+                        result: result
                     )
                 }
             }
@@ -11707,10 +11911,17 @@ actor ServerNetworkManager {
             // Connection lanes provide bounded FIFO admission only. Shared-state correctness is
             // enforced below by explicit window/app/repository resource ownership.
             guard let admissionClass = Self.admissionClass(forCanonicalToolName: toolName) else {
-                return Self.executionContractToolErrorResult(
-                    rawJSON: capturedRawJSON,
-                    code: "tool_execution_admission_unclassified",
-                    message: "No static admission classification exists for tool '\(toolName)'."
+                let code = "tool_execution_admission_unclassified"
+                let message = "No static admission classification exists for tool '\(toolName)'."
+                let result = Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
+                return await denyToolCall(
+                    connectionID: connectionID,
+                    invocationID: invocationID,
+                    toolName: toolName,
+                    args: capturedArguments,
+                    code: code,
+                    message: message,
+                    result: result
                 )
             }
             let callLane = admissionClass.connectionLane
@@ -11724,10 +11935,17 @@ actor ServerNetworkManager {
             endPreLimiterEnvelopeIfNeeded()
             guard let limiterResolution else {
                 connectionLog("tools/call \(toolName): rejected because connection limiter is unavailable")
-                return Self.executionContractToolErrorResult(
-                    rawJSON: capturedRawJSON,
-                    code: "tool_execution_connection_terminal",
-                    message: "The MCP connection is closing."
+                let code = "tool_execution_connection_terminal"
+                let message = "The MCP connection is closing."
+                let result = Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
+                return await denyToolCall(
+                    connectionID: connectionID,
+                    invocationID: invocationID,
+                    toolName: toolName,
+                    args: capturedArguments,
+                    code: code,
+                    message: message,
+                    result: result
                 )
             }
             connectionLog("tools/call \(toolName): entering limiter lane=\(callLane.rawValue)")
@@ -11763,10 +11981,17 @@ actor ServerNetworkManager {
                           await !(self.executionWatchdogTerminalConnections.contains(connectionID))
                     else {
                         connectionLog("tools/call \(toolName): rejected after limiter because connection is terminal or cancelled")
-                        return Self.executionContractToolErrorResult(
-                            rawJSON: capturedRawJSON,
-                            code: "tool_execution_connection_terminal",
-                            message: "The MCP connection was closed after an earlier tool failed to stop."
+                        let code = "tool_execution_connection_terminal"
+                        let message = "The MCP connection was closed after an earlier tool failed to stop."
+                        let result = Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
+                        return await self.denyToolCall(
+                            connectionID: connectionID,
+                            invocationID: invocationID,
+                            toolName: toolName,
+                            args: capturedArguments,
+                            code: code,
+                            message: message,
+                            result: result
                         )
                     }
                     EditFlowPerf.lifecycleEvent(
@@ -11802,7 +12027,17 @@ actor ServerNetworkManager {
                                 }
                                 guard isEnabled else {
                                     log.notice("Tool call rejected: RepoPrompt MCP is disabled")
-                                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "RepoPrompt MCP is currently disabled.")
+                                    let message = "RepoPrompt MCP is currently disabled."
+                                    let result = Self.toolErrorResult(rawJSON: capturedRawJSON, message: message)
+                                    return await self.denyToolCall(
+                                        connectionID: connectionID,
+                                        invocationID: invocationID,
+                                        toolName: toolName,
+                                        args: capturedArguments,
+                                        code: "mcp_disabled",
+                                        message: message,
+                                        result: result
+                                    )
                                 }
 
                                 // ────────────────────────────────────────────────────────
@@ -11839,13 +12074,20 @@ actor ServerNetworkManager {
                                     if !bypassWindowRouting, let requestedWindowID = capturedWindowID {
                                         let windowValid = await WindowStatesManager.shared.hasWindowWithMCPEnabled(requestedWindowID)
                                         guard windowValid else {
-                                            return Self.toolErrorResult(
-                                                rawJSON: capturedRawJSON,
-                                                message: Self.invalidWindowSelectionGuidance(
-                                                    windowID: requestedWindowID,
-                                                    purpose: policy.purpose,
-                                                    restrictedTools: policy.restricted
-                                                )
+                                            let message = Self.invalidWindowSelectionGuidance(
+                                                windowID: requestedWindowID,
+                                                purpose: policy.purpose,
+                                                restrictedTools: policy.restricted
+                                            )
+                                            let result = Self.toolErrorResult(rawJSON: capturedRawJSON, message: message)
+                                            return await self.denyToolCall(
+                                                connectionID: connectionID,
+                                                invocationID: invocationID,
+                                                toolName: toolName,
+                                                args: capturedArguments,
+                                                code: "invalid_window_selection",
+                                                message: message,
+                                                result: result
                                             )
                                         }
 
@@ -11953,12 +12195,19 @@ actor ServerNetworkManager {
                                        chosenID == nil,
                                        !Self.isWindowSelectionExempt(toolName: toolName, args: capturedArguments)
                                     {
-                                        return Self.toolErrorResult(
-                                            rawJSON: capturedRawJSON,
-                                            message: Self.multiWindowSelectionGuidance(
-                                                purpose: policy.purpose,
-                                                restrictedTools: policy.restricted
-                                            )
+                                        let message = Self.multiWindowSelectionGuidance(
+                                            purpose: policy.purpose,
+                                            restrictedTools: policy.restricted
+                                        )
+                                        let result = Self.toolErrorResult(rawJSON: capturedRawJSON, message: message)
+                                        return await self.denyToolCall(
+                                            connectionID: connectionID,
+                                            invocationID: invocationID,
+                                            toolName: toolName,
+                                            args: capturedArguments,
+                                            code: "window_selection_required",
+                                            message: message,
+                                            result: result
                                         )
                                     }
 
@@ -11982,19 +12231,33 @@ actor ServerNetworkManager {
                                     } else if let chosenID {
                                         mutationResource = .window(chosenID)
                                     } else {
-                                        return Self.executionContractToolErrorResult(
-                                            rawJSON: capturedRawJSON,
-                                            code: "tool_execution_mutation_resource_unresolved",
-                                            message: "The exclusive tool '\(toolName)' has no resolved window resource."
+                                        let code = "tool_execution_mutation_resource_unresolved"
+                                        let message = "The exclusive tool '\(toolName)' has no resolved window resource."
+                                        let result = Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
+                                        return await self.denyToolCall(
+                                            connectionID: connectionID,
+                                            invocationID: invocationID,
+                                            toolName: toolName,
+                                            args: capturedArguments,
+                                            code: code,
+                                            message: message,
+                                            result: result
                                         )
                                     }
                                     do {
                                         mutationAdmissionLease = try await self.mutationAdmissionController.acquire(mutationResource)
                                     } catch {
-                                        return Self.executionContractToolErrorResult(
-                                            rawJSON: capturedRawJSON,
-                                            code: "tool_execution_connection_terminal",
-                                            message: "The MCP connection closed while waiting for exclusive resource admission."
+                                        let code = "tool_execution_connection_terminal"
+                                        let message = "The MCP connection closed while waiting for exclusive resource admission."
+                                        let result = Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
+                                        return await self.denyToolCall(
+                                            connectionID: connectionID,
+                                            invocationID: invocationID,
+                                            toolName: toolName,
+                                            args: capturedArguments,
+                                            code: code,
+                                            message: message,
+                                            result: result
                                         )
                                     }
                                 } else {
@@ -12005,19 +12268,33 @@ actor ServerNetworkManager {
                                 let smallReadAdmissionLease: MCPToolResourceAdmissionController.Lease?
                                 if admissionClass == .smallRead {
                                     guard let chosenID else {
-                                        return Self.executionContractToolErrorResult(
-                                            rawJSON: capturedRawJSON,
-                                            code: "tool_execution_read_resource_unresolved",
-                                            message: "The small-read tool '\(toolName)' has no resolved window/store resource."
+                                        let code = "tool_execution_read_resource_unresolved"
+                                        let message = "The small-read tool '\(toolName)' has no resolved window/store resource."
+                                        let result = Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
+                                        return await self.denyToolCall(
+                                            connectionID: connectionID,
+                                            invocationID: invocationID,
+                                            toolName: toolName,
+                                            args: capturedArguments,
+                                            code: code,
+                                            message: message,
+                                            result: result
                                         )
                                     }
                                     do {
                                         smallReadAdmissionLease = try await self.smallReadAdmissionController.acquire(.window(chosenID))
                                     } catch {
-                                        return Self.executionContractToolErrorResult(
-                                            rawJSON: capturedRawJSON,
-                                            code: "tool_execution_connection_terminal",
-                                            message: "The MCP connection closed while waiting for window/store read admission."
+                                        let code = "tool_execution_connection_terminal"
+                                        let message = "The MCP connection closed while waiting for window/store read admission."
+                                        let result = Self.executionContractToolErrorResult(rawJSON: capturedRawJSON, code: code, message: message)
+                                        return await self.denyToolCall(
+                                            connectionID: connectionID,
+                                            invocationID: invocationID,
+                                            toolName: toolName,
+                                            args: capturedArguments,
+                                            code: code,
+                                            message: message,
+                                            result: result
                                         )
                                     }
                                 } else {

@@ -5,6 +5,179 @@
     import XCTest
 
     final class AgentToolTrackingControllerTests: XCTestCase {
+        func testPreExecutionDenialsAreOMPOptInAndZeroForCursorOpenCodeClaude() async {
+            let manager = ServerNetworkManager.shared
+            for provider in ["Cursor", "OpenCode", "Claude"] {
+                let controller = AgentToolTrackingController()
+                let recorder = LockedEventRecorder()
+                let runID = UUID()
+                await controller.startTracking(
+                    runID: runID,
+                    clientNameHint: nil,
+                    onCalled: { _, _, _ in recorder.append("\(provider)-call") },
+                    onCompleted: { _, _, _, _, _ in recorder.append("\(provider)-completion") }
+                )
+                _ = await manager.debugFireToolCalledObservers(
+                    runID: runID,
+                    invocationID: UUID(),
+                    toolName: "read_file",
+                    isPreExecutionDenial: true
+                )
+                _ = await manager.debugFireToolCompletedObservers(
+                    runID: runID,
+                    invocationID: UUID(),
+                    toolName: "read_file",
+                    resultJSON: #"{"code":"policy_restricted"}"#,
+                    isError: true,
+                    isPreExecutionDenial: true
+                )
+                await controller.waitForPendingEventDeliveriesForTesting()
+                XCTAssertTrue(recorder.snapshot().isEmpty, provider)
+                await controller.stopTracking()
+            }
+
+            let ompController = AgentToolTrackingController()
+            let ompRecorder = LockedEventRecorder()
+            let ompRunID = UUID()
+            let invocationID = UUID()
+            await ompController.startTracking(
+                runID: ompRunID,
+                clientNameHint: nil,
+                observationPolicy: .executionAndPreExecutionDenials,
+                onCalled: { observedID, _, _ in ompRecorder.append("call:\(observedID)") },
+                onCompleted: { observedID, _, _, _, isError in
+                    ompRecorder.append("completion:\(observedID):\(isError)")
+                }
+            )
+            let calledCount = await manager.debugFireToolCalledObservers(
+                runID: ompRunID,
+                invocationID: invocationID,
+                toolName: "read_file",
+                isPreExecutionDenial: true
+            )
+            let completedCount = await manager.debugFireToolCompletedObservers(
+                runID: ompRunID,
+                invocationID: invocationID,
+                toolName: "read_file",
+                resultJSON: #"{"code":"policy_restricted"}"#,
+                isError: true,
+                isPreExecutionDenial: true
+            )
+            await ompController.waitForPendingEventDeliveriesForTesting()
+            XCTAssertEqual(calledCount, 1)
+            XCTAssertEqual(completedCount, 1)
+            XCTAssertEqual(ompRecorder.snapshot(), [
+                "call:\(invocationID)",
+                "completion:\(invocationID):true"
+            ])
+            await ompController.stopTracking()
+        }
+
+        func testDeniedCallFunnelPreservesPayloadIdentityAndNeverExecutesTool() async {
+            let manager = ServerNetworkManager.shared
+            let controller = AgentToolTrackingController()
+            let recorder = LockedEventRecorder()
+            let runID = UUID()
+            let invocationID = UUID()
+            let toolExecutionCount = 0
+            await controller.startTracking(
+                runID: runID,
+                clientNameHint: nil,
+                observationPolicy: .executionAndPreExecutionDenials,
+                onCalled: { observedID, toolName, _ in
+                    recorder.append("call:\(observedID):\(toolName)")
+                },
+                onCompleted: { observedID, toolName, _, resultJSON, isError in
+                    recorder.append("completion:\(observedID):\(toolName):\(isError):\(resultJSON)")
+                }
+            )
+
+            let message = "Tool 'read_file' is disabled for this connection."
+            let original = ServerNetworkManager.toolErrorResult(rawJSON: true, message: message)
+            let returned = await manager.debugDenyToolCallForTesting(
+                runID: runID,
+                invocationID: invocationID,
+                toolName: "read_file",
+                args: ["path": .string("/tmp/denied")],
+                code: "policy_restricted",
+                message: message,
+                result: original
+            )
+            // The denied path has no dispatch callback; this counter represents the tool body.
+            XCTAssertEqual(toolExecutionCount, 0)
+            let originalText = original.content.compactMap { content -> String? in
+                if case let .text(text, _, _) = content { return text }
+                return nil
+            }
+            let returnedText = returned.content.compactMap { content -> String? in
+                if case let .text(text, _, _) = content { return text }
+                return nil
+            }
+            XCTAssertEqual(returnedText, originalText)
+            XCTAssertEqual(returned.isError, original.isError)
+            await controller.waitForPendingEventDeliveriesForTesting()
+            XCTAssertEqual(recorder.snapshot().count, 2)
+            XCTAssertTrue(recorder.snapshot()[0].hasPrefix("call:\(invocationID):read_file"))
+            XCTAssertTrue(recorder.snapshot()[1].contains("completion:\(invocationID):read_file:true"))
+            XCTAssertTrue(recorder.snapshot()[1].contains("policy_restricted"))
+            await controller.stopTracking()
+        }
+
+        func testDeniedCallPairSurvivesConcurrentObserverTeardown() async {
+            let manager = ServerNetworkManager.shared
+            let controller = AgentToolTrackingController()
+            let recorder = LockedEventRecorder()
+            let deliveryGate = AsyncDeliveryGate()
+            let runID = UUID()
+            let invocationID = UUID()
+
+            await controller.startTracking(
+                runID: runID,
+                clientNameHint: nil,
+                observationPolicy: .executionAndPreExecutionDenials,
+                onCalled: { _, _, _ in recorder.append("call") },
+                onCompleted: { _, _, _, _, _ in recorder.append("completion") }
+            )
+            await manager.debugSetBeforeToolEventObserverDeliveryForTesting {
+                await deliveryGate.pause()
+            }
+            addTeardownBlock {
+                await deliveryGate.release()
+                await manager.debugSetBeforeToolEventObserverDeliveryForTesting(nil)
+                await controller.stopTracking()
+                await manager.unregisterToolObservers(for: runID)
+            }
+
+            let original = ServerNetworkManager.toolErrorResult(rawJSON: true, message: "denied")
+            let denialTask = Task {
+                await manager.debugDenyToolCallForTesting(
+                    runID: runID,
+                    invocationID: invocationID,
+                    toolName: "read_file",
+                    args: nil,
+                    code: "policy_restricted",
+                    message: "denied",
+                    result: original
+                )
+            }
+            await deliveryGate.waitUntilPaused()
+
+            let stopTask = Task { @MainActor in
+                await controller.stopTracking()
+                recorder.append("stopped")
+            }
+            let observerWasRemoved = await waitForToolObserverCount(0, for: runID, manager: manager)
+            XCTAssertTrue(observerWasRemoved)
+            XCTAssertTrue(recorder.snapshot().isEmpty)
+
+            await deliveryGate.release()
+            _ = await denialTask.value
+            await stopTask.value
+            await manager.debugSetBeforeToolEventObserverDeliveryForTesting(nil)
+            await controller.waitForPendingEventDeliveriesForTesting()
+            XCTAssertEqual(recorder.snapshot(), ["call", "completion", "stopped"])
+        }
+
         func testToolObserverCallbacksReturnBeforeFIFOTranscriptDeliveryCompletes() async {
             let manager = ServerNetworkManager.shared
             let controller = AgentToolTrackingController()

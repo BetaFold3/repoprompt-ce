@@ -10,7 +10,7 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
     typealias RoutingOutcomeWaiter = @Sendable (UUID, TimeInterval) async -> MCPRoutingWaiter.WaitOutcome
     typealias LiveRouteVerifier = @Sendable (UUID) async -> Bool
     typealias RouteCheck = @Sendable (UUID) async -> Bool
-    typealias ModelSetter = @Sendable (String) async throws -> Void
+    typealias SelectionSetter = @Sendable (String, [ACPConfigOptionAssignment]) async throws -> Void
 
     private let config: OhMyPiAgentConfig
     private let bridge: ACPHeadlessAgentProviderBridge
@@ -53,8 +53,11 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
                 try await Self.prepareForPrompt(
                     config: config,
                     runID: runID,
-                    setModel: { model in
-                        try await controller.setSessionModel(model)
+                    setSelection: { model, additionalOptions in
+                        try await controller.setSessionSelection(
+                            model: model,
+                            additionalOptions: additionalOptions
+                        )
                     },
                     routeCheck: routeCheck
                 )
@@ -85,18 +88,23 @@ final class OhMyPiACPHeadlessAgentProvider: HeadlessAgentProvider {
             workspacePath: workspacePath,
             resumeSessionID: message.resumeSessionID,
             attachments: [],
-            taskLabelKind: nil
+            taskLabelKind: nil,
+            additionalConfigOptionValues: config.additionalConfigOptionValues
         )
     }
 
     static func prepareForPrompt(
         config: OhMyPiAgentConfig,
         runID: UUID,
-        setModel: @escaping ModelSetter,
+        setSelection: @escaping SelectionSetter,
         routeCheck: @escaping RouteCheck
     ) async throws {
         if let model = selectedModelToApply(config: config) {
-            try await setModel(model)
+            try await setSelection(model, config.additionalConfigOptionValues)
+        } else if !config.additionalConfigOptionValues.isEmpty {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Internal configuration error: Oh My Pi thinking requires an explicit available model."
+            )
         }
         guard config.includeRepoPromptMCPServer else { return }
         let routed = await routeCheck(runID)

@@ -43,8 +43,9 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             guard !isReloadingScopedState, oldValue != syncChatWithOracle else { return }
             updateSelectedProfile(reason: "agent_models.sync_toggle") { profile in
                 profile.syncChatModelWithOracle = syncChatWithOracle
-                if syncChatWithOracle, profile.preferredComposeModelRaw != profile.planningModelRaw {
+                if syncChatWithOracle {
                     profile.preferredComposeModelRaw = profile.planningModelRaw
+                    profile.preferredComposeOhMyPiThinkingSelections = profile.planningModelOhMyPiThinkingSelections
                 }
             }
         }

@@ -242,6 +242,8 @@ struct GlobalDefaults: Codable, Equatable {
     var discoverAgentRaw: String?
     /// Maps agent rawValue to last-used model rawValue for that agent (global)
     var discoverModelsByAgent: [String: String]?
+    /// Destination-owned OMP thinking map for the Context Builder selection.
+    var contextBuilderOhMyPiThinkingSelections: OhMyPiThinkingSelections?
     var discoveryTokenBudget: Int?
     var discoveryEnhancementMode: String?
     /// Former preferred context-builder agent retained for decoding compatibility.
@@ -461,8 +463,11 @@ class GlobalSettingsStore: ObservableObject {
         AgentModelsSettingsProfile(
             planningModelRaw: scalarPreferences.modelSelection?.planningModel,
             preferredComposeModelRaw: scalarPreferences.modelSelection?.preferredComposeModel,
+            planningModelOhMyPiThinkingSelections: scalarPreferences.modelSelection?.planningModelOhMyPiThinkingSelections ?? .empty,
+            preferredComposeOhMyPiThinkingSelections: scalarPreferences.modelSelection?.preferredComposeOhMyPiThinkingSelections ?? .empty,
             syncChatModelWithOracle: resolvedSyncChatModelWithOracleFromCurrentPreferences(),
             contextBuilderAgentRaw: globalDefaults.discoverAgentRaw,
+            contextBuilderOhMyPiThinkingSelections: globalDefaults.contextBuilderOhMyPiThinkingSelections ?? .empty,
             contextBuilderModelsByAgent: globalDefaults.discoverModelsByAgent,
             mcpAgentRoleOverrides: globalDefaults.mcpAgentRoleOverrides,
             restrictMCPAgentDiscoveryToRoleLabels: restrictMCPAgentDiscoveryToRoleLabels()
@@ -478,6 +483,8 @@ class GlobalSettingsStore: ObservableObject {
         var modelSelection = scalarPreferences.modelSelection ?? GlobalScalarPreferences.ModelSelectionSettings()
         modelSelection.planningModel = normalized.planningModelRaw
         modelSelection.preferredComposeModel = normalized.preferredComposeModelRaw
+        modelSelection.planningModelOhMyPiThinkingSelections = normalized.planningModelOhMyPiThinkingSelections.nilIfEmpty
+        modelSelection.preferredComposeOhMyPiThinkingSelections = normalized.preferredComposeOhMyPiThinkingSelections.nilIfEmpty
         modelSelection.syncChatModelWithOracle = normalized.syncChatModelWithOracle
         scalarPreferences.modelSelection = modelSelection
 
@@ -487,6 +494,7 @@ class GlobalSettingsStore: ObservableObject {
 
         globalDefaults.discoverAgentRaw = normalized.contextBuilderAgentRaw
         globalDefaults.discoverModelsByAgent = normalized.contextBuilderModelsByAgent
+        globalDefaults.contextBuilderOhMyPiThinkingSelections = normalized.contextBuilderOhMyPiThinkingSelections.nilIfEmpty
         globalDefaults.mcpAgentRoleOverrides = normalized.mcpAgentRoleOverrides
         switch contextBuilderWriteIntent {
         case .preserveExistingOwnership:
@@ -1008,6 +1016,7 @@ class GlobalSettingsStore: ObservableObject {
             settings.preferredComposeModel = raw
             if shouldMirrorModel {
                 settings.planningModel = raw
+                settings.planningModelOhMyPiThinkingSelections = settings.preferredComposeOhMyPiThinkingSelections
             }
         }
         recordSettingsWriteDiagnostic(
@@ -1058,6 +1067,7 @@ class GlobalSettingsStore: ObservableObject {
             settings.planningModel = raw
             if shouldMirror {
                 settings.preferredComposeModel = raw
+                settings.preferredComposeOhMyPiThinkingSelections = settings.planningModelOhMyPiThinkingSelections
             }
         }
         recordSettingsWriteDiagnostic(
@@ -1107,8 +1117,11 @@ class GlobalSettingsStore: ObservableObject {
         let shouldSnap = enabled && snapOnEnableToPlanning && !planning.isEmpty && planning != oldPreferred
         updateModelSelectionScalar(commit: commit) { settings in
             settings.syncChatModelWithOracle = enabled
-            if shouldSnap {
-                settings.preferredComposeModel = planning
+            if enabled, snapOnEnableToPlanning, !planning.isEmpty {
+                if shouldSnap {
+                    settings.preferredComposeModel = planning
+                }
+                settings.preferredComposeOhMyPiThinkingSelections = settings.planningModelOhMyPiThinkingSelections
             }
         }
         recordSettingsWriteDiagnostic(
@@ -2135,8 +2148,11 @@ class GlobalSettingsStore: ObservableObject {
         AgentModelsSettingsProfile(
             planningModelRaw: profile.planningModelRaw,
             preferredComposeModelRaw: profile.preferredComposeModelRaw,
+            planningModelOhMyPiThinkingSelections: profile.planningModelOhMyPiThinkingSelections,
+            preferredComposeOhMyPiThinkingSelections: profile.preferredComposeOhMyPiThinkingSelections,
             syncChatModelWithOracle: profile.syncChatModelWithOracle,
             contextBuilderAgentRaw: profile.contextBuilderAgentRaw,
+            contextBuilderOhMyPiThinkingSelections: profile.contextBuilderOhMyPiThinkingSelections,
             contextBuilderModelsByAgent: profile.contextBuilderModelsByAgent,
             mcpAgentRoleOverrides: profile.mcpAgentRoleOverrides,
             restrictMCPAgentDiscoveryToRoleLabels: profile.restrictMCPAgentDiscoveryToRoleLabels

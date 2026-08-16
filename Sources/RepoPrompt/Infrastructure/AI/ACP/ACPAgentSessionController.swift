@@ -1,6 +1,11 @@
 import Darwin
 import Foundation
 
+enum ACPDynamicModelPublicationPolicy {
+    case standard
+    case capabilityOnly
+}
+
 actor ACPAgentSessionController {
     struct RequestTimeouts {
         let bootstrapSeconds: TimeInterval
@@ -195,7 +200,15 @@ actor ACPAgentSessionController {
         case malformed(String)
     }
 
-    private struct CursorParameterRollback {
+    private struct AuxiliarySelectorSnapshot {
+        let configID: String
+        let category: String?
+        let currentValue: String
+        let values: [String]
+        let displayNames: [String]
+    }
+
+    private struct AuxiliarySelectorRollback {
         let configID: String
         let previousValue: String
         let requestedValue: String
@@ -255,6 +268,8 @@ actor ACPAgentSessionController {
     private let logPrefix: String
     private let diagnosticSink: DiagnosticSink?
     private let requestTimeouts: RequestTimeouts
+    private let dynamicModelPublicationPolicy: ACPDynamicModelPublicationPolicy
+    private let ohMyPiThinkingCapabilityPublisher: OhMyPiThinkingCapabilityPublisher
 
     /// Modern configOptions are the only configuration authority. Mutations are serialized,
     /// and complete snapshots apply in inbound wire order.
@@ -305,7 +320,8 @@ actor ACPAgentSessionController {
     private var sessionModelFailureReason: String?
     private var sessionModeSnapshot: SessionModeSnapshot?
     private var sessionModeFailureReason: String?
-    private var cursorParameterSelectors: [String: (currentValue: String, values: [String])] = [:]
+    private var auxiliarySelectors: [String: AuxiliarySelectorSnapshot] = [:]
+    private var authoritativeConfigOptions: [[String: Any]] = []
     private var lastAppliedConfigurationSequence: UInt64 = 0
     private var bufferedConfigOptionUpdates: [BufferedConfigOptionUpdate] = []
     private var suppressSessionLoadReplayUpdates = false
@@ -321,8 +337,16 @@ actor ACPAgentSessionController {
         provider: any ACPAgentProvider,
         runRequest: ACPRunRequest,
         diagnosticSink: DiagnosticSink? = nil,
-        requestTimeouts: RequestTimeouts = .default
+        requestTimeouts: RequestTimeouts = .default,
+        dynamicModelPublicationPolicy: ACPDynamicModelPublicationPolicy = .standard,
+        ohMyPiThinkingCapabilityPublisher: @escaping OhMyPiThinkingCapabilityPublisher = {
+            _ = OhMyPiThinkingCapabilityRegistry.shared.record($0)
+        }
     ) throws {
+        try ACPConfigOptionAssignment.validate(
+            runRequest.additionalConfigOptionValues,
+            for: provider.providerID
+        )
         self.provider = provider
         providerSessionIdentity = ACPProviderSessionIdentity(
             providerID: provider.providerID,
@@ -342,6 +366,8 @@ actor ACPAgentSessionController {
         logPrefix = "[ACP][\(provider.providerID.rawValue)]"
         self.diagnosticSink = diagnosticSink
         self.requestTimeouts = requestTimeouts
+        self.dynamicModelPublicationPolicy = dynamicModelPublicationPolicy
+        self.ohMyPiThinkingCapabilityPublisher = ohMyPiThinkingCapabilityPublisher
         #if DEBUG
             rawACPCaptureURL = Self.resolveRawACPCaptureURL(for: provider.providerID)
         #endif
@@ -687,24 +713,45 @@ actor ACPAgentSessionController {
     }
 
     func setSessionModel(_ rawModel: String) async throws {
+        try await setSessionSelection(model: rawModel, additionalOptions: [])
+    }
+
+    func setSessionSelection(
+        model rawModel: String,
+        additionalOptions: [ACPConfigOptionAssignment]
+    ) async throws {
         try await configurationMutationMutex.withLock { [weak self] in
             guard let self else { throw CancellationError() }
-            try await setSessionModelSerialized(rawModel)
+            try ACPConfigOptionAssignment.validate(additionalOptions, for: provider.providerID)
+            try await setSessionSelectionSerialized(
+                model: rawModel,
+                additionalOptions: additionalOptions
+            )
         }
     }
 
-    private func setSessionModelSerialized(_ rawModel: String) async throws {
+    private func setSessionSelectionSerialized(
+        model rawModel: String,
+        additionalOptions: [ACPConfigOptionAssignment]
+    ) async throws {
         guard let sessionID else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
         let model = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !model.isEmpty, model.lowercased() != "default" else { return }
+        if model.isEmpty || model.lowercased() == "default" {
+            guard additionalOptions.isEmpty else {
+                throw ControllerError.requestFailed(
+                    "Internal configuration error: Oh My Pi thinking requires an explicit model selection."
+                )
+            }
+            return
+        }
         guard state == .sessionOpen || state == .promptRunning else {
             throw ControllerError.invalidState(expected: "sessionOpen or promptRunning", actual: state)
         }
 
         switch provider.providerID {
-        case .openCode, .ohMyPi:
+        case .openCode:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -735,6 +782,20 @@ actor ACPAgentSessionController {
                 requiredModelValue: configValue
             )
 
+        case .ohMyPi:
+            if let sessionModelFailureReason {
+                throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
+            }
+            guard let sessionModelConfigOptionID else {
+                throw ControllerError.requestFailed("ACP runtime does not advertise model switching through configOptions.")
+            }
+            try await setOhMyPiSessionSelectionSerialized(
+                model: model,
+                additionalOptions: additionalOptions,
+                sessionID: sessionID,
+                modelConfigID: sessionModelConfigOptionID
+            )
+
         case .cursor:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
@@ -753,6 +814,227 @@ actor ACPAgentSessionController {
                 modelConfigID: sessionModelConfigOptionID
             )
         }
+    }
+
+    private func setOhMyPiSessionSelectionSerialized(
+        model: String,
+        additionalOptions: [ACPConfigOptionAssignment],
+        sessionID: String,
+        modelConfigID: String
+    ) async throws {
+        guard let mappedConfigValue = sessionModelConfigValue(forSelectedModel: model) else {
+            throw ControllerError.requestFailed(
+                "ACP runtime does not advertise a safe config value for selected model '\(model)'."
+            )
+        }
+        let targetModel = try canonicalSessionModelValue(mappedConfigValue)
+        if targetModel != model {
+            log("Mapping selected model \(model) to ACP config value \(targetModel)")
+        }
+
+        let requestedThinking = additionalOptions.first {
+            $0.key == .ohMyPiThinking
+        }
+        let previousModel = discoveredSessionModels?.currentModelRaw
+        let previousThinking = try? resolvedOhMyPiThinkingSelector()
+        var targetThinkingBeforeMutation: AuxiliarySelectorSnapshot?
+        var didAttemptModelMutation = false
+        var didAttemptThinkingMutation = false
+
+        do {
+            try Task.checkCancellation()
+
+            if previousModel != targetModel {
+                didAttemptModelMutation = true
+                let response = try await sendRequestResponse(
+                    method: "session/set_config_option",
+                    params: [
+                        "sessionId": sessionID,
+                        "configId": modelConfigID,
+                        "value": targetModel
+                    ]
+                )
+                try await applyVerifiedConfigOptionsMutationResponse(
+                    response,
+                    requiredModeValue: nil,
+                    requiredModelValue: targetModel
+                )
+                try Task.checkCancellation()
+            }
+
+            guard let requestedThinking else {
+                try Task.checkCancellation()
+                return
+            }
+
+            let selector = try resolvedOhMyPiThinkingSelector()
+            targetThinkingBeforeMutation = selector
+            guard selector.values.contains(requestedThinking.value) else {
+                throw ControllerError.requestFailed(
+                    "Oh My Pi model '\(targetModel)' does not advertise thinking value '\(requestedThinking.value)'. Advertised choices: \(selector.values.joined(separator: ", "))."
+                )
+            }
+            if selector.currentValue == requestedThinking.value {
+                try Task.checkCancellation()
+                return
+            }
+
+            didAttemptThinkingMutation = true
+            let response = try await sendRequestResponse(
+                method: "session/set_config_option",
+                params: [
+                    "sessionId": sessionID,
+                    "configId": selector.configID,
+                    "value": requestedThinking.value
+                ]
+            )
+            try await applyVerifiedConfigOptionsMutationResponse(
+                response,
+                requiredModeValue: nil,
+                requiredModelValue: targetModel,
+                requiredSelectValue: (
+                    configID: selector.configID,
+                    value: requestedThinking.value
+                )
+            )
+            try Task.checkCancellation()
+
+            guard discoveredSessionModels?.currentModelRaw == targetModel,
+                  auxiliarySelectors[selector.configID]?.currentValue == requestedThinking.value
+            else {
+                throw ControllerError.protocolViolation(
+                    "final Oh My Pi configuration does not confirm model '\(targetModel)' and thinking '\(requestedThinking.value)'"
+                )
+            }
+        } catch {
+            let originalError = error
+            let rollbackFailures = await rollbackOhMyPiSelection(
+                sessionID: sessionID,
+                modelConfigID: modelConfigID,
+                previousModel: previousModel,
+                previousThinking: previousThinking,
+                targetModel: targetModel,
+                targetThinkingBeforeMutation: targetThinkingBeforeMutation,
+                didAttemptModelMutation: didAttemptModelMutation,
+                didAttemptThinkingMutation: didAttemptThinkingMutation
+            )
+            guard !rollbackFailures.isEmpty else {
+                throw originalError
+            }
+            throw ControllerError.requestFailed(
+                "\(originalError.localizedDescription); Oh My Pi may retain partial configuration: \(rollbackFailures.joined(separator: "; "))"
+            )
+        }
+    }
+
+    private func rollbackOhMyPiSelection(
+        sessionID: String,
+        modelConfigID: String,
+        previousModel: String?,
+        previousThinking: AuxiliarySelectorSnapshot?,
+        targetModel: String,
+        targetThinkingBeforeMutation: AuxiliarySelectorSnapshot?,
+        didAttemptModelMutation: Bool,
+        didAttemptThinkingMutation: Bool
+    ) async -> [String] {
+        var failures: [String] = []
+
+        if didAttemptThinkingMutation,
+           discoveredSessionModels?.currentModelRaw == targetModel,
+           let targetThinkingBeforeMutation
+        {
+            do {
+                let selector = try resolvedOhMyPiThinkingSelector()
+                guard selector.values.contains(targetThinkingBeforeMutation.currentValue) else {
+                    throw ControllerError.requestFailed(
+                        "thinking value '\(targetThinkingBeforeMutation.currentValue)' is no longer advertised"
+                    )
+                }
+                let response = try await sendRequestResponse(
+                    method: "session/set_config_option",
+                    params: [
+                        "sessionId": sessionID,
+                        "configId": selector.configID,
+                        "value": targetThinkingBeforeMutation.currentValue
+                    ]
+                )
+                try await applyVerifiedConfigOptionsMutationResponse(
+                    response,
+                    requiredModeValue: nil,
+                    requiredModelValue: targetModel,
+                    requiredSelectValue: (
+                        configID: selector.configID,
+                        value: targetThinkingBeforeMutation.currentValue
+                    )
+                )
+            } catch {
+                failures.append(
+                    "thinking=\(targetThinkingBeforeMutation.currentValue) for model \(targetModel) (restore failed: \(error.localizedDescription))"
+                )
+            }
+        }
+
+        if didAttemptModelMutation, let previousModel {
+            do {
+                let response = try await sendRequestResponse(
+                    method: "session/set_config_option",
+                    params: [
+                        "sessionId": sessionID,
+                        "configId": modelConfigID,
+                        "value": previousModel
+                    ]
+                )
+                try await applyVerifiedConfigOptionsMutationResponse(
+                    response,
+                    requiredModeValue: nil,
+                    requiredModelValue: previousModel
+                )
+            } catch {
+                failures.append(
+                    "model=\(targetModel) (restore to \(previousModel) failed: \(error.localizedDescription))"
+                )
+            }
+        }
+
+        if didAttemptModelMutation,
+           let previousModel,
+           discoveredSessionModels?.currentModelRaw == previousModel,
+           let previousThinking
+        {
+            do {
+                let selector = try resolvedOhMyPiThinkingSelector()
+                guard selector.values.contains(previousThinking.currentValue) else {
+                    throw ControllerError.requestFailed(
+                        "thinking value '\(previousThinking.currentValue)' is no longer advertised"
+                    )
+                }
+                if selector.currentValue != previousThinking.currentValue {
+                    let response = try await sendRequestResponse(
+                        method: "session/set_config_option",
+                        params: [
+                            "sessionId": sessionID,
+                            "configId": selector.configID,
+                            "value": previousThinking.currentValue
+                        ]
+                    )
+                    try await applyVerifiedConfigOptionsMutationResponse(
+                        response,
+                        requiredModeValue: nil,
+                        requiredModelValue: previousModel,
+                        requiredSelectValue: (
+                            configID: selector.configID,
+                            value: previousThinking.currentValue
+                        )
+                    )
+                }
+            } catch {
+                failures.append(
+                    "thinking=\(previousThinking.currentValue) for model \(previousModel) (restore failed: \(error.localizedDescription))"
+                )
+            }
+        }
+
+        return failures
     }
 
     private func setCursorSessionModelSerialized(
@@ -817,12 +1099,12 @@ actor ACPAgentSessionController {
             modelConfigID: modelConfigID
         )
 
-        var rollbacks: [CursorParameterRollback] = []
+        var rollbacks: [AuxiliarySelectorRollback] = []
         do {
             let orderedParameters = parsed.params.filter { $0.key.lowercased() != "fast" }
                 + parsed.params.filter { $0.key.lowercased() == "fast" }
             for parameter in orderedParameters {
-                guard let selector = cursorParameterSelectors[parameter.key] else {
+                guard let selector = auxiliarySelectors[parameter.key] else {
                     throw ControllerError.requestFailed("Cursor model '\(cleanModelValue)' does not advertise parameter selector '\(parameter.key)'.")
                 }
                 guard selector.values.contains(parameter.value) else {
@@ -831,13 +1113,13 @@ actor ACPAgentSessionController {
             }
 
             for parameter in orderedParameters {
-                guard let selector = cursorParameterSelectors[parameter.key] else {
+                guard let selector = auxiliarySelectors[parameter.key] else {
                     throw ControllerError.protocolViolation("Cursor parameter selector '\(parameter.key)' disappeared during model configuration")
                 }
                 if selector.currentValue == parameter.value {
                     continue
                 }
-                let rollback = CursorParameterRollback(
+                let rollback = AuxiliarySelectorRollback(
                     configID: parameter.key,
                     previousValue: selector.currentValue,
                     requestedValue: parameter.value
@@ -870,7 +1152,7 @@ actor ACPAgentSessionController {
                 throw ControllerError.protocolViolation("final Cursor configuration no longer confirms requested model '\(cleanModelValue)'")
             }
             for parameter in orderedParameters {
-                guard cursorParameterSelectors[parameter.key]?.currentValue == parameter.value else {
+                guard auxiliarySelectors[parameter.key]?.currentValue == parameter.value else {
                     throw ControllerError.protocolViolation("final Cursor configuration does not confirm requested value '\(parameter.value)' for selector '\(parameter.key)'")
                 }
             }
@@ -945,15 +1227,15 @@ actor ACPAgentSessionController {
     }
 
     private func surfaceCursorEffectiveParametersForBareSelection() {
-        guard !cursorParameterSelectors.isEmpty else { return }
-        let orderedIDs = cursorParameterSelectors.keys.filter { $0.lowercased() != "fast" }.sorted()
-            + cursorParameterSelectors.keys.filter { $0.lowercased() == "fast" }.sorted()
+        guard !auxiliarySelectors.isEmpty else { return }
+        let orderedIDs = auxiliarySelectors.keys.filter { $0.lowercased() != "fast" }.sorted()
+            + auxiliarySelectors.keys.filter { $0.lowercased() == "fast" }.sorted()
         let effective = orderedIDs.compactMap { configID -> String? in
-            guard let selector = cursorParameterSelectors[configID] else { return nil }
+            guard let selector = auxiliarySelectors[configID] else { return nil }
             return "\(configID)=\(selector.currentValue)"
         }
         diagnose(.info("Cursor bare-base model selection inherited effective parameters: \(effective.joined(separator: ", "))."))
-        if cursorParameterSelectors["fast"]?.currentValue == "true" {
+        if auxiliarySelectors["fast"]?.currentValue == "true" {
             emit(.stream(AIStreamResult(
                 type: "system",
                 text: "Cursor Fast mode is enabled for this bare-base model selection (effective fast=true)."
@@ -1281,7 +1563,8 @@ actor ACPAgentSessionController {
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
-        cursorParameterSelectors.removeAll()
+        auxiliarySelectors.removeAll()
+        authoritativeConfigOptions.removeAll()
         lastAppliedConfigurationSequence = 0
         bufferedConfigOptionUpdates.removeAll()
         sessionID = nil
@@ -2274,7 +2557,8 @@ actor ACPAgentSessionController {
         sessionModelFailureReason = nil
         sessionModeSnapshot = nil
         sessionModeFailureReason = nil
-        cursorParameterSelectors.removeAll()
+        auxiliarySelectors.removeAll()
+        authoritativeConfigOptions.removeAll()
         lastAppliedConfigurationSequence = 0
         bufferedConfigOptionUpdates.removeAll()
     }
@@ -2313,9 +2597,12 @@ actor ACPAgentSessionController {
             sessionModeFailureReason = reason
             diagnose(.info("ACP session advertised a malformed modern mode config option: \(reason)"))
         }
+        let configOptions = response["configOptions"] as? [[String: Any]] ?? []
         applyDiscoveredSessionModels(from: response)
-        rebuildCursorParameterSelectors(from: response["configOptions"] as? [[String: Any]] ?? [])
+        rebuildAuxiliarySelectors(from: configOptions)
+        authoritativeConfigOptions = configOptions
         lastAppliedConfigurationSequence = inboundSequence
+        publishOhMyPiThinkingCapabilityIfAvailable()
     }
 
     private func parseModernModeSnapshot(from response: [String: Any]) -> ParsedModernModeSnapshot {
@@ -2535,6 +2822,18 @@ actor ACPAgentSessionController {
         requiredModelValue: String?,
         requiredSelectValue: (configID: String, value: String)? = nil
     ) async throws {
+        if response.inboundSequence < lastAppliedConfigurationSequence {
+            diagnose(.info("Ignoring stale session/set_config_option snapshot."))
+            #if DEBUG
+                await debugSuspendConfigurationMutationPostcheckIfNeeded()
+            #endif
+            try verifyCurrentConfigurationState(
+                requiredModeValue: requiredModeValue,
+                requiredModelValue: requiredModelValue,
+                requiredSelectValue: requiredSelectValue
+            )
+            return
+        }
         guard let configOptions = response.result["configOptions"] as? [[String: Any]] else {
             throw ControllerError.protocolViolation("session/set_config_option response missing complete configOptions snapshot")
         }
@@ -2587,6 +2886,18 @@ actor ACPAgentSessionController {
         #if DEBUG
             await debugSuspendConfigurationMutationPostcheckIfNeeded()
         #endif
+        try verifyCurrentConfigurationState(
+            requiredModeValue: requiredModeValue,
+            requiredModelValue: requiredModelValue,
+            requiredSelectValue: requiredSelectValue
+        )
+    }
+
+    private func verifyCurrentConfigurationState(
+        requiredModeValue: String?,
+        requiredModelValue: String?,
+        requiredSelectValue: (configID: String, value: String)?
+    ) throws {
         if let requiredModeValue,
            sessionModeSnapshot?.currentValue != requiredModeValue
         {
@@ -2598,7 +2909,7 @@ actor ACPAgentSessionController {
             throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested model '\(requiredModelValue)'")
         }
         if let requiredSelectValue,
-           cursorParameterSelectors[requiredSelectValue.configID]?.currentValue != requiredSelectValue.value
+           auxiliarySelectors[requiredSelectValue.configID]?.currentValue != requiredSelectValue.value
         {
             throw ControllerError.protocolViolation("newer ACP configuration state no longer confirms requested value '\(requiredSelectValue.value)' for selector '\(requiredSelectValue.configID)'")
         }
@@ -2674,13 +2985,15 @@ actor ACPAgentSessionController {
         }
         let response: [String: Any] = ["configOptions": configOptions]
         applyDiscoveredSessionModels(from: response)
-        rebuildCursorParameterSelectors(from: configOptions)
+        rebuildAuxiliarySelectors(from: configOptions)
+        authoritativeConfigOptions = configOptions
         lastAppliedConfigurationSequence = inboundSequence
+        publishOhMyPiThinkingCapabilityIfAvailable()
     }
 
-    private func rebuildCursorParameterSelectors(from configOptions: [[String: Any]]) {
+    private func rebuildAuxiliarySelectors(from configOptions: [[String: Any]]) {
         let excludedIDs = Set([sessionModeSnapshot?.configID, sessionModelConfigOptionID].compactMap(\.self))
-        var selectors: [String: (currentValue: String, values: [String])] = [:]
+        var selectors: [String: AuxiliarySelectorSnapshot] = [:]
         var visitedIDs = Set<String>()
         for option in configOptions {
             guard let configID = normalizedConfigValue(option["id"] as? String),
@@ -2696,9 +3009,101 @@ actor ACPAgentSessionController {
                 normalizedConfigValue($0["value"] as? String)
             })
             guard !values.isEmpty, values.contains(parsed.currentValue) else { continue }
-            selectors[configID] = (currentValue: parsed.currentValue, values: values)
+            selectors[configID] = AuxiliarySelectorSnapshot(
+                configID: configID,
+                category: normalizedConfigValue(option["category"] as? String),
+                currentValue: parsed.currentValue,
+                values: values,
+                displayNames: values
+            )
         }
-        cursorParameterSelectors = selectors
+        auxiliarySelectors = selectors
+    }
+
+    private func resolvedOhMyPiThinkingSelector() throws -> AuxiliarySelectorSnapshot {
+        let expectedID = ACPConfigOptionKey.ohMyPiThinking.configID
+        let expectedCategory = ACPConfigOptionKey.ohMyPiThinking.category
+        let categoryMatches = authoritativeConfigOptions.filter {
+            normalizedConfigValue($0["category"] as? String) == expectedCategory
+        }
+        let idMatches = authoritativeConfigOptions.filter {
+            normalizedConfigValue($0["id"] as? String) == expectedID
+        }
+
+        guard categoryMatches.count == 1 else {
+            if categoryMatches.isEmpty {
+                throw ControllerError.requestFailed(
+                    "Oh My Pi does not advertise the required thinking selector category '\(expectedCategory)' for model '\(discoveredSessionModels?.currentModelRaw ?? "unknown")'."
+                )
+            }
+            throw ControllerError.requestFailed(
+                "Oh My Pi advertised multiple thinking selectors in category '\(expectedCategory)'; expected exactly one selector with id '\(expectedID)'."
+            )
+        }
+        guard idMatches.count == 1 else {
+            if idMatches.isEmpty {
+                throw ControllerError.requestFailed(
+                    "Oh My Pi thinking selector for model '\(discoveredSessionModels?.currentModelRaw ?? "unknown")' has an unexpected id; expected '\(expectedID)'."
+                )
+            }
+            throw ControllerError.requestFailed(
+                "Oh My Pi advertised multiple selectors with id '\(expectedID)'; thinking selection is ambiguous."
+            )
+        }
+        guard normalizedConfigValue(categoryMatches[0]["id"] as? String) == expectedID,
+              normalizedConfigValue(idMatches[0]["category"] as? String) == expectedCategory
+        else {
+            throw ControllerError.requestFailed(
+                "Oh My Pi thinking selector must use id '\(expectedID)' and category '\(expectedCategory)'."
+            )
+        }
+        guard case let .valid(parsed) = parseSelectConfigOptionByID(
+            expectedID,
+            from: authoritativeConfigOptions
+        ) else {
+            throw ControllerError.requestFailed(
+                "Oh My Pi thinking selector '\(expectedID)' is malformed for model '\(discoveredSessionModels?.currentModelRaw ?? "unknown")'."
+            )
+        }
+        let values = deduplicatedExactValues(parsed.choices.compactMap {
+            normalizedConfigValue($0["value"] as? String)
+        })
+        guard !values.isEmpty, values.contains(parsed.currentValue) else {
+            throw ControllerError.requestFailed(
+                "Oh My Pi thinking selector '\(expectedID)' has no valid current choice for model '\(discoveredSessionModels?.currentModelRaw ?? "unknown")'."
+            )
+        }
+        let displayNamesByValue = Dictionary(
+            parsed.choices.compactMap { choice -> (String, String)? in
+                guard let value = normalizedConfigValue(choice["value"] as? String) else { return nil }
+                let name = normalizedConfigValue(choice["name"] as? String) ?? value
+                return (value, name)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return AuxiliarySelectorSnapshot(
+            configID: expectedID,
+            category: expectedCategory,
+            currentValue: parsed.currentValue,
+            values: values,
+            displayNames: values.map { displayNamesByValue[$0] ?? $0 }
+        )
+    }
+
+    private func publishOhMyPiThinkingCapabilityIfAvailable() {
+        guard provider.providerID == .ohMyPi,
+              let modelID = discoveredSessionModels?.currentModelRaw,
+              let selector = try? resolvedOhMyPiThinkingSelector()
+        else {
+            return
+        }
+        ohMyPiThinkingCapabilityPublisher(OhMyPiThinkingCapabilityRecord(
+            modelID: modelID,
+            configID: selector.configID,
+            category: selector.category ?? ACPConfigOptionKey.ohMyPiThinking.category,
+            orderedOptions: selector.values,
+            optionDisplayNames: selector.displayNames
+        ))
     }
 
     private func applyDiscoveredSessionModels(from response: [String: Any]) {
@@ -2726,7 +3131,9 @@ actor ACPAgentSessionController {
         }
 
         discoveredSessionModels = parsed
-        guard let parsed else { return }
+        guard let parsed,
+              dynamicModelPublicationPolicy == .standard
+        else { return }
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(parsed, for: provider.providerID)
     }
 

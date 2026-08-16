@@ -200,6 +200,7 @@ struct AgentComposerProps: Equatable {
     let selectedAgent: AgentProviderKind
     let selectedModelRaw: String
     let selectedModelDisplayName: String
+    let ohMyPiThinkingSelections: OhMyPiThinkingSelections
     let selectedReasoningEffortRaw: String?
     let selectedReasoningEffortDisplayName: String
     let availableAgents: [AgentProviderKind]
@@ -235,6 +236,7 @@ struct AgentComposerProps: Equatable {
         selectedAgent: .claudeCode,
         selectedModelRaw: AgentModel.defaultModel.rawValue,
         selectedModelDisplayName: AgentModel.defaultModel.displayName,
+        ohMyPiThinkingSelections: .empty,
         selectedReasoningEffortRaw: nil,
         selectedReasoningEffortDisplayName: "",
         availableAgents: [],

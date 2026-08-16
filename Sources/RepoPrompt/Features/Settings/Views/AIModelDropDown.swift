@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 
 struct AIModelDropdown: View {
@@ -21,6 +22,7 @@ struct AIModelDropdown: View {
     @State private var menuModelSnapshot: [AIModel]? = nil
     @State private var menuSnapshotReleaseTask: Task<Void, Never>? = nil
     @State private var cursorCatalogRevision: Int = 0
+    @State private var ohMyPiThinkingRevision: Int = 0
 
     private struct ClaudeCodeTopLevelMenu {
         let displayName: String
@@ -82,6 +84,13 @@ struct AIModelDropdown: View {
                 .receive(on: RunLoop.main)
         ) { _ in
             cursorCatalogRevision &+= 1
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .ohMyPiThinkingCapabilitiesDidChange)
+                .merge(with: NotificationCenter.default.publisher(for: .ohMyPiThinkingCapabilityProbeStateDidChange))
+                .receive(on: RunLoop.main)
+        ) { _ in
+            ohMyPiThinkingRevision &+= 1
         }
     }
 
@@ -146,6 +155,7 @@ struct AIModelDropdown: View {
     // MARK: - AppKit Menu Content (Provider → Models)
 
     private func aiModelMenuItems() -> [StableMenuItem] {
+        _ = ohMyPiThinkingRevision
         let allModels = menuModelSnapshot ?? promptViewModel.availableModels
         guard !allModels.isEmpty else {
             return [.action("Configure API Settings", handleConfigureAction)]
@@ -182,14 +192,7 @@ struct AIModelDropdown: View {
                     return [.submenu(providerGroup.displayName, items: modelItems)]
                 }
             } else if provider == .ohMyPi {
-                OhMyPiModelMenuBuilder.groups(for: models).map { group in
-                    .submenu(
-                        group.namespace,
-                        items: group.leaves.map { leaf in
-                            aiModelMenuItem(leaf.model, title: leaf.title)
-                        }
-                    )
-                }
+                aiModelOhMyPiItems(for: models)
             } else {
                 models.map(aiModelMenuItem)
             }
@@ -449,6 +452,54 @@ struct AIModelDropdown: View {
         return .separator
     }
 
+    private func aiModelOhMyPiItems(for models: [AIModel]) -> [StableMenuItem] {
+        let projection = OhMyPiModelMenuBuilder.projection(for: models)
+        var items = projection.rootLeaves.map { leaf in
+            aiModelMenuItem(leaf.model, title: leaf.title)
+        }
+        items.append(contentsOf: projection.namespaceGroups.map { namespaceGroup in
+            .submenu(
+                namespaceGroup.namespace,
+                items: namespaceGroup.modelGroups.map(aiModelOhMyPiMenuItem)
+            )
+        })
+        if destination.hasThinkingAccessory,
+           let exactModelID = OhMyPiThinkingMenuBuilder.exactModelID(from: destination.currentRawValue)
+        {
+            items.append(.separator)
+            items.append(.submenu(
+                "Thinking",
+                items: OhMyPiThinkingMenuBuilder.stableMenuItems(
+                    exactModelID: exactModelID,
+                    destination: destination
+                )
+            ))
+        }
+        return items
+    }
+
+    private func aiModelOhMyPiMenuItem(
+        _ group: OhMyPiModelMenuBuilder.ModelGroup
+    ) -> StableMenuItem {
+        guard group.isFamily else {
+            return group.normalLeaves.first.map {
+                aiModelMenuItem($0.model, title: $0.title)
+            } ?? .separator
+        }
+        var items = group.normalLeaves.map {
+            aiModelMenuItem($0.model, title: $0.title)
+        }
+        if !group.fastLeaves.isEmpty {
+            items.append(.submenu(
+                "Fast",
+                items: group.fastLeaves.map {
+                    aiModelMenuItem($0.model, title: $0.title)
+                }
+            ))
+        }
+        return .submenu(group.title, items: items)
+    }
+
     private func aiModelMenuItem(_ model: AIModel) -> StableMenuItem {
         aiModelMenuItem(model, title: model.displayName)
     }
@@ -469,6 +520,7 @@ struct AIModelDropdown: View {
                 : nil
         ) {
             destination.apply(model.rawValue)
+            OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(of: model)
         }
     }
 

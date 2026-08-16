@@ -190,7 +190,7 @@ enum ACPDefaultSessionUpdateNormalizer {
         case "tool_call":
             return normalizeToolCall(payload)
         case "tool_call_update":
-            return normalizeToolCallUpdate(payload)
+            return normalizeToolCallUpdate(payload, providerID: providerID)
         case "usage_update":
             return normalizeUsageUpdate(payload)
         case "session_info_update":
@@ -226,7 +226,10 @@ enum ACPDefaultSessionUpdateNormalizer {
         ]
     }
 
-    private static func normalizeToolCallUpdate(_ payload: [String: Any]) -> [NormalizedAgentRuntimeEvent] {
+    private static func normalizeToolCallUpdate(
+        _ payload: [String: Any],
+        providerID: ACPProviderID
+    ) -> [NormalizedAgentRuntimeEvent] {
         let toolCallID = ACPRuntimeEventParsing.firstString(in: payload, keys: ["toolCallId"]) ?? UUID().uuidString
         let toolName = ACPRuntimeEventParsing.normalizedToolName(from: payload)
         let invocationID = ACPRuntimeEventParsing.stableInvocationUUID(rawValue: toolCallID)
@@ -240,7 +243,9 @@ enum ACPDefaultSessionUpdateNormalizer {
         let progressText = ACPRuntimeEventParsing.extractContentText(from: payload["content"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if status == "completed" || status == "failed" {
+        let isOMPProviderTerminalFailure = providerID == .ohMyPi
+            && (status == "failed" || status == "cancelled")
+        if status == "completed" || status == "failed" || isOMPProviderTerminalFailure {
             return [
                 .stream(
                     AIStreamResult(
@@ -252,7 +257,7 @@ enum ACPDefaultSessionUpdateNormalizer {
                         toolInvocationID: invocationID,
                         toolResultJSON: outputJSON,
                         toolArgsJSON: argsJSON,
-                        toolIsError: status == "failed"
+                        toolIsError: status == "failed" || isOMPProviderTerminalFailure
                     )
                 )
             ]

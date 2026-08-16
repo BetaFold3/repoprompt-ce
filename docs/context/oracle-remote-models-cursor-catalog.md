@@ -12,7 +12,9 @@ The implementation is split deliberately; do not introduce a parallel model or p
 - Dynamic ACP model authority: `Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentACPModelRegistry.swift` and `Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/ACPAIModelCatalog.swift`.
 - OMP Oracle execution: `Sources/RepoPrompt/Infrastructure/AI/Providers/OhMyPi/OhMyPiCLIProvider.swift` and the OMP ACP headless provider.
 - Shared one-shot lifecycle: `Sources/RepoPrompt/Infrastructure/AI/Providers/HeadlessCLIStreamBridge.swift`.
-- OMP grouping/presentation: `Sources/RepoPrompt/Features/Settings/Views/OhMyPiModelMenuBuilder.swift`.
+- OMP model grouping/presentation: `Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/OhMyPiModelMenuProjector.swift` is the shared raw-wire projector; `Sources/RepoPrompt/Features/Settings/Views/OhMyPiModelMenuBuilder.swift` is its settings/Oracle adapter.
+- OMP destination intent and typed execution metadata: `Sources/RepoPrompt/Infrastructure/AI/Models/OhMyPiThinkingSelections.swift`, destination/tab/preset owners, and `Sources/RepoPrompt/Infrastructure/AI/AIMessage.swift`.
+- OMP thinking capability authority: the separate `OhMyPiThinkingCapabilityRegistry.swift`, `OhMyPiThinkingCapabilityResolver.swift`, and shared row-only `OhMyPiThinkingMenuBuilder.swift`; never fold capability state into the dynamic model registry.
 - Cursor parameter persistence and catalog authority: `Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorModelParameterStore.swift` and `CursorModelParameterCatalog.swift`.
 - Cursor discovery/recovery: `Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorACPModelPollingService.swift`.
 - Cursor parameter application and bracket grammar: the Cursor parameterized-model controller and `CursorBracketModelID.swift`.
@@ -22,7 +24,7 @@ The implementation is split deliberately; do not introduce a parallel model or p
 ## OMP Oracle contract
 
 - OMP Oracle selections use `AIModel.ohMyPiCustom(name:)` with the frozen `ohmypi_custom_` raw prefix. The suffix is the exact nonempty registry wire ID; preserve case, `/`, `:`, and flattened suffixes.
-- The dynamic OMP registry is the model authority. There is no synthesized static fallback model.
+- The dynamic OMP registry is the model authority. There is no synthesized static fallback model. Thinking capabilities are a separate authority and must never change `AgentACPModelRegistry.currentModelRaw` or discovered-model preference.
 - Picker availability requires the effective OMP connection gate (plus the established DEBUG smoke override). A persisted registry alone must not make OMP selectable.
 - Warm the standard registry before request-time validation. Distinguish disconnected OMP from a model withdrawn upstream and fail closed; never fall through to OMP's default model.
 - Oracle uses a fresh headless OMP provider with RepoPrompt MCP disabled, no workspace, the exact validated canonical model, and the explicit no-tools prompt suffix even when the incoming system prompt is empty.
@@ -31,7 +33,12 @@ The implementation is split deliberately; do not introduce a parallel model or p
 - `HeadlessCLIStreamBridge` owns terminal delivery, cancellation ordering, active-provider registration, and exactly-once disposal for both OMP and Cursor.
 - Do not infer a prompt-only OMP session mode from advertised mode names. No session-mode field is sent until a verified upstream fixture proves a tool-free mode.
 - OMP `cursor/...` IDs remain distinct from direct Cursor selections because auth, billing, session, and tool-policy paths differ. Do not deduplicate them or infer Cursor fast-pricing warnings from OMP suffixes.
-- OMP menus group by the namespace before the first `/`; persisted selection always retains the full wire ID.
+- Every OMP model surface uses `OhMyPiModelMenuProjector`: group from exact raw wire IDs by namespace, then form only corroborated effort/fast suffix families. The projector preserves a bijection of source and wire IDs, never fabricates a selection, and keeps suffix families independent from the runtime `thinking` selector.
+- Thinking intent is destination-owned, not provider-global: each Agent Mode tab/session, Prompt chat/planning/Context Builder destination, and model preset keeps its own capped exact-model map. Presets or destinations sharing one wire model may select different thinking values; key absence is Default and sends nothing.
+- Oracle and preset execution carry thinking through typed `AIMessage.executionMetadata.additionalACPConfigOptionValues` as `.ohMyPiThinking`; the canonical OMP model string remains pure. Central destination/preset resolution attaches only that source's exact-model entry. An OMP assignment presented to another provider is rejected at the provider boundary; no provider parses thinking from model suffixes.
+- `OhMyPiThinkingCapabilityRegistry` is the capability authority. It records only valid sequence-authoritative OMP `thinking`/`thought_level` snapshots per exact model, persists ordered options with OMP version and observation time in `omp-thinking-capabilities-v1.json`, never persists session `currentValue`, invalidates on binary-version change, and notifies future menu snapshots. Real sessions and the existing settings refresh bootstrap publish through the same controller hook with no additional ACP round trip.
+- Lazy capability discovery is cache-first and starts only after an explicit OMP model-selection action or the shared manual Load action—never during construction, render, hover, restore, checkmark evaluation, or catalog refresh. It reuses the existing no-prompt OMP bootstrap, is fire-and-forget, coalesces each exact ID, permits only one global probe with no cross-model queue, applies an approximately eight-second deadline and non-durable failure cooldown, and guarantees provider disposal. Selection never waits; manual retry may bypass cooldown but not the global/no-queue bounds.
+- Thinking menus are projections of destination intent plus the capability registry: Default is always present; authoritative options retain upstream order and exact raw values; duplicate labels are disambiguated; loading is disabled; unknown/failure states retain stored intent and expose Load; an authoritative stale choice remains stored and renders a one-click clear warning. The shared builder returns rows, and each of the four surface families renders one sibling Thinking section/submenu after the OMP model hierarchy rather than multiplying it per model.
 
 ## Cursor parameter-catalog contract
 

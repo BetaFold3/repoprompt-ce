@@ -56,6 +56,7 @@ extension AgentModeViewModel {
             selectedAgent: session?.selectedAgent ?? selectedAgent,
             selectedModelRaw: selectedModelRawForProps,
             selectedModelDisplayName: selectedModelDisplayNameForProps,
+            ohMyPiThinkingSelections: session?.ohMyPiThinkingSelections ?? .empty,
             selectedReasoningEffortRaw: selectedReasoningEffortRaw,
             selectedReasoningEffortDisplayName: selectedReasoningEffortDisplayName,
             availableAgents: availableAgentsForTab,

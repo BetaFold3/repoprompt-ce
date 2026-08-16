@@ -100,6 +100,179 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
         XCTAssertEqual(persisted.modelRaw, AgentModel.gpt55CodexLow.rawValue)
     }
 
+    func testContextBuilderAIModelPickerRoundTripsThroughItsDestination() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let prompt = makePromptViewModel(
+            windowID: 1,
+            store: fixture.settingsStore,
+            promptStore: fixture.promptStore
+        )
+        let originalAgentModelRaw = prompt.contextBuilderAgentModelRaw
+        let model = AIModel.ohMyPiCustom(name: "provider/model")
+        let destination = ModelDestination.contextBuilderModel(promptVM: prompt)
+        let items = OptimizedModelPicker.stableMenuItemsForTesting(
+            availableModels: [model],
+            destination: destination
+        )
+
+        XCTAssertTrue(performFirstAction(titled: "model", in: items))
+        XCTAssertEqual(destination.currentRawValue, model.rawValue)
+        XCTAssertEqual(prompt.contextBuilderModelName, model.rawValue)
+        XCTAssertEqual(
+            prompt.contextBuilderAgentModelRaw,
+            originalAgentModelRaw,
+            "The AIModel picker must not corrupt the separate Context Builder agent selection"
+        )
+        XCTAssertEqual(
+            OhMyPiThinkingMenuBuilder.exactModelID(from: destination.currentRawValue),
+            "provider/model"
+        )
+    }
+
+    func testEmptyPlanningModelCannotClearComposeModelOrThinkingMapDuringSync() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let store = fixture.settingsStore
+        let prompt = makePromptViewModel(
+            windowID: 1,
+            store: store,
+            promptStore: fixture.promptStore
+        )
+        let composeModel = AIModel.ohMyPiCustom(name: "provider/chat").rawValue
+        var composeSelections = OhMyPiThinkingSelections()
+        composeSelections.setValue("high", for: "provider/chat")
+        var planningSelections = OhMyPiThinkingSelections()
+        planningSelections.setValue("low", for: "provider/planning")
+
+        var profile = store.globalAgentModelsProfile()
+        profile.preferredComposeModelRaw = composeModel
+        profile.preferredComposeOhMyPiThinkingSelections = composeSelections
+        profile.planningModelRaw = nil
+        profile.planningModelOhMyPiThinkingSelections = planningSelections
+        profile.syncChatModelWithOracle = false
+        store.setGlobalAgentModelsProfile(
+            profile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        await drainMainQueue()
+
+        store.setSyncChatModelWithOracle(
+            true,
+            reason: "empty-planning-test",
+            snapOnEnableToPlanning: true
+        )
+        await drainMainQueue()
+        XCTAssertEqual(store.globalAgentModelsProfile().preferredComposeModelRaw, composeModel)
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().preferredComposeOhMyPiThinkingSelections,
+            composeSelections
+        )
+
+        var editedPlanningSelections = planningSelections
+        editedPlanningSelections.setValue("max", for: "provider/planning")
+        prompt.planningModelOhMyPiThinkingSelections = editedPlanningSelections
+        XCTAssertEqual(prompt.preferredModel, composeModel)
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().preferredComposeOhMyPiThinkingSelections,
+            composeSelections
+        )
+    }
+
+    func testOhMyPiThinkingMapsFollowPromptSyncAtomicallyAndRemainIsolatedWhenOff() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let store = fixture.settingsStore
+        let prompt = makePromptViewModel(
+            windowID: 1,
+            store: store,
+            promptStore: fixture.promptStore
+        )
+        let wireID = "cursor/shared-model"
+        let unrelatedWireID = "cursor/unrelated-model"
+        let chatModel = AIModel.ohMyPiCustom(name: wireID).rawValue
+        let planningModel = AIModel.ohMyPiCustom(name: "cursor/planning-model").rawValue
+        var chatSelections = OhMyPiThinkingSelections()
+        chatSelections.setValue(
+            "chat-low",
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 1)
+        )
+        var planningSelections = OhMyPiThinkingSelections()
+        planningSelections.setValue(
+            "plan-high",
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 2)
+        )
+        planningSelections.setValue(
+            "unrelated",
+            for: unrelatedWireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 3)
+        )
+
+        var initialProfile = store.globalAgentModelsProfile()
+        initialProfile.preferredComposeModelRaw = chatModel
+        initialProfile.preferredComposeOhMyPiThinkingSelections = chatSelections
+        initialProfile.planningModelRaw = planningModel
+        initialProfile.planningModelOhMyPiThinkingSelections = planningSelections
+        initialProfile.syncChatModelWithOracle = false
+        store.setGlobalAgentModelsProfile(
+            initialProfile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        await drainMainQueue()
+
+        ModelDestination.chatModel(promptVM: prompt).applyThinkingValue(
+            "chat-max",
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 4)
+        )
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().preferredComposeOhMyPiThinkingSelections.value(for: wireID),
+            "chat-max"
+        )
+        XCTAssertEqual(
+            store.globalAgentModelsProfile().planningModelOhMyPiThinkingSelections,
+            planningSelections,
+            "sync-off writes must not cross destination ownership"
+        )
+
+        store.setSyncChatModelWithOracle(
+            true,
+            reason: "test",
+            snapOnEnableToPlanning: true
+        )
+        await drainMainQueue()
+
+        let snappedProfile = store.globalAgentModelsProfile()
+        XCTAssertEqual(snappedProfile.preferredComposeModelRaw, planningModel)
+        XCTAssertEqual(
+            snappedProfile.preferredComposeOhMyPiThinkingSelections,
+            planningSelections,
+            "enabling sync must snap the entire map, including entries for other models"
+        )
+
+        ModelDestination.planningModel(
+            promptVM: prompt,
+            postNotification: false
+        ).applyThinkingValue(
+            "plan-max",
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 5)
+        )
+
+        let syncedProfile = store.globalAgentModelsProfile()
+        XCTAssertEqual(
+            syncedProfile.preferredComposeOhMyPiThinkingSelections,
+            syncedProfile.planningModelOhMyPiThinkingSelections
+        )
+        XCTAssertEqual(
+            syncedProfile.preferredComposeOhMyPiThinkingSelections.value(for: unrelatedWireID),
+            "unrelated",
+            "sync must copy the whole map rather than only the selected model entry"
+        )
+    }
+
     // NOTE: Context Builder agent propagation is exercised compositionally — the store-side
     // publish is covered by SettingsJSONOnlyPersistenceTests.testGlobalDefaultsSettersPublishObjectWillChange
     // and the VM-side subscription + re-seed is covered by testOracleModelChangePropagatesAcrossWindows
@@ -107,6 +280,20 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
     // agent-kind resolution itself is availability-gated and covered by ContextBuilderModelStartupSelectionTests.
 
     // MARK: - Helpers
+
+    private func performFirstAction(titled title: String, in items: [StableMenuItem]) -> Bool {
+        for item in items {
+            if item.title == title, item.performActionForTesting() {
+                return true
+            }
+            if let submenuItems = item.submenuItems,
+               performFirstAction(titled: title, in: submenuItems)
+            {
+                return true
+            }
+        }
+        return false
+    }
 
     private struct Fixture {
         let directory: URL

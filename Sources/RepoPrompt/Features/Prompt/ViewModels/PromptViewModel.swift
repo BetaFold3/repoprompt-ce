@@ -387,6 +387,7 @@ class PromptViewModel: ObservableObject {
         // Oracle dropdown briefly shows empty until the next settings sync re-reads it.
         if shouldSync, !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             profile.planningModelRaw = rawValue
+            profile.planningModelOhMyPiThinkingSelections = profile.preferredComposeOhMyPiThinkingSelections
             if _planningModel != rawValue {
                 _planningModel = rawValue
             }
@@ -406,6 +407,7 @@ class PromptViewModel: ObservableObject {
         profile.planningModelRaw = rawValue
         if shouldSync {
             profile.preferredComposeModelRaw = rawValue
+            profile.preferredComposeOhMyPiThinkingSelections = profile.planningModelOhMyPiThinkingSelections
             if _preferredModel != rawValue {
                 sessionPreferredModelOverrideRaw = nil
                 _preferredModel = rawValue
@@ -415,6 +417,60 @@ class PromptViewModel: ObservableObject {
         if markDirty {
             isDirty = true
         }
+    }
+
+    var preferredModelOhMyPiThinkingSelections: OhMyPiThinkingSelections {
+        get { currentAgentModelsProfile().preferredComposeOhMyPiThinkingSelections }
+        set { setPreferredModelOhMyPiThinkingSelections(newValue) }
+    }
+
+    var planningModelOhMyPiThinkingSelections: OhMyPiThinkingSelections {
+        get { currentAgentModelsProfile().planningModelOhMyPiThinkingSelections }
+        set { setPlanningModelOhMyPiThinkingSelections(newValue) }
+    }
+
+    var contextBuilderOhMyPiThinkingSelections: OhMyPiThinkingSelections {
+        get { currentAgentModelsProfile().contextBuilderOhMyPiThinkingSelections }
+        set {
+            var profile = currentAgentModelsProfile()
+            profile.contextBuilderOhMyPiThinkingSelections = newValue
+            persistCurrentAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: .userInitiated
+            )
+            isDirty = true
+        }
+    }
+
+    private func setPreferredModelOhMyPiThinkingSelections(_ selections: OhMyPiThinkingSelections) {
+        var profile = currentAgentModelsProfile()
+        profile.preferredComposeOhMyPiThinkingSelections = selections
+        if profile.syncChatModelWithOracle,
+           let modelRaw = profile.preferredComposeModelRaw,
+           !modelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            profile.planningModelRaw = modelRaw
+            profile.planningModelOhMyPiThinkingSelections = selections
+            _planningModel = modelRaw
+        }
+        persistCurrentAgentModelsProfile(profile)
+        isDirty = true
+    }
+
+    private func setPlanningModelOhMyPiThinkingSelections(_ selections: OhMyPiThinkingSelections) {
+        var profile = currentAgentModelsProfile()
+        profile.planningModelOhMyPiThinkingSelections = selections
+        if profile.syncChatModelWithOracle,
+           let planningModelRaw = profile.planningModelRaw,
+           !planningModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            profile.preferredComposeModelRaw = planningModelRaw
+            profile.preferredComposeOhMyPiThinkingSelections = selections
+            sessionPreferredModelOverrideRaw = nil
+            _preferredModel = planningModelRaw
+        }
+        persistCurrentAgentModelsProfile(profile)
+        isDirty = true
     }
 
     @Published private(set) var availableModels: [AIModel] = []

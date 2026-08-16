@@ -340,6 +340,36 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         }
     }
 
+    func testStaleMutationResponseWithoutConfigOptionsCannotOverrideNewerCrossProviderSnapshot() async throws {
+        for providerID in [ACPProviderID.openCode, .cursor] {
+            let diagnostics = LockedStrings()
+            let fixture = try makeFixture(
+                shape: "modern",
+                extraEnvironment: [
+                    "ACP_SET_RESPONSE": "empty",
+                    "ACP_AFTER_SET_NOTIFICATION_MODE": "ask"
+                ],
+                diagnostics: diagnostics,
+                providerID: providerID
+            )
+            _ = try await fixture.controller.bootstrap()
+            await assertThrows(containing: "newer ACP configuration state") {
+                try await fixture.controller.setSessionMode("plan")
+            }
+            try await diagnostics.waitUntil("newer \(providerID.rawValue) snapshot") {
+                $0.contains("Processed authoritative config_option_update snapshot.")
+            }
+            try await fixture.controller.setSessionMode("ask")
+            await fixture.controller.shutdown()
+
+            XCTAssertEqual(
+                recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count,
+                1,
+                providerID.rawValue
+            )
+        }
+    }
+
     func testNewerNotificationRemainsAuthoritativeAfterMutationResponse() async throws {
         let diagnostics = LockedStrings()
         let fixture = try makeFixture(
@@ -536,6 +566,407 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
 
         let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
         XCTAssertEqual(mutations.compactMap { $0.params["configId"] as? String }, ["model", "mode_after_model"])
+    }
+
+    func testOhMyPiModelThinkingTransactionOrdersMutationsAndKeepsWireModelPure() async throws {
+        let capabilities = LockedOhMyPiThinkingCapabilities()
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1"
+            ],
+            providerID: .ohMyPi,
+            thinkingCapabilityPublisher: { capabilities.append($0) }
+        )
+
+        try await withBootstrappedController(fixture.controller) { controller in
+            try await controller.setSessionSelection(
+                model: "model-b",
+                additionalOptions: [.ohMyPiThinking("high")]
+            )
+            try await controller.setSessionSelection(
+                model: "model-b",
+                additionalOptions: [.ohMyPiThinking("high")]
+            )
+        }
+
+        let mutations = recordedMutationRequests(at: fixture.recordURL)
+        XCTAssertEqual(mutations.compactMap { $0.params["configId"] as? String }, ["model", "thinking"])
+        XCTAssertEqual(mutations.compactMap { $0.params["value"] as? String }, ["model-b", "high"])
+
+        let thinkingTokens = Set(["off", "low", "high"])
+        let modelValues = mutations.filter {
+            $0.params["configId"] as? String == "model"
+        }.compactMap {
+            $0.params["value"] as? String
+        }
+        XCTAssertTrue(modelValues.allSatisfy { !thinkingTokens.contains($0) })
+        XCTAssertEqual(capabilities.records.map(\.modelID), ["model-a", "model-b", "model-b"])
+        XCTAssertEqual(capabilities.records.last?.configID, "thinking")
+        XCTAssertEqual(capabilities.records.last?.category, "thought_level")
+        XCTAssertEqual(capabilities.records.last?.orderedOptions, ["off", "high"])
+        XCTAssertEqual(capabilities.records.last?.optionDisplayNames, ["Off", "High"])
+    }
+
+    func testOhMyPiCapabilityOnlyPublicationDoesNotMutateDynamicModelAuthority() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        let capabilities = LockedOhMyPiThinkingCapabilities()
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1"
+            ],
+            providerID: .ohMyPi,
+            dynamicModelPublicationPolicy: .capabilityOnly,
+            thinkingCapabilityPublisher: { capabilities.append($0) }
+        )
+
+        _ = try await fixture.controller.bootstrap()
+        XCTAssertEqual(capabilities.records.map(\.modelID), ["model-a"])
+        XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .ohMyPi))
+        await fixture.controller.shutdown()
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+    }
+
+    func testOhMyPiRemovedCatalogModelFailsClosedWithoutMutation() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: ["ACP_INCLUDE_MODEL": "1"],
+            providerID: .ohMyPi
+        )
+        _ = try await fixture.controller.bootstrap()
+        await assertThrows(containing: "does not advertise model 'removed-upstream-model'") {
+            try await fixture.controller.setSessionSelection(
+                model: "removed-upstream-model",
+                additionalOptions: []
+            )
+        }
+        await fixture.controller.shutdown()
+        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
+    }
+
+    func testOhMyPiDefaultAndMatchingThinkingAreIdempotent() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1"
+            ],
+            providerID: .ohMyPi
+        )
+
+        try await withBootstrappedController(fixture.controller) { controller in
+            try await controller.setSessionSelection(
+                model: "model-a",
+                additionalOptions: []
+            )
+            try await controller.setSessionSelection(
+                model: "model-a",
+                additionalOptions: [.ohMyPiThinking("off")]
+            )
+        }
+
+        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
+    }
+
+    func testOhMyPiUnavailableThinkingRollsBackModelInReverseOrder() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1"
+            ],
+            providerID: .ohMyPi
+        )
+        _ = try await fixture.controller.bootstrap()
+
+        await assertThrows(containing: "Advertised choices: off, high") {
+            try await fixture.controller.setSessionSelection(
+                model: "model-b",
+                additionalOptions: [.ohMyPiThinking("ultra")]
+            )
+        }
+        await fixture.controller.shutdown()
+
+        let mutations = recordedMutationRequests(at: fixture.recordURL)
+        XCTAssertEqual(mutations.compactMap { $0.params["configId"] as? String }, ["model", "model"])
+        XCTAssertEqual(mutations.compactMap { $0.params["value"] as? String }, ["model-b", "model-a"])
+    }
+
+    func testOhMyPiThinkingVerificationFailureRestoresThinkingThenModel() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1",
+                "ACP_THINKING_RESPONSE_MISMATCH": "1"
+            ],
+            providerID: .ohMyPi
+        )
+        _ = try await fixture.controller.bootstrap()
+
+        await assertThrows(containing: "did not confirm requested value 'high'") {
+            try await fixture.controller.setSessionSelection(
+                model: "model-b",
+                additionalOptions: [.ohMyPiThinking("high")]
+            )
+        }
+        await fixture.controller.shutdown()
+
+        let mutations = recordedMutationRequests(at: fixture.recordURL)
+        XCTAssertEqual(
+            mutations.compactMap { $0.params["configId"] as? String },
+            ["model", "thinking", "thinking", "model"]
+        )
+        XCTAssertEqual(
+            mutations.compactMap { $0.params["value"] as? String },
+            ["model-b", "high", "off", "model-a"]
+        )
+    }
+
+    func testOhMyPiCancellationAfterModelMutationRollsBackAndPropagatesCancellation() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1"
+            ],
+            releaseGates: [.modelResponse],
+            providerID: .ohMyPi
+        )
+        _ = try await fixture.controller.bootstrap()
+
+        let mutation = Task {
+            try await fixture.controller.setSessionSelection(
+                model: "model-b",
+                additionalOptions: [.ohMyPiThinking("high")]
+            )
+        }
+        try await fixture.sync.waitForReleaseWaiter(.modelResponse)
+        mutation.cancel()
+        try fixture.sync.release(.modelResponse)
+
+        do {
+            try await mutation.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {
+            // Clean rollback preserves cancellation.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+        await fixture.controller.shutdown()
+
+        let mutations = recordedMutationRequests(at: fixture.recordURL)
+        XCTAssertEqual(mutations.compactMap { $0.params["configId"] as? String }, ["model", "model"])
+        XCTAssertEqual(mutations.compactMap { $0.params["value"] as? String }, ["model-b", "model-a"])
+        XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/prompt").isEmpty)
+    }
+
+    func testOhMyPiRollbackFailureSurfacesCompoundPartialStateError() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1",
+                "ACP_FAIL_MODEL_RESTORE": "1"
+            ],
+            providerID: .ohMyPi
+        )
+        _ = try await fixture.controller.bootstrap()
+
+        await assertThrows(containing: "Oh My Pi may retain partial configuration") {
+            try await fixture.controller.setSessionSelection(
+                model: "model-b",
+                additionalOptions: [.ohMyPiThinking("ultra")]
+            )
+        }
+        await fixture.controller.shutdown()
+
+        let mutations = recordedMutationRequests(at: fixture.recordURL)
+        XCTAssertEqual(mutations.compactMap { $0.params["value"] as? String }, ["model-b", "model-a"])
+        XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/prompt").isEmpty)
+    }
+
+    func testEmptyAdditionalSelectionPreservesCursorAndOpenCodeModelTransport() async throws {
+        for providerID in [ACPProviderID.openCode, .cursor] {
+            let legacy = try makeFixture(
+                shape: "modern",
+                extraEnvironment: ["ACP_INCLUDE_MODEL": "1"],
+                providerID: providerID
+            )
+            try await withBootstrappedController(legacy.controller) { controller in
+                try await controller.setSessionModel("model-b")
+            }
+
+            let combined = try makeFixture(
+                shape: "modern",
+                extraEnvironment: ["ACP_INCLUDE_MODEL": "1"],
+                providerID: providerID
+            )
+            try await withBootstrappedController(combined.controller) { controller in
+                try await controller.setSessionSelection(
+                    model: "model-b",
+                    additionalOptions: []
+                )
+            }
+
+            XCTAssertEqual(
+                canonicalRequestBytes(recordedMutationRequests(at: legacy.recordURL)),
+                canonicalRequestBytes(recordedMutationRequests(at: combined.recordURL)),
+                providerID.rawValue
+            )
+        }
+    }
+
+    func testOhMyPiAssignmentOnNonOhMyPiProviderFailsAsInternalConfigurationError() async throws {
+        for providerID in [ACPProviderID.openCode, .cursor] {
+            XCTAssertThrowsError(try makeFixture(
+                shape: "modern",
+                providerID: providerID,
+                additionalConfigOptionValues: [.ohMyPiThinking("high")]
+            )) { error in
+                XCTAssertTrue(error.localizedDescription.contains("Internal configuration error"))
+                XCTAssertTrue(error.localizedDescription.contains("only valid for ohMyPi"))
+            }
+
+            let fixture = try makeFixture(
+                shape: "modern",
+                extraEnvironment: ["ACP_INCLUDE_MODEL": "1"],
+                providerID: providerID
+            )
+            _ = try await fixture.controller.bootstrap()
+            await assertThrows(containing: "Internal configuration error") {
+                try await fixture.controller.setSessionSelection(
+                    model: "model-b",
+                    additionalOptions: [.ohMyPiThinking("high")]
+                )
+            }
+            await fixture.controller.shutdown()
+            XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
+        }
+    }
+
+    func testOhMyPiThinkingSelectorRequiresExactIDCategoryAndValue() async throws {
+        let cases: [(label: String, environment: [String: String], expected: String)] = [
+            (
+                "wrong-id",
+                ["ACP_THINKING_CONFIG_ID": "reasoning"],
+                "unexpected id"
+            ),
+            (
+                "wrong-category",
+                ["ACP_THINKING_CATEGORY": "reasoning"],
+                "required thinking selector category"
+            )
+        ]
+
+        for testCase in cases {
+            var environment = testCase.environment
+            environment["ACP_INCLUDE_MODEL"] = "1"
+            environment["ACP_INCLUDE_THINKING"] = "1"
+            let capabilities = LockedOhMyPiThinkingCapabilities()
+            let fixture = try makeFixture(
+                shape: "modern",
+                extraEnvironment: environment,
+                providerID: .ohMyPi,
+                thinkingCapabilityPublisher: { capabilities.append($0) }
+            )
+            _ = try await fixture.controller.bootstrap()
+            await assertThrows(containing: testCase.expected, label: testCase.label) {
+                try await fixture.controller.setSessionSelection(
+                    model: "model-a",
+                    additionalOptions: [.ohMyPiThinking("low")]
+                )
+            }
+            await fixture.controller.shutdown()
+            XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, testCase.label)
+            XCTAssertTrue(capabilities.records.isEmpty, testCase.label)
+        }
+
+        let caseSensitive = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1"
+            ],
+            providerID: .ohMyPi
+        )
+        _ = try await caseSensitive.controller.bootstrap()
+        await assertThrows(containing: "does not advertise thinking value 'LOW'") {
+            try await caseSensitive.controller.setSessionSelection(
+                model: "model-a",
+                additionalOptions: [.ohMyPiThinking("LOW")]
+            )
+        }
+        await caseSensitive.controller.shutdown()
+        XCTAssertTrue(recordedMutationRequests(at: caseSensitive.recordURL).isEmpty)
+    }
+
+    func testOhMyPiThinkingVerificationAlsoRejectsRuntimeModelReset() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1",
+                "ACP_THINKING_RESETS_MODEL": "1"
+            ],
+            providerID: .ohMyPi
+        )
+        _ = try await fixture.controller.bootstrap()
+
+        await assertThrows(containing: "did not confirm requested model 'model-b'") {
+            try await fixture.controller.setSessionSelection(
+                model: "model-b",
+                additionalOptions: [.ohMyPiThinking("high")]
+            )
+        }
+        await fixture.controller.shutdown()
+
+        XCTAssertTrue(recordedRequests(at: fixture.recordURL, method: "session/prompt").isEmpty)
+        XCTAssertGreaterThanOrEqual(recordedMutationRequests(at: fixture.recordURL).count, 4)
+    }
+
+    func testOhMyPiHeadlessTransactionFailureNeverStartsPrompt() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let scriptURL = try makeFakeACPServerScript()
+        let recordURL = workspace.appendingPathComponent("omp-headless-failure.jsonl")
+        let fakeProvider = ModeConfigFakeACPProvider(
+            commandPath: scriptURL.path,
+            launchArguments: [],
+            environment: [
+                "ACP_RECORD_PATH": recordURL.path,
+                "ACP_SHAPE": "modern",
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1"
+            ],
+            mcpServers: [],
+            providerID: .ohMyPi
+        )
+        let provider = OhMyPiACPHeadlessAgentProvider(
+            config: OhMyPiAgentConfig(
+                modelString: "model-b",
+                additionalConfigOptionValues: [.ohMyPiThinking("ultra")],
+                includeRepoPromptMCPServer: false
+            ),
+            workspacePath: workspace.path,
+            providerFactory: { _ in fakeProvider }
+        )
+
+        do {
+            try await drain(provider.streamAgentMessage(AgentMessage(userMessage: "must not run")))
+            XCTFail("Expected OMP selection failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Advertised choices: off, high"))
+        }
+        await provider.dispose()
+
+        XCTAssertTrue(recordedRequests(at: recordURL, method: "session/prompt").isEmpty)
+        XCTAssertEqual(
+            recordedMutationRequests(at: recordURL).compactMap { $0.params["value"] as? String },
+            ["model-b", "model-a"]
+        )
     }
 
     func testLoadFallbackToNewSessionDoesNotLeakModeConfiguration() async throws {
@@ -1157,7 +1588,10 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         mcpServers: [RepoPromptMCPServerConfiguration] = [],
         diagnostics: LockedStrings? = nil,
         normalizedUpdates: LockedStrings? = nil,
-        providerID: ACPProviderID = .openCode
+        providerID: ACPProviderID = .openCode,
+        additionalConfigOptionValues: [ACPConfigOptionAssignment] = [],
+        dynamicModelPublicationPolicy: ACPDynamicModelPublicationPolicy = .standard,
+        thinkingCapabilityPublisher: @escaping OhMyPiThinkingCapabilityPublisher = { _ in }
     ) throws -> Fixture {
         let workspace = try makeTemporaryDirectory()
         let scriptURL = try makeFakeACPServerScript()
@@ -1167,13 +1601,22 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         environment.merge(sync.environment) { _, syncValue in syncValue }
         environment["ACP_RECORD_PATH"] = recordURL.path
         environment["ACP_SHAPE"] = shape
+        let agentKind: AgentProviderKind = switch providerID {
+        case .cursor:
+            .cursor
+        case .openCode:
+            .openCode
+        case .ohMyPi:
+            .ohMyPi
+        }
         let request = ACPRunRequest(
-            agentKind: providerID == .cursor ? .cursor : .openCode,
+            agentKind: agentKind,
             modelString: modelString,
             workspacePath: workspace.path,
             resumeSessionID: resumeSessionID,
             attachments: [],
-            taskLabelKind: nil
+            taskLabelKind: nil,
+            additionalConfigOptionValues: additionalConfigOptionValues
         )
         let provider = ModeConfigFakeACPProvider(
             commandPath: scriptURL.path,
@@ -1190,7 +1633,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 if case let .info(message) = event {
                     diagnostics?.append(message)
                 }
-            }
+            },
+            dynamicModelPublicationPolicy: dynamicModelPublicationPolicy,
+            ohMyPiThinkingCapabilityPublisher: thinkingCapabilityPublisher
         )
         addTeardownBlock {
             await controller.shutdown()
@@ -1275,6 +1720,15 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         }
     }
 
+    private func canonicalRequestBytes(_ requests: [RecordedRequest]) -> [Data] {
+        requests.compactMap {
+            try? JSONSerialization.data(
+                withJSONObject: ["method": $0.method, "params": $0.params],
+                options: [.sortedKeys]
+            )
+        }
+    }
+
     private func makeTemporaryDirectory() throws -> URL {
         try makeTestDirectory(name: "ACPAgentSessionControllerModeConfigTests")
     }
@@ -1295,6 +1749,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         session_id = os.environ.get("ACP_SESSION_ID", "mode-config-session")
         current_mode = "base" if shape == "headless" else "ask"
         current_model = "Foo" if os.environ.get("ACP_MODEL_CASE_COLLISION") == "1" else "model-a"
+        current_thinking = "off"
         mode_config_id = "permission_mode" if shape == "custom_id" else "mode"
         output_lock = threading.Lock()
         sync_events_path = os.environ.get("ACP_SYNC_EVENTS_PATH")
@@ -1394,10 +1849,29 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 "options": model_choices
             }
 
-        def config_options(mode_value=None, include_mode=True, malformed_mode=False, model_value=None):
+        def thinking_option(value=None):
+            choices = [
+                {"value": "off", "name": "Off"},
+                {"value": "high", "name": "High"}
+            ] if current_model == "model-b" else [
+                {"value": "off", "name": "Off"},
+                {"value": "low", "name": "Low"}
+            ]
+            return {
+                "id": os.environ.get("ACP_THINKING_CONFIG_ID", "thinking"),
+                "name": "Thinking",
+                "category": os.environ.get("ACP_THINKING_CATEGORY", "thought_level"),
+                "type": "select",
+                "currentValue": value if value is not None else current_thinking,
+                "options": choices
+            }
+
+        def config_options(mode_value=None, include_mode=True, malformed_mode=False, model_value=None, thinking_value=None):
             result = []
             if os.environ.get("ACP_INCLUDE_MODEL") == "1":
                 result.append(model_option(model_value))
+            if os.environ.get("ACP_INCLUDE_THINKING") == "1":
+                result.append(thinking_option(thinking_value))
             if include_mode:
                 result.append(mode_option(mode_value, malformed_mode))
             return result
@@ -1480,6 +1954,8 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
                 return {"configOptions": config_options(malformed_mode=True)}
             if os.environ.get("ACP_MODEL_RESPONSE_MISMATCH") == "1":
                 return {"configOptions": config_options(model_value="Foo")}
+            if os.environ.get("ACP_THINKING_RESPONSE_MISMATCH") == "1":
+                return {"configOptions": config_options(thinking_value="off")}
             return {"configOptions": config_options()}
 
         def delayed_model_response(request_id):
@@ -1527,12 +2003,27 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             elif method == "session/set_config_option":
                 config_id = params.get("configId")
                 if config_id == os.environ.get("ACP_MODEL_CONFIG_ID", "model"):
+                    if (
+                        os.environ.get("ACP_FAIL_MODEL_RESTORE") == "1"
+                        and params.get("value") == "model-a"
+                        and current_model != "model-a"
+                    ):
+                        respond(request.get("id"), error={"code": -32001, "message": "model rollback rejected"})
+                        continue
                     current_model = params.get("value")
+                    current_thinking = "off"
                     if os.environ.get("ACP_MODEL_CHANGES_MODE_CONFIG_ID") == "1":
                         mode_config_id = "mode_after_model"
-                    if os.environ.get("ACP_MODEL_RELEASE_FIFO"):
+                    if (
+                        os.environ.get("ACP_MODEL_RELEASE_FIFO")
+                        and params.get("value") == "model-b"
+                    ):
                         threading.Thread(target=delayed_model_response, args=(request.get("id"),), daemon=True).start()
                         continue
+                elif config_id == os.environ.get("ACP_THINKING_CONFIG_ID", "thinking"):
+                    current_thinking = params.get("value")
+                    if os.environ.get("ACP_THINKING_RESETS_MODEL") == "1":
+                        current_model = "model-a"
                 else:
                     current_mode = params.get("value")
                 after_mode = os.environ.get("ACP_AFTER_SET_NOTIFICATION_MODE")
@@ -1610,6 +2101,21 @@ private final class LockedACPStreamResults: @unchecked Sendable {
     func waitForTerminal(_ description: String) async throws {
         try await condition.waitUntil(description) { state in
             state.didSeeTerminal
+        }
+    }
+}
+
+private final class LockedOhMyPiThinkingCapabilities: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [OhMyPiThinkingCapabilityRecord] = []
+
+    var records: [OhMyPiThinkingCapabilityRecord] {
+        lock.withLock { storage }
+    }
+
+    func append(_ record: OhMyPiThinkingCapabilityRecord) {
+        lock.withLock {
+            storage.append(record)
         }
     }
 }

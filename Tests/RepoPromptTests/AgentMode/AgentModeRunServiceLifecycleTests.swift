@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import MCP
 import XCTest
 @_spi(TestSupport) @testable import RepoPromptApp
 
@@ -30,6 +31,224 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             await OMPQualificationSharedGateTestIsolation.shared.release()
         #endif
         try await super.tearDown()
+    }
+
+    func testOMPTranscriptAuthoritySuppressesArbitraryProviderTitlesOnlyForMatchingRun() {
+        let harness = makeHarness(recorder: LifecycleRecorder())
+        let runner = harness.service.test_acpRunner()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let runID = UUID()
+        session.selectedAgent = .ohMyPi
+        session.runID = runID
+        runner.testInstallOMPToolTrackingAuthority(session: session, runID: runID)
+
+        XCTAssertTrue(runner.handleToolStreamEvent(
+            .toolCall(.init(toolName: "A completely arbitrary title", invocationID: UUID(), argsJSON: #"{"path":"/tmp/a"}"#)),
+            session: session
+        ))
+        XCTAssertTrue(session.items.isEmpty)
+
+        session.runID = UUID()
+        XCTAssertFalse(runner.handleToolStreamEvent(
+            .toolCall(.init(toolName: "Another arbitrary title", invocationID: UUID(), argsJSON: nil)),
+            session: session
+        ))
+        XCTAssertTrue(session.items.isEmpty)
+    }
+
+    func testOMPPendingProviderFailuresAreDedupedBoundedAndMaterializedNeutrally() {
+        let harness = makeHarness(recorder: LifecycleRecorder())
+        let runner = harness.service.test_acpRunner()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let runID = UUID()
+        session.selectedAgent = .ohMyPi
+        session.runID = runID
+        runner.testInstallOMPToolTrackingAuthority(session: session, runID: runID)
+
+        let duplicateID = UUID()
+        for index in 0 ..< 70 {
+            let invocationID = index < 2 ? duplicateID : UUID()
+            XCTAssertTrue(runner.handleToolStreamEvent(
+                .toolResult(.init(
+                    toolName: "Provider failure \(index)",
+                    invocationID: invocationID,
+                    argsJSON: #"{"raw":true}"#,
+                    resultJSON: "provider payload",
+                    isError: true
+                )),
+                session: session
+            ))
+        }
+        XCTAssertEqual(runner.testOMPTranscriptAuthorityState(tabID: session.tabID).pendingCount, 64)
+
+        runner.testMaterializePendingOMPProviderFailures(session: session)
+        XCTAssertEqual(session.items.count, 64)
+        XCTAssertTrue(session.items.allSatisfy { item in
+            item.kind == .toolResult
+                && item.toolIsError == true
+                && item.toolResultJSON == #"{"note":"Reported failed by Oh My Pi; not correlated with any RepoPrompt MCP-tracked call."}"#
+        })
+        XCTAssertEqual(runner.testOMPTranscriptAuthorityState(tabID: session.tabID).pendingCount, 0)
+    }
+
+    func testOMPProviderFailureBeforeCreditAndCreditBeforeFailurePreserveCardinality() {
+        let harness = makeHarness(recorder: LifecycleRecorder())
+        let runner = harness.service.test_acpRunner()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let runID = UUID()
+        session.selectedAgent = .ohMyPi
+        session.runID = runID
+        runner.testInstallOMPToolTrackingAuthority(session: session, runID: runID)
+
+        XCTAssertTrue(runner.handleToolStreamEvent(
+            .toolResult(.init(
+                toolName: "Failure before credit",
+                invocationID: UUID(),
+                argsJSON: nil,
+                resultJSON: "failed",
+                isError: true
+            )),
+            session: session
+        ))
+        runner.testHandleTrackerToolResult(
+            invocationID: UUID(),
+            toolName: "read_file",
+            args: nil,
+            resultJSON: #"{"error":"denied"}"#,
+            isError: true,
+            session: session
+        )
+        runner.testMaterializePendingOMPProviderFailures(session: session)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .toolResult }), 2)
+        XCTAssertTrue(session.items.contains { item in
+            item.toolName == "Failure before credit"
+                && item.toolResultJSON == #"{"note":"Reported failed by Oh My Pi; not correlated with any RepoPrompt MCP-tracked call."}"#
+        })
+
+        session.setItemsSilently([], reason: .testOverride)
+        runner.testInstallOMPToolTrackingAuthority(session: session, runID: runID)
+        runner.testHandleTrackerToolResult(
+            invocationID: UUID(),
+            toolName: "read_file",
+            args: nil,
+            resultJSON: #"{"error":"denied"}"#,
+            isError: true,
+            session: session
+        )
+        let creditedProviderFailureID = UUID()
+        XCTAssertTrue(runner.handleToolStreamEvent(
+            .toolResult(.init(
+                toolName: "Credited provider failure",
+                invocationID: creditedProviderFailureID,
+                argsJSON: nil,
+                resultJSON: "failed",
+                isError: true
+            )),
+            session: session
+        ))
+        XCTAssertTrue(runner.handleToolStreamEvent(
+            .toolResult(.init(
+                toolName: "Duplicate credited provider failure",
+                invocationID: creditedProviderFailureID,
+                argsJSON: nil,
+                resultJSON: "failed again",
+                isError: true
+            )),
+            session: session
+        ))
+        XCTAssertEqual(runner.testOMPTranscriptAuthorityState(tabID: session.tabID).pendingCount, 0)
+        XCTAssertEqual(runner.testOMPTranscriptAuthorityState(tabID: session.tabID).seenTerminalCount, 1)
+        XCTAssertTrue(runner.handleToolStreamEvent(
+            .toolResult(.init(
+                toolName: "Unmatched pre-dispatch failure",
+                invocationID: UUID(),
+                argsJSON: nil,
+                resultJSON: "failed",
+                isError: true
+            )),
+            session: session
+        ))
+        runner.testMaterializePendingOMPProviderFailures(session: session)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .toolResult }), 2)
+    }
+
+    func testOMPTeardownSynchronouslyIsolatesSuccessorRunState() {
+        let harness = makeHarness(recorder: LifecycleRecorder())
+        let runner = harness.service.test_acpRunner()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .ohMyPi
+
+        let firstRunID = UUID()
+        session.runID = firstRunID
+        runner.testInstallOMPToolTrackingAuthority(session: session, runID: firstRunID)
+        runner.testHandleTrackerToolResult(
+            invocationID: UUID(),
+            toolName: "read_file",
+            args: nil,
+            resultJSON: #"{"error":"denied"}"#,
+            isError: true,
+            session: session
+        )
+        XCTAssertEqual(runner.testOMPTranscriptAuthorityState(tabID: session.tabID).credits, 1)
+
+        runner.testPrepareToolTrackingTeardownState(session: session, matchingRunID: firstRunID)
+        let detached = runner.testOMPTranscriptAuthorityState(tabID: session.tabID)
+        XCTAssertEqual(detached.credits, 0)
+        XCTAssertEqual(detached.pendingCount, 0)
+        XCTAssertEqual(detached.seenTerminalCount, 0)
+        XCTAssertNil(detached.runID)
+
+        let successorRunID = UUID()
+        session.runID = successorRunID
+        runner.testInstallOMPToolTrackingAuthority(session: session, runID: successorRunID)
+        XCTAssertTrue(runner.handleToolStreamEvent(
+            .toolResult(.init(
+                toolName: "Successor failure",
+                invocationID: UUID(),
+                argsJSON: nil,
+                resultJSON: "failed",
+                isError: true
+            )),
+            session: session
+        ))
+        XCTAssertEqual(runner.testOMPTranscriptAuthorityState(tabID: session.tabID).pendingCount, 1)
+    }
+
+    func testOMPTrackerIsSoleToolInputTokenAuthority() {
+        var inputTokenEvents = 0
+        let hooks = AgentToolTrackingHooks(
+            flushPendingAssistantDelta: { _ in },
+            endActiveAssistantSegment: { _ in },
+            endActiveReasoningSegment: { _ in },
+            sealAssistantBoundary: { _ in },
+            requestUIRefresh: { _, _ in },
+            scheduleSave: { _ in },
+            addToolInputTokens: { _, _ in inputTokenEvents += 1 },
+            addToolOutputTokens: { _, _ in }
+        )
+        let harness = makeHarness(recorder: LifecycleRecorder(), toolTrackingHooks: hooks)
+        let runner = harness.service.test_acpRunner()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let runID = UUID()
+        session.selectedAgent = .ohMyPi
+        session.runID = runID
+        runner.testInstallOMPToolTrackingAuthority(session: session, runID: runID)
+        let invocationID = UUID()
+        let rawInput = #"{"path":"/tmp/a"}"#
+
+        XCTAssertTrue(runner.handleToolStreamEvent(
+            .toolCall(.init(toolName: "Opaque title", invocationID: invocationID, argsJSON: rawInput)),
+            session: session
+        ))
+        runner.testHandleTrackerToolCall(
+            invocationID: invocationID,
+            toolName: "read_file",
+            args: ["path": .string("/tmp/a")],
+            session: session
+        )
+
+        XCTAssertEqual(inputTokenEvents, 1)
+        XCTAssertEqual(session.items.count(where: { $0.kind == .toolCall }), 1)
     }
 
     func testTerminalCommitPreservesRebuiltToolCorrelationIndexes() async throws {
@@ -4439,6 +4658,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
         publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
         handleHeadlessStreamResult: ((AIStreamResult) async -> Void)? = nil,
+        toolTrackingHooks: AgentToolTrackingHooks = .noOp,
         autoSignalACPRouting: Bool = false,
         expectedPIDPolicyArmer: @escaping (MCPBootstrapLeaseSpec) async -> Bool = { _ in true },
         ompQualificationAuthorizer: @escaping (OhMyPiAgentModeSmokeGate.StartTransaction, UUID) -> Bool = { _, _ in false },
@@ -4547,7 +4767,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     publishTerminalCommit: publishTerminalCommit,
                     handleHeadlessStreamResult: handleHeadlessStreamResult
                 ),
-                toolTrackingHooks: .noOp
+                toolTrackingHooks: toolTrackingHooks
             ),
             host: host
         )

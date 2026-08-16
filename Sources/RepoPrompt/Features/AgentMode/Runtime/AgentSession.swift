@@ -248,6 +248,9 @@ struct AgentSession: Codable, Identifiable {
     /// Model used for this session (e.g., "sonnet", "opus", "codexMedium")
     var agentModel: String?
 
+    /// Destination-owned OMP thinking selections for this tab/session.
+    var ohMyPiThinkingSelections: OhMyPiThinkingSelections?
+
     /// User-selected reasoning effort (Codex-only)
     var agentReasoningEffort: String?
 
@@ -332,6 +335,7 @@ struct AgentSession: Codable, Identifiable {
         lastUserMessageAt: Date? = nil,
         agentKind: String? = nil,
         agentModel: String? = nil,
+        ohMyPiThinkingSelections: OhMyPiThinkingSelections? = nil,
         agentReasoningEffort: String? = nil,
         lastRunState: String? = nil,
         providerSessionID: String? = nil,
@@ -374,6 +378,7 @@ struct AgentSession: Codable, Identifiable {
         self.lastUserMessageAt = lastUserMessageAt
         self.agentKind = agentKind
         self.agentModel = agentModel
+        self.ohMyPiThinkingSelections = ohMyPiThinkingSelections?.nilIfEmpty
         self.agentReasoningEffort = agentReasoningEffort
         self.lastRunState = lastRunState
         self.providerSessionID = providerSessionID
@@ -419,6 +424,7 @@ struct AgentSession: Codable, Identifiable {
         case lastUserMessageAt
         case agentKind
         case agentModel
+        case ohMyPiThinkingSelections
         case agentReasoningEffort
         case lastRunState
         case providerSessionID
@@ -469,6 +475,10 @@ struct AgentSession: Codable, Identifiable {
         lastUserMessageAt = try container.decodeIfPresent(Date.self, forKey: .lastUserMessageAt)
         agentKind = try container.decodeIfPresent(String.self, forKey: .agentKind)
         agentModel = try container.decodeIfPresent(String.self, forKey: .agentModel)
+        ohMyPiThinkingSelections = try container.decodeIfPresent(
+            OhMyPiThinkingSelections.self,
+            forKey: .ohMyPiThinkingSelections
+        )?.nilIfEmpty
         agentReasoningEffort = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffort)
         lastRunState = try container.decodeIfPresent(String.self, forKey: .lastRunState)
         providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)

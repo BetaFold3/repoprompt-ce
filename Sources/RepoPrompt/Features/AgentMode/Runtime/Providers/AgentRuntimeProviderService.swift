@@ -254,8 +254,14 @@ final class AgentRuntimeProviderService {
         modelString: String? = nil,
         runType: AgentRunType = .discover,
         workspacePath: String? = nil,
+        additionalConfigOptionValues: [ACPConfigOptionAssignment] = [],
         defaults: UserDefaults = .standard
     ) throws -> HeadlessAgentProvider {
+        guard additionalConfigOptionValues.isEmpty || agent == .ohMyPi else {
+            throw AIProviderError.invalidConfiguration(
+                detail: "Additional ACP configuration assignments are only valid for Oh My Pi providers."
+            )
+        }
         if Self.enableDebugLogging {
             Self.logger.debug("Creating provider for agent: \(agent.displayName), model: \(modelString ?? "default"), runType: \(String(describing: runType))")
         }
@@ -323,6 +329,7 @@ final class AgentRuntimeProviderService {
             let config = OhMyPiAgentConfig(
                 commandName: agent.commandName,
                 modelString: modelString,
+                additionalConfigOptionValues: additionalConfigOptionValues,
                 enableDebugLogging: Self.enableDebugLogging,
                 includeRepoPromptMCPServer: true
             )

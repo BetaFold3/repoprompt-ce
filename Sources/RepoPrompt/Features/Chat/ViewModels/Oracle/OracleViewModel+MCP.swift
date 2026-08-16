@@ -2644,6 +2644,7 @@ extension OracleViewModel {
         workspaceID: UUID? = nil,
         lookupContext: WorkspaceLookupContext? = nil,
         resolvedModel: AIModel? = nil,
+        resolvedModelPresetID: UUID? = nil,
         finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
@@ -2661,14 +2662,17 @@ extension OracleViewModel {
         // 1) Resolve model
         let model: AIModel
         let chatPresetID: UUID?
+        let modelPresetID: UUID?
 
         if let resolvedModel {
             model = resolvedModel
             chatPresetID = nil
+            modelPresetID = resolvedModelPresetID
         } else if useChatModelDirectly {
             // UI-triggered: use the current chat model directly, bypassing MCP preset logic
             model = promptViewModel.preferredAIModel
             chatPresetID = nil
+            modelPresetID = nil
         } else {
             // MCP-triggered: use preset resolution logic
             let presetsManager = ModelPresetsManager.shared
@@ -2684,6 +2688,21 @@ extension OracleViewModel {
             )
             model = modelSelection.model
             chatPresetID = modelSelection.chatPresetID
+            modelPresetID = modelSelection.modelPresetID
+        }
+
+        let effectiveProfile = workspaceID.map {
+            GlobalSettingsStore.shared.effectiveAgentModelsProfile(workspaceID: $0)
+        }
+        let resolvedModelPreset = modelPresetID.flatMap { ModelPresetsManager.shared.preset(withID: $0) }
+        let ohMyPiThinkingSelections: OhMyPiThinkingSelections = if let resolvedModelPreset {
+            resolvedModelPreset.ohMyPiThinkingSelections
+        } else if useChatModelDirectly {
+            effectiveProfile?.preferredComposeOhMyPiThinkingSelections
+                ?? promptViewModel.preferredModelOhMyPiThinkingSelections
+        } else {
+            effectiveProfile?.planningModelOhMyPiThinkingSelections
+                ?? promptViewModel.planningModelOhMyPiThinkingSelections
         }
 
         // 2) Build snapshot
@@ -2700,11 +2719,14 @@ extension OracleViewModel {
         try Task.checkCancellation()
 
         // 3) Build AIMessage from snapshot
-        let aiMessage = try await promptViewModel.buildHeadlessAIMessage(
+        let packagedAIMessage = try await promptViewModel.buildHeadlessAIMessage(
             from: snapshot,
             model: model,
             mode: mode,
             gitScopeOverride: gitScopeOverride
+        )
+        let aiMessage = packagedAIMessage.replacingExecutionMetadata(
+            ohMyPiThinkingSelections.executionMetadata(for: model)
         )
 
         try Task.checkCancellation()

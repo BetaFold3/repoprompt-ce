@@ -160,8 +160,11 @@ enum ContextBuilderSettingsWriteIntent {
 struct AgentModelsSettingsProfile: Codable, Equatable {
     var planningModelRaw: String?
     var preferredComposeModelRaw: String?
+    var planningModelOhMyPiThinkingSelections: OhMyPiThinkingSelections
+    var preferredComposeOhMyPiThinkingSelections: OhMyPiThinkingSelections
     var syncChatModelWithOracle: Bool
     var contextBuilderAgentRaw: String?
+    var contextBuilderOhMyPiThinkingSelections: OhMyPiThinkingSelections
     var contextBuilderModelsByAgent: [String: String]?
     var mcpAgentRoleOverrides: [String: String]?
     var restrictMCPAgentDiscoveryToRoleLabels: Bool
@@ -169,16 +172,22 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
     init(
         planningModelRaw: String? = nil,
         preferredComposeModelRaw: String? = nil,
+        planningModelOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty,
+        preferredComposeOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty,
         syncChatModelWithOracle: Bool = false,
         contextBuilderAgentRaw: String? = nil,
+        contextBuilderOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty,
         contextBuilderModelsByAgent: [String: String]? = nil,
         mcpAgentRoleOverrides: [String: String]? = nil,
         restrictMCPAgentDiscoveryToRoleLabels: Bool = false
     ) {
         self.planningModelRaw = Self.normalizedChatModelRaw(planningModelRaw)
         self.preferredComposeModelRaw = Self.normalizedChatModelRaw(preferredComposeModelRaw)
+        self.planningModelOhMyPiThinkingSelections = planningModelOhMyPiThinkingSelections
+        self.preferredComposeOhMyPiThinkingSelections = preferredComposeOhMyPiThinkingSelections
         self.syncChatModelWithOracle = syncChatModelWithOracle
         self.contextBuilderAgentRaw = Self.normalizedAgentRaw(contextBuilderAgentRaw)
+        self.contextBuilderOhMyPiThinkingSelections = contextBuilderOhMyPiThinkingSelections
         self.contextBuilderModelsByAgent = Self.normalizedContextBuilderModelsByAgent(contextBuilderModelsByAgent)
         self.mcpAgentRoleOverrides = Self.normalizedStringMap(mcpAgentRoleOverrides)
         self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
@@ -187,8 +196,11 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case planningModelRaw
         case preferredComposeModelRaw
+        case planningModelOhMyPiThinkingSelections
+        case preferredComposeOhMyPiThinkingSelections
         case syncChatModelWithOracle
         case contextBuilderAgentRaw
+        case contextBuilderOhMyPiThinkingSelections
         case contextBuilderModelsByAgent
         case mcpAgentRoleOverrides
         case restrictMCPAgentDiscoveryToRoleLabels
@@ -199,11 +211,49 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         try self.init(
             planningModelRaw: container.decodeIfPresent(String.self, forKey: .planningModelRaw),
             preferredComposeModelRaw: container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw),
+            planningModelOhMyPiThinkingSelections: OhMyPiThinkingSelections.decodeIfPresent(
+                from: container,
+                forKey: .planningModelOhMyPiThinkingSelections
+            ),
+            preferredComposeOhMyPiThinkingSelections: OhMyPiThinkingSelections.decodeIfPresent(
+                from: container,
+                forKey: .preferredComposeOhMyPiThinkingSelections
+            ),
             syncChatModelWithOracle: container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle) ?? false,
             contextBuilderAgentRaw: container.decodeIfPresent(String.self, forKey: .contextBuilderAgentRaw),
+            contextBuilderOhMyPiThinkingSelections: OhMyPiThinkingSelections.decodeIfPresent(
+                from: container,
+                forKey: .contextBuilderOhMyPiThinkingSelections
+            ),
             contextBuilderModelsByAgent: container.decodeIfPresent([String: String].self, forKey: .contextBuilderModelsByAgent),
             mcpAgentRoleOverrides: container.decodeIfPresent([String: String].self, forKey: .mcpAgentRoleOverrides),
             restrictMCPAgentDiscoveryToRoleLabels: container.decodeIfPresent(Bool.self, forKey: .restrictMCPAgentDiscoveryToRoleLabels) ?? false
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(planningModelRaw, forKey: .planningModelRaw)
+        try container.encodeIfPresent(preferredComposeModelRaw, forKey: .preferredComposeModelRaw)
+        try planningModelOhMyPiThinkingSelections.encodeIfNonEmpty(
+            to: &container,
+            forKey: .planningModelOhMyPiThinkingSelections
+        )
+        try preferredComposeOhMyPiThinkingSelections.encodeIfNonEmpty(
+            to: &container,
+            forKey: .preferredComposeOhMyPiThinkingSelections
+        )
+        try container.encode(syncChatModelWithOracle, forKey: .syncChatModelWithOracle)
+        try container.encodeIfPresent(contextBuilderAgentRaw, forKey: .contextBuilderAgentRaw)
+        try contextBuilderOhMyPiThinkingSelections.encodeIfNonEmpty(
+            to: &container,
+            forKey: .contextBuilderOhMyPiThinkingSelections
+        )
+        try container.encodeIfPresent(contextBuilderModelsByAgent, forKey: .contextBuilderModelsByAgent)
+        try container.encodeIfPresent(mcpAgentRoleOverrides, forKey: .mcpAgentRoleOverrides)
+        try container.encode(
+            restrictMCPAgentDiscoveryToRoleLabels,
+            forKey: .restrictMCPAgentDiscoveryToRoleLabels
         )
     }
 
@@ -457,15 +507,21 @@ struct GlobalScalarPreferences: Codable, Equatable {
     struct ModelSelectionSettings: Codable, Equatable {
         var preferredComposeModel: String?
         var planningModel: String?
+        var preferredComposeOhMyPiThinkingSelections: OhMyPiThinkingSelections?
+        var planningModelOhMyPiThinkingSelections: OhMyPiThinkingSelections?
         var syncChatModelWithOracle: Bool?
 
         init(
             preferredComposeModel: String? = nil,
             planningModel: String? = nil,
+            preferredComposeOhMyPiThinkingSelections: OhMyPiThinkingSelections? = nil,
+            planningModelOhMyPiThinkingSelections: OhMyPiThinkingSelections? = nil,
             syncChatModelWithOracle: Bool? = nil
         ) {
             self.preferredComposeModel = preferredComposeModel
             self.planningModel = planningModel
+            self.preferredComposeOhMyPiThinkingSelections = preferredComposeOhMyPiThinkingSelections?.nilIfEmpty
+            self.planningModelOhMyPiThinkingSelections = planningModelOhMyPiThinkingSelections?.nilIfEmpty
             self.syncChatModelWithOracle = syncChatModelWithOracle
         }
     }

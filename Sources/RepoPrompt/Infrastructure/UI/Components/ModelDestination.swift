@@ -10,11 +10,21 @@ struct ModelDestination: Identifiable {
     let id: String
     private let getter: @MainActor () -> String
     private let applier: @MainActor (String) -> Void
+    private let thinkingGetter: (@MainActor () -> OhMyPiThinkingSelections)?
+    private let thinkingApplier: (@MainActor (OhMyPiThinkingSelections) -> Void)?
 
-    init(id: String, getter: @escaping @MainActor () -> String, applier: @escaping @MainActor (String) -> Void) {
+    init(
+        id: String,
+        getter: @escaping @MainActor () -> String,
+        applier: @escaping @MainActor (String) -> Void,
+        thinkingGetter: (@MainActor () -> OhMyPiThinkingSelections)? = nil,
+        thinkingApplier: (@MainActor (OhMyPiThinkingSelections) -> Void)? = nil
+    ) {
         self.id = id
         self.getter = getter
         self.applier = applier
+        self.thinkingGetter = thinkingGetter
+        self.thinkingApplier = thinkingApplier
     }
 
     /// The current model raw value for this destination
@@ -25,6 +35,32 @@ struct ModelDestination: Identifiable {
     /// Apply a new model selection to this destination
     func apply(_ rawValue: String) {
         applier(rawValue)
+    }
+
+    var hasThinkingAccessory: Bool {
+        thinkingGetter != nil && thinkingApplier != nil
+    }
+
+    var currentThinkingSelections: OhMyPiThinkingSelections? {
+        thinkingGetter?()
+    }
+
+    func applyThinkingSelections(_ selections: OhMyPiThinkingSelections) {
+        thinkingApplier?(selections)
+    }
+
+    func thinkingChoice(for exactWireModelID: String) -> OhMyPiThinkingSelections.ThinkingChoice? {
+        thinkingGetter?()[exactWireModelID]
+    }
+
+    func applyThinkingValue(
+        _ value: String?,
+        for exactWireModelID: String,
+        updatedAt: Date = Date()
+    ) {
+        guard var selections = thinkingGetter?(), let thinkingApplier else { return }
+        selections.setValue(value, for: exactWireModelID, updatedAt: updatedAt)
+        thinkingApplier(selections)
     }
 }
 
@@ -39,6 +75,34 @@ extension ModelDestination {
             applier: { binding.wrappedValue = $0 }
         )
     }
+
+    static func binding(
+        _ binding: Binding<String>,
+        thinkingSelections: Binding<OhMyPiThinkingSelections>,
+        id: String
+    ) -> ModelDestination {
+        ModelDestination(
+            id: id,
+            getter: { binding.wrappedValue },
+            applier: { binding.wrappedValue = $0 },
+            thinkingGetter: { thinkingSelections.wrappedValue },
+            thinkingApplier: { thinkingSelections.wrappedValue = $0 }
+        )
+    }
+}
+
+// MARK: - Agent Tab Destination
+
+extension ModelDestination {
+    static func agentTab(_ session: AgentModeViewModel.TabSession) -> ModelDestination {
+        ModelDestination(
+            id: "agentTab.\(session.tabID.uuidString)",
+            getter: { session.selectedModelRaw },
+            applier: { session.selectedModelRaw = $0 },
+            thinkingGetter: { session.ohMyPiThinkingSelections },
+            thinkingApplier: { session.ohMyPiThinkingSelections = $0 }
+        )
+    }
 }
 
 // MARK: - PromptViewModel-backed Destinations
@@ -50,7 +114,9 @@ extension ModelDestination {
         ModelDestination(
             id: "chatModel",
             getter: { promptVM.preferredModel },
-            applier: { promptVM.preferredModel = $0 }
+            applier: { promptVM.preferredModel = $0 },
+            thinkingGetter: { promptVM.preferredModelOhMyPiThinkingSelections },
+            thinkingApplier: { promptVM.preferredModelOhMyPiThinkingSelections = $0 }
         )
     }
 
@@ -59,7 +125,9 @@ extension ModelDestination {
         ModelDestination(
             id: "contextBuilderModel",
             getter: { promptVM.contextBuilderModelName },
-            applier: { promptVM.contextBuilderModelName = $0 }
+            applier: { promptVM.contextBuilderModelName = $0 },
+            thinkingGetter: { promptVM.contextBuilderOhMyPiThinkingSelections },
+            thinkingApplier: { promptVM.contextBuilderOhMyPiThinkingSelections = $0 }
         )
     }
 
@@ -85,7 +153,9 @@ extension ModelDestination {
                         )
                     }
                 }
-            }
+            },
+            thinkingGetter: { promptVM.planningModelOhMyPiThinkingSelections },
+            thinkingApplier: { promptVM.planningModelOhMyPiThinkingSelections = $0 }
         )
     }
 }

@@ -134,6 +134,10 @@ final class AgentModeRunService {
     private let hooks: Hooks
 
     #if DEBUG
+        func test_acpRunner() -> ACPIntegratedAgentModeRunner {
+            acpRunner
+        }
+
         func test_attachmentFinalizationHook() -> (
             AgentModeViewModel.TabSession,
             UUID?,
@@ -294,6 +298,11 @@ final class AgentModeRunService {
                 attachments: attachments,
                 taskLabelKind: session.mcpControlContext?.taskLabelKind,
                 sessionModeID: runtimePermission.acpSessionModeID,
+                additionalConfigOptionValues: Self.ohMyPiConfigAssignments(
+                    agent: selectedAgent,
+                    exactWireModelID: selectedModelString,
+                    selections: session.ohMyPiThinkingSelections
+                ),
                 autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions
             )
         } else {
@@ -484,6 +493,11 @@ final class AgentModeRunService {
             attachments: attachments,
             taskLabelKind: session.mcpControlContext?.taskLabelKind,
             sessionModeID: runtimePermission.acpSessionModeID,
+            additionalConfigOptionValues: Self.ohMyPiConfigAssignments(
+                agent: selectedAgent,
+                exactWireModelID: selectedModelString,
+                selections: session.ohMyPiThinkingSelections
+            ),
             autoApproveAllToolPermissions: runtimePermission.autoApproveAllACPToolPermissions
         )
         let sent = await acpRunner.submitActivePrompt(
@@ -654,6 +668,21 @@ final class AgentModeRunService {
         }
 
         return true
+    }
+
+    static func ohMyPiConfigAssignments(
+        agent: AgentProviderKind,
+        exactWireModelID: String?,
+        selections: OhMyPiThinkingSelections
+    ) -> [ACPConfigOptionAssignment] {
+        guard agent == .ohMyPi,
+              let rawModelID = exactWireModelID,
+              let canonicalModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: rawModelID),
+              let assignment = selections.assignment(for: canonicalModelID)
+        else {
+            return []
+        }
+        return [assignment]
     }
 
     private static func providerStartupFailureMessage(for error: Error) -> String {

@@ -101,6 +101,20 @@ final class ACPIntegratedAgentModeRunner {
     private var toolTrackingRunIDByTabID: [UUID: UUID] = [:]
     private var acpProviderInvocationByTrackerInvocationIDByTabID: [UUID: [UUID: UUID]] = [:]
     private var acpProviderPlaceholderInvocationIDsByTabID: [UUID: Set<UUID>] = [:]
+
+    private struct PendingOMPProviderFailure {
+        let toolCallID: UUID?
+        let title: String
+        let rawInput: String?
+    }
+
+    private static let maxPendingOMPProviderFailures = 64
+    private static let ompUncorrelatedFailureJSON =
+        #"{"note":"Reported failed by Oh My Pi; not correlated with any RepoPrompt MCP-tracked call."}"#
+    private var trackerErrorCreditsByTabID: [UUID: Int] = [:]
+    private var pendingOMPProviderFailuresByTabID: [UUID: [PendingOMPProviderFailure]] = [:]
+    /// Run-scoped terminal IDs, including failures consumed by a tracker credit.
+    private var seenOMPProviderFailureIDsByTabID: [UUID: Set<UUID>] = [:]
     #if DEBUG
         struct OMPQualificationStartupProbes {
             var beforeAgentTaskEntry: () async -> Void = {}
@@ -895,7 +909,11 @@ final class ACPIntegratedAgentModeRunner {
         runRequest: ACPRunRequest,
         terminalState: AgentSessionRunState
     ) async {
-        await teardownToolTrackingAfterSessionLoss(tabID: tabID, runID: runID)
+        await teardownToolTrackingAfterSessionLoss(
+            tabID: tabID,
+            runID: runID,
+            session: session.value
+        )
         if let liveSession = session.value {
             hooks.finalizeAttachmentsForTurn(
                 liveSession,
@@ -1676,13 +1694,6 @@ final class ACPIntegratedAgentModeRunner {
         else {
             return
         }
-        if runRequest.agentKind == .ohMyPi {
-            guard let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .ohMyPi),
-                  snapshot.contains(rawModel: model)
-            else {
-                return
-            }
-        }
         if runRequest.agentKind == .cursor,
            let snapshot = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor),
            !Self.cursorRegistryAllowsSelectedModel(model, snapshot: snapshot)
@@ -1690,7 +1701,14 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
         log("applying \(runRequest.agentKind.displayName) selected model=\(model)", runID: runID)
-        try await controller.setSessionModel(model)
+        if runRequest.agentKind == .ohMyPi {
+            try await controller.setSessionSelection(
+                model: model,
+                additionalOptions: runRequest.additionalConfigOptionValues
+            )
+        } else {
+            try await controller.setSessionModel(model)
+        }
     }
 
     static func cursorRegistryAllowsSelectedModel(
@@ -1824,6 +1842,12 @@ final class ACPIntegratedAgentModeRunner {
             log("finalize ignored; session no longer owns run", runID: runID)
             return
         }
+        if session.selectedAgent == .ohMyPi,
+           toolTrackingRunIDByTabID[session.tabID] == runID
+        {
+            await toolTrackingByTabID[session.tabID]?.waitForPendingEventDeliveries()
+            materializePendingOMPProviderFailures(for: session)
+        }
         let supportsSessionResume = terminalState == .completed && controller != nil
         await terminalCommitBarrier.commit(.init(
             session: session,
@@ -1878,6 +1902,9 @@ final class ACPIntegratedAgentModeRunner {
         await controller.startTracking(
             runID: runID,
             clientNameHint: clientNameHint,
+            observationPolicy: session.selectedAgent == .ohMyPi
+                ? .executionAndPreExecutionDenials
+                : .executionOnly,
             onCalled: { [weak self, weak session] invocationID, toolName, args in
                 guard let self, let session else { return }
                 handleTrackerToolCall(invocationID: invocationID, toolName: toolName, args: args, session: session)
@@ -1893,24 +1920,35 @@ final class ACPIntegratedAgentModeRunner {
         for session: AgentModeViewModel.TabSession,
         matchingRunID: UUID? = nil
     ) -> AgentRunAttemptTerminalResources.Teardown? {
-        prepareToolTrackingTeardown(tabID: session.tabID, matchingRunID: matchingRunID)
+        prepareToolTrackingTeardown(
+            tabID: session.tabID,
+            matchingRunID: matchingRunID,
+            session: session
+        )
     }
 
     private func prepareToolTrackingTeardown(
         tabID: UUID,
-        matchingRunID: UUID? = nil
+        matchingRunID: UUID? = nil,
+        session: AgentModeViewModel.TabSession? = nil
     ) -> AgentRunAttemptTerminalResources.Teardown? {
         if let matchingRunID, toolTrackingRunIDByTabID[tabID] != matchingRunID {
             return nil
         }
         let stoppedRunID = toolTrackingRunIDByTabID.removeValue(forKey: tabID)
-        guard let controller = toolTrackingByTabID.removeValue(forKey: tabID) else { return nil }
+        let pendingFailures = takePendingOMPProviderFailures(for: tabID)
         resetACPToolCorrelation(for: tabID)
+        guard let controller = toolTrackingByTabID.removeValue(forKey: tabID) else { return nil }
         #if DEBUG
             let stoppedHook = ompQualificationStartupProbes.toolTrackingStopped
         #endif
-        return {
+        // State is detached synchronously above. A successor run can start while stopTracking
+        // drains without inheriting credits, failures, seen terminal IDs, or ACP correlation.
+        return { [weak self, session] in
             await controller.stopTracking()
+            if let self, let session {
+                materializeOMPProviderFailures(pendingFailures, for: session)
+            }
             #if DEBUG
                 if let stoppedRunID {
                     stoppedHook(stoppedRunID)
@@ -1919,8 +1957,16 @@ final class ACPIntegratedAgentModeRunner {
         }
     }
 
-    private func teardownToolTrackingAfterSessionLoss(tabID: UUID, runID: UUID) async {
-        let teardown = prepareToolTrackingTeardown(tabID: tabID, matchingRunID: runID)
+    private func teardownToolTrackingAfterSessionLoss(
+        tabID: UUID,
+        runID: UUID,
+        session: AgentModeViewModel.TabSession? = nil
+    ) async {
+        let teardown = prepareToolTrackingTeardown(
+            tabID: tabID,
+            matchingRunID: runID,
+            session: session
+        )
         await teardown?()
     }
 
@@ -2047,6 +2093,9 @@ final class ACPIntegratedAgentModeRunner {
         isError: Bool,
         session: AgentModeViewModel.TabSession
     ) {
+        if isError {
+            recordOMPTrackerErrorCredit(for: session)
+        }
         guard AgentToolTrackingSupport.isRepoPromptTool(toolName) else { return }
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         #if DEBUG
@@ -2415,9 +2464,86 @@ final class ACPIntegratedAgentModeRunner {
         return providerInvocationID
     }
 
+    private func isOMPToolTrackingActive(for session: AgentModeViewModel.TabSession) -> Bool {
+        guard session.selectedAgent == .ohMyPi, let runID = session.runID else { return false }
+        return toolTrackingRunIDByTabID[session.tabID] == runID
+    }
+
+    private func recordOMPTrackerErrorCredit(for session: AgentModeViewModel.TabSession) {
+        guard isOMPToolTrackingActive(for: session) else { return }
+        // Credits only apply to provider failures that arrive later. Consuming an earlier
+        // unmatched failure would hide evidence from an unrelated denied/cancelled call.
+        trackerErrorCreditsByTabID[session.tabID, default: 0] += 1
+    }
+
+    private func recordOMPProviderFailure(
+        toolCallID: UUID?,
+        title: String,
+        rawInput: String?,
+        session: AgentModeViewModel.TabSession
+    ) {
+        let tabID = session.tabID
+        if let toolCallID {
+            guard seenOMPProviderFailureIDsByTabID[tabID, default: []].insert(toolCallID).inserted else {
+                return
+            }
+        }
+        if let credits = trackerErrorCreditsByTabID[tabID], credits > 0 {
+            trackerErrorCreditsByTabID[tabID] = credits == 1 ? nil : credits - 1
+            return
+        }
+        guard pendingOMPProviderFailuresByTabID[tabID, default: []].count
+            < Self.maxPendingOMPProviderFailures else { return }
+        pendingOMPProviderFailuresByTabID[tabID, default: []].append(.init(
+            toolCallID: toolCallID,
+            title: title,
+            rawInput: rawInput
+        ))
+    }
+
+    private func takePendingOMPProviderFailures(for tabID: UUID) -> [PendingOMPProviderFailure] {
+        let pending = pendingOMPProviderFailuresByTabID.removeValue(forKey: tabID) ?? []
+        trackerErrorCreditsByTabID[tabID] = nil
+        return pending
+    }
+
+    private func materializePendingOMPProviderFailures(for session: AgentModeViewModel.TabSession) {
+        materializeOMPProviderFailures(
+            takePendingOMPProviderFailures(for: session.tabID),
+            for: session
+        )
+    }
+
+    private func materializeOMPProviderFailures(
+        _ pending: [PendingOMPProviderFailure],
+        for session: AgentModeViewModel.TabSession
+    ) {
+        guard !pending.isEmpty else { return }
+        let tabID = session.tabID
+        toolTrackingHooks.flushPendingAssistantDelta(session)
+        toolTrackingHooks.endActiveAssistantSegment(session)
+        toolTrackingHooks.endActiveReasoningSegment(session)
+        for failure in pending {
+            var item = AgentChatItem.toolResult(
+                name: failure.title,
+                invocationID: failure.toolCallID,
+                resultJSON: Self.ompUncorrelatedFailureJSON,
+                isError: true,
+                sequenceIndex: session.nextSequenceIndex
+            )
+            item.toolArgsJSON = failure.rawInput
+            session.appendItem(item)
+        }
+        toolTrackingHooks.requestUIRefresh(tabID, false)
+        toolTrackingHooks.scheduleSave(tabID)
+    }
+
     private func resetACPToolCorrelation(for tabID: UUID) {
         acpProviderInvocationByTrackerInvocationIDByTabID[tabID] = nil
         acpProviderPlaceholderInvocationIDsByTabID[tabID] = nil
+        trackerErrorCreditsByTabID[tabID] = nil
+        pendingOMPProviderFailuresByTabID[tabID] = nil
+        seenOMPProviderFailureIDsByTabID[tabID] = nil
     }
 
     private func toolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
@@ -2460,6 +2586,38 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     #if DEBUG
+        func testInstallOMPToolTrackingAuthority(
+            session: AgentModeViewModel.TabSession,
+            runID: UUID
+        ) {
+            resetACPToolCorrelation(for: session.tabID)
+            toolTrackingRunIDByTabID[session.tabID] = runID
+        }
+
+        func testMaterializePendingOMPProviderFailures(
+            session: AgentModeViewModel.TabSession
+        ) {
+            materializePendingOMPProviderFailures(for: session)
+        }
+
+        func testOMPTranscriptAuthorityState(
+            tabID: UUID
+        ) -> (credits: Int, pendingCount: Int, seenTerminalCount: Int, runID: UUID?) {
+            (
+                trackerErrorCreditsByTabID[tabID] ?? 0,
+                pendingOMPProviderFailuresByTabID[tabID]?.count ?? 0,
+                seenOMPProviderFailureIDsByTabID[tabID]?.count ?? 0,
+                toolTrackingRunIDByTabID[tabID]
+            )
+        }
+
+        func testPrepareToolTrackingTeardownState(
+            session: AgentModeViewModel.TabSession,
+            matchingRunID: UUID
+        ) {
+            _ = prepareToolTrackingTeardown(for: session, matchingRunID: matchingRunID)
+        }
+
         func testHandleTrackerToolCall(
             invocationID: UUID,
             toolName: String,
@@ -2530,6 +2688,20 @@ final class ACPIntegratedAgentModeRunner {
         _ event: AgentToolStreamEvent,
         session: AgentModeViewModel.TabSession
     ) -> Bool {
+        // For the exact managed OMP run, the MCP tracker is the transcript and token
+        // authority. Provider titles are intentionally not inspected for identity.
+        if isOMPToolTrackingActive(for: session) {
+            if case let .toolResult(result) = event, result.isError == true {
+                recordOMPProviderFailure(
+                    toolCallID: result.invocationID,
+                    title: result.toolName,
+                    rawInput: result.argsJSON,
+                    session: session
+                )
+            }
+            return true
+        }
+
         // ACP provider events carry the provider's tool invocation IDs, while the
         // MCP tracker sees RepoPrompt's internal invocation IDs. Render explicit
         // RepoPrompt tool cards here so AgentModeViewModel can remain provider-neutral.

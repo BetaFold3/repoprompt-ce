@@ -215,6 +215,38 @@ final class AgentSessionProfilePersistenceTests: XCTestCase {
         XCTAssertEqual(sidebar.preferredSessionIDByTabID[tabID], sessionID)
     }
 
+    func testDataServiceStubPreservesOhMyPiThinkingSelections() async throws {
+        let service = AgentSessionDataService.shared
+        let workspace = makeTemporaryWorkspace()
+        defer { try? FileManager.default.removeItem(at: try XCTUnwrap(workspace.customStoragePath)) }
+        let wireID = "cursor/persisted-model"
+        var selections = OhMyPiThinkingSelections()
+        selections.setValue(
+            "high",
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 40)
+        )
+        let session = AgentSession(
+            id: UUID(),
+            workspaceID: workspace.id,
+            name: "OMP Metadata Session",
+            savedAt: Date(timeIntervalSinceReferenceDate: 41),
+            agentKind: AgentProviderKind.ohMyPi.rawValue,
+            agentModel: wireID,
+            ohMyPiThinkingSelections: selections
+        )
+
+        let fileURL = try await service.saveAgentSession(
+            session,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: 0
+        )
+        let stub = try await service.loadAgentSessionStub(from: fileURL)
+
+        XCTAssertEqual(stub.ohMyPiThinkingSelections, selections)
+    }
+
     func testMetadataRecordMatchingIncludesProfile() throws {
         let sessionID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000211"))
         let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-\(sessionID.uuidString).json")

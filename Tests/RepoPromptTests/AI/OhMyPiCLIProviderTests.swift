@@ -25,14 +25,22 @@ final class OhMyPiCLIProviderTests: XCTestCase {
             }
         )
 
+        let thinking = ACPConfigOptionAssignment.ohMyPiThinking("high")
         let result = try await provider.completeMessage(
-            AIMessage(systemPrompt: "", userMessage: "Hello"),
+            AIMessage(
+                systemPrompt: "",
+                userMessage: "Hello",
+                executionMetadata: AIMessageExecutionMetadata(
+                    additionalACPConfigOptionValues: [thinking]
+                )
+            ),
             model: .ohMyPiCustom(name: "cursor/gpt:fast")
         )
 
         XCTAssertEqual(result.text, "complete")
         XCTAssertEqual(recorder.steps, ["warm", "connection"])
         XCTAssertEqual(recorder.config?.modelString, canonicalRaw)
+        XCTAssertEqual(recorder.config?.additionalConfigOptionValues, [thinking])
         XCTAssertEqual(recorder.config?.includeRepoPromptMCPServer, false)
         XCTAssertNil(recorder.workspacePath)
         XCTAssertEqual(fake.lastMessage?.resumeSessionID, nil)

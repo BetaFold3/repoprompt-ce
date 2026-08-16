@@ -20,7 +20,10 @@ final class OhMyPiACPHeadlessAgentProviderTests: XCTestCase {
                 includeRepoPromptMCPServer: false
             ),
             runID: UUID(),
-            setModel: { model in await modelRecorder.record(model) },
+            setSelection: { model, options in
+                XCTAssertTrue(options.isEmpty)
+                await modelRecorder.record(model)
+            },
             routeCheck: { _ in
                 XCTFail("MCP-disabled requests must not check routing")
                 return false
@@ -37,8 +40,9 @@ final class OhMyPiACPHeadlessAgentProviderTests: XCTestCase {
                     includeRepoPromptMCPServer: false
                 ),
                 runID: UUID(),
-                setModel: { model in
+                setSelection: { model, options in
                     XCTAssertEqual(model, canonicalModel)
+                    XCTAssertTrue(options.isEmpty)
                     throw TestFailure.setModel
                 },
                 routeCheck: { _ in
@@ -59,7 +63,7 @@ final class OhMyPiACPHeadlessAgentProviderTests: XCTestCase {
         try await OhMyPiACPHeadlessAgentProvider.prepareForPrompt(
             config: OhMyPiAgentConfig(includeRepoPromptMCPServer: false),
             runID: UUID(),
-            setModel: { _ in XCTFail("No model should be applied") },
+            setSelection: { _, _ in XCTFail("No model should be applied") },
             routeCheck: { runID in await recorder.check(runID) }
         )
         let invocationCount = await recorder.invocationCount
@@ -72,7 +76,7 @@ final class OhMyPiACPHeadlessAgentProviderTests: XCTestCase {
         try await OhMyPiACPHeadlessAgentProvider.prepareForPrompt(
             config: OhMyPiAgentConfig(includeRepoPromptMCPServer: true),
             runID: runID,
-            setModel: { _ in XCTFail("No model should be applied") },
+            setSelection: { _, _ in XCTFail("No model should be applied") },
             routeCheck: { checkedRunID in await recorder.check(checkedRunID) }
         )
         let invocationCount = await recorder.invocationCount
@@ -87,7 +91,7 @@ final class OhMyPiACPHeadlessAgentProviderTests: XCTestCase {
             try await OhMyPiACPHeadlessAgentProvider.prepareForPrompt(
                 config: OhMyPiAgentConfig(includeRepoPromptMCPServer: true),
                 runID: UUID(),
-                setModel: { _ in XCTFail("No model should be applied") },
+                setSelection: { _, _ in XCTFail("No model should be applied") },
                 routeCheck: { checkedRunID in await recorder.check(checkedRunID) }
             )
             XCTFail("Expected the existing route failure")

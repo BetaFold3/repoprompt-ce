@@ -166,6 +166,7 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
                 let minimum = OhMyPiAgentConfig.minimumSupportedVersion.map(String.init).joined(separator: ".")
                 return .unsupported(reason: "Oh My Pi \(version.map(String.init).joined(separator: ".")) is unsupported; version \(minimum) or newer is required.")
             }
+            OhMyPiRuntimeVersionRegistry.shared.observe(version)
 
             try launch.executableIdentity.validateForTrustedPathLaunch(atPath: launch.command)
             cache(launch, key: key)

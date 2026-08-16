@@ -18,6 +18,7 @@ struct ModelPreset: Codable, Identifiable, Equatable {
     let supportedModes: SupportedModes?
     let proEditingOverride: ProEditingOverride // Legacy decode-only field
     let chatPresetMappings: ChatPresetMappings? // Maps modes to chat preset IDs
+    let ohMyPiThinkingSelections: OhMyPiThinkingSelections
 
     /// Returns the resolved AIModel, or `.claude4Sonnet` as a fallback if the stored rawValue can't be parsed.
     /// For cases where you need to handle missing models differently, use `optionalModel` instead.
@@ -37,7 +38,16 @@ struct ModelPreset: Codable, Identifiable, Equatable {
         AIModel.fromModelName(modelString) != nil
     }
 
-    init(id: UUID = UUID(), name: String, model: AIModel, description: String? = nil, supportedModes: SupportedModes? = nil, proEditingOverride: ProEditingOverride = .useDefault, chatPresetMappings: ChatPresetMappings? = nil) {
+    init(
+        id: UUID = UUID(),
+        name: String,
+        model: AIModel,
+        description: String? = nil,
+        supportedModes: SupportedModes? = nil,
+        proEditingOverride: ProEditingOverride = .useDefault,
+        chatPresetMappings: ChatPresetMappings? = nil,
+        ohMyPiThinkingSelections: OhMyPiThinkingSelections = .empty
+    ) {
         self.id = id
         self.name = Self.sanitizeName(name)
         modelString = model.rawValue
@@ -45,6 +55,7 @@ struct ModelPreset: Codable, Identifiable, Equatable {
         self.supportedModes = supportedModes
         self.proEditingOverride = proEditingOverride
         self.chatPresetMappings = chatPresetMappings
+        self.ohMyPiThinkingSelections = ohMyPiThinkingSelections
     }
 
     /// Custom decoding to handle missing fields in existing presets
@@ -59,6 +70,7 @@ struct ModelPreset: Codable, Identifiable, Equatable {
         proEditingOverride = try container.decodeIfPresent(ProEditingOverride.self, forKey: .proEditingOverride) ?? .useDefault
         // Default to nil if not present (for backward compatibility)
         chatPresetMappings = try container.decodeIfPresent(ChatPresetMappings.self, forKey: .chatPresetMappings)
+        ohMyPiThinkingSelections = try .decodeIfPresent(from: container, forKey: .ohMyPiThinkingSelections)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -69,10 +81,12 @@ struct ModelPreset: Codable, Identifiable, Equatable {
         try container.encodeIfPresent(description, forKey: .description)
         try container.encodeIfPresent(supportedModes, forKey: .supportedModes)
         try container.encodeIfPresent(chatPresetMappings, forKey: .chatPresetMappings)
+        try ohMyPiThinkingSelections.encodeIfNonEmpty(to: &container, forKey: .ohMyPiThinkingSelections)
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, modelString, description, supportedModes, proEditingOverride, chatPresetMappings
+        case ohMyPiThinkingSelections
     }
 
     /// Sanitizes a preset name to ensure it's valid for command-line use

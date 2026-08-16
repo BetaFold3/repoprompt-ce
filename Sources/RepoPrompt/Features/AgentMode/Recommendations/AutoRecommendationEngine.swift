@@ -640,6 +640,9 @@ final class AutoRecommendationEngine {
         ) { profile in
             profile.planningModelRaw = trimmedModel
             profile.preferredComposeModelRaw = trimmedModel
+            if profile.syncChatModelWithOracle {
+                profile.preferredComposeOhMyPiThinkingSelections = profile.planningModelOhMyPiThinkingSelections
+            }
         }
     }
 

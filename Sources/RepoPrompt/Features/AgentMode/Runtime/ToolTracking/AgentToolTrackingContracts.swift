@@ -3,6 +3,19 @@ import MCP
 
 // SEARCH-HELPER: AgentToolTracking, ToolStreamEvent, ToolTrackingHooks, ToolTrackingSupport
 
+// MARK: - Tool Observation Policy
+
+/// Controls whether a tool-tracking registration observes only executed calls or also
+/// attributable calls denied before dispatch. The default preserves existing provider behavior.
+enum AgentToolTrackingObservationPolicy {
+    case executionOnly
+    case executionAndPreExecutionDenials
+
+    var observesPreExecutionDenials: Bool {
+        self == .executionAndPreExecutionDenials
+    }
+}
+
 // MARK: - Tool Stream Event
 
 /// Normalized bridge between `AIStreamResult` tool events and provider handlers.

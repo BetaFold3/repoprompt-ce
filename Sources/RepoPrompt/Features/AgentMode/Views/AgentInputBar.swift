@@ -27,6 +27,7 @@ struct AgentComposerActions {
     let canSelectAgentInCurrentChat: (_ agent: AgentProviderKind) -> Bool
     /// Returns a localized rejection message when the presentation snapshot is stale.
     let selectAgentModel: (_ agent: AgentProviderKind, _ rawModel: String) -> String?
+    let selectOhMyPiThinking: (_ exactModelID: String, _ value: String?) -> Void
     let selectRemoteAgentModel: (_ rawModel: String) -> Void
     let reasoningEffortOptionsForCurrentSelection: () -> [CodexReasoningEffort]
     let selectReasoningEffort: (_ effort: CodexReasoningEffort?) -> Void
@@ -167,6 +168,14 @@ struct AgentInputBar: View {
                     return error.localizedDescription
                 }
             },
+            selectOhMyPiThinking: { exactModelID, value in
+                guard let sourceTabID = currentTabID else { return }
+                agentModeVM.commitOhMyPiThinkingSelection(
+                    value,
+                    exactModelID: exactModelID,
+                    sourceTabID: sourceTabID
+                )
+            },
             selectRemoteAgentModel: { rawModel in
                 agentModeVM.selectRemoteAgentModel(rawModel: rawModel)
             },
@@ -299,6 +308,7 @@ struct AgentComposerView: View, Equatable {
     @State private var cursorPopoverOriginAgent: AgentProviderKind?
     @State private var cursorLastSelfCommittedRaw: String?
     @State private var cursorParameterCatalogRevision: UInt = 0
+    @State private var ohMyPiThinkingRevision: UInt = 0
     @State private var showPermissionPopover: Bool = false
     @State private var showClaudeToolsPopover: Bool = false
     @State private var steeringUnsupportedMessage: String? = nil
@@ -561,6 +571,13 @@ struct AgentComposerView: View, Equatable {
             if !cursorParameterPickerIsAvailable {
                 dismissCursorModelParametersPopover()
             }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .ohMyPiThinkingCapabilitiesDidChange)
+                .merge(with: NotificationCenter.default.publisher(for: .ohMyPiThinkingCapabilityProbeStateDidChange))
+                .receive(on: DispatchQueue.main)
+        ) { _ in
+            ohMyPiThinkingRevision &+= 1
         }
         .onChange(of: showCursorModelParametersPopover) { _, isPresented in
             if !isPresented {
@@ -1042,6 +1059,7 @@ struct AgentComposerView: View, Equatable {
     }
 
     private func inputBarModelMenuItems(for agent: AgentProviderKind) -> [StableMenuItem] {
+        _ = ohMyPiThinkingRevision
         let options = inputBarModelOptions(for: agent)
         if agent == .cursor {
             return AgentModelStableMenuItems.cursorModelItems(
@@ -1054,13 +1072,37 @@ struct AgentComposerView: View, Equatable {
                 }
             }
         }
-        guard agent == .openCode || agent == .ohMyPi else {
+        if agent == .ohMyPi {
+            let onSelect: (AgentProviderKind, AgentModelOption) -> Void = { selectedAgent, model in
+                if let message = actions.selectAgentModel(selectedAgent, model.rawValue) {
+                    showSteeringUnsupportedNotice(message)
+                } else {
+                    OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                        agent: selectedAgent,
+                        rawModel: model.rawValue
+                    )
+                }
+            }
+            if let destination = inputBarOhMyPiThinkingDestination {
+                return AgentModelStableMenuItems.ohMyPiModelItems(
+                    options: options,
+                    selectedAgent: props.selectedAgent,
+                    selectedModelRaw: props.selectedModelRaw,
+                    thinkingDestination: destination,
+                    onSelect: onSelect
+                )
+            }
+            return AgentModelStableMenuItems.ohMyPiModelItems(
+                options: options,
+                selectedAgent: props.selectedAgent,
+                selectedModelRaw: props.selectedModelRaw,
+                onSelect: onSelect
+            )
+        }
+        guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
         }
-        return AgentModelCatalog.openCodeMenu(
-            for: options,
-            providerID: agent.acpProviderID ?? .openCode
-        ).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
+        return AgentModelCatalog.openCodeMenu(for: options).providerGroups.flatMap { providerGroup -> [StableMenuItem] in
             let modelItems = providerGroup.groups.map { inputBarOpenCodeModelMenuItem(agent: agent, group: $0) }
             guard providerGroup.rendersAsSubmenu else { return modelItems }
             return [.submenu(providerGroup.displayName, items: modelItems)]
@@ -1099,6 +1141,22 @@ struct AgentComposerView: View, Equatable {
                 showSteeringUnsupportedNotice(message)
             }
         }
+    }
+
+    private var inputBarOhMyPiThinkingDestination: ModelDestination? {
+        guard let currentTabID,
+              props.selectedAgent == .ohMyPi
+        else { return nil }
+        return ModelDestination(
+            id: "agentInputBar.\(currentTabID.uuidString)",
+            getter: { props.selectedModelRaw },
+            applier: { _ in },
+            thinkingGetter: { props.ohMyPiThinkingSelections },
+            thinkingApplier: { selections in
+                let value = selections.value(for: props.selectedModelRaw)
+                actions.selectOhMyPiThinking(props.selectedModelRaw, value)
+            }
+        )
     }
 
     private func inputBarModelOptions(for agent: AgentProviderKind) -> [AgentModelOption] {

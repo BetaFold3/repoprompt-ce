@@ -171,11 +171,8 @@ struct AgentModelSelectionIndex {
                     }
                 }
 
-            case .openCode, .ohMyPi:
-                let menu = AgentModelCatalog.openCodeMenu(
-                    for: options,
-                    providerID: agent.acpProviderID ?? .openCode
-                )
+            case .openCode:
+                let menu = AgentModelCatalog.openCodeMenu(for: options)
                 for providerGroup in menu.providerGroups {
                     for group in providerGroup.groups {
                         for menuOption in group.options {
@@ -203,6 +200,70 @@ struct AgentModelSelectionIndex {
                                 catalogOrder: catalogOrder
                             ))
                             catalogOrder += 1
+                        }
+                    }
+                }
+
+            case .ohMyPi:
+                let indexed = options.enumerated().map {
+                    (sourceID: String($0.offset), option: $0.element)
+                }
+                let optionsBySourceID = Dictionary(
+                    uniqueKeysWithValues: indexed.map { ($0.sourceID, $0.option) }
+                )
+                let projection = OhMyPiModelMenuProjector.project(indexed.map {
+                    OhMyPiModelMenuProjector.Input(
+                        sourceID: $0.sourceID,
+                        wireID: $0.option.rawValue,
+                        displayName: $0.option.displayName
+                    )
+                })
+
+                func appendProjectedLeaf(
+                    _ leaf: OhMyPiModelMenuProjector.Leaf,
+                    group: OhMyPiModelMenuProjector.ModelGroup?,
+                    namespace: String?
+                ) {
+                    guard let option = optionsBySourceID[leaf.sourceID] else { return }
+                    let isFamily = group?.isFamily == true
+                    let variant = isFamily
+                        ? (leaf.isFast ? "Fast \(leaf.title)" : leaf.title)
+                        : nil
+                    let title = if isFamily, leaf.isFast,
+                                   leaf.title.caseInsensitiveCompare("Default") == .orderedSame
+                    {
+                        "\(group?.title ?? leaf.title) Fast"
+                    } else if isFamily,
+                              leaf.title.caseInsensitiveCompare("Default") != .orderedSame
+                    {
+                        "\(group?.title ?? leaf.title) \(variant ?? leaf.title)"
+                    } else {
+                        group?.title ?? leaf.title
+                    }
+                    leaves.append(localOptionLeaf(
+                        agent: agent,
+                        option: option,
+                        title: title,
+                        baseDisplayName: group?.title ?? leaf.title,
+                        effortDisplayName: variant,
+                        providerDetail: namespace,
+                        selected: selected,
+                        selectionDefaults: selectionDefaults,
+                        catalogOrder: catalogOrder
+                    ))
+                    catalogOrder += 1
+                }
+
+                for leaf in projection.rootLeaves {
+                    appendProjectedLeaf(leaf, group: nil, namespace: nil)
+                }
+                for namespaceGroup in projection.namespaceGroups {
+                    for group in namespaceGroup.modelGroups {
+                        for leaf in group.normalLeaves {
+                            appendProjectedLeaf(leaf, group: group, namespace: namespaceGroup.namespace)
+                        }
+                        for leaf in group.fastLeaves {
+                            appendProjectedLeaf(leaf, group: group, namespace: namespaceGroup.namespace)
                         }
                     }
                 }

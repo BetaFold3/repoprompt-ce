@@ -11,6 +11,7 @@ struct OptimizedModelPicker: View {
     let widthStyle: WidthStyle
 
     @State private var cursorCatalogRevision: Int = 0
+    @State private var ohMyPiThinkingRevision: Int = 0
     @State private var menuModelSnapshot: [AIModel]? = nil
     @State private var menuSnapshotReleaseTask: Task<Void, Never>? = nil
 
@@ -102,6 +103,13 @@ struct OptimizedModelPicker: View {
         ) { _ in
             cursorCatalogRevision &+= 1
         }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .ohMyPiThinkingCapabilitiesDidChange)
+                .merge(with: NotificationCenter.default.publisher(for: .ohMyPiThinkingCapabilityProbeStateDidChange))
+                .receive(on: RunLoop.main)
+        ) { _ in
+            ohMyPiThinkingRevision &+= 1
+        }
         .onDisappear {
             menuSnapshotReleaseTask?.cancel()
             menuSnapshotReleaseTask = nil
@@ -120,12 +128,21 @@ struct OptimizedModelPicker: View {
             selectedRawValue: String,
             onSelect: @escaping @MainActor (String) -> Void
         ) -> [StableMenuItem] {
-            let destination = ModelDestination(
-                id: "optimizedModelPickerTest",
-                getter: { selectedRawValue },
-                applier: onSelect
+            stableMenuItemsForTesting(
+                availableModels: availableModels,
+                destination: ModelDestination(
+                    id: "optimizedModelPickerTest",
+                    getter: { selectedRawValue },
+                    applier: onSelect
+                )
             )
-            return OptimizedModelPicker(
+        }
+
+        static func stableMenuItemsForTesting(
+            availableModels: [AIModel],
+            destination: ModelDestination
+        ) -> [StableMenuItem] {
+            OptimizedModelPicker(
                 destination: destination,
                 availableModels: availableModels,
                 font: .body
@@ -135,6 +152,7 @@ struct OptimizedModelPicker: View {
 
     private func stableMenuItems() -> [StableMenuItem] {
         _ = cursorCatalogRevision
+        _ = ohMyPiThinkingRevision
         let allModels = menuModelSnapshot ?? availableModels
         return stableMenuItems(for: allModels)
     }
@@ -229,14 +247,29 @@ struct OptimizedModelPicker: View {
             }
         }
         if provider == .ohMyPi {
-            return OhMyPiModelMenuBuilder.groups(for: models).map { group in
-                .submenu(
-                    group.namespace,
-                    items: group.leaves.map { leaf in
-                        stableModelItem(leaf.model, title: leaf.title)
-                    }
-                )
+            let projection = OhMyPiModelMenuBuilder.projection(for: models)
+            var items = projection.rootLeaves.map {
+                stableModelItem($0.model, title: $0.title)
             }
+            items.append(contentsOf: projection.namespaceGroups.map { namespaceGroup in
+                .submenu(
+                    namespaceGroup.namespace,
+                    items: namespaceGroup.modelGroups.map(stableOhMyPiItem)
+                )
+            })
+            if destination.hasThinkingAccessory,
+               let exactModelID = OhMyPiThinkingMenuBuilder.exactModelID(from: destination.currentRawValue)
+            {
+                items.append(.separator)
+                items.append(.submenu(
+                    "Thinking",
+                    items: OhMyPiThinkingMenuBuilder.stableMenuItems(
+                        exactModelID: exactModelID,
+                        destination: destination
+                    )
+                ))
+            }
+            return items
         }
         return models.map { stableModelItem($0) }
     }
@@ -280,6 +313,28 @@ struct OptimizedModelPicker: View {
         return stableModelItem(option.model, title: option.displayName)
     }
 
+    private func stableOhMyPiItem(
+        _ group: OhMyPiModelMenuBuilder.ModelGroup
+    ) -> StableMenuItem {
+        guard group.isFamily else {
+            return group.normalLeaves.first.map {
+                stableModelItem($0.model, title: $0.title)
+            } ?? .separator
+        }
+        var items = group.normalLeaves.map {
+            stableModelItem($0.model, title: $0.title)
+        }
+        if !group.fastLeaves.isEmpty {
+            items.append(.submenu(
+                "Fast",
+                items: group.fastLeaves.map {
+                    stableModelItem($0.model, title: $0.title)
+                }
+            ))
+        }
+        return .submenu(group.title, items: items)
+    }
+
     private func stableCompatibleClaudeItem(_ model: AIModel) -> StableMenuItem? {
         guard let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) else {
             return nil
@@ -303,6 +358,7 @@ struct OptimizedModelPicker: View {
                 : nil
         ) {
             destination.apply(model.rawValue)
+            OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(of: model)
         }
     }
 

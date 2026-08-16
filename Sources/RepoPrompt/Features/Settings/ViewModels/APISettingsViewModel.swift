@@ -1669,6 +1669,7 @@ public class APISettingsViewModel: ObservableObject {
         // A live refresh may legitimately omit dynamic metadata, especially for Cursor.
         CursorModelParameterCatalog.shared.hydrateSynchronously()
         await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        await OhMyPiThinkingCapabilityRegistry.shared.warmStandardStoreIfNeeded()
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
         if isContextBuilderProviderValidationComplete { return }
         if let contextBuilderProviderValidationTask {

@@ -241,6 +241,7 @@ struct ModelPresetEditView: View {
 
     @State private var name: String = ""
     @State private var selectedModel: AIModel = .claude4Sonnet
+    @State private var ohMyPiThinkingSelections: OhMyPiThinkingSelections = .empty
     @State private var description: String = ""
     @State private var chatEnabled = true
     @State private var planEnabled = true
@@ -271,6 +272,14 @@ struct ModelPresetEditView: View {
                     selectedModel = model
                 }
             }
+        )
+    }
+
+    private var modelDestination: ModelDestination {
+        .binding(
+            modelSelectionBinding,
+            thinkingSelections: $ohMyPiThinkingSelections,
+            id: "modelPresetEditor"
         )
     }
 
@@ -322,7 +331,7 @@ struct ModelPresetEditView: View {
                         Text("Model")
                         Spacer()
                         OptimizedModelPicker(
-                            selection: modelSelectionBinding,
+                            destination: modelDestination,
                             availableModels: availableModels,
                             font: FontScalePreset.current.font
                         )
@@ -447,6 +456,7 @@ struct ModelPresetEditView: View {
             if let preset {
                 name = preset.name
                 selectedModel = preset.model
+                ohMyPiThinkingSelections = preset.ohMyPiThinkingSelections
                 description = preset.description ?? ""
 
                 // Initialize modes from preset.supportedModes if present; default to true
@@ -514,7 +524,8 @@ struct ModelPresetEditView: View {
             model: selectedModel,
             description: description.isEmpty ? nil : description,
             supportedModes: supportedModesFinal,
-            chatPresetMappings: chatPresetMappingsFinal
+            chatPresetMappings: chatPresetMappingsFinal,
+            ohMyPiThinkingSelections: ohMyPiThinkingSelections
         )
 
         onSave(newPreset)

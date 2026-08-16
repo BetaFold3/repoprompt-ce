@@ -1,9 +1,6 @@
 import Foundation
 
-/// Shared Oh My Pi picker projection.
-///
-/// OMP owns flattened wire IDs. RepoPrompt only groups them by the first path
-/// segment and always keeps the complete canonical wire ID on the selected model.
+/// AI-model adapter for the shared Oh My Pi presentation projector.
 enum OhMyPiModelMenuBuilder {
     struct Leaf: Identifiable, Hashable {
         let model: AIModel
@@ -14,77 +11,91 @@ enum OhMyPiModelMenuBuilder {
         }
     }
 
-    struct NamespaceGroup: Identifiable, Hashable {
-        let namespace: String
-        let leaves: [Leaf]
+    struct ModelGroup: Identifiable, Hashable {
+        let id: String
+        let title: String
+        let normalLeaves: [Leaf]
+        let fastLeaves: [Leaf]
+        let isFamily: Bool
 
-        var id: String {
-            namespace.lowercased()
+        var allLeaves: [Leaf] {
+            normalLeaves + fastLeaves
         }
     }
 
-    static func groups(for models: [AIModel]) -> [NamespaceGroup] {
-        let entries = models.compactMap { model -> (namespace: String, leaf: Leaf)? in
-            guard case let .ohMyPiCustom(rawValue) = model, !rawValue.isEmpty else {
-                return nil
+    struct NamespaceGroup: Identifiable, Hashable {
+        let namespace: String
+        let modelGroups: [ModelGroup]
+
+        var id: String {
+            namespace
+        }
+
+        var leaves: [Leaf] {
+            modelGroups.flatMap(\.allLeaves)
+        }
+    }
+
+    struct Projection: Hashable {
+        let rootLeaves: [Leaf]
+        let namespaceGroups: [NamespaceGroup]
+
+        var allLeaves: [Leaf] {
+            rootLeaves + namespaceGroups.flatMap(\.leaves)
+        }
+    }
+
+    static func projection(for models: [AIModel]) -> Projection {
+        let ohMyPiModels = models.filter {
+            if case .ohMyPiCustom = $0 {
+                return true
             }
-            let namespace = String(rawValue.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).first ?? "")
-            let normalizedNamespace = namespace.isEmpty ? rawValue : namespace
-            return (
-                normalizedNamespace,
-                Leaf(model: model, title: leafTitle(model: model, namespace: normalizedNamespace))
+            return false
+        }
+        let indexed = ohMyPiModels.enumerated().map {
+            (sourceID: String($0.offset), model: $0.element)
+        }
+        let modelsBySourceID = Dictionary(uniqueKeysWithValues: indexed.map { ($0.sourceID, $0.model) })
+        let projected = OhMyPiModelMenuProjector.project(indexed.map { entry in
+            OhMyPiModelMenuProjector.Input(
+                sourceID: entry.sourceID,
+                wireID: entry.model.modelName,
+                displayName: entry.model.displayName
+            )
+        })
+
+        func leaf(_ projectedLeaf: OhMyPiModelMenuProjector.Leaf) -> Leaf? {
+            guard let model = modelsBySourceID[projectedLeaf.sourceID] else { return nil }
+            return Leaf(model: model, title: projectedLeaf.title)
+        }
+
+        func modelGroup(_ projectedGroup: OhMyPiModelMenuProjector.ModelGroup) -> ModelGroup {
+            ModelGroup(
+                id: projectedGroup.id,
+                title: projectedGroup.title,
+                normalLeaves: projectedGroup.normalLeaves.compactMap(leaf),
+                fastLeaves: projectedGroup.fastLeaves.compactMap(leaf),
+                isFamily: projectedGroup.isFamily
             )
         }
 
-        let grouped = Dictionary(grouping: entries, by: \.namespace)
-        return grouped.keys
-            .sorted { ModelPickerStringOrdering.precedes($0, $1) }
-            .map { namespace in
-                let leaves = (grouped[namespace] ?? [])
-                    .map(\.leaf)
-                    .sorted {
-                        let titleOrder = ModelPickerStringOrdering.compare(
-                            $0.title,
-                            $1.title,
-                            caseInsensitiveASCII: true
-                        )
-                        if titleOrder != .orderedSame {
-                            return titleOrder == .orderedAscending
-                        }
-                        return ModelPickerStringOrdering.precedes(
-                            $0.model.modelName,
-                            $1.model.modelName,
-                            caseInsensitiveASCII: false
-                        )
-                    }
-                return NamespaceGroup(namespace: namespace, leaves: leaves)
+        return Projection(
+            rootLeaves: projected.rootLeaves.compactMap(leaf),
+            namespaceGroups: projected.namespaceGroups.map { namespaceGroup in
+                NamespaceGroup(
+                    namespace: namespaceGroup.namespace,
+                    modelGroups: namespaceGroup.modelGroups.map(modelGroup)
+                )
             }
+        )
+    }
+
+    static func groups(for models: [AIModel]) -> [NamespaceGroup] {
+        projection(for: models).namespaceGroups
     }
 
     static func collapsedLabel(for model: AIModel) -> String? {
         guard case let .ohMyPiCustom(rawValue) = model else { return nil }
         return "OMP/\(rawValue)"
-    }
-
-    private static func leafTitle(model: AIModel, namespace: String) -> String {
-        let displayName = model.displayName
-        let prefix = namespace + "/"
-        if displayName.lowercased().hasPrefix(prefix.lowercased()) {
-            let index = displayName.index(displayName.startIndex, offsetBy: prefix.count)
-            let stripped = String(displayName[index...])
-            if !stripped.isEmpty {
-                return stripped
-            }
-        }
-
-        guard case let .ohMyPiCustom(rawValue) = model else { return displayName }
-        if rawValue.lowercased().hasPrefix(prefix.lowercased()) {
-            let index = rawValue.index(rawValue.startIndex, offsetBy: prefix.count)
-            let stripped = String(rawValue[index...])
-            if !stripped.isEmpty {
-                return stripped
-            }
-        }
-        return displayName.isEmpty ? rawValue : displayName
     }
 }

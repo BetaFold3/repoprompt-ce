@@ -1950,7 +1950,15 @@ struct CLIProvidersSettingsView: View {
         if count == 0 {
             return "Model discovery will refresh in the background."
         }
-        let groupedBaseCount = AgentModelCatalog.openCodeMenu(for: options, providerID: .ohMyPi).groups.count
+        let projection = OhMyPiModelMenuProjector.project(options.enumerated().map {
+            OhMyPiModelMenuProjector.Input(
+                sourceID: String($0.offset),
+                wireID: $0.element.rawValue,
+                displayName: $0.element.displayName
+            )
+        })
+        let groupedBaseCount = projection.rootLeaves.count
+            + projection.namespaceGroups.reduce(0) { $0 + $1.modelGroups.count }
         if groupedBaseCount > 0, groupedBaseCount < count {
             return "\(count) models discovered across \(groupedBaseCount) base models."
         }

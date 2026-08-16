@@ -12,6 +12,14 @@ struct ConversationEntry {
     let content: String
 }
 
+struct AIMessageExecutionMetadata: Equatable {
+    let additionalACPConfigOptionValues: [ACPConfigOptionAssignment]
+
+    init(additionalACPConfigOptionValues: [ACPConfigOptionAssignment] = []) {
+        self.additionalACPConfigOptionValues = additionalACPConfigOptionValues
+    }
+}
+
 /// Keep each piece separate. We also provide "XML getters" for certain fields.
 struct AIMessage {
     /// The main system prompt
@@ -34,6 +42,7 @@ struct AIMessage {
 
     let temperature: Double?
     let disableTemperatureOverrides: Bool
+    let executionMetadata: AIMessageExecutionMetadata
 
     /// User-defined ordering of prompt sections
     let promptSectionsOrder: [PromptSection]
@@ -121,6 +130,7 @@ struct AIMessage {
         conversationMessages: [ConversationEntry] = [],
         temperature: Double?,
         disableTemperatureOverrides: Bool = false,
+        executionMetadata: AIMessageExecutionMetadata = AIMessageExecutionMetadata(),
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
         duplicateUserInstructionsAtTop: Bool = false
@@ -133,6 +143,7 @@ struct AIMessage {
         self.conversationMessages = conversationMessages
         self.temperature = temperature
         self.disableTemperatureOverrides = disableTemperatureOverrides
+        self.executionMetadata = executionMetadata
         self.promptSectionsOrder = promptSectionsOrder
         self.disabledPromptSections = disabledPromptSections
         self.duplicateUserInstructionsAtTop = duplicateUserInstructionsAtTop
@@ -140,7 +151,13 @@ struct AIMessage {
 
     /// Simpler initializer for "system prompt + user message" usage
     /// (e.g. older single-user instructions approach).
-    init(systemPrompt: String, userMessage: String, temperature: Double? = nil, disableTemperatureOverrides: Bool = false) {
+    init(
+        systemPrompt: String,
+        userMessage: String,
+        temperature: Double? = nil,
+        disableTemperatureOverrides: Bool = false,
+        executionMetadata: AIMessageExecutionMetadata = AIMessageExecutionMetadata()
+    ) {
         self.systemPrompt = systemPrompt
         metaPrompts = []
         fileTree = ""
@@ -148,6 +165,7 @@ struct AIMessage {
         gitDiff = nil
         self.temperature = temperature
         self.disableTemperatureOverrides = disableTemperatureOverrides
+        self.executionMetadata = executionMetadata
         // Store the single user message in conversationMessages
         conversationMessages = [
             ConversationEntry(role: .user, content: userMessage)
@@ -156,6 +174,23 @@ struct AIMessage {
         promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder
         disabledPromptSections = []
         duplicateUserInstructionsAtTop = false
+    }
+
+    func replacingExecutionMetadata(_ metadata: AIMessageExecutionMetadata) -> AIMessage {
+        AIMessage(
+            systemPrompt: systemPrompt,
+            metaPrompts: metaPrompts,
+            fileTree: fileTree,
+            fileBlocks: fileBlocks,
+            gitDiff: gitDiff,
+            conversationMessages: conversationMessages,
+            temperature: temperature,
+            disableTemperatureOverrides: disableTemperatureOverrides,
+            executionMetadata: metadata,
+            promptSectionsOrder: promptSectionsOrder,
+            disabledPromptSections: disabledPromptSections,
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
+        )
     }
 
     /// Builds the text block that must be *prepended* to the **final** user

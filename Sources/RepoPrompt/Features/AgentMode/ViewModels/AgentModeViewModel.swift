@@ -1920,6 +1920,22 @@ final class AgentModeViewModel: ObservableObject {
         persistLastUsedModelIfNeeded(agent: agent, modelRaw: preferredModelRaw)
     }
 
+    func commitOhMyPiThinkingSelection(
+        _ value: String?,
+        exactModelID: String,
+        sourceTabID: UUID
+    ) {
+        guard let session = sessions[sourceTabID],
+              session.selectedAgent == .ohMyPi,
+              session.selectedModelRaw == exactModelID
+        else { return }
+        var selections = session.ohMyPiThinkingSelections
+        selections.setValue(value, for: exactModelID)
+        session.ohMyPiThinkingSelections = selections
+        scheduleSave(for: sourceTabID)
+        syncComposerUIState()
+    }
+
     private nonisolated static func defaultHeadlessProviderFactory(
         agent: AgentProviderKind,
         modelString: String?
@@ -4738,6 +4754,7 @@ final class AgentModeViewModel: ObservableObject {
             sessionIndexStore.removeSortDate(forTabID: session.tabID)
         }
         session.selectedAgent = payload.normalizedSelection.agent
+        session.ohMyPiThinkingSelections = agentSession.ohMyPiThinkingSelections ?? .empty
         if session.transcriptAnalyticsSnapshot.selectedAgent != session.selectedAgent {
             session.transcriptAnalyticsSnapshot.selectedAgent = session.selectedAgent
         }
@@ -12191,6 +12208,7 @@ final class AgentModeViewModel: ObservableObject {
             lastUserMessageAt: lastUserMessageAt,
             agentKind: session.selectedAgent.rawValue,
             agentModel: session.selectedModelRaw,
+            ohMyPiThinkingSelections: session.ohMyPiThinkingSelections.nilIfEmpty,
             agentReasoningEffort: session.selectedReasoningEffortRaw,
             lastRunState: session.runState.rawValue,
             providerSessionID: session.providerSessionID,

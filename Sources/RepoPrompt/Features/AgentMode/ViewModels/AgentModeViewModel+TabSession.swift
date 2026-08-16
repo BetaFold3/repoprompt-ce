@@ -543,6 +543,7 @@ extension AgentModeViewModel {
         // Settings (per-tab)
         var selectedAgent: AgentProviderKind = .claudeCode
         var selectedModelRaw: String = AgentModel.defaultModel.rawValue
+        var ohMyPiThinkingSelections: OhMyPiThinkingSelections = .empty
         var selectedReasoningEffortRaw: String?
         var autoEditEnabled: Bool = true
         var selectedModel: AgentModel {

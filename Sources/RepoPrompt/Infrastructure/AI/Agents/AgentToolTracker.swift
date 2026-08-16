@@ -11,6 +11,7 @@ actor AgentToolTracker {
     /// Registers an enhanced tool event observer that receives args on call and result on completion.
     func registerEnhancedObserver(
         runID: UUID,
+        observationPolicy: AgentToolTrackingObservationPolicy = .executionOnly,
         onCalled: @escaping @Sendable (UUID, String, [String: Value]?) async -> Void,
         onCompleted: @escaping @Sendable (UUID, String, [String: Value]?, String, Bool) async -> Void
     ) async {
@@ -21,7 +22,8 @@ actor AgentToolTracker {
         // observer installed before a provider readiness boundary returns.
         let observer = ServerNetworkManager.ToolEventObserver(
             onCalled: onCalled,
-            onCompleted: onCompleted
+            onCompleted: onCompleted,
+            observationPolicy: observationPolicy
         )
         let token = await manager.registerToolEventObserver(for: runID, observer: observer)
         trackedRunID = runID
@@ -68,11 +70,13 @@ actor AgentToolTracker {
         connectionTimeoutSeconds: TimeInterval = 10.0,
         fallbackTimeoutSeconds: TimeInterval = 5.0,
         keepObserversOnTimeout: Bool = true,
+        observationPolicy: AgentToolTrackingObservationPolicy = .executionOnly,
         onCalled: @escaping @Sendable (UUID, String, [String: Value]?) async -> Void,
         onCompleted: @escaping @Sendable (UUID, String, [String: Value]?, String, Bool) async -> Void
     ) async {
         await registerEnhancedObserver(
             runID: runID,
+            observationPolicy: observationPolicy,
             onCalled: onCalled,
             onCompleted: onCompleted
         )
@@ -248,6 +252,7 @@ final class AgentToolTrackingController {
     @MainActor func startTracking(
         runID: UUID,
         clientNameHint: String?,
+        observationPolicy: AgentToolTrackingObservationPolicy = .executionOnly,
         onCalled: @escaping @MainActor (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?) -> Void,
         onCompleted: @escaping @MainActor (_ invocationID: UUID, _ toolName: String, _ args: [String: Value]?, _ resultJSON: String, _ isError: Bool) -> Void
     ) async {
@@ -280,6 +285,7 @@ final class AgentToolTrackingController {
             guard shouldRegister else { return }
             await tracker.registerEnhancedObserver(
                 runID: runID,
+                observationPolicy: observationPolicy,
                 onCalled: { [weak self, eventDeliveryMailbox] invocationID, toolName, args in
                     #if DEBUG
                         let scheduledAt = DispatchTime.now().uptimeNanoseconds
@@ -477,9 +483,13 @@ final class AgentToolTrackingController {
         registrationTask = nil
     }
 
+    func waitForPendingEventDeliveries() async {
+        await eventDeliveryMailbox.waitUntilIdle()
+    }
+
     #if DEBUG
         func waitForPendingEventDeliveriesForTesting() async {
-            await eventDeliveryMailbox.waitUntilIdle()
+            await waitForPendingEventDeliveries()
         }
     #endif
 
