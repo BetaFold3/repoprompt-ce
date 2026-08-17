@@ -705,11 +705,7 @@ class WindowState: ObservableObject {
         guard workspaceManager.activeWorkspace?.isSystemWorkspace == false else { return }
 
         Task {
-            let activeTabID = await MainActor.run { agentModeViewModel.currentTabID }
-            if await MainActor.run(body: { agentModeViewModel.shouldSwallowNewSessionClick(for: activeTabID) }) {
-                return
-            }
-            await agentModeViewModel.createAndActivateSessionTab()
+            await agentModeViewModel.createAndActivateSessionTab(focusComposer: true)
         }
     }
 

@@ -16,6 +16,78 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     #endif
 
+    func testFocusedStandardSessionCreationPublishesReturnedTabRequest() async throws {
+        try await withFixture { fixture in
+            let returnedTabID = await fixture.viewModel.createAndActivateSessionTab(
+                focusComposer: true
+            )
+            let tabID = try XCTUnwrap(returnedTabID)
+            let request = try XCTUnwrap(fixture.viewModel.ui.composer.focusRequest)
+
+            XCTAssertEqual(request.tabID, tabID)
+            XCTAssertEqual(request.reason, .newSession)
+        }
+    }
+
+    func testDefaultSessionCreationPublishesNoFocusRequest() async throws {
+        try await withFixture { fixture in
+            let returnedTabID = await fixture.viewModel.createAndActivateSessionTab()
+
+            XCTAssertNotNil(returnedTabID)
+            XCTAssertNil(fixture.viewModel.ui.composer.focusRequest)
+        }
+    }
+
+    func testFocusedSwallowedPlaceholderPublishesReusedPriorTabRequest() async throws {
+        try await withFixture { fixture in
+            let session = fixture.sessionA
+            session.hasSentFirstMessage = false
+            session.replaceItems([])
+            session.transcript = AgentTranscript()
+            fixture.viewModel.refreshDerivedTranscriptState(for: session)
+
+            let returnedTabID = await fixture.viewModel.createAndActivateSessionTab(
+                focusComposer: true
+            )
+
+            XCTAssertEqual(returnedTabID, fixture.tabAID)
+            XCTAssertEqual(fixture.viewModel.ui.composer.focusRequest?.tabID, fixture.tabAID)
+            XCTAssertEqual(fixture.viewModel.ui.composer.focusRequest?.reason, .reusedPlaceholder)
+        }
+    }
+
+    func testFocusedKnowledgeSessionCreationPublishesKnowledgeReason() async throws {
+        try await withFixture { fixture in
+            fixture.viewModel.test_setAvailableAgents([.codexExec])
+
+            let returnedTabID = await fixture.viewModel.createAndActivateSessionTab(
+                profile: .knowledge,
+                focusComposer: true
+            )
+            let tabID = try XCTUnwrap(returnedTabID)
+
+            XCTAssertEqual(fixture.viewModel.ui.composer.focusRequest?.tabID, tabID)
+            XCTAssertEqual(
+                fixture.viewModel.ui.composer.focusRequest?.reason,
+                .newKnowledgeSession
+            )
+        }
+    }
+
+    func testFailedKnowledgeSessionCreationPublishesNoFocusRequest() async throws {
+        try await withFixture { fixture in
+            fixture.viewModel.test_setAvailableAgents([])
+
+            let tabID = await fixture.viewModel.createAndActivateSessionTab(
+                profile: .knowledge,
+                focusComposer: true
+            )
+
+            XCTAssertNil(tabID)
+            XCTAssertNil(fixture.viewModel.ui.composer.focusRequest)
+        }
+    }
+
     func testSharedModelSelectionCommitPreservesInputBarOrderingAndRejectsDrift() async throws {
         try await withFixture { fixture in
             fixture.window.apiSettingsViewModel.isCodexConnected = true

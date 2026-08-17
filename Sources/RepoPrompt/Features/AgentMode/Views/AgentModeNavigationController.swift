@@ -47,17 +47,15 @@ final class AgentModeNavigationController: ObservableObject {
             true,
             onNewSession: { [weak agentModeVM] in
                 Task {
-                    guard let agentModeVM else { return }
-                    let activeTabID = await MainActor.run { agentModeVM.currentTabID }
-                    if await MainActor.run(body: { agentModeVM.shouldSwallowNewSessionClick(for: activeTabID) }) {
-                        return
-                    }
-                    await agentModeVM.createAndActivateSessionTab()
+                    await agentModeVM?.createAndActivateSessionTab(focusComposer: true)
                 }
             },
             onNewKnowledgeSession: { [weak agentModeVM] in
                 Task {
-                    await agentModeVM?.createAndActivateSessionTab(profile: .knowledge)
+                    await agentModeVM?.createAndActivateSessionTab(
+                        profile: .knowledge,
+                        focusComposer: true
+                    )
                 }
             },
             isKnowledgeSessionAvailable: agentModeVM.canCreateKnowledgeSession

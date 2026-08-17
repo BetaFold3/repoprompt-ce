@@ -17957,7 +17957,8 @@ final class AgentModeViewModel: ObservableObject {
     /// Profiles are chosen before provider construction and remain immutable for the tab's lifetime.
     @discardableResult
     func createAndActivateSessionTab(
-        profile requestedProfile: AgentSessionProfile = .standard
+        profile requestedProfile: AgentSessionProfile = .standard,
+        focusComposer: Bool = false
     ) async -> UUID? {
         guard let promptManager else { return nil }
 
@@ -17969,6 +17970,15 @@ final class AgentModeViewModel: ObservableObject {
             for: priorTabID,
             requestedProfile: requestedProfile
         ) {
+            if focusComposer, let priorTabID {
+                ui.composer.requestFocus(
+                    AgentComposerFocusRequest(
+                        id: UUID(),
+                        tabID: priorTabID,
+                        reason: .reusedPlaceholder
+                    )
+                )
+            }
             return priorTabID
         }
         let shouldClosePriorPlaceholder = isUntouchedSessionPlaceholder(for: priorTabID)
@@ -18011,6 +18021,15 @@ final class AgentModeViewModel: ObservableObject {
         invalidateSidebarRestoreOrdering()
         updateBindingsFromSession(session)
         syncAllActiveUIState()
+        if focusComposer {
+            ui.composer.requestFocus(
+                AgentComposerFocusRequest(
+                    id: UUID(),
+                    tabID: tabID,
+                    reason: requestedProfile == .knowledge ? .newKnowledgeSession : .newSession
+                )
+            )
+        }
 
         if shouldClosePriorPlaceholder,
            let priorTabID,

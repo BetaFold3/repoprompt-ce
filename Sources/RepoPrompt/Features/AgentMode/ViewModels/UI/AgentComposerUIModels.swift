@@ -1,5 +1,17 @@
 import Foundation
 
+struct AgentComposerFocusRequest: Equatable {
+    enum Reason: Equatable {
+        case newSession
+        case newKnowledgeSession
+        case reusedPlaceholder
+    }
+
+    let id: UUID
+    let tabID: UUID
+    let reason: Reason
+}
+
 struct AgentDraftRestorationProps: Equatable {
     let id: UUID
     let tabID: UUID

@@ -122,6 +122,27 @@ struct AgentInputBar: View {
             statusPills
                 .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
         }
+        .onChange(of: composerUI.focusRequest) { _, _ in
+            applyComposerFocusRequest(discardMismatch: false)
+        }
+        .onChange(of: currentTabID) { _, _ in
+            applyComposerFocusRequest(discardMismatch: true)
+        }
+        .onAppear {
+            applyComposerFocusRequest(discardMismatch: false)
+        }
+    }
+
+    private func applyComposerFocusRequest(discardMismatch: Bool) {
+        guard let request = composerUI.focusRequest else { return }
+        guard request.tabID == currentTabID else {
+            if discardMismatch {
+                composerUI.consumeFocusRequest(id: request.id)
+            }
+            return
+        }
+        isFocused = true
+        composerUI.consumeFocusRequest(id: request.id)
     }
 
     private var composerActions: AgentComposerActions {
