@@ -29,6 +29,19 @@ final class KeyboardShortcutCatalogTests: XCTestCase {
         XCTAssertNotEqual(modelPicker.name, handoff.name)
     }
 
+    func testSnippetPaletteNotificationContractPreservesPublicAndPrivateHops() {
+        XCTAssertEqual(
+            Notification.Name.openPromptSnippetPalette.rawValue,
+            "openPromptSnippetPalette"
+        )
+        XCTAssertEqual(
+            Notification.Name.performPromptSnippetPaletteActivation.rawValue,
+            "performPromptSnippetPaletteActivation"
+        )
+        XCTAssertEqual(SnippetPaletteNotificationUserInfoKey.windowID, "windowID")
+        XCTAssertEqual(SnippetPaletteNotificationUserInfoKey.tabID, "tabID")
+    }
+
     func testModelSelectionHUDNotificationContractUsesStableModes() {
         XCTAssertEqual(
             Notification.Name.showAgentModelSelectionHUD.rawValue,

@@ -1,6 +1,6 @@
 # Agent Mode quick model picker and handoff HUD
 
-Scope: read when the task touches the Agent Mode quick model picker or quick handoff shortcuts, model-leaf index/ranking, HUD lifecycle or hosting, current-session model commit seam, or last-completed-reply handoff routing.
+Scope: read when the task touches the Agent Mode quick model picker or quick handoff shortcuts, model-leaf index/ranking, HUD lifecycle or hosting, snippet-palette shell arbitration, current-session model commit seam, or last-completed-reply handoff routing.
 Authority: Authoritative
 Last-verified: 2026-08-17
 
@@ -25,7 +25,7 @@ Quick model picker changes the active session's model. Quick handoff creates a n
 - Shared MCP-only model-control interactivity, current-session commit ordering, cache-only remote catalog access, last-reply lookup, and source-pinned handoff config: `ViewModels/AgentModeViewModel+Handoff.swift`; composer props consume the same predicate in `AgentModeViewModel+ComposerUI.swift`.
 - Transcript cutoff policy: `Runtime/Transcript/AgentTranscriptServices.swift`, with shared conclusion repair in `AgentTranscriptQualityRepair.swift`.
 - Handoff execution, success-only effort persistence, and error formatting: `Services/AgentHandoffActionSupport.swift`.
-- Atomic hosting and blocking-overlay/nav-HUD exclusion: `Sources/RepoPrompt/App/Views/ContentRootShellView.swift`.
+- Atomic hosting, blocking-overlay/HUD exclusion, and snippet-palette activation arbitration: `Sources/RepoPrompt/App/Views/ContentRootShellView.swift`.
 - Shortcut activation and target resolution: `App/GlobalShortcutActivation.swift`, `App/WindowStateManager.swift`, and `App/GlobalKeyboardShortcutsCoordinator.swift`; notification and catalog ownership remains in `Infrastructure/Utilities/Shortcuts.swift`, `App/Notifications/AppNotifications.swift`, and `Features/Settings/Views/KeyboardShortcutsSettingsView.swift`.
 
 ## Safety and performance invariants
@@ -41,7 +41,7 @@ Quick model picker changes the active session's model. Quick handoff creates a n
 - Codex native startup classifies start-versus-resume from saved native metadata alone — for handoff destinations and every other local Codex session — never from migrated transcript rows or reconnect flags. Both saved thread ID and rollout path absent (or whitespace-only) starts a new thread; a saved thread ID resumes that thread; a rollout path without its required thread ID is an explicit persisted-state integrity error, and successful start results never persist that shape. Failed first starts retain the pending handoff and retry `thread/start`.
 - The last-reply resolver refuses active sessions, skips explicit failed/cancelled turns even when they contain displayable assistant text, accepts legacy nil terminal state, never synthesizes compacted summaries, and uses legacy items only when structured turns are absent.
 - Ordinary Escape, click-outside, and dismissal cannot cancel a committing handoff. A blocking overlay—including remote device approval—immediately unmounts the HUD through the non-cancelling suspension path; task completion must not remount stale state.
-- The navigation HUD and model-selection HUD are mutually exclusive.
+- The navigation HUD, model-selection HUD, and snippet-palette activation are mutually exclusive. A window-scoped public snippet request is accepted only by the exact main-route key window when no sheet or blocking overlay is present and both HUDs are absent; the shell stamps the active compose tab onto the internal activation hop. The composer accepts only an exact window-and-tab scope, revalidates its live key-window/text-view/IME state, then focuses before opening or toggles when already first responder; an active palette is dismissed whenever its configured window/tab scope changes, including to nil.
 
 ## Smallest validation routes
 

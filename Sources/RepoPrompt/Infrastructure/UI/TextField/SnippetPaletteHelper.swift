@@ -52,16 +52,9 @@ final class SnippetPaletteHelper {
         self.itemsProvider = itemsProvider
     }
 
-    /// Open the palette anchored at the caret, or close it when already open.
-    func toggleSession(in textView: NSTextView) {
-        if isSessionActive {
-            dismiss()
-            return
-        }
-        beginSession(in: textView)
-    }
-
-    func beginSession(in textView: NSTextView) {
+    /// Open the palette anchored at the caret. Repeated opens are idempotent.
+    func openSession(in textView: NSTextView) {
+        guard !isSessionActive else { return }
         guard itemsProvider != nil else { return }
         guard !textView.hasMarkedText() else { return }
         let selection = textView.selectedRange()
@@ -73,6 +66,15 @@ final class SnippetPaletteHelper {
         }
         anchorLocation = caret
         scheduleRefresh(for: textView, immediate: true, enabled: true, isActive: true)
+    }
+
+    /// Open the palette anchored at the caret, or close it when already open.
+    func toggleSession(in textView: NSTextView) {
+        if isSessionActive {
+            dismiss()
+        } else {
+            openSession(in: textView)
+        }
     }
 
     /// Refreshes synchronously: filtering is in-memory and microsecond-cheap,
@@ -351,6 +353,10 @@ final class SnippetPaletteHelper {
 
         var matchedItemsForTesting: [SnippetPaletteItem] {
             matchedItems
+        }
+
+        var anchorLocationForTesting: Int? {
+            anchorLocation
         }
 
         func setSessionStateForTesting(

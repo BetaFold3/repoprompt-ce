@@ -5,6 +5,11 @@ enum AgentUtilityPanelNotificationUserInfoKey {
     static let windowID = "windowID"
 }
 
+enum SnippetPaletteNotificationUserInfoKey {
+    static let windowID = "windowID"
+    static let tabID = "tabID"
+}
+
 extension Notification.Name {
     static let showAPISettingsTab = Notification.Name("showAPISettingsTab")
     /// General request to open/focus the dedicated Settings window (Appearance / current tab).
@@ -14,10 +19,14 @@ extension Notification.Name {
     static let showManagePresetsTab = Notification.Name("showManagePresetsTab")
     /// Posted when the UI should present the "Create Preset" naming sheet
     static let showCreatePresetSheet = Notification.Name("showCreatePresetSheet")
-    /// Posted by the global shortcut to open the prompt snippet palette in the
-    /// focused Agent composer text view. The composer coordinator that owns
-    /// the focused text view responds; all others ignore it.
+    /// Posted by the global shortcut to request prompt snippet palette activation.
+    /// Both snippet palette hops must be posted on the main thread and deliver synchronously.
+    /// userInfo: [SnippetPaletteNotificationUserInfoKey.windowID: Int]
     static let openPromptSnippetPalette = Notification.Name("openPromptSnippetPalette")
+    /// App-internal second hop posted after the content shell accepts the request.
+    /// userInfo: [SnippetPaletteNotificationUserInfoKey.windowID: Int,
+    /// SnippetPaletteNotificationUserInfoKey.tabID: UUID]
+    static let performPromptSnippetPaletteActivation = Notification.Name("performPromptSnippetPaletteActivation")
     /// Posted when the UI should show the MCP settings tab
     static let showMCPSettingsTab = Notification.Name("showMCPSettingsTab")
     /// Posted when the UI should show the CLI Providers settings tab

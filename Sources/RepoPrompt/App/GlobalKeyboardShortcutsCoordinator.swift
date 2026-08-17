@@ -234,9 +234,12 @@ final class GlobalKeyboardShortcutsCoordinator {
     }
 
     private func openPromptSnippetPaletteFromShortcut() {
-        guard guardedFocusedWindowState() != nil else { return }
-        // The composer coordinator that owns the focused text view responds.
-        NotificationCenter.default.post(name: .openPromptSnippetPalette, object: nil)
+        guard let win = guardedFocusedWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .openPromptSnippetPalette,
+            object: nil,
+            userInfo: [SnippetPaletteNotificationUserInfoKey.windowID: win.windowID]
+        )
     }
 
     private func toggleNavigationSidebarFromShortcut() {

@@ -268,7 +268,44 @@ final class SnippetPaletteHelperTests: XCTestCase {
 
     // MARK: - Session lifecycle
 
-    func testBeginSessionAnchorsAtCaretAndTypedQueryFiltersSuggestions() async throws {
+    func testOpenSessionOpensInactiveAndIsIdempotentWhenActive() {
+        let item = makeItem(title: "duel oracles", content: "content")
+        let owner = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        defer { owner.orderOut(nil) }
+        let textView = ImageAwareTextView(frame: NSRect(x: 20, y: 20, width: 300, height: 80))
+        textView.string = "prompt"
+        textView.setSelectedRange(NSRange(location: 6, length: 0))
+        owner.contentView = textView
+        let helper = SnippetPaletteHelper()
+        defer { helper.dismiss() }
+        helper.configure(enabled: true, itemsProvider: { [item] })
+
+        helper.openSession(in: textView)
+        XCTAssertTrue(helper.isSessionActive)
+        XCTAssertEqual(helper.anchorLocationForTesting, 6)
+
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        helper.openSession(in: textView)
+        XCTAssertTrue(helper.isSessionActive)
+        XCTAssertEqual(helper.anchorLocationForTesting, 6)
+    }
+
+    func testToggleSessionClosesActiveSession() {
+        let textView = ImageAwareTextView(frame: NSRect(x: 0, y: 0, width: 300, height: 80))
+        let helper = SnippetPaletteHelper()
+        helper.setSessionStateForTesting(matchedItems: [], highlightedIndex: 0, anchorLocation: 0)
+
+        helper.toggleSession(in: textView)
+
+        XCTAssertFalse(helper.isSessionActive)
+    }
+
+    func testOpenSessionAnchorsAtCaretAndTypedQueryFiltersSuggestions() async throws {
         let duel = makeItem(title: "duel oracles", content: "content A")
         let review = makeItem(title: "review checklist", content: "content B")
         let owner = NSWindow(
@@ -285,7 +322,7 @@ final class SnippetPaletteHelperTests: XCTestCase {
         let helper = SnippetPaletteHelper()
         helper.configure(enabled: true, itemsProvider: { [duel, review] })
 
-        helper.beginSession(in: textView)
+        helper.openSession(in: textView)
         XCTAssertTrue(helper.isSessionActive)
         try await waitUntil { helper.matchedItemsForTesting == [duel, review] }
 

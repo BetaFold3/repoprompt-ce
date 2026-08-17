@@ -1,5 +1,28 @@
 import SwiftUI
 
+enum SnippetPaletteActivationGate {
+    static func shouldActivate(
+        requestWindowID: Int?,
+        currentWindowID: Int,
+        rootRoute: AppRootRoute,
+        isMainWindowKey: Bool,
+        hasAttachedSheet: Bool,
+        isBlockingOverlayVisible: Bool,
+        isNavigationHUDPresented: Bool,
+        isModelSelectionHUDPresented: Bool,
+        activeComposeTabID: UUID?
+    ) -> Bool {
+        requestWindowID == currentWindowID
+            && rootRoute == .main
+            && isMainWindowKey
+            && !hasAttachedSheet
+            && !isBlockingOverlayVisible
+            && !isNavigationHUDPresented
+            && !isModelSelectionHUDPresented
+            && activeComposeTabID != nil
+    }
+}
+
 // MARK: - Content Root Shell
 
 struct ContentRootShellView: View {
@@ -84,6 +107,31 @@ struct ContentRootShellView: View {
         }
         .animation(hudAnimation, value: agentNavigationHUD.isPresented)
         .animation(hudAnimation, value: agentModelSelectionHUD.isPresented)
+        .onReceive(NotificationCenter.default.publisher(for: .openPromptSnippetPalette)) { note in
+            let window = viewModel.state.nsWindow
+            let tabID = viewModel.state.promptManager.activeComposeTabID
+            guard SnippetPaletteActivationGate.shouldActivate(
+                requestWindowID: note.userInfo?[SnippetPaletteNotificationUserInfoKey.windowID] as? Int,
+                currentWindowID: viewModel.state.windowID,
+                rootRoute: viewModel.rootRoute,
+                isMainWindowKey: window?.isKeyWindow == true,
+                hasAttachedSheet: window?.attachedSheet != nil,
+                isBlockingOverlayVisible: isBlockingOverlayVisible,
+                isNavigationHUDPresented: agentNavigationHUD.isPresented,
+                isModelSelectionHUDPresented: agentModelSelectionHUD.isPresented,
+                activeComposeTabID: tabID
+            ), let tabID
+            else { return }
+
+            NotificationCenter.default.post(
+                name: .performPromptSnippetPaletteActivation,
+                object: nil,
+                userInfo: [
+                    SnippetPaletteNotificationUserInfoKey.windowID: viewModel.state.windowID,
+                    SnippetPaletteNotificationUserInfoKey.tabID: tabID
+                ]
+            )
+        }
         .onReceive(NotificationCenter.default.publisher(for: .showAgentNavigationHUD)) { note in
             guard noteTargetsCurrentWindow(note) else { return }
             guard !agentModelSelectionHUD.isCommitting else { return }

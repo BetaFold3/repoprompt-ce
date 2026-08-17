@@ -134,6 +134,20 @@ final class ImageAwareTextView: NSTextView {
     }
 }
 
+struct SnippetPaletteScope: Equatable {
+    let windowID: Int
+    let tabID: UUID
+
+    static func matches(
+        _ scope: SnippetPaletteScope?,
+        requestWindowID: Int?,
+        requestTabID: UUID?
+    ) -> Bool {
+        guard let scope, let requestWindowID, let requestTabID else { return false }
+        return scope.windowID == requestWindowID && scope.tabID == requestTabID
+    }
+}
+
 struct ResizableTextFieldFeatures {
     var enableFileTagOverlay: Bool = false
     var fileTagStore: WorkspaceFileContextStore?
@@ -147,6 +161,7 @@ struct ResizableTextFieldFeatures {
     var slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?
     var enableSnippetPalette: Bool = false
     var snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])?
+    var snippetPaletteScope: SnippetPaletteScope?
 
     static let plain = ResizableTextFieldFeatures()
 
@@ -159,7 +174,8 @@ struct ResizableTextFieldFeatures {
         fileMentionPickerConfiguration: FileMentionPickerConfiguration = .compact,
         onFileTagCommitted: ((MentionSuggestion) -> Void)?,
         slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?,
-        snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])? = nil
+        snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])? = nil,
+        snippetPaletteScope: SnippetPaletteScope? = nil
     ) -> ResizableTextFieldFeatures {
         ResizableTextFieldFeatures(
             enableFileTagOverlay: true,
@@ -173,7 +189,8 @@ struct ResizableTextFieldFeatures {
             enableSlashSkillOverlay: true,
             slashSkillSuggestionsProvider: slashSkillSuggestionsProvider,
             enableSnippetPalette: snippetPaletteItemsProvider != nil,
-            snippetPaletteItemsProvider: snippetPaletteItemsProvider
+            snippetPaletteItemsProvider: snippetPaletteItemsProvider,
+            snippetPaletteScope: snippetPaletteScope
         )
     }
 }
@@ -346,7 +363,8 @@ struct CustomTextField: NSViewRepresentable {
         context.coordinator.configureSnippetPaletteSupport(
             textView: textView,
             enabled: features.enableSnippetPalette,
-            itemsProvider: features.snippetPaletteItemsProvider
+            itemsProvider: features.snippetPaletteItemsProvider,
+            scope: features.snippetPaletteScope
         )
         textView.string = text
         context.coordinator.clearUndoHistory()
@@ -388,7 +406,8 @@ struct CustomTextField: NSViewRepresentable {
         context.coordinator.configureSnippetPaletteSupport(
             textView: textView,
             enabled: features.enableSnippetPalette,
-            itemsProvider: features.snippetPaletteItemsProvider
+            itemsProvider: features.snippetPaletteItemsProvider,
+            scope: features.snippetPaletteScope
         )
 
         var appliedProgrammaticTextChange = false
@@ -452,6 +471,7 @@ struct CustomTextField: NSViewRepresentable {
         private let snippetPaletteHelper = SnippetPaletteHelper()
         private weak var snippetPaletteTextView: ImageAwareTextView?
         private var snippetPaletteShortcutObserver: (any NSObjectProtocol)?
+        private var configuredSnippetPaletteScope: SnippetPaletteScope?
         // NEW: mark inactive after dismantle
         var isActive: Bool = true
 
@@ -643,22 +663,27 @@ struct CustomTextField: NSViewRepresentable {
         func configureSnippetPaletteSupport(
             textView: ImageAwareTextView,
             enabled: Bool,
-            itemsProvider: (() -> [SnippetPaletteItem])?
+            itemsProvider: (() -> [SnippetPaletteItem])?,
+            scope: SnippetPaletteScope?
         ) {
             snippetPaletteTextView = textView
+            if configuredSnippetPaletteScope != scope {
+                snippetPaletteHelper.dismiss()
+                configuredSnippetPaletteScope = scope
+            }
             snippetPaletteHelper.configure(enabled: enabled, itemsProvider: itemsProvider)
-            guard enabled, itemsProvider != nil else {
+            guard enabled, itemsProvider != nil, scope != nil else {
                 removeSnippetPaletteShortcutObserver()
                 return
             }
             guard snippetPaletteShortcutObserver == nil else { return }
             snippetPaletteShortcutObserver = NotificationCenter.default.addObserver(
-                forName: .openPromptSnippetPalette,
+                forName: .performPromptSnippetPaletteActivation,
                 object: nil,
-                queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.handleOpenSnippetPaletteShortcut()
+                queue: nil
+            ) { [weak self] note in
+                MainActor.assumeIsolated {
+                    self?.handleOpenSnippetPaletteShortcut(note)
                 }
             }
         }
@@ -691,6 +716,7 @@ struct CustomTextField: NSViewRepresentable {
             snippetPaletteHelper.dismiss()
             removeSnippetPaletteShortcutObserver()
             snippetPaletteTextView = nil
+            configuredSnippetPaletteScope = nil
         }
 
         private func removeSnippetPaletteShortcutObserver() {
@@ -700,14 +726,41 @@ struct CustomTextField: NSViewRepresentable {
             snippetPaletteShortcutObserver = nil
         }
 
-        private func handleOpenSnippetPaletteShortcut() {
+        private func handleOpenSnippetPaletteShortcut(_ note: Notification) {
+            guard SnippetPaletteScope.matches(
+                configuredSnippetPaletteScope,
+                requestWindowID: note.userInfo?[SnippetPaletteNotificationUserInfoKey.windowID] as? Int,
+                requestTabID: note.userInfo?[SnippetPaletteNotificationUserInfoKey.tabID] as? UUID
+            ) else { return }
             guard isActive, parent.features.enableSnippetPalette else { return }
             guard let textView = snippetPaletteTextView,
+                  textView.delegate === self,
                   let window = textView.window,
                   window.isKeyWindow,
+                  window.attachedSheet == nil,
+                  !textView.hasMarkedText()
+            else { return }
+
+            if window.firstResponder === textView {
+                snippetPaletteHelper.toggleSession(in: textView)
+                return
+            }
+
+            guard textView.acceptsFirstResponder,
+                  window.makeFirstResponder(textView),
                   window.firstResponder === textView
             else { return }
-            snippetPaletteHelper.toggleSession(in: textView)
+            snippetPaletteHelper.openSession(in: textView)
         }
+
+        #if DEBUG
+            var snippetPaletteSessionIsActiveForTesting: Bool {
+                snippetPaletteHelper.isSessionActive
+            }
+
+            func openSnippetPaletteSessionForTesting(in textView: NSTextView) {
+                snippetPaletteHelper.openSession(in: textView)
+            }
+        #endif
     }
 }

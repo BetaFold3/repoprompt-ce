@@ -717,6 +717,9 @@ struct AgentComposerView: View, Equatable {
                                 content: prompt.content
                             )
                         }
+                    },
+                    snippetPaletteScope: currentTabID.map {
+                        SnippetPaletteScope(windowID: windowID, tabID: $0)
                     }
                 ),
                 onHeightChange: { newHeight in
