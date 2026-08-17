@@ -418,6 +418,8 @@ struct AgentModelsSettingsView: View {
                 .cornerRadius(6)
             } else {
                 HStack(alignment: .center, spacing: 12) {
+                    // Do not hoist: StableMenuButton rebuilds this closure on every open so
+                    // newly learned OMP thinking capabilities appear without extra view state.
                     StableMenuButton(
                         items: { viewModel.contextBuilderAgentModelMenuItems(windowID: windowID) },
                         triggerStyle: .plain

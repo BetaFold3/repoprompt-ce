@@ -4,6 +4,18 @@ import XCTest
 
 @MainActor
 final class AgentModeChatSwitchActivationTests: XCTestCase {
+    #if DEBUG
+        override func setUp() {
+            super.setUp()
+            OhMyPiThinkingSelectionProbeTrigger.isDisabledForTesting = true
+        }
+
+        override func tearDown() {
+            OhMyPiThinkingSelectionProbeTrigger.isDisabledForTesting = false
+            super.tearDown()
+        }
+    #endif
+
     func testSharedModelSelectionCommitPreservesInputBarOrderingAndRejectsDrift() async throws {
         try await withFixture { fixture in
             fixture.window.apiSettingsViewModel.isCodexConnected = true

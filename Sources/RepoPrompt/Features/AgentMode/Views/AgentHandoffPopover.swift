@@ -627,6 +627,7 @@ struct AgentHandoffPopover: View {
                 selectedModelRaw: selectedModelRaw
             ) { agent, model in
                 selectHandoffModel(model, for: agent)
+                return true
             }
         }
     }

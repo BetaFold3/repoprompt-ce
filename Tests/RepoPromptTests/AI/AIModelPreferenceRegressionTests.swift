@@ -46,12 +46,13 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
     func testOptimizedPickerStableMenuTreeRoutesProviderSelections() throws {
         let cursorSnapshot = CursorModelParameterCatalog.shared.currentSnapshot()
         defer { CursorModelParameterCatalog.shared.test_restoreSnapshot(cursorSnapshot) }
-        XCTAssertEqual(
-            CursorModelParameterCatalog.shared.apply(
-                response: optimizedPickerCursorParameterResponse()
-            ),
-            .applied(didChange: true)
+        let cursorCatalogOutcome = CursorModelParameterCatalog.shared.apply(
+            response: optimizedPickerCursorParameterResponse()
         )
+        guard case .applied = cursorCatalogOutcome else {
+            XCTFail("Expected Cursor parameter catalog setup to apply, got \(cursorCatalogOutcome)")
+            return
+        }
 
         let codexLow = AIModel.codexCustom(name: "gpt-5.6-sol-low")
         let codexHigh = AIModel.codexCustom(name: "gpt-5.6-sol-high")
@@ -177,6 +178,46 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
         let lowLeaf = try XCTUnwrap(lowGroup.submenuItems?.first)
         XCTAssertTrue(lowLeaf.performActionForTesting())
         XCTAssertEqual(emittedLowRaw, codexLow.rawValue)
+    }
+
+    @MainActor
+    func testOptimizedPickerValidOMPLeafHasDefaultThinkingChildren() throws {
+        let model = AIModel.ohMyPiCustom(name: "provider/model")
+        var selectedRaw = model.rawValue
+        var selections = OhMyPiThinkingSelections()
+        let destination = ModelDestination(
+            id: "optimized-picker-omp-thinking-test",
+            getter: { selectedRaw },
+            applier: { selectedRaw = $0 },
+            thinkingGetter: { selections },
+            thinkingApplier: { selections = $0 }
+        )
+
+        let tree = OptimizedModelPicker.stableMenuItemsForTesting(
+            availableModels: [model],
+            destination: destination
+        )
+        let ompMenu = try stableMenuItem(
+            at: [AIProviderType.displayName(for: .ohMyPi)],
+            in: tree
+        )
+        let validLeaves = descendants(of: ompMenu.submenuItems ?? []).filter {
+            $0.submenuItems?.first?.title == "Default"
+        }
+
+        XCTAssertEqual(validLeaves.count, 1)
+        let validLeaf = try XCTUnwrap(validLeaves.first)
+        XCTAssertEqual(validLeaf.title, "model")
+        let defaultChild = try XCTUnwrap(validLeaf.submenuItems?.first)
+        XCTAssertEqual(defaultChild.title, "Default")
+        XCTAssertTrue(defaultChild.isEnabled)
+        XCTAssertTrue(defaultChild.isSelected)
+    }
+
+    private func descendants(of items: [StableMenuItem]) -> [StableMenuItem] {
+        items.flatMap { item in
+            [item] + descendants(of: item.submenuItems ?? [])
+        }
     }
 
     private func stableMenuItem(

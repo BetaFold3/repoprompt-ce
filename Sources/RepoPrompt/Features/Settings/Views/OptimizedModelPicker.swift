@@ -247,29 +247,13 @@ struct OptimizedModelPicker: View {
             }
         }
         if provider == .ohMyPi {
-            let projection = OhMyPiModelMenuBuilder.projection(for: models)
-            var items = projection.rootLeaves.map {
-                stableModelItem($0.model, title: $0.title)
+            return OhMyPiModelMenuBuilder.stableMenuItems(
+                for: models,
+                destination: destination
+            ) { model in
+                destination.apply(model.rawValue)
+                OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(of: model)
             }
-            items.append(contentsOf: projection.namespaceGroups.map { namespaceGroup in
-                .submenu(
-                    namespaceGroup.namespace,
-                    items: namespaceGroup.modelGroups.map(stableOhMyPiItem)
-                )
-            })
-            if destination.hasThinkingAccessory,
-               let exactModelID = OhMyPiThinkingMenuBuilder.exactModelID(from: destination.currentRawValue)
-            {
-                items.append(.separator)
-                items.append(.submenu(
-                    "Thinking",
-                    items: OhMyPiThinkingMenuBuilder.stableMenuItems(
-                        exactModelID: exactModelID,
-                        destination: destination
-                    )
-                ))
-            }
-            return items
         }
         return models.map { stableModelItem($0) }
     }
@@ -311,28 +295,6 @@ struct OptimizedModelPicker: View {
         }
         guard let option = group.options.first else { return nil }
         return stableModelItem(option.model, title: option.displayName)
-    }
-
-    private func stableOhMyPiItem(
-        _ group: OhMyPiModelMenuBuilder.ModelGroup
-    ) -> StableMenuItem {
-        guard group.isFamily else {
-            return group.normalLeaves.first.map {
-                stableModelItem($0.model, title: $0.title)
-            } ?? .separator
-        }
-        var items = group.normalLeaves.map {
-            stableModelItem($0.model, title: $0.title)
-        }
-        if !group.fastLeaves.isEmpty {
-            items.append(.submenu(
-                "Fast",
-                items: group.fastLeaves.map {
-                    stableModelItem($0.model, title: $0.title)
-                }
-            ))
-        }
-        return .submenu(group.title, items: items)
     }
 
     private func stableCompatibleClaudeItem(_ model: AIModel) -> StableMenuItem? {

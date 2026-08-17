@@ -2097,6 +2097,599 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertFalse(viewModel.roleDefaultsHasOverrides)
     }
 
+    func testAgentModelsThinkingDestinationsKeepIndependentMapsWhenSyncOff() throws {
+        let planning = thinkingSelections("planning-old", for: "provider/planning")
+        let compose = thinkingSelections("compose-old", for: "provider/compose")
+        let contextBuilder = thinkingSelections("context-old", for: "provider/context")
+        let harness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+            planningModelRaw: "ohMyPiCustom:provider/planning",
+            preferredComposeModelRaw: "ohMyPiCustom:provider/compose",
+            planningModelOhMyPiThinkingSelections: planning,
+            preferredComposeOhMyPiThinkingSelections: compose,
+            syncChatModelWithOracle: false,
+            contextBuilderOhMyPiThinkingSelections: contextBuilder
+        ))
+        let newPlanning = thinkingSelections("planning-new", for: "provider/planning")
+        let newCompose = thinkingSelections("compose-new", for: "provider/compose")
+
+        harness.viewModel.oracleModelDestination.applyThinkingSelections(newPlanning)
+
+        var profile = harness.store.globalAgentModelsProfile()
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, newPlanning)
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, compose)
+        XCTAssertEqual(profile.contextBuilderOhMyPiThinkingSelections, contextBuilder)
+        XCTAssertEqual(profile.planningModelRaw, "ohMyPiCustom:provider/planning")
+        XCTAssertEqual(profile.preferredComposeModelRaw, "ohMyPiCustom:provider/compose")
+
+        harness.viewModel.builtinChatModelDestination.applyThinkingSelections(newCompose)
+
+        profile = harness.store.globalAgentModelsProfile()
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, newPlanning)
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, newCompose)
+        XCTAssertEqual(profile.contextBuilderOhMyPiThinkingSelections, contextBuilder)
+        XCTAssertEqual(harness.fileStore.saveCount, 2)
+    }
+
+    func testAgentModelsOracleThinkingMirrorsWholeMapAndModelWhenSyncOn() throws {
+        let oldCompose = thinkingSelections("compose-old", for: "provider/compose")
+        let contextBuilder = thinkingSelections("context", for: "provider/context")
+        let harness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+            planningModelRaw: "ohMyPiCustom:provider/planning",
+            preferredComposeModelRaw: "ohMyPiCustom:provider/compose",
+            preferredComposeOhMyPiThinkingSelections: oldCompose,
+            syncChatModelWithOracle: true,
+            contextBuilderOhMyPiThinkingSelections: contextBuilder
+        ))
+        var replacement = thinkingSelections("planning-new", for: "provider/planning")
+        replacement.setValue(
+            "unrelated",
+            for: "provider/unrelated",
+            updatedAt: Date(timeIntervalSinceReferenceDate: 2)
+        )
+
+        harness.viewModel.oracleModelDestination.applyThinkingSelections(replacement)
+
+        let profile = harness.store.globalAgentModelsProfile()
+        XCTAssertEqual(profile.planningModelRaw, "ohMyPiCustom:provider/planning")
+        XCTAssertEqual(profile.preferredComposeModelRaw, profile.planningModelRaw)
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, replacement)
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, replacement)
+        XCTAssertEqual(profile.contextBuilderOhMyPiThinkingSelections, contextBuilder)
+        XCTAssertEqual(harness.fileStore.saveCount, 1)
+    }
+
+    func testAgentModelsBuiltinChatThinkingMirrorsWholeMapAndModelWhenSyncOn() throws {
+        let oldPlanning = thinkingSelections("planning-old", for: "provider/planning")
+        let contextBuilder = thinkingSelections("context", for: "provider/context")
+        let harness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+            planningModelRaw: "ohMyPiCustom:provider/planning",
+            preferredComposeModelRaw: "ohMyPiCustom:provider/compose",
+            planningModelOhMyPiThinkingSelections: oldPlanning,
+            syncChatModelWithOracle: true,
+            contextBuilderOhMyPiThinkingSelections: contextBuilder
+        ))
+        var replacement = thinkingSelections("compose-new", for: "provider/compose")
+        replacement.setValue(
+            "unrelated",
+            for: "provider/unrelated",
+            updatedAt: Date(timeIntervalSinceReferenceDate: 2)
+        )
+
+        harness.viewModel.builtinChatModelDestination.applyThinkingSelections(replacement)
+
+        let profile = harness.store.globalAgentModelsProfile()
+        XCTAssertEqual(profile.preferredComposeModelRaw, "ohMyPiCustom:provider/compose")
+        XCTAssertEqual(profile.planningModelRaw, profile.preferredComposeModelRaw)
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, replacement)
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, replacement)
+        XCTAssertEqual(profile.contextBuilderOhMyPiThinkingSelections, contextBuilder)
+        XCTAssertEqual(harness.fileStore.saveCount, 1)
+    }
+
+    func testAgentModelsThinkingSyncDoesNotReassertBlankSourceModels() throws {
+        let planning = thinkingSelections("planning-old", for: "provider/planning")
+        let compose = thinkingSelections("compose-old", for: "provider/compose")
+        let blankChatHarness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+            planningModelRaw: "ohMyPiCustom:provider/planning",
+            preferredComposeModelRaw: " \n\t ",
+            planningModelOhMyPiThinkingSelections: planning,
+            preferredComposeOhMyPiThinkingSelections: compose,
+            syncChatModelWithOracle: true
+        ))
+        let newCompose = thinkingSelections("compose-new", for: "provider/compose")
+
+        blankChatHarness.viewModel.builtinChatModelDestination.applyThinkingSelections(newCompose)
+
+        var profile = blankChatHarness.store.globalAgentModelsProfile()
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, newCompose)
+        XCTAssertEqual(profile.planningModelRaw, "ohMyPiCustom:provider/planning")
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, planning)
+
+        let blankOracleHarness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+            planningModelRaw: " \n\t ",
+            preferredComposeModelRaw: "ohMyPiCustom:provider/compose",
+            planningModelOhMyPiThinkingSelections: planning,
+            preferredComposeOhMyPiThinkingSelections: compose,
+            syncChatModelWithOracle: true
+        ))
+        let newPlanning = thinkingSelections("planning-new", for: "provider/planning")
+
+        blankOracleHarness.viewModel.oracleModelDestination.applyThinkingSelections(newPlanning)
+
+        profile = blankOracleHarness.store.globalAgentModelsProfile()
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, newPlanning)
+        XCTAssertEqual(profile.preferredComposeModelRaw, "ohMyPiCustom:provider/compose")
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, compose)
+    }
+
+    func testAgentModelsDirectModelWritesFollowReferenceSyncMatrix() throws {
+        enum Destination {
+            case oracle
+            case builtinChat
+        }
+        struct Case {
+            let name: String
+            let sync: Bool
+            let destination: Destination
+            let raw: String
+            let expectedPlanningRaw: String?
+            let expectedComposeRaw: String?
+            let expectedPlanningMapSource: Destination
+            let expectedComposeMapSource: Destination
+        }
+
+        let planningRaw = "ohMyPiCustom:provider/planning"
+        let composeRaw = "ohMyPiCustom:provider/compose"
+        let replacementRaw = "ohMyPiCustom:provider/replacement"
+        let blank = " \n\t "
+        let cases = [
+            Case(
+                name: "sync on Oracle nonblank",
+                sync: true,
+                destination: .oracle,
+                raw: replacementRaw,
+                expectedPlanningRaw: replacementRaw,
+                expectedComposeRaw: replacementRaw,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .oracle
+            ),
+            Case(
+                name: "sync on Oracle blank",
+                sync: true,
+                destination: .oracle,
+                raw: blank,
+                expectedPlanningRaw: nil,
+                expectedComposeRaw: nil,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .oracle
+            ),
+            Case(
+                name: "sync on Built-in Chat nonblank",
+                sync: true,
+                destination: .builtinChat,
+                raw: replacementRaw,
+                expectedPlanningRaw: replacementRaw,
+                expectedComposeRaw: replacementRaw,
+                expectedPlanningMapSource: .builtinChat,
+                expectedComposeMapSource: .builtinChat
+            ),
+            Case(
+                name: "sync on Built-in Chat blank",
+                sync: true,
+                destination: .builtinChat,
+                raw: blank,
+                expectedPlanningRaw: planningRaw,
+                expectedComposeRaw: nil,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            ),
+            Case(
+                name: "sync off Oracle nonblank",
+                sync: false,
+                destination: .oracle,
+                raw: replacementRaw,
+                expectedPlanningRaw: replacementRaw,
+                expectedComposeRaw: composeRaw,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            ),
+            Case(
+                name: "sync off Oracle blank",
+                sync: false,
+                destination: .oracle,
+                raw: blank,
+                expectedPlanningRaw: nil,
+                expectedComposeRaw: composeRaw,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            ),
+            Case(
+                name: "sync off Built-in Chat nonblank",
+                sync: false,
+                destination: .builtinChat,
+                raw: replacementRaw,
+                expectedPlanningRaw: planningRaw,
+                expectedComposeRaw: replacementRaw,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            ),
+            Case(
+                name: "sync off Built-in Chat blank",
+                sync: false,
+                destination: .builtinChat,
+                raw: blank,
+                expectedPlanningRaw: planningRaw,
+                expectedComposeRaw: nil,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            )
+        ]
+
+        for testCase in cases {
+            let planning = thinkingSelections("planning", for: "provider/planning")
+            let compose = thinkingSelections("compose", for: "provider/compose")
+            let harness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+                planningModelRaw: planningRaw,
+                preferredComposeModelRaw: composeRaw,
+                planningModelOhMyPiThinkingSelections: planning,
+                preferredComposeOhMyPiThinkingSelections: compose,
+                syncChatModelWithOracle: testCase.sync
+            ))
+
+            switch testCase.destination {
+            case .oracle:
+                harness.viewModel.oracleModelDestination.apply(testCase.raw)
+            case .builtinChat:
+                harness.viewModel.builtinChatModelDestination.apply(testCase.raw)
+            }
+
+            let profile = harness.store.globalAgentModelsProfile()
+            XCTAssertEqual(profile.planningModelRaw, testCase.expectedPlanningRaw, testCase.name)
+            XCTAssertEqual(profile.preferredComposeModelRaw, testCase.expectedComposeRaw, testCase.name)
+            XCTAssertEqual(
+                profile.planningModelOhMyPiThinkingSelections,
+                testCase.expectedPlanningMapSource == .oracle ? planning : compose,
+                testCase.name
+            )
+            XCTAssertEqual(
+                profile.preferredComposeOhMyPiThinkingSelections,
+                testCase.expectedComposeMapSource == .oracle ? planning : compose,
+                testCase.name
+            )
+            XCTAssertEqual(harness.fileStore.saveCount, 1, testCase.name)
+        }
+    }
+
+    func testAgentModelsRecommendationMirrorsThinkingMapWhenSyncOn() throws {
+        let workspaceID = UUID()
+        let planning = thinkingSelections("planning", for: "provider/planning")
+        let contextBuilder = thinkingSelections("context", for: "provider/context")
+        let harness = try makeAgentModelsSettingsHarness(
+            profile: AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.claude4Sonnet.rawValue,
+                preferredComposeModelRaw: AIModel.claude4Opus.rawValue,
+                planningModelOhMyPiThinkingSelections: planning,
+                preferredComposeOhMyPiThinkingSelections: thinkingSelections("compose", for: "provider/compose"),
+                syncChatModelWithOracle: true,
+                contextBuilderOhMyPiThinkingSelections: contextBuilder
+            ),
+            workspaceID: workspaceID,
+            configureAPI: { $0.isOpenAIKeyValid = true }
+        )
+
+        harness.viewModel.applyOracleRecommendation()
+
+        var profile = try XCTUnwrap(harness.store.workspaceAgentModelsProfile(for: workspaceID))
+        XCTAssertEqual(profile.preferredComposeModelRaw, profile.planningModelRaw)
+        XCTAssertFalse(profile.planningModelRaw?.isEmpty ?? true)
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, planning)
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, planning)
+        XCTAssertEqual(profile.contextBuilderOhMyPiThinkingSelections, contextBuilder)
+
+        let secondPlanning = thinkingSelections("planning-all", for: "provider/planning-all")
+        var reset = profile
+        reset.planningModelOhMyPiThinkingSelections = secondPlanning
+        reset.preferredComposeOhMyPiThinkingSelections =
+            thinkingSelections("compose-all", for: "provider/compose-all")
+        harness.store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: reset)
+
+        harness.viewModel.applyAllRecommendations()
+
+        profile = try XCTUnwrap(harness.store.workspaceAgentModelsProfile(for: workspaceID))
+        XCTAssertEqual(profile.preferredComposeModelRaw, profile.planningModelRaw)
+        XCTAssertFalse(profile.planningModelRaw?.isEmpty ?? true)
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, secondPlanning)
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, secondPlanning)
+        XCTAssertEqual(profile.contextBuilderOhMyPiThinkingSelections, contextBuilder)
+    }
+
+    func testAgentModelsRecommendationLeavesBothThinkingMapsUntouchedWhenSyncOff() throws {
+        let workspaceID = UUID()
+        let planning = thinkingSelections("planning", for: "provider/planning")
+        let compose = thinkingSelections("compose", for: "provider/compose")
+        let harness = try makeAgentModelsSettingsHarness(
+            profile: AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.claude4Sonnet.rawValue,
+                preferredComposeModelRaw: AIModel.claude4Opus.rawValue,
+                planningModelOhMyPiThinkingSelections: planning,
+                preferredComposeOhMyPiThinkingSelections: compose,
+                syncChatModelWithOracle: false
+            ),
+            workspaceID: workspaceID,
+            configureAPI: { $0.isOpenAIKeyValid = true }
+        )
+
+        let externalCompose = thinkingSelections("external-compose", for: "provider/external")
+        var external = try XCTUnwrap(harness.store.workspaceAgentModelsProfile(for: workspaceID))
+        external.preferredComposeOhMyPiThinkingSelections = externalCompose
+        harness.store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: external)
+
+        harness.viewModel.applyAllRecommendations()
+
+        var profile = try XCTUnwrap(harness.store.workspaceAgentModelsProfile(for: workspaceID))
+        XCTAssertEqual(profile.preferredComposeModelRaw, profile.planningModelRaw)
+        XCTAssertFalse(profile.planningModelRaw?.isEmpty ?? true)
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, planning)
+        XCTAssertEqual(
+            profile.preferredComposeOhMyPiThinkingSelections,
+            externalCompose,
+            "sync-off bulk apply must preserve the freshly written independent Chat map"
+        )
+
+        let secondPlanning = thinkingSelections("planning-oracle", for: "provider/planning-oracle")
+        let secondCompose = thinkingSelections("compose-oracle", for: "provider/compose-oracle")
+        var reset = profile
+        reset.planningModelOhMyPiThinkingSelections = secondPlanning
+        reset.preferredComposeOhMyPiThinkingSelections = secondCompose
+        harness.store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: reset)
+
+        harness.viewModel.applyOracleRecommendation()
+
+        profile = try XCTUnwrap(harness.store.workspaceAgentModelsProfile(for: workspaceID))
+        XCTAssertEqual(profile.preferredComposeModelRaw, profile.planningModelRaw)
+        XCTAssertFalse(profile.planningModelRaw?.isEmpty ?? true)
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, secondPlanning)
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, secondCompose)
+    }
+
+    func testAgentModelsMutationReadsFreshProfileAndPreservesExternalFields() throws {
+        let planning = thinkingSelections("planning", for: "provider/planning")
+        let compose = thinkingSelections("compose", for: "provider/compose")
+        let harness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+            planningModelRaw: "old-planning",
+            preferredComposeModelRaw: "old-compose",
+            planningModelOhMyPiThinkingSelections: planning,
+            preferredComposeOhMyPiThinkingSelections: compose,
+            syncChatModelWithOracle: false,
+            mcpAgentRoleOverrides: ["explore": "codexExec:old"]
+        ))
+        var external = harness.store.globalAgentModelsProfile()
+        external.preferredComposeModelRaw = "external-compose"
+        external.mcpAgentRoleOverrides = ["explore": "codexExec:external"]
+        external.restrictMCPAgentDiscoveryToRoleLabels = true
+        harness.store.setGlobalAgentModelsProfile(
+            external,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+
+        XCTAssertEqual(harness.viewModel.builtinChatModelDestination.currentRawValue, "external-compose")
+        harness.viewModel.setOracleModel(raw: "new-planning")
+
+        let profile = harness.store.globalAgentModelsProfile()
+        XCTAssertEqual(profile.planningModelRaw, "new-planning")
+        XCTAssertEqual(profile.preferredComposeModelRaw, "external-compose")
+        XCTAssertEqual(profile.mcpAgentRoleOverrides, ["explore": "codexExec:external"])
+        XCTAssertTrue(profile.restrictMCPAgentDiscoveryToRoleLabels)
+        XCTAssertEqual(profile.planningModelOhMyPiThinkingSelections, planning)
+        XCTAssertEqual(profile.preferredComposeOhMyPiThinkingSelections, compose)
+    }
+
+    func testAgentModelsRoleDefaultMutationPreservesFreshExternalOverrides() throws {
+        let harness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+            planningModelRaw: "planning",
+            preferredComposeModelRaw: "compose",
+            syncChatModelWithOracle: false,
+            mcpAgentRoleOverrides: ["explore": "codexExec:old"]
+        ))
+        var external = harness.store.globalAgentModelsProfile()
+        external.mcpAgentRoleOverrides = [
+            "explore": "codexExec:external",
+            "engineer": "claudeCode:external"
+        ]
+        harness.store.setGlobalAgentModelsProfile(
+            external,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        let selection = AgentModelCatalog.NormalizedAgentSelection(
+            agent: .ohMyPi,
+            modelRaw: "provider/design"
+        )
+
+        harness.viewModel.setRoleDefaultSelection(selection, for: .design)
+
+        XCTAssertEqual(
+            harness.store.globalAgentModelsProfile().mcpAgentRoleOverrides,
+            [
+                "explore": "codexExec:external",
+                "engineer": "claudeCode:external",
+                "design": "ohMyPi:provider/design"
+            ]
+        )
+    }
+
+    func testAgentModelsFreshInheritanceReadTargetsMatchingWorkspaceProfile() throws {
+        let workspaceID = UUID()
+        let globalProfile = AgentModelsSettingsProfile(
+            planningModelRaw: "global-planning",
+            preferredComposeModelRaw: "global-compose",
+            syncChatModelWithOracle: false
+        )
+        let harness = try makeAgentModelsSettingsHarness(
+            profile: globalProfile,
+            workspaceID: nil
+        )
+        let workspaceProfile = AgentModelsSettingsProfile(
+            planningModelRaw: "workspace-planning",
+            preferredComposeModelRaw: "workspace-compose",
+            syncChatModelWithOracle: false,
+            mcpAgentRoleOverrides: ["explore": "codexExec:workspace"]
+        )
+        harness.store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
+        harness.store.setWorkspaceAgentModelsInheritanceMode(
+            workspaceID: workspaceID,
+            mode: .useGlobalSettings
+        )
+        harness.viewModel.updateWorkspaceContext(workspaceID: workspaceID, workspaceName: "Fresh scope")
+        harness.store.setWorkspaceAgentModelsInheritanceMode(
+            workspaceID: workspaceID,
+            mode: .useWorkspaceOverrides
+        )
+
+        harness.viewModel.setOracleModel(raw: "workspace-new")
+
+        XCTAssertEqual(harness.store.globalAgentModelsProfile(), globalProfile)
+        let persistedWorkspace = try XCTUnwrap(harness.store.workspaceAgentModelsProfile(for: workspaceID))
+        XCTAssertEqual(persistedWorkspace.planningModelRaw, "workspace-new")
+        XCTAssertEqual(persistedWorkspace.preferredComposeModelRaw, "workspace-compose")
+        XCTAssertEqual(persistedWorkspace.mcpAgentRoleOverrides, ["explore": "codexExec:workspace"])
+    }
+
+    func testAgentModelsContextBuilderDestinationUsesUserInitiatedIntent() throws {
+        let contextBuilder = thinkingSelections("old", for: "provider/context")
+        let harness = try makeAgentModelsSettingsHarness(profile: AgentModelsSettingsProfile(
+            planningModelRaw: "planning",
+            preferredComposeModelRaw: "compose",
+            syncChatModelWithOracle: false,
+            contextBuilderAgentRaw: AgentProviderKind.ohMyPi.rawValue,
+            contextBuilderOhMyPiThinkingSelections: contextBuilder,
+            contextBuilderModelsByAgent: [AgentProviderKind.ohMyPi.rawValue: "provider/context"],
+            mcpAgentRoleOverrides: ["explore": "codexExec:preserve"]
+        ))
+        harness.store.setGlobalAgentModelsProfile(
+            harness.store.globalAgentModelsProfile(),
+            contextBuilderWriteIntent: .automaticSeed
+        )
+        harness.fileStore.saveCount = 0
+        XCTAssertFalse(harness.store.hasUserSetGlobalContextBuilderAgentDefaults)
+        let replacement = thinkingSelections("new", for: "provider/context")
+
+        harness.viewModel.contextBuilderAgentModelDestination.applyThinkingSelections(replacement)
+
+        let profile = harness.store.globalAgentModelsProfile()
+        XCTAssertTrue(harness.store.hasUserSetGlobalContextBuilderAgentDefaults)
+        XCTAssertEqual(profile.contextBuilderOhMyPiThinkingSelections, replacement)
+        XCTAssertEqual(profile.contextBuilderAgentRaw, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(profile.contextBuilderModelsByAgent?[AgentProviderKind.ohMyPi.rawValue], "provider/context")
+        XCTAssertEqual(profile.planningModelRaw, "planning")
+        XCTAssertEqual(profile.preferredComposeModelRaw, "compose")
+        XCTAssertEqual(profile.mcpAgentRoleOverrides, ["explore": "codexExec:preserve"])
+        XCTAssertEqual(harness.fileStore.saveCount, 1)
+
+        let workspaceID = UUID()
+        let legacyChatModelRaw = AIModel.gpt54Pro.rawValue
+        var chatSettings = harness.store.chatSettings(for: workspaceID)
+        chatSettings.contextBuilderModelRaw = legacyChatModelRaw
+        harness.store.updateChatSettings(chatSettings, commit: true)
+        var promptProfile = profile
+        promptProfile.contextBuilderAgentRaw = AgentProviderKind.codexExec.rawValue
+        promptProfile = promptProfile.replacingContextBuilderModel(
+            AgentModel.gpt55CodexMedium.rawValue,
+            for: AgentProviderKind.codexExec.rawValue
+        )
+        harness.store.setGlobalAgentModelsProfile(
+            promptProfile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        let fileManager = WorkspaceFilesViewModel()
+        fileManager.setCurrentWorkspaceID(workspaceID)
+        let apiSettings = makeAPISettingsViewModel()
+        apiSettings.isCodexConnected = true
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: apiSettings,
+            windowID: -506,
+            settingsManager: WindowSettingsManager(windowID: -506, store: harness.store)
+        )
+        prompt.contextBuilderAgent = .codexExec
+        let promptDestination = ModelDestination.contextBuilderAgentModel(promptVM: prompt)
+        let selectedAgentModelRaw = AgentModel.gpt55CodexLow.rawValue
+        let promptThinking = thinkingSelections("prompt", for: selectedAgentModelRaw)
+
+        promptDestination.apply(selectedAgentModelRaw)
+        promptDestination.applyThinkingSelections(promptThinking)
+
+        let promptPersistedProfile = harness.store.globalAgentModelsProfile()
+        XCTAssertEqual(prompt.contextBuilderAgentModelRaw, selectedAgentModelRaw)
+        XCTAssertEqual(
+            promptPersistedProfile.contextBuilderModelsByAgent?[AgentProviderKind.codexExec.rawValue],
+            selectedAgentModelRaw
+        )
+        XCTAssertEqual(
+            promptPersistedProfile.contextBuilderOhMyPiThinkingSelections,
+            promptThinking
+        )
+        XCTAssertEqual(prompt.contextBuilderModelName, legacyChatModelRaw)
+        XCTAssertEqual(
+            harness.store.chatSettings(for: workspaceID).contextBuilderModelRaw,
+            legacyChatModelRaw,
+            "The CLI agent-model destination must never mutate the legacy AI Chat Context Builder model."
+        )
+    }
+
+    private func makeAgentModelsSettingsHarness(
+        profile: AgentModelsSettingsProfile,
+        workspaceID: UUID? = nil,
+        configureAPI: (APISettingsViewModel) -> Void = { _ in }
+    ) throws -> (
+        store: GlobalSettingsStore,
+        manager: WindowSettingsManager,
+        viewModel: AgentModelsSettingsViewModel,
+        fileStore: CountingGlobalSettingsFileStore
+    ) {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        if let workspaceID {
+            store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+            store.setWorkspaceAgentModelsInheritanceMode(
+                workspaceID: workspaceID,
+                mode: .useWorkspaceOverrides
+            )
+        } else {
+            store.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: .preserveExistingOwnership
+            )
+        }
+        let manager = WindowSettingsManager(windowID: -505, store: store)
+        let apiSettings = makeAPISettingsViewModel()
+        configureAPI(apiSettings)
+        let viewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: apiSettings,
+            workspaceID: workspaceID,
+            workspaceName: workspaceID == nil ? nil : "Settings OMP tests",
+            settingsManager: manager,
+            settingsStore: store
+        )
+        fileStore.saveCount = 0
+        return (store, manager, viewModel, fileStore)
+    }
+
+    private func thinkingSelections(
+        _ value: String,
+        for wireID: String
+    ) -> OhMyPiThinkingSelections {
+        var selections = OhMyPiThinkingSelections()
+        selections.setValue(
+            value,
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 1)
+        )
+        return selections
+    }
+
     private func makeAPISettingsViewModel() -> APISettingsViewModel {
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())

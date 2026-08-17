@@ -90,6 +90,65 @@ enum OhMyPiModelMenuBuilder {
         )
     }
 
+    @MainActor
+    static func stableMenuItems(
+        for models: [AIModel],
+        destination: ModelDestination,
+        titleTransform: (String) -> String = { $0 },
+        onModelCommit: @escaping (AIModel) -> Void
+    ) -> [StableMenuItem] {
+        func modelItem(_ leaf: Leaf) -> StableMenuItem {
+            let title = titleTransform(leaf.title)
+            guard destination.hasThinkingAccessory,
+                  let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: leaf.model)
+            else {
+                return .action(
+                    title,
+                    isSelected: leaf.model.rawValue == destination.currentRawValue
+                ) {
+                    onModelCommit(leaf.model)
+                }
+            }
+
+            return .submenu(
+                title,
+                isSelected: leaf.model.rawValue == destination.currentRawValue,
+                items: OhMyPiThinkingMenuBuilder.stableMenuItems(
+                    exactModelID: exactModelID,
+                    destination: destination,
+                    onBeforeApply: {
+                        onModelCommit(leaf.model)
+                        return true
+                    }
+                )
+            )
+        }
+
+        func modelGroupItem(_ group: ModelGroup) -> StableMenuItem {
+            guard group.isFamily else {
+                return group.normalLeaves.first.map(modelItem) ?? .separator
+            }
+            var items = group.normalLeaves.map(modelItem)
+            if !group.fastLeaves.isEmpty {
+                items.append(.submenu(
+                    "Fast",
+                    items: group.fastLeaves.map(modelItem)
+                ))
+            }
+            return .submenu(group.title, items: items)
+        }
+
+        let projection = projection(for: models)
+        var items = projection.rootLeaves.map(modelItem)
+        items.append(contentsOf: projection.namespaceGroups.map { namespaceGroup in
+            .submenu(
+                namespaceGroup.namespace,
+                items: namespaceGroup.modelGroups.map(modelGroupItem)
+            )
+        })
+        return items
+    }
+
     static func groups(for models: [AIModel]) -> [NamespaceGroup] {
         projection(for: models).namespaceGroups
     }

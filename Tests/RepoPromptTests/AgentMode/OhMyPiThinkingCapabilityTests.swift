@@ -142,6 +142,18 @@ final class OhMyPiThinkingCapabilityRegistryTests: XCTestCase {
 }
 
 final class OhMyPiThinkingCapabilityResolverTests: XCTestCase {
+    #if DEBUG
+        override func setUp() {
+            super.setUp()
+            OhMyPiThinkingSelectionProbeTrigger.isDisabledForTesting = false
+        }
+
+        override func tearDown() {
+            OhMyPiThinkingSelectionProbeTrigger.isDisabledForTesting = false
+            super.tearDown()
+        }
+    #endif
+
     func testCacheFirstAvoidsProbe() async throws {
         let fixture = try makeResolver(behavior: .success)
         XCTAssertTrue(fixture.registry.record(
@@ -378,6 +390,16 @@ final class OhMyPiThinkingCapabilityResolverTests: XCTestCase {
 
 @MainActor
 final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+    }
+
+    override func tearDown() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        super.tearDown()
+    }
+
     func testRowsPreserveUpstreamOrderDisambiguateDuplicatesAndWarnForStaleValue() {
         let capability = OhMyPiThinkingCapabilitySnapshot(
             modelID: "provider/model",
@@ -419,6 +441,7 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             storedChoice: .init(value: "future", updatedAt: Date())
         )
         XCTAssertEqual(unknown.first?.title, "Default")
+        XCTAssertTrue(unknown.first?.isEnabled == true)
         XCTAssertEqual(unknown.last?.action, .load)
         XCTAssertTrue(unknown.last?.isEnabled == true)
 
@@ -428,6 +451,7 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             storedChoice: nil
         )
         XCTAssertEqual(loading.map(\.title), ["Default", "Loading thinking levels…"])
+        XCTAssertTrue(loading.first?.isEnabled == true)
         XCTAssertFalse(loading.last?.isEnabled ?? true)
 
         let failed = OhMyPiThinkingMenuBuilder.rows(
@@ -435,10 +459,12 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             probeState: .failed,
             storedChoice: nil
         )
+        XCTAssertEqual(failed.first?.title, "Default")
+        XCTAssertTrue(failed.first?.isEnabled == true)
         XCTAssertEqual(failed.last?.action, .load)
     }
 
-    func testStableAgentSurfaceAddsOneThinkingSiblingNotPerModel() {
+    func testStableAgentSurfaceNestsThinkingUnderEachValidModelNotAsSibling() {
         let models = (0 ..< 203).map {
             AgentModelOption(
                 rawValue: "provider/model-\($0)",
@@ -463,11 +489,371 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             onSelect: { _, _ in }
         )
 
-        XCTAssertEqual(countTitle("Thinking", in: items), 1)
-        XCTAssertEqual(
-            items.last?.title,
-            "Thinking"
+        let modelLeaves = models.compactMap { model in
+            findItem(titled: model.displayName, in: items)
+        }
+        XCTAssertEqual(modelLeaves.count, 203)
+        XCTAssertTrue(modelLeaves.allSatisfy { $0.submenuItems?.first?.title == "Default" })
+        XCTAssertEqual(countTitle("Thinking", in: items), 0)
+    }
+
+    func testStableAgentSurfaceThinkingChildCommitsItsExactLeafAcrossProjectionShapes() throws {
+        let scenarios: [(rawModel: String, path: [String])] = [
+            ("root-high", ["root-high", "Default"]),
+            (
+                "google-antigravity/gemini-3.7-flash",
+                ["google-antigravity", "gemini-3.7-flash", "Default"]
+            ),
+            (
+                "cursor/gpt-5.6-sol-high",
+                ["cursor", "gpt-5.6-sol", "High", "Default"]
+            )
+        ]
+        var models = scenarios.map { scenario in
+            AgentModelOption(
+                rawValue: scenario.rawModel,
+                displayName: scenario.rawModel,
+                description: nil,
+                isDefault: false
+            )
+        }
+        models.append(AgentModelOption(
+            rawValue: "cursor/gpt-5.6-sol-low",
+            displayName: "cursor/gpt-5.6-sol-low",
+            description: nil,
+            isDefault: false
+        ))
+        var selectedRaw = scenarios[0].rawModel
+        var committedRaws: [String] = []
+        var appliedKeys: [String] = []
+        var selections = OhMyPiThinkingSelections()
+        let destination = ModelDestination(
+            id: "exact-leaf-menu-test",
+            getter: { selectedRaw },
+            applier: { selectedRaw = $0 },
+            thinkingGetter: { selections },
+            thinkingApplier: { updatedSelections in
+                let removedKeys = Set(selections.entries.keys)
+                    .subtracting(updatedSelections.entries.keys)
+                appliedKeys.append(contentsOf: removedKeys)
+                selections = updatedSelections
+            }
         )
+
+        for scenario in scenarios {
+            try XCTContext.runActivity(named: scenario.rawModel) { _ in
+                selections = OhMyPiThinkingSelections()
+                for candidate in scenarios {
+                    selections.setValue("high", for: candidate.rawModel, updatedAt: Date(timeIntervalSince1970: 1))
+                }
+                selectedRaw = scenario.rawModel
+                committedRaws.removeAll()
+                appliedKeys.removeAll()
+
+                let commitSelection: (AgentProviderKind, AgentModelOption) -> Void = { agent, option in
+                    XCTAssertEqual(agent, .ohMyPi)
+                    committedRaws.append(option.rawValue)
+                    selectedRaw = option.rawValue
+                }
+                let items = AgentModelStableMenuItems.ohMyPiModelItems(
+                    options: models,
+                    selectedAgent: .ohMyPi,
+                    selectedModelRaw: selectedRaw,
+                    thinkingDestination: destination,
+                    onSelect: commitSelection
+                )
+                let child = try stableMenuItem(at: scenario.path, in: items)
+
+                XCTAssertTrue(child.performActionForTesting())
+                XCTAssertEqual(committedRaws, [scenario.rawModel])
+                XCTAssertEqual(appliedKeys, [scenario.rawModel])
+                XCTAssertNil(selections[scenario.rawModel])
+                XCTAssertTrue(
+                    scenarios.filter { $0.rawModel != scenario.rawModel }
+                        .allSatisfy { selections[$0.rawModel]?.value == "high" }
+                )
+            }
+        }
+    }
+
+    func testContextBuilderSurfaceNestsThinkingUnderValidLeavesEvenWhenSelectedAgentIsNonOMP() throws {
+        let rawModel = "provider/context-builder-model"
+        let surface = try makeContextBuilderSurface(
+            selectedModelRaw: rawModel,
+            selectedCurrentAgent: .codexExec
+        )
+        defer { surface.cleanup() }
+
+        let items = surface.viewModel.contextBuilderAgentModelMenuItems(windowID: -701)
+        let ompMenu = try XCTUnwrap(items.first { $0.title == AgentProviderKind.ohMyPi.displayName })
+        let validLeaf = try XCTUnwrap(
+            findItem(titled: "Context Builder Model", in: ompMenu.submenuItems ?? [])
+        )
+
+        XCTAssertEqual(surface.viewModel.selectedContextBuilderAgent, .codexExec)
+        XCTAssertEqual(validLeaf.submenuItems?.first?.title, "Default")
+        XCTAssertEqual(countTitle("Thinking", in: items), 0)
+    }
+
+    func testThinkingSubmenuAbsentForPlaceholderModel() throws {
+        let surface = try makeContextBuilderSurface(
+            selectedModelRaw: AgentModel.defaultModel.rawValue
+        )
+        defer { surface.cleanup() }
+
+        let items = surface.viewModel.contextBuilderAgentModelMenuItems(windowID: -702)
+        let ompMenu = try XCTUnwrap(items.first { $0.title == AgentProviderKind.ohMyPi.displayName })
+        let ompItems = try XCTUnwrap(ompMenu.submenuItems)
+        let placeholder = try XCTUnwrap(ompItems.first { $0.title == "Default" })
+        let validLeaf = try XCTUnwrap(
+            findItem(titled: "Context Builder Model", in: ompItems)
+        )
+
+        XCTAssertNil(placeholder.submenuItems, "The literal provider default must remain an action leaf")
+        XCTAssertEqual(validLeaf.submenuItems?.first?.title, "Default")
+        XCTAssertEqual(countTitle("Thinking", in: items), 0)
+    }
+
+    func testThinkingSelectionCommitsModelBeforeApplyRejectsFailedCommitAndLoadSkipsCommit() throws {
+        let rawModel = "provider/composite-model"
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omp-thinking-composite-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let capabilityRegistry = OhMyPiThinkingCapabilityRegistry(
+            store: OhMyPiThinkingCapabilityStore(
+                fileURL: directory.appendingPathComponent("capabilities.json")
+            )
+        )
+        XCTAssertTrue(capabilityRegistry.record(
+            OhMyPiThinkingCapabilityRecord(
+                modelID: rawModel,
+                configID: "thinking",
+                category: "thought_level",
+                orderedOptions: ["off", "high"],
+                optionDisplayNames: ["Off", "High"]
+            ),
+            ompVersion: "99.0.0"
+        ))
+
+        var events: [String] = []
+        var selections = OhMyPiThinkingSelections()
+        let destination = ModelDestination(
+            id: "composite-menu-test",
+            getter: { rawModel },
+            applier: { _ in },
+            thinkingGetter: { selections },
+            thinkingApplier: {
+                selections = $0
+                events.append("thinking")
+            }
+        )
+
+        let high = try XCTUnwrap(OhMyPiThinkingMenuBuilder.rows(
+            capability: capabilityRegistry.snapshot(for: rawModel),
+            probeState: .idle,
+            storedChoice: nil
+        ).first { $0.title == "High" })
+        OhMyPiThinkingMenuBuilder.perform(
+            high,
+            exactModelID: rawModel,
+            destination: destination,
+            onBeforeApply: {
+                events.append("model")
+                return true
+            }
+        )
+        XCTAssertEqual(events, ["model", "thinking"])
+        XCTAssertEqual(selections[rawModel]?.value, "high")
+
+        events.removeAll()
+        let rejectedItems = OhMyPiThinkingMenuBuilder.stableMenuItems(
+            exactModelID: rawModel,
+            destination: destination,
+            registry: capabilityRegistry,
+            onBeforeApply: {
+                events.append("model-rejected")
+                return false
+            }
+        )
+        let defaultItem = try XCTUnwrap(rejectedItems.first { $0.title == "Default" })
+        XCTAssertTrue(defaultItem.performActionForTesting())
+        XCTAssertEqual(events, ["model-rejected"])
+        XCTAssertEqual(selections[rawModel]?.value, "high")
+
+        let emptyRegistry = OhMyPiThinkingCapabilityRegistry(
+            store: OhMyPiThinkingCapabilityStore(
+                fileURL: directory.appendingPathComponent("empty-capabilities.json")
+            )
+        )
+        let resolver = OhMyPiThinkingCapabilityResolver(
+            client: ProbeClient(behavior: .failure),
+            registry: capabilityRegistry,
+            statusStore: OhMyPiThinkingCapabilityProbeStatusStore(),
+            runtimeVersion: { "99.0.0" }
+        )
+        events.removeAll()
+        let unknownItems = OhMyPiThinkingMenuBuilder.stableMenuItems(
+            exactModelID: rawModel,
+            destination: destination,
+            registry: emptyRegistry,
+            resolver: resolver,
+            onBeforeApply: {
+                events.append("unexpected-model-commit")
+                return true
+            }
+        )
+        let load = try XCTUnwrap(unknownItems.first { $0.title == "Load thinking levels…" })
+        XCTAssertTrue(load.performActionForTesting())
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(selections[rawModel]?.value, "high")
+    }
+
+    func testReopenedThinkingMenuReflectsNewlyLearnedCapabilities() throws {
+        let rawModel = "provider/reopened-\(UUID().uuidString)"
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omp-thinking-reopen-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let registry = OhMyPiThinkingCapabilityRegistry(
+            store: OhMyPiThinkingCapabilityStore(
+                fileURL: directory.appendingPathComponent("capabilities.json")
+            )
+        )
+        let destination = contextBuilderDestination(rawModel: rawModel)
+        let buildItems = {
+            OhMyPiThinkingMenuBuilder.stableMenuItems(
+                exactModelID: rawModel,
+                destination: destination,
+                registry: registry
+            )
+        }
+
+        XCTAssertFalse(buildItems().contains { $0.title == "High" })
+        XCTAssertTrue(registry.record(
+            OhMyPiThinkingCapabilityRecord(
+                modelID: rawModel,
+                configID: "thinking",
+                category: "thought_level",
+                orderedOptions: ["off", "high"],
+                optionDisplayNames: ["Off", "High"]
+            ),
+            ompVersion: "99.0.0"
+        ))
+        XCTAssertTrue(buildItems().contains { $0.title == "High" })
+    }
+
+    private func contextBuilderDestination(rawModel: String) -> ModelDestination {
+        var selections = OhMyPiThinkingSelections()
+        return ModelDestination(
+            id: "contextBuilderAgentModel",
+            getter: { rawModel },
+            applier: { _ in },
+            thinkingGetter: { selections },
+            thinkingApplier: { selections = $0 }
+        )
+    }
+
+    private func makeContextBuilderSurface(
+        selectedModelRaw: String,
+        selectedCurrentAgent: AgentProviderKind = .ohMyPi
+    ) throws -> (
+        viewModel: AgentModelsSettingsViewModel,
+        cleanup: () -> Void
+    ) {
+        let discoveredRaw = OhMyPiCanonicalModelIdentity.exactWireID(for: selectedModelRaw)
+            ?? "provider/context-builder-catalog-model"
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: discoveredRaw,
+                        displayName: "Context Builder Model",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: true
+                    )
+                ],
+                currentModelRaw: discoveredRaw
+            ),
+            for: .ohMyPi
+        ))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omp-thinking-surface-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let suiteName = "OhMyPiThinkingMenuBuilderTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        let store = try GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(
+                fileURL: directory.appendingPathComponent("globalSettings.json")
+            )
+        )
+        var contextBuilderModelsByAgent = [
+            AgentProviderKind.ohMyPi.rawValue: selectedModelRaw
+        ]
+        if selectedCurrentAgent != .ohMyPi {
+            contextBuilderModelsByAgent[selectedCurrentAgent.rawValue] = AgentModel.defaultModel.rawValue
+        }
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                contextBuilderAgentRaw: selectedCurrentAgent.rawValue,
+                contextBuilderModelsByAgent: contextBuilderModelsByAgent
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        let apiSettings = APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+        apiSettings.isOhMyPiConnected = true
+        if selectedCurrentAgent == .codexExec {
+            apiSettings.isCodexConnected = true
+        }
+        let viewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: apiSettings,
+            settingsManager: WindowSettingsManager(windowID: -700, store: store),
+            settingsStore: store
+        )
+        return (
+            viewModel,
+            {
+                defaults.removePersistentDomain(forName: suiteName)
+                try? FileManager.default.removeItem(at: directory)
+            }
+        )
+    }
+
+    private func stableMenuItem(at path: [String], in items: [StableMenuItem]) throws -> StableMenuItem {
+        var currentItems = items
+        var currentItem: StableMenuItem?
+        for title in path {
+            currentItem = currentItems.first { $0.title == title }
+            let item = try XCTUnwrap(
+                currentItem,
+                "Missing menu path component \(title); available: \(currentItems.map(\.title))"
+            )
+            currentItems = item.submenuItems ?? []
+        }
+        return try XCTUnwrap(currentItem)
+    }
+
+    private func findItem(titled title: String, in items: [StableMenuItem]) -> StableMenuItem? {
+        for item in items {
+            if item.title == title {
+                return item
+            }
+            if let match = findItem(titled: title, in: item.submenuItems ?? []) {
+                return match
+            }
+        }
+        return nil
     }
 
     private func countTitle(_ title: String, in items: [StableMenuItem]) -> Int {

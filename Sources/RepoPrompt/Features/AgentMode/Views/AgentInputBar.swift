@@ -1073,31 +1073,38 @@ struct AgentComposerView: View, Equatable {
             }
         }
         if agent == .ohMyPi {
-            let onSelect: (AgentProviderKind, AgentModelOption) -> Void = { selectedAgent, model in
+            let onSelect: (AgentProviderKind, AgentModelOption) -> Bool = { selectedAgent, model in
                 if let message = actions.selectAgentModel(selectedAgent, model.rawValue) {
                     showSteeringUnsupportedNotice(message)
-                } else {
-                    OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
-                        agent: selectedAgent,
-                        rawModel: model.rawValue
-                    )
+                    return false
                 }
+                OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                    agent: selectedAgent,
+                    rawModel: model.rawValue
+                )
+                return true
             }
-            if let destination = inputBarOhMyPiThinkingDestination {
+            if let currentTabID {
                 return AgentModelStableMenuItems.ohMyPiModelItems(
                     options: options,
                     selectedAgent: props.selectedAgent,
                     selectedModelRaw: props.selectedModelRaw,
-                    thinkingDestination: destination,
+                    thinkingDestinationForModel: { exactModelID in
+                        inputBarOhMyPiThinkingDestination(
+                            tabID: currentTabID,
+                            exactModelID: exactModelID
+                        )
+                    },
                     onSelect: onSelect
                 )
             }
             return AgentModelStableMenuItems.ohMyPiModelItems(
                 options: options,
                 selectedAgent: props.selectedAgent,
-                selectedModelRaw: props.selectedModelRaw,
-                onSelect: onSelect
-            )
+                selectedModelRaw: props.selectedModelRaw
+            ) { selectedAgent, model in
+                _ = onSelect(selectedAgent, model)
+            }
         }
         guard agent == .openCode else {
             return options.map { inputBarModelMenuItem(agent: agent, model: $0) }
@@ -1143,18 +1150,17 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
-    private var inputBarOhMyPiThinkingDestination: ModelDestination? {
-        guard let currentTabID,
-              props.selectedAgent == .ohMyPi
-        else { return nil }
-        return ModelDestination(
-            id: "agentInputBar.\(currentTabID.uuidString)",
-            getter: { props.selectedModelRaw },
+    private func inputBarOhMyPiThinkingDestination(
+        tabID: UUID,
+        exactModelID: String
+    ) -> ModelDestination {
+        ModelDestination(
+            id: "agentInputBar.\(tabID.uuidString).\(exactModelID)",
+            getter: { exactModelID },
             applier: { _ in },
             thinkingGetter: { props.ohMyPiThinkingSelections },
             thinkingApplier: { selections in
-                let value = selections.value(for: props.selectedModelRaw)
-                actions.selectOhMyPiThinking(props.selectedModelRaw, value)
+                actions.selectOhMyPiThinking(exactModelID, selections.value(for: exactModelID))
             }
         )
     }

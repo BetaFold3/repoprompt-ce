@@ -95,6 +95,10 @@ extension AgentModeViewModel {
         )
         selectedAgent = agent
         selectModel(rawModel: rawModel)
+        OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+            agent: agent,
+            rawModel: rawModel
+        )
         if agent == .codexExec,
            CodexModelSpecifier(raw: rawModel).reasoningEffort == nil,
            let explicitCodexEffort

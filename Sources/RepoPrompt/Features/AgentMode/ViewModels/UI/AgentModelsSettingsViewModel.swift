@@ -289,10 +289,16 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         ModelDestination(
             id: "agentModels.oracle",
             getter: { [weak self] in
-                self?.profileSnapshot.planningModelRaw ?? ""
+                self?.currentProfile().profile.planningModelRaw ?? ""
             },
             applier: { [weak self] rawValue in
                 self?.setOracleModel(raw: rawValue)
+            },
+            thinkingGetter: { [weak self] in
+                self?.currentProfile().profile.planningModelOhMyPiThinkingSelections ?? .empty
+            },
+            thinkingApplier: { [weak self] selections in
+                self?.setOracleThinkingSelections(selections)
             }
         )
     }
@@ -304,10 +310,45 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         ModelDestination(
             id: "agentModels.builtinChat",
             getter: { [weak self] in
-                self?.profileSnapshot.preferredComposeModelRaw ?? ""
+                self?.currentProfile().profile.preferredComposeModelRaw ?? ""
             },
             applier: { [weak self] rawValue in
                 self?.setBuiltinChatModel(raw: rawValue)
+            },
+            thinkingGetter: { [weak self] in
+                self?.currentProfile().profile.preferredComposeOhMyPiThinkingSelections ?? .empty
+            },
+            thinkingApplier: { [weak self] selections in
+                self?.setBuiltinChatThinkingSelections(selections)
+            }
+        )
+    }
+
+    /// Destination for the Context Builder agent model and its OMP thinking selection.
+    var contextBuilderAgentModelDestination: ModelDestination {
+        ModelDestination(
+            id: "agentModels.contextBuilderAgentModel",
+            getter: { [weak self] in
+                guard let self else { return "" }
+                return currentContextBuilderSelection().modelRaw
+            },
+            applier: { [weak self] rawValue in
+                guard let self else { return }
+                setContextBuilderSelection(
+                    agent: currentContextBuilderSelection().agent,
+                    modelRaw: rawValue
+                )
+            },
+            thinkingGetter: { [weak self] in
+                self?.currentProfile().profile.contextBuilderOhMyPiThinkingSelections ?? .empty
+            },
+            thinkingApplier: { [weak self] selections in
+                self?.updateSelectedProfile(
+                    reason: "agent_models.context_builder_thinking",
+                    contextBuilderWriteIntent: .userInitiated
+                ) { profile in
+                    profile.contextBuilderOhMyPiThinkingSelections = selections
+                }
             }
         )
     }
@@ -319,6 +360,8 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             profile.planningModelRaw = raw
             if profile.syncChatModelWithOracle {
                 profile.preferredComposeModelRaw = raw
+                profile.preferredComposeOhMyPiThinkingSelections =
+                    profile.planningModelOhMyPiThinkingSelections
             }
         }
     }
@@ -330,6 +373,34 @@ final class AgentModelsSettingsViewModel: ObservableObject {
                !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
                 profile.planningModelRaw = raw
+                profile.planningModelOhMyPiThinkingSelections =
+                    profile.preferredComposeOhMyPiThinkingSelections
+            }
+        }
+    }
+
+    private func setOracleThinkingSelections(_ selections: OhMyPiThinkingSelections) {
+        updateSelectedProfile(reason: "agent_models.oracle_thinking") { profile in
+            profile.planningModelOhMyPiThinkingSelections = selections
+            if profile.syncChatModelWithOracle,
+               let modelRaw = profile.planningModelRaw,
+               !modelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                profile.preferredComposeModelRaw = modelRaw
+                profile.preferredComposeOhMyPiThinkingSelections = selections
+            }
+        }
+    }
+
+    private func setBuiltinChatThinkingSelections(_ selections: OhMyPiThinkingSelections) {
+        updateSelectedProfile(reason: "agent_models.builtin_chat_thinking") { profile in
+            profile.preferredComposeOhMyPiThinkingSelections = selections
+            if profile.syncChatModelWithOracle,
+               let modelRaw = profile.preferredComposeModelRaw,
+               !modelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                profile.planningModelRaw = modelRaw
+                profile.planningModelOhMyPiThinkingSelections = selections
             }
         }
     }
@@ -365,6 +436,14 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         updateSelectedProfile(reason: "agent_models.apply_oracle_recommendation") { profile in
             profile.planningModelRaw = recommendedModelRaw
             profile.preferredComposeModelRaw = recommendedModelRaw
+            // Recommendations have always set both model fields regardless of the sync toggle.
+            // Thinking ownership remains directional, so only sync an existing map when opted in.
+            if profile.syncChatModelWithOracle,
+               !recommendedModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                profile.preferredComposeOhMyPiThinkingSelections =
+                    profile.planningModelOhMyPiThinkingSelections
+            }
         }
         postRecommendationsDidApply(reason: "agent_models.apply_oracle_recommendation")
     }
@@ -384,9 +463,12 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     func applyRoleDefault(_ resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution) {
-        var overrides = profileSnapshot.mcpAgentRoleOverrides ?? [:]
-        overrides.removeValue(forKey: resolution.role.rawValue)
-        persistRoleDefaultOverrides(overrides.isEmpty ? nil : overrides)
+        updateSelectedProfile(reason: "agent_models.role_defaults") { profile in
+            var overrides = profile.mcpAgentRoleOverrides ?? [:]
+            overrides.removeValue(forKey: resolution.role.rawValue)
+            profile.mcpAgentRoleOverrides = overrides.isEmpty ? nil : overrides
+        }
+        postAgentRoleDefaultsChanged()
     }
 
     func resetAllRoleDefaults() {
@@ -397,15 +479,18 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         _ selection: AgentModelCatalog.NormalizedAgentSelection,
         for role: AgentModelCatalog.TaskLabelKind
     ) {
-        var overrides = profileSnapshot.mcpAgentRoleOverrides ?? [:]
-        let selectionID = AgentModelSelectionID(
-            agentRaw: selection.agent.rawValue,
-            modelRaw: selection.modelRaw
-        )
-        // Keep explicit role picks durable even when they currently match the recommendation;
-        // `applyRoleDefault` / reset actions are the explicit path back to recommendation-tracking.
-        overrides[role.rawValue] = selectionID.rawValue
-        persistRoleDefaultOverrides(overrides)
+        updateSelectedProfile(reason: "agent_models.role_defaults") { profile in
+            var overrides = profile.mcpAgentRoleOverrides ?? [:]
+            let selectionID = AgentModelSelectionID(
+                agentRaw: selection.agent.rawValue,
+                modelRaw: selection.modelRaw
+            )
+            // Keep explicit role picks durable even when they currently match the recommendation;
+            // `applyRoleDefault` / reset actions are the explicit path back to recommendation-tracking.
+            overrides[role.rawValue] = selectionID.rawValue
+            profile.mcpAgentRoleOverrides = overrides
+        }
+        postAgentRoleDefaultsChanged()
     }
 
     // MARK: - Bulk Apply
@@ -415,13 +500,22 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         guard workspaceID != nil else { return }
         isApplyingAll = true
 
-        var profile = profileSnapshot
+        let current = currentProfile()
+        var profile = current.profile
         var didMutateProfile = false
         if let chat = recommendations.chatModel,
            let recommendedModelRaw = engine.recommendedChatModelRaw(chat, backend: chat.defaultBackend)
         {
             profile.planningModelRaw = recommendedModelRaw
             profile.preferredComposeModelRaw = recommendedModelRaw
+            // The legacy recommendation path writes both models even with sync off; unlike the
+            // model write, the whole-map copy remains opt-in and never clears independent maps.
+            if profile.syncChatModelWithOracle,
+               !recommendedModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
+                profile.preferredComposeOhMyPiThinkingSelections =
+                    profile.planningModelOhMyPiThinkingSelections
+            }
             didMutateProfile = true
         }
         if let cb = recommendations.contextBuilder {
@@ -437,6 +531,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         if didMutateProfile {
             persistSelectedProfile(
                 profile,
+                scope: current.scope,
                 reason: "agent_models.apply_all_recommendations",
                 contextBuilderWriteIntent: recommendations.contextBuilder == nil
                     ? .preserveExistingOwnership
@@ -459,15 +554,35 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     // MARK: - Context Builder Menu
 
     func contextBuilderAgentModelMenuItems(windowID: Int) -> [StableMenuItem] {
-        let selection = selectedContextBuilderSelection
+        let selection = currentContextBuilderSelection()
+        let thinkingDestination = contextBuilderAgentModelDestination
+        let onSelect: (AgentProviderKind, AgentModelOption) -> Bool = { [weak self] selectedAgent, selectedOption in
+            guard let self else { return false }
+            setContextBuilderSelection(agent: selectedAgent, modelRaw: selectedOption.rawValue)
+            OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                agent: selectedAgent,
+                rawModel: selectedOption.rawValue
+            )
+            return true
+        }
         var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
+            if agent == .ohMyPi {
+                return AgentModelStableMenuItems.agentSubmenu(
+                    agentKind: agent,
+                    options: AgentModelCatalog.options(for: agent, availability: availability),
+                    selectedAgent: selection.agent,
+                    selectedModelRaw: selection.modelRaw,
+                    thinkingDestination: thinkingDestination,
+                    onSelect: onSelect
+                )
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
                 selectedAgent: selection.agent,
                 selectedModelRaw: selection.modelRaw
-            ) { [weak self] selectedAgent, selectedOption in
-                self?.setContextBuilderSelection(agent: selectedAgent, modelRaw: selectedOption.rawValue)
+            ) { selectedAgent, selectedOption in
+                _ = onSelect(selectedAgent, selectedOption)
             }
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(
@@ -482,6 +597,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
         AgentModelCatalog.selectableAgents(availability: availability).map { agent in
+            // Deliberately model-only: role defaults have no per-role thinking owner.
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
@@ -497,6 +613,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
                     modelRaw: selectedOption.rawValue
                 )
                 setRoleDefaultSelection(selection, for: resolution.role)
+                OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                    agent: selectedAgent,
+                    rawModel: selectedOption.rawValue
+                )
             }
         }
     }
@@ -521,6 +641,40 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         }
         return settingsManager.workspaceAgentModelsProfile(for: workspaceID)
             ?? settingsManager.effectiveAgentModelsProfile(workspaceID: workspaceID)
+    }
+
+    private func currentProfile() -> (
+        scope: AgentModelsEditingScope,
+        profile: AgentModelsSettingsProfile
+    ) {
+        let currentInheritanceMode = Self.inheritanceMode(
+            settingsManager: settingsManager,
+            workspaceID: workspaceID
+        )
+        let scope: AgentModelsEditingScope = if let workspaceID, currentInheritanceMode == .useWorkspaceOverrides {
+            .workspace(workspaceID)
+        } else {
+            .global
+        }
+        return (
+            scope,
+            Self.profile(
+                settingsManager: settingsManager,
+                workspaceID: workspaceID,
+                inheritanceMode: currentInheritanceMode
+            )
+        )
+    }
+
+    private func currentContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection {
+        let profile = currentProfile().profile
+        let selectedAgentRaw = profile.contextBuilderAgentRaw
+        let selectedModelRaw = selectedAgentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
+        return AgentModelCatalog.normalizeSelection(
+            agentRaw: selectedAgentRaw,
+            modelRaw: selectedModelRaw,
+            availability: availability
+        )
     }
 
     private func observeNotifications() {
@@ -580,10 +734,12 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership,
         _ mutation: (inout AgentModelsSettingsProfile) -> Void
     ) {
-        var profile = profileSnapshot
+        let current = currentProfile()
+        var profile = current.profile
         mutation(&profile)
         persistSelectedProfile(
             profile,
+            scope: current.scope,
             reason: reason,
             contextBuilderWriteIntent: contextBuilderWriteIntent
         )
@@ -591,10 +747,11 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     private func persistSelectedProfile(
         _ profile: AgentModelsSettingsProfile,
+        scope: AgentModelsEditingScope,
         reason: String,
         contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership
     ) {
-        switch editingScope {
+        switch scope {
         case .global:
             settingsManager.setGlobalAgentModelsProfile(
                 profile,

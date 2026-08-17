@@ -605,6 +605,8 @@ struct MCPServerPopoverContent: View {
 
                 Spacer()
 
+                // Do not hoist: StableMenuButton rebuilds this closure on every open so
+                // newly learned OMP thinking capabilities appear without extra view state.
                 StableMenuButton(
                     items: contextBuilderAgentModelMenuItems,
                     triggerStyle: .borderless
@@ -626,20 +628,40 @@ struct MCPServerPopoverContent: View {
     }
 
     private func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
+        let rawModel = promptViewModel.contextBuilderAgentModelRaw
+        let destination = ModelDestination.contextBuilderAgentModel(promptVM: promptViewModel)
         var items = promptViewModel.availableAgentKinds.map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
-                agentKind: agent,
-                options: promptViewModel.contextBuilderModelOptions(for: agent),
-                selectedAgent: promptViewModel.contextBuilderAgent,
-                selectedModelRaw: promptViewModel.contextBuilderAgentModelRaw
-            ) { selectedAgent, selectedOption in
+            let onSelect: (AgentProviderKind, AgentModelOption) -> Bool = { selectedAgent, selectedOption in
                 promptViewModel.contextBuilderAgent = selectedAgent
                 promptViewModel.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
                 // Persist even when the user re-selects the displayed runtime fallback.
                 promptViewModel.commitContextBuilderSettings()
+                OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                    agent: selectedAgent,
+                    rawModel: selectedOption.rawValue
+                )
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .recommendationsDidApply, object: nil)
                 }
+                return true
+            }
+            if agent == .ohMyPi {
+                return AgentModelStableMenuItems.agentSubmenu(
+                    agentKind: agent,
+                    options: promptViewModel.contextBuilderModelOptions(for: agent),
+                    selectedAgent: promptViewModel.contextBuilderAgent,
+                    selectedModelRaw: rawModel,
+                    thinkingDestination: destination,
+                    onSelect: onSelect
+                )
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
+                agentKind: agent,
+                options: promptViewModel.contextBuilderModelOptions(for: agent),
+                selectedAgent: promptViewModel.contextBuilderAgent,
+                selectedModelRaw: rawModel
+            ) { selectedAgent, selectedOption in
+                _ = onSelect(selectedAgent, selectedOption)
             }
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(

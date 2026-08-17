@@ -116,7 +116,7 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
             destination: destination
         )
 
-        XCTAssertTrue(performFirstAction(titled: "model", in: items))
+        XCTAssertTrue(performFirstAction(titled: "Default", in: items))
         XCTAssertEqual(destination.currentRawValue, model.rawValue)
         XCTAssertEqual(prompt.contextBuilderModelName, model.rawValue)
         XCTAssertEqual(
@@ -271,6 +271,171 @@ final class GlobalSettingsCrossWindowPropagationTests: XCTestCase {
             "unrelated",
             "sync must copy the whole map rather than only the selected model entry"
         )
+    }
+
+    func testDirectModelWritesFollowSyncMatrix() async throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+        let store = fixture.settingsStore
+        let prompt = makePromptViewModel(
+            windowID: 1,
+            store: store,
+            promptStore: fixture.promptStore
+        )
+        let wireID = "cursor/shared-model"
+        let chatModel = AIModel.ohMyPiCustom(name: wireID).rawValue
+        let planningModel = AIModel.ohMyPiCustom(name: "cursor/planning-model").rawValue
+        var chatSelections = OhMyPiThinkingSelections()
+        chatSelections.setValue(
+            "chat-low",
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 1)
+        )
+        var planningSelections = OhMyPiThinkingSelections()
+        planningSelections.setValue(
+            "plan-high",
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 2)
+        )
+        planningSelections.setValue(
+            "unrelated",
+            for: "cursor/unrelated-model",
+            updatedAt: Date(timeIntervalSinceReferenceDate: 3)
+        )
+
+        enum Destination: Equatable {
+            case oracle
+            case builtinChat
+        }
+        struct ModelWriteCase {
+            let name: String
+            let sync: Bool
+            let destination: Destination
+            let raw: String
+            let expectedPlanningRaw: String?
+            let expectedComposeRaw: String?
+            let expectedPlanningMapSource: Destination
+            let expectedComposeMapSource: Destination
+        }
+        let replacementModel = AIModel.ohMyPiCustom(name: "cursor/replacement-model").rawValue
+        let blank = " \n\t "
+        let modelWriteCases = [
+            ModelWriteCase(
+                name: "sync on Oracle nonblank",
+                sync: true,
+                destination: .oracle,
+                raw: replacementModel,
+                expectedPlanningRaw: replacementModel,
+                expectedComposeRaw: replacementModel,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .oracle
+            ),
+            ModelWriteCase(
+                name: "sync on Oracle blank",
+                sync: true,
+                destination: .oracle,
+                raw: blank,
+                expectedPlanningRaw: nil,
+                expectedComposeRaw: nil,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .oracle
+            ),
+            ModelWriteCase(
+                name: "sync on Built-in Chat nonblank",
+                sync: true,
+                destination: .builtinChat,
+                raw: replacementModel,
+                expectedPlanningRaw: replacementModel,
+                expectedComposeRaw: replacementModel,
+                expectedPlanningMapSource: .builtinChat,
+                expectedComposeMapSource: .builtinChat
+            ),
+            ModelWriteCase(
+                name: "sync on Built-in Chat blank",
+                sync: true,
+                destination: .builtinChat,
+                raw: blank,
+                expectedPlanningRaw: planningModel,
+                expectedComposeRaw: nil,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            ),
+            ModelWriteCase(
+                name: "sync off Oracle nonblank",
+                sync: false,
+                destination: .oracle,
+                raw: replacementModel,
+                expectedPlanningRaw: replacementModel,
+                expectedComposeRaw: chatModel,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            ),
+            ModelWriteCase(
+                name: "sync off Oracle blank",
+                sync: false,
+                destination: .oracle,
+                raw: blank,
+                expectedPlanningRaw: nil,
+                expectedComposeRaw: chatModel,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            ),
+            ModelWriteCase(
+                name: "sync off Built-in Chat nonblank",
+                sync: false,
+                destination: .builtinChat,
+                raw: replacementModel,
+                expectedPlanningRaw: planningModel,
+                expectedComposeRaw: replacementModel,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            ),
+            ModelWriteCase(
+                name: "sync off Built-in Chat blank",
+                sync: false,
+                destination: .builtinChat,
+                raw: blank,
+                expectedPlanningRaw: planningModel,
+                expectedComposeRaw: nil,
+                expectedPlanningMapSource: .oracle,
+                expectedComposeMapSource: .builtinChat
+            )
+        ]
+
+        for testCase in modelWriteCases {
+            var resetProfile = store.globalAgentModelsProfile()
+            resetProfile.planningModelRaw = planningModel
+            resetProfile.preferredComposeModelRaw = chatModel
+            resetProfile.planningModelOhMyPiThinkingSelections = planningSelections
+            resetProfile.preferredComposeOhMyPiThinkingSelections = chatSelections
+            resetProfile.syncChatModelWithOracle = testCase.sync
+            store.setGlobalAgentModelsProfile(
+                resetProfile,
+                contextBuilderWriteIntent: .preserveExistingOwnership
+            )
+            await drainMainQueue()
+
+            switch testCase.destination {
+            case .oracle:
+                prompt.planningModelName = testCase.raw
+            case .builtinChat:
+                prompt.preferredModel = testCase.raw
+            }
+
+            let profile = store.globalAgentModelsProfile()
+            XCTAssertEqual(profile.planningModelRaw, testCase.expectedPlanningRaw, testCase.name)
+            XCTAssertEqual(profile.preferredComposeModelRaw, testCase.expectedComposeRaw, testCase.name)
+            XCTAssertEqual(
+                profile.planningModelOhMyPiThinkingSelections,
+                testCase.expectedPlanningMapSource == .oracle ? planningSelections : chatSelections,
+                testCase.name
+            )
+            XCTAssertEqual(
+                profile.preferredComposeOhMyPiThinkingSelections,
+                testCase.expectedComposeMapSource == .oracle ? planningSelections : chatSelections,
+                testCase.name
+            )
+        }
     }
 
     // NOTE: Context Builder agent propagation is exercised compositionally — the store-side

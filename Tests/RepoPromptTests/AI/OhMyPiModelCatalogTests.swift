@@ -189,6 +189,79 @@ final class OhMyPiModelCatalogTests: XCTestCase {
         XCTAssertEqual(multiset(selectedSourceIDs), multiset(inputs.map(\.sourceID)))
     }
 
+    func testOhMyPiIgnoresGroupOpenCodeFlagAndAlwaysProjects() throws {
+        let wireIDs = try fixtureWireIDs()
+        XCTAssertEqual(wireIDs.count, 203)
+
+        let options = wireIDs.enumerated().map {
+            AgentModelOption(
+                rawValue: $0.element,
+                displayName: "source-\($0.offset)",
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        }
+        var selectedWireIDs: [String] = []
+        var selectedSourceIDs: [String] = []
+        let menuItems = AgentModelStableMenuItems.modelItems(
+            agentKind: .ohMyPi,
+            options: options,
+            selectedAgent: .ohMyPi,
+            selectedModelRaw: "",
+            groupOpenCode: false
+        ) { agent, option in
+            XCTAssertEqual(agent, .ohMyPi)
+            selectedWireIDs.append(option.rawValue)
+            selectedSourceIDs.append(option.displayName)
+        }
+
+        XCTAssertLessThan(menuItems.count, wireIDs.count)
+        XCTAssertNotNil(try XCTUnwrap(menuItems.first { $0.title == "cursor" }).submenuItems)
+        XCTAssertNotNil(try XCTUnwrap(menuItems.first { $0.title == "google-antigravity" }).submenuItems)
+
+        performAllActions(in: menuItems)
+        XCTAssertEqual(multiset(selectedWireIDs), multiset(wireIDs))
+        XCTAssertEqual(multiset(selectedSourceIDs), multiset(options.map(\.displayName)))
+    }
+
+    func testAntigravityGeminiHasNoFabricatedEffortLeaves() throws {
+        let wireIDs = try fixtureWireIDs()
+        XCTAssertEqual(wireIDs.count, 203)
+
+        let expectedWireIDs = [
+            "google-antigravity/gemini-3.7-flash",
+            "google-antigravity/gemini-3.7-flash-tiered"
+        ]
+        XCTAssertEqual(
+            wireIDs.filter { $0.hasPrefix("google-antigravity/gemini-3.7-flash") },
+            expectedWireIDs
+        )
+
+        let inputs = wireIDs.enumerated().map {
+            OhMyPiModelMenuProjector.Input(
+                sourceID: "source-\($0.offset)",
+                wireID: $0.element,
+                displayName: $0.element
+            )
+        }
+        let projection = OhMyPiModelMenuProjector.project(inputs)
+        let antigravity = try XCTUnwrap(
+            projection.namespaceGroups.first { $0.namespace == "google-antigravity" }
+        )
+        let gemini37Groups = antigravity.modelGroups.filter {
+            $0.allLeaves.contains { $0.wireID.hasPrefix("google-antigravity/gemini-3.7-flash") }
+        }
+
+        XCTAssertEqual(gemini37Groups.map(\.title), ["gemini-3.7-flash", "gemini-3.7-flash-tiered"])
+        XCTAssertTrue(gemini37Groups.allSatisfy { !$0.isFamily })
+        XCTAssertTrue(gemini37Groups.flatMap(\.allLeaves).allSatisfy { $0.effort == nil })
+        XCTAssertEqual(
+            gemini37Groups.flatMap(\.allLeaves).map(\.wireID),
+            expectedWireIDs
+        )
+    }
+
     func testProjectorEnforcesAdversarialParsingCorroborationAndStableOrdering() throws {
         let wireIDs = [
             "root-high",

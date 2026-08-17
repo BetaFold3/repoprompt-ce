@@ -192,6 +192,8 @@ struct AgentModelsPopoverView: View {
     }
 
     private var contextBuilderPicker: some View {
+        // Do not hoist: StableMenuButton rebuilds this closure on every open so
+        // newly learned OMP thinking capabilities appear without extra view state.
         StableMenuButton(
             items: contextBuilderAgentModelMenuItems,
             triggerStyle: .plain
@@ -231,19 +233,39 @@ struct AgentModelsPopoverView: View {
     }
 
     private func contextBuilderAgentModelMenuItems() -> [StableMenuItem] {
+        let rawModel = promptViewModel.contextBuilderAgentModelRaw
+        let destination = ModelDestination.contextBuilderAgentModel(promptVM: promptViewModel)
         var items = promptViewModel.availableAgentKinds.map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
-                agentKind: agent,
-                options: promptViewModel.contextBuilderModelOptions(for: agent),
-                selectedAgent: promptViewModel.contextBuilderAgent,
-                selectedModelRaw: promptViewModel.contextBuilderAgentModelRaw
-            ) { selectedAgent, selectedOption in
+            let onSelect: (AgentProviderKind, AgentModelOption) -> Bool = { selectedAgent, selectedOption in
                 promptViewModel.contextBuilderAgent = selectedAgent
                 promptViewModel.selectContextBuilderAgentModel(rawModel: selectedOption.rawValue)
                 promptViewModel.commitContextBuilderSettings()
+                OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                    agent: selectedAgent,
+                    rawModel: selectedOption.rawValue
+                )
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .recommendationsDidApply, object: nil)
                 }
+                return true
+            }
+            if agent == .ohMyPi {
+                return AgentModelStableMenuItems.agentSubmenu(
+                    agentKind: agent,
+                    options: promptViewModel.contextBuilderModelOptions(for: agent),
+                    selectedAgent: promptViewModel.contextBuilderAgent,
+                    selectedModelRaw: rawModel,
+                    thinkingDestination: destination,
+                    onSelect: onSelect
+                )
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
+                agentKind: agent,
+                options: promptViewModel.contextBuilderModelOptions(for: agent),
+                selectedAgent: promptViewModel.contextBuilderAgent,
+                selectedModelRaw: rawModel
+            ) { selectedAgent, selectedOption in
+                _ = onSelect(selectedAgent, selectedOption)
             }
         }
         AgentProviderSettingsMenuAction.appendStableMenuItem(
@@ -363,6 +385,7 @@ struct AgentModelsPopoverView: View {
     private func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
+        // Role defaults deliberately omit Thinking: there is no per-role thinking owner.
         var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
             AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
@@ -377,11 +400,15 @@ struct AgentModelsPopoverView: View {
                     agent: selectedAgent,
                     modelRaw: selectedOption.rawValue
                 )
-                _ = MCPAgentRoleDefaultsService.setSelection(
+                guard MCPAgentRoleDefaultsService.setSelection(
                     selection,
                     for: resolution.role,
                     availability: availability,
                     scope: editingScope
+                ) else { return }
+                OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                    agent: selectedAgent,
+                    rawModel: selectedOption.rawValue
                 )
                 bumpRoleDefaults()
             }

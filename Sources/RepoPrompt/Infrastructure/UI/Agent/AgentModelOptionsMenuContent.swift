@@ -80,7 +80,7 @@ struct AgentModelOptionsMenuContent: View {
     let selectedAgent: AgentProviderKind
     let selectedModelRaw: String
     var thinkingDestination: ModelDestination?
-    let onSelect: (AgentProviderKind, AgentModelOption) -> Void
+    let onSelect: (AgentProviderKind, AgentModelOption) -> Bool
 
     var body: some View {
         if agentKind == .codexExec {
@@ -177,7 +177,7 @@ struct AgentModelOptionsMenuContent: View {
             let projected = Self.ohMyPiProjection(for: options)
             ForEach(projected.projection.rootLeaves) { leaf in
                 if let option = projected.optionsBySourceID[leaf.sourceID] {
-                    modelOptionButton(option, title: leaf.title)
+                    ohMyPiModelLeaf(leaf, option: option)
                 }
             }
             ForEach(projected.projection.namespaceGroups) { namespaceGroup in
@@ -185,18 +185,6 @@ struct AgentModelOptionsMenuContent: View {
                     ohMyPiModelGroupContent(
                         namespaceGroup.modelGroups,
                         optionsBySourceID: projected.optionsBySourceID
-                    )
-                }
-            }
-            if selectedAgent == .ohMyPi,
-               let thinkingDestination,
-               thinkingDestination.hasThinkingAccessory
-            {
-                Divider()
-                Menu("Thinking") {
-                    ohMyPiThinkingRows(
-                        exactModelID: selectedModelRaw,
-                        destination: thinkingDestination
                     )
                 }
             }
@@ -255,14 +243,14 @@ struct AgentModelOptionsMenuContent: View {
                 Menu(group.title) {
                     ForEach(group.normalLeaves) { leaf in
                         if let option = optionsBySourceID[leaf.sourceID] {
-                            modelOptionButton(option, title: leaf.title)
+                            ohMyPiModelLeaf(leaf, option: option)
                         }
                     }
                     if !group.fastLeaves.isEmpty {
                         Menu("Fast") {
                             ForEach(group.fastLeaves) { leaf in
                                 if let option = optionsBySourceID[leaf.sourceID] {
-                                    modelOptionButton(option, title: leaf.title)
+                                    ohMyPiModelLeaf(leaf, option: option)
                                 }
                             }
                         }
@@ -271,8 +259,44 @@ struct AgentModelOptionsMenuContent: View {
             } else if let leaf = group.normalLeaves.first,
                       let option = optionsBySourceID[leaf.sourceID]
             {
-                modelOptionButton(option, title: leaf.title)
+                ohMyPiModelLeaf(leaf, option: option)
             }
+        }
+    }
+
+    @ViewBuilder
+    private func ohMyPiModelLeaf(
+        _ leaf: OhMyPiModelMenuProjector.Leaf,
+        option: AgentModelOption
+    ) -> some View {
+        if !option.isPlaceholderDefault,
+           let thinkingDestination,
+           thinkingDestination.hasThinkingAccessory,
+           let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: leaf.wireID)
+        {
+            Menu {
+                ohMyPiThinkingRows(
+                    exactModelID: exactModelID,
+                    option: option,
+                    destination: thinkingDestination
+                )
+            } label: {
+                HStack {
+                    Text(leaf.title)
+                    if selectedAgent == .ohMyPi,
+                       AgentModelCatalog.modelOptionIsSelected(
+                           optionRaw: option.rawValue,
+                           selectedRaw: selectedModelRaw,
+                           agentKind: .ohMyPi
+                       )
+                    {
+                        Spacer()
+                        Image(systemName: "checkmark")
+                    }
+                }
+            }
+        } else {
+            modelOptionButton(option, title: leaf.title)
         }
     }
 
@@ -306,15 +330,7 @@ struct AgentModelOptionsMenuContent: View {
             rawModel: option.rawValue
         )
         Button {
-            AgentModelCatalog.updateLastUsedEffortIfEncoded(
-                agentKind: agentKind,
-                rawModel: option.rawValue
-            )
-            onSelect(agentKind, option)
-            OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
-                agent: agentKind,
-                rawModel: option.rawValue
-            )
+            commitModelOption(option)
         } label: {
             HStack {
                 warningAwareMenuLabel(title: title ?? option.displayName, showsWarning: showsWarning)
@@ -331,6 +347,19 @@ struct AgentModelOptionsMenuContent: View {
                 }
             }
         }
+    }
+
+    private func commitModelOption(_ option: AgentModelOption) -> Bool {
+        guard onSelect(agentKind, option) else { return false }
+        AgentModelCatalog.updateLastUsedEffortIfEncoded(
+            agentKind: agentKind,
+            rawModel: option.rawValue
+        )
+        OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+            agent: agentKind,
+            rawModel: option.rawValue
+        )
+        return true
     }
 
     private func cursorLeafButton(
@@ -352,6 +381,7 @@ struct AgentModelOptionsMenuContent: View {
     @ViewBuilder
     private func ohMyPiThinkingRows(
         exactModelID: String,
+        option: AgentModelOption,
         destination: ModelDestination
     ) -> some View {
         let rows = OhMyPiThinkingMenuBuilder.rows(
@@ -364,29 +394,26 @@ struct AgentModelOptionsMenuContent: View {
             case .none:
                 Button(row.title) {}
                     .disabled(true)
-            case .selectDefault:
+            case .selectDefault, .selectValue, .clearUnavailable:
                 Button {
-                    destination.applyThinkingValue(nil, for: exactModelID)
-                } label: {
-                    thinkingRowLabel(row)
-                }
-            case let .selectValue(value):
-                Button {
-                    destination.applyThinkingValue(value, for: exactModelID)
+                    OhMyPiThinkingMenuBuilder.perform(
+                        row,
+                        exactModelID: exactModelID,
+                        destination: destination,
+                        onBeforeApply: {
+                            commitModelOption(option)
+                        }
+                    )
                 } label: {
                     thinkingRowLabel(row)
                 }
             case .load:
                 Button(row.title) {
-                    OhMyPiThinkingCapabilityResolver.shared.requestManualRetry(
-                        exactModelID: exactModelID
+                    OhMyPiThinkingMenuBuilder.perform(
+                        row,
+                        exactModelID: exactModelID,
+                        destination: destination
                     )
-                }
-            case .clearUnavailable:
-                Button {
-                    destination.applyThinkingValue(nil, for: exactModelID)
-                } label: {
-                    thinkingRowLabel(row)
                 }
             }
         }
@@ -442,6 +469,8 @@ private enum CursorModelMenuOptionAdapter {
 /// Mirrors `AgentModelOptionsMenuContent`, but produces `StableMenuItem`s for
 /// long-lived pickers where SwiftUI `Menu` tracking can be interrupted by view updates.
 enum AgentModelStableMenuItems {
+    /// - Parameter groupOpenCode: Whether OpenCode models use provider/model grouping.
+    ///   Oh My Pi always projects hierarchically.
     static func agentSubmenu(
         agentKind: AgentProviderKind,
         options: [AgentModelOption],
@@ -467,6 +496,8 @@ enum AgentModelStableMenuItems {
         )
     }
 
+    /// - Parameter groupOpenCode: Whether OpenCode models use provider/model grouping.
+    ///   Oh My Pi always projects hierarchically.
     @MainActor
     static func agentSubmenu(
         agentKind: AgentProviderKind,
@@ -477,7 +508,7 @@ enum AgentModelStableMenuItems {
         flattenSingleCodexGroups: Bool = false,
         groupOpenCode: Bool = true,
         thinkingDestination: ModelDestination,
-        onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
+        onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Bool
     ) -> StableMenuItem {
         StableMenuItem.submenu(
             agentKind.displayName,
@@ -495,6 +526,8 @@ enum AgentModelStableMenuItems {
         )
     }
 
+    /// - Parameter groupOpenCode: Whether OpenCode models use provider/model grouping.
+    ///   Oh My Pi always projects hierarchically.
     static func modelItems(
         agentKind: AgentProviderKind,
         options: [AgentModelOption],
@@ -535,7 +568,7 @@ enum AgentModelStableMenuItems {
                 onSelect: onSelect
             )
         }
-        if agentKind == .ohMyPi, groupOpenCode {
+        if agentKind == .ohMyPi {
             return ohMyPiModelItems(
                 options: visibleOptions,
                 selectedAgent: selectedAgent,
@@ -570,6 +603,8 @@ enum AgentModelStableMenuItems {
         }
     }
 
+    /// - Parameter groupOpenCode: Whether OpenCode models use provider/model grouping.
+    ///   Oh My Pi always projects hierarchically.
     @MainActor
     static func modelItems(
         agentKind: AgentProviderKind,
@@ -580,9 +615,9 @@ enum AgentModelStableMenuItems {
         flattenSingleCodexGroups: Bool = false,
         groupOpenCode: Bool = true,
         thinkingDestination: ModelDestination,
-        onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
+        onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Bool
     ) -> [StableMenuItem] {
-        guard agentKind == .ohMyPi, groupOpenCode else {
+        guard agentKind == .ohMyPi else {
             return modelItems(
                 agentKind: agentKind,
                 options: options,
@@ -590,9 +625,10 @@ enum AgentModelStableMenuItems {
                 selectedModelRaw: selectedModelRaw,
                 includePlaceholderDefault: includePlaceholderDefault,
                 flattenSingleCodexGroups: flattenSingleCodexGroups,
-                groupOpenCode: groupOpenCode,
-                onSelect: onSelect
-            )
+                groupOpenCode: groupOpenCode
+            ) { agent, option in
+                _ = onSelect(agent, option)
+            }
         }
         return ohMyPiModelItems(
             options: visibleOptions(options, includePlaceholderDefault: includePlaceholderDefault),
@@ -846,22 +882,109 @@ enum AgentModelStableMenuItems {
         thinkingDestination: ModelDestination,
         onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Void
     ) -> [StableMenuItem] {
-        var items = ohMyPiModelItems(
+        let committingSelect: (AgentProviderKind, AgentModelOption) -> Bool = { agent, option in
+            onSelect(agent, option)
+            return true
+        }
+        return ohMyPiModelItems(
             options: options,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
+            thinkingDestination: thinkingDestination,
+            onSelect: committingSelect
+        )
+    }
+
+    @MainActor
+    static func ohMyPiModelItems(
+        options: [AgentModelOption],
+        selectedAgent: AgentProviderKind,
+        selectedModelRaw: String,
+        thinkingDestination: ModelDestination,
+        onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Bool
+    ) -> [StableMenuItem] {
+        ohMyPiModelItems(
+            options: options,
+            selectedAgent: selectedAgent,
+            selectedModelRaw: selectedModelRaw,
+            thinkingDestinationForModel: { _ in thinkingDestination },
             onSelect: onSelect
         )
-        if selectedAgent == .ohMyPi, thinkingDestination.hasThinkingAccessory {
-            items.append(.separator)
-            items.append(.submenu(
-                "Thinking",
+    }
+
+    @MainActor
+    static func ohMyPiModelItems(
+        options: [AgentModelOption],
+        selectedAgent: AgentProviderKind,
+        selectedModelRaw: String,
+        thinkingDestinationForModel: @escaping (String) -> ModelDestination,
+        onSelect: @escaping (AgentProviderKind, AgentModelOption) -> Bool
+    ) -> [StableMenuItem] {
+        let projected = AgentModelOptionsMenuContent.ohMyPiProjection(for: options)
+
+        func leafItem(_ leaf: OhMyPiModelMenuProjector.Leaf) -> StableMenuItem {
+            guard let option = projected.optionsBySourceID[leaf.sourceID] else {
+                return .separator
+            }
+            guard !option.isPlaceholderDefault,
+                  let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: leaf.wireID)
+            else {
+                return modelItem(
+                    option,
+                    title: leaf.title,
+                    agentKind: .ohMyPi,
+                    selectedAgent: selectedAgent,
+                    selectedModelRaw: selectedModelRaw
+                ) { agent, option in
+                    _ = onSelect(agent, option)
+                }
+            }
+
+            let thinkingDestination = thinkingDestinationForModel(exactModelID)
+            guard thinkingDestination.hasThinkingAccessory else {
+                return modelItem(
+                    option,
+                    title: leaf.title,
+                    agentKind: .ohMyPi,
+                    selectedAgent: selectedAgent,
+                    selectedModelRaw: selectedModelRaw
+                ) { agent, option in
+                    _ = onSelect(agent, option)
+                }
+            }
+
+            return .submenu(
+                leaf.title,
+                isSelected: selectedAgent == .ohMyPi && AgentModelCatalog.modelOptionIsSelected(
+                    optionRaw: option.rawValue,
+                    selectedRaw: selectedModelRaw,
+                    agentKind: .ohMyPi
+                ),
                 items: OhMyPiThinkingMenuBuilder.stableMenuItems(
-                    exactModelID: selectedModelRaw,
-                    destination: thinkingDestination
+                    exactModelID: exactModelID,
+                    destination: thinkingDestination,
+                    onBeforeApply: {
+                        onSelect(.ohMyPi, option)
+                    }
                 )
-            ))
+            )
         }
+
+        func groupItem(_ group: OhMyPiModelMenuProjector.ModelGroup) -> StableMenuItem {
+            guard group.isFamily else {
+                return group.normalLeaves.first.map(leafItem) ?? .separator
+            }
+            var items = group.normalLeaves.map(leafItem)
+            if !group.fastLeaves.isEmpty {
+                items.append(.submenu("Fast", items: group.fastLeaves.map(leafItem)))
+            }
+            return .submenu(group.title, items: items)
+        }
+
+        var items = projected.projection.rootLeaves.map(leafItem)
+        items.append(contentsOf: projected.projection.namespaceGroups.map { namespaceGroup in
+            .submenu(namespaceGroup.namespace, items: namespaceGroup.modelGroups.map(groupItem))
+        })
         return items
     }
 

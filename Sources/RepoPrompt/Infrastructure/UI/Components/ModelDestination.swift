@@ -120,12 +120,28 @@ extension ModelDestination {
         )
     }
 
-    /// Destination for the context builder model
+    /// Destination for the context builder model.
+    /// KNOWN: The model uses legacy chat settings while its thinking accessory uses
+    /// the Agent Models profile. Keep this mixed-store destination for compatibility.
     static func contextBuilderModel(promptVM: PromptViewModel) -> ModelDestination {
         ModelDestination(
             id: "contextBuilderModel",
             getter: { promptVM.contextBuilderModelName },
             applier: { promptVM.contextBuilderModelName = $0 },
+            thinkingGetter: { promptVM.contextBuilderOhMyPiThinkingSelections },
+            thinkingApplier: { promptVM.contextBuilderOhMyPiThinkingSelections = $0 }
+        )
+    }
+
+    /// Destination for the Context Builder CLI agent model.
+    static func contextBuilderAgentModel(promptVM: PromptViewModel) -> ModelDestination {
+        ModelDestination(
+            id: "contextBuilderAgentModel",
+            getter: { promptVM.contextBuilderAgentModelRaw },
+            applier: { rawValue in
+                promptVM.selectContextBuilderAgentModel(rawModel: rawValue)
+                promptVM.commitContextBuilderSettings()
+            },
             thinkingGetter: { promptVM.contextBuilderOhMyPiThinkingSelections },
             thinkingApplier: { promptVM.contextBuilderOhMyPiThinkingSelections = $0 }
         )

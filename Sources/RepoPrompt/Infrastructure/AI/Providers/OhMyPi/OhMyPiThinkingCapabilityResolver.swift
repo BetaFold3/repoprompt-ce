@@ -308,11 +308,24 @@ actor OhMyPiThinkingCapabilityResolver {
 }
 
 enum OhMyPiThinkingSelectionProbeTrigger {
+    #if DEBUG
+        private static let testingStateLock = NSLock()
+        private static var disabledForTesting = false
+
+        static var isDisabledForTesting: Bool {
+            get { testingStateLock.withLock { disabledForTesting } }
+            set { testingStateLock.withLock { disabledForTesting = newValue } }
+        }
+    #endif
+
     static func afterExplicitSelection(
         of model: AIModel,
         workspacePath: String? = nil,
         resolver: OhMyPiThinkingCapabilityResolver = .shared
     ) {
+        #if DEBUG
+            guard !isDisabledForTesting else { return }
+        #endif
         guard let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: model) else { return }
         resolver.requestAfterExplicitSelection(
             exactModelID: exactModelID,
@@ -326,6 +339,9 @@ enum OhMyPiThinkingSelectionProbeTrigger {
         workspacePath: String? = nil,
         resolver: OhMyPiThinkingCapabilityResolver = .shared
     ) {
+        #if DEBUG
+            guard !isDisabledForTesting else { return }
+        #endif
         guard agent == .ohMyPi,
               let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: rawModel)
         else { return }

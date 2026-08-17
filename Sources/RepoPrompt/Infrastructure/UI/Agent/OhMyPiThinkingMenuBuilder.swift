@@ -115,11 +115,37 @@ enum OhMyPiThinkingMenuBuilder {
     }
 
     @MainActor
+    static func perform(
+        _ row: Row,
+        exactModelID: String,
+        destination: ModelDestination,
+        resolver: OhMyPiThinkingCapabilityResolver = .shared,
+        onBeforeApply: () -> Bool = { true }
+    ) {
+        switch row.action {
+        case .none:
+            break
+        case .selectDefault:
+            guard onBeforeApply() else { return }
+            destination.applyThinkingValue(nil, for: exactModelID)
+        case let .selectValue(value):
+            guard onBeforeApply() else { return }
+            destination.applyThinkingValue(value, for: exactModelID)
+        case .load:
+            resolver.requestManualRetry(exactModelID: exactModelID)
+        case .clearUnavailable:
+            guard onBeforeApply() else { return }
+            destination.applyThinkingValue(nil, for: exactModelID)
+        }
+    }
+
+    @MainActor
     static func stableMenuItems(
         exactModelID: String,
         destination: ModelDestination,
         registry: OhMyPiThinkingCapabilityRegistry = .shared,
-        resolver: OhMyPiThinkingCapabilityResolver = .shared
+        resolver: OhMyPiThinkingCapabilityResolver = .shared,
+        onBeforeApply: @escaping () -> Bool = { true }
     ) -> [StableMenuItem] {
         rows(
             capability: registry.snapshot(for: exactModelID),
@@ -129,27 +155,30 @@ enum OhMyPiThinkingMenuBuilder {
             switch row.action {
             case .none:
                 .message(row.title)
-            case .selectDefault:
+            case .selectDefault, .selectValue:
                 .action(
                     row.title,
                     isEnabled: row.isEnabled,
                     isSelected: row.isSelected,
                     style: row.style == .warning ? .warning : .normal
                 ) {
-                    destination.applyThinkingValue(nil, for: exactModelID)
-                }
-            case let .selectValue(value):
-                .action(
-                    row.title,
-                    isEnabled: row.isEnabled,
-                    isSelected: row.isSelected,
-                    style: row.style == .warning ? .warning : .normal
-                ) {
-                    destination.applyThinkingValue(value, for: exactModelID)
+                    perform(
+                        row,
+                        exactModelID: exactModelID,
+                        destination: destination,
+                        resolver: resolver,
+                        onBeforeApply: onBeforeApply
+                    )
                 }
             case .load:
                 .action(row.title, isEnabled: row.isEnabled) {
-                    resolver.requestManualRetry(exactModelID: exactModelID)
+                    perform(
+                        row,
+                        exactModelID: exactModelID,
+                        destination: destination,
+                        resolver: resolver,
+                        onBeforeApply: onBeforeApply
+                    )
                 }
             case .clearUnavailable:
                 .action(
@@ -160,7 +189,13 @@ enum OhMyPiThinkingMenuBuilder {
                     style: .warning,
                     toolTip: "Clear this unavailable stored thinking value."
                 ) {
-                    destination.applyThinkingValue(nil, for: exactModelID)
+                    perform(
+                        row,
+                        exactModelID: exactModelID,
+                        destination: destination,
+                        resolver: resolver,
+                        onBeforeApply: onBeforeApply
+                    )
                 }
             }
         }
