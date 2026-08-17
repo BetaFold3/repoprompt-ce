@@ -678,6 +678,7 @@ final class AgentModeRunService {
         guard agent == .ohMyPi,
               let rawModelID = exactWireModelID,
               let canonicalModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: rawModelID),
+              OhMyPiThinkingExecutionEligibility.allowsAssignment(for: canonicalModelID),
               let assignment = selections.assignment(for: canonicalModelID)
         else {
             return []

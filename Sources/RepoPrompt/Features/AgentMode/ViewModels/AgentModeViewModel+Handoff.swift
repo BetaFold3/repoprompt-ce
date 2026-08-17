@@ -169,6 +169,7 @@ extension AgentModeViewModel {
             defaultDestinationAgent: sourceSession.selectedAgent,
             defaultModelRaw: sourceSession.selectedModelRaw,
             defaultReasoningEffortRaw: sourceSession.selectedReasoningEffortRaw,
+            defaultOhMyPiThinkingSelections: sourceSession.ohMyPiThinkingSelections,
             availableAgentsProvider: { [weak self] in
                 guard let self,
                       (try? pinnedHandoffSource(
@@ -242,7 +243,8 @@ extension AgentModeViewModel {
                         upToItemID: itemID,
                         destinationAgent: selection.agent,
                         destinationModelRaw: selection.modelRaw,
-                        destinationReasoningEffortRaw: selection.reasoningEffortRaw
+                        destinationReasoningEffortRaw: selection.reasoningEffortRaw,
+                        destinationOhMyPiThinkingSelections: selection.ohMyPiThinkingSelections
                     )
                 case let (.remoteCatalog, .remote(agentID, modelID, effort)):
                     try await remoteCoordinator.fork(

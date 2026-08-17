@@ -674,7 +674,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { [self] target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource in
+            startRun: { [self] target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, roleOhMyPiThinkingSelections, workflow, expectedParentSessionID, oracleReviewSource in
                 try await AgentExternalMCPRunStarter.start(
                     target: target,
                     message: message,
@@ -685,6 +685,7 @@ final class MCPServerViewModel: ObservableObject {
                     modelRaw: modelRaw,
                     reasoningEffortRaw: reasoningEffortRaw,
                     taskLabelKind: taskLabelKind,
+                    roleOhMyPiThinkingSelections: roleOhMyPiThinkingSelections,
                     workflow: workflow,
                     expectedParentSessionID: expectedParentSessionID,
                     oracleReviewSource: oracleReviewSource,
@@ -933,7 +934,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
+            startRun: { target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, roleOhMyPiThinkingSelections, workflow, _, _ in
                 try await AgentExternalMCPRunStarter.start(
                     target: target,
                     message: message,
@@ -944,6 +945,7 @@ final class MCPServerViewModel: ObservableObject {
                     modelRaw: modelRaw,
                     reasoningEffortRaw: reasoningEffortRaw,
                     taskLabelKind: taskLabelKind,
+                    roleOhMyPiThinkingSelections: roleOhMyPiThinkingSelections,
                     workflow: workflow
                 )
             }

@@ -10,6 +10,13 @@ protocol MCPAgentRoleDefaultsStoring: AnyObject {
     func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]?
     func mcpAgentRoleOverrides(scope: AgentModelsEditingScope) -> [String: String]?
     func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope, commit: Bool)
+    func mcpAgentRoleOhMyPiThinkingSelections(workspaceID: UUID?) -> [String: OhMyPiThinkingSelections]?
+    func mcpAgentRoleOhMyPiThinkingSelections(scope: AgentModelsEditingScope) -> [String: OhMyPiThinkingSelections]?
+    func updateMCPAgentRoleOhMyPiThinkingSelections(
+        _ selections: [String: OhMyPiThinkingSelections]?,
+        scope: AgentModelsEditingScope,
+        commit: Bool
+    )
 }
 
 extension GlobalSettingsStore: MCPAgentRoleDefaultsStoring {
@@ -29,14 +36,40 @@ extension GlobalSettingsStore: MCPAgentRoleDefaultsStoring {
     func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope, commit _: Bool) {
         setAgentModelsMCPAgentRoleOverrides(overrides, scope: scope)
     }
+
+    func mcpAgentRoleOhMyPiThinkingSelections(workspaceID: UUID?) -> [String: OhMyPiThinkingSelections]? {
+        effectiveAgentModelsProfile(workspaceID: workspaceID).mcpAgentRoleOhMyPiThinkingSelections
+    }
+
+    func mcpAgentRoleOhMyPiThinkingSelections(scope: AgentModelsEditingScope) -> [String: OhMyPiThinkingSelections]? {
+        switch scope {
+        case .global:
+            globalAgentModelsProfile().mcpAgentRoleOhMyPiThinkingSelections
+        case let .workspace(workspaceID):
+            workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOhMyPiThinkingSelections
+        }
+    }
+
+    func updateMCPAgentRoleOhMyPiThinkingSelections(
+        _ selections: [String: OhMyPiThinkingSelections]?,
+        scope: AgentModelsEditingScope,
+        commit _: Bool
+    ) {
+        setAgentModelsMCPAgentRoleOhMyPiThinkingSelections(selections, scope: scope)
+    }
 }
 
 @MainActor
 final class AgentModelsProfileRoleDefaultsStore: MCPAgentRoleDefaultsStoring {
     private var overrides: [String: String]?
+    private var roleThinkingSelections: [String: OhMyPiThinkingSelections]?
 
-    init(overrides: [String: String]?) {
+    init(
+        overrides: [String: String]?,
+        roleThinkingSelections: [String: OhMyPiThinkingSelections]? = nil
+    ) {
         self.overrides = overrides
+        self.roleThinkingSelections = roleThinkingSelections
     }
 
     func mcpAgentRoleOverrides(workspaceID _: UUID?) -> [String: String]? {
@@ -49,6 +82,22 @@ final class AgentModelsProfileRoleDefaultsStore: MCPAgentRoleDefaultsStoring {
 
     func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, scope _: AgentModelsEditingScope, commit _: Bool) {
         self.overrides = overrides
+    }
+
+    func mcpAgentRoleOhMyPiThinkingSelections(workspaceID _: UUID?) -> [String: OhMyPiThinkingSelections]? {
+        roleThinkingSelections
+    }
+
+    func mcpAgentRoleOhMyPiThinkingSelections(scope _: AgentModelsEditingScope) -> [String: OhMyPiThinkingSelections]? {
+        roleThinkingSelections
+    }
+
+    func updateMCPAgentRoleOhMyPiThinkingSelections(
+        _ selections: [String: OhMyPiThinkingSelections]?,
+        scope _: AgentModelsEditingScope,
+        commit _: Bool
+    ) {
+        roleThinkingSelections = selections
     }
 }
 
@@ -72,6 +121,8 @@ enum MCPAgentRoleDefaultsService {
         /// What will actually be used at runtime (may differ if user overrode).
         let effective: AgentModelCatalog.NormalizedAgentSelection
         let effectiveDisplayName: String
+        /// Only the effective exact OMP model entry; empty for non-OMP and unavailable-override fallback.
+        let effectiveOhMyPiThinkingSelections: OhMyPiThinkingSelections
 
         /// A persisted override exists for this role, even if it currently matches the recommendation.
         let hasStoredOverride: Bool
@@ -97,11 +148,13 @@ enum MCPAgentRoleDefaultsService {
     ) -> [RoleDefaultResolution] {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)
+        let roleThinkingSelections = settingsStore.mcpAgentRoleOhMyPiThinkingSelections(workspaceID: workspaceID)
         let recommendationAvailability = recommendedAvailability ?? defaultRecommendedAvailability(from: availability, settingsStore: settingsStore)
         return AgentModelCatalog.TaskLabelKind.allCases.compactMap { kind in
             resolve(
                 kind: kind,
                 overrides: overrides,
+                roleThinkingSelections: roleThinkingSelections,
                 availability: availability,
                 recommendedAvailability: recommendationAvailability,
                 codexDynamicModels: codexDynamicModels
@@ -120,9 +173,11 @@ enum MCPAgentRoleDefaultsService {
     ) -> RoleDefaultResolution? {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)
+        let roleThinkingSelections = settingsStore.mcpAgentRoleOhMyPiThinkingSelections(workspaceID: workspaceID)
         return resolve(
             kind: role,
             overrides: overrides,
+            roleThinkingSelections: roleThinkingSelections,
             availability: availability,
             recommendedAvailability: recommendedAvailability ?? defaultRecommendedAvailability(from: availability, settingsStore: settingsStore),
             codexDynamicModels: codexDynamicModels
@@ -191,6 +246,31 @@ enum MCPAgentRoleDefaultsService {
         settingsStore.updateMCPAgentRoleOverrides(nil, scope: scope, commit: true)
     }
 
+    static func roleOhMyPiThinkingSelections(
+        for role: AgentModelCatalog.TaskLabelKind,
+        scope: AgentModelsEditingScope,
+        settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
+    ) -> OhMyPiThinkingSelections {
+        let settingsStore = settingsStore ?? GlobalSettingsStore.shared
+        return settingsStore.mcpAgentRoleOhMyPiThinkingSelections(scope: scope)?[role.rawValue] ?? .empty
+    }
+
+    static func setRoleOhMyPiThinkingSelections(
+        _ selections: OhMyPiThinkingSelections,
+        for role: AgentModelCatalog.TaskLabelKind,
+        scope: AgentModelsEditingScope,
+        settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
+    ) {
+        let settingsStore = settingsStore ?? GlobalSettingsStore.shared
+        var selectionsByRole = settingsStore.mcpAgentRoleOhMyPiThinkingSelections(scope: scope) ?? [:]
+        selectionsByRole[role.rawValue] = selections.nilIfEmpty
+        settingsStore.updateMCPAgentRoleOhMyPiThinkingSelections(
+            selectionsByRole.isEmpty ? nil : selectionsByRole,
+            scope: scope,
+            commit: true
+        )
+    }
+
     // MARK: - Private
 
     private static func defaultRecommendedAvailability(
@@ -206,6 +286,7 @@ enum MCPAgentRoleDefaultsService {
     private static func resolve(
         kind: AgentModelCatalog.TaskLabelKind,
         overrides: [String: String]?,
+        roleThinkingSelections: [String: OhMyPiThinkingSelections]?,
         availability: AgentModelCatalog.AvailabilityContext,
         recommendedAvailability: AgentModelCatalog.AvailabilityContext,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]?
@@ -254,6 +335,12 @@ enum MCPAgentRoleDefaultsService {
 
         let effectiveDisplayName = "\(effective.agent.displayName) \(AgentModelCatalog.displayName(for: effective.modelRaw, agentKind: effective.agent, codexDynamicModels: codexDynamicModels))"
 
+        let effectiveRoleThinkingSelections = narrowedRoleThinkingSelections(
+            roleSelections: roleThinkingSelections?[kind.rawValue],
+            effective: effective,
+            overrideUnavailable: overrideUnavailable
+        )
+
         return RoleDefaultResolution(
             role: kind,
             roleLabel: taskLabel.label,
@@ -262,10 +349,26 @@ enum MCPAgentRoleDefaultsService {
             recommendedDisplayName: recommendedDisplayName,
             effective: effective,
             effectiveDisplayName: effectiveDisplayName,
+            effectiveOhMyPiThinkingSelections: effectiveRoleThinkingSelections,
             hasStoredOverride: hasStoredOverride,
             hasCustomOverride: hasCustomOverride,
             overrideUnavailable: overrideUnavailable
         )
+    }
+
+    private static func narrowedRoleThinkingSelections(
+        roleSelections: OhMyPiThinkingSelections?,
+        effective: AgentModelCatalog.NormalizedAgentSelection,
+        overrideUnavailable: Bool
+    ) -> OhMyPiThinkingSelections {
+        guard !overrideUnavailable,
+              effective.agent == .ohMyPi,
+              let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: effective.modelRaw),
+              let choice = roleSelections?[exactModelID]
+        else {
+            return .empty
+        }
+        return OhMyPiThinkingSelections(entries: [exactModelID: choice])
     }
 
     private static func resolvedRecommendedSelection(

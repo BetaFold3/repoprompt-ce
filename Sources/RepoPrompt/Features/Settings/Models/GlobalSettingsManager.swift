@@ -257,6 +257,8 @@ struct GlobalDefaults: Codable, Equatable {
     /// Global MCP Agent Mode role-default overrides (shared across all workspaces).
     /// Keys are TaskLabelKind rawValues, values are AgentModelSelectionID rawValues.
     var mcpAgentRoleOverrides: [String: String]?
+    /// Destination-owned OMP thinking maps keyed by TaskLabelKind rawValue.
+    var mcpAgentRoleOhMyPiThinkingSelections: [String: OhMyPiThinkingSelections]?
     /// One-time migration version for legacy workspace-scoped MCP role overrides.
     var mcpAgentRoleOverridesMigrationVersion: Int?
     /// Global provider filter used by recommendation generation. nil means all providers.
@@ -470,6 +472,7 @@ class GlobalSettingsStore: ObservableObject {
             contextBuilderOhMyPiThinkingSelections: globalDefaults.contextBuilderOhMyPiThinkingSelections ?? .empty,
             contextBuilderModelsByAgent: globalDefaults.discoverModelsByAgent,
             mcpAgentRoleOverrides: globalDefaults.mcpAgentRoleOverrides,
+            mcpAgentRoleOhMyPiThinkingSelections: globalDefaults.mcpAgentRoleOhMyPiThinkingSelections,
             restrictMCPAgentDiscoveryToRoleLabels: restrictMCPAgentDiscoveryToRoleLabels()
         )
     }
@@ -496,6 +499,7 @@ class GlobalSettingsStore: ObservableObject {
         globalDefaults.discoverModelsByAgent = normalized.contextBuilderModelsByAgent
         globalDefaults.contextBuilderOhMyPiThinkingSelections = normalized.contextBuilderOhMyPiThinkingSelections.nilIfEmpty
         globalDefaults.mcpAgentRoleOverrides = normalized.mcpAgentRoleOverrides
+        globalDefaults.mcpAgentRoleOhMyPiThinkingSelections = normalized.mcpAgentRoleOhMyPiThinkingSelections
         switch contextBuilderWriteIntent {
         case .preserveExistingOwnership:
             break
@@ -665,6 +669,15 @@ class GlobalSettingsStore: ObservableObject {
     ) {
         updateAgentModelsProfile(scope: scope) { profile in
             profile.mcpAgentRoleOverrides = overrides
+        }
+    }
+
+    func setAgentModelsMCPAgentRoleOhMyPiThinkingSelections(
+        _ selections: [String: OhMyPiThinkingSelections]?,
+        scope: AgentModelsEditingScope
+    ) {
+        updateAgentModelsProfile(scope: scope) { profile in
+            profile.mcpAgentRoleOhMyPiThinkingSelections = selections
         }
     }
 
@@ -2155,6 +2168,7 @@ class GlobalSettingsStore: ObservableObject {
             contextBuilderOhMyPiThinkingSelections: profile.contextBuilderOhMyPiThinkingSelections,
             contextBuilderModelsByAgent: profile.contextBuilderModelsByAgent,
             mcpAgentRoleOverrides: profile.mcpAgentRoleOverrides,
+            mcpAgentRoleOhMyPiThinkingSelections: profile.mcpAgentRoleOhMyPiThinkingSelections,
             restrictMCPAgentDiscoveryToRoleLabels: profile.restrictMCPAgentDiscoveryToRoleLabels
         )
     }
@@ -2190,6 +2204,7 @@ class GlobalSettingsStore: ObservableObject {
             "sync=\(profile.syncChatModelWithOracle)",
             "contextBuilder=\(profile.contextBuilderAgentRaw ?? "nil"):\(contextBuilderModelRaw ?? "nil")",
             "roleOverrides=\(profile.mcpAgentRoleOverrides?.count ?? 0)",
+            "roleThinking=\(profile.mcpAgentRoleOhMyPiThinkingSelections?.count ?? 0)",
             "restrictRoleDiscovery=\(profile.restrictMCPAgentDiscoveryToRoleLabels)"
         ].joined(separator: ";")
     }
@@ -2352,6 +2367,10 @@ class GlobalSettingsStore: ObservableObject {
         globalDefaults: GlobalDefaults
     ) -> (chatSettings: [UUID: ChatGlobalSettings], globalDefaults: GlobalDefaults) {
         var migratedGlobalDefaults = globalDefaults
+        migratedGlobalDefaults.mcpAgentRoleOhMyPiThinkingSelections =
+            AgentModelsSettingsProfile.normalizedRoleThinkingSelections(
+                migratedGlobalDefaults.mcpAgentRoleOhMyPiThinkingSelections
+            )
         if migratedGlobalDefaults.discoverAgentRaw == nil,
            let legacySelection = legacyContextBuilderSelection(
                chatSettings: chatSettings,

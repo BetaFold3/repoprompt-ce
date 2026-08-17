@@ -61,7 +61,8 @@ enum AgentHandoffActionSupport {
         return AgentHandoffSelection(
             agent: selection.agent,
             modelRaw: selection.modelRaw,
-            reasoningEffortRaw: encodedEffort.rawValue
+            reasoningEffortRaw: encodedEffort.rawValue,
+            ohMyPiThinkingSelections: selection.ohMyPiThinkingSelections
         )
     }
 

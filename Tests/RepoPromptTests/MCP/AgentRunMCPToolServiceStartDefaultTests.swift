@@ -1,9 +1,19 @@
 import Foundation
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 @MainActor
 final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+    }
+
+    override func tearDown() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        super.tearDown()
+    }
+
     func testUntargetedStartWithoutModelIDResolvesThroughPairDefault() throws {
         let defaultLabel = AgentRunMCPToolService.defaultTaskLabelForStart(resolvedTabID: nil)
         XCTAssertEqual(defaultLabel, .pair)
@@ -23,6 +33,10 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
         XCTAssertEqual(resolved.taskLabelKind, .pair)
         XCTAssertEqual(resolved.agentRaw, AgentProviderKind.codexExec.rawValue)
         XCTAssertEqual(resolved.modelRaw, "pair-default-model")
+        XCTAssertTrue(
+            resolved.ohMyPiThinkingSelections.isEmpty,
+            "Injected role providers cannot authoritatively resolve scoped role thinking"
+        )
     }
 
     func testFreshPairEngineerAndExploreStartsUseCodexSafeManagedDefaults() throws {
@@ -214,6 +228,35 @@ final class AgentRunMCPToolServiceStartDefaultTests: XCTestCase {
         XCTAssertNil(resolved.taskLabelKind)
         XCTAssertEqual(resolved.agentRaw, AgentProviderKind.codexExec.rawValue)
         XCTAssertEqual(resolved.modelRaw, "explicit-model")
+        XCTAssertTrue(
+            resolved.ohMyPiThinkingSelections.isEmpty,
+            "Compound selections structurally carry no role-owned thinking"
+        )
+
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: "provider/exact",
+                        displayName: "Exact OMP",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: false
+                    )
+                ],
+                currentModelRaw: "provider/exact"
+            ),
+            for: .ohMyPi
+        ))
+        let ompCompound = try AgentMCPSelectionResolver.resolve(
+            modelID: "ohMyPi:provider/exact",
+            defaultTaskLabel: .pair,
+            availability: .init(codexAvailable: true, ohMyPiAvailable: true)
+        )
+        XCTAssertNil(ompCompound.taskLabelKind)
+        XCTAssertEqual(ompCompound.agentRaw, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(ompCompound.modelRaw, "provider/exact")
+        XCTAssertTrue(ompCompound.ohMyPiThinkingSelections.isEmpty)
     }
 }
 

@@ -502,7 +502,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
 
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 4)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 5)
         XCTAssertTrue(store.worktreeVisualIdentitiesByRepositoryID().isEmpty)
     }
 
@@ -1053,6 +1053,56 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         XCTAssertEqual(GlobalSettingsDocument.workspaceAgentModelsSchemaVersion, 4)
         XCTAssertEqual(document.requiredSchemaVersion, GlobalSettingsDocument.workspaceAgentModelsSchemaVersion)
+    }
+
+    func testAgentRoleThinkingUsesFixedFeatureSchemaV5AndGlobalDefaultsJSONRoundTrip() throws {
+        let role = AgentModelCatalog.TaskLabelKind.explore.rawValue
+        let wireID = "provider/schema-v5"
+        let thinking = thinkingSelections("high", for: wireID)
+        var globalDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
+        globalDefaults.mcpAgentRoleOhMyPiThinkingSelections = [role: thinking]
+        let globalDocument = GlobalSettingsDocument(globalDefaults: globalDefaults)
+
+        XCTAssertEqual(GlobalSettingsDocument.mcpAgentRoleOhMyPiThinkingSchemaVersion, 5)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 5)
+        XCTAssertEqual(
+            globalDocument.requiredSchemaVersion,
+            GlobalSettingsDocument.mcpAgentRoleOhMyPiThinkingSchemaVersion
+        )
+
+        let encoded = try JSONEncoder().encode(globalDocument)
+        let decoded = try JSONDecoder().decode(GlobalSettingsDocument.self, from: encoded)
+        XCTAssertEqual(decoded.globalDefaults.mcpAgentRoleOhMyPiThinkingSelections, [role: thinking])
+        XCTAssertEqual(
+            decoded.requiredSchemaVersion,
+            GlobalSettingsDocument.mcpAgentRoleOhMyPiThinkingSchemaVersion
+        )
+
+        var emptyDefaults = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
+        emptyDefaults.mcpAgentRoleOhMyPiThinkingSelections = [role: .empty]
+        let emptyDocument = GlobalSettingsDocument(globalDefaults: emptyDefaults)
+        XCTAssertNil(emptyDocument.globalDefaults.mcpAgentRoleOhMyPiThinkingSelections)
+        let emptyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(emptyDocument)) as? [String: Any]
+        )
+        let encodedDefaults = try XCTUnwrap(emptyObject["globalDefaults"] as? [String: Any])
+        XCTAssertNil(encodedDefaults["mcpAgentRoleOhMyPiThinkingSelections"])
+        XCTAssertEqual(emptyDocument.requiredSchemaVersion, GlobalSettingsDocument.baselineSchemaVersion)
+
+        let workspaceDocument = GlobalSettingsDocument(
+            agentModelsSettings: [
+                UUID(): WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: AgentModelsSettingsProfile(
+                        mcpAgentRoleOhMyPiThinkingSelections: [role: thinking]
+                    )
+                )
+            ]
+        )
+        XCTAssertEqual(
+            workspaceDocument.requiredSchemaVersion,
+            GlobalSettingsDocument.mcpAgentRoleOhMyPiThinkingSchemaVersion
+        )
     }
 
     func testFalseV4BacksUpExactBytesNormalizesOnlyHeaderAndIsIdempotent() throws {
@@ -2552,6 +2602,136 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(persistedWorkspace.planningModelRaw, "workspace-new")
         XCTAssertEqual(persistedWorkspace.preferredComposeModelRaw, "workspace-compose")
         XCTAssertEqual(persistedWorkspace.mcpAgentRoleOverrides, ["explore": "codexExec:workspace"])
+    }
+
+    func testAgentModelsRoleThinkingRoundTripsAcrossScopesCopiesAndUnrelatedMutations() throws {
+        let workspaceID = UUID()
+        let sharedWireID = "provider/shared"
+        let explore = thinkingSelections("low", for: sharedWireID)
+        let pair = thinkingSelections("high", for: sharedWireID)
+        let roleThinking = [
+            AgentModelCatalog.TaskLabelKind.explore.rawValue: explore,
+            AgentModelCatalog.TaskLabelKind.pair.rawValue: pair,
+            "future-role": thinkingSelections("auto", for: "provider/future")
+        ]
+        let harness = try makeAgentModelsSettingsHarness(
+            profile: AgentModelsSettingsProfile(
+                planningModelRaw: "ohMyPiCustom:provider/planning",
+                preferredComposeModelRaw: "ohMyPiCustom:provider/chat",
+                syncChatModelWithOracle: true,
+                mcpAgentRoleOhMyPiThinkingSelections: roleThinking
+            ),
+            configureAPI: { $0.isOpenAIKeyValid = true }
+        )
+
+        XCTAssertEqual(
+            harness.fileStore.document.globalDefaults.mcpAgentRoleOhMyPiThinkingSelections,
+            roleThinking,
+            "Global profile decomposition must retain destination-owned role thinking"
+        )
+        harness.store.setWorkspaceAgentModelsInheritanceMode(
+            workspaceID: workspaceID,
+            mode: .useGlobalSettings
+        )
+        XCTAssertEqual(
+            harness.store.effectiveAgentModelsProfile(workspaceID: workspaceID)
+                .mcpAgentRoleOhMyPiThinkingSelections,
+            roleThinking
+        )
+
+        harness.store.copyAgentModelsProfile(from: .global, to: .workspace(workspaceID))
+        XCTAssertEqual(
+            harness.store.workspaceAgentModelsProfile(for: workspaceID)?
+                .mcpAgentRoleOhMyPiThinkingSelections,
+            roleThinking
+        )
+        harness.store.copyAgentModelsProfile(from: .workspace(workspaceID), to: .global)
+
+        let freshWorkspaceID = UUID()
+        let design = thinkingSelections("auto", for: "provider/design")
+        MCPAgentRoleDefaultsService.setRoleOhMyPiThinkingSelections(
+            design,
+            for: .design,
+            scope: .workspace(freshWorkspaceID),
+            settingsStore: harness.store
+        )
+        XCTAssertEqual(
+            harness.store.workspaceAgentModelsProfile(for: freshWorkspaceID)?
+                .mcpAgentRoleOhMyPiThinkingSelections,
+            [AgentModelCatalog.TaskLabelKind.design.rawValue: design],
+            "A scoped workspace mutation must not clone inherited global role-thinking entries"
+        )
+        XCTAssertEqual(
+            harness.store.effectiveAgentModelsProfile(workspaceID: UUID())
+                .mcpAgentRoleOhMyPiThinkingSelections,
+            roleThinking,
+            "Effective access for an absent workspace must still inherit global role thinking"
+        )
+
+        let reloaded = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: harness.fileStore
+        )
+        XCTAssertEqual(
+            reloaded.globalAgentModelsProfile().mcpAgentRoleOhMyPiThinkingSelections,
+            roleThinking
+        )
+        XCTAssertEqual(
+            reloaded.workspaceAgentModelsProfile(for: workspaceID)?
+                .mcpAgentRoleOhMyPiThinkingSelections,
+            roleThinking
+        )
+        XCTAssertEqual(
+            reloaded.globalAgentModelsProfile()
+                .mcpAgentRoleOhMyPiThinkingSelections?[AgentModelCatalog.TaskLabelKind.explore.rawValue]?
+                .value(for: sharedWireID),
+            "low"
+        )
+        XCTAssertEqual(
+            reloaded.globalAgentModelsProfile()
+                .mcpAgentRoleOhMyPiThinkingSelections?[AgentModelCatalog.TaskLabelKind.pair.rawValue]?
+                .value(for: sharedWireID),
+            "high",
+            "Roles sharing an exact model must remain independent"
+        )
+
+        harness.viewModel.oracleModelDestination.applyThinkingSelections(
+            thinkingSelections("max", for: "provider/planning")
+        )
+        harness.viewModel.builtinChatModelDestination.applyThinkingSelections(
+            thinkingSelections("minimal", for: "provider/chat")
+        )
+        harness.viewModel.setRoleDefaultSelection(
+            .init(agent: .codexExec, modelRaw: AgentModel.gpt56SolLow.rawValue),
+            for: .explore
+        )
+        if let resolution = harness.viewModel.roleDefaultsResolutions.first(where: { $0.role == .explore }) {
+            harness.viewModel.applyRoleDefault(resolution)
+        }
+        harness.viewModel.applyOracleRecommendation()
+        XCTAssertEqual(
+            harness.store.globalAgentModelsProfile().mcpAgentRoleOhMyPiThinkingSelections,
+            roleThinking,
+            "Oracle/chat sync, role pin/reset, and recommendations must not touch role thinking"
+        )
+
+        var defaultsWithEmptyRole = GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil)
+        defaultsWithEmptyRole.mcpAgentRoleOhMyPiThinkingSelections = [
+            AgentModelCatalog.TaskLabelKind.explore.rawValue: .empty
+        ]
+        let emptyFileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: defaultsWithEmptyRole,
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let emptyStore = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: emptyFileStore
+        )
+        emptyStore.setGlobalRecommendationProviderFilter([.codex])
+        XCTAssertNil(
+            emptyFileStore.document.globalDefaults.mcpAgentRoleOhMyPiThinkingSelections,
+            "Loaded empty role maps must be removed on the next unrelated write"
+        )
     }
 
     func testAgentModelsContextBuilderDestinationUsesUserInitiatedIntent() throws {

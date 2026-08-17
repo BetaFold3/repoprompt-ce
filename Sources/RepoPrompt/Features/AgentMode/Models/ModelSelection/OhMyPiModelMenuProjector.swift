@@ -40,6 +40,7 @@ enum OhMyPiModelMenuProjector {
         let title: String
         let effort: Effort?
         let isFast: Bool
+        let allowsThinkingAccessory: Bool
 
         var id: String {
             sourceID
@@ -246,9 +247,9 @@ enum OhMyPiModelMenuProjector {
             }
         }
 
-        let normalEfforts = Set(entries.filter { !$0.isFast }.compactMap(\.effort))
-        let fastEfforts = Set(entries.filter(\.isFast).compactMap(\.effort))
-        if normalEfforts.count >= 2 || fastEfforts.count >= 2 {
+        let normalSlots = Set(entries.filter { !$0.isFast }.map(\.effort))
+        let fastSlots = Set(entries.filter(\.isFast).map(\.effort))
+        if normalSlots.count >= 2 || fastSlots.count >= 2 {
             return true
         }
 
@@ -259,8 +260,6 @@ enum OhMyPiModelMenuProjector {
             return true
         }
 
-        let normalSlots = Set(entries.filter { !$0.isFast }.map(\.effort))
-        let fastSlots = Set(entries.filter(\.isFast).map(\.effort))
         return !normalSlots.isDisjoint(with: fastSlots)
     }
 
@@ -317,7 +316,8 @@ enum OhMyPiModelMenuProjector {
             displayName: entry.input.displayName,
             title: entry.effort?.displayName ?? "Default",
             effort: entry.effort,
-            isFast: entry.isFast
+            isFast: entry.isFast,
+            allowsThinkingAccessory: false
         )
     }
 
@@ -347,7 +347,8 @@ enum OhMyPiModelMenuProjector {
             displayName: input.displayName,
             title: title,
             effort: nil,
-            isFast: false
+            isFast: false,
+            allowsThinkingAccessory: true
         )
     }
 

@@ -14,6 +14,7 @@ struct AgentHandoffConfig {
     let defaultDestinationAgent: AgentProviderKind
     let defaultModelRaw: String
     let defaultReasoningEffortRaw: String?
+    let defaultOhMyPiThinkingSelections: OhMyPiThinkingSelections
     let availableAgentsProvider: () -> [AgentProviderKind]
     let modelOptionsProvider: (AgentProviderKind) -> [AgentModelOption]
     let remoteCatalogSnapshot: RemoteHostAgentCatalog?
@@ -58,6 +59,19 @@ struct AgentHandoffSelection: Equatable {
     let agent: AgentProviderKind
     let modelRaw: String
     let reasoningEffortRaw: String?
+    let ohMyPiThinkingSelections: OhMyPiThinkingSelections
+
+    init(
+        agent: AgentProviderKind,
+        modelRaw: String,
+        reasoningEffortRaw: String?,
+        ohMyPiThinkingSelections: OhMyPiThinkingSelections = .empty
+    ) {
+        self.agent = agent
+        self.modelRaw = modelRaw
+        self.reasoningEffortRaw = reasoningEffortRaw
+        self.ohMyPiThinkingSelections = agent == .ohMyPi ? ohMyPiThinkingSelections : .empty
+    }
 }
 
 /// Testable selection state for the remote handoff picker. Every destination value is

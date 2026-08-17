@@ -5,6 +5,7 @@ enum OhMyPiModelMenuBuilder {
     struct Leaf: Identifiable, Hashable {
         let model: AIModel
         let title: String
+        let allowsThinkingAccessory: Bool
 
         var id: String {
             model.rawValue
@@ -66,7 +67,11 @@ enum OhMyPiModelMenuBuilder {
 
         func leaf(_ projectedLeaf: OhMyPiModelMenuProjector.Leaf) -> Leaf? {
             guard let model = modelsBySourceID[projectedLeaf.sourceID] else { return nil }
-            return Leaf(model: model, title: projectedLeaf.title)
+            return Leaf(
+                model: model,
+                title: projectedLeaf.title,
+                allowsThinkingAccessory: projectedLeaf.allowsThinkingAccessory
+            )
         }
 
         func modelGroup(_ projectedGroup: OhMyPiModelMenuProjector.ModelGroup) -> ModelGroup {
@@ -99,7 +104,8 @@ enum OhMyPiModelMenuBuilder {
     ) -> [StableMenuItem] {
         func modelItem(_ leaf: Leaf) -> StableMenuItem {
             let title = titleTransform(leaf.title)
-            guard destination.hasThinkingAccessory,
+            guard leaf.allowsThinkingAccessory,
+                  destination.hasThinkingAccessory,
                   let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: leaf.model)
             else {
                 return .action(

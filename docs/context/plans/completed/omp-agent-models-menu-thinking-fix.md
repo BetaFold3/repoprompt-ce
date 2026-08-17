@@ -6,11 +6,13 @@ Outcome: Implemented the OMP Agent Models menu projection, thinking-destination,
 
 Completion addendum: the sibling Thinking and current-selection gate passages in the preserved historical body are superseded by the implemented per-model leaf submenus and per-leaf placeholder guard. Every valid exact-wire OMP model leaf owns its Thinking children regardless of the current selection; only a literal provider-default placeholder remains an action leaf without Thinking children.
 
+2026-08-17 completion addendum: the historical role-default omission and persistence-shape non-goals below are superseded by the clarified per-role contract. `AgentModelsSettingsProfile` now owns sparse per-role OMP thinking maps at global/workspace scope; `MCPAgentRoleDefaultsService` narrows them to the effective exact OMP model; both role menus expose the destination; and only fresh role-launched sessions seed an empty session map before `AgentModeRunService` dispatch. Model changes, resets, recommendations, Oracle/Chat sync, compound selections, resumes, and existing sessions do not mutate or seed role thinking.
+
 Corrected sync-matrix resolution: when Oracle/Chat sync is enabled, directional writes mirror the whole model-and-thinking-map pair using the established blank asymmetry—Oracle-side model writes mirror even a blank raw value, while Built-in Chat model writes mirror only for a non-blank raw value.
 
-Validation: focused affected suites passed 140 tests with 0 failures; `make dev-build`, `make dev-lint`, `make dev-format-check`, `Scripts/check-agent-context`, and `Scripts/test-check-agent-context` passed. The prior `make dev-test-parallel` pass of 521/521 suites and 5328/5328 tests predates this submenu correction. The current full `make dev-test` exercised the suite but hit one unrelated transient `CursorCLIProviderTests` mock-count failure amid socket lock contention; that exact suite passed immediately in isolation. No new all-green full sweep is claimed.
+Validation: focused affected suites passed 140 tests with 0 failures; `make dev-build`, `make dev-lint`, `make dev-format-check`, `Scripts/check-agent-context`, and `Scripts/test-check-agent-context` passed. The prior `make dev-test-parallel` pass of 521/521 suites and 5328/5328 tests predates this submenu correction. A full `make dev-test` on the reviewed and fixed tree initially exposed the new lifecycle test missing shared OMP qualification-ledger metadata, plus unrelated `CursorCLIProviderTests` and two durable-artifact failures amid socket-lock contention. After the ledger metadata fix, `AgentManageMCPToolServiceListAgentsTests` passed 3/3; the exact earlier lifecycle timing failure (`testFreshRoleOMPThinkingSeedsOnceAndFeedsRunServiceAssignments`) also passed in isolation. All three unrelated failing suites passed immediately in isolation: Cursor 1/1, durable crash/catalog 6/6, and durable identity/lease GC 9/9. No all-green full sweep is claimed.
 
-Review: the current OracleA review on exact preset `61D024A4-CCFB-4C9C-A614-CC65E0A1864C` found only the stale completion-record issue, now fixed. The current OracleB review on exact preset `7CDD523E-1D7C-47EA-98FE-D5FEA24D2D8C` found no P0; its in-scope SwiftUI commit-success gate, completion record, exact-leaf test, active-document wording, ledger/resource declarations, and test-safety findings were fixed and revalidated. Its structural deduplication and performance suggestions remain unimplemented follow-ups.
+Review: both exact named final reviewers ran: OracleA preset `61D024A4-CCFB-4C9C-A614-CC65E0A1864C` and OracleB preset `7CDD523E-1D7C-47EA-98FE-D5FEA24D2D8C`. In-scope findings applied from their reviews were the fresh Settings scope authority, schema v5 compatibility boundary, symmetric workspace mutation behavior, exact-entry session seed hardening, JSON and production-handoff coverage, and the routed validation-list update. Out-of-scope structural refactors and menu-performance rewrites remain unimplemented.
 
 Known unrelated baseline caveats: `make guardrails` rejects five pre-existing tracked documents, and ledger verification reports pre-existing `missing=286` / `stale=3`; all new and renamed task IDs reconcile.
 
@@ -88,9 +90,9 @@ Fire `OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(agent:rawModel:
 
 ### 6. Explicit non-goals
 
-- No per-role thinking storage (persistence-shape change; out of scope).
+- **Superseded by the 2026-08-17 completion addendum:** per-role thinking storage and the additive Agent Models persistence-shape change are now implemented.
 - Quick Model Picker HUD stays a flat searchable leaf index (only its probe gap is fixed).
-- No changes to `OhMyPiModelMenuProjector`, capability registry/resolver internals, `GlobalSettingsDocument`, or persistence shapes. **No migration needed or written** — all fields already `decodeIfPresent`/encode-when-non-empty; old↔new documents degrade to Default both ways.
+- No changes to `OhMyPiModelMenuProjector` or capability registry/resolver internals. The follow-up adds only an optional, sparse `GlobalSettingsDocument` profile field; **no migration is needed or written** because missing/empty data means Default.
 - Legacy `contextBuilderModel(promptVM:)` mixed-store split: documented follow-up only.
 
 ## File-by-file impact

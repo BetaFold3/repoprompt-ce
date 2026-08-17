@@ -232,7 +232,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var roleDefaultsResolutions: [MCPAgentRoleDefaultsService.RoleDefaultResolution] {
-        let profileStore = AgentModelsProfileRoleDefaultsStore(overrides: profileSnapshot.mcpAgentRoleOverrides)
+        let profileStore = AgentModelsProfileRoleDefaultsStore(
+            overrides: profileSnapshot.mcpAgentRoleOverrides,
+            roleThinkingSelections: profileSnapshot.mcpAgentRoleOhMyPiThinkingSelections
+        )
         return MCPAgentRoleDefaultsService.resolutions(
             availability: availability,
             recommendedAvailability: availability.filteredForRecommendationProviders(settingsManager.globalRecommendationProviderFilter()),
@@ -596,9 +599,35 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        AgentModelCatalog.selectableAgents(availability: availability).map { agent in
-            // Deliberately model-only: role defaults have no per-role thinking owner.
-            AgentModelStableMenuItems.agentSubmenu(
+        let onSelect: (AgentProviderKind, AgentModelOption) -> Bool = { [weak self] selectedAgent, selectedOption in
+            guard let self else { return false }
+            let selection = AgentModelCatalog.NormalizedAgentSelection(
+                agent: selectedAgent,
+                modelRaw: selectedOption.rawValue
+            )
+            setRoleDefaultSelection(selection, for: resolution.role)
+            OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                agent: selectedAgent,
+                rawModel: selectedOption.rawValue
+            )
+            return true
+        }
+        let thinkingDestination = roleDefaultThinkingDestination(for: resolution)
+        return AgentModelCatalog.selectableAgents(availability: availability).map { agent in
+            if agent == .ohMyPi {
+                return AgentModelStableMenuItems.agentSubmenu(
+                    agentKind: agent,
+                    options: AgentModelCatalog.options(for: agent, availability: availability),
+                    selectedAgent: resolution.effective.agent,
+                    selectedModelRaw: resolution.effective.modelRaw,
+                    includePlaceholderDefault: false,
+                    flattenSingleCodexGroups: true,
+                    groupOpenCode: false,
+                    thinkingDestination: thinkingDestination,
+                    onSelect: onSelect
+                )
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
                 selectedAgent: resolution.effective.agent,
@@ -606,19 +635,36 @@ final class AgentModelsSettingsViewModel: ObservableObject {
                 includePlaceholderDefault: false,
                 flattenSingleCodexGroups: true,
                 groupOpenCode: false
-            ) { [weak self] selectedAgent, selectedOption in
-                guard let self else { return }
-                let selection = AgentModelCatalog.NormalizedAgentSelection(
-                    agent: selectedAgent,
-                    modelRaw: selectedOption.rawValue
-                )
-                setRoleDefaultSelection(selection, for: resolution.role)
-                OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
-                    agent: selectedAgent,
-                    rawModel: selectedOption.rawValue
-                )
+            ) { selectedAgent, selectedOption in
+                _ = onSelect(selectedAgent, selectedOption)
             }
         }
+    }
+
+    private func roleDefaultThinkingDestination(
+        for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
+    ) -> ModelDestination {
+        let role = resolution.role
+        return ModelDestination(
+            id: "agentModels.roleDefault.\(role.rawValue)",
+            getter: { [weak self] in
+                self?.roleDefaultsResolutions.first(where: { $0.role == role })?.effective.modelRaw
+                    ?? resolution.effective.modelRaw
+            },
+            applier: { _ in },
+            thinkingGetter: { [weak self] in
+                self?.currentProfile().profile.mcpAgentRoleOhMyPiThinkingSelections?[role.rawValue] ?? .empty
+            },
+            thinkingApplier: { [weak self] selections in
+                guard let self else { return }
+                updateSelectedProfile(reason: "agent_models.role_thinking") { profile in
+                    var selectionsByRole = profile.mcpAgentRoleOhMyPiThinkingSelections ?? [:]
+                    selectionsByRole[role.rawValue] = selections.nilIfEmpty
+                    profile.mcpAgentRoleOhMyPiThinkingSelections = selectionsByRole.isEmpty ? nil : selectionsByRole
+                }
+                postAgentRoleDefaultsChanged()
+            }
+        )
     }
 
     // MARK: - Private helpers

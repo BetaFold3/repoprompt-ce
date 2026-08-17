@@ -126,9 +126,31 @@ enum OhMyPiCanonicalModelIdentity {
     }
 }
 
+enum OhMyPiThinkingExecutionEligibility {
+    static func allowsAssignment(
+        for exactWireModelID: String,
+        snapshot: ACPDiscoveredSessionModels? = AgentACPModelRegistry.shared.resolvedSnapshot(for: .ohMyPi)
+    ) -> Bool {
+        guard let snapshot else { return true }
+        let projection = OhMyPiModelMenuProjector.project(snapshot.options.enumerated().map { index, option in
+            OhMyPiModelMenuProjector.Input(
+                sourceID: String(index),
+                wireID: option.rawValue,
+                displayName: option.displayName
+            )
+        })
+        let matchingLeaves = projection.allLeaves.filter { $0.wireID == exactWireModelID }
+        guard matchingLeaves.count == 1, let leaf = matchingLeaves.first else {
+            return true
+        }
+        return leaf.allowsThinkingAccessory
+    }
+}
+
 extension OhMyPiThinkingSelections {
     func assignments(for model: AIModel) -> [ACPConfigOptionAssignment] {
         guard let exactWireModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: model),
+              OhMyPiThinkingExecutionEligibility.allowsAssignment(for: exactWireModelID),
               let assignment = assignment(for: exactWireModelID)
         else {
             return []

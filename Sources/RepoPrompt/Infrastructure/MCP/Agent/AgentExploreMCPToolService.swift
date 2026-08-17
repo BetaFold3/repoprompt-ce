@@ -309,6 +309,7 @@ struct AgentExploreMCPToolService {
             context.selection.modelRaw,
             nil,
             .explore,
+            context.selection.ohMyPiThinkingSelections,
             nil,
             nil,
             nil

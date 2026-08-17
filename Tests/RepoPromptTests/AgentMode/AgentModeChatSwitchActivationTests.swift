@@ -460,6 +460,43 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
         }
     }
 
+    func testLocalHandoffPropagatesOMPThinkingOnlyToOMPDestinationSession() async throws {
+        try await withFixture { fixture in
+            let cutoffItemID = try XCTUnwrap(fixture.sessionA.items.last?.id)
+            let config = try XCTUnwrap(fixture.viewModel.makeHandoffConfig(
+                for: cutoffItemID,
+                sourceTabID: fixture.tabAID,
+                windowID: fixture.window.windowID
+            ))
+            let ompModelRaw = "google-antigravity/gemini-3.7-flash"
+            var thinking = OhMyPiThinkingSelections()
+            thinking.setValue("high", for: ompModelRaw)
+
+            try await config.performHandoff(.local(AgentHandoffSelection(
+                agent: .ohMyPi,
+                modelRaw: ompModelRaw,
+                reasoningEffortRaw: nil,
+                ohMyPiThinkingSelections: thinking
+            )))
+            let ompTabID = try XCTUnwrap(fixture.viewModel.currentTabID)
+            let ompDestination = try XCTUnwrap(fixture.viewModel.sessions[ompTabID])
+            XCTAssertEqual(ompDestination.selectedAgent, .ohMyPi)
+            XCTAssertEqual(ompDestination.selectedModelRaw, ompModelRaw)
+            XCTAssertEqual(ompDestination.ohMyPiThinkingSelections, thinking)
+
+            try await config.performHandoff(.local(AgentHandoffSelection(
+                agent: .codexExec,
+                modelRaw: "gpt-5.6-sol",
+                reasoningEffortRaw: "high",
+                ohMyPiThinkingSelections: thinking
+            )))
+            let codexTabID = try XCTUnwrap(fixture.viewModel.currentTabID)
+            let codexDestination = try XCTUnwrap(fixture.viewModel.sessions[codexTabID])
+            XCTAssertEqual(codexDestination.selectedAgent, .codexExec)
+            XCTAssertTrue(codexDestination.ohMyPiThinkingSelections.isEmpty)
+        }
+    }
+
     func testSourcePinnedHandoffConfigRejectsHostBindingDrift() async throws {
         try await withFixture { fixture in
             let cutoffItemID = try XCTUnwrap(fixture.sessionA.items.last?.id)

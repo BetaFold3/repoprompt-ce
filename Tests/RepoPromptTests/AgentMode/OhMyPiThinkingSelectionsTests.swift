@@ -44,6 +44,30 @@ extension ACPAgentSessionControllerModeConfigTests {
                         description: nil,
                         isPlaceholderDefault: false,
                         isProviderDefault: true
+                    ),
+                    AgentModelOption(
+                        rawValue: "cursor/cursor-grok-4.6-low",
+                        displayName: "Cursor Grok 4.6 Low",
+                        description: nil,
+                        isDefault: false
+                    ),
+                    AgentModelOption(
+                        rawValue: "cursor/cursor-grok-4.6-high",
+                        displayName: "Cursor Grok 4.6 High",
+                        description: nil,
+                        isDefault: false
+                    ),
+                    AgentModelOption(
+                        rawValue: "provider/sparse-fast",
+                        displayName: "Sparse Fast Default",
+                        description: nil,
+                        isDefault: false
+                    ),
+                    AgentModelOption(
+                        rawValue: "provider/sparse-low-fast",
+                        displayName: "Sparse Fast Low",
+                        description: nil,
+                        isDefault: false
                     )
                 ],
                 currentModelRaw: canonicalID
@@ -77,6 +101,49 @@ extension ACPAgentSessionControllerModeConfigTests {
             exactWireModelID: persistedAlias,
             selections: selections
         ), [.ohMyPiThinking("max")])
+
+        let familyModelID = "cursor/cursor-grok-4.6-high"
+        selections.setValue("high", for: familyModelID)
+        let familyModel = AIModel.ohMyPiCustom(name: familyModelID)
+        XCTAssertEqual(
+            selections.value(for: familyModelID),
+            "high",
+            "Legacy family intent remains persisted even while execution ignores it"
+        )
+        XCTAssertTrue(selections.assignments(for: familyModel).isEmpty)
+        XCTAssertTrue(AgentModeRunService.ohMyPiConfigAssignments(
+            agent: .ohMyPi,
+            exactWireModelID: familyModelID,
+            selections: selections
+        ).isEmpty)
+
+        for sparseFamilyModelID in ["provider/sparse-fast", "provider/sparse-low-fast"] {
+            selections.setValue("low", for: sparseFamilyModelID)
+            XCTAssertTrue(
+                selections.assignments(for: .ohMyPiCustom(name: sparseFamilyModelID)).isEmpty,
+                "Default and explicit effort leaves in a corroborated fast-only family stay terminal"
+            )
+            XCTAssertTrue(AgentModeRunService.ohMyPiConfigAssignments(
+                agent: .ohMyPi,
+                exactWireModelID: sparseFamilyModelID,
+                selections: selections
+            ).isEmpty)
+        }
+
+        XCTAssertTrue(
+            OhMyPiThinkingExecutionEligibility.allowsAssignment(
+                for: "provider/unknown",
+                snapshot: nil
+            ),
+            "Execution deliberately fails open when catalog classification is unavailable"
+        )
+        XCTAssertTrue(
+            OhMyPiThinkingExecutionEligibility.allowsAssignment(
+                for: "provider/unknown",
+                snapshot: AgentACPModelRegistry.shared.resolvedSnapshot(for: .ohMyPi)
+            ),
+            "An exact model absent from the resolved catalog remains fail-open"
+        )
     }
 
     func testOhMyPiThinkingSelectionsLegacyDecodeAndNonemptyOnlyEncoding() throws {
@@ -131,6 +198,7 @@ extension ACPAgentSessionControllerModeConfigTests {
         XCTAssertTrue(legacy.planningModelOhMyPiThinkingSelections.isEmpty)
         XCTAssertTrue(legacy.preferredComposeOhMyPiThinkingSelections.isEmpty)
         XCTAssertTrue(legacy.contextBuilderOhMyPiThinkingSelections.isEmpty)
+        XCTAssertNil(legacy.mcpAgentRoleOhMyPiThinkingSelections)
 
         let emptyData = try JSONEncoder().encode(legacy)
         let emptyObject = try XCTUnwrap(
@@ -139,6 +207,16 @@ extension ACPAgentSessionControllerModeConfigTests {
         XCTAssertNil(emptyObject["planningModelOhMyPiThinkingSelections"])
         XCTAssertNil(emptyObject["preferredComposeOhMyPiThinkingSelections"])
         XCTAssertNil(emptyObject["contextBuilderOhMyPiThinkingSelections"])
+        XCTAssertNil(emptyObject["mcpAgentRoleOhMyPiThinkingSelections"])
+
+        var explicitlyEmpty = legacy
+        explicitlyEmpty.mcpAgentRoleOhMyPiThinkingSelections = [
+            AgentModelCatalog.TaskLabelKind.explore.rawValue: .empty
+        ]
+        let explicitlyEmptyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(explicitlyEmpty)) as? [String: Any]
+        )
+        XCTAssertNil(explicitlyEmptyObject["mcpAgentRoleOhMyPiThinkingSelections"])
 
         var planning = OhMyPiThinkingSelections()
         planning.setValue(
@@ -162,13 +240,37 @@ extension ACPAgentSessionControllerModeConfigTests {
         populated.planningModelOhMyPiThinkingSelections = planning
         populated.preferredComposeOhMyPiThinkingSelections = chat
         populated.contextBuilderOhMyPiThinkingSelections = contextBuilder
+        populated.mcpAgentRoleOhMyPiThinkingSelections = [
+            AgentModelCatalog.TaskLabelKind.explore.rawValue: planning,
+            AgentModelCatalog.TaskLabelKind.pair.rawValue: chat,
+            "future-role": contextBuilder,
+            AgentModelCatalog.TaskLabelKind.design.rawValue: .empty
+        ]
 
         let populatedData = try JSONEncoder().encode(populated)
         let roundTripped = try JSONDecoder().decode(
             AgentModelsSettingsProfile.self,
             from: populatedData
         )
-        XCTAssertEqual(roundTripped, populated)
+        XCTAssertEqual(roundTripped.planningModelOhMyPiThinkingSelections, planning)
+        XCTAssertEqual(roundTripped.preferredComposeOhMyPiThinkingSelections, chat)
+        XCTAssertEqual(roundTripped.contextBuilderOhMyPiThinkingSelections, contextBuilder)
+        XCTAssertEqual(
+            roundTripped.mcpAgentRoleOhMyPiThinkingSelections?[AgentModelCatalog.TaskLabelKind.explore.rawValue]?.value(for: "cursor/planning"),
+            "plan"
+        )
+        XCTAssertEqual(
+            roundTripped.mcpAgentRoleOhMyPiThinkingSelections?[AgentModelCatalog.TaskLabelKind.pair.rawValue]?.value(for: "cursor/chat"),
+            "chat"
+        )
+        XCTAssertEqual(
+            roundTripped.mcpAgentRoleOhMyPiThinkingSelections?["future-role"],
+            contextBuilder,
+            "Unknown destination-owned role keys must survive additive round trips"
+        )
+        XCTAssertNil(
+            roundTripped.mcpAgentRoleOhMyPiThinkingSelections?[AgentModelCatalog.TaskLabelKind.design.rawValue]
+        )
     }
 
     func testOhMyPiPresetCopiesAndSharedModelsKeepIndependentSelections() {

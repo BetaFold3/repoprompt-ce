@@ -269,7 +269,8 @@ struct AgentModelOptionsMenuContent: View {
         _ leaf: OhMyPiModelMenuProjector.Leaf,
         option: AgentModelOption
     ) -> some View {
-        if !option.isPlaceholderDefault,
+        if leaf.allowsThinkingAccessory,
+           !option.isPlaceholderDefault,
            let thinkingDestination,
            thinkingDestination.hasThinkingAccessory,
            let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: leaf.wireID)
@@ -926,7 +927,8 @@ enum AgentModelStableMenuItems {
             guard let option = projected.optionsBySourceID[leaf.sourceID] else {
                 return .separator
             }
-            guard !option.isPlaceholderDefault,
+            guard leaf.allowsThinkingAccessory,
+                  !option.isPlaceholderDefault,
                   let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: leaf.wireID)
             else {
                 return modelItem(

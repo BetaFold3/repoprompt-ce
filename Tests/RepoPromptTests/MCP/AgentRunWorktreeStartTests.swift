@@ -3930,7 +3930,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             resolveSpawnParentSessionID: { _, _ in nil },
             bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, message, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
+            startRun: { target, message, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, workflow, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Test explore target did not resolve a session ID.")
                 }
@@ -4015,7 +4015,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             resolveSpawnParentSessionID: { _, _ in fallbackParentSessionID },
             bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, _, _ in
+            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, _, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Test start target did not resolve a session ID.")
                 }

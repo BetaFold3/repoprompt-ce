@@ -5,7 +5,8 @@ import Foundation
 ///
 /// Schema v1 contains copy settings, chat settings, and cross-workspace global
 /// defaults. Schema v2 adds optional scalar preference groups. Schema v4 adds
-/// workspace-scoped Agent Models profiles. Scalar fields stay optional so missing
+/// workspace-scoped Agent Models profiles. Schema v5 protects persisted per-role OMP
+/// thinking intent. Scalar fields stay optional so missing
 /// JSON fields fall back through the typed GlobalSettingsStore accessors without
 /// losing current default behavior.
 struct GlobalSettingsDocument: Codable {
@@ -14,7 +15,8 @@ struct GlobalSettingsDocument: Codable {
     /// version from `currentSchemaVersion`.
     static let baselineSchemaVersion = 2
     static let workspaceAgentModelsSchemaVersion = 4
-    static let currentSchemaVersion = 4
+    static let mcpAgentRoleOhMyPiThinkingSchemaVersion = 5
+    static let currentSchemaVersion = 5
     /// Lineage marker for settings files written by this open-source CE schema family.
     ///
     /// CE inherited numeric schema versions from classic/internal builds, so version numbers
@@ -52,7 +54,12 @@ struct GlobalSettingsDocument: Codable {
         agentModelsSettingsByWorkspaceID = agentModelsSettings.isEmpty
             ? nil
             : Self.encodeUUIDKeyedDictionary(agentModelsSettings)
-        self.globalDefaults = globalDefaults
+        var normalizedGlobalDefaults = globalDefaults
+        normalizedGlobalDefaults.mcpAgentRoleOhMyPiThinkingSelections =
+            AgentModelsSettingsProfile.normalizedRoleThinkingSelections(
+                globalDefaults.mcpAgentRoleOhMyPiThinkingSelections
+            )
+        self.globalDefaults = normalizedGlobalDefaults
         self.scalarPreferences = scalarPreferences
     }
 
@@ -77,6 +84,15 @@ struct GlobalSettingsDocument: Codable {
         var requiredVersion = Self.baselineSchemaVersion
         if let agentModelsSettingsByWorkspaceID, !agentModelsSettingsByWorkspaceID.isEmpty {
             requiredVersion = max(requiredVersion, Self.workspaceAgentModelsSchemaVersion)
+        }
+        let hasGlobalRoleThinking = globalDefaults.mcpAgentRoleOhMyPiThinkingSelections?
+            .values.contains(where: { !$0.isEmpty }) == true
+        let hasWorkspaceRoleThinking = agentModelsSettingsByWorkspaceID?.values.contains { settings in
+            settings.profile?.mcpAgentRoleOhMyPiThinkingSelections?
+                .values.contains(where: { !$0.isEmpty }) == true
+        } == true
+        if hasGlobalRoleThinking || hasWorkspaceRoleThinking {
+            requiredVersion = max(requiredVersion, Self.mcpAgentRoleOhMyPiThinkingSchemaVersion)
         }
         return requiredVersion
     }
@@ -167,6 +183,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
     var contextBuilderOhMyPiThinkingSelections: OhMyPiThinkingSelections
     var contextBuilderModelsByAgent: [String: String]?
     var mcpAgentRoleOverrides: [String: String]?
+    var mcpAgentRoleOhMyPiThinkingSelections: [String: OhMyPiThinkingSelections]?
     var restrictMCPAgentDiscoveryToRoleLabels: Bool
 
     init(
@@ -179,6 +196,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         contextBuilderOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty,
         contextBuilderModelsByAgent: [String: String]? = nil,
         mcpAgentRoleOverrides: [String: String]? = nil,
+        mcpAgentRoleOhMyPiThinkingSelections: [String: OhMyPiThinkingSelections]? = nil,
         restrictMCPAgentDiscoveryToRoleLabels: Bool = false
     ) {
         self.planningModelRaw = Self.normalizedChatModelRaw(planningModelRaw)
@@ -190,6 +208,9 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         self.contextBuilderOhMyPiThinkingSelections = contextBuilderOhMyPiThinkingSelections
         self.contextBuilderModelsByAgent = Self.normalizedContextBuilderModelsByAgent(contextBuilderModelsByAgent)
         self.mcpAgentRoleOverrides = Self.normalizedStringMap(mcpAgentRoleOverrides)
+        self.mcpAgentRoleOhMyPiThinkingSelections = Self.normalizedRoleThinkingSelections(
+            mcpAgentRoleOhMyPiThinkingSelections
+        )
         self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
     }
 
@@ -203,6 +224,7 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         case contextBuilderOhMyPiThinkingSelections
         case contextBuilderModelsByAgent
         case mcpAgentRoleOverrides
+        case mcpAgentRoleOhMyPiThinkingSelections
         case restrictMCPAgentDiscoveryToRoleLabels
     }
 
@@ -227,6 +249,10 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
             ),
             contextBuilderModelsByAgent: container.decodeIfPresent([String: String].self, forKey: .contextBuilderModelsByAgent),
             mcpAgentRoleOverrides: container.decodeIfPresent([String: String].self, forKey: .mcpAgentRoleOverrides),
+            mcpAgentRoleOhMyPiThinkingSelections: container.decodeIfPresent(
+                [String: OhMyPiThinkingSelections].self,
+                forKey: .mcpAgentRoleOhMyPiThinkingSelections
+            ),
             restrictMCPAgentDiscoveryToRoleLabels: container.decodeIfPresent(Bool.self, forKey: .restrictMCPAgentDiscoveryToRoleLabels) ?? false
         )
     }
@@ -251,6 +277,10 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         )
         try container.encodeIfPresent(contextBuilderModelsByAgent, forKey: .contextBuilderModelsByAgent)
         try container.encodeIfPresent(mcpAgentRoleOverrides, forKey: .mcpAgentRoleOverrides)
+        try container.encodeIfPresent(
+            Self.normalizedRoleThinkingSelections(mcpAgentRoleOhMyPiThinkingSelections),
+            forKey: .mcpAgentRoleOhMyPiThinkingSelections
+        )
         try container.encode(
             restrictMCPAgentDiscoveryToRoleLabels,
             forKey: .restrictMCPAgentDiscoveryToRoleLabels
@@ -293,6 +323,22 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
                 return
             }
             result[key] = value
+        }
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    static func normalizedRoleThinkingSelections(
+        _ values: [String: OhMyPiThinkingSelections]?
+    ) -> [String: OhMyPiThinkingSelections]? {
+        guard let values else { return nil }
+        let normalized = values.keys.sorted().reduce(into: [String: OhMyPiThinkingSelections]()) { result, rawKey in
+            guard let key = trimmedNonEmpty(rawKey),
+                  let selections = values[rawKey],
+                  !selections.isEmpty
+            else {
+                return
+            }
+            result[key] = selections
         }
         return normalized.isEmpty ? nil : normalized
     }

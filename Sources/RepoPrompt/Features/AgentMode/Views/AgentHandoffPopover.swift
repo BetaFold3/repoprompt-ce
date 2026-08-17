@@ -131,11 +131,13 @@ struct AgentHandoffPopover: View {
     @State private var selectedAgent: AgentProviderKind
     @State private var selectedModelRaw: String
     @State private var selectedReasoningEffortRaw: String?
+    @State private var selectedOhMyPiThinkingSelections: OhMyPiThinkingSelections
     @State private var remoteDestinationState: AgentHandoffRemoteDestinationState
     @State private var isLoading = false
     @State private var isCopying = false
     @State private var showCopied = false
     @State private var errorMessage: String?
+    @State private var ohMyPiThinkingRevision: UInt = 0
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -152,6 +154,9 @@ struct AgentHandoffPopover: View {
         _selectedAgent = State(initialValue: initialSelection.agent)
         _selectedModelRaw = State(initialValue: initialSelection.modelRaw)
         _selectedReasoningEffortRaw = State(initialValue: initialSelection.reasoningEffortRaw)
+        _selectedOhMyPiThinkingSelections = State(
+            initialValue: Self.initialOhMyPiThinkingSelections(for: config)
+        )
         _remoteDestinationState = State(initialValue: AgentHandoffRemoteDestinationState(
             catalog: config.remoteCatalogSnapshot,
             preferredModelID: config.defaultModelRaw
@@ -246,7 +251,8 @@ struct AgentHandoffPopover: View {
         return .local(Self.canonicalizedSelection(AgentHandoffSelection(
             agent: selectedAgent,
             modelRaw: selectedModelRaw,
-            reasoningEffortRaw: showReasoningEffort ? selectedReasoningEffortRaw : nil
+            reasoningEffortRaw: showReasoningEffort ? selectedReasoningEffortRaw : nil,
+            ohMyPiThinkingSelections: selectedOhMyPiThinkingSelections
         )))
     }
 
@@ -390,6 +396,14 @@ struct AgentHandoffPopover: View {
             if !isRemoteDestination {
                 reconcileSelectionWithAvailability()
             }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .ohMyPiThinkingCapabilitiesDidChange)
+                .merge(with: NotificationCenter.default.publisher(for: .ohMyPiThinkingCapabilityProbeStateDidChange))
+                // Default-mode delivery waits until SwiftUI tracking menus exit event-tracking mode.
+                .receive(on: RunLoop.main)
+        ) { _ in
+            ohMyPiThinkingRevision &+= 1
         }
     }
 
@@ -594,6 +608,7 @@ struct AgentHandoffPopover: View {
 
     @ViewBuilder
     private func handoffModelMenuContent(for agent: AgentProviderKind) -> some View {
+        let _ = ohMyPiThinkingRevision
         let options = Self.visibleModelOptions(config.modelOptionsProvider(agent))
         if options.isEmpty {
             Button("No models available") {}
@@ -624,7 +639,8 @@ struct AgentHandoffPopover: View {
                 agentKind: agent,
                 options: options,
                 selectedAgent: selectedAgent,
-                selectedModelRaw: selectedModelRaw
+                selectedModelRaw: selectedModelRaw,
+                thinkingDestination: agent == .ohMyPi ? handoffThinkingDestination : nil
             ) { agent, model in
                 selectHandoffModel(model, for: agent)
                 return true
@@ -662,6 +678,14 @@ struct AgentHandoffPopover: View {
         selectedAgent = selection.agent
         selectedModelRaw = selection.modelRaw
         selectedReasoningEffortRaw = selection.reasoningEffortRaw
+    }
+
+    private var handoffThinkingDestination: ModelDestination {
+        .binding(
+            $selectedModelRaw,
+            thinkingSelections: $selectedOhMyPiThinkingSelections,
+            id: "agentHandoff"
+        )
     }
 
     private func selectHandoffModel(_ model: AgentModelOption, for agent: AgentProviderKind) {
@@ -738,6 +762,12 @@ struct AgentHandoffPopover: View {
         AgentHandoffActionSupport.errorMessage(for: action, error: error)
     }
 
+    static func initialOhMyPiThinkingSelections(
+        for config: AgentHandoffConfig
+    ) -> OhMyPiThinkingSelections {
+        config.defaultOhMyPiThinkingSelections
+    }
+
     static func initialSelection(for config: AgentHandoffConfig) -> AgentHandoffSelection {
         let agents = config.availableAgentsProvider()
         let agent = agents.contains(config.defaultDestinationAgent)
@@ -754,7 +784,12 @@ struct AgentHandoffPopover: View {
             preferredReasoningEffortRaw: agent == config.defaultDestinationAgent ? config.defaultReasoningEffortRaw : nil,
             config: config
         )
-        return AgentHandoffSelection(agent: agent, modelRaw: modelRaw, reasoningEffortRaw: reasoningEffortRaw)
+        return AgentHandoffSelection(
+            agent: agent,
+            modelRaw: modelRaw,
+            reasoningEffortRaw: reasoningEffortRaw,
+            ohMyPiThinkingSelections: config.defaultOhMyPiThinkingSelections
+        )
     }
 
     static func initialModelRaw(

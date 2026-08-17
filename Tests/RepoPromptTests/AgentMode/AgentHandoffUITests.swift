@@ -8,6 +8,7 @@ final class AgentHandoffUITests: XCTestCase {
     override func setUp() {
         super.setUp()
         cursorCatalogSnapshot = CursorModelParameterCatalog.shared.currentSnapshot()
+        CursorModelParameterCatalog.shared.test_restoreSnapshot([:])
         AgentACPModelRegistry.shared.test_reset(providerID: .cursor)
     }
 
@@ -29,6 +30,66 @@ final class AgentHandoffUITests: XCTestCase {
             AgentHandoffConfig.destinationSource(remoteHostID: "host-a", resolvedHostRowID: UUID()),
             .remoteCatalog(hostID: "host-a")
         )
+    }
+
+    func testLocalHandoffPreservesEphemeralOMPMapAcrossNonOMPInitialSelectionAndCanonicalizesDestinations() {
+        let ompModelRaw = "google-antigravity/gemini-3.7-flash"
+        let codexModelRaw = "gpt-5.6-sol"
+        var sourceThinking = OhMyPiThinkingSelections()
+        sourceThinking.setValue("high", for: ompModelRaw)
+        let ompOption = AgentModelOption(
+            rawValue: ompModelRaw,
+            displayName: "Gemini 3.7 Flash",
+            description: nil,
+            isDefault: true
+        )
+        let codexOption = AgentModelOption(
+            rawValue: codexModelRaw,
+            displayName: "GPT-5.6 Sol",
+            description: nil,
+            isDefault: true
+        )
+        let config = AgentHandoffConfig(
+            itemID: UUID(),
+            destinationSource: .localProviders,
+            defaultDestinationAgent: .codexExec,
+            defaultModelRaw: codexModelRaw,
+            defaultReasoningEffortRaw: "high",
+            defaultOhMyPiThinkingSelections: sourceThinking,
+            availableAgentsProvider: { [.codexExec, .ohMyPi] },
+            modelOptionsProvider: { agent in
+                agent == .ohMyPi ? [ompOption] : [codexOption]
+            },
+            remoteCatalogSnapshot: nil,
+            windowID: -1,
+            buildPayloadForClipboard: { "" },
+            performHandoff: { _ in }
+        )
+
+        let initial = AgentHandoffPopover.initialSelection(for: config)
+        XCTAssertEqual(initial.agent, .codexExec)
+        XCTAssertTrue(initial.ohMyPiThinkingSelections.isEmpty)
+        XCTAssertEqual(
+            AgentHandoffPopover.initialOhMyPiThinkingSelections(for: config),
+            sourceThinking,
+            "The ephemeral map must survive a non-OMP initial provider so switching to OMP can reuse it"
+        )
+
+        let ompSelection = AgentHandoffActionSupport.canonicalizedSelection(AgentHandoffSelection(
+            agent: .ohMyPi,
+            modelRaw: ompModelRaw,
+            reasoningEffortRaw: nil,
+            ohMyPiThinkingSelections: AgentHandoffPopover.initialOhMyPiThinkingSelections(for: config)
+        ))
+        XCTAssertEqual(ompSelection.ohMyPiThinkingSelections, sourceThinking)
+
+        let nonOMP = AgentHandoffActionSupport.canonicalizedSelection(AgentHandoffSelection(
+            agent: .codexExec,
+            modelRaw: codexModelRaw,
+            reasoningEffortRaw: "high",
+            ohMyPiThinkingSelections: sourceThinking
+        ))
+        XCTAssertTrue(nonOMP.ohMyPiThinkingSelections.isEmpty)
     }
 
     func testRemoteDestinationStateRendersStructuredCatalogEffortAndExactRawValues() throws {
@@ -465,6 +526,7 @@ final class AgentHandoffUITests: XCTestCase {
             defaultDestinationAgent: .cursor,
             defaultModelRaw: defaultModelRaw,
             defaultReasoningEffortRaw: nil,
+            defaultOhMyPiThinkingSelections: .empty,
             availableAgentsProvider: { [.cursor] },
             modelOptionsProvider: { agent in
                 agent == .cursor ? options : []
@@ -544,6 +606,7 @@ final class AgentHandoffUITests: XCTestCase {
             defaultDestinationAgent: .codexExec,
             defaultModelRaw: "codexExec:gpt-5.4:high",
             defaultReasoningEffortRaw: "high",
+            defaultOhMyPiThinkingSelections: .empty,
             availableAgentsProvider: { [] },
             modelOptionsProvider: { _ in [] },
             remoteCatalogSnapshot: catalog,

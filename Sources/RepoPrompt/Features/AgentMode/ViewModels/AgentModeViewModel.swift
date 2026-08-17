@@ -7009,6 +7009,34 @@ final class AgentModeViewModel: ObservableObject {
         return createdTab.id
     }
 
+    @discardableResult
+    func mcpSeedRoleOhMyPiThinkingSelections(
+        tabID: UUID,
+        targetOrigin: MCPSessionTarget.Origin,
+        taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        selections: OhMyPiThinkingSelections
+    ) -> Bool {
+        guard targetOrigin == .createdNewTab,
+              taskLabelKind != nil,
+              !selections.isEmpty,
+              let session = session(for: tabID, createIfNeeded: false),
+              session.selectedAgent == .ohMyPi,
+              session.ohMyPiThinkingSelections.isEmpty,
+              let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: session.selectedModelRaw),
+              let exactChoice = selections[exactModelID]
+        else {
+            return false
+        }
+        session.ohMyPiThinkingSelections = OhMyPiThinkingSelections(entries: [exactModelID: exactChoice])
+        if tabID == currentTabID {
+            applySessionToBindings(session)
+        }
+        if session.activeAgentSessionID != nil {
+            scheduleSave(for: tabID)
+        }
+        return true
+    }
+
     func mcpConfigureSession(
         tabID: UUID,
         agentRaw: String?,
@@ -18267,7 +18295,8 @@ final class AgentModeViewModel: ObservableObject {
         upToItemID: UUID?,
         destinationAgent: AgentProviderKind,
         destinationModelRaw: String,
-        destinationReasoningEffortRaw: String?
+        destinationReasoningEffortRaw: String?,
+        destinationOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty
     ) async throws -> UUID {
         guard let promptManager,
               let workspaceManager
@@ -18328,6 +18357,9 @@ final class AgentModeViewModel: ObservableObject {
         destSession.selectedAgent = destinationAgent
         destSession.selectedModelRaw = destinationModelRaw
         destSession.selectedReasoningEffortRaw = destinationReasoningEffortRaw
+        destSession.ohMyPiThinkingSelections = destinationAgent == .ohMyPi
+            ? destinationOhMyPiThinkingSelections
+            : .empty
         destSession.autoEditEnabled = sourceSession.autoEditEnabled
         guard let destinationAgentModeSessionID = ensureSessionBoundToTab(destSession) else {
             await promptManager.closeComposeTab(destTabID)
@@ -18387,7 +18419,8 @@ final class AgentModeViewModel: ObservableObject {
         upToItemID: UUID,
         destinationAgent: AgentProviderKind,
         destinationModelRaw: String,
-        destinationReasoningEffortRaw: String?
+        destinationReasoningEffortRaw: String?,
+        destinationOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty
     ) async throws -> UUID {
         guard let sourceTabID = currentTabID else {
             throw AgentSessionError.noActiveWorkspace
@@ -18397,7 +18430,8 @@ final class AgentModeViewModel: ObservableObject {
             upToItemID: upToItemID,
             destinationAgent: destinationAgent,
             destinationModelRaw: destinationModelRaw,
-            destinationReasoningEffortRaw: destinationReasoningEffortRaw
+            destinationReasoningEffortRaw: destinationReasoningEffortRaw,
+            destinationOhMyPiThinkingSelections: destinationOhMyPiThinkingSelections
         )
     }
 
@@ -18409,7 +18443,8 @@ final class AgentModeViewModel: ObservableObject {
         upToItemID: UUID,
         destinationAgent: AgentProviderKind,
         destinationModelRaw: String,
-        destinationReasoningEffortRaw: String?
+        destinationReasoningEffortRaw: String?,
+        destinationOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty
     ) async throws -> UUID {
         guard let promptManager,
               let workspaceManager
@@ -18422,7 +18457,8 @@ final class AgentModeViewModel: ObservableObject {
             upToItemID: upToItemID,
             destinationAgent: destinationAgent,
             destinationModelRaw: destinationModelRaw,
-            destinationReasoningEffortRaw: destinationReasoningEffortRaw
+            destinationReasoningEffortRaw: destinationReasoningEffortRaw,
+            destinationOhMyPiThinkingSelections: destinationOhMyPiThinkingSelections
         )
         let clonedActiveChatSessionID = workspaceManager.activeChatSessionID(forTabID: destTabID)
         guard let destSession = sessions[destTabID] else {

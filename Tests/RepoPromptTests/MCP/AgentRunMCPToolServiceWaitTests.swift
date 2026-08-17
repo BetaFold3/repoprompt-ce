@@ -568,7 +568,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
             liveSnapshots: liveSnapshots,
             recorder: recorder,
             resolveRequestedTabID: { _ in session.tabID },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, _, _, _, _, _, _ in
+            startRun: { target, _, _, _, agentModeVM, agentRaw, _, _, _, _, _, _, _ in
                 providerDispatchCount += 1
                 XCTAssertEqual(agentRaw, AgentProviderKind.ohMyPi.rawValue)
                 let liveSession = try XCTUnwrap(agentModeVM.session(for: target.tabID, createIfNeeded: false))
@@ -635,7 +635,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 viewModel: viewModel,
                 liveSnapshots: liveSnapshots,
                 recorder: recorder,
-                startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
+                startRun: { _, _, _, _, _, _, _, _, _, _, _, _, _ in
                     providerDispatchCount += 1
                     throw MCPError.internalError("Malformed qualification input reached provider dispatch")
                 }
@@ -707,7 +707,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 liveSnapshots: liveSnapshots,
                 recorder: recorder,
                 connectionID: connectionID,
-                startRun: { target, _, _, _, agentModeVM, _, _, _, _, _, _, _ in
+                startRun: { target, _, _, _, agentModeVM, _, _, _, _, _, _, _, _ in
                     let session = try XCTUnwrap(agentModeVM.session(for: target.tabID, createIfNeeded: false))
                     let context = try XCTUnwrap(session.ompQualificationStartContext)
                     session.runState = .failed
@@ -846,7 +846,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 liveSnapshots: liveSnapshots,
                 recorder: recorder,
                 connectionID: connectionID,
-                startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
+                startRun: { _, _, _, _, _, _, _, _, _, _, _, _, _ in
                     providerDispatchCount += 1
                     throw MCPError.internalError("Provider dispatch must remain fenced")
                 }
@@ -973,7 +973,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 liveSnapshots: liveSnapshots,
                 recorder: recorder,
                 connectionID: connectionID,
-                startRun: { target, _, _, _, agentModeVM, _, _, _, _, _, _, _ in
+                startRun: { target, _, _, _, agentModeVM, _, _, _, _, _, _, _, _ in
                     let session = agentModeVM.session(for: target.tabID)
                     session.runID = runID
                     session.runState = .running
@@ -1100,7 +1100,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 liveSnapshots: liveSnapshots,
                 recorder: recorder,
                 connectionID: connectionID,
-                startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
+                startRun: { _, _, _, _, _, _, _, _, _, _, _, _, _ in
                     providerDispatchCount += 1
                     throw MCPError.internalError("Expired qualification must not dispatch")
                 }
@@ -1204,7 +1204,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 recorder: recorder,
                 connectionID: connectionID,
                 resolveRequestedTabID: { _ in tabID },
-                startRun: { _, _, _, _, _, _, _, _, _, _, _, _ in
+                startRun: { _, _, _, _, _, _, _, _, _, _, _, _, _ in
                     providerDispatchCount += 1
                     throw MCPError.internalError("Stale invocation must not dispatch")
                 }
@@ -1338,6 +1338,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                     modelRaw,
                     reasoningEffortRaw,
                     taskLabelKind,
+                    roleOhMyPiThinkingSelections,
                     workflow,
                     expectedParentSessionID,
                     oracleReviewSource in
@@ -1351,6 +1352,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                         modelRaw: modelRaw,
                         reasoningEffortRaw: reasoningEffortRaw,
                         taskLabelKind: taskLabelKind,
+                        roleOhMyPiThinkingSelections: roleOhMyPiThinkingSelections,
                         workflow: workflow,
                         expectedParentSessionID: expectedParentSessionID,
                         oracleReviewSource: oracleReviewSource
@@ -1789,7 +1791,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 liveSnapshots: liveSnapshots,
                 recorder: recorder,
                 connectionID: connectionID,
-                startRun: { target, _, _, _, agentModeVM, _, _, _, _, _, _, _ in
+                startRun: { target, _, _, _, agentModeVM, _, _, _, _, _, _, _, _ in
                     providerDispatchCount += 1
                     let sessionID = try XCTUnwrap(target.sessionID)
                     let session = agentModeVM.session(for: target.tabID)
@@ -2212,7 +2214,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
                 resolveSpawnParentSessionID: { _, _ in nil },
                 bindCurrentRequestToTab: { _, _ in },
                 withHeartbeat: { _, _, _, _, operation in try await operation() },
-                startRun: { target, _, metadata, _, agentModeVM, agentRaw, modelRaw, _, taskLabelKind, _, _, _ in
+                startRun: { target, _, metadata, _, agentModeVM, agentRaw, modelRaw, _, taskLabelKind, _, _, _, _ in
                     let sessionID = try XCTUnwrap(target.sessionID)
                     try await agentModeVM.mcpActivateControlContext(
                         forTabID: target.tabID,
@@ -3197,7 +3199,7 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         connectionID: UUID? = nil,
         resolveRequestedTabID: @escaping (_ args: [String: Value]) throws -> UUID? = { _ in nil },
         resolveSpawnParentSourceTabID: @escaping (_ metadata: MCPServerViewModel.RequestMetadata) async -> UUID? = { _ in nil },
-        startRun: @escaping AgentRunMCPToolService.StartRun = { _, _, _, _, _, _, _, _, _, _, _, _ in
+        startRun: @escaping AgentRunMCPToolService.StartRun = { _, _, _, _, _, _, _, _, _, _, _, _, _ in
             throw MCPError.internalError("startRun should not be used by wait tests")
         }
     ) -> AgentRunMCPToolService {

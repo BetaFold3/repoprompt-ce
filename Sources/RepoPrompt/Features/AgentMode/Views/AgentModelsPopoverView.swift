@@ -385,9 +385,40 @@ struct AgentModelsPopoverView: View {
     private func roleDefaultMenuItems(
         for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
     ) -> [StableMenuItem] {
-        // Role defaults deliberately omit Thinking: there is no per-role thinking owner.
+        let onSelect: (AgentProviderKind, AgentModelOption) -> Bool = { selectedAgent, selectedOption in
+            let selection = AgentModelCatalog.NormalizedAgentSelection(
+                agent: selectedAgent,
+                modelRaw: selectedOption.rawValue
+            )
+            guard MCPAgentRoleDefaultsService.setSelection(
+                selection,
+                for: resolution.role,
+                availability: availability,
+                scope: editingScope
+            ) else { return false }
+            OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
+                agent: selectedAgent,
+                rawModel: selectedOption.rawValue
+            )
+            bumpRoleDefaults()
+            return true
+        }
+        let thinkingDestination = roleDefaultThinkingDestination(for: resolution)
         var items = AgentModelCatalog.selectableAgents(availability: availability).map { agent in
-            AgentModelStableMenuItems.agentSubmenu(
+            if agent == .ohMyPi {
+                return AgentModelStableMenuItems.agentSubmenu(
+                    agentKind: agent,
+                    options: AgentModelCatalog.options(for: agent, availability: availability),
+                    selectedAgent: resolution.effective.agent,
+                    selectedModelRaw: resolution.effective.modelRaw,
+                    includePlaceholderDefault: false,
+                    flattenSingleCodexGroups: true,
+                    groupOpenCode: false,
+                    thinkingDestination: thinkingDestination,
+                    onSelect: onSelect
+                )
+            }
+            return AgentModelStableMenuItems.agentSubmenu(
                 agentKind: agent,
                 options: AgentModelCatalog.options(for: agent, availability: availability),
                 selectedAgent: resolution.effective.agent,
@@ -396,21 +427,7 @@ struct AgentModelsPopoverView: View {
                 flattenSingleCodexGroups: true,
                 groupOpenCode: false
             ) { selectedAgent, selectedOption in
-                let selection = AgentModelCatalog.NormalizedAgentSelection(
-                    agent: selectedAgent,
-                    modelRaw: selectedOption.rawValue
-                )
-                guard MCPAgentRoleDefaultsService.setSelection(
-                    selection,
-                    for: resolution.role,
-                    availability: availability,
-                    scope: editingScope
-                ) else { return }
-                OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
-                    agent: selectedAgent,
-                    rawModel: selectedOption.rawValue
-                )
-                bumpRoleDefaults()
+                _ = onSelect(selectedAgent, selectedOption)
             }
         }
         if resolution.hasStoredOverride {
@@ -424,6 +441,34 @@ struct AgentModelsPopoverView: View {
             }, at: 0)
         }
         return items
+    }
+
+    private func roleDefaultThinkingDestination(
+        for resolution: MCPAgentRoleDefaultsService.RoleDefaultResolution
+    ) -> ModelDestination {
+        let role = resolution.role
+        return ModelDestination(
+            id: "agentModelsPopover.roleDefault.\(role.rawValue)",
+            getter: {
+                roleResolutions.first(where: { $0.role == role })?.effective.modelRaw
+                    ?? resolution.effective.modelRaw
+            },
+            applier: { _ in },
+            thinkingGetter: {
+                MCPAgentRoleDefaultsService.roleOhMyPiThinkingSelections(
+                    for: role,
+                    scope: editingScope
+                )
+            },
+            thinkingApplier: { selections in
+                MCPAgentRoleDefaultsService.setRoleOhMyPiThinkingSelections(
+                    selections,
+                    for: role,
+                    scope: editingScope
+                )
+                bumpRoleDefaults()
+            }
+        )
     }
 
     private func bumpRoleDefaults() {

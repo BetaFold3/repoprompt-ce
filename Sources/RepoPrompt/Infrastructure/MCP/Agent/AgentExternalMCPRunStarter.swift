@@ -142,6 +142,7 @@ enum AgentExternalMCPRunStarter {
         modelRaw: String?,
         reasoningEffortRaw: String?,
         taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil,
+        roleOhMyPiThinkingSelections: OhMyPiThinkingSelections = .empty,
         workflow: AgentWorkflowDefinition? = nil,
         expectedParentSessionID: UUID? = nil,
         oracleReviewSource: AgentRunOracleReviewSource? = nil,
@@ -206,6 +207,12 @@ enum AgentExternalMCPRunStarter {
                 agentRaw: agentRaw,
                 modelRaw: resolvedModel,
                 reasoningEffortRaw: resolvedEffort
+            )
+            agentModeVM.mcpSeedRoleOhMyPiThinkingSelections(
+                tabID: target.tabID,
+                targetOrigin: target.origin,
+                taskLabelKind: taskLabelKind,
+                selections: roleOhMyPiThinkingSelections
             )
             try await bindCurrentRequestToTab(target.tabID, metadata)
             #if DEBUG

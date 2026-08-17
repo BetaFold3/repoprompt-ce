@@ -720,6 +720,12 @@ struct AgentManageMCPToolService {
                 modelRaw: resolved.model,
                 reasoningEffortRaw: resolved.effort
             )
+            agentModeVM.mcpSeedRoleOhMyPiThinkingSelections(
+                tabID: target.tabID,
+                targetOrigin: target.origin,
+                taskLabelKind: selection.taskLabelKind,
+                selections: selection.ohMyPiThinkingSelections
+            )
             try await bindCurrentRequestToTab(target.tabID, metadata)
             guard let sessionID = target.sessionID else {
                 throw MCPError.internalError("Failed to resolve created agent session ID.")

@@ -393,10 +393,16 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
     override func setUp() {
         super.setUp()
         AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        #if DEBUG
+            OhMyPiThinkingSelectionProbeTrigger.isDisabledForTesting = true
+        #endif
     }
 
     override func tearDown() {
         AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        #if DEBUG
+            OhMyPiThinkingSelectionProbeTrigger.isDisabledForTesting = false
+        #endif
         super.tearDown()
     }
 
@@ -497,83 +503,162 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         XCTAssertEqual(countTitle("Thinking", in: items), 0)
     }
 
-    func testStableAgentSurfaceThinkingChildCommitsItsExactLeafAcrossProjectionShapes() throws {
-        let scenarios: [(rawModel: String, path: [String])] = [
-            ("root-high", ["root-high", "Default"]),
-            (
-                "google-antigravity/gemini-3.7-flash",
-                ["google-antigravity", "gemini-3.7-flash", "Default"]
-            ),
-            (
-                "cursor/gpt-5.6-sol-high",
-                ["cursor", "gpt-5.6-sol", "High", "Default"]
-            )
+    func testStableAgentSurfaceKeepsFamilyLeavesTerminalAndStandaloneGoogleThinkingCapable() throws {
+        let rootRaw = "root-high"
+        let googleRaw = "google-antigravity/gemini-3.7-flash"
+        let familyHighRaw = "cursor/cursor-grok-4.6-high"
+        let fastXHighRaw = "cursor/cursor-grok-4.6-xhigh-fast"
+        let sparseFastDefaultRaw = "provider/sparse-fast"
+        let sparseFastLowRaw = "provider/sparse-low-fast"
+        let rawModels = [
+            rootRaw,
+            googleRaw,
+            "cursor/cursor-grok-4.6",
+            "cursor/cursor-grok-4.6-low",
+            familyHighRaw,
+            "cursor/cursor-grok-4.6-low-fast",
+            fastXHighRaw,
+            sparseFastDefaultRaw,
+            sparseFastLowRaw
         ]
-        var models = scenarios.map { scenario in
+        let options = rawModels.map {
             AgentModelOption(
-                rawValue: scenario.rawModel,
-                displayName: scenario.rawModel,
+                rawValue: $0,
+                displayName: $0,
                 description: nil,
                 isDefault: false
             )
         }
-        models.append(AgentModelOption(
-            rawValue: "cursor/gpt-5.6-sol-low",
-            displayName: "cursor/gpt-5.6-sol-low",
-            description: nil,
-            isDefault: false
-        ))
-        var selectedRaw = scenarios[0].rawModel
-        var committedRaws: [String] = []
-        var appliedKeys: [String] = []
+        var selectedRaw = googleRaw
         var selections = OhMyPiThinkingSelections()
+        selections.setValue("high", for: rootRaw)
+        selections.setValue("high", for: googleRaw)
+        var events: [String] = []
         let destination = ModelDestination(
-            id: "exact-leaf-menu-test",
+            id: "agent-family-vs-standalone",
             getter: { selectedRaw },
             applier: { selectedRaw = $0 },
             thinkingGetter: { selections },
-            thinkingApplier: { updatedSelections in
-                let removedKeys = Set(selections.entries.keys)
-                    .subtracting(updatedSelections.entries.keys)
-                appliedKeys.append(contentsOf: removedKeys)
-                selections = updatedSelections
+            thinkingApplier: {
+                selections = $0
+                events.append("thinking")
             }
         )
-
-        for scenario in scenarios {
-            try XCTContext.runActivity(named: scenario.rawModel) { _ in
-                selections = OhMyPiThinkingSelections()
-                for candidate in scenarios {
-                    selections.setValue("high", for: candidate.rawModel, updatedAt: Date(timeIntervalSince1970: 1))
-                }
-                selectedRaw = scenario.rawModel
-                committedRaws.removeAll()
-                appliedKeys.removeAll()
-
-                let commitSelection: (AgentProviderKind, AgentModelOption) -> Void = { agent, option in
-                    XCTAssertEqual(agent, .ohMyPi)
-                    committedRaws.append(option.rawValue)
-                    selectedRaw = option.rawValue
-                }
-                let items = AgentModelStableMenuItems.ohMyPiModelItems(
-                    options: models,
-                    selectedAgent: .ohMyPi,
-                    selectedModelRaw: selectedRaw,
-                    thinkingDestination: destination,
-                    onSelect: commitSelection
-                )
-                let child = try stableMenuItem(at: scenario.path, in: items)
-
-                XCTAssertTrue(child.performActionForTesting())
-                XCTAssertEqual(committedRaws, [scenario.rawModel])
-                XCTAssertEqual(appliedKeys, [scenario.rawModel])
-                XCTAssertNil(selections[scenario.rawModel])
-                XCTAssertTrue(
-                    scenarios.filter { $0.rawModel != scenario.rawModel }
-                        .allSatisfy { selections[$0.rawModel]?.value == "high" }
-                )
-            }
+        let onSelect: (AgentProviderKind, AgentModelOption) -> Void = { _, option in
+            selectedRaw = option.rawValue
+            events.append("model:\(option.rawValue)")
         }
+        let items = AgentModelStableMenuItems.ohMyPiModelItems(
+            options: options,
+            selectedAgent: .ohMyPi,
+            selectedModelRaw: selectedRaw,
+            thinkingDestination: destination,
+            onSelect: onSelect
+        )
+
+        let rootDefault = try stableMenuItem(at: [rootRaw, "Default"], in: items)
+        XCTAssertTrue(rootDefault.performActionForTesting())
+        XCTAssertEqual(events, ["model:\(rootRaw)", "thinking"])
+        XCTAssertNil(selections[rootRaw])
+        XCTAssertEqual(
+            selections[googleRaw]?.value,
+            "high",
+            "Clearing a root standalone leaf must preserve other standalone keys"
+        )
+
+        events.removeAll()
+        let familyDefault = try stableMenuItem(
+            at: ["cursor", "cursor-grok-4.6", "Default"],
+            in: items
+        )
+        let familyHigh = try stableMenuItem(
+            at: ["cursor", "cursor-grok-4.6", "High"],
+            in: items
+        )
+        let fastXHigh = try stableMenuItem(
+            at: ["cursor", "cursor-grok-4.6", "Fast", "X-High"],
+            in: items
+        )
+        let sparseFastDefault = try stableMenuItem(
+            at: ["provider", "sparse", "Fast", "Default"],
+            in: items
+        )
+        let sparseFastLow = try stableMenuItem(
+            at: ["provider", "sparse", "Fast", "Low"],
+            in: items
+        )
+        XCTAssertNil(familyDefault.submenuItems)
+        XCTAssertNil(familyHigh.submenuItems)
+        XCTAssertNil(fastXHigh.submenuItems)
+        XCTAssertNil(sparseFastDefault.submenuItems)
+        XCTAssertNil(sparseFastLow.submenuItems)
+        XCTAssertTrue(familyHigh.performActionForTesting())
+        XCTAssertEqual(events, ["model:\(familyHighRaw)"])
+        XCTAssertEqual(selections[googleRaw]?.value, "high")
+
+        events.removeAll()
+        let googleDefault = try stableMenuItem(
+            at: ["google-antigravity", "gemini-3.7-flash", "Default"],
+            in: items
+        )
+        XCTAssertTrue(googleDefault.performActionForTesting())
+        XCTAssertEqual(events, ["model:\(googleRaw)", "thinking"])
+        XCTAssertNil(selections[googleRaw])
+    }
+
+    func testStableSettingsSurfaceKeepsFamilyLeavesTerminalAndStandaloneGoogleThinkingCapable() throws {
+        let googleRaw = "google-antigravity/gemini-3.7-flash"
+        let familyHighRaw = "cursor/cursor-grok-4.6-high"
+        let models: [AIModel] = [
+            .ohMyPiCustom(name: googleRaw),
+            .ohMyPiCustom(name: "cursor/cursor-grok-4.6-low"),
+            .ohMyPiCustom(name: familyHighRaw),
+            .ohMyPiCustom(name: "cursor/cursor-grok-4.6-xhigh-fast")
+        ]
+        let projection = OhMyPiModelMenuBuilder.projection(for: models)
+        let googleTitle = try XCTUnwrap(
+            projection.namespaceGroups
+                .first { $0.namespace == "google-antigravity" }?
+                .modelGroups.first?.normalLeaves.first?.title
+        )
+        var selectedModel = models[0]
+        var selections = OhMyPiThinkingSelections()
+        selections.setValue("high", for: googleRaw)
+        var events: [String] = []
+        let destination = ModelDestination(
+            id: "settings-family-vs-standalone",
+            getter: { selectedModel.rawValue },
+            applier: { _ in },
+            thinkingGetter: { selections },
+            thinkingApplier: {
+                selections = $0
+                events.append("thinking")
+            }
+        )
+        let items = OhMyPiModelMenuBuilder.stableMenuItems(
+            for: models,
+            destination: destination
+        ) { model in
+            selectedModel = model
+            events.append("model:\(model.modelName)")
+        }
+
+        let familyHigh = try stableMenuItem(
+            at: ["cursor", "cursor-grok-4.6", "High"],
+            in: items
+        )
+        XCTAssertNil(familyHigh.submenuItems)
+        XCTAssertTrue(familyHigh.performActionForTesting())
+        XCTAssertEqual(events, ["model:\(familyHighRaw)"])
+
+        events.removeAll()
+        let googleDefault = try stableMenuItem(
+            at: ["google-antigravity", googleTitle, "Default"],
+            in: items
+        )
+        XCTAssertTrue(googleDefault.performActionForTesting())
+        XCTAssertEqual(events, ["model:\(googleRaw)", "thinking"])
+        XCTAssertNil(selections[googleRaw])
     }
 
     func testContextBuilderSurfaceNestsThinkingUnderValidLeavesEvenWhenSelectedAgentIsNonOMP() throws {
@@ -593,6 +678,139 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         XCTAssertEqual(surface.viewModel.selectedContextBuilderAgent, .codexExec)
         XCTAssertEqual(validLeaf.submenuItems?.first?.title, "Default")
         XCTAssertEqual(countTitle("Thinking", in: items), 0)
+    }
+
+    func testRoleDefaultMenuExposesThinkingForOMPLeafAndCommitsExactModelFirst() throws {
+        let rawModel = "provider/context-builder-model"
+        let surface = try makeContextBuilderSurface(
+            selectedModelRaw: rawModel,
+            selectedCurrentAgent: .codexExec
+        )
+        defer { surface.cleanup() }
+        let resolution = try XCTUnwrap(
+            surface.viewModel.roleDefaultsResolutions.first { $0.role == .explore }
+        )
+        XCTAssertNotEqual(resolution.effective.agent, .ohMyPi)
+        var stored = OhMyPiThinkingSelections()
+        stored.setValue("high", for: rawModel)
+        MCPAgentRoleDefaultsService.setRoleOhMyPiThinkingSelections(
+            stored,
+            for: resolution.role,
+            scope: .global,
+            settingsStore: surface.store
+        )
+
+        let items = surface.viewModel.roleDefaultMenuItems(for: resolution)
+        let ompMenu = try XCTUnwrap(items.first { $0.title == AgentProviderKind.ohMyPi.displayName })
+        let validLeaf = try XCTUnwrap(
+            findItem(titled: "Context Builder Model", in: ompMenu.submenuItems ?? [])
+        )
+        let defaultThinking = try XCTUnwrap(validLeaf.submenuItems?.first)
+        XCTAssertEqual(defaultThinking.title, "Default")
+
+        XCTAssertTrue(defaultThinking.performActionForTesting())
+        let profile = surface.store.globalAgentModelsProfile()
+        XCTAssertEqual(
+            profile.mcpAgentRoleOverrides?[resolution.role.rawValue],
+            AgentModelSelectionID(
+                agentRaw: AgentProviderKind.ohMyPi.rawValue,
+                modelRaw: rawModel
+            ).rawValue,
+            "Thinking children must commit their exact OMP leaf before writing role thinking"
+        )
+        XCTAssertNil(
+            profile.mcpAgentRoleOhMyPiThinkingSelections?[resolution.role.rawValue]?[rawModel]
+        )
+    }
+
+    func testRoleThinkingMenuUsesFreshWorkspaceScopeForModelAndThinkingWrites() throws {
+        let rawModel = "provider/context-builder-model"
+        let surface = try makeContextBuilderSurface(
+            selectedModelRaw: rawModel,
+            selectedCurrentAgent: .codexExec
+        )
+        defer { surface.cleanup() }
+        let role = AgentModelCatalog.TaskLabelKind.explore
+        var globalThinking = OhMyPiThinkingSelections()
+        globalThinking.setValue("high", for: rawModel)
+        MCPAgentRoleDefaultsService.setRoleOhMyPiThinkingSelections(
+            globalThinking,
+            for: role,
+            scope: .global,
+            settingsStore: surface.store
+        )
+
+        let workspaceID = UUID()
+        surface.viewModel.updateWorkspaceContext(workspaceID: workspaceID, workspaceName: "Fresh role scope")
+        surface.manager.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: AgentModelsSettingsProfile()
+        )
+        surface.manager.setWorkspaceAgentModelsInheritanceMode(
+            workspaceID: workspaceID,
+            mode: .useWorkspaceOverrides
+        )
+
+        var profileNotifications: [(scope: String?, workspaceID: UUID?)] = []
+        let profileToken = NotificationCenter.default.addObserver(
+            forName: .agentModelsSettingsDidChange,
+            object: surface.store,
+            queue: nil
+        ) { notification in
+            profileNotifications.append((
+                notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String,
+                notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+            ))
+        }
+        defer { NotificationCenter.default.removeObserver(profileToken) }
+        var roleChangeNotifications = 0
+        let roleToken = NotificationCenter.default.addObserver(
+            forName: .recommendationsShouldRefresh,
+            object: nil,
+            queue: nil
+        ) { notification in
+            if notification.userInfo?["reason"] as? String == "agentRoleDefaultsChanged" {
+                roleChangeNotifications += 1
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(roleToken) }
+
+        let resolution = try XCTUnwrap(
+            surface.viewModel.roleDefaultsResolutions.first { $0.role == role }
+        )
+        let items = surface.viewModel.roleDefaultMenuItems(for: resolution)
+        let ompMenu = try XCTUnwrap(items.first { $0.title == AgentProviderKind.ohMyPi.displayName })
+        let validLeaf = try XCTUnwrap(
+            findItem(titled: "Context Builder Model", in: ompMenu.submenuItems ?? [])
+        )
+        let defaultThinking = try XCTUnwrap(validLeaf.submenuItems?.first)
+        XCTAssertEqual(defaultThinking.title, "Default")
+        XCTAssertTrue(defaultThinking.performActionForTesting())
+
+        XCTAssertEqual(
+            surface.store.globalAgentModelsProfile()
+                .mcpAgentRoleOhMyPiThinkingSelections?[role.rawValue],
+            globalThinking,
+            "A stale cached global scope must not receive the thinking half of a workspace action"
+        )
+        XCTAssertEqual(
+            surface.store.workspaceAgentModelsProfile(for: workspaceID)?
+                .mcpAgentRoleOverrides?[role.rawValue],
+            AgentModelSelectionID(
+                agentRaw: AgentProviderKind.ohMyPi.rawValue,
+                modelRaw: rawModel
+            ).rawValue
+        )
+        XCTAssertNil(
+            surface.store.workspaceAgentModelsProfile(for: workspaceID)?
+                .mcpAgentRoleOhMyPiThinkingSelections?[role.rawValue]
+        )
+        XCTAssertEqual(profileNotifications.count, 2, "Exact-model commit and thinking apply must each persist once")
+        XCTAssertTrue(profileNotifications.allSatisfy {
+            $0.scope == AgentModelsSettingsNotification.Scope.workspace.rawValue
+                && $0.workspaceID == workspaceID
+        })
+        XCTAssertEqual(roleChangeNotifications, 2)
     }
 
     func testThinkingSubmenuAbsentForPlaceholderModel() throws {
@@ -760,6 +978,8 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         selectedCurrentAgent: AgentProviderKind = .ohMyPi
     ) throws -> (
         viewModel: AgentModelsSettingsViewModel,
+        store: GlobalSettingsStore,
+        manager: WindowSettingsManager,
         cleanup: () -> Void
     ) {
         let discoveredRaw = OhMyPiCanonicalModelIdentity.exactWireID(for: selectedModelRaw)
@@ -816,13 +1036,16 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         if selectedCurrentAgent == .codexExec {
             apiSettings.isCodexConnected = true
         }
+        let manager = WindowSettingsManager(windowID: -700, store: store)
         let viewModel = AgentModelsSettingsViewModel(
             apiSettingsVM: apiSettings,
-            settingsManager: WindowSettingsManager(windowID: -700, store: store),
+            settingsManager: manager,
             settingsStore: store
         )
         return (
             viewModel,
+            store,
+            manager,
             {
                 defaults.removePersistentDomain(forName: suiteName)
                 try? FileManager.default.removeItem(at: directory)

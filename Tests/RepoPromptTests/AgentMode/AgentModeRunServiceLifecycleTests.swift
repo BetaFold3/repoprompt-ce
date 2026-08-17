@@ -2841,6 +2841,210 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testFreshRoleOMPThinkingSeedsOnceAndFeedsRunServiceAssignments() async throws {
+        let wireID = "Provider/Role-Model"
+        let selectedModelRaw = "provider/role-model"
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        defer { AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi) }
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: wireID,
+                        displayName: "Role Model",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: false
+                    )
+                ],
+                currentModelRaw: wireID
+            ),
+            for: .ohMyPi
+        ))
+        let recorder = LifecycleRecorder()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .ohMyPi,
+            commandPath: "/usr/bin/true",
+            recorder: recorder
+        )
+        var capturedRequest: ACPRunRequest?
+        let harness = makeHarness(
+            recorder: recorder,
+            acpProviderFactory: { _, _ in provider },
+            acpControllerFactory: { _, request in
+                capturedRequest = request
+                throw LifecycleTestError.expectedACPDispatchStop
+            }
+        )
+        var expectedRoleThinking = OhMyPiThinkingSelections()
+        expectedRoleThinking.setValue(
+            "high",
+            for: wireID,
+            updatedAt: Date(timeIntervalSinceReferenceDate: 1)
+        )
+        var persistedRoleThinking = expectedRoleThinking
+        persistedRoleThinking.setValue(
+            "stale",
+            for: "provider/other",
+            updatedAt: Date(timeIntervalSinceReferenceDate: 2)
+        )
+        let role = AgentModelCatalog.TaskLabelKind.engineer
+        let persistedRoleStore = AgentModelsProfileRoleDefaultsStore(overrides: nil)
+        XCTAssertTrue(MCPAgentRoleDefaultsService.setSelection(
+            .init(agent: .ohMyPi, modelRaw: selectedModelRaw),
+            for: role,
+            scope: .global,
+            settingsStore: persistedRoleStore
+        ))
+        MCPAgentRoleDefaultsService.setRoleOhMyPiThinkingSelections(
+            persistedRoleThinking,
+            for: role,
+            scope: .global,
+            settingsStore: persistedRoleStore
+        )
+        let resolvedSelection = try AgentMCPSelectionResolver.resolve(
+            modelID: role.rawValue,
+            availability: .init(codexAvailable: true, ohMyPiAvailable: true),
+            roleDefaultsStore: persistedRoleStore
+        )
+        XCTAssertEqual(resolvedSelection.agentRaw, AgentProviderKind.ohMyPi.rawValue)
+        XCTAssertEqual(resolvedSelection.modelRaw, selectedModelRaw)
+        XCTAssertEqual(resolvedSelection.taskLabelKind, role)
+        XCTAssertEqual(resolvedSelection.ohMyPiThinkingSelections, expectedRoleThinking)
+
+        let sessionID = UUID()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+        harness.host.test_installLiveSession(session)
+        let target = AgentModeViewModel.MCPSessionTarget(
+            tabID: session.tabID,
+            sessionID: sessionID,
+            origin: .createdNewTab
+        )
+        var didReachDispatch = false
+        let startRun: AgentRunMCPToolService.StartRun = {
+            target,
+            message,
+            metadata,
+            bindCurrentRequestToTab,
+            agentModeVM,
+            agentRaw,
+            modelRaw,
+            reasoningEffortRaw,
+            taskLabelKind,
+            roleOhMyPiThinkingSelections,
+            workflow,
+            expectedParentSessionID,
+            oracleReviewSource in
+            try await AgentExternalMCPRunStarter.start(
+                target: target,
+                message: message,
+                metadata: metadata,
+                bindCurrentRequestToTab: bindCurrentRequestToTab,
+                agentModeVM: agentModeVM,
+                agentRaw: agentRaw,
+                modelRaw: modelRaw,
+                reasoningEffortRaw: reasoningEffortRaw,
+                taskLabelKind: taskLabelKind,
+                roleOhMyPiThinkingSelections: roleOhMyPiThinkingSelections,
+                workflow: workflow,
+                expectedParentSessionID: expectedParentSessionID,
+                oracleReviewSource: oracleReviewSource,
+                dispatchInstruction: { _, tabID, _, _, host in
+                    let configuredSession = try XCTUnwrap(host.session(for: tabID, createIfNeeded: false))
+                    XCTAssertEqual(configuredSession.selectedAgent, .ohMyPi)
+                    XCTAssertEqual(configuredSession.selectedModelRaw, selectedModelRaw)
+                    XCTAssertEqual(configuredSession.ohMyPiThinkingSelections, expectedRoleThinking)
+                    didReachDispatch = true
+                    return .queuedFollowUp
+                }
+            )
+        }
+
+        _ = try await startRun(
+            target,
+            "role omp",
+            .init(connectionID: UUID(), clientName: "role-thinking-handoff-test", windowID: nil),
+            { _, _ in },
+            harness.host,
+            resolvedSelection.agentRaw,
+            resolvedSelection.modelRaw,
+            nil,
+            resolvedSelection.taskLabelKind,
+            resolvedSelection.ohMyPiThinkingSelections,
+            nil,
+            nil,
+            nil
+        )
+        XCTAssertTrue(didReachDispatch)
+        XCTAssertEqual(session.ohMyPiThinkingSelections, expectedRoleThinking)
+
+        var replacement = OhMyPiThinkingSelections()
+        replacement.setValue("low", for: wireID)
+        XCTAssertFalse(harness.host.mcpSeedRoleOhMyPiThinkingSelections(
+            tabID: session.tabID,
+            targetOrigin: .createdNewTab,
+            taskLabelKind: .engineer,
+            selections: replacement
+        ))
+        XCTAssertEqual(session.ohMyPiThinkingSelections, expectedRoleThinking, "A nonempty session map must never be overwritten")
+
+        let resumed = AgentModeViewModel.TabSession(tabID: UUID())
+        resumed.selectedAgent = .ohMyPi
+        resumed.selectedModelRaw = selectedModelRaw
+        harness.host.test_installLiveSession(resumed)
+        XCTAssertFalse(harness.host.mcpSeedRoleOhMyPiThinkingSelections(
+            tabID: resumed.tabID,
+            targetOrigin: .createdForSessionResume,
+            taskLabelKind: .engineer,
+            selections: persistedRoleThinking
+        ))
+        XCTAssertTrue(resumed.ohMyPiThinkingSelections.isEmpty)
+        XCTAssertFalse(harness.host.mcpSeedRoleOhMyPiThinkingSelections(
+            tabID: resumed.tabID,
+            targetOrigin: .existingSession,
+            taskLabelKind: .engineer,
+            selections: persistedRoleThinking
+        ))
+        XCTAssertTrue(resumed.ohMyPiThinkingSelections.isEmpty)
+
+        let compound = AgentModeViewModel.TabSession(tabID: UUID())
+        compound.selectedAgent = .ohMyPi
+        compound.selectedModelRaw = selectedModelRaw
+        harness.host.test_installLiveSession(compound)
+        XCTAssertFalse(harness.host.mcpSeedRoleOhMyPiThinkingSelections(
+            tabID: compound.tabID,
+            targetOrigin: .createdNewTab,
+            taskLabelKind: nil,
+            selections: persistedRoleThinking
+        ))
+        XCTAssertTrue(compound.ohMyPiThinkingSelections.isEmpty)
+
+        let nonOMP = AgentModeViewModel.TabSession(tabID: UUID())
+        nonOMP.selectedAgent = .codexExec
+        nonOMP.selectedModelRaw = selectedModelRaw
+        harness.host.test_installLiveSession(nonOMP)
+        XCTAssertFalse(harness.host.mcpSeedRoleOhMyPiThinkingSelections(
+            tabID: nonOMP.tabID,
+            targetOrigin: .createdNewTab,
+            taskLabelKind: .engineer,
+            selections: persistedRoleThinking
+        ))
+        XCTAssertTrue(nonOMP.ohMyPiThinkingSelections.isEmpty)
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "role omp",
+            initialMessageForRun: "role omp",
+            attachments: []
+        )
+        XCTAssertNil(outcome)
+        XCTAssertEqual(capturedRequest?.modelString, selectedModelRaw)
+        XCTAssertEqual(capturedRequest?.additionalConfigOptionValues, [.ohMyPiThinking("high")])
+        await harness.host.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
     func testNormalOhMyPiStartWithoutQualificationContextReachesACPProvider() async {
         let recorder = LifecycleRecorder()
         let provider = LifecycleFakeACPProvider(

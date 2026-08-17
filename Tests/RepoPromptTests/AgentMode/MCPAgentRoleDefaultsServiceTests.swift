@@ -1,8 +1,18 @@
-@testable import RepoPromptApp
+@_spi(TestSupport) @testable import RepoPromptApp
 import XCTest
 
 @MainActor
 final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+    }
+
+    override func tearDown() {
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        super.tearDown()
+    }
+
     func testResolutionsFallbackToActualAvailabilityWhenRecommendationAvailabilityIsEmpty() {
         let actualAvailability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: false,
@@ -212,13 +222,113 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         XCTAssertFalse(clearedResolution.hasCustomOverride)
     }
 
+    func testRoleThinkingNarrowsToEffectiveExactOMPModelAndSurvivesModelMutations() throws {
+        let wireID = "Provider/Shared"
+        let selectedModelRaw = "provider/shared"
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: [
+                    AgentModelOption(
+                        rawValue: wireID,
+                        displayName: "Shared OMP",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: false
+                    )
+                ],
+                currentModelRaw: wireID
+            ),
+            for: .ohMyPi
+        ))
+        let ompPin = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.ohMyPi.rawValue,
+            modelRaw: selectedModelRaw
+        ).rawValue
+        let nonOMPPin = AgentModelSelectionID(
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            modelRaw: AgentModel.gpt56SolLow.rawValue
+        ).rawValue
+        var exploreThinking = OhMyPiThinkingSelections()
+        exploreThinking.setValue("low", for: wireID, updatedAt: Date(timeIntervalSinceReferenceDate: 1))
+        exploreThinking.setValue("stale", for: "provider/other", updatedAt: Date(timeIntervalSinceReferenceDate: 2))
+        var pairThinking = OhMyPiThinkingSelections()
+        pairThinking.setValue("high", for: wireID, updatedAt: Date(timeIntervalSinceReferenceDate: 3))
+        let originalRoleThinking = [
+            AgentModelCatalog.TaskLabelKind.explore.rawValue: exploreThinking,
+            AgentModelCatalog.TaskLabelKind.pair.rawValue: pairThinking,
+            "future-role": exploreThinking
+        ]
+        let store = RoleDefaultsStoreStub(
+            overrides: [
+                AgentModelCatalog.TaskLabelKind.explore.rawValue: ompPin,
+                AgentModelCatalog.TaskLabelKind.pair.rawValue: ompPin,
+                AgentModelCatalog.TaskLabelKind.design.rawValue: nonOMPPin
+            ],
+            roleThinkingSelections: originalRoleThinking
+        )
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false,
+            codexAvailable: true,
+            openCodeAvailable: false,
+            cursorAvailable: false,
+            ohMyPiAvailable: true
+        )
+
+        let explore = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .explore,
+            availability: availability,
+            settingsStore: store
+        ))
+        let pair = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .pair,
+            availability: availability,
+            settingsStore: store
+        ))
+        XCTAssertEqual(explore.effective.modelRaw, selectedModelRaw)
+        XCTAssertEqual(explore.effectiveOhMyPiThinkingSelections.count, 1)
+        XCTAssertEqual(explore.effectiveOhMyPiThinkingSelections.value(for: wireID), "low")
+        XCTAssertNil(explore.effectiveOhMyPiThinkingSelections["provider/other"])
+        XCTAssertEqual(pair.effectiveOhMyPiThinkingSelections.value(for: wireID), "high")
+
+        let nonOMP = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: .design,
+            availability: availability,
+            settingsStore: store
+        ))
+        XCTAssertTrue(nonOMP.effectiveOhMyPiThinkingSelections.isEmpty)
+
+        MCPAgentRoleDefaultsService.setSelection(
+            .init(agent: .codexExec, modelRaw: AgentModel.gpt56SolMedium.rawValue),
+            for: .explore,
+            scope: .global,
+            settingsStore: store
+        )
+        MCPAgentRoleDefaultsService.clearOverride(for: .explore, scope: .global, settingsStore: store)
+        MCPAgentRoleDefaultsService.clearAllOverrides(scope: .global, settingsStore: store)
+        XCTAssertEqual(store.roleThinkingSelections, originalRoleThinking)
+
+        MCPAgentRoleDefaultsService.setRoleOhMyPiThinkingSelections(
+            .empty,
+            for: .explore,
+            scope: .global,
+            settingsStore: store
+        )
+        XCTAssertNil(store.roleThinkingSelections?[AgentModelCatalog.TaskLabelKind.explore.rawValue])
+        XCTAssertNotNil(store.roleThinkingSelections?["future-role"])
+    }
+
     func testExplicitWorkspaceResetDoesNotMutateGlobalAndStaleNonCodexPinDoesNotExecute() throws {
         let workspaceID = UUID()
         let stale = AgentModelSelectionID(agentRaw: AgentProviderKind.claudeCode.rawValue, modelRaw: "removed-model").rawValue
         let global = AgentModelSelectionID(agentRaw: AgentProviderKind.codexExec.rawValue, modelRaw: "dynamic-model").rawValue
+        var staleThinking = OhMyPiThinkingSelections()
+        staleThinking.setValue("high", for: "removed-model")
         let store = RoleDefaultsStoreStub(
             overrides: [AgentModelCatalog.TaskLabelKind.engineer.rawValue: global],
-            workspaceOverrides: [workspaceID: [AgentModelCatalog.TaskLabelKind.engineer.rawValue: stale]]
+            workspaceOverrides: [workspaceID: [AgentModelCatalog.TaskLabelKind.engineer.rawValue: stale]],
+            workspaceRoleThinkingSelections: [workspaceID: [
+                AgentModelCatalog.TaskLabelKind.engineer.rawValue: staleThinking
+            ]]
         )
         let availability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: true,
@@ -238,6 +348,10 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         ))
         XCTAssertTrue(resolution.overrideUnavailable)
         XCTAssertNotEqual(resolution.effective.modelRaw, "removed-model")
+        XCTAssertTrue(
+            resolution.effectiveOhMyPiThinkingSelections.isEmpty,
+            "Unavailable pins that fall back to another model must not carry stale thinking"
+        )
 
         MCPAgentRoleDefaultsService.clearOverride(
             for: .engineer,
@@ -253,10 +367,19 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
 private final class RoleDefaultsStoreStub: MCPAgentRoleDefaultsStoring {
     private(set) var overrides: [String: String]?
     private(set) var workspaceOverrides: [UUID: [String: String]]
+    private(set) var roleThinkingSelections: [String: OhMyPiThinkingSelections]?
+    private(set) var workspaceRoleThinkingSelections: [UUID: [String: OhMyPiThinkingSelections]]
 
-    init(overrides: [String: String]? = nil, workspaceOverrides: [UUID: [String: String]] = [:]) {
+    init(
+        overrides: [String: String]? = nil,
+        workspaceOverrides: [UUID: [String: String]] = [:],
+        roleThinkingSelections: [String: OhMyPiThinkingSelections]? = nil,
+        workspaceRoleThinkingSelections: [UUID: [String: OhMyPiThinkingSelections]] = [:]
+    ) {
         self.overrides = overrides
         self.workspaceOverrides = workspaceOverrides
+        self.roleThinkingSelections = roleThinkingSelections
+        self.workspaceRoleThinkingSelections = workspaceRoleThinkingSelections
     }
 
     func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]? {
@@ -279,5 +402,31 @@ private final class RoleDefaultsStoreStub: MCPAgentRoleDefaultsStoring {
             return
         }
         workspaceOverrides[workspaceID] = overrides
+    }
+
+    func mcpAgentRoleOhMyPiThinkingSelections(workspaceID: UUID?) -> [String: OhMyPiThinkingSelections]? {
+        guard let workspaceID else { return roleThinkingSelections }
+        return workspaceRoleThinkingSelections[workspaceID]
+    }
+
+    func mcpAgentRoleOhMyPiThinkingSelections(scope: AgentModelsEditingScope) -> [String: OhMyPiThinkingSelections]? {
+        switch scope {
+        case .global:
+            roleThinkingSelections
+        case let .workspace(workspaceID):
+            workspaceRoleThinkingSelections[workspaceID]
+        }
+    }
+
+    func updateMCPAgentRoleOhMyPiThinkingSelections(
+        _ selections: [String: OhMyPiThinkingSelections]?,
+        scope: AgentModelsEditingScope,
+        commit _: Bool
+    ) {
+        guard case let .workspace(workspaceID) = scope else {
+            roleThinkingSelections = selections
+            return
+        }
+        workspaceRoleThinkingSelections[workspaceID] = selections
     }
 }

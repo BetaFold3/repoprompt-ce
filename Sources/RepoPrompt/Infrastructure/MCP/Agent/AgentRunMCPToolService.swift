@@ -190,6 +190,7 @@ struct AgentRunMCPToolService {
         _ modelRaw: String?,
         _ reasoningEffortRaw: String?,
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
+        _ roleOhMyPiThinkingSelections: OhMyPiThinkingSelections,
         _ workflow: AgentWorkflowDefinition?,
         _ expectedParentSessionID: UUID?,
         _ oracleReviewSource: AgentRunOracleReviewSource?
@@ -1288,6 +1289,7 @@ struct AgentRunMCPToolService {
                         selection.modelRaw,
                         nil,
                         selection.taskLabelKind,
+                        selection.ohMyPiThinkingSelections,
                         workflow,
                         spawnParentSessionID,
                         oracleLaunchSource.source
@@ -1304,6 +1306,7 @@ struct AgentRunMCPToolService {
                     selection.modelRaw,
                     nil,
                     selection.taskLabelKind,
+                    selection.ohMyPiThinkingSelections,
                     workflow,
                     spawnParentSessionID,
                     oracleLaunchSource.source
