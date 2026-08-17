@@ -34,7 +34,7 @@ final class GlobalKeyboardShortcutsCoordinator {
     // MARK: - Context helpers
 
     private func focusedWindowState() -> WindowState? {
-        WindowStatesManager.shared.allWindows.first(where: { $0.isCurrentlyFocused })
+        WindowStatesManager.shared.activeMainWindowState
     }
 
     private func focusedOrLatestWindowState() -> WindowState? {
@@ -43,8 +43,7 @@ final class GlobalKeyboardShortcutsCoordinator {
 
     private func guardedFocusedWindowState() -> WindowState? {
         guard NSApplication.shared.isActive else { return nil }
-        guard let win = focusedWindowState(), win.isCurrentlyFocused else { return nil }
-        return win
+        return focusedWindowState()
     }
 
     /// On the first HUD shortcut after app activation, the Carbon handler can fire

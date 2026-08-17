@@ -7,7 +7,6 @@
 
 import Combine
 import Foundation
-import KeyboardShortcuts
 import SwiftUI
 
 struct WindowSessionSnapshot: Codable {
@@ -223,6 +222,15 @@ class WindowStatesManager: ObservableObject {
     /// This is checked by views and view models before triggering updates.
     private(set) var isTerminating = false
 
+    private lazy var globalShortcutActivationController = GlobalShortcutActivationController(
+        trackedWindows: { [weak self] in self?.allWindows ?? [] },
+        isSuspended: { [weak self] in self?.isTerminating ?? true },
+        settingsEnabled: { GlobalSettingsStore.shared.enableKeyboardShortcuts() },
+        ensureHandlersRegistered: {
+            GlobalKeyboardShortcutsCoordinator.shared.ensureHandlersRegistered()
+        }
+    )
+
     /// Prevent accidental secondary instances
     private init() {
         autoRestoreWorkspacesEnabled = UserDefaults.standard.object(forKey: WindowStatesManager.autoRestoreDefaultsKey) as? Bool ?? false
@@ -326,6 +334,26 @@ class WindowStatesManager: ObservableObject {
     /// Returns the *most recently added* window if it exists
     var latestWindowState: WindowState? {
         allWindows.last
+    }
+
+    /// Resolves the active tracked main window using native key identity first, then the focus flag fallback.
+    var activeMainWindowState: WindowState? {
+        let nativeKeyWindow = NSApplication.shared.keyWindow
+        let descriptors = allWindows.map { window in
+            GlobalShortcutTargetResolver.WindowDescriptor(
+                windowID: window.windowID,
+                isNativeKeyWindow: GlobalShortcutTargetResolver.isExactNativeWindowMatch(
+                    trackedWindow: window.nsWindow,
+                    nativeKeyWindow: nativeKeyWindow
+                ),
+                isFocusFlagged: window.isCurrentlyFocused,
+                isClosing: window.isClosing
+            )
+        }
+        guard let targetWindowID = GlobalShortcutTargetResolver.targetWindowID(in: descriptors) else {
+            return nil
+        }
+        return allWindows.first { $0.windowID == targetWindowID }
     }
 
     /// Returns whether multi-window routing should be enforced (multiple windows are open).
@@ -831,22 +859,13 @@ class WindowStatesManager: ObservableObject {
 
     // MARK: - Keyboard Shortcuts Enabling/Disabling
 
-    /// Updates `KeyboardShortcuts.isEnabled` depending on whether
-    /// any of our tracked windows is currently focused and if shortcuts are enabled in settings.
     private func updateKeyboardShortcutsState() {
-        // Skip during termination to prevent observation crashes
+        refreshGlobalShortcutActivation()
+    }
+
+    func refreshGlobalShortcutActivation() {
         guard !isTerminating else { return }
-
-        let shortcutsEnabled = GlobalSettingsStore.shared.enableKeyboardShortcuts()
-
-        // If *any* window is currently focused AND shortcuts are enabled, enable shortcuts; otherwise disable them.
-        let anyFocused = allWindows.contains { $0.isCurrentlyFocused == true }
-        let shouldEnable = anyFocused && shortcutsEnabled
-        if shouldEnable {
-            // Register handlers lazily to avoid installing Carbon hotkeys during background/inactive launch.
-            GlobalKeyboardShortcutsCoordinator.shared.ensureHandlersRegistered()
-        }
-        KeyboardShortcuts.isEnabled = shouldEnable
+        globalShortcutActivationController.refresh()
     }
 
     // MARK: - Window Lookup Helpers (for MCP routing)

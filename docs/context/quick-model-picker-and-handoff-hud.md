@@ -2,7 +2,7 @@
 
 Scope: read when the task touches the Agent Mode quick model picker or quick handoff shortcuts, model-leaf index/ranking, HUD lifecycle or hosting, current-session model commit seam, or last-completed-reply handoff routing.
 Authority: Authoritative
-Last-verified: 2026-08-16
+Last-verified: 2026-08-17
 
 ## Durable contract
 
@@ -13,7 +13,7 @@ The feature provides two configurable, window-scoped Agent Mode HUDs:
 | Quick model picker | `showAgentQuickModelSelectionHUD` | ⌥⌘K |
 | Quick handoff | `showAgentQuickHandoffHUD` | ⇧⌥⌘K |
 
-Both shortcuts post `.showAgentModelSelectionHUD` with a target `windowID` and stable `AgentModelSelectionHUDMode` raw value. The global coordinator must route through `guardedHUDWindowState()`; Settings owns the user-configurable catalog rows.
+Both shortcuts post `.showAgentModelSelectionHUD` with a target `windowID` and stable `AgentModelSelectionHUDMode` raw value. Global shortcut enablement requires an active app, enabled settings, and an exact tracked non-closing main window matching AppKit's native key window. Target resolution is native-key-first with the deferred focus flag only as a routing fallback; the fallback never enables shortcuts. The global coordinator must route HUD actions through `guardedHUDWindowState()`, preserving its latest-window fallback; Settings owns the user-configurable catalog rows.
 
 Quick model picker changes the active session's model. Quick handoff creates a new session from the newest eligible completed assistant reply and may cross provider families.
 
@@ -26,7 +26,7 @@ Quick model picker changes the active session's model. Quick handoff creates a n
 - Transcript cutoff policy: `Runtime/Transcript/AgentTranscriptServices.swift`, with shared conclusion repair in `AgentTranscriptQualityRepair.swift`.
 - Handoff execution, success-only effort persistence, and error formatting: `Services/AgentHandoffActionSupport.swift`.
 - Atomic hosting and blocking-overlay/nav-HUD exclusion: `Sources/RepoPrompt/App/Views/ContentRootShellView.swift`.
-- Shortcut and notification ownership: `Infrastructure/Utilities/Shortcuts.swift`, `App/GlobalKeyboardShortcutsCoordinator.swift`, `App/Notifications/AppNotifications.swift`, and `Features/Settings/Views/KeyboardShortcutsSettingsView.swift`.
+- Shortcut activation and target resolution: `App/GlobalShortcutActivation.swift`, `App/WindowStateManager.swift`, and `App/GlobalKeyboardShortcutsCoordinator.swift`; notification and catalog ownership remains in `Infrastructure/Utilities/Shortcuts.swift`, `App/Notifications/AppNotifications.swift`, and `Features/Settings/Views/KeyboardShortcutsSettingsView.swift`.
 
 ## Safety and performance invariants
 

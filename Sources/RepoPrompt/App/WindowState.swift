@@ -287,6 +287,7 @@ class WindowState: ObservableObject {
         isClosing = true
 
         let manager = windowStatesManager ?? WindowStatesManager.shared
+        manager.refreshGlobalShortcutActivation()
         if !manager.isTerminating {
             manager.markWindowAsExplicitlyClosing(windowID: windowID)
         }
@@ -498,6 +499,7 @@ class WindowState: ObservableObject {
             pendingFocusUpdateTask?.cancel()
             pendingFocusUpdateTask = nil
             scheduleFocusUpdate(false)
+            windowStatesManager?.refreshGlobalShortcutActivation()
             return
         }
         guard let window else { return }
@@ -508,6 +510,7 @@ class WindowState: ObservableObject {
             scheduleFocusUpdate(from: window)
             requestWindowTitleUpdate(reason: .windowAttached)
             applyAgentTitlebarAccessoryIfPossible()
+            windowStatesManager?.refreshGlobalShortcutActivation()
             return
         }
 
@@ -529,6 +532,7 @@ class WindowState: ObservableObject {
         requestWindowTitleUpdate(reason: .windowAttached)
         // Install Agent mode titlebar accessory if requested before window was attached
         applyAgentTitlebarAccessoryIfPossible()
+        windowStatesManager?.refreshGlobalShortcutActivation()
     }
 
     private func configureWindowChrome(for window: NSWindow) {

@@ -2,8 +2,8 @@
 
 Scope: read when the task touches first-press global-shortcut delivery, snippet-palette activation, new-session composer focus, the Agent Mode toolbar item set, or utility-panel/sidebar open-close motion.
 Authority: Authoritative
-Last-verified: 2026-08-16
-Status: Duel-settled plan, approved for implementation; no code changed yet.
+Last-verified: 2026-08-17
+Status: T0 inventories complete; T1 shortcut authority implemented and validated; T2–T5 pending.
 
 ## How this plan was settled
 
