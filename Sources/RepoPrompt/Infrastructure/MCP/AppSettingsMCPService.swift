@@ -1419,7 +1419,7 @@ private enum AppSettingsMCPRegistry {
     /// (which does NOT re-enter `afterWrite`), then posts `.recommendationsDidApply`
     /// exactly once so UI layers (`AgentModelsSettingsViewModel`,
     /// `ContextBuilderAgentViewModel`, `PromptViewModel`, `RecommendationWizardViewModel`,
-    /// `MCPServerToggleView`, `MCPSettingsView`) rebuild their derived state.
+    /// `MCPSettingsView`) rebuild their derived state.
     ///
     /// Mirror-skip cases:
     /// - sync disabled

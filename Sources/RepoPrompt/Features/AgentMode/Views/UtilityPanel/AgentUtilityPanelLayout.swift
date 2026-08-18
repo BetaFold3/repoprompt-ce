@@ -11,8 +11,6 @@ private enum AgentUtilityPanelLayoutConstants {
     static let resizeStripIndicatorWidth: CGFloat = 1
     static let resizeStripActiveOpacity: Double = 0.55
     static let resizeStripIdleOpacity: Double = 0
-    static let visibilityAnimationDuration: Double = 0.18
-    static let reducedMotionAnimationDuration: Double = 0.10
 }
 
 /// Places the utility panel beside — or over — the detail content.
@@ -51,42 +49,38 @@ struct AgentUtilityPanelLayout<Detail: View, Panel: View>: View {
                 )
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .animation(visibilityAnimation, value: store.isVisible)
         }
     }
 
-    // MARK: - Presentations
+    // MARK: - Presentation
 
-    @ViewBuilder
     private func presentationContent(
         _ presentation: AgentUtilityPanelLayoutMetrics.Presentation
     ) -> some View {
-        switch presentation {
-        case .hidden:
+        let isPresent = presentation.panelWidth != nil
+
+        return HStack(spacing: 0) {
             detail()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-        case let .docked(panelWidth, _):
-            HStack(spacing: 0) {
-                detail()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-
+            if presentation.isDocked, let panelWidth = presentation.panelWidth {
                 Divider()
-
-                panelSurface(width: panelWidth, isOverlay: false)
-                    .transition(dockedTransition)
+                Color.clear.frame(width: panelWidth)
             }
-
-        case let .overlay(panelWidth):
-            detail()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(alignment: .trailing) {
-                    // No scrim: the overlay only covers — and only captures input within — its own
-                    // bounds, so the transcript beside it stays live.
-                    panelSurface(width: panelWidth, isOverlay: true)
-                        .transition(overlayTransition)
-                }
         }
+        .overlay(alignment: .trailing) {
+            // The persisting container owns animation and hit testing. Its transaction cannot
+            // animate the sibling detail layout, and an exiting panel becomes inert immediately.
+            ZStack(alignment: .trailing) {
+                if let panelWidth = presentation.panelWidth {
+                    panelSurface(width: panelWidth, isOverlay: presentation.isOverlay)
+                        .transition(panelTransition)
+                }
+            }
+            .allowsHitTesting(isPresent)
+            .animation(AgentPanelMotion.reveal(reduceMotion: reduceMotion), value: isPresent)
+        }
+        .clipped()
     }
 
     private func panelSurface(width: CGFloat, isOverlay: Bool) -> some View {
@@ -149,11 +143,8 @@ struct AgentUtilityPanelLayout<Detail: View, Panel: View>: View {
             }
             .gesture(resizeDragGesture)
             .onTapGesture(count: 2) {
-                // Double-click restores the default width. This is the one width change worth
-                // animating; drags must track the pointer exactly.
-                withAnimation(visibilityAnimation) {
-                    store.resetPreferredWidth()
-                }
+                // Width mutations are deliberately unanimated, matching the direct resize drag.
+                store.resetPreferredWidth()
             }
             .accessibilityLabel("Resize utility panel")
             .accessibilityValue("\(Int(store.preferredWidth.rounded())) points")
@@ -194,17 +185,7 @@ struct AgentUtilityPanelLayout<Detail: View, Panel: View>: View {
 
     // MARK: - Motion
 
-    private var visibilityAnimation: Animation {
-        reduceMotion
-            ? .easeOut(duration: Layout.reducedMotionAnimationDuration)
-            : .easeInOut(duration: Layout.visibilityAnimationDuration)
-    }
-
-    private var dockedTransition: AnyTransition {
-        reduceMotion ? .opacity : .move(edge: .trailing).combined(with: .opacity)
-    }
-
-    private var overlayTransition: AnyTransition {
+    private var panelTransition: AnyTransition {
         reduceMotion ? .opacity : .move(edge: .trailing)
     }
 }

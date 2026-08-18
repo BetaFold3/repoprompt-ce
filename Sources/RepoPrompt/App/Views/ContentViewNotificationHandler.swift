@@ -5,7 +5,6 @@ import SwiftUI
 struct ContentViewNotificationHandler: ViewModifier {
     let windowState: WindowState
     let onShowWizard: () -> Void
-    let onShowMCPPopover: () -> Void
     let onShowCreatePresetSheet: () -> Void
     let onShowMCPStatusSheet: () -> Void
     let onShowRecommendationWizard: () -> Void
@@ -15,14 +14,6 @@ struct ContentViewNotificationHandler: ViewModifier {
         content
             .onReceive(NotificationCenter.default.publisher(for: .showAgentOnboardingWizard)) { _ in
                 onShowWizard()
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .showMCPServerPopover)) { note in
-                if let id = note.userInfo?["windowID"] as? Int,
-                   id != windowState.windowID
-                {
-                    return
-                }
-                onShowMCPPopover()
             }
             .modifier(SettingsNotificationHandler(windowState: windowState))
             .onReceive(NotificationCenter.default.publisher(for: .showCreatePresetSheet)) { note in

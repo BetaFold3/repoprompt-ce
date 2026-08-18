@@ -7,6 +7,7 @@ struct ContentViewSheetPresenter: ViewModifier {
     @Binding var showWorkspaceSetup: Bool
     @Binding var showCreatePresetSheet: Bool
     @Binding var showMCPStatusSheet: Bool
+    @Binding var showRecommendationWizardSheet: Bool
     let recommendationWizardViewModel: RecommendationWizardViewModel?
 
     func body(content: Content) -> some View {
@@ -48,6 +49,22 @@ struct ContentViewSheetPresenter: ViewModifier {
             // MCP Status sheet
             .sheet(isPresented: $showMCPStatusSheet) {
                 MCPStatusView(server: viewModel.state.mcpServer)
+            }
+            .sheet(isPresented: $showRecommendationWizardSheet) {
+                if let recommendationWizardViewModel {
+                    RecommendationWizardPopoverView(
+                        viewModel: recommendationWizardViewModel,
+                        onDismiss: {
+                            if recommendationWizardViewModel.currentStep == .summary
+                                || !recommendationWizardViewModel.hasActiveRecommendations
+                            {
+                                recommendationWizardViewModel.markCompleted()
+                            }
+                            showRecommendationWizardSheet = false
+                        }
+                    )
+                    .frame(width: 480)
+                }
             }
     }
 }

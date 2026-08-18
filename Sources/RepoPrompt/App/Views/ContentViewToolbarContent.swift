@@ -4,9 +4,6 @@ import SwiftUI
 
 struct ContentViewToolbarContent: ToolbarContent {
     let windowState: WindowState
-    let recommendationWizardViewModel: RecommendationWizardViewModel?
-    @Binding var showRecommendationsPopover: Bool
-    @Binding var showMCPServerPopover: Bool
 
     var body: some ToolbarContent {
         if #available(macOS 26.0, *) {
@@ -14,21 +11,6 @@ struct ContentViewToolbarContent: ToolbarContent {
                 .sharedBackgroundVisibility(.hidden)
         } else {
             agentChatTitleItem
-        }
-
-        // Recommendation wizard button
-        ToolbarItem(placement: .automatic) {
-            if let wizardVM = recommendationWizardViewModel {
-                RecommendationToolbarButtonView(
-                    viewModel: wizardVM,
-                    showPopover: $showRecommendationsPopover
-                )
-            }
-        }
-
-        // TOOLBAR POPOVER FIX: Pass bindings to prevent state loss during toolbar re-evaluation
-        ToolbarItem(placement: .automatic) {
-            MCPServerToggleView(windowState: windowState, showPopover: $showMCPServerPopover)
         }
 
         // Update pill (user-initiated Sparkle UI)

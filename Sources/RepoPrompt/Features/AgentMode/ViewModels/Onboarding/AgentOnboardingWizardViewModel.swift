@@ -373,12 +373,6 @@ final class AgentOnboardingWizardViewModel: ObservableObject {
         }
     }
 
-    func openMCPServerPopover(windowID: Int? = nil) {
-        var userInfo: [String: Any] = [:]
-        if let id = windowID { userInfo["windowID"] = id }
-        NotificationCenter.default.post(name: .showMCPServerPopover, object: nil, userInfo: userInfo)
-    }
-
     // MARK: - Deep-Link Helpers
 
     func openCLIProviders(windowID: Int? = nil) {

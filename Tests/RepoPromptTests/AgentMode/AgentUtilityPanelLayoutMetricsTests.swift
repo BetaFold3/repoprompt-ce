@@ -27,6 +27,14 @@ final class AgentUtilityPanelLayoutMetricsTests: XCTestCase {
         }
         XCTAssertEqual(panelWidth, 360, accuracy: accuracy)
         XCTAssertEqual(transcriptWidth, 1200 - Metrics.dividerWidth - 360, accuracy: accuracy)
+        XCTAssertEqual(presentation.panelWidth, panelWidth)
+        XCTAssertTrue(presentation.isDocked)
+        XCTAssertFalse(presentation.isOverlay)
+        XCTAssertEqual(
+            presentation.reservedGutterWidth,
+            panelWidth + Metrics.dividerWidth,
+            accuracy: accuracy
+        )
     }
 
     func testPanelOverlaysWhenDockingCouldNotProtectTheTranscript() {
@@ -44,6 +52,10 @@ final class AgentUtilityPanelLayoutMetricsTests: XCTestCase {
             return XCTFail("expected an overlay presentation, got \(presentation)")
         }
         XCTAssertEqual(panelWidth, 360, accuracy: accuracy)
+        XCTAssertEqual(presentation.panelWidth, panelWidth)
+        XCTAssertFalse(presentation.isDocked)
+        XCTAssertTrue(presentation.isOverlay)
+        XCTAssertEqual(presentation.reservedGutterWidth, 0, accuracy: accuracy)
     }
 
     /// A column that cannot afford the user's preferred width but can still afford a panel should
@@ -83,6 +95,12 @@ final class AgentUtilityPanelLayoutMetricsTests: XCTestCase {
                     protectedWidth - accuracy,
                     "transcript compressed to \(transcriptWidth) at container \(availableWidth)"
                 )
+                XCTAssertEqual(
+                    presentation.reservedGutterWidth + transcriptWidth,
+                    availableWidth,
+                    accuracy: accuracy,
+                    "docked gutter and transcript did not partition \(availableWidth)pt"
+                )
             }
         }
     }
@@ -108,10 +126,17 @@ final class AgentUtilityPanelLayoutMetricsTests: XCTestCase {
         let metrics = Metrics(preset: .normal)
 
         for availableWidth in [CGFloat(400), 900, 2400] {
-            XCTAssertEqual(
-                metrics.resolve(availableWidth: availableWidth, preferredWidth: 360, isVisible: false),
-                .hidden
+            let presentation = metrics.resolve(
+                availableWidth: availableWidth,
+                preferredWidth: 360,
+                isVisible: false
             )
+
+            XCTAssertEqual(presentation, .hidden)
+            XCTAssertNil(presentation.panelWidth)
+            XCTAssertFalse(presentation.isDocked)
+            XCTAssertFalse(presentation.isOverlay)
+            XCTAssertEqual(presentation.reservedGutterWidth, 0, accuracy: accuracy)
         }
     }
 

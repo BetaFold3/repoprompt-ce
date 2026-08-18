@@ -941,12 +941,12 @@ private struct MCPSetupStepView: View {
                         .foregroundColor(.secondary)
 
                     Button(action: {
-                        viewModel.openMCPServerPopover(windowID: windowID)
+                        viewModel.openMCPSettings(windowID: windowID)
                     }) {
                         HStack(spacing: 4) {
                             Image(systemName: "server.rack")
                                 .foregroundColor(.green)
-                            Text("MCP Server")
+                            Text("MCP Settings")
                         }
                     }
                     .buttonStyle(CustomButtonStyle())

@@ -1002,7 +1002,6 @@ final class MCPServerViewModel: ObservableObject {
     private var dashboardSubscriptionID: UUID?
 
     enum DashboardConsumer: Hashable {
-        case toolbarPopover
         case statusView
     }
 

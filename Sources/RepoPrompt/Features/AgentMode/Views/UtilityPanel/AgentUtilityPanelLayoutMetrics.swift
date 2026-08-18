@@ -40,6 +40,34 @@ struct AgentUtilityPanelLayoutMetrics: Equatable {
         case docked(panelWidth: CGFloat, transcriptWidth: CGFloat)
         /// Panel floats over the trailing edge of the transcript on a material background.
         case overlay(panelWidth: CGFloat)
+
+        var panelWidth: CGFloat? {
+            switch self {
+            case .hidden:
+                nil
+            case let .docked(panelWidth, _), let .overlay(panelWidth):
+                panelWidth
+            }
+        }
+
+        var isDocked: Bool {
+            if case .docked = self {
+                return true
+            }
+            return false
+        }
+
+        var isOverlay: Bool {
+            if case .overlay = self {
+                return true
+            }
+            return false
+        }
+
+        var reservedGutterWidth: CGFloat {
+            guard case let .docked(panelWidth, _) = self else { return 0 }
+            return panelWidth + AgentUtilityPanelLayoutMetrics.dividerWidth
+        }
     }
 
     let preset: FontScalePreset

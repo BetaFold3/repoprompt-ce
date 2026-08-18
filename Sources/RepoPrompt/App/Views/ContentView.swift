@@ -12,10 +12,8 @@ struct ContentView: View {
     /// Sheet for naming a brand-new preset
     @State private var showCreatePresetSheet = false
 
-    // Stable state for toolbar popovers so they survive toolbar re-evaluation
-    @State private var showMCPServerPopover = false
     @State private var showMCPStatusSheet = false
-    @State private var showRecommendationsPopover = false
+    @State private var showRecommendationWizardSheet = false
     @State private var showWorkspaceSwitchOverlay = false
 
     /// Recommendation wizard view model (lazy initialized)
@@ -35,12 +33,7 @@ struct ContentView: View {
             showWorkspaceSwitchOverlay: $showWorkspaceSwitchOverlay
         )
         .toolbar {
-            ContentViewToolbarContent(
-                windowState: viewModel.state,
-                recommendationWizardViewModel: recommendationWizardViewModel,
-                showRecommendationsPopover: $showRecommendationsPopover,
-                showMCPServerPopover: $showMCPServerPopover
-            )
+            ContentViewToolbarContent(windowState: viewModel.state)
         }
         .onAppear {
             showWorkspaceSwitchOverlay = viewModel.workspaceManager.isWorkspaceSwitchOverlayVisible
@@ -49,19 +42,7 @@ struct ContentView: View {
             viewModel.evaluateInitialRouteIfNeeded()
 
             // Initialize recommendation wizard view model
-            if recommendationWizardViewModel == nil {
-                let engine = AutoRecommendationEngine(
-                    settingsStore: GlobalSettingsStore.shared,
-                    profileSettingsManager: GlobalSettingsStore.shared,
-                    apiSettingsViewModel: viewModel.apiSettingsViewModel
-                )
-                recommendationWizardViewModel = RecommendationWizardViewModel(
-                    engine: engine,
-                    settingsStore: GlobalSettingsStore.shared,
-                    workspaceManager: viewModel.workspaceManager,
-                    windowID: viewModel.state.windowID
-                )
-            }
+            _ = ensureRecommendationWizardViewModel()
         }
         .onReceive(
             NotificationCenter.default.publisher(
@@ -79,17 +60,18 @@ struct ContentView: View {
             showWorkspaceSetup: $showWorkspaceSetup,
             showCreatePresetSheet: $showCreatePresetSheet,
             showMCPStatusSheet: $showMCPStatusSheet,
+            showRecommendationWizardSheet: $showRecommendationWizardSheet,
             recommendationWizardViewModel: recommendationWizardViewModel
         ))
         .modifier(ContentViewNotificationHandler(
             windowState: viewModel.state,
             onShowWizard: { viewModel.presentSetupGuide() },
-            onShowMCPPopover: { showMCPServerPopover = true },
             onShowCreatePresetSheet: { showCreatePresetSheet = true },
             onShowMCPStatusSheet: { showMCPStatusSheet = true },
             onShowRecommendationWizard: {
-                recommendationWizardViewModel?.refresh(navigation: .resetToIntro)
-                showRecommendationsPopover = true
+                let wizardViewModel = ensureRecommendationWizardViewModel()
+                wizardViewModel.refresh(navigation: .resetToIntro)
+                showRecommendationWizardSheet = true
             },
             onAppWillRestartForUpdate: { closeAllSheets() }
         ))
@@ -114,11 +96,32 @@ struct ContentView: View {
         .environmentObject(viewModel.workspaceManager)
     }
 
+    private func ensureRecommendationWizardViewModel() -> RecommendationWizardViewModel {
+        if let recommendationWizardViewModel {
+            return recommendationWizardViewModel
+        }
+
+        let engine = AutoRecommendationEngine(
+            settingsStore: GlobalSettingsStore.shared,
+            profileSettingsManager: GlobalSettingsStore.shared,
+            apiSettingsViewModel: viewModel.apiSettingsViewModel
+        )
+        let wizardViewModel = RecommendationWizardViewModel(
+            engine: engine,
+            settingsStore: GlobalSettingsStore.shared,
+            workspaceManager: viewModel.workspaceManager,
+            windowID: viewModel.state.windowID
+        )
+        recommendationWizardViewModel = wizardViewModel
+        return wizardViewModel
+    }
+
     private func closeAllSheets() {
         withAnimation {
             showWorkspaceSetup = false
             showCreatePresetSheet = false
             showMCPStatusSheet = false
+            showRecommendationWizardSheet = false
         }
     }
 }

@@ -14,6 +14,7 @@ struct AgentModeView: View {
     @StateObject private var navigationController: AgentModeNavigationController
     @StateObject private var rootsSidebarStore: AgentWorkspaceRootsSidebarStore
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var currentTabID: UUID? {
         promptManager.activeComposeTabID
@@ -172,7 +173,7 @@ struct AgentModeView: View {
     }
 
     private func toggleAgentSessionSidebar() {
-        withAnimation(.easeInOut(duration: 0.2)) {
+        withAnimation(AgentPanelMotion.reveal(reduceMotion: reduceMotion)) {
             if navigationController.columnVisibility == .detailOnly {
                 navigationController.columnVisibility = .all
             } else {

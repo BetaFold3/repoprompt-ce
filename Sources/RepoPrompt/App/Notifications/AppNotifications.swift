@@ -65,7 +65,7 @@ extension Notification.Name {
     /// Triggers wizard to recompute without affecting other VMs.
     /// userInfo may include: ["workspaceID": UUID, "reason": String]
     static let recommendationsShouldRefresh = Notification.Name("recommendationsShouldRefresh")
-    /// Request to open the recommendation wizard popover for a specific window.
+    /// Request to open the recommendation wizard sheet for a specific window.
     /// userInfo: ["windowID": Int, "step": String?]
     static let showRecommendationWizard = Notification.Name("showRecommendationWizard")
     /// Posted when a new workspace is created (for auto-apply recommendations).
@@ -78,9 +78,6 @@ extension Notification.Name {
     /// Posted when the UI should show the agent onboarding wizard.
     /// userInfo: ["windowID": Int]
     static let showAgentOnboardingWizard = Notification.Name("showAgentOnboardingWizard")
-    /// Posted when the UI should open the MCP server toolbar popover.
-    /// userInfo: ["windowID": Int]
-    static let showMCPServerPopover = Notification.Name("showMCPServerPopover")
     /// Posted when Agent Mode should open the Oracle pill popover.
     /// userInfo: ["windowID": Int, "workspaceID": UUID, "tabID": UUID, "chatID": String]
     /// Running Oracle tool calls may instead use ["route": "latest"] without chatID to open
