@@ -8,11 +8,13 @@ final class AgentModelSelectionHUDViewModelTests: XCTestCase {
         var switchSnapshots = 0
         var handoffSnapshots = 0
 
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 0)
         viewModel.present(mode: .switchModel) {
             switchSnapshots += 1
             return presentation(leaves: [leaf(0, current: true)])
         }
         XCTAssertTrue(viewModel.isPresented)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1)
         XCTAssertEqual(switchSnapshots, 1)
 
         viewModel.present(mode: .switchModel) {
@@ -20,12 +22,17 @@ final class AgentModelSelectionHUDViewModelTests: XCTestCase {
             return presentation(leaves: [])
         }
         XCTAssertFalse(viewModel.isPresented)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1, "Toggling closed must not assert focus.")
         XCTAssertEqual(switchSnapshots, 1, "Toggling closed must not rebuild provider snapshots.")
+
+        viewModel.dismiss()
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1, "Dismissal must not assert focus.")
 
         viewModel.present(mode: .switchModel) {
             switchSnapshots += 1
             return presentation(leaves: [leaf(0)])
         }
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 2)
         viewModel.query = "5.6"
         viewModel.present(mode: .handoffLastReply) {
             handoffSnapshots += 1
@@ -34,9 +41,63 @@ final class AgentModelSelectionHUDViewModelTests: XCTestCase {
 
         XCTAssertTrue(viewModel.isPresented)
         XCTAssertEqual(viewModel.mode, .handoffLastReply)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 3)
         XCTAssertEqual(viewModel.query, "5.6", "Replacing mode preserves the typeahead query.")
         XCTAssertEqual(switchSnapshots, 2)
         XCTAssertEqual(handoffSnapshots, 1)
+    }
+
+    func testFocusAssertionEpochIgnoresCommitAndSuspensionLifecycle() async {
+        let viewModel = AgentModelSelectionHUDViewModel()
+        let gate = CommitGate()
+        var blockedPresentationSnapshots = 0
+
+        viewModel.present(mode: .switchModel) {
+            presentation(leaves: [leaf(0, current: true)]) { _ in
+                await gate.wait()
+            }
+        }
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1)
+
+        let commit = Task { await viewModel.commitSelected() }
+        await Task.yield()
+        XCTAssertEqual(viewModel.phase, .committing)
+
+        viewModel.present(mode: .handoffLastReply) {
+            blockedPresentationSnapshots += 1
+            return presentation(leaves: [leaf(1, current: true)])
+        }
+        XCTAssertEqual(blockedPresentationSnapshots, 0)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1, "A press during commit must not assert focus.")
+
+        viewModel.present(mode: .switchModel) {
+            blockedPresentationSnapshots += 1
+            return presentation(leaves: [leaf(1, current: true)])
+        }
+        XCTAssertEqual(blockedPresentationSnapshots, 0)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1, "A same-mode press during commit must not assert focus.")
+
+        viewModel.suspendForBlockingOverlay()
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1, "Suspension must not assert focus.")
+        gate.release()
+        await commit.value
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1, "Commit reset must not assert focus.")
+
+        viewModel.present(mode: .switchModel) {
+            presentation(leaves: [leaf(2, current: true)])
+        }
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 2, "A later fresh presentation must advance monotonically.")
+        await viewModel.commitSelected()
+        XCTAssertFalse(viewModel.isPresented)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 2, "Successful commit reset must not assert focus.")
+
+        viewModel.present(mode: .switchModel) {
+            presentation(leaves: [leaf(3, current: true)])
+        }
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 3)
+        viewModel.suspendForBlockingOverlay()
+        XCTAssertFalse(viewModel.isPresented)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 3, "Non-committing suspension dismissal must not assert focus.")
     }
 
     func testRankingCapCurrentPreselectionSelectionPreservationWrapAndEscape() {
@@ -245,9 +306,11 @@ final class AgentModelSelectionHUDViewModelTests: XCTestCase {
 
     func testUnavailablePresentationShowsMessageAndCannotCommit() async {
         let viewModel = AgentModelSelectionHUDViewModel()
+        var presentationCount = 0
         var commitCount = 0
-        viewModel.present(mode: .handoffLastReply) {
-            AgentModelSelectionHUDPresentation(
+        let unavailablePresentation = {
+            presentationCount += 1
+            return AgentModelSelectionHUDPresentation(
                 title: "Quick Handoff",
                 subtitle: "No destination",
                 index: AgentModelSelectionIndex(leaves: []),
@@ -257,14 +320,34 @@ final class AgentModelSelectionHUDViewModelTests: XCTestCase {
             )
         }
 
+        viewModel.present(mode: .handoffLastReply, presentationProvider: unavailablePresentation)
+
         XCTAssertEqual(
             viewModel.phase,
             .unavailable(message: "No completed assistant reply to hand off.")
         )
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1)
+        XCTAssertTrue(viewModel.canDismiss)
         XCTAssertEqual(viewModel.noticeText, "Target reply")
         await viewModel.commitSelected()
         XCTAssertEqual(commitCount, 0)
         XCTAssertTrue(viewModel.isPresented)
+
+        viewModel.query = "destination"
+        XCTAssertFalse(viewModel.clearQueryOrDismiss())
+        XCTAssertTrue(viewModel.queryIsEmpty)
+        XCTAssertTrue(viewModel.isPresented)
+        XCTAssertTrue(viewModel.clearQueryOrDismiss())
+        XCTAssertFalse(viewModel.isPresented)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 1)
+
+        viewModel.present(mode: .handoffLastReply, presentationProvider: unavailablePresentation)
+        XCTAssertTrue(viewModel.isPresented)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 2)
+        viewModel.present(mode: .handoffLastReply, presentationProvider: unavailablePresentation)
+        XCTAssertFalse(viewModel.isPresented)
+        XCTAssertEqual(viewModel.focusAssertionEpoch, 2, "Same-mode toggle-dismiss must not assert focus.")
+        XCTAssertEqual(presentationCount, 2, "Same-mode toggle-dismiss must not rebuild the presentation.")
     }
 
     private func presentation(

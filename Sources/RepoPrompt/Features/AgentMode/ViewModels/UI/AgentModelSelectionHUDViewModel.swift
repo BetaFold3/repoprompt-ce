@@ -93,6 +93,7 @@ final class AgentModelSelectionHUDViewModel: ObservableObject {
     static let displayLimit = 50
 
     @Published private(set) var isPresented = false
+    @Published private(set) var focusAssertionEpoch: UInt64 = 0
     @Published private(set) var mode: AgentModelSelectionHUDMode = .switchModel
     @Published private(set) var phase: AgentModelSelectionHUDPhase = .ready
     @Published private(set) var title = AgentModelSelectionHUDMode.switchModel.title
@@ -160,6 +161,7 @@ final class AgentModelSelectionHUDViewModel: ObservableObject {
             query = ""
         }
         rebuildFilteredLeaves(preserveSelection: wasPresented)
+        focusAssertionEpoch &+= 1
     }
 
     func dismiss() {

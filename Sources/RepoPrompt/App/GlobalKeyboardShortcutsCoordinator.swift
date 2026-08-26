@@ -1,10 +1,28 @@
 import AppKit
 import Foundation
 import KeyboardShortcuts
+#if DEBUG
+    import OSLog
+#endif
 
 @MainActor
 final class GlobalKeyboardShortcutsCoordinator {
     static let shared = GlobalKeyboardShortcutsCoordinator()
+
+    #if DEBUG
+        private enum HUDRoutingCommand: String {
+            case navigation
+            case modelSelection
+        }
+
+        private enum HUDRoutingResolution: String {
+            case nativeKey
+            case focusFallback
+            case latestFallback
+        }
+
+        private static let hudRoutingLogger = Logger(subsystem: "com.repoprompt.app", category: "hud-routing")
+    #endif
 
     private var didRegisterHandlers = false
 
@@ -291,7 +309,15 @@ final class GlobalKeyboardShortcutsCoordinator {
     }
 
     private func showAgentNavigationHUD(mode: AgentNavigationHUDMode) {
-        guard let win = guardedHUDWindowState() else { return }
+        guard let win = guardedHUDWindowState() else {
+            #if DEBUG
+                logHUDRoutingSuppressed(command: .navigation, mode: mode.rawValue)
+            #endif
+            return
+        }
+        #if DEBUG
+            logHUDRoutingPost(command: .navigation, mode: mode.rawValue, windowState: win)
+        #endif
         NotificationCenter.default.post(
             name: .showAgentNavigationHUD,
             object: nil,
@@ -303,7 +329,15 @@ final class GlobalKeyboardShortcutsCoordinator {
     }
 
     private func showAgentModelSelectionHUD(mode: AgentModelSelectionHUDMode) {
-        guard let win = guardedHUDWindowState() else { return }
+        guard let win = guardedHUDWindowState() else {
+            #if DEBUG
+                logHUDRoutingSuppressed(command: .modelSelection, mode: mode.rawValue)
+            #endif
+            return
+        }
+        #if DEBUG
+            logHUDRoutingPost(command: .modelSelection, mode: mode.rawValue, windowState: win)
+        #endif
         NotificationCenter.default.post(
             name: .showAgentModelSelectionHUD,
             object: nil,
@@ -313,4 +347,30 @@ final class GlobalKeyboardShortcutsCoordinator {
             ]
         )
     }
+
+    #if DEBUG
+        private func logHUDRoutingPost(command: HUDRoutingCommand, mode: String, windowState: WindowState) {
+            let keyWindow = NSApp.keyWindow
+            let activeMainWindowState = WindowStatesManager.shared.activeMainWindowState
+            let resolution: HUDRoutingResolution = if let window = windowState.nsWindow,
+                                                      let keyWindow,
+                                                      window === keyWindow
+            {
+                .nativeKey
+            } else if activeMainWindowState === windowState {
+                .focusFallback
+            } else {
+                .latestFallback
+            }
+            Self.hudRoutingLogger.debug(
+                "post command=\(command.rawValue, privacy: .public) mode=\(mode, privacy: .public) windowID=\(windowState.windowID, privacy: .public) windowNumber=\(windowState.nsWindow?.windowNumber ?? -1, privacy: .public) keyWindowNumber=\(keyWindow?.windowNumber ?? -1, privacy: .public) appActive=\(NSApp.isActive, privacy: .public) resolution=\(resolution.rawValue, privacy: .public)"
+            )
+        }
+
+        private func logHUDRoutingSuppressed(command: HUDRoutingCommand, mode: String) {
+            Self.hudRoutingLogger.debug(
+                "command=\(command.rawValue, privacy: .public) mode=\(mode, privacy: .public) keyWindowNumber=\(NSApp.keyWindow?.windowNumber ?? -1, privacy: .public) appActive=\(NSApp.isActive, privacy: .public) disposition=suppressed"
+            )
+        }
+    #endif
 }

@@ -1,4 +1,7 @@
 import SwiftUI
+#if DEBUG
+    import OSLog
+#endif
 
 enum SnippetPaletteActivationGate {
     static func shouldActivate(
@@ -26,6 +29,25 @@ enum SnippetPaletteActivationGate {
 // MARK: - Content Root Shell
 
 struct ContentRootShellView: View {
+    #if DEBUG
+        private enum HUDRoutingCommand: String {
+            case navigation
+            case modelSelection
+        }
+
+        private enum HUDRoutingDisposition: String {
+            case mismatch
+            case routing
+            case blocked
+            case duplicate
+            case workspaceEntry = "workspace-entry"
+            case presented
+            case toggleDismissed = "toggle-dismissed"
+        }
+
+        private static let hudRoutingLogger = Logger(subsystem: "com.repoprompt.app", category: "hud-routing")
+    #endif
+
     @ObservedObject var viewModel: ContentViewModel
     @ObservedObject var workspaceApprovalManager: WorkspaceApprovalManager
     @ObservedObject var remoteDeviceApprovalManager: RemoteDeviceApprovalManager
@@ -133,9 +155,22 @@ struct ContentRootShellView: View {
             )
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAgentNavigationHUD)) { note in
-            guard noteTargetsCurrentWindow(note) else { return }
-            guard !agentModelSelectionHUD.isCommitting else { return }
+            guard noteTargetsCurrentWindow(note) else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .navigation, note: note, disposition: .mismatch)
+                #endif
+                return
+            }
+            guard !agentModelSelectionHUD.isCommitting else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .navigation, note: note, disposition: .routing)
+                #endif
+                return
+            }
             guard !isBlockingOverlayVisible else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .navigation, note: note, disposition: .blocked)
+                #endif
                 animateHUD {
                     agentNavigationHUD.dismiss()
                     agentModelSelectionHUD.dismiss()
@@ -144,8 +179,16 @@ struct ContentRootShellView: View {
             }
             let rawMode = note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.mode] as? String
             let mode = rawMode.flatMap(AgentNavigationHUDMode.init(rawValue:)) ?? .currentWindow
-            guard !isDuplicateAgentNavigationHUDCommand(mode) else { return }
+            guard !isDuplicateAgentNavigationHUDCommand(mode) else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .navigation, note: note, disposition: .duplicate)
+                #endif
+                return
+            }
             guard viewModel.rootRoute != .workspaceEntry || mode == .allAgents else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .navigation, note: note, disposition: .workspaceEntry)
+                #endif
                 animateHUD { agentNavigationHUD.dismiss() }
                 return
             }
@@ -153,11 +196,28 @@ struct ContentRootShellView: View {
                 agentModelSelectionHUD.dismiss()
                 agentNavigationHUD.present(mode: mode, currentWindow: viewModel.state)
             }
+            #if DEBUG
+                let disposition: HUDRoutingDisposition = agentNavigationHUD.isPresented ? .presented : .toggleDismissed
+                logHUDRoutingReceive(command: .navigation, note: note, disposition: disposition)
+            #endif
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAgentModelSelectionHUD)) { note in
-            guard noteTargetsCurrentWindow(note) else { return }
-            guard !agentNavigationHUD.isRouting else { return }
+            guard noteTargetsCurrentWindow(note) else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .modelSelection, note: note, disposition: .mismatch)
+                #endif
+                return
+            }
+            guard !agentNavigationHUD.isRouting else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .modelSelection, note: note, disposition: .routing)
+                #endif
+                return
+            }
             guard !isBlockingOverlayVisible else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .modelSelection, note: note, disposition: .blocked)
+                #endif
                 animateHUD {
                     agentNavigationHUD.dismiss()
                     agentModelSelectionHUD.dismiss()
@@ -166,8 +226,16 @@ struct ContentRootShellView: View {
             }
             let rawMode = note.userInfo?[AgentModelSelectionHUDNotificationUserInfoKey.mode] as? String
             let mode = rawMode.flatMap(AgentModelSelectionHUDMode.init(rawValue:)) ?? .switchModel
-            guard !isDuplicateAgentModelSelectionHUDCommand(mode) else { return }
+            guard !isDuplicateAgentModelSelectionHUDCommand(mode) else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .modelSelection, note: note, disposition: .duplicate)
+                #endif
+                return
+            }
             guard viewModel.rootRoute != .workspaceEntry else {
+                #if DEBUG
+                    logHUDRoutingReceive(command: .modelSelection, note: note, disposition: .workspaceEntry)
+                #endif
                 animateHUD { agentModelSelectionHUD.dismiss() }
                 return
             }
@@ -189,6 +257,10 @@ struct ContentRootShellView: View {
                     )
                 }
             }
+            #if DEBUG
+                let disposition: HUDRoutingDisposition = agentModelSelectionHUD.isPresented ? .presented : .toggleDismissed
+                logHUDRoutingReceive(command: .modelSelection, note: note, disposition: disposition)
+            #endif
         }
         .onReceive(NotificationCenter.default.publisher(for: .selectAgentNavigationHUDResult)) { note in
             guard noteTargetsCurrentWindow(note), agentNavigationHUD.isPresented else { return }
@@ -267,6 +339,32 @@ struct ContentRootShellView: View {
         }
         return true
     }
+
+    #if DEBUG
+        private func logHUDRoutingReceive(
+            command: HUDRoutingCommand,
+            note: Notification,
+            disposition: HUDRoutingDisposition
+        ) {
+            let requestWindowID = note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.windowID] as? Int
+            let mode = switch command {
+            case .navigation:
+                (
+                    (note.userInfo?[AgentNavigationHUDNotificationUserInfoKey.mode] as? String)
+                        .flatMap(AgentNavigationHUDMode.init(rawValue:)) ?? .currentWindow
+                ).rawValue
+            case .modelSelection:
+                (
+                    (note.userInfo?[AgentModelSelectionHUDNotificationUserInfoKey.mode] as? String)
+                        .flatMap(AgentModelSelectionHUDMode.init(rawValue:)) ?? .switchModel
+                ).rawValue
+            }
+            let window = viewModel.state.nsWindow
+            Self.hudRoutingLogger.debug(
+                "receive command=\(command.rawValue, privacy: .public) mode=\(mode, privacy: .public) requestWindowID=\(requestWindowID ?? -1, privacy: .public) windowID=\(viewModel.state.windowID, privacy: .public) windowNumber=\(window?.windowNumber ?? -1, privacy: .public) windowIDMatch=\(noteTargetsCurrentWindow(note), privacy: .public) isKeyWindow=\(window?.isKeyWindow == true, privacy: .public) disposition=\(disposition.rawValue, privacy: .public)"
+            )
+        }
+    #endif
 
     @ViewBuilder
     private var routedContent: some View {

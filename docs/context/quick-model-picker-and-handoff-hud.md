@@ -1,8 +1,8 @@
 # Agent Mode quick model picker and handoff HUD
 
-Scope: read when the task touches the Agent Mode quick model picker or quick handoff shortcuts, model-leaf index/ranking, HUD lifecycle or hosting, snippet-palette shell arbitration, current-session model commit seam, or last-completed-reply handoff routing.
+Scope: read when the task touches the Agent Mode quick model picker or quick handoff shortcuts, model-leaf index/ranking, HUD lifecycle or hosting, HUD or new-session composer focus acquisition, snippet-palette shell arbitration, current-session model commit seam, or last-completed-reply handoff routing.
 Authority: Authoritative
-Last-verified: 2026-08-17
+Last-verified: 2026-08-25
 
 ## Durable contract
 
@@ -20,12 +20,13 @@ Quick model picker changes the active session's model. Quick handoff creates a n
 ## Owning source seams
 
 - Pure catalog flattening and ranking: `Sources/RepoPrompt/Features/AgentMode/Models/ModelSelection/AgentModelSelectionIndex.swift`.
-- HUD state and rendering: `ViewModels/UI/AgentModelSelectionHUDViewModel.swift` and `Views/Components/AgentModelSelectionHUDView.swift`.
+- HUD state, rendering, and presentation-driven focus assertion: `ViewModels/UI/AgentModelSelectionHUDViewModel.swift` and `Views/Components/AgentModelSelectionHUDView.swift`.
 - Presentation, live revalidation, and commits: `ViewModels/AgentModeViewModel+ModelSelectionHUD.swift`.
 - Shared MCP-only model-control interactivity, current-session commit ordering, cache-only remote catalog access, last-reply lookup, and source-pinned handoff config: `ViewModels/AgentModeViewModel+Handoff.swift`; composer props consume the same predicate in `AgentModeViewModel+ComposerUI.swift`.
 - Transcript cutoff policy: `Runtime/Transcript/AgentTranscriptServices.swift`, with shared conclusion repair in `AgentTranscriptQualityRepair.swift`.
 - Handoff execution, success-only effort persistence, and error formatting: `Services/AgentHandoffActionSupport.swift`.
 - Atomic hosting, blocking-overlay/HUD exclusion, and snippet-palette activation arbitration: `Sources/RepoPrompt/App/Views/ContentRootShellView.swift`.
+- New-session composer focus-token carriage and AppKit first-responder delivery: `Sources/RepoPrompt/Features/AgentMode/Views/AgentInputBar.swift` and `Sources/RepoPrompt/Infrastructure/UI/TextField/ResizableTextField.swift`.
 - Shortcut activation and target resolution: `App/GlobalShortcutActivation.swift`, `App/WindowStateManager.swift`, and `App/GlobalKeyboardShortcutsCoordinator.swift`; notification and catalog ownership remains in `Infrastructure/Utilities/Shortcuts.swift`, `App/Notifications/AppNotifications.swift`, and `Features/Settings/Views/KeyboardShortcutsSettingsView.swift`.
 
 ## Safety and performance invariants
@@ -41,6 +42,10 @@ Quick model picker changes the active session's model. Quick handoff creates a n
 - Codex native startup classifies start-versus-resume from saved native metadata alone — for handoff destinations and every other local Codex session — never from migrated transcript rows or reconnect flags. Both saved thread ID and rollout path absent (or whitespace-only) starts a new thread; a saved thread ID resumes that thread; a rollout path without its required thread ID is an explicit persisted-state integrity error, and successful start results never persist that shape. Failed first starts retain the pending handoff and retry `thread/start`.
 - The last-reply resolver refuses active sessions, skips explicit failed/cancelled turns even when they contain displayable assistant text, accepts legacy nil terminal state, never synthesizes compacted summaries, and uses legacy items only when structured turns are absent.
 - Ordinary Escape, click-outside, and dismissal cannot cancel a committing handoff. A blocking overlay—including remote device approval—immediately unmounts the HUD through the non-cancelling suspension path; task completion must not remount stale state.
+- Every completed model-selection/handoff HUD presentation, including a cross-mode refresh while mounted, increments a presentation epoch after rebuilding its rows. The view responds with an animation-disabled false→true query-focus edge whose true leg runs on the next main-queue turn outside the insertion transaction and revalidates presentation, epoch, and non-committing phase. Fresh mount, cross-mode presentation, commit-error recovery, and guarded window re-key are the only acquisition sites; same-mode re-press remains a pure toggle-dismiss. The query is disabled only while committing, so an unavailable completed presentation accepts the same focus edge and query input even though its result rows remain disabled.
+- HUD focus transfer is owned by that presentation edge. Do not resign first responder in the shell, add an `NSEvent` monitor, or rely on `.defaultFocus`; those paths either strand unavailable presentations or create parallel input routing. This contract currently applies only to the model-selection/handoff HUD, not the navigation HUD.
+- User-initiated new-session focus uses one view-local `@State composerFocusToken` and UUID-only `ResizableTextFieldFeatures` plumbing; the token is part of `AgentComposerView`'s custom equality identity and must not move into `AgentComposerProps`. `AgentInputBar` must observe tab ID plus request ID/tab ID through one Equatable cue, not independent `onChange` handlers: coalesced updates could otherwise consume a matching request and then erase its token. The single cue clears on a tab transition before evaluating the new snapshot, preserves consume-at-match, leaves publish-time mismatches pending, and consumes/discards tab-change mismatches. The text-field coordinator seeds mounted tokens without focusing, applies only post-mount token changes on the next main-queue turn, waits for window attachment, drops sheet-blocked or dismantled requests, and revalidates stale deferred work. An already-first-responder text view marks the token applied without another AppKit call; an attempted focus failure is terminal, marks the token applied, and increments a DEBUG diagnostic. App/key-window state is not a gate because `makeFirstResponder` changes only that window's responder chain; the existing SwiftUI focus bindings remain non-authoritative mirrors.
+- DEBUG `hud-routing` instrumentation is observational only and records command/mode, suppressed resolution, non-nil exact native-key classification versus exact focus/latest fallback, and shell `presented` versus same-mode `toggle-dismissed`; it must not change target resolution, notification payloads, shell gates, or routing.
 - The navigation HUD, model-selection HUD, and snippet-palette activation are mutually exclusive. A window-scoped public snippet request is accepted only by the exact main-route key window when no sheet or blocking overlay is present and both HUDs are absent; the shell stamps the active compose tab onto the internal activation hop. The composer accepts only an exact window-and-tab scope, revalidates its live key-window/text-view/IME state, then focuses before opening or toggles when already first responder; an active palette is dismissed whenever its configured window/tab scope changes, including to nil.
 
 ## Smallest validation routes

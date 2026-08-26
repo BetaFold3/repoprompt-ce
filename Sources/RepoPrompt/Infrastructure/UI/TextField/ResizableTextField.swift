@@ -42,6 +42,12 @@ enum ImagePasteboardTypes {
 final class ImageAwareTextView: NSTextView {
     var imagePasteHandler: ((NSPasteboard) -> Bool)?
     var enablesImagePasteHandling = false
+    var onDidMoveToWindow: (() -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onDidMoveToWindow?()
+    }
 
     override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
         var types = super.readablePasteboardTypes
@@ -148,6 +154,69 @@ struct SnippetPaletteScope: Equatable {
     }
 }
 
+enum ComposerFocusTokenPolicy {
+    enum Action: Equatable {
+        case clearPending
+        case none
+        case waitForWindow
+        case drop
+        case attempt
+    }
+
+    struct State: Equatable {
+        var lastAppliedToken: UUID?
+        var pendingToken: UUID?
+    }
+
+    static func seededState(for token: UUID?) -> State {
+        State(lastAppliedToken: token, pendingToken: nil)
+    }
+
+    static func action(
+        token: UUID?,
+        lastAppliedToken: UUID?,
+        hasWindow: Bool,
+        hasAttachedSheet: Bool
+    ) -> Action {
+        guard let token else { return .clearPending }
+        guard token != lastAppliedToken else { return .none }
+        guard hasWindow else { return .waitForWindow }
+        guard !hasAttachedSheet else { return .drop }
+        return .attempt
+    }
+
+    static func state(
+        after action: Action,
+        token: UUID?,
+        currentState: State
+    ) -> State {
+        switch action {
+        case .clearPending:
+            State(lastAppliedToken: currentState.lastAppliedToken, pendingToken: nil)
+        case .none:
+            currentState
+        case .waitForWindow:
+            State(lastAppliedToken: currentState.lastAppliedToken, pendingToken: token)
+        case .drop, .attempt:
+            State(lastAppliedToken: token, pendingToken: nil)
+        }
+    }
+
+    static func shouldSchedule(
+        token: UUID?,
+        lastAppliedToken: UUID?,
+        pendingToken: UUID?
+    ) -> Bool {
+        guard pendingToken == nil else { return true }
+        guard let token else { return false }
+        return token != lastAppliedToken
+    }
+
+    static func scheduledTokenIsCurrent(_ scheduledToken: UUID?, currentToken: UUID?) -> Bool {
+        scheduledToken == currentToken
+    }
+}
+
 struct ResizableTextFieldFeatures {
     var enableFileTagOverlay: Bool = false
     var fileTagStore: WorkspaceFileContextStore?
@@ -162,6 +231,7 @@ struct ResizableTextFieldFeatures {
     var enableSnippetPalette: Bool = false
     var snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])?
     var snippetPaletteScope: SnippetPaletteScope?
+    var composerFocusToken: UUID?
 
     static let plain = ResizableTextFieldFeatures()
 
@@ -175,7 +245,8 @@ struct ResizableTextFieldFeatures {
         onFileTagCommitted: ((MentionSuggestion) -> Void)?,
         slashSkillSuggestionsProvider: ((String) async -> [MentionSuggestion])?,
         snippetPaletteItemsProvider: (() -> [SnippetPaletteItem])? = nil,
-        snippetPaletteScope: SnippetPaletteScope? = nil
+        snippetPaletteScope: SnippetPaletteScope? = nil,
+        composerFocusToken: UUID? = nil
     ) -> ResizableTextFieldFeatures {
         ResizableTextFieldFeatures(
             enableFileTagOverlay: true,
@@ -190,7 +261,8 @@ struct ResizableTextFieldFeatures {
             slashSkillSuggestionsProvider: slashSkillSuggestionsProvider,
             enableSnippetPalette: snippetPaletteItemsProvider != nil,
             snippetPaletteItemsProvider: snippetPaletteItemsProvider,
-            snippetPaletteScope: snippetPaletteScope
+            snippetPaletteScope: snippetPaletteScope,
+            composerFocusToken: composerFocusToken
         )
     }
 }
@@ -344,6 +416,13 @@ struct CustomTextField: NSViewRepresentable {
 
         textView.delegate = context.coordinator
         textView.imagePasteHandler = onImagePaste
+        textView.onDidMoveToWindow = { [weak coordinator = context.coordinator, weak textView] in
+            guard let coordinator, let textView else { return }
+            coordinator.composerTextViewDidMoveToWindow(textView)
+        }
+        let composerFocusState = ComposerFocusTokenPolicy.seededState(for: features.composerFocusToken)
+        context.coordinator.lastAppliedComposerFocusToken = composerFocusState.lastAppliedToken
+        context.coordinator.pendingComposerFocusToken = composerFocusState.pendingToken
         textView.enablesImagePasteHandling = onImagePaste != nil
         context.coordinator.configureFileTagSupport(
             textView: textView,
@@ -409,6 +488,7 @@ struct CustomTextField: NSViewRepresentable {
             itemsProvider: features.snippetPaletteItemsProvider,
             scope: features.snippetPaletteScope
         )
+        context.coordinator.scheduleComposerFocusToken(features.composerFocusToken, for: textView)
 
         var appliedProgrammaticTextChange = false
         // IME FIX: Avoid stomping marked text (composition) with programmatic writes.
@@ -451,11 +531,13 @@ struct CustomTextField: NSViewRepresentable {
         guard let textView = nsView.documentView as? ImageAwareTextView else { return }
         textView.delegate = nil
         textView.imagePasteHandler = nil
+        textView.onDidMoveToWindow = nil
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.clearUndoHistory()
         coordinator.dismissFileTagOverlay()
         coordinator.dismissSlashSkillOverlay()
         coordinator.tearDownSnippetPaletteSupport()
+        coordinator.discardPendingComposerFocusTokenForDismantle()
         coordinator.isActive = false
     }
 
@@ -464,6 +546,8 @@ struct CustomTextField: NSViewRepresentable {
         var parent: CustomTextField
         var internalUpdateInProgress = false
         var lastReportedHeight: CGFloat?
+        var lastAppliedComposerFocusToken: UUID?
+        var pendingComposerFocusToken: UUID?
 
         private let textViewUndoManager = UndoManager()
         private let fileTagHelper = FileTagMentionHelper()
@@ -477,6 +561,103 @@ struct CustomTextField: NSViewRepresentable {
 
         init(_ parent: CustomTextField) {
             self.parent = parent
+        }
+
+        func scheduleComposerFocusToken(_ token: UUID?, for textView: ImageAwareTextView) {
+            guard ComposerFocusTokenPolicy.shouldSchedule(
+                token: token,
+                lastAppliedToken: lastAppliedComposerFocusToken,
+                pendingToken: pendingComposerFocusToken
+            ) else { return }
+            DispatchQueue.main.async { [weak self, weak textView] in
+                guard let self, isActive, let textView else { return }
+                let currentToken = parent.features.composerFocusToken
+                guard ComposerFocusTokenPolicy.scheduledTokenIsCurrent(
+                    token,
+                    currentToken: currentToken
+                ) else { return }
+                applyComposerFocusToken(currentToken, to: textView)
+            }
+        }
+
+        func composerTextViewDidMoveToWindow(_ textView: ImageAwareTextView) {
+            guard let pendingComposerFocusToken else { return }
+            scheduleComposerFocusToken(pendingComposerFocusToken, for: textView)
+        }
+
+        func discardPendingComposerFocusTokenForDismantle() {
+            #if DEBUG
+                let hasUnappliedCurrentToken = parent.features.composerFocusToken.map {
+                    $0 != lastAppliedComposerFocusToken
+                } ?? false
+                if pendingComposerFocusToken != nil || hasUnappliedCurrentToken {
+                    AgentModePerfDiagnostics.increment("ui.composer.focusToken.dismantleDrop")
+                }
+            #endif
+            pendingComposerFocusToken = nil
+            lastAppliedComposerFocusToken = nil
+        }
+
+        private func applyComposerFocusToken(_ token: UUID?, to textView: ImageAwareTextView) {
+            let action = ComposerFocusTokenPolicy.action(
+                token: token,
+                lastAppliedToken: lastAppliedComposerFocusToken,
+                hasWindow: textView.window != nil,
+                hasAttachedSheet: textView.window?.attachedSheet != nil
+            )
+            let currentState = ComposerFocusTokenPolicy.State(
+                lastAppliedToken: lastAppliedComposerFocusToken,
+                pendingToken: pendingComposerFocusToken
+            )
+
+            switch action {
+            case .clearPending, .none, .waitForWindow:
+                applyComposerFocusState(
+                    ComposerFocusTokenPolicy.state(
+                        after: action,
+                        token: token,
+                        currentState: currentState
+                    )
+                )
+            case .drop:
+                applyComposerFocusState(
+                    ComposerFocusTokenPolicy.state(
+                        after: action,
+                        token: token,
+                        currentState: currentState
+                    )
+                )
+                #if DEBUG
+                    AgentModePerfDiagnostics.increment("ui.composer.focusToken.sheetDrop")
+                #endif
+            case .attempt:
+                let appliedState = ComposerFocusTokenPolicy.state(
+                    after: action,
+                    token: token,
+                    currentState: currentState
+                )
+                if textView.window?.firstResponder === textView {
+                    applyComposerFocusState(appliedState)
+                    return
+                }
+                guard textView.acceptsFirstResponder,
+                      let window = textView.window,
+                      window.makeFirstResponder(textView),
+                      window.firstResponder === textView
+                else {
+                    applyComposerFocusState(appliedState)
+                    #if DEBUG
+                        AgentModePerfDiagnostics.increment("ui.composer.focusToken.attemptFailed")
+                    #endif
+                    return
+                }
+                applyComposerFocusState(appliedState)
+            }
+        }
+
+        private func applyComposerFocusState(_ state: ComposerFocusTokenPolicy.State) {
+            lastAppliedComposerFocusToken = state.lastAppliedToken
+            pendingComposerFocusToken = state.pendingToken
         }
 
         func textDidChange(_ notification: Notification) {

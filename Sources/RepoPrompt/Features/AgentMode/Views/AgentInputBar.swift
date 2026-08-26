@@ -56,6 +56,37 @@ enum CursorModelProviderChipDisplay {
     }
 }
 
+struct AgentComposerFocusObservationCue: Equatable {
+    enum RequestAction: Equatable {
+        case none
+        case applyAndConsume(UUID)
+        case leavePending
+        case discard(UUID)
+    }
+
+    let tabID: UUID?
+    let requestID: UUID?
+    let requestTabID: UUID?
+
+    init(tabID: UUID?, request: AgentComposerFocusRequest?) {
+        self.tabID = tabID
+        requestID = request?.id
+        requestTabID = request?.tabID
+    }
+
+    static func tabChanged(from oldValue: Self, to newValue: Self) -> Bool {
+        oldValue.tabID != newValue.tabID
+    }
+
+    func requestAction(discardMismatch: Bool) -> RequestAction {
+        guard let requestID, let requestTabID else { return .none }
+        guard requestTabID == tabID else {
+            return discardMismatch ? .discard(requestID) : .leavePending
+        }
+        return .applyAndConsume(requestID)
+    }
+}
+
 struct AgentInputBar: View {
     let agentModeVM: AgentModeViewModel
     @ObservedObject var composerUI: AgentComposerUIStore
@@ -73,9 +104,17 @@ struct AgentInputBar: View {
     @Binding var transcriptBottomClearance: CGFloat
 
     @FocusState var isFocused: Bool
+    @State private var composerFocusToken: UUID?
 
     /// Height of the footer spacing below the composer chrome
     static let footerHeight: CGFloat = 28
+
+    private var composerFocusObservationCue: AgentComposerFocusObservationCue {
+        AgentComposerFocusObservationCue(
+            tabID: currentTabID,
+            request: composerUI.focusRequest
+        )
+    }
 
     private var composerPlaceholderText: String {
         if let stagedSlashCommand = statusPillsUI.snapshot.stagedSlashCommand {
@@ -112,6 +151,7 @@ struct AgentInputBar: View {
             selectionCoordinator: selectionCoordinator,
             windowID: windowID,
             currentTabID: currentTabID,
+            composerFocusToken: composerFocusToken,
             resetTextFieldTrigger: $resetTextFieldTrigger,
             composerBottomInset: $composerBottomInset,
             transcriptBottomClearance: $transcriptBottomClearance,
@@ -122,11 +162,15 @@ struct AgentInputBar: View {
             statusPills
                 .padding(.bottom, Self.footerHeight + ComposerChrome<EmptyView, EmptyView>.baseBarHeight + composerBottomInset - 8)
         }
-        .onChange(of: composerUI.focusRequest) { _, _ in
-            applyComposerFocusRequest(discardMismatch: false)
-        }
-        .onChange(of: currentTabID) { _, _ in
-            applyComposerFocusRequest(discardMismatch: true)
+        .onChange(of: composerFocusObservationCue) { oldCue, newCue in
+            let tabChanged = AgentComposerFocusObservationCue.tabChanged(
+                from: oldCue,
+                to: newCue
+            )
+            if tabChanged {
+                composerFocusToken = nil
+            }
+            applyComposerFocusRequest(discardMismatch: tabChanged)
         }
         .onAppear {
             applyComposerFocusRequest(discardMismatch: false)
@@ -134,15 +178,16 @@ struct AgentInputBar: View {
     }
 
     private func applyComposerFocusRequest(discardMismatch: Bool) {
-        guard let request = composerUI.focusRequest else { return }
-        guard request.tabID == currentTabID else {
-            if discardMismatch {
-                composerUI.consumeFocusRequest(id: request.id)
-            }
+        switch composerFocusObservationCue.requestAction(discardMismatch: discardMismatch) {
+        case .none, .leavePending:
             return
+        case let .discard(requestID):
+            composerUI.consumeFocusRequest(id: requestID)
+        case let .applyAndConsume(requestID):
+            composerFocusToken = requestID
+            isFocused = true
+            composerUI.consumeFocusRequest(id: requestID)
         }
-        isFocused = true
-        composerUI.consumeFocusRequest(id: request.id)
     }
 
     private var composerActions: AgentComposerActions {
@@ -309,6 +354,7 @@ struct AgentComposerView: View, Equatable {
     let selectionCoordinator: WorkspaceSelectionCoordinator
     let windowID: Int
     let currentTabID: UUID?
+    let composerFocusToken: UUID?
 
     @Binding var resetTextFieldTrigger: Bool
     @Binding var composerBottomInset: CGFloat
@@ -350,13 +396,16 @@ struct AgentComposerView: View, Equatable {
         lhsProps: AgentComposerProps,
         lhsPlaceholderText: String,
         lhsCurrentTabID: UUID?,
+        lhsComposerFocusToken: UUID?,
         rhsProps: AgentComposerProps,
         rhsPlaceholderText: String,
-        rhsCurrentTabID: UUID?
+        rhsCurrentTabID: UUID?,
+        rhsComposerFocusToken: UUID?
     ) -> Bool {
         lhsProps == rhsProps &&
             lhsPlaceholderText == rhsPlaceholderText &&
-            lhsCurrentTabID == rhsCurrentTabID
+            lhsCurrentTabID == rhsCurrentTabID &&
+            lhsComposerFocusToken == rhsComposerFocusToken
     }
 
     static func == (lhs: AgentComposerView, rhs: AgentComposerView) -> Bool {
@@ -364,9 +413,11 @@ struct AgentComposerView: View, Equatable {
             lhsProps: lhs.props,
             lhsPlaceholderText: lhs.placeholderText,
             lhsCurrentTabID: lhs.currentTabID,
+            lhsComposerFocusToken: lhs.composerFocusToken,
             rhsProps: rhs.props,
             rhsPlaceholderText: rhs.placeholderText,
-            rhsCurrentTabID: rhs.currentTabID
+            rhsCurrentTabID: rhs.currentTabID,
+            rhsComposerFocusToken: rhs.composerFocusToken
         )
     }
 
@@ -720,7 +771,8 @@ struct AgentComposerView: View, Equatable {
                     },
                     snippetPaletteScope: currentTabID.map {
                         SnippetPaletteScope(windowID: windowID, tabID: $0)
-                    }
+                    },
+                    composerFocusToken: composerFocusToken
                 ),
                 onHeightChange: { newHeight in
                     editorTextFieldHeight = newHeight

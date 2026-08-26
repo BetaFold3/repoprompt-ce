@@ -2,8 +2,8 @@
 
 Scope: read when the task touches first-press global-shortcut delivery, snippet-palette activation, new-session composer focus, the Agent Mode toolbar item set, or utility-panel/sidebar open-close motion.
 Authority: Authoritative
-Last-verified: 2026-08-17
-Status: T1 shortcut authority is implemented and validated; T2 implementation and focused automated validation are complete, with live palette routing/focus/IME/HUD checks pending; T3 implementation and automated validation are complete, with the live first-responder/caret check pending; T4 and T5 implementation and focused automated validation are complete, with their specified live D4/D5 checks pending.
+Last-verified: 2026-08-25
+Status: T1 shortcut authority is implemented and validated; T2 implementation and focused automated validation are complete, with live palette routing/focus/IME/HUD checks pending; T3 implementation and automated validation are complete, and its pre-specified D3 `composerFocusToken` contingency is activated and implemented to carry focus into the hosted text view across the mount race, with the live first-responder/caret check still pending; T4 and T5 implementation and focused automated validation are complete, with their specified live D4/D5 checks pending.
 
 ## How this plan was settled
 

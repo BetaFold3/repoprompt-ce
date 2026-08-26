@@ -7,15 +7,18 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
     func testComposerProductionEqualityRejectsLiveTabChangeBeforePropsCatchUp() {
         let sourceTabID = UUID()
         let destinationTabID = UUID()
+        let focusToken = UUID()
 
         XCTAssertTrue(
             AgentComposerView.hasEquivalentRenderIdentity(
                 lhsProps: .empty,
                 lhsPlaceholderText: "Send a message...",
                 lhsCurrentTabID: sourceTabID,
+                lhsComposerFocusToken: focusToken,
                 rhsProps: .empty,
                 rhsPlaceholderText: "Send a message...",
-                rhsCurrentTabID: sourceTabID
+                rhsCurrentTabID: sourceTabID,
+                rhsComposerFocusToken: focusToken
             )
         )
         XCTAssertFalse(
@@ -23,9 +26,23 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
                 lhsProps: .empty,
                 lhsPlaceholderText: "Send a message...",
                 lhsCurrentTabID: sourceTabID,
+                lhsComposerFocusToken: focusToken,
                 rhsProps: .empty,
                 rhsPlaceholderText: "Send a message...",
-                rhsCurrentTabID: destinationTabID
+                rhsCurrentTabID: destinationTabID,
+                rhsComposerFocusToken: focusToken
+            )
+        )
+        XCTAssertFalse(
+            AgentComposerView.hasEquivalentRenderIdentity(
+                lhsProps: .empty,
+                lhsPlaceholderText: "Send a message...",
+                lhsCurrentTabID: sourceTabID,
+                lhsComposerFocusToken: focusToken,
+                rhsProps: .empty,
+                rhsPlaceholderText: "Send a message...",
+                rhsCurrentTabID: sourceTabID,
+                rhsComposerFocusToken: UUID()
             )
         )
     }

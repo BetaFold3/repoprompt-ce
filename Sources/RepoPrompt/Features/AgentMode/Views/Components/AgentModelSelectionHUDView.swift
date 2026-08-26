@@ -4,6 +4,7 @@ struct AgentModelSelectionHUDView: View {
     @ObservedObject var viewModel: AgentModelSelectionHUDViewModel
 
     @FocusState private var queryFocused: Bool
+    @StateObject private var hostingWindowReference = AgentModelSelectionHUDHostingWindowReference()
     @State private var suppressHoverSelectionUntil = Date.distantPast
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -60,11 +61,29 @@ struct AgentModelSelectionHUDView: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .strokeBorder(Color(NSColor.separatorColor).opacity(0.62), lineWidth: 1)
         )
-        .onAppear { queryFocused = true }
+        .background(
+            WindowAccessor { window in
+                hostingWindowReference.window = window
+            }
+        )
+        .onAppear(perform: assertQueryFocusEdge)
+        .onChange(of: viewModel.focusAssertionEpoch) { _, _ in
+            assertQueryFocusEdge()
+        }
         .onChange(of: viewModel.phase) { _, phase in
             if phase == .ready {
-                queryFocused = true
+                assertQueryFocusEdge()
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
+            guard let window = notification.object as? NSWindow,
+                  window === hostingWindowReference.window,
+                  viewModel.isPresented,
+                  !queryFocused
+            else {
+                return
+            }
+            assertQueryFocusEdge()
         }
         .agentModelSelectionHUDKeys(
             viewModel: viewModel,
@@ -148,7 +167,7 @@ struct AgentModelSelectionHUDView: View {
             TextField(viewModel.mode.searchPlaceholder, text: $viewModel.query)
                 .textFieldStyle(.plain)
                 .focused($queryFocused)
-                .disabled(viewModel.phase != .ready)
+                .disabled(viewModel.isCommitting)
                 .onSubmit {
                     Task { await viewModel.commitSelected() }
                 }
@@ -297,6 +316,29 @@ struct AgentModelSelectionHUDView: View {
         suppressHoverSelectionUntil = Date().addingTimeInterval(0.28)
     }
 
+    private func assertQueryFocusEdge() {
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            queryFocused = false
+        }
+
+        let epoch = viewModel.focusAssertionEpoch
+        DispatchQueue.main.async {
+            guard viewModel.isPresented,
+                  viewModel.focusAssertionEpoch == epoch,
+                  viewModel.phase != .committing
+            else {
+                return
+            }
+            var focusTransaction = Transaction()
+            focusTransaction.disablesAnimations = true
+            withTransaction(focusTransaction) {
+                queryFocused = true
+            }
+        }
+    }
+
     private func footerHint(_ key: String, _ label: String) -> some View {
         HStack(spacing: 4) {
             Text(key)
@@ -314,6 +356,11 @@ struct AgentModelSelectionHUDView: View {
             Text(label)
         }
     }
+}
+
+@MainActor
+private final class AgentModelSelectionHUDHostingWindowReference: ObservableObject {
+    weak var window: NSWindow?
 }
 
 private extension View {
