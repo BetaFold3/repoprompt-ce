@@ -23,7 +23,7 @@ enum MarkdownFilePathLinkDetector {
     )
 
     static func proseMatches(in text: String) -> [Match] {
-        guard hasExtensionGuard(in: text) else { return [] }
+        guard containsSupportedExtension(in: text) else { return [] }
 
         let fullRange = NSRange(text.startIndex ..< text.endIndex, in: text)
         return proseExpression.matches(in: text, range: fullRange).compactMap {
@@ -43,7 +43,7 @@ enum MarkdownFilePathLinkDetector {
         return Match(range: range, path: trimmed)
     }
 
-    private static func hasExtensionGuard(in text: String) -> Bool {
+    static func containsSupportedExtension(in text: String) -> Bool {
         extensionNeedles.contains {
             text.range(of: $0, options: .caseInsensitive) != nil
         }

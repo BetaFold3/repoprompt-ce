@@ -25,6 +25,10 @@ struct TextKitView: NSViewRepresentable {
     var autohidesScrollers: Bool = false
     /// Optional AppKit scroller style override.
     var scrollerStyle: NSScroller.Style?
+    /// Default-off lexical file links for plain-text surfaces that preserve verbatim Markdown.
+    var detectedMarkdownFileLinks: [MarkdownFilePathLinkDetector.Match] = []
+    /// Routes opt-in detected links through the same policy as rendered Markdown links.
+    var markdownFileLinkOpener: MarkdownFileLinkOpener?
     /// Notifies parent when the user starts/stops editing so it can gate external writes.
     var onEditingChanged: ((Bool) -> Void)?
 
@@ -81,6 +85,7 @@ struct TextKitView: NSViewRepresentable {
         var pendingLayoutTask: Task<Void, Never>?
         var layoutGeneration: UInt64 = 0
         var paragraphStyleSignature: ParagraphStyleSignature?
+        var appliedDetectedMarkdownFileLinks: [MarkdownFilePathLinkDetector.Match] = []
 
         fileprivate enum LayoutStabilizationReason {
             case emptyTransition
@@ -124,6 +129,28 @@ struct TextKitView: NSViewRepresentable {
 
         func undoManager(for view: NSTextView) -> UndoManager? {
             textViewUndoManager
+        }
+
+        func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+            guard charIndex >= 0,
+                  let storage = textView.textStorage,
+                  charIndex < storage.length,
+                  storage.attribute(.markdownDetectedFileLink, at: charIndex, effectiveRange: nil) != nil
+            else { return false }
+
+            guard let rawPath = storage.attribute(
+                .markdownRawLink,
+                at: charIndex,
+                effectiveRange: nil
+            ) as? String,
+                let target = MarkdownFileLinkTarget.detectedFilePath(rawPath)
+            else { return true }
+
+            guard let opener = parent.markdownFileLinkOpener else { return true }
+            Task { @MainActor in
+                _ = await opener.open(target)
+            }
+            return true
         }
 
         func performExternalReplacement(
@@ -290,11 +317,22 @@ struct TextKitView: NSViewRepresentable {
         // Configure spell-check and autocorrection (kept user-configurable)
         textView.isContinuousSpellCheckingEnabled = isSpellCheckEnabled
         textView.isAutomaticSpellingCorrectionEnabled = isSpellCheckEnabled
+
+        refreshDetectedMarkdownFileLinks(
+            in: textView,
+            coordinator: coordinator,
+            force: true
+        )
     }
 
     @MainActor
     func updateNSView(_ nsView: NSScrollView, context: Context) {
-        context.coordinator.parent = self
+        updateNSView(nsView, coordinator: context.coordinator)
+    }
+
+    @MainActor
+    func updateNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        coordinator.parent = self
         guard let textView = nsView.documentView as? NSTextView else { return }
 
         // Non-contiguous layout: disabled by default (fixes Intel Mac scroll issues),
@@ -320,7 +358,7 @@ struct TextKitView: NSViewRepresentable {
         }
 
         // Compute whether we should force a programmatic update even if focused
-        let shouldForce = context.coordinator.lastAppliedTick != externalUpdateTick
+        let shouldForce = coordinator.lastAppliedTick != externalUpdateTick
 
         // Only touch the font when size/mono actually changed to avoid reflow on every update
         let requiredFont = resolvedFont
@@ -335,37 +373,51 @@ struct TextKitView: NSViewRepresentable {
         }
         refreshDefaultParagraphStyle(
             in: textView,
-            coordinator: context.coordinator,
+            coordinator: coordinator,
             font: requiredFont
         )
 
         // Determine if user is actively editing in this text view
         let wasFirstResponder = (textView.window?.firstResponder as? NSTextView) == textView
 
+        var replacedText = false
         if textView.string != text {
             if textView.hasMarkedText() { return }
-            if wasFirstResponder, !shouldForce {
+            if isEditable, wasFirstResponder, !shouldForce {
                 // Do not overwrite in-flight user edits; let delegate drive the binding.
             } else {
                 // Preserve selection but clamp it to the new text length
                 let previousSelection = textView.clampedSelectedRange()
-                context.coordinator.performExternalReplacement(in: textView) {
+                if let storage = textView.textStorage {
+                    storage.beginEditing()
+                    Self.restorePlainTextStyling(
+                        for: coordinator.appliedDetectedMarkdownFileLinks,
+                        in: storage
+                    )
+                    storage.endEditing()
+                }
+                coordinator.appliedDetectedMarkdownFileLinks = []
+                coordinator.performExternalReplacement(in: textView) {
                     textView.string = text
                 }
+                replacedText = true
                 textView.setSelectedRange(previousSelection.clamped(to: textView.currentStringLength()))
 
-                // Only auto-scroll when not forcing or not focused
-                let nsLen = textView.currentStringLength()
-                if !wasFirstResponder || !shouldForce {
+                // Preserve editor scrolling behavior, but a focused read-only payload update
+                // must not jump to the end.
+                let shouldAutoScroll = (!wasFirstResponder || !shouldForce) &&
+                    (isEditable || !wasFirstResponder)
+                if shouldAutoScroll {
+                    let nsLen = textView.currentStringLength()
                     textView.scrollRangeToVisible(NSRange(location: nsLen, length: 0))
                 }
 
                 // Record that we applied this external tick
                 if shouldForce {
-                    context.coordinator.lastAppliedTick = externalUpdateTick
+                    coordinator.lastAppliedTick = externalUpdateTick
                     // Sync empty state tracker
-                    context.coordinator.wasEmpty = text.isEmpty
-                    context.coordinator.scheduleLayoutStabilization(
+                    coordinator.wasEmpty = text.isEmpty
+                    coordinator.scheduleLayoutStabilization(
                         for: textView,
                         expectedIsEmpty: text.isEmpty,
                         reason: .externalWrite
@@ -373,6 +425,12 @@ struct TextKitView: NSViewRepresentable {
                 }
             }
         }
+
+        refreshDetectedMarkdownFileLinks(
+            in: textView,
+            coordinator: coordinator,
+            force: replacedText
+        )
 
         // Ensure wrapping mode is still respected with minimal churn
         let shouldBeHorizontallyResizable = !wrapLines
@@ -394,6 +452,58 @@ struct TextKitView: NSViewRepresentable {
                     height: CGFloat.greatestFiniteMagnitude
                 )
             }
+        }
+    }
+
+    private func refreshDetectedMarkdownFileLinks(
+        in textView: NSTextView,
+        coordinator: Coordinator,
+        force: Bool
+    ) {
+        guard textView.string == text,
+              let storage = textView.textStorage
+        else { return }
+
+        let desiredMatches = markdownFileLinkOpener == nil ? [] : detectedMarkdownFileLinks
+        guard force || coordinator.appliedDetectedMarkdownFileLinks != desiredMatches else { return }
+
+        storage.beginEditing()
+        defer { storage.endEditing() }
+        Self.restorePlainTextStyling(
+            for: coordinator.appliedDetectedMarkdownFileLinks,
+            in: storage
+        )
+        Self.decorateDetectedMarkdownFileLinks(desiredMatches, in: storage)
+        coordinator.appliedDetectedMarkdownFileLinks = desiredMatches
+    }
+
+    static func restorePlainTextStyling(
+        for matches: [MarkdownFilePathLinkDetector.Match],
+        in storage: NSMutableAttributedString
+    ) {
+        for match in matches where NSMaxRange(match.range) <= storage.length {
+            storage.removeAttribute(.link, range: match.range)
+            storage.removeAttribute(.markdownRawLink, range: match.range)
+            storage.removeAttribute(.markdownDetectedFileLink, range: match.range)
+            storage.addAttributes([
+                .foregroundColor: NSColor.textColor,
+                .underlineStyle: 0
+            ], range: match.range)
+        }
+    }
+
+    static func decorateDetectedMarkdownFileLinks(
+        _ matches: [MarkdownFilePathLinkDetector.Match],
+        in storage: NSMutableAttributedString
+    ) {
+        for match in matches where NSMaxRange(match.range) <= storage.length {
+            storage.addAttributes([
+                .link: match.path,
+                .markdownRawLink: match.path,
+                .markdownDetectedFileLink: true,
+                .foregroundColor: NSColor.linkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ], range: match.range)
         }
     }
 
@@ -436,6 +546,7 @@ struct TextKitView: NSViewRepresentable {
         textView.string = ""
         coordinator.internalText = ""
         coordinator.wasEmpty = true
+        coordinator.appliedDetectedMarkdownFileLinks = []
         coordinator.pendingLayoutTask?.cancel()
         coordinator.pendingLayoutTask = nil
         // NEW: mark inactive
