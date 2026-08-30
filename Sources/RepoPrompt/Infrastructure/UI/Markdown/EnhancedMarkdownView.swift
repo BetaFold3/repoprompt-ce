@@ -485,10 +485,12 @@ final class MarkdownTextViewCoordinator: NSObject, NSTextViewDelegate {
             let isObsidianEmbed = hasAttributedCharacter &&
                 storage?.attribute(.markdownObsidianEmbed, at: charIndex, effectiveRange: nil) != nil
             let isAutoDetected = isAutoDetectedLink(in: textView, charIndex: charIndex)
+            if isAutoDetected {
+                return MarkdownFileLinkTarget.detectedFilePath(rawDestination)
+            }
             return MarkdownFileLinkTarget.parse(
                 rawDestination: rawDestination,
-                isObsidianEmbed: isObsidianEmbed,
-                isAutoDetected: isAutoDetected
+                isObsidianEmbed: isObsidianEmbed
             )
         }
         if let link = link as? URL {

@@ -184,6 +184,7 @@ struct AgentMessageBubble: View {
     let codexManagedLoginAction: CodexManagedLoginAction?
     let runLocallyInsteadAction: (() -> Void)?
     let resendUndeliveredAction: (() -> Void)?
+    let linkifiesUserDocumentPaths: Bool
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
@@ -214,7 +215,8 @@ struct AgentMessageBubble: View {
         cancelActiveToolsAction: (() -> Void)? = nil,
         codexManagedLoginAction: CodexManagedLoginAction? = nil,
         runLocallyInsteadAction: (() -> Void)? = nil,
-        resendUndeliveredAction: (() -> Void)? = nil
+        resendUndeliveredAction: (() -> Void)? = nil,
+        linkifiesUserDocumentPaths: Bool = false
     ) {
         self.item = item
         self.isMostRecentEditBubble = isMostRecentEditBubble
@@ -232,6 +234,7 @@ struct AgentMessageBubble: View {
         self.codexManagedLoginAction = codexManagedLoginAction
         self.runLocallyInsteadAction = runLocallyInsteadAction
         self.resendUndeliveredAction = resendUndeliveredAction
+        self.linkifiesUserDocumentPaths = linkifiesUserDocumentPaths
     }
 
     private var runtimeFooter: AgentMessageRuntimeFooter? {
@@ -364,7 +367,10 @@ struct AgentMessageBubble: View {
                     if !item.taggedFileAttachments.isEmpty {
                         TaggedFilesBadge(attachments: item.taggedFileAttachments)
                     }
-                    CollapsibleUserMessage(text: item.text)
+                    CollapsibleUserMessage(
+                        text: item.text,
+                        linkifiesDocumentPaths: linkifiesUserDocumentPaths
+                    )
                 }
                 .padding(12)
                 .background(BubbleColors.lightBlue)

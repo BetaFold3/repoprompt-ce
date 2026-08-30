@@ -3,6 +3,71 @@ import Foundation
 import XCTest
 
 final class AgentPreviewLinkRouterTests: XCTestCase {
+    func testTranscriptFileURLRoundTripsReservedPathCharacters() throws {
+        let candidates = [
+            "docs/report.md",
+            "docs/My Report.html",
+            "docs/報告.md",
+            "docs/100%.md",
+            "docs/50%20off.md",
+            "docs/report#draft.md",
+            "docs/C++.md",
+            "../docs/report.md:12"
+        ]
+
+        for candidate in candidates {
+            let url = try XCTUnwrap(AgentPreviewLinkRouter.transcriptFileURL(for: candidate))
+            let queryPath = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "path" })?
+                .value
+
+            XCTAssertEqual(url.host, "transcript-file", candidate)
+            XCTAssertEqual(queryPath, candidate, candidate)
+            XCTAssertEqual(AgentPreviewLinkRouter.candidateFilePath(from: url), candidate, candidate)
+        }
+    }
+
+    func testTranscriptFileNamespaceRejectsMalformedReservedURLsAndPreservesLegacyHostPaths() throws {
+        let missingQuery = try XCTUnwrap(URL(string: "repoprompt-preview://transcript-file"))
+        let emptyPath = try XCTUnwrap(URL(string: "repoprompt-preview://transcript-file?path="))
+        let missingPathItem = try XCTUnwrap(
+            URL(string: "repoprompt-preview://transcript-file?other=docs/report.md")
+        )
+        let uppercaseMissingPath = try XCTUnwrap(URL(string: "repoprompt-preview://TRANSCRIPT-FILE"))
+        let legacyHostPath = try XCTUnwrap(
+            URL(string: "repoprompt-preview://transcript-file/legacy/report.md")
+        )
+
+        XCTAssertNil(AgentPreviewLinkRouter.candidateFilePath(from: missingQuery))
+        XCTAssertNil(AgentPreviewLinkRouter.candidateFilePath(from: emptyPath))
+        XCTAssertNil(AgentPreviewLinkRouter.candidateFilePath(from: missingPathItem))
+        XCTAssertNil(AgentPreviewLinkRouter.candidateFilePath(from: uppercaseMissingPath))
+        XCTAssertEqual(
+            AgentPreviewLinkRouter.candidateFilePath(from: legacyHostPath),
+            "/transcript-file/legacy/report.md"
+        )
+    }
+
+    func testTranscriptFileTargetStripsLineSuffixWithoutPercentRedecoding() throws {
+        let lineURL = try XCTUnwrap(
+            AgentPreviewLinkRouter.transcriptFileURL(for: "../docs/report.md:12")
+        )
+        let percentURL = try XCTUnwrap(
+            AgentPreviewLinkRouter.transcriptFileURL(for: "docs/50%20off.md")
+        )
+
+        let lineTarget = try XCTUnwrap(AgentPreviewLinkRouter.transcriptFileTarget(from: lineURL))
+        let percentTarget = try XCTUnwrap(AgentPreviewLinkRouter.transcriptFileTarget(from: percentURL))
+
+        XCTAssertEqual(lineTarget.normalizedPath, "../docs/report.md")
+        XCTAssertEqual(lineTarget.lineNumber, 12)
+        XCTAssertEqual(percentTarget.normalizedPath, "docs/50%20off.md")
+        XCTAssertNil(percentTarget.lineNumber)
+        XCTAssertTrue(lineTarget.isAutoDetected)
+        XCTAssertTrue(percentTarget.isAutoDetected)
+    }
+
     func testTripleSlashURLExtractsAbsolutePath() throws {
         let url = try XCTUnwrap(
             URL(string: "repoprompt-preview:///Users/tnguyen/docs/report.html")

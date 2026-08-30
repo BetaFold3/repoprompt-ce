@@ -2035,9 +2035,22 @@ struct AgentModeChatDetailView: View {
         guard url.scheme?.caseInsensitiveCompare(RepoPreviewURLScheme.scheme) == .orderedSame else {
             return .systemAction
         }
-        guard let path = AgentPreviewLinkRouter.candidateFilePath(from: url) else {
+        guard let candidatePath = AgentPreviewLinkRouter.candidateFilePath(from: url) else {
             Self.previewLinkLogger.debug("Rejected preview link without a candidate file path")
             return .handled
+        }
+
+        let path: String
+        if AgentPreviewLinkRouter.isTranscriptFileURL(url) {
+            guard let target = AgentPreviewLinkRouter.transcriptFileTarget(from: url),
+                  AgentTranscriptPreviewLinkRoutingPolicy.isPreviewable(target)
+            else {
+                Self.previewLinkLogger.debug("Rejected invalid or non-previewable transcript file path")
+                return .handled
+            }
+            path = target.normalizedPath
+        } else {
+            path = candidatePath
         }
 
         beginPreviewLinkResolution(
@@ -2998,7 +3011,8 @@ struct AgentModeChatDetailView: View {
             cancelActiveToolsAction: cancelAction,
             codexManagedLoginAction: codexManagedLoginAction,
             runLocallyInsteadAction: runLocallyInsteadAction,
-            resendUndeliveredAction: resendUndeliveredAction
+            resendUndeliveredAction: resendUndeliveredAction,
+            linkifiesUserDocumentPaths: true
         )
         .id(item.id)
         .environment(\.markdownFileLinkOpener, markdownFileLinkOpener)

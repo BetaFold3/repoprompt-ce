@@ -9,6 +9,63 @@
 import AppKit
 import SwiftUI
 
+enum CollapsibleUserMessageLinkification {
+    static func swiftUIAttributedString(
+        _ displayText: String,
+        sourceText: String? = nil,
+        enabled: Bool = false
+    ) -> AttributedString {
+        var attributedString = AttributedString(displayText)
+        guard enabled else { return attributedString }
+
+        for match in matches(in: displayText, sourceText: sourceText) {
+            guard let url = ReservedTranscriptFileURLCodec.makeURL(path: match.path),
+                  let stringRange = Range(match.range, in: displayText),
+                  let attributedRange = Range(stringRange, in: attributedString)
+            else { continue }
+            attributedString[attributedRange].link = url
+        }
+        return attributedString
+    }
+
+    static func appKitAttributedString(
+        _ displayText: String,
+        sourceText: String? = nil,
+        font: NSFont,
+        enabled: Bool = false
+    ) -> NSAttributedString {
+        let attributedString = NSMutableAttributedString(string: displayText, attributes: [
+            .font: font,
+            .foregroundColor: NSColor.textColor
+        ])
+        guard enabled else { return attributedString }
+
+        for match in matches(in: displayText, sourceText: sourceText) {
+            guard let url = ReservedTranscriptFileURLCodec.makeURL(path: match.path) else { continue }
+            attributedString.addAttributes([
+                .link: url,
+                .markdownRawLink: match.path,
+                .markdownDetectedFileLink: true,
+                .foregroundColor: NSColor.linkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ], range: match.range)
+        }
+        return attributedString
+    }
+
+    private static func matches(
+        in displayText: String,
+        sourceText: String?
+    ) -> [MarkdownFilePathLinkDetector.Match] {
+        let detectionText = sourceText ?? displayText
+        let displayedUTF16Length = displayText.utf16.count
+        return MarkdownFilePathLinkDetector.proseMatches(in: detectionText).filter {
+            NSMaxRange($0.range) <= displayedUTF16Length &&
+                Range($0.range, in: displayText) != nil
+        }
+    }
+}
+
 // MARK: - Content Width Observation
 
 private struct CollapsibleUserMessageContentWidthPreferenceKey: PreferenceKey {
@@ -48,12 +105,16 @@ private struct MeasuredPlainTextView: View {
     let text: String
     let font: NSFont
     let fallbackMeasurementWidth: CGFloat?
+    let linkifiesDocumentPaths: Bool
+
+    @Environment(\.markdownFileLinkOpener) private var linkOpener
 
     private var attributedString: NSAttributedString {
-        NSAttributedString(string: text, attributes: [
-            .font: font,
-            .foregroundColor: NSColor.textColor
-        ])
+        CollapsibleUserMessageLinkification.appKitAttributedString(
+            text,
+            font: font,
+            enabled: linkifiesDocumentPaths
+        )
     }
 
     var body: some View {
@@ -61,6 +122,7 @@ private struct MeasuredPlainTextView: View {
             attributedString: attributedString,
             isEditable: false,
             allowsTextSelection: true,
+            linkOpener: linkOpener,
             fallbackMeasurementWidth: fallbackMeasurementWidth
         )
     }
@@ -72,6 +134,7 @@ private struct MeasuredPlainTextView: View {
 /// Provides expand/collapse functionality with smooth animations.
 struct CollapsibleUserMessage: View {
     let text: String
+    var linkifiesDocumentPaths: Bool = false
 
     /// Number of characters to show in collapsed state
     var previewCharCount: Int = 500
@@ -102,6 +165,21 @@ struct CollapsibleUserMessage: View {
         text.count > previewCharCount
     }
 
+    @ViewBuilder
+    private var collapsedContent: some View {
+        if linkifiesDocumentPaths {
+            Text(
+                CollapsibleUserMessageLinkification.swiftUIAttributedString(
+                    displayText,
+                    sourceText: text,
+                    enabled: true
+                )
+            )
+        } else {
+            Text(displayText)
+        }
+    }
+
     private func updateLastKnownContentWidth(_ width: CGFloat) {
         guard width.isFinite, width > 1 else { return }
         if let lastKnownContentWidth,
@@ -122,7 +200,7 @@ struct CollapsibleUserMessage: View {
             // Use normal Text for small messages or collapsed state.
             // Use the shared measured AppKit text path for expanded large messages.
             if !needsCollapse || isCollapsed {
-                Text(displayText)
+                collapsedContent
                     .font(fontPreset.font)
                     .textSelection(.enabled)
                     .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
@@ -130,7 +208,8 @@ struct CollapsibleUserMessage: View {
                 MeasuredPlainTextView(
                     text: displayText,
                     font: fontPreset.nsFont,
-                    fallbackMeasurementWidth: lastKnownContentWidth
+                    fallbackMeasurementWidth: lastKnownContentWidth,
+                    linkifiesDocumentPaths: linkifiesDocumentPaths
                 )
                 .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
             }

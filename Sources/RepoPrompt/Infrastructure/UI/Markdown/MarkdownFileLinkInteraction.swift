@@ -1,6 +1,40 @@
 import Foundation
 import SwiftUI
 
+enum ReservedTranscriptFileURLCodec {
+    static let host = "transcript-file"
+
+    static func makeURL(path: String) -> URL? {
+        guard !path.isEmpty else { return nil }
+
+        var components = URLComponents()
+        components.scheme = RepoPreviewURLScheme.scheme
+        components.host = host
+        components.queryItems = [URLQueryItem(name: "path", value: path)]
+        return components.url
+    }
+
+    static func isReservedURL(_ url: URL) -> Bool {
+        let encodedPath = url.path(percentEncoded: true)
+        return url.scheme?.caseInsensitiveCompare(RepoPreviewURLScheme.scheme) == .orderedSame &&
+            url.host?.caseInsensitiveCompare(host) == .orderedSame &&
+            encodedPath.isEmpty
+    }
+
+    static func path(from url: URL) -> String? {
+        guard isReservedURL(url),
+              let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+              .queryItems?
+              .first(where: { $0.name == "path" })?
+              .value,
+              !path.isEmpty
+        else {
+            return nil
+        }
+        return path
+    }
+}
+
 struct MarkdownFileLinkTarget {
     let rawDestination: String
     let normalizedPath: String
@@ -19,6 +53,25 @@ struct MarkdownFileLinkTarget {
             lineNumber: nil,
             isObsidianEmbed: false,
             isAutoDetected: false
+        )
+    }
+
+    /// Builds an auto-detected target without percent-decoding an exact lexical filename.
+    static func detectedFilePath(_ path: String) -> MarkdownFileLinkTarget? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let colonLineMatch = parseColonLineSuffix(in: trimmed)
+        let candidate = colonLineMatch?.path ?? trimmed
+        let normalizedPath = (candidate as NSString).standardizingPath
+        guard !normalizedPath.isEmpty, normalizedPath != "." else { return nil }
+
+        return MarkdownFileLinkTarget(
+            rawDestination: path,
+            normalizedPath: normalizedPath,
+            lineNumber: colonLineMatch?.lineNumber,
+            isObsidianEmbed: false,
+            isAutoDetected: true
         )
     }
 
