@@ -8,6 +8,20 @@ struct MarkdownFileLinkTarget {
     let isObsidianEmbed: Bool
     let isAutoDetected: Bool
 
+    /// Builds a link target from canonical attachment metadata without Markdown or URL decoding.
+    static func canonicalFilePath(_ path: String) -> MarkdownFileLinkTarget? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        return MarkdownFileLinkTarget(
+            rawDestination: path,
+            normalizedPath: trimmed,
+            lineNumber: nil,
+            isObsidianEmbed: false,
+            isAutoDetected: false
+        )
+    }
+
     static func parse(
         rawDestination: String,
         isObsidianEmbed: Bool = false,

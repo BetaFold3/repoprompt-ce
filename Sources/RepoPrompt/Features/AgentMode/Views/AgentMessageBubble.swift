@@ -1901,16 +1901,97 @@ private struct DiffContentView: View {
 
 // MARK: - Tagged Files Badge
 
+enum TaggedFilesBadgeInteractionKind: Equatable {
+    case none
+    case button
+    case menu
+}
+
+struct TaggedFilesBadgePreviewTarget: Identifiable {
+    let id: UUID
+    let displayName: String
+    let target: MarkdownFileLinkTarget
+}
+
+@MainActor
+enum TaggedFilesBadgeInteraction {
+    static func previewTargets(
+        in attachments: [AgentTaggedFileAttachment]
+    ) -> [TaggedFilesBadgePreviewTarget] {
+        attachments.compactMap { attachment in
+            guard
+                let target = MarkdownFileLinkTarget.canonicalFilePath(attachment.relativePath),
+                AgentTranscriptPreviewLinkRoutingPolicy.isPreviewable(target)
+            else {
+                return nil
+            }
+            return TaggedFilesBadgePreviewTarget(
+                id: attachment.id,
+                displayName: attachment.displayName,
+                target: target
+            )
+        }
+    }
+
+    static func kind(for targets: [TaggedFilesBadgePreviewTarget]) -> TaggedFilesBadgeInteractionKind {
+        switch targets.count {
+        case 0: .none
+        case 1: .button
+        default: .menu
+        }
+    }
+
+    static func open(
+        _ target: TaggedFilesBadgePreviewTarget,
+        using opener: MarkdownFileLinkOpener
+    ) async -> Bool {
+        await opener.open(target.target)
+    }
+}
+
 /// Compact badge showing attached file name(s) in a user message bubble.
 /// Shows the file name for a single file, or "+N files attached" for multiple.
 private struct TaggedFilesBadge: View {
     let attachments: [AgentTaggedFileAttachment]
+    @Environment(\.markdownFileLinkOpener) private var markdownFileLinkOpener
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
 
     var body: some View {
+        let targets = TaggedFilesBadgeInteraction.previewTargets(in: attachments)
+        if let markdownFileLinkOpener {
+            switch TaggedFilesBadgeInteraction.kind(for: targets) {
+            case .none:
+                badgeLabel
+            case .button:
+                Button {
+                    open(targets[0], using: markdownFileLinkOpener)
+                } label: {
+                    badgeLabel
+                }
+                .buttonStyle(.plain)
+            case .menu:
+                Menu {
+                    ForEach(targets) { target in
+                        Button(target.displayName) {
+                            open(target, using: markdownFileLinkOpener)
+                        }
+                    }
+                } label: {
+                    badgeLabel
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+            }
+        } else {
+            badgeLabel
+        }
+    }
+
+    private var badgeLabel: some View {
         HStack(spacing: 4) {
             Image(systemName: "paperclip")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
@@ -1923,6 +2004,15 @@ private struct TaggedFilesBadge: View {
         .padding(.vertical, 3)
         .background(Color.secondary.opacity(0.1))
         .clipShape(Capsule())
+    }
+
+    private func open(
+        _ target: TaggedFilesBadgePreviewTarget,
+        using opener: MarkdownFileLinkOpener
+    ) {
+        Task { @MainActor in
+            _ = await TaggedFilesBadgeInteraction.open(target, using: opener)
+        }
     }
 
     private var label: String {
