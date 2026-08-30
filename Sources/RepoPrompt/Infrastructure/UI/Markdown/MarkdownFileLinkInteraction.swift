@@ -6,10 +6,12 @@ struct MarkdownFileLinkTarget {
     let normalizedPath: String
     let lineNumber: Int?
     let isObsidianEmbed: Bool
+    let isAutoDetected: Bool
 
     static func parse(
         rawDestination: String,
-        isObsidianEmbed: Bool = false
+        isObsidianEmbed: Bool = false,
+        isAutoDetected: Bool = false
     ) -> MarkdownFileLinkTarget? {
         let trimmed = rawDestination.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
@@ -28,7 +30,8 @@ struct MarkdownFileLinkTarget {
                     rawDestination: rawDestination,
                     normalizedPath: normalizedPath,
                     lineNumber: parseLineNumber(fragment: url.fragment),
-                    isObsidianEmbed: isObsidianEmbed
+                    isObsidianEmbed: isObsidianEmbed,
+                    isAutoDetected: isAutoDetected
                 )
             default:
                 return nil
@@ -48,7 +51,8 @@ struct MarkdownFileLinkTarget {
             rawDestination: rawDestination,
             normalizedPath: normalizedPath,
             lineNumber: parseLineNumber(fragment: fragment) ?? colonLineMatch?.lineNumber,
-            isObsidianEmbed: isObsidianEmbed
+            isObsidianEmbed: isObsidianEmbed,
+            isAutoDetected: isAutoDetected
         )
     }
 
@@ -107,4 +111,5 @@ extension EnvironmentValues {
 extension NSAttributedString.Key {
     static let markdownRawLink = NSAttributedString.Key("markdownRawLink")
     static let markdownObsidianEmbed = NSAttributedString.Key("markdownObsidianEmbed")
+    static let markdownDetectedFileLink = NSAttributedString.Key("markdownDetectedFileLink")
 }

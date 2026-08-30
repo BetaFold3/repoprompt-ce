@@ -14,6 +14,7 @@ struct MarkdownRenderSignature: Equatable {
     let fontSize: CGFloat
     let forceTextColor: Color?
     let useMonospaced: Bool
+    let detectsMarkdownFilePaths: Bool
     /// Resolved transcript code-font face identity (system or custom).
     let codeFontFaceIdentity: String
 
@@ -21,6 +22,7 @@ struct MarkdownRenderSignature: Equatable {
         fontSize == other.fontSize &&
             forceTextColor == other.forceTextColor &&
             useMonospaced == other.useMonospaced &&
+            detectsMarkdownFilePaths == other.detectsMarkdownFilePaths &&
             codeFontFaceIdentity == other.codeFontFaceIdentity
     }
 
@@ -357,6 +359,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
     let allowInteraction: Bool
     let forceTextColor: Color?
     let useMonospaced: Bool
+    let detectsMarkdownFilePaths: Bool
     let initialBoundary: MarkdownStreamingFreezeBoundary
 
     @State private var frozenBoundaryUTF16Offset: Int?
@@ -372,6 +375,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                             allowInteraction: allowInteraction,
                             forceTextColor: forceTextColor,
                             useMonospaced: useMonospaced,
+                            detectsMarkdownFilePaths: detectsMarkdownFilePaths,
                             renderCadence: .immediate,
                             allowsStreamingSegmentation: false
                         )
@@ -382,6 +386,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                         allowInteraction: allowInteraction,
                         forceTextColor: forceTextColor,
                         useMonospaced: useMonospaced,
+                        detectsMarkdownFilePaths: detectsMarkdownFilePaths,
                         renderCadence: .streamingCoalesced,
                         allowsStreamingSegmentation: false
                     )
@@ -393,6 +398,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                     allowInteraction: allowInteraction,
                     forceTextColor: forceTextColor,
                     useMonospaced: useMonospaced,
+                    detectsMarkdownFilePaths: detectsMarkdownFilePaths,
                     renderCadence: .streamingCoalesced,
                     allowsStreamingSegmentation: false
                 )
@@ -408,6 +414,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
             lhs.allowInteraction == rhs.allowInteraction &&
             lhs.forceTextColor == rhs.forceTextColor &&
             lhs.useMonospaced == rhs.useMonospaced &&
+            lhs.detectsMarkdownFilePaths == rhs.detectsMarkdownFilePaths &&
             lhs.initialBoundary == rhs.initialBoundary
     }
 
@@ -434,6 +441,7 @@ struct MarkdownTextView: View, Equatable {
     let allowInteraction: Bool
     let forceTextColor: Color?
     let useMonospaced: Bool
+    let detectsMarkdownFilePaths: Bool
     let renderCadence: MarkdownRenderCadence
     private let allowsStreamingSegmentation: Bool
     @Environment(\.markdownFileLinkOpener) private var markdownFileLinkOpener
@@ -463,6 +471,7 @@ struct MarkdownTextView: View, Equatable {
         allowInteraction: Bool = true,
         forceTextColor: Color? = nil,
         useMonospaced: Bool = false,
+        detectsMarkdownFilePaths: Bool = false,
         renderCadence: MarkdownRenderCadence = .immediate,
         allowsStreamingSegmentation: Bool = true
     ) {
@@ -471,6 +480,7 @@ struct MarkdownTextView: View, Equatable {
         self.allowInteraction = allowInteraction
         self.forceTextColor = forceTextColor
         self.useMonospaced = useMonospaced
+        self.detectsMarkdownFilePaths = detectsMarkdownFilePaths
         self.renderCadence = renderCadence
         self.allowsStreamingSegmentation = allowsStreamingSegmentation
     }
@@ -481,6 +491,7 @@ struct MarkdownTextView: View, Equatable {
             lhs.allowInteraction == rhs.allowInteraction &&
             lhs.forceTextColor == rhs.forceTextColor &&
             lhs.useMonospaced == rhs.useMonospaced &&
+            lhs.detectsMarkdownFilePaths == rhs.detectsMarkdownFilePaths &&
             lhs.renderCadence == rhs.renderCadence &&
             lhs.allowsStreamingSegmentation == rhs.allowsStreamingSegmentation &&
             lhs.fontScale.preset.scaleFactor == rhs.fontScale.preset.scaleFactor &&
@@ -517,6 +528,7 @@ struct MarkdownTextView: View, Equatable {
                 allowInteraction: allowInteraction,
                 forceTextColor: forceTextColor,
                 useMonospaced: useMonospaced,
+                detectsMarkdownFilePaths: detectsMarkdownFilePaths,
                 initialBoundary: segmentedBoundary
             )
         } else {
@@ -540,6 +552,7 @@ struct MarkdownTextView: View, Equatable {
                 fontSize: CGFloat(fontPreset.rawValue),
                 forceTextColor: forceTextColor,
                 useMonospaced: useMonospaced,
+                detectsMarkdownFilePaths: detectsMarkdownFilePaths,
                 codeFontFaceIdentity: resolvedCodeFont.fingerprint.faceIdentity
             ),
             cadence: renderCadence
@@ -661,6 +674,7 @@ struct MarkdownTextView: View, Equatable {
         compiler.fontSize = signature.fontSize
         compiler.forceTextColor = signature.forceTextColor
         compiler.useMonospaced = signature.useMonospaced
+        compiler.detectsMarkdownFilePaths = signature.detectsMarkdownFilePaths
         compiler.codeFont = TranscriptCodeFontResolver.resolve(
             preferredPostScriptName: signature.codeFontFaceIdentity,
             pointSize: signature.fontSize

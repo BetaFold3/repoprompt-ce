@@ -113,6 +113,32 @@ final class AgentTranscriptPreviewLinkResolverTests: XCTestCase {
         XCTAssertEqual(events, ["fallback"])
     }
 
+    func testExternalFallbackPolicyCoversAuthoredAndDetectedPreviewabilityMatrix() throws {
+        let cases: [(destination: String, isAutoDetected: Bool, isPreviewable: Bool, mayFallBack: Bool)] = [
+            ("docs/report.md", false, true, true),
+            ("Sources/App.swift", false, false, true),
+            ("docs/report.md", true, true, false),
+            ("Sources/App.swift", true, false, false)
+        ]
+
+        for testCase in cases {
+            let target = try XCTUnwrap(MarkdownFileLinkTarget.parse(
+                rawDestination: testCase.destination,
+                isAutoDetected: testCase.isAutoDetected
+            ))
+            XCTAssertEqual(
+                AgentTranscriptPreviewLinkRoutingPolicy.isPreviewable(target),
+                testCase.isPreviewable,
+                testCase.destination
+            )
+            XCTAssertEqual(
+                AgentTranscriptPreviewLinkRoutingPolicy.mayUseExternalFallback(target),
+                testCase.mayFallBack,
+                testCase.destination
+            )
+        }
+    }
+
     func testCancelledRoutingCannotShowRevealOrFallBack() async {
         let reference = PreviewDocumentReference(rootID: UUID(), relativePath: "docs/report.md")
         let resolveGate = TranscriptPreviewRoutingGate<PreviewDocumentReference?>()

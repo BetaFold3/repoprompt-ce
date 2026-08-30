@@ -48,6 +48,8 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     var maximumImageDisplayWidth: CGFloat = 560
     /// Opt-in rendered-storage anchors for the utility-panel outline. Disabled for transcripts.
     var indexesHeadingsForNavigation = false
+    /// Opt-in lexical links for Markdown/HTML file paths in assistant transcript content.
+    var detectsMarkdownFilePaths = false
 
     private static let maxTextTableRowsForInlineLayout = 300
     private static let maxTextTableCharactersForInlineLayout = 50000
@@ -56,6 +58,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     private var currentListDepth: Int = 0
     private var currentListTracker: OrderedListMarkerGenerator? // For ordered lists
     private var nextNavigationHeadingIndex = 0
+    private var authoredLinkDepth = 0
 
     private var resolvedCodeFont: NSFont {
         codeFont ?? NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
@@ -72,6 +75,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
     mutating func attributedString(from markup: Markdown.Markup) -> NSAttributedString {
         nextNavigationHeadingIndex = 0
+        authoredLinkDepth = 0
         let result = visit(markup).mutableCopy() as! NSMutableAttributedString
         guard useMonospaced else {
             return result
@@ -118,7 +122,12 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     }
 
     mutating func visitText(_ text: Markdown.Text) -> NSAttributedString {
-        NSAttributedString(string: text.plainText, attributes: attributes())
+        let result = NSMutableAttributedString(string: text.plainText, attributes: attributes())
+        guard detectsMarkdownFilePaths, authoredLinkDepth == 0 else { return result }
+        for match in MarkdownFilePathLinkDetector.proseMatches(in: text.plainText) {
+            decorateDetectedFileLink(in: result, match: match)
+        }
+        return result
     }
 
     mutating func visitParagraph(_ paragraph: Markdown.Paragraph) -> NSAttributedString {
@@ -166,10 +175,30 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
     mutating func visitInlineCode(_ inlineCode: Markdown.InlineCode) -> NSAttributedString {
         let font = codeFont(sizeDelta: -1)
-        return NSAttributedString(string: inlineCode.code, attributes: [
+        let result = NSMutableAttributedString(string: inlineCode.code, attributes: [
             .font: font,
             .foregroundColor: NSColor.textColor
         ])
+        if detectsMarkdownFilePaths,
+           authoredLinkDepth == 0,
+           let match = MarkdownFilePathLinkDetector.inlineCodeMatch(in: inlineCode.code)
+        {
+            decorateDetectedFileLink(in: result, match: match)
+        }
+        return result
+    }
+
+    private func decorateDetectedFileLink(
+        in result: NSMutableAttributedString,
+        match: MarkdownFilePathLinkDetector.Match
+    ) {
+        result.addAttributes([
+            .markdownRawLink: match.path,
+            .link: match.path,
+            .foregroundColor: NSColor.linkColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .markdownDetectedFileLink: true
+        ], range: match.range)
     }
 
     // MARK: - Code Block ----------------------------------------------------
@@ -263,10 +292,12 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     }
 
     mutating func visitLink(_ link: Markdown.Link) -> NSAttributedString {
+        authoredLinkDepth += 1
         let result = NSMutableAttributedString()
         for child in link.children {
             result.append(visit(child))
         }
+        authoredLinkDepth -= 1
         guard let destination = link.destination, result.length > 0 else {
             return result
         }

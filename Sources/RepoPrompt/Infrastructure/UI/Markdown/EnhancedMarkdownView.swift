@@ -458,8 +458,9 @@ final class MarkdownTextViewCoordinator: NSObject, NSTextViewDelegate {
     }
 
     func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+        let isAutoDetected = isAutoDetectedLink(in: textView, charIndex: charIndex)
         guard let target = fileLinkTarget(in: textView, link: link, charIndex: charIndex) else {
-            return false
+            return isAutoDetected
         }
         guard let opener else {
             return true
@@ -479,17 +480,15 @@ final class MarkdownTextViewCoordinator: NSObject, NSTextViewDelegate {
         }
 
         if let rawDestination {
-            let isObsidianEmbed = if let storage = textView.textStorage,
-                                     charIndex >= 0,
-                                     charIndex < storage.length
-            {
-                storage.attribute(.markdownObsidianEmbed, at: charIndex, effectiveRange: nil) != nil
-            } else {
-                false
-            }
+            let storage = textView.textStorage
+            let hasAttributedCharacter = charIndex >= 0 && charIndex < (storage?.length ?? 0)
+            let isObsidianEmbed = hasAttributedCharacter &&
+                storage?.attribute(.markdownObsidianEmbed, at: charIndex, effectiveRange: nil) != nil
+            let isAutoDetected = isAutoDetectedLink(in: textView, charIndex: charIndex)
             return MarkdownFileLinkTarget.parse(
                 rawDestination: rawDestination,
-                isObsidianEmbed: isObsidianEmbed
+                isObsidianEmbed: isObsidianEmbed,
+                isAutoDetected: isAutoDetected
             )
         }
         if let link = link as? URL {
@@ -499,6 +498,13 @@ final class MarkdownTextViewCoordinator: NSObject, NSTextViewDelegate {
             return MarkdownFileLinkTarget.parse(rawDestination: link)
         }
         return nil
+    }
+
+    private func isAutoDetectedLink(in textView: NSTextView, charIndex: Int) -> Bool {
+        guard let storage = textView.textStorage, charIndex >= 0, charIndex < storage.length else {
+            return false
+        }
+        return storage.attribute(.markdownDetectedFileLink, at: charIndex, effectiveRange: nil) != nil
     }
 }
 

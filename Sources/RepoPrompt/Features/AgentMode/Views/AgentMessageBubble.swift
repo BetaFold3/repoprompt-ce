@@ -494,6 +494,7 @@ struct AgentMessageBubble: View {
                 text: item.text,
                 isMarkdown: true,
                 allowInteraction: true,
+                detectsMarkdownFilePaths: true,
                 renderCadence: item.isStreaming ? .streamingCoalesced : .immediate
             )
         }
@@ -934,7 +935,8 @@ struct AgentMessageBubble: View {
                 text: item.text,
                 isMarkdown: true,
                 allowInteraction: true,
-                forceTextColor: .secondary.opacity(0.85)
+                forceTextColor: .secondary.opacity(0.85),
+                detectsMarkdownFilePaths: true
             )
             .padding(.vertical, 6)
             .padding(.leading, 10)
@@ -1522,7 +1524,12 @@ private struct CollapsibleAssistantTranscriptContent: View {
         let summary = lineSummary
         VStack(alignment: .leading, spacing: 6) {
             if isExpanded || !summary.needsCollapse {
-                MarkdownTextView(text: text, isMarkdown: true, allowInteraction: true)
+                MarkdownTextView(
+                    text: text,
+                    isMarkdown: true,
+                    allowInteraction: true,
+                    detectsMarkdownFilePaths: true
+                )
             } else {
                 Text(summary.previewText)
                     .font(fontPreset.standardFont)

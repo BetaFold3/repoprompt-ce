@@ -1493,17 +1493,27 @@ struct AgentModeChatDetailView: View {
     private var markdownFileLinkOpener: MarkdownFileLinkOpener {
         MarkdownFileLinkOpener { target in
             previewLinkResolutionTask?.cancel()
+            let mayUseExternalFallback = AgentTranscriptPreviewLinkRoutingPolicy.mayUseExternalFallback(target)
             guard AgentTranscriptPreviewLinkRoutingPolicy.isPreviewable(target) else {
+                guard mayUseExternalFallback else { return false }
                 return await promptManager.fileManager.openFileForMarkdownLink(target)
             }
 
-            let task = beginPreviewLinkResolution(
-                path: target.normalizedPath,
-                tabID: currentTabID,
-                fallback: {
-                    await promptManager.fileManager.openFileForMarkdownLink(target)
-                }
-            )
+            let task = if !mayUseExternalFallback {
+                beginPreviewLinkResolution(
+                    path: target.normalizedPath,
+                    tabID: currentTabID,
+                    fallback: nil
+                )
+            } else {
+                beginPreviewLinkResolution(
+                    path: target.normalizedPath,
+                    tabID: currentTabID,
+                    fallback: {
+                        await promptManager.fileManager.openFileForMarkdownLink(target)
+                    }
+                )
+            }
             return await task.value
         }
     }

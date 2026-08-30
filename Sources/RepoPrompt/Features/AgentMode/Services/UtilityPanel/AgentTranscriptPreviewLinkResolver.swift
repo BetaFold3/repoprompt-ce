@@ -72,6 +72,10 @@ enum AgentTranscriptPreviewLinkRoutingPolicy {
         return AgentSessionArtifactKind(fileExtension: fileExtension) != nil
     }
 
+    static func mayUseExternalFallback(_ target: MarkdownFileLinkTarget) -> Bool {
+        !target.isAutoDetected
+    }
+
     static func route(
         resolve: @MainActor () async -> PreviewDocumentReference?,
         showPreview: @MainActor (PreviewDocumentReference) -> Void,
