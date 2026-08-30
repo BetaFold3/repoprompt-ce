@@ -109,6 +109,35 @@ final class AgentUtilityPanelPresentationStoreTests: XCTestCase {
         XCTAssertFalse(store.isVisible)
     }
 
+    func testRevealNotificationRequiresAnExactIntegerWindowTarget() {
+        XCTAssertNotEqual(Notification.Name.showAgentUtilityPanel, .toggleAgentUtilityPanel)
+        XCTAssertTrue(AgentUtilityPanelNotificationTarget.matches(
+            Notification(
+                name: .showAgentUtilityPanel,
+                userInfo: [AgentUtilityPanelNotificationUserInfoKey.windowID: 42]
+            ),
+            windowID: 42
+        ))
+        XCTAssertFalse(AgentUtilityPanelNotificationTarget.matches(
+            Notification(
+                name: .showAgentUtilityPanel,
+                userInfo: [AgentUtilityPanelNotificationUserInfoKey.windowID: 7]
+            ),
+            windowID: 42
+        ))
+        XCTAssertFalse(AgentUtilityPanelNotificationTarget.matches(
+            Notification(name: .showAgentUtilityPanel),
+            windowID: 42
+        ))
+        XCTAssertFalse(AgentUtilityPanelNotificationTarget.matches(
+            Notification(
+                name: .showAgentUtilityPanel,
+                userInfo: [AgentUtilityPanelNotificationUserInfoKey.windowID: "42"]
+            ),
+            windowID: 42
+        ))
+    }
+
     /// Deep links reveal the panel without disturbing the width the user chose for this window.
     func testShowRevealsThePanelAndIsIdempotent() throws {
         let harness = try makeHarness()

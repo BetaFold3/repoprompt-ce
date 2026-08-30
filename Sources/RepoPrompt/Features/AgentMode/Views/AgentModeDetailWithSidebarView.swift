@@ -177,6 +177,10 @@ struct AgentModeDetailWithSidebarView: View {
             guard noteTargetsCurrentWindow(note) else { return }
             utilityPanel.toggleVisibility()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .showAgentUtilityPanel)) { note in
+            guard noteTargetsCurrentWindow(note) else { return }
+            utilityPanel.show()
+        }
         .onDisappear { pauseStressHarnessIfNeeded() }
     }
 
@@ -268,10 +272,7 @@ struct AgentModeDetailWithSidebarView: View {
     }
 
     private func noteTargetsCurrentWindow(_ note: Notification) -> Bool {
-        guard let id = note.userInfo?[AgentUtilityPanelNotificationUserInfoKey.windowID] as? Int else {
-            return false
-        }
-        return id == windowID
+        AgentUtilityPanelNotificationTarget.matches(note, windowID: windowID)
     }
 
     private func syncContextBuilderQuestionPresentation() {

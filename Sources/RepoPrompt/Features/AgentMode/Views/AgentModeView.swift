@@ -227,7 +227,7 @@ struct AgentModeChatDetailView: View {
     // Non-grouped state
     @State private var resetTextFieldTrigger = false
     @State private var isTranscriptWindowExpanded = false
-    @State private var previewLinkResolutionTask: Task<Void, Never>?
+    @State private var previewLinkResolutionTask: Task<Bool, Never>?
     @StateObject private var viewportRegistry = AgentTranscriptViewportRegistry()
 
     // MARK: - Assistant transcript search & ephemeral expansion (Workstream 5 item 1)
@@ -1492,8 +1492,64 @@ struct AgentModeChatDetailView: View {
 
     private var markdownFileLinkOpener: MarkdownFileLinkOpener {
         MarkdownFileLinkOpener { target in
-            await promptManager.fileManager.openFileForMarkdownLink(target)
+            previewLinkResolutionTask?.cancel()
+            guard AgentTranscriptPreviewLinkRoutingPolicy.isPreviewable(target) else {
+                return await promptManager.fileManager.openFileForMarkdownLink(target)
+            }
+
+            let task = beginPreviewLinkResolution(
+                path: target.normalizedPath,
+                tabID: currentTabID,
+                fallback: {
+                    await promptManager.fileManager.openFileForMarkdownLink(target)
+                }
+            )
+            return await task.value
         }
+    }
+
+    @discardableResult
+    private func beginPreviewLinkResolution(
+        path: String,
+        tabID: UUID?,
+        fallback: (@MainActor () async -> Bool)?
+    ) -> Task<Bool, Never> {
+        previewLinkResolutionTask?.cancel()
+
+        let resolver = AgentTranscriptPreviewLinkResolver(
+            environment: AgentChangesPanelLiveEnvironment(agentModeVM: agentModeVM)
+        )
+        let task = Task { @MainActor in
+            let outcome = await AgentTranscriptPreviewLinkRoutingPolicy.route(
+                resolve: {
+                    await resolver.reference(for: path, tabID: tabID)
+                },
+                showPreview: { reference in
+                    agentModeVM.showUtilityPanelPreview(of: reference, tabID: tabID)
+                },
+                reveal: {
+                    NotificationCenter.default.post(
+                        name: .showAgentUtilityPanel,
+                        object: nil,
+                        userInfo: [AgentUtilityPanelNotificationUserInfoKey.windowID: windowID]
+                    )
+                },
+                fallback: fallback
+            )
+            if outcome == .unresolved {
+                Self.previewLinkLogger.debug(
+                    "Unable to resolve transcript preview link in the active workspace: \(path, privacy: .private)"
+                )
+            }
+            return outcome.opened
+        }
+        previewLinkResolutionTask = task
+        return task
+    }
+
+    private func cancelPreviewLinkResolution() {
+        previewLinkResolutionTask?.cancel()
+        previewLinkResolutionTask = nil
     }
 
     private var supportsAutoScroll: Bool {
@@ -1956,9 +2012,16 @@ struct AgentModeChatDetailView: View {
                 expandAllAssistantReplies()
             }
         }
+        .onChange(of: currentTabID) { _, _ in
+            cancelPreviewLinkResolution()
+        }
+        .onDisappear {
+            cancelPreviewLinkResolution()
+        }
     }
 
     private func handleTranscriptURL(_ url: URL) -> OpenURLAction.Result {
+        cancelPreviewLinkResolution()
         guard url.scheme?.caseInsensitiveCompare(RepoPreviewURLScheme.scheme) == .orderedSame else {
             return .systemAction
         }
@@ -1967,40 +2030,11 @@ struct AgentModeChatDetailView: View {
             return .handled
         }
 
-        let tabID = currentTabID
-        previewLinkResolutionTask?.cancel()
-        previewLinkResolutionTask = Task { @MainActor in
-            let environment = AgentChangesPanelLiveEnvironment(agentModeVM: agentModeVM)
-            let rootInputs = await environment.rootInputs(tabID: tabID)
-            guard !Task.isCancelled else { return }
-
-            let resolution = await AgentPanelCheckoutResolver.resolve(
-                AgentPanelCheckoutRequest(
-                    logicalRoots: rootInputs.logicalRoots,
-                    worktreeBindings: rootInputs.worktreeBindings,
-                    isPreparingWorktree: rootInputs.isPreparingWorktree
-                ),
-                probe: AgentPanelLiveCheckoutProbe()
-            )
-            guard !Task.isCancelled else { return }
-
-            let checkouts: [AgentPanelResolvedCheckout] = resolution.items.compactMap { item in
-                guard case let .resolved(checkout) = item else { return nil }
-                return checkout
-            }
-            guard let reference = AgentChangesArtifactLinkResolver.reference(
-                forArtifactPath: path,
-                checkouts: checkouts,
-                logicalRoots: rootInputs.logicalRoots,
-                rootIDsByPath: rootInputs.rootIDsByPath
-            ) else {
-                Self.previewLinkLogger.debug(
-                    "Unable to resolve transcript preview link in the active workspace: \(path, privacy: .private)"
-                )
-                return
-            }
-            agentModeVM.showUtilityPanelPreview(of: reference, tabID: tabID)
-        }
+        beginPreviewLinkResolution(
+            path: path,
+            tabID: currentTabID,
+            fallback: nil
+        )
         return .handled
     }
 

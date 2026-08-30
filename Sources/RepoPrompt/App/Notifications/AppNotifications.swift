@@ -5,6 +5,17 @@ enum AgentUtilityPanelNotificationUserInfoKey {
     static let windowID = "windowID"
 }
 
+enum AgentUtilityPanelNotificationTarget {
+    static func matches(_ notification: Notification, windowID: Int) -> Bool {
+        guard let targetWindowID = notification
+            .userInfo?[AgentUtilityPanelNotificationUserInfoKey.windowID] as? Int
+        else {
+            return false
+        }
+        return targetWindowID == windowID
+    }
+}
+
 enum SnippetPaletteNotificationUserInfoKey {
     static let windowID = "windowID"
     static let tabID = "tabID"
@@ -112,6 +123,10 @@ extension Notification.Name {
     /// Toggle the Agent Mode right utility panel (Changes / Preview) for the focused window.
     /// `userInfo[AgentUtilityPanelNotificationUserInfoKey.windowID]` should be the target window ID.
     static let toggleAgentUtilityPanel = Notification.Name("toggleAgentUtilityPanel")
+
+    /// Reveal the Agent Mode right utility panel for the focused window without toggling it closed.
+    /// `userInfo[AgentUtilityPanelNotificationUserInfoKey.windowID]` should be the target window ID.
+    static let showAgentUtilityPanel = Notification.Name("showAgentUtilityPanel")
 
     /// Show the Agent navigation HUD for the target window.
     /// userInfo: ["windowID": Int, "mode": AgentNavigationHUDMode.rawValue]
