@@ -1,6 +1,24 @@
 import Foundation
 import SwiftAnthropic
 
+enum AnthropicProviderResponseError: LocalizedError, Equatable {
+    case refusal(modelID: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .refusal(modelID):
+            "Anthropic model \(modelID) refused to complete the request."
+        }
+    }
+
+    static func classifyTerminal(
+        stopReason: String?,
+        modelID: String
+    ) -> AnthropicProviderResponseError? {
+        stopReason == "refusal" ? .refusal(modelID: modelID) : nil
+    }
+}
+
 class AnthropicProvider: AIProvider {
     private let service: AnthropicService
     private let requestEncoder: AnthropicRequestEncoder
@@ -135,6 +153,15 @@ class AnthropicProvider: AIProvider {
                                 currentThinking = ""
                             }
 
+                        case .messageDelta:
+                            if let error = AnthropicProviderResponseError.classifyTerminal(
+                                stopReason: result.delta?.stopReason,
+                                modelID: plan.modelID
+                            ) {
+                                // Throw here to prevent both the SDK's later message_stop and our synthetic successful message_stop.
+                                throw error
+                            }
+
                         case .messageStop:
                             // Extract token usage from the end of stream
                             if let usage = result.usage {
@@ -206,6 +233,12 @@ class AnthropicProvider: AIProvider {
             with: request,
             debugEnabled: false
         )
+        if let error = AnthropicProviderResponseError.classifyTerminal(
+            stopReason: response.stopReason,
+            modelID: plan.modelID
+        ) {
+            throw error
+        }
 
         let text = response.content.compactMap { contentItem in
             switch contentItem {

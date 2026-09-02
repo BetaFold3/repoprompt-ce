@@ -21,6 +21,17 @@ struct AnthropicRequestPlan: Equatable {
         let resolvedMaxTokens = requestedMaxTokens
             ?? configuration.defaultMaxTokens
             ?? fallbackMaxTokens
+        let traits = AnthropicModelFamilyTraits.resolve(modelID: configuration.apiModelID)
+        if let requestedMaxTokens,
+           let knownMaxOutputTokens = traits.knownMaxOutputTokens,
+           requestedMaxTokens > knownMaxOutputTokens
+        {
+            throw AnthropicModelConfigurationError.maxTokensExceedsKnownLimit(
+                modelID: configuration.apiModelID,
+                requested: requestedMaxTokens,
+                limit: knownMaxOutputTokens
+            )
+        }
         if case let .enabled(budgetTokens) = configuration.thinking,
            resolvedMaxTokens <= budgetTokens
         {

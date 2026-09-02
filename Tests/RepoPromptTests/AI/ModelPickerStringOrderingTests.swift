@@ -54,20 +54,28 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(AIModel.fromModelName("gemini-3-pro-preview"), .gemini3p1ProPreview)
     }
 
-    func testClaudeCodePickerExposesFable5WithEffortVariantsFirst() throws {
+    func testClaudeCodePickerExposesFable51WithEffortVariantsFirstAndResolvesWireValue() throws {
         let models = AIModel.modelsForProvider(.claudeCode)
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-fable-5-1")))
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-fable-5-1:xhigh")))
         XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-fable-5")))
-        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-fable-5:xhigh")))
         XCTAssertEqual(
-            AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-fable-5:xhigh"),
-            .claudeCodeModel(specifier: "claude-fable-5:xhigh")
+            AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-fable-5-1:xhigh"),
+            .claudeCodeModel(specifier: "claude-fable-5-1:xhigh")
         )
 
         let menu = AIModel.claudeCodeMenu(for: models)
-        XCTAssertEqual(menu.groups.first?.baseModelRaw, "claude-fable-5")
-        let fableGroup = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-fable-5" })
-        XCTAssertEqual(fableGroup.displayName, "Fable 5")
-        XCTAssertTrue(fableGroup.options.contains { $0.displayName == "XHigh" })
+        XCTAssertEqual(menu.groups.first?.baseModelRaw, "claude-fable-5-1")
+        let fable51Group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-fable-5-1" })
+        XCTAssertEqual(fable51Group.displayName, "Fable 5.1")
+        XCTAssertEqual(fable51Group.options.map(\.displayName), ["Low", "Medium", "High", "Max", "XHigh"])
+        XCTAssertEqual(Array(AgentModel.modelsForAgent(.claudeCode).prefix(3)), [.defaultModel, .claudeFable51, .claudeFable5])
+
+        let selection = try ClaudeCodeProvider.resolveCLIModelSelection(
+            for: .claudeCodeModel(specifier: "claude-fable-5-1:xhigh")
+        )
+        XCTAssertEqual(selection.modelArgument, "claude-fable-5-1")
+        XCTAssertEqual(selection.effortLevel, .xhigh)
     }
 
     func testClaudeCodePickerExposesSonnet5WithAllOfficialEffortVariants() throws {

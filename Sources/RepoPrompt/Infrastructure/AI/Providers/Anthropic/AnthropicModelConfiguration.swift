@@ -21,11 +21,10 @@ enum AnthropicThinkingConfiguration: Equatable {
 enum AnthropicModelConfigurationError: Error, Equatable {
     case unsupportedEffort(modelID: String, effort: AnthropicEffort)
     case insufficientMaxTokens(modelID: String, budgetTokens: Int, maxTokens: Int)
+    case maxTokensExceedsKnownLimit(modelID: String, requested: Int, limit: Int)
 }
 
 struct AnthropicModelConfiguration: Equatable {
-    static let claudeOpus5ModelID = "claude-opus-5"
-
     let apiModelID: String
     let thinking: AnthropicThinkingConfiguration
     let effort: AnthropicEffort?
@@ -36,13 +35,14 @@ struct AnthropicModelConfiguration: Equatable {
         effort requestedEffort: AnthropicEffort? = nil
     ) throws -> AnthropicModelConfiguration {
         let legacy = legacyThinkingConfiguration(for: modelID)
+        let traits = AnthropicModelFamilyTraits.resolve(modelID: legacy.baseModelID)
 
-        if legacy.baseModelID == claudeOpus5ModelID {
+        if traits.requestShape == .adaptiveEffort {
             return AnthropicModelConfiguration(
-                apiModelID: claudeOpus5ModelID,
+                apiModelID: legacy.baseModelID,
                 thinking: .adaptive,
                 effort: requestedEffort ?? .high,
-                defaultMaxTokens: nil
+                defaultMaxTokens: traits.defaultMaxTokens
             )
         }
 

@@ -29,9 +29,15 @@ enum AIModelCapabilityMetadata {
             return resolve(for: base)
         }
         let window = contextWindowMetadata(for: model)
+        let maxOutputTokens: Int? = if case let .anthropicCustom(name) = model {
+            AnthropicModelFamilyTraits.resolve(modelID: name).knownMaxOutputTokens
+                ?? model.maxTokens
+        } else {
+            model.maxTokens
+        }
         return Snapshot(
             contextWindowTokens: window.tokens,
-            maxOutputTokens: model.maxTokens,
+            maxOutputTokens: maxOutputTokens,
             windowSource: window.source
         )
     }
@@ -84,8 +90,14 @@ enum AIModelCapabilityMetadata {
             return (1_000_000, .exact)
         case .openrouterClaude4Sonnet, .openrouterClaude4Opus:
             return (200_000, .exact)
+        case let .anthropicCustom(name):
+            let traits = AnthropicModelFamilyTraits.resolve(modelID: name)
+            if let knownContextWindowTokens = traits.knownContextWindowTokens {
+                return (knownContextWindowTokens, .exact)
+            }
+            return (nil, nil)
         case .ollama, .openrouterCustom, .openaiCustom, .openaiCustomResponses,
-             .openaiCustomReasoning, .openAIConfigured, .anthropicCustom,
+             .openaiCustomReasoning, .openAIConfigured,
              .geminiCustom, .deepseekCustom, .fireworksCustom, .azureCustom,
              .grokCustom, .groqCustom, .zaiCustom, .codexCustom,
              .openCodeCustom, .cursorCustom, .ohMyPiCustom, .customProvider, .customProviderUser:
