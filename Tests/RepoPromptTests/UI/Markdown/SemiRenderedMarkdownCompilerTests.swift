@@ -248,6 +248,266 @@ final class SemiRenderedMarkdownCompilerTests: XCTestCase {
         )
     }
 
+    func testCodeBlockBackgroundDoesNotOverlapAdjacentProse() {
+        let source = "Intro.\n```swift\ncode\n```\nOutro.\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let textStorage = NSTextStorage(attributedString: output)
+        let layoutManager = NSLayoutManager()
+        let textContainer = NSTextContainer(
+            size: NSSize(width: 400, height: CGFloat.greatestFiniteMagnitude)
+        )
+        textContainer.lineFragmentPadding = 0
+        layoutManager.addTextContainer(textContainer)
+        textStorage.addLayoutManager(layoutManager)
+        layoutManager.ensureLayout(for: textContainer)
+
+        var codeSourceRange = NSRange(location: NSNotFound, length: 0)
+        let openingFenceIndex = nsSource.range(of: "```swift").location
+        XCTAssertNotNil(
+            output.attribute(
+                .codeBlockSource,
+                at: openingFenceIndex,
+                effectiveRange: &codeSourceRange
+            )
+        )
+        guard codeSourceRange.location != NSNotFound else { return }
+
+        let codeGlyphRange = layoutManager.glyphRange(
+            forCharacterRange: codeSourceRange,
+            actualCharacterRange: nil
+        )
+        var codeLineFragmentRect = NSRect.null
+        layoutManager.enumerateLineFragments(forGlyphRange: codeGlyphRange) { lineRect, _, _, _, _ in
+            codeLineFragmentRect = codeLineFragmentRect.union(lineRect)
+        }
+        let blockBackgroundRect = codeLineFragmentRect.insetBy(dx: -6, dy: -6)
+
+        func usedRect(for characterRange: NSRange) -> NSRect {
+            let glyphRange = layoutManager.glyphRange(
+                forCharacterRange: characterRange,
+                actualCharacterRange: nil
+            )
+            var result = NSRect.null
+            layoutManager.enumerateLineFragments(forGlyphRange: glyphRange) { _, usedRect, _, _, _ in
+                result = result.union(usedRect)
+            }
+            return result
+        }
+
+        let introUsedRect = usedRect(for: nsSource.range(of: "Intro."))
+        let outroUsedRect = usedRect(for: nsSource.range(of: "Outro."))
+        XCTAssertFalse(
+            blockBackgroundRect.intersects(introUsedRect) || blockBackgroundRect.intersects(outroUsedRect),
+            "blockBackgroundRect=\(blockBackgroundRect), introUsedRect=\(introUsedRect), "
+                + "outroUsedRect=\(outroUsedRect)"
+        )
+    }
+
+    func testFencedCodeDirectlyAfterProseAddsLeadingBoundarySpacing() {
+        let source = "Intro.\n```swift\ncode\n```\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let introParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "Intro.").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let openingFenceParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "```swift").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+
+        XCTAssertNotNil(introParagraph)
+        XCTAssertGreaterThanOrEqual(introParagraph?.paragraphSpacing ?? 0, 6)
+        XCTAssertNotNil(openingFenceParagraph)
+        XCTAssertEqual(openingFenceParagraph?.paragraphSpacingBefore, 0)
+        XCTAssertEqual(openingFenceParagraph?.paragraphSpacing, 0)
+        XCTAssertEqual(output.string, source)
+    }
+
+    func testFencedCodeDirectlyBeforeProseAddsTrailingBoundarySpacing() {
+        let source = "```swift\ncode\n```\nOutro.\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let closingFenceParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "```\nOutro.").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let outroParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "Outro.").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+
+        XCTAssertNotNil(closingFenceParagraph)
+        XCTAssertEqual(closingFenceParagraph?.paragraphSpacingBefore, 0)
+        XCTAssertEqual(closingFenceParagraph?.paragraphSpacing, 0)
+        XCTAssertNotNil(outroParagraph)
+        XCTAssertGreaterThanOrEqual(outroParagraph?.paragraphSpacingBefore ?? 0, 6)
+        XCTAssertEqual(output.string, source)
+    }
+
+    func testBlankLineSeparatedFencedCodeKeepsExistingBoundarySpacing() {
+        let source = "Intro.\n\n```swift\ncode\n```\n\nOutro.\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let openingFenceIndex = nsSource.range(of: "```swift").location
+        let closingFenceIndex = nsSource.range(of: "```\n\nOutro.").location
+        let openingParagraph = output.attribute(
+            .paragraphStyle,
+            at: openingFenceIndex,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let closingParagraph = output.attribute(
+            .paragraphStyle,
+            at: closingFenceIndex,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+
+        XCTAssertNotNil(openingParagraph)
+        XCTAssertNotNil(closingParagraph)
+        XCTAssertEqual(openingParagraph?.paragraphSpacingBefore, 0)
+        XCTAssertEqual(openingParagraph?.paragraphSpacing, 0)
+        XCTAssertEqual(closingParagraph?.paragraphSpacingBefore, 0)
+        XCTAssertEqual(closingParagraph?.paragraphSpacing, 0)
+    }
+
+    func testFencedCodeInsideListPreservesIndentWhileAddingBoundarySpacing() {
+        let source = "- item\n  ```\n  code\n  ```\n  tail\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let itemParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "item").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let tailParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "tail").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let openingFenceParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "  ```").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let closingFenceParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "  ```\n  tail").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+
+        XCTAssertGreaterThanOrEqual(itemParagraph?.paragraphSpacing ?? 0, 6)
+        XCTAssertGreaterThan(itemParagraph?.headIndent ?? 0, 0)
+        XCTAssertGreaterThanOrEqual(tailParagraph?.paragraphSpacingBefore ?? 0, 6)
+        XCTAssertGreaterThan(tailParagraph?.headIndent ?? 0, 0)
+        XCTAssertEqual(openingFenceParagraph?.paragraphSpacingBefore, 0)
+        XCTAssertEqual(openingFenceParagraph?.paragraphSpacing, 0)
+        XCTAssertEqual(closingFenceParagraph?.paragraphSpacingBefore, 0)
+        XCTAssertEqual(closingFenceParagraph?.paragraphSpacing, 0)
+    }
+
+    func testIndentedCodeDirectlyBeforeProseAddsTrailingBoundarySpacing() {
+        let source = "    code\nOutro.\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let codeParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "code").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let outroParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "Outro.").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+
+        XCTAssertEqual(codeParagraph?.paragraphSpacing, 0)
+        XCTAssertGreaterThanOrEqual(outroParagraph?.paragraphSpacingBefore ?? 0, 6)
+        XCTAssertEqual(output.string, source)
+    }
+
+    func testBackToBackFencedCodeBlocksDoNotAddSpacingToFenceLines() {
+        let source = "```first\none\n```\n```second\ntwo\n```\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let fenceIndices = [
+            nsSource.range(of: "```first").location,
+            nsSource.range(of: "```\n```second").location,
+            nsSource.range(of: "```second").location,
+            nsSource.range(of: "```\n", options: .backwards).location
+        ]
+
+        for fenceIndex in fenceIndices {
+            let paragraph = output.attribute(
+                .paragraphStyle,
+                at: fenceIndex,
+                effectiveRange: nil
+            ) as? NSParagraphStyle
+            XCTAssertNotNil(paragraph)
+            XCTAssertEqual(paragraph?.paragraphSpacingBefore, 0)
+            XCTAssertEqual(paragraph?.paragraphSpacing, 0)
+        }
+        XCTAssertEqual(output.string, source)
+    }
+
+    func testBlockQuoteNestedFencePreservesNeighborIndentsWithSpacing() {
+        let source = "> before\n> ```\n> code\n> ```\n> after\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let beforeParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "before").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let afterParagraph = output.attribute(
+            .paragraphStyle,
+            at: nsSource.range(of: "after").location,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+
+        XCTAssertGreaterThanOrEqual(beforeParagraph?.paragraphSpacing ?? 0, 6)
+        XCTAssertGreaterThan(beforeParagraph?.headIndent ?? 0, 0)
+        XCTAssertGreaterThanOrEqual(afterParagraph?.paragraphSpacingBefore ?? 0, 6)
+        XCTAssertGreaterThan(afterParagraph?.headIndent ?? 0, 0)
+        XCTAssertEqual(output.string, source)
+    }
+
+    func testCRLFCodeBlockSpacingCoversNeighborParagraphTerminator() {
+        let source = "Intro.\r\n```swift\r\ncode\r\n```\r\nOutro.\r\n"
+        let output = render(source)
+        let nsSource = source as NSString
+        let introRange = nsSource.range(of: "Intro.")
+        let introParagraphRange = nsSource.paragraphRange(for: introRange)
+        var effectiveRange = NSRange(location: NSNotFound, length: 0)
+        let introParagraph = output.attribute(
+            .paragraphStyle,
+            at: introRange.location,
+            effectiveRange: &effectiveRange
+        ) as? NSParagraphStyle
+
+        XCTAssertGreaterThanOrEqual(introParagraph?.paragraphSpacing ?? 0, 6)
+        XCTAssertEqual(NSIntersectionRange(effectiveRange, introParagraphRange), introParagraphRange)
+        let carriageReturnIndex = NSMaxRange(introParagraphRange) - 2
+        let lineFeedIndex = NSMaxRange(introParagraphRange) - 1
+        let carriageReturnParagraph = output.attribute(
+            .paragraphStyle,
+            at: carriageReturnIndex,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        let lineFeedParagraph = output.attribute(
+            .paragraphStyle,
+            at: lineFeedIndex,
+            effectiveRange: nil
+        ) as? NSParagraphStyle
+        XCTAssertGreaterThanOrEqual(carriageReturnParagraph?.paragraphSpacing ?? 0, 6)
+        XCTAssertGreaterThanOrEqual(lineFeedParagraph?.paragraphSpacing ?? 0, 6)
+        XCTAssertEqual(output.string, source)
+    }
+
     func testQuotesAndListsTintTheirMarkersAndHangTheirWrappedLines() {
         let source = "> quoted line\n> still quoted\n\n- first item\n- second item\n\n1. ordered one\n"
         let output = render(source)

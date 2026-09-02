@@ -124,6 +124,14 @@ private final class SemiRenderedMarkdownRenderer {
     /// Deep enough for any hand-written document; a backstop against
     /// pathological nesting rather than a product limit.
     private static let maximumNestingDepth = 48
+    /// Mirrors `CodeBlockTextView.drawCodeBlockBackgrounds()`'s `backgroundPadding = 6`.
+    /// These values must stay equal so adjacent prose clears the expanded background.
+    private static let codeBlockBoundarySpacing: CGFloat = 6
+
+    private struct CodeBlockLineSpan {
+        let firstLine: Int
+        let lastLine: Int
+    }
 
     private let source: String
     private let nsSource: NSString
@@ -139,6 +147,8 @@ private final class SemiRenderedMarkdownRenderer {
     /// Literal-code spans. Wiki-link scanning skips these so `[[x]]` inside a
     /// code sample stays a code sample.
     private var codeSpans: [NSRange] = []
+    /// Source-line spans used to place boundary spacing after traversal.
+    private var codeBlockLineSpans: [CodeBlockLineSpan] = []
     /// Ranges of the blocks that can contain inline content. Wiki links are
     /// scanned inside these bounds only.
     private var inlineContainerRanges: [NSRange] = []
@@ -169,6 +179,7 @@ private final class SemiRenderedMarkdownRenderer {
         // the document describing the same characters.
         let document = Markdown.Document(parsing: source, options: [.disableSmartOpts])
         visit(document, depth: 0)
+        applyCodeBlockBoundarySpacing()
         decorateWikiLinks()
         return storage
     }
@@ -248,8 +259,12 @@ private final class SemiRenderedMarkdownRenderer {
         apply([.codeBlockSource: nsSource.substring(with: range)], to: range)
         codeSpans.append(range)
 
-        var firstContentLine = sourceRange.lowerBound.line
-        var lastContentLine = max(firstContentLine, sourceRange.upperBound.line)
+        let firstLine = sourceRange.lowerBound.line
+        let lastLine = max(firstLine, sourceRange.upperBound.line)
+        codeBlockLineSpans.append(CodeBlockLineSpan(firstLine: firstLine, lastLine: lastLine))
+
+        var firstContentLine = firstLine
+        var lastContentLine = lastLine
 
         if isFenceLine(sourceRange.lowerBound.line) {
             markLine(sourceRange.lowerBound.line)
@@ -269,6 +284,72 @@ private final class SemiRenderedMarkdownRenderer {
         applySyntaxHighlighting(
             in: NSRange(location: first.location, length: contentEnd - first.location)
         )
+    }
+
+    /// Adds clearance to nonblank prose lines adjacent to collected code blocks.
+    private func applyCodeBlockBoundarySpacing() {
+        for span in codeBlockLineSpans {
+            let precedingLine = span.firstLine - 1
+            if sourceLineHasNonWhitespaceContent(precedingLine),
+               !codeBlockLineSpans.contains(where: {
+                   $0.firstLine <= precedingLine && precedingLine <= $0.lastLine
+               })
+            {
+                applyParagraphSpacing(
+                    Self.codeBlockBoundarySpacing,
+                    keyPath: \.paragraphSpacing,
+                    toLine: precedingLine
+                )
+            }
+
+            let followingLine = span.lastLine + 1
+            if sourceLineHasNonWhitespaceContent(followingLine),
+               !codeBlockLineSpans.contains(where: {
+                   $0.firstLine <= followingLine && followingLine <= $0.lastLine
+               })
+            {
+                applyParagraphSpacing(
+                    Self.codeBlockBoundarySpacing,
+                    keyPath: \.paragraphSpacingBefore,
+                    toLine: followingLine
+                )
+            }
+        }
+        // Deliberately leave back-to-back blocks unchanged: spacing on a line
+        // inside another block would expand that block's own background.
+    }
+
+    /// Returns whether a source line contains anything other than spaces or tabs.
+    private func sourceLineHasNonWhitespaceContent(_ line: Int) -> Bool {
+        guard let range = mapper.lineContentRange(line: line) else { return false }
+        let end = range.location + range.length
+        for index in range.location ..< end {
+            guard let value = character(at: index) else { return false }
+            if !isSpaceOrTab(value) { return true }
+        }
+        return false
+    }
+
+    /// Raises one paragraph-spacing field on every effective style run in a source line.
+    private func applyParagraphSpacing(
+        _ spacing: CGFloat,
+        keyPath: ReferenceWritableKeyPath<NSMutableParagraphStyle, CGFloat>,
+        toLine line: Int
+    ) {
+        guard let lineRange = mapper.lineContentRange(line: line),
+              lineRange.location < storage.length
+        else { return }
+        let paragraphRange = nsSource.paragraphRange(for: lineRange)
+        var updates: [(NSMutableParagraphStyle, NSRange)] = []
+        storage.enumerateAttribute(.paragraphStyle, in: paragraphRange, options: []) { value, range, _ in
+            let paragraph = (value as? NSParagraphStyle)?.mutableCopy()
+                as? NSMutableParagraphStyle ?? makeParagraphStyle()
+            paragraph[keyPath: keyPath] = max(paragraph[keyPath: keyPath], spacing)
+            updates.append((paragraph, range))
+        }
+        for (paragraph, range) in updates {
+            apply([.paragraphStyle: paragraph], to: range)
+        }
     }
 
     private func style(_ quote: Markdown.BlockQuote) {
