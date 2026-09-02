@@ -35,15 +35,151 @@ enum AnthropicAPIModelsClientError: Error, Equatable {
     case missingPaginationCursor
     case repeatedPaginationCursor(String)
     case pageLimitExceeded(Int)
+    case invalidModelDescriptor
+}
+
+// Explicit because these values cross actor/task boundaries in catalog refresh payloads.
+// swiftformat:disable:next redundantSendable
+enum AnthropicJSONValue: Codable, Equatable, Sendable {
+    case null
+    case bool(Bool)
+    case number(Decimal)
+    case string(String)
+    case array([AnthropicJSONValue])
+    case object([String: AnthropicJSONValue])
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Decimal.self) {
+            self = .number(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([AnthropicJSONValue].self) {
+            self = .array(value)
+        } else {
+            self = try .object(container.decode([String: AnthropicJSONValue].self))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null: try container.encodeNil()
+        case let .bool(value): try container.encode(value)
+        case let .number(value): try container.encode(value)
+        case let .string(value): try container.encode(value)
+        case let .array(value): try container.encode(value)
+        case let .object(value): try container.encode(value)
+        }
+    }
+}
+
+// swiftformat:disable:next redundantSendable
+struct AnthropicDiscoveredModel: Codable, Equatable, Sendable {
+    let id: String
+    let displayName: String?
+    let maxInputTokens: Int?
+    let maxOutputTokens: Int?
+    let capabilities: AnthropicJSONValue?
+
+    init(
+        id: String,
+        displayName: String? = nil,
+        maxInputTokens: Int? = nil,
+        maxOutputTokens: Int? = nil,
+        capabilities: AnthropicJSONValue? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.maxInputTokens = maxInputTokens
+        self.maxOutputTokens = maxOutputTokens
+        self.capabilities = capabilities
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case displayName = "display_name"
+        case maxInputTokens = "max_input_tokens"
+        case maxOutputTokens = "max_tokens"
+        case capabilities
+    }
+}
+
+enum AnthropicDiscoveredModelValidation {
+    static func canonicalizedPreservingOrder(
+        _ models: [AnthropicDiscoveredModel]
+    ) -> [AnthropicDiscoveredModel]? {
+        var canonical: [AnthropicDiscoveredModel] = []
+        var seen = Set<String>()
+
+        for model in models {
+            let id = model.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty,
+                  id.utf8.count <= 512,
+                  !id.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  seen.insert(id).inserted,
+                  model.maxInputTokens.map({ $0 > 0 }) ?? true,
+                  model.maxOutputTokens.map({ $0 > 0 }) ?? true
+            else {
+                return nil
+            }
+
+            let displayName = model.displayName?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            canonical.append(AnthropicDiscoveredModel(
+                id: id,
+                displayName: displayName?.isEmpty == false ? displayName : nil,
+                maxInputTokens: model.maxInputTokens,
+                maxOutputTokens: model.maxOutputTokens,
+                capabilities: model.capabilities
+            ))
+        }
+        return canonical
+    }
 }
 
 struct AnthropicAPIModelsClient {
-    private struct ModelDescriptor: Decodable {
+    private struct TolerantModelDescriptor: Decodable {
         let id: String
+        let displayName: String?
+        let maxInputTokens: Int?
+        let maxOutputTokens: Int?
+        let capabilities: AnthropicJSONValue?
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(String.self, forKey: .id)
+            displayName = try? container.decode(String.self, forKey: .displayName)
+            maxInputTokens = try? container.decode(Int.self, forKey: .maxInputTokens)
+            maxOutputTokens = try? container.decode(Int.self, forKey: .maxOutputTokens)
+            capabilities = try? container.decode(AnthropicJSONValue.self, forKey: .capabilities)
+        }
+
+        var discoveredModel: AnthropicDiscoveredModel {
+            AnthropicDiscoveredModel(
+                id: id,
+                displayName: displayName,
+                maxInputTokens: maxInputTokens,
+                maxOutputTokens: maxOutputTokens,
+                capabilities: capabilities
+            )
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case displayName = "display_name"
+            case maxInputTokens = "max_input_tokens"
+            case maxOutputTokens = "max_tokens"
+            case capabilities
+        }
     }
 
     private struct ModelsPage: Decodable {
-        let data: [ModelDescriptor]
+        let data: [TolerantModelDescriptor]
         let lastID: String?
         let hasMore: Bool
 
@@ -80,7 +216,11 @@ struct AnthropicAPIModelsClient {
     }
 
     func fetchModelIDs() async throws -> [String] {
-        var modelIDs: [String] = []
+        try await fetchModels().map(\.id)
+    }
+
+    func fetchModels() async throws -> [AnthropicDiscoveredModel] {
+        var models: [AnthropicDiscoveredModel] = []
         var afterID: String?
         var seenCursors = Set<String>()
 
@@ -92,8 +232,15 @@ struct AnthropicAPIModelsClient {
             }
 
             let page = try JSONDecoder().decode(ModelsPage.self, from: response.data)
-            modelIDs.append(contentsOf: page.data.map(\.id))
-            guard page.hasMore else { return modelIDs }
+            models.append(contentsOf: page.data.map(\.discoveredModel))
+            guard page.hasMore else {
+                guard let canonicalModels = AnthropicDiscoveredModelValidation
+                    .canonicalizedPreservingOrder(models)
+                else {
+                    throw AnthropicAPIModelsClientError.invalidModelDescriptor
+                }
+                return canonicalModels
+            }
 
             guard let rawCursor = page.lastID else {
                 throw AnthropicAPIModelsClientError.missingPaginationCursor

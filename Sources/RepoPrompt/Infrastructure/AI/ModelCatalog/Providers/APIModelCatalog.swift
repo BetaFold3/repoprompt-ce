@@ -139,9 +139,26 @@ actor APIModelCatalogFileStorage: APIModelCatalogStorage {
     }
 }
 
+struct APIModelCatalogRefreshPayload {
+    let modelIDs: [String]
+    let acceptsEmptyResponse: Bool
+    let acceptedCommit: (@Sendable () async -> Void)?
+
+    init(
+        modelIDs: [String],
+        acceptsEmptyResponse: Bool = false,
+        acceptedCommit: (@Sendable () async -> Void)? = nil
+    ) {
+        self.modelIDs = modelIDs
+        self.acceptsEmptyResponse = acceptsEmptyResponse
+        self.acceptedCommit = acceptedCommit
+    }
+}
+
 actor APIModelCatalog {
     typealias Clock = @Sendable () -> Date
     typealias Loader = @Sendable (APIModelCatalogScope) async throws -> [String]
+    typealias PayloadLoader = @Sendable (APIModelCatalogScope) async throws -> APIModelCatalogRefreshPayload
 
     private struct Entry {
         var generation: UInt64 = 0
@@ -199,6 +216,29 @@ actor APIModelCatalog {
         }
     }
 
+    func snapshots(
+        for scope: APIModelCatalogScope,
+        payloadLoader: @escaping PayloadLoader
+    ) -> AsyncStream<APIModelCatalogSnapshot> {
+        AsyncStream { continuation in
+            let producer = Task {
+                let cached = await self.cachedSnapshot(for: scope)
+                if let cached {
+                    continuation.yield(cached)
+                }
+
+                let refreshed = await self.refresh(for: scope, payloadLoader: payloadLoader)
+                if let refreshed, refreshed != cached {
+                    continuation.yield(refreshed)
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { @Sendable _ in
+                producer.cancel()
+            }
+        }
+    }
+
     @discardableResult
     func refresh(
         for scope: APIModelCatalogScope,
@@ -208,8 +248,24 @@ actor APIModelCatalog {
         if let refreshTask = entries[scope]?.refreshTask {
             return await refreshTask.value
         }
-        guard let loader = requestedLoader ?? defaultLoader else {
+        let loader = requestedLoader ?? defaultLoader
+        guard let loader else {
             return entries[scope]?.snapshot
+        }
+        return await refresh(for: scope) { scope in
+            let modelIDs = try await loader(scope)
+            return APIModelCatalogRefreshPayload(modelIDs: modelIDs)
+        }
+    }
+
+    @discardableResult
+    func refresh(
+        for scope: APIModelCatalogScope,
+        payloadLoader: @escaping PayloadLoader
+    ) async -> APIModelCatalogSnapshot? {
+        _ = await ensureCachedSnapshotLoaded(for: scope)
+        if let refreshTask = entries[scope]?.refreshTask {
+            return await refreshTask.value
         }
 
         var entry = entries[scope] ?? Entry()
@@ -217,11 +273,11 @@ actor APIModelCatalog {
         let generation = entry.generation
         let task = Task { [weak self] in
             do {
-                let modelIDs = try await loader(scope)
+                let payload = try await payloadLoader(scope)
                 return await self?.completeRefresh(
                     for: scope,
                     generation: generation,
-                    loadedModelIDs: modelIDs
+                    payload: payload
                 )
             } catch {
                 return await self?.completeRefreshFailure(for: scope, generation: generation)
@@ -285,10 +341,7 @@ actor APIModelCatalog {
         entry.didLoadStorage = true
         entry.loadTask = nil
 
-        if let stored,
-           stored.scope == scope,
-           !normalizedModelIDs(stored.modelIDs).isEmpty
-        {
+        if let stored, stored.scope == scope {
             entry.snapshot = APIModelCatalogSnapshot(
                 scope: scope,
                 modelIDs: normalizedModelIDs(stored.modelIDs),
@@ -303,20 +356,25 @@ actor APIModelCatalog {
     private func completeRefresh(
         for scope: APIModelCatalogScope,
         generation: UInt64,
-        loadedModelIDs: [String]
+        payload: APIModelCatalogRefreshPayload
     ) async -> APIModelCatalogSnapshot? {
         guard entries[scope]?.generation == generation else {
             return entries[scope]?.snapshot
         }
 
-        let modelIDs = normalizedModelIDs(loadedModelIDs)
-        guard !modelIDs.isEmpty else {
+        let normalizedModelIDs = normalizedModelIDs(payload.modelIDs)
+        let acceptedModelIDs: [String]
+        if !normalizedModelIDs.isEmpty {
+            acceptedModelIDs = normalizedModelIDs
+        } else if payload.acceptsEmptyResponse, payload.modelIDs.isEmpty {
+            acceptedModelIDs = []
+        } else {
             return completeRefreshFailure(for: scope, generation: generation)
         }
 
         let snapshot = APIModelCatalogSnapshot(
             scope: scope,
-            modelIDs: modelIDs,
+            modelIDs: acceptedModelIDs,
             refreshedAt: clock(),
             generation: generation
         )
@@ -332,6 +390,7 @@ actor APIModelCatalog {
         entry.didLoadStorage = true
         entry.refreshTask = nil
         entries[scope] = entry
+        await payload.acceptedCommit?()
         return snapshot
     }
 

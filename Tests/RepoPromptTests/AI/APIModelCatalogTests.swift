@@ -171,6 +171,73 @@ final class APIModelCatalogTests: XCTestCase {
         XCTAssertEqual(savedModelIDs, [["newer"]])
     }
 
+    func testAcceptedEmptyPayloadClearsPriorSnapshotAndRunsCommit() async throws {
+        let scope = try makeScope()
+        let accepted = APIModelCatalogAcceptedCommitProbe()
+        let storage = APIModelCatalogStorageSpy()
+        let catalog = APIModelCatalog(storage: storage)
+
+        _ = await catalog.refresh(for: scope, payloadLoader: { _ in
+            APIModelCatalogRefreshPayload(modelIDs: ["known"])
+        })
+        let cleared = await catalog.refresh(for: scope, payloadLoader: { _ in
+            APIModelCatalogRefreshPayload(
+                modelIDs: [],
+                acceptsEmptyResponse: true,
+                acceptedCommit: { accepted.append("empty") }
+            )
+        })
+
+        let cachedModelIDs = await catalog.cachedSnapshot(for: scope)?.modelIDs
+        let savedModelIDs = await storage.savedSnapshots.map(\.modelIDs)
+        let rehydratedCatalog = APIModelCatalog(storage: storage)
+        let rehydratedModelIDs = await rehydratedCatalog.cachedSnapshot(for: scope)?.modelIDs
+        XCTAssertEqual(cleared?.modelIDs, [])
+        XCTAssertEqual(cachedModelIDs, [])
+        XCTAssertEqual(savedModelIDs, [["known"], []])
+        XCTAssertEqual(rehydratedModelIDs, [])
+        XCTAssertEqual(accepted.values, ["empty"])
+    }
+
+    func testInvalidationGenerationPreventsStaleDescriptorPayloadCommit() async throws {
+        let scope = try makeScope()
+        let loader = APIModelCatalogPayloadLoaderProbe()
+        let accepted = APIModelCatalogAcceptedCommitProbe()
+        let catalog = APIModelCatalog()
+
+        let olderRefresh = Task {
+            await catalog.refresh(for: scope, payloadLoader: { try await loader.load($0) })
+        }
+        await loader.waitForCallCount(1)
+        await catalog.invalidate(scope)
+
+        let newerRefresh = Task {
+            await catalog.refresh(for: scope, payloadLoader: { try await loader.load($0) })
+        }
+        await loader.waitForCallCount(2)
+        await loader.succeed(
+            call: 1,
+            payload: APIModelCatalogRefreshPayload(
+                modelIDs: ["newer"],
+                acceptedCommit: { accepted.append("newer") }
+            )
+        )
+        _ = await newerRefresh.value
+
+        await loader.succeed(
+            call: 0,
+            payload: APIModelCatalogRefreshPayload(
+                modelIDs: ["older"],
+                acceptedCommit: { accepted.append("older") }
+            )
+        )
+        _ = await olderRefresh.value
+
+        let cachedModelIDs = await catalog.cachedSnapshot(for: scope)?.modelIDs
+        XCTAssertEqual(accepted.values, ["newer"])
+        XCTAssertEqual(cachedModelIDs, ["newer"])
+    }
+
     private func makeScope() throws -> APIModelCatalogScope {
         try XCTUnwrap(APIModelCatalogScope(
             providerID: "openai",
@@ -223,6 +290,61 @@ private actor APIModelCatalogLoaderProbe {
             }
         }
         callWaiters = remaining
+    }
+}
+
+private actor APIModelCatalogPayloadLoaderProbe {
+    private var callCount = 0
+    private var pending: [Int: CheckedContinuation<APIModelCatalogRefreshPayload, any Error>] = [:]
+    private var callWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func load(_ scope: APIModelCatalogScope) async throws -> APIModelCatalogRefreshPayload {
+        let call = callCount
+        callCount += 1
+        resumeSatisfiedWaiters()
+        return try await withCheckedThrowingContinuation { continuation in
+            pending[call] = continuation
+        }
+    }
+
+    func waitForCallCount(_ target: Int) async {
+        guard callCount < target else { return }
+        await withCheckedContinuation { continuation in
+            callWaiters.append((target, continuation))
+        }
+    }
+
+    func succeed(call: Int, payload: APIModelCatalogRefreshPayload) {
+        pending.removeValue(forKey: call)?.resume(returning: payload)
+    }
+
+    private func resumeSatisfiedWaiters() {
+        var remaining: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+        for waiter in callWaiters {
+            if callCount >= waiter.target {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        callWaiters = remaining
+    }
+}
+
+private final class APIModelCatalogAcceptedCommitProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValues: [String] = []
+
+    var values: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValues
+    }
+
+    func append(_ value: String) {
+        lock.lock()
+        storedValues.append(value)
+        lock.unlock()
     }
 }
 

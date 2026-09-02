@@ -1453,10 +1453,15 @@ public class APISettingsViewModel: ObservableObject {
     private let claudeFamilyModelAvailabilityRefreshBoundary: (@MainActor @Sendable () async -> Void)?
     private let codexModelPollingService: CodexModelPollingService
     private let apiModelCatalog: APIModelCatalog
-    private let anthropicModelsLoader: @Sendable (String) async throws -> [String]
+    private let anthropicDiscoveredModelStore: AnthropicDiscoveredModelStore
+    private let anthropicModelsLoader: @Sendable (String) async throws -> [AnthropicDiscoveredModel]
+    private let anthropicKeyValidationOperation: @Sendable (String) async throws -> Bool
+    private let anthropicModelsSnapshotsCreatedBoundary: (@MainActor @Sendable () async -> Void)?
     private let storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)?
     private let contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)?
     private var activeAnthropicModelCatalogScope: APIModelCatalogScope?
+    private var anthropicModelRefreshIdentityScope: APIModelCatalogScope?
+    private var anthropicModelRefreshEpoch: UInt64 = 0
     private var activeOpenAIModelCatalogScope: APIModelCatalogScope?
     private var hasPreparedForWindowClose = false
 
@@ -1472,7 +1477,10 @@ public class APISettingsViewModel: ObservableObject {
         cliResolvedCommandCacheInvalidator: (() async -> Void)? = nil,
         claudeExecutableOverridePipelineObserver: ((ClaudeExecutableOverridePipelineStage) -> Void)? = nil,
         claudeFamilyModelAvailabilityRefreshBoundary: (@MainActor @Sendable () async -> Void)? = nil,
-        anthropicModelsLoader: (@Sendable (String) async throws -> [String])? = nil,
+        anthropicDiscoveredModelStore: AnthropicDiscoveredModelStore = .shared,
+        anthropicModelsLoader: (@Sendable (String) async throws -> [AnthropicDiscoveredModel])? = nil,
+        anthropicKeyValidationOperation: (@Sendable (String) async throws -> Bool)? = nil,
+        anthropicModelsSnapshotsCreatedBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         storedDataLoadBoundary: (@MainActor @Sendable () async -> Void)? = nil,
         contextBuilderProviderValidationWillBegin: (@MainActor @Sendable () async -> Void)? = nil
     ) {
@@ -1492,9 +1500,14 @@ public class APISettingsViewModel: ObservableObject {
         self.claudeFamilyModelAvailabilityRefreshBoundary = claudeFamilyModelAvailabilityRefreshBoundary
         self.codexModelPollingService = codexModelPollingService
         self.apiModelCatalog = apiModelCatalog ?? Self.makeDefaultAPIModelCatalog()
+        self.anthropicDiscoveredModelStore = anthropicDiscoveredModelStore
         self.anthropicModelsLoader = anthropicModelsLoader ?? { apiKey in
-            try await AnthropicAPIModelsClient(apiKey: apiKey).fetchModelIDs()
+            try await AnthropicAPIModelsClient(apiKey: apiKey).fetchModels()
         }
+        self.anthropicKeyValidationOperation = anthropicKeyValidationOperation ?? { apiKey in
+            try await aiQueriesService.testAnthropicAPI(with: apiKey)
+        }
+        self.anthropicModelsSnapshotsCreatedBoundary = anthropicModelsSnapshotsCreatedBoundary
         self.storedDataLoadBoundary = storedDataLoadBoundary
         self.contextBuilderProviderValidationWillBegin = contextBuilderProviderValidationWillBegin
         synchronizeClaudeExecutableOverrideAppliedState(updateDraft: true)
@@ -2028,7 +2041,11 @@ public class APISettingsViewModel: ObservableObject {
         // 4. Fire-and-forget model-catalogue fetches (always refresh)
         // ----------------------------------------------------------------
         guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
-        if isAnthropicKeyValid { startAnthropicModelsRefresh() }
+        if isAnthropicKeyValid {
+            startAnthropicModelsRefresh()
+        } else {
+            invalidateAnthropicModelRefreshIdentity()
+        }
         if isOpenAIKeyValid { startOpenAIModelsRefresh() }
         if isDeepSeekKeyValid { deepSeekModelsTask = Task { await self.updateDeepSeekModels() } }
         if isFireworksKeyValid { fireworksModelsTask = Task { await self.updateFireworksModels() } }
@@ -2417,8 +2434,13 @@ public class APISettingsViewModel: ObservableObject {
 
             switch provider {
             case .anthropic:
+                let previousScope = clearAnthropicModelDiscoveryState()
                 anthropicApiKey = trimmedKey
                 isAnthropicKeyValid = true
+                let nextScope = anthropicModelCatalogScope(apiKey: trimmedKey)
+                if let previousScope, previousScope != nextScope {
+                    await apiModelCatalog.invalidate(previousScope)
+                }
                 seedPreferredComposeModelIfMissing(AIModel.claude4Sonnet, reason: "api_settings.validate_key.default_seed.anthropic")
             case .openAI:
                 openAIApiKey = trimmedKey
@@ -2480,7 +2502,12 @@ public class APISettingsViewModel: ObservableObject {
                 break
             }
 
-            await updateAvailableModels()
+            if provider == .anthropic {
+                let refreshTask = startAnthropicModelsRefresh()
+                await refreshTask.value
+            } else {
+                await updateAvailableModels()
+            }
         }
         return isValid
     }
@@ -2492,6 +2519,7 @@ public class APISettingsViewModel: ObservableObject {
             let scope = clearAnthropicModelDiscoveryState()
             anthropicApiKey = ""
             isAnthropicKeyValid = false
+            invalidateAnthropicModelRefreshIdentity()
             if let scope {
                 await apiModelCatalog.invalidate(scope)
             }
@@ -2656,7 +2684,7 @@ public class APISettingsViewModel: ObservableObject {
         isAnthropicKeyValid = false
         await updateAvailableModels()
 
-        let isValid = try await aiQueriesService.testAnthropicAPI(with: trimmedKey)
+        let isValid = try await anthropicKeyValidationOperation(trimmedKey)
         if isValid {
             try await keyManager.saveAPIKey(trimmedKey, for: .anthropic)
             anthropicApiKey = trimmedKey
@@ -4289,12 +4317,23 @@ public class APISettingsViewModel: ObservableObject {
     @discardableResult
     private func startAnthropicModelsRefresh() -> Task<Void, Never> {
         anthropicModelsTask?.cancel()
+        let identityScope = anthropicModelCatalogScope(apiKey: anthropicApiKey)
+        if anthropicModelRefreshIdentityScope != identityScope {
+            anthropicModelRefreshEpoch &+= 1
+            anthropicModelRefreshIdentityScope = identityScope
+        }
+        let refreshEpoch = anthropicModelRefreshEpoch
         let task = Task { @MainActor [weak self] in
             guard let self, !hasPreparedForWindowClose else { return }
-            await updateAnthropicModels()
+            await updateAnthropicModels(refreshEpoch: refreshEpoch)
         }
         anthropicModelsTask = task
         return task
+    }
+
+    private func invalidateAnthropicModelRefreshIdentity() {
+        anthropicModelRefreshEpoch &+= 1
+        anthropicModelRefreshIdentityScope = nil
     }
 
     @discardableResult
@@ -4348,7 +4387,7 @@ public class APISettingsViewModel: ObservableObject {
         )
     }
 
-    private func updateAnthropicModels() async {
+    private func updateAnthropicModels(refreshEpoch: UInt64) async {
         guard isAnthropicKeyValid else {
             activeAnthropicModelCatalogScope = nil
             availableAnthropicModels = []
@@ -4371,9 +4410,24 @@ public class APISettingsViewModel: ObservableObject {
 
         let capturedKey = anthropicApiKey
         let loader = anthropicModelsLoader
-        let snapshots = await apiModelCatalog.snapshots(for: scope) { _ in
-            try await loader(capturedKey)
-        }
+        let store = anthropicDiscoveredModelStore
+        let snapshots = await apiModelCatalog.snapshots(for: scope, payloadLoader: { _ in
+            let models = try await loader(capturedKey)
+            return APIModelCatalogRefreshPayload(
+                modelIDs: models.map(\.id),
+                acceptsEmptyResponse: true,
+                acceptedCommit: { [weak self] in
+                    await self?.commitAnthropicModels(
+                        models,
+                        store: store,
+                        scope: scope,
+                        apiKey: capturedKey,
+                        refreshEpoch: refreshEpoch
+                    )
+                }
+            )
+        })
+        await anthropicModelsSnapshotsCreatedBoundary?()
 
         for await snapshot in snapshots {
             guard !Task.isCancelled,
@@ -4385,6 +4439,25 @@ public class APISettingsViewModel: ObservableObject {
             availableAnthropicModels = snapshot.modelIDs
             await updateAvailableModels()
         }
+    }
+
+    private func commitAnthropicModels(
+        _ models: [AnthropicDiscoveredModel],
+        store: AnthropicDiscoveredModelStore,
+        scope: APIModelCatalogScope,
+        apiKey: String,
+        refreshEpoch: UInt64
+    ) {
+        guard !hasPreparedForWindowClose,
+              isAnthropicKeyValid,
+              anthropicModelRefreshEpoch == refreshEpoch,
+              anthropicModelRefreshIdentityScope == scope,
+              activeAnthropicModelCatalogScope == scope,
+              anthropicApiKey == apiKey
+        else {
+            return
+        }
+        store.replace(with: models)
     }
 
     private func updateOpenAIModels() async {

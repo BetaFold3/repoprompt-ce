@@ -5,7 +5,7 @@ Authority: Authoritative
 Last-verified: 2026-09-02
 
 - **Date:** 2026-09-02
-- **Status:** Phases 1a/1b implemented; Phases 2–4 planned
+- **Status:** Phases 1a/1b and 2 implemented; Phases 3–4 planned
 - **Provenance:** Two independent Oracle consultations (OracleE, OracleD) received an identical prompt with verified repo/upstream facts; material disagreements were cross-examined anonymously over two rounds; minor points were resolved by the orchestrating agent with its own verification. Lane identity checks (`model_preset_id`/`model_preset_name`) passed on every send.
 
 ## 1. Goals
@@ -52,11 +52,11 @@ Defaults unchanged everywhere: provider default stays `opus`; app effort default
 3. `AIModelCapabilityMetadata`: `.anthropicCustom(name:)` consults trait table (fable family → `(1M, .exact)`) before returning `(nil, nil)`; registry lookup lands ahead of this in Phase 2. Enforce known max-output ceiling in `AnthropicRequestPlan.resolve` (reject `requestedMaxTokens` above a known limit) — a few lines beside the existing budget validation.
 4. **Refusal handling (in scope — converged in round 2):** first verify (U8) whether the pinned SwiftAnthropic types already decode terminal `stop_reason` (likely, since `end_turn` vs `max_tokens` must be distinguishable). Favorable → ~15-line provider-local guard; unfavorable → narrowest local decode of terminal `stop_reason` only (never a transport replacement). On `refusal`: streaming finishes with typed `AnthropicProviderResponseError.refusal` after already-emitted deltas (no successful `message_stop`); non-streaming throws. `stop_details` included only if the pinned types already expose it; otherwise a bounded message. One focused terminal-state test in an existing suite where possible.
 
-### Phase 2 — Models API metadata + persisted registry
+### Phase 2 — Models API metadata + persisted registry (implemented)
 
 1. `AnthropicAPIModelsClient`: decode `display_name`, `max_input_tokens`, `max_tokens` (as maxOutputTokens), `capabilities` (lossless, optional, absence tolerated); new `fetchModels() -> [AnthropicDiscoveredModel]`; keep `fetchModelIDs()` as a mapping wrapper so existing call sites/tests stay intact; retain cursor-loop/page-limit protections; atomic validation across the full paginated result.
 2. **New** `AnthropicDiscoveredModelStore` (Cursor-store pattern): injectable storage, versioned envelope (`AnthropicModelCatalogV1`: version, fetchedAt, models), synchronous hydration at init, atomic whole-replacement, last-good retention on transient failure, corrupt/future-version envelopes ignored but preserved, cleared **only** on a structurally valid empty response, **not cleared on API-key removal** (models stay runnable via CLI), monotone `revision` for memoization, main-queue change notification.
-3. `APISettingsViewModel`: Anthropic loader fetches descriptors, feeds the store, returns `.map(\.id)` so the published `availableAnthropicModels: [String]` contract is unchanged; scope/generation guards prevent stale-scope commits (inspect `APIModelCatalog`'s snapshot payload first — U1; carry descriptors through the pipeline if it is generic enough, side-channel otherwise). Refresh triggers: existing ones (launch / key change / scope change) plus a forced refresh after successful key validation; **no TTL loop** (single-user app; launch refresh suffices — orchestrator resolution of a minor divergence).
+3. `APISettingsViewModel`: Anthropic loader fetches descriptors and returns `.map(\.id)` so the published `availableAnthropicModels: [String]` contract is unchanged; `APIModelCatalog` carries a narrow accepted-commit payload so descriptors reach the store only after the refresh generation is accepted, preventing stale-scope commits while preserving OpenAI and stored snapshot compatibility. Refresh triggers: existing ones (launch / key change / scope change) plus a forced refresh after successful key validation; **no TTL loop** (single-user app; launch refresh suffices — orchestrator resolution of a minor divergence).
 
 ### Phase 3 — Family grammar + dynamic pass-through
 

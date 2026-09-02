@@ -18,6 +18,7 @@ final class AnthropicAPIModelsClientTests: XCTestCase {
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: APIModelCatalog(),
+            anthropicDiscoveredModelStore: .transient(),
             anthropicModelsLoader: { key in
                 await loader.load(key: key)
             }
@@ -51,6 +52,7 @@ final class AnthropicAPIModelsClientTests: XCTestCase {
             keyManager: keyManager,
             loadStoredDataOnInit: false,
             apiModelCatalog: APIModelCatalog(),
+            anthropicDiscoveredModelStore: .transient(),
             anthropicModelsLoader: { key in
                 await loader.load(key: key)
             }
@@ -128,6 +130,155 @@ final class AnthropicAPIModelsClientTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
         XCTAssertEqual(request.value(forHTTPHeaderField: "accept"), "application/json")
         XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+    }
+
+    func testFetchModelsDecodesMetadataMissingFieldsAndLosslessCapabilities() async throws {
+        let object: [String: Any] = [
+            "data": [
+                [
+                    "id": "claude-fable-5-1",
+                    "display_name": "Claude Fable 5.1",
+                    "max_input_tokens": 1_000_000,
+                    "max_tokens": 128_000,
+                    "capabilities": [
+                        "thinking": true,
+                        "effort_levels": ["low", "high"],
+                        "nested": ["limit": 12.5, "nullable": NSNull()]
+                    ]
+                ],
+                ["id": "claude-minimal"]
+            ],
+            "last_id": "claude-minimal",
+            "has_more": false
+        ]
+        let responseData = try JSONSerialization.data(withJSONObject: object)
+        let transport = AnthropicAPIModelsTransportSpy(stubs: [
+            .init(data: responseData, statusCode: 200)
+        ])
+        let client = AnthropicAPIModelsClient(apiKey: "test-key", transport: transport)
+        let models = try await client.fetchModels()
+        let decimalCapability = try XCTUnwrap(Decimal(string: "12.5"))
+
+        let expectedModels = [
+            AnthropicDiscoveredModel(
+                id: "claude-fable-5-1",
+                displayName: "Claude Fable 5.1",
+                maxInputTokens: 1_000_000,
+                maxOutputTokens: 128_000,
+                capabilities: .object([
+                    "thinking": .bool(true),
+                    "effort_levels": .array([.string("low"), .string("high")]),
+                    "nested": .object([
+                        "limit": .number(decimalCapability),
+                        "nullable": .null
+                    ])
+                ])
+            ),
+            AnthropicDiscoveredModel(id: "claude-minimal")
+        ]
+        XCTAssertEqual(models, expectedModels)
+
+        let encodedModels = try JSONEncoder().encode(models)
+        let roundTrippedModels = try JSONDecoder().decode(
+            [AnthropicDiscoveredModel].self,
+            from: encodedModels
+        )
+        XCTAssertEqual(roundTrippedModels, expectedModels)
+    }
+
+    func testFetchModelsToleratesAnyCapabilitiesShapeAndMalformedOptionalMetadata() async throws {
+        let responseData = Data(
+            """
+            {
+              "data": [
+                {
+                  "id": "claude-array-capabilities",
+                  "display_name": 42,
+                  "max_input_tokens": "many",
+                  "max_tokens": [],
+                  "capabilities": [true, "adaptive", 3]
+                },
+                {
+                  "id": "claude-scalar-capabilities",
+                  "capabilities": "adaptive"
+                },
+                {
+                  "id": "claude-malformed-capabilities",
+                  "capabilities": 1e10000
+                }
+              ],
+              "last_id": "claude-malformed-capabilities",
+              "has_more": false
+            }
+            """.utf8
+        )
+        let transport = AnthropicAPIModelsTransportSpy(stubs: [
+            .init(data: responseData, statusCode: 200),
+            .init(data: responseData, statusCode: 200)
+        ])
+        let client = AnthropicAPIModelsClient(apiKey: "test-key", transport: transport)
+
+        let models = try await client.fetchModels()
+
+        XCTAssertEqual(models, [
+            AnthropicDiscoveredModel(
+                id: "claude-array-capabilities",
+                capabilities: .array([.bool(true), .string("adaptive"), .number(3)])
+            ),
+            AnthropicDiscoveredModel(
+                id: "claude-scalar-capabilities",
+                capabilities: .string("adaptive")
+            ),
+            AnthropicDiscoveredModel(id: "claude-malformed-capabilities")
+        ])
+        let modelIDs = try await client.fetchModelIDs()
+        XCTAssertEqual(modelIDs, [
+            "claude-array-capabilities",
+            "claude-scalar-capabilities",
+            "claude-malformed-capabilities"
+        ])
+    }
+
+    func testFetchModelIDsWrapperPreservesPaginatedCompatibility() async throws {
+        let transport = AnthropicAPIModelsTransportSpy(stubs: [
+            .init(data: page(ids: ["claude-first"], lastID: "cursor-one", hasMore: true), statusCode: 200),
+            .init(data: page(ids: ["claude-second"], lastID: "cursor-two", hasMore: false), statusCode: 200)
+        ])
+        let client = AnthropicAPIModelsClient(apiKey: "test-key", transport: transport)
+
+        let modelIDs = try await client.fetchModelIDs()
+        XCTAssertEqual(modelIDs, ["claude-first", "claude-second"])
+    }
+
+    func testFetchModelsRejectsWholePaginatedResultWhenLaterPageIsInvalid() async throws {
+        let invalidLaterPages = [
+            Data("{malformed".utf8),
+            page(ids: ["   "], lastID: "invalid", hasMore: false),
+            page(ids: ["claude-first"], lastID: "duplicate", hasMore: false)
+        ]
+
+        for invalidLaterPage in invalidLaterPages {
+            let transport = AnthropicAPIModelsTransportSpy(stubs: [
+                .init(
+                    data: page(
+                        ids: ["claude-first"],
+                        lastID: "cursor-one",
+                        hasMore: true
+                    ),
+                    statusCode: 200
+                ),
+                .init(data: invalidLaterPage, statusCode: 200)
+            ])
+            let client = AnthropicAPIModelsClient(apiKey: "test-key", transport: transport)
+
+            do {
+                _ = try await client.fetchModels()
+                XCTFail("Expected the full paginated fetch to fail atomically")
+            } catch {
+                let requestCount = await transport.capturedRequests().count
+                XCTAssertEqual(requestCount, 2)
+            }
+        }
     }
 
     func testFetchPaginatesUsingLastIDAsAfterID() async throws {
@@ -232,6 +383,13 @@ final class AnthropicAPIModelsClientTests: XCTestCase {
         XCTAssertEqual(AIModel.fromModelName(unknown.rawValue), unknown)
         XCTAssertEqual(unknown.providerType, .anthropic)
         XCTAssertNil(unknown.claudeCodeRuntimeSpecifierRaw)
+
+        let fable51 = AIModel.anthropicCustom(name: "claude-fable-5-1")
+        XCTAssertEqual(
+            AnthropicDiscoveredModelCatalog.models(from: ["claude-fable-5-1"]),
+            [fable51]
+        )
+        XCTAssertNotEqual(fable51, .claudeCodeModel(specifier: "claude-fable-5-1"))
     }
 
     private func page(ids: [String], lastID: String?, hasMore: Bool) -> Data {
@@ -299,9 +457,9 @@ private actor AnthropicModelsLoaderProbe {
         self.modelIDs = modelIDs
     }
 
-    func load(key: String) -> [String] {
+    func load(key: String) -> [AnthropicDiscoveredModel] {
         keys.append(key)
-        return modelIDs
+        return modelIDs.map { AnthropicDiscoveredModel(id: $0) }
     }
 
     func loadedKeys() -> [String] {
@@ -317,9 +475,9 @@ private actor KeyedAnthropicModelsLoaderProbe {
         self.modelIDsByKey = modelIDsByKey
     }
 
-    func load(key: String) -> [String] {
+    func load(key: String) -> [AnthropicDiscoveredModel] {
         keys.append(key)
-        return modelIDsByKey[key] ?? []
+        return (modelIDsByKey[key] ?? []).map { AnthropicDiscoveredModel(id: $0) }
     }
 
     func loadedKeys() -> [String] {
