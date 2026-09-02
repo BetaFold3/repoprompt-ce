@@ -39,6 +39,56 @@ final class AgentTranscriptPreviewLinkResolverTests: XCTestCase {
             PreviewDocumentReference(rootID: rootID, relativePath: "docs/report.md")
         )
 
+        let singleRootMentionReference = await worktreeResolver.reference(
+            for: "@docs/report.md",
+            tabID: UUID()
+        )
+        XCTAssertEqual(
+            singleRootMentionReference,
+            PreviewDocumentReference(rootID: rootID, relativePath: "docs/report.md")
+        )
+
+        let rippleRootID = UUID()
+        let thanosRootID = UUID()
+        let namedMultiRootEnvironment = TranscriptPreviewEnvironment(inputs: AgentChangesPanelRootInputs(
+            logicalRoots: [
+                AgentPanelLogicalRoot(path: "/ws/ripple", name: "ripple"),
+                AgentPanelLogicalRoot(path: "/ws/thanos", name: "thanos")
+            ],
+            rootIDsByPath: ["/ws/ripple": rippleRootID, "/ws/thanos": thanosRootID],
+            worktreeBindings: [],
+            isPreparingWorktree: false,
+            watchedRootPaths: ["/ws/ripple", "/ws/thanos"]
+        ))
+        let namedMultiRootResolver = AgentTranscriptPreviewLinkResolver(
+            environment: namedMultiRootEnvironment,
+            probe: TranscriptPreviewProbe(repositoryPaths: ["/ws/ripple", "/ws/thanos"])
+        )
+
+        let rootPrefixedCases = [
+            (
+                path: "@ripple/docs/edge-report-alerting.md",
+                expected: PreviewDocumentReference(
+                    rootID: rippleRootID,
+                    relativePath: "docs/edge-report-alerting.md"
+                )
+            ),
+            (
+                path: "thanos/docs/drain-probe.HTML",
+                expected: PreviewDocumentReference(
+                    rootID: thanosRootID,
+                    relativePath: "docs/drain-probe.HTML"
+                )
+            )
+        ]
+        for testCase in rootPrefixedCases {
+            let reference = await namedMultiRootResolver.reference(
+                for: testCase.path,
+                tabID: UUID()
+            )
+            XCTAssertEqual(reference, testCase.expected, testCase.path)
+        }
+
         let firstRootID = UUID()
         let secondRootID = UUID()
         let ambiguousEnvironment = TranscriptPreviewEnvironment(inputs: AgentChangesPanelRootInputs(
@@ -58,6 +108,32 @@ final class AgentTranscriptPreviewLinkResolverTests: XCTestCase {
 
         let ambiguousReference = await ambiguousResolver.reference(for: "README.md", tabID: UUID())
         XCTAssertNil(ambiguousReference)
+
+        let firstSharedRootID = UUID()
+        let secondSharedRootID = UUID()
+        let ambiguousAliasEnvironment = TranscriptPreviewEnvironment(inputs: AgentChangesPanelRootInputs(
+            logicalRoots: [
+                AgentPanelLogicalRoot(path: "/ws/one/shared", name: "shared"),
+                AgentPanelLogicalRoot(path: "/ws/two/shared", name: "shared")
+            ],
+            rootIDsByPath: [
+                "/ws/one/shared": firstSharedRootID,
+                "/ws/two/shared": secondSharedRootID
+            ],
+            worktreeBindings: [],
+            isPreparingWorktree: false,
+            watchedRootPaths: ["/ws/one/shared", "/ws/two/shared"]
+        ))
+        let ambiguousAliasResolver = AgentTranscriptPreviewLinkResolver(
+            environment: ambiguousAliasEnvironment,
+            probe: TranscriptPreviewProbe(repositoryPaths: ["/ws/one/shared", "/ws/two/shared"])
+        )
+
+        let ambiguousAliasReference = await ambiguousAliasResolver.reference(
+            for: "@shared/docs/report.md",
+            tabID: UUID()
+        )
+        XCTAssertNil(ambiguousAliasReference)
     }
 
     func testRoutingKindGateOrderingAndFallbackPolicy() async throws {

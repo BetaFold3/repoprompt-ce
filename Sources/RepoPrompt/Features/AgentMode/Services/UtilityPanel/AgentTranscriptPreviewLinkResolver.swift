@@ -34,12 +34,57 @@ struct AgentTranscriptPreviewLinkResolver {
             guard case let .resolved(checkout) = item else { return nil }
             return checkout
         }
+        guard let artifactPath = Self.artifactPath(
+            forTranscriptPath: path,
+            logicalRoots: rootInputs.logicalRoots,
+            rootIDsByPath: rootInputs.rootIDsByPath
+        ) else {
+            return nil
+        }
         return AgentChangesArtifactLinkResolver.reference(
-            forArtifactPath: path,
+            forArtifactPath: artifactPath,
             checkouts: checkouts,
             logicalRoots: rootInputs.logicalRoots,
             rootIDsByPath: rootInputs.rootIDsByPath
         )
+    }
+
+    /// Composer mentions render as `@path`, while their canonical attachment metadata omits `@`.
+    /// In a multi-root workspace that path begins with the owning root's display alias. Translate
+    /// either representation to a logical absolute path before checkout projection so the alias is
+    /// not mistaken for a directory inside every checkout.
+    private static func artifactPath(
+        forTranscriptPath path: String,
+        logicalRoots: [AgentPanelLogicalRoot],
+        rootIDsByPath: [String: UUID]
+    ) -> String? {
+        let markerStripped = path.hasPrefix("@") ? String(path.dropFirst()) : path
+        guard !markerStripped.isEmpty else { return nil }
+        guard !markerStripped.hasPrefix("/"), logicalRoots.count > 1 else {
+            return markerStripped
+        }
+
+        let visibleRoots = logicalRoots.compactMap { root -> WorkspaceRootRef? in
+            guard let rootID = rootIDsByPath[root.path] else { return nil }
+            return WorkspaceRootRef(id: rootID, name: root.displayName, fullPath: root.path)
+        }
+        guard visibleRoots.count == logicalRoots.count else { return nil }
+
+        switch WorkspaceAliasResolver.resolve(
+            userPath: markerStripped,
+            roots: visibleRoots,
+            options: RootAliasOptions(requireRemainder: true)
+        ) {
+        case let .prefixed(root, _, remainder):
+            return URL(fileURLWithPath: root.standardizedFullPath)
+                .appendingPathComponent(remainder)
+                .standardizedFileURL
+                .path
+        case .ambiguous:
+            return nil
+        case .notAliasPrefixed, .bareRoot:
+            return markerStripped
+        }
     }
 }
 
