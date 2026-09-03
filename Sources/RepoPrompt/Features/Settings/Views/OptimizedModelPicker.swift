@@ -177,6 +177,23 @@ struct OptimizedModelPicker: View {
                     )
                 }
             }
+            if provider == .ohMyPi {
+                return [.lazySubmenu(
+                    AIProviderType.displayName(for: provider),
+                    onOpen: {
+                        OhMyPiThinkingSweepTrigger.onProviderSubmenuOpen(
+                            wireIDs: models.compactMap { OhMyPiCanonicalModelIdentity.exactWireID(for: $0) },
+                            selectedRawModel: OhMyPiThinkingMenuBuilder.exactModelID(
+                                from: destination.currentRawValue
+                            ),
+                            workspacePath: nil
+                        )
+                    },
+                    items: {
+                        stableProviderItems(provider: provider, models: models)
+                    }
+                )]
+            }
             return [
                 .submenu(
                     AIProviderType.displayName(for: provider),

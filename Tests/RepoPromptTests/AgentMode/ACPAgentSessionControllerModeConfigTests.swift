@@ -609,6 +609,30 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         XCTAssertEqual(capabilities.records.last?.optionDisplayNames, ["Off", "High"])
     }
 
+    func testSequentialSetSessionModelPublishesCapabilityPerVerifiedSwitchUnderCapabilityOnlyPolicy() async throws {
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+        let capabilities = LockedOhMyPiThinkingCapabilities()
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_INCLUDE_MODEL": "1",
+                "ACP_INCLUDE_THINKING": "1"
+            ],
+            providerID: .ohMyPi,
+            dynamicModelPublicationPolicy: .capabilityOnly,
+            thinkingCapabilityPublisher: { capabilities.append($0) }
+        )
+
+        try await withBootstrappedController(fixture.controller) { controller in
+            try await controller.setSessionModel("model-b")
+            try await controller.setSessionModel("model-a")
+        }
+
+        XCTAssertEqual(capabilities.records.map(\.modelID), ["model-a", "model-b", "model-a"])
+        XCTAssertNil(AgentACPModelRegistry.shared.currentSnapshot(for: .ohMyPi))
+        AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
+    }
+
     func testOhMyPiCapabilityOnlyPublicationDoesNotMutateDynamicModelAuthority() async throws {
         AgentACPModelRegistry.shared.test_reset(providerID: .ohMyPi)
         let capabilities = LockedOhMyPiThinkingCapabilities()

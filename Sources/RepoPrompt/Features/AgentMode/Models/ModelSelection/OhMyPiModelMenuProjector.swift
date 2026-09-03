@@ -49,6 +49,11 @@ enum OhMyPiModelMenuProjector {
     }
 
     struct ModelGroup: Identifiable, Hashable {
+        struct Shape: Hashable {
+            let collapsesNormal: Bool
+            let collapsesFast: Bool
+        }
+
         let id: String
         let title: String
         let normalLeaves: [Leaf]
@@ -57,6 +62,13 @@ enum OhMyPiModelMenuProjector {
 
         var allLeaves: [Leaf] {
             normalLeaves + fastLeaves
+        }
+
+        var shape: Shape {
+            Shape(
+                collapsesNormal: isFamily && normalLeaves.count == 1 && normalLeaves[0].effort == nil,
+                collapsesFast: fastLeaves.count == 1 && fastLeaves[0].effort == nil
+            )
         }
     }
 

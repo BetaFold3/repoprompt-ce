@@ -227,16 +227,18 @@ struct AgentModelSelectionIndex {
                     guard let option = optionsBySourceID[leaf.sourceID] else { return }
                     let isFamily = group?.isFamily == true
                     let variant = isFamily
-                        ? (leaf.isFast ? "Fast \(leaf.title)" : leaf.title)
+                        ? (
+                            leaf.isFast
+                                ? (leaf.effort.map { "Fast \($0.displayName)" } ?? "Fast")
+                                : leaf.effort?.displayName
+                        )
                         : nil
-                    let title = if isFamily, leaf.isFast,
-                                   leaf.title.caseInsensitiveCompare("Default") == .orderedSame
-                    {
+                    let title = if isFamily, leaf.isFast, group?.shape.collapsesFast == true {
                         "\(group?.title ?? leaf.title) Fast"
-                    } else if isFamily,
-                              leaf.title.caseInsensitiveCompare("Default") != .orderedSame
-                    {
-                        "\(group?.title ?? leaf.title) \(variant ?? leaf.title)"
+                    } else if isFamily, !leaf.isFast, group?.shape.collapsesNormal == true {
+                        group?.title ?? leaf.title
+                    } else if isFamily, let variant {
+                        "\(group?.title ?? leaf.title) \(variant)"
                     } else {
                         group?.title ?? leaf.title
                     }

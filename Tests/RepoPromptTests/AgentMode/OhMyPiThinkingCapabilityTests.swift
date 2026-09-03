@@ -130,6 +130,36 @@ final class OhMyPiThinkingCapabilityRegistryTests: XCTestCase {
         XCTAssertEqual(Set(store.load().keys), ["provider/model-b"])
     }
 
+    func testConditionalRecordIsAtomicWithRuntimeVersionTransition() async {
+        let registry = OhMyPiThinkingCapabilityRegistry(store: store)
+        let runtime = OhMyPiRuntimeVersionRegistry(capabilityRegistry: registry)
+        runtime.observe([1, 0, 0])
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        runtime.test_setConditionalRecordBarrier {
+            entered.signal()
+            release.wait()
+        }
+        let record = OhMyPiThinkingCapabilityRecord(
+            modelID: "provider/model-a",
+            configID: "thinking",
+            category: "thought_level",
+            orderedOptions: ["off", "high"],
+            optionDisplayNames: ["Off", "High"]
+        )
+        let recordTask = Task.detached {
+            runtime.recordCapabilityIfCurrent(record, expectedVersion: "1.0.0")
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        let transitionTask = Task.detached { runtime.observe([2, 0, 0]) }
+        release.signal()
+        _ = await recordTask.value
+        _ = await transitionTask.value
+        runtime.test_setConditionalRecordBarrier(nil)
+        XCTAssertEqual(runtime.currentVersion, "2.0.0")
+        XCTAssertNil(registry.snapshot(for: "provider/model-a"))
+    }
+
     private func capabilityRecord(modelID: String) -> OhMyPiThinkingCapabilityRecord {
         OhMyPiThinkingCapabilityRecord(
             modelID: modelID,
@@ -154,149 +184,397 @@ final class OhMyPiThinkingCapabilityResolverTests: XCTestCase {
         }
     #endif
 
-    func testCacheFirstAvoidsProbe() async throws {
-        let fixture = try makeResolver(behavior: .success)
+    func testSweepTargetsNormalizeDeduplicateAndRejectPlaceholdersBeforeProjection() {
+        XCTAssertEqual(
+            OhMyPiThinkingSweepTargets.compute(
+                wireIDs: [" ", AgentModel.defaultModel.rawValue, " cursor/model-a ", "cursor/model-a", "cursor/model-b-high"],
+                selectedRawModel: AgentModel.defaultModel.rawValue,
+                recentlyInvalidated: []
+            ),
+            ["cursor/model-a", "cursor/model-b-high"]
+        )
+    }
+
+    func testPlaceholderOnlySweepSpawnsNoClientAndMixedPlaceholdersConsumeNoCap() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.maxBackgroundTargets = 1
+        let fixture = try makeResolver(limits: limits)
+        let placeholder = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["", "   ", AgentModel.defaultModel.rawValue],
+            selectedRawModel: AgentModel.defaultModel.rawValue,
+            workspacePath: nil
+        ))
+        XCTAssertEqual(placeholder, .cached)
+        let placeholderMetrics = await fixture.client.metrics()
+        XCTAssertEqual(placeholderMetrics.bootstraps, 0)
+
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: [AgentModel.defaultModel.rawValue, "cursor/model-a", " ", "cursor/model-b"],
+            selectedRawModel: nil,
+            workspacePath: nil
+        ))
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        let mixedMetrics = await fixture.client.metrics()
+        XCTAssertEqual(mixedMetrics.switches, ["cursor/model-a"])
+        XCTAssertEqual(fixture.resolver.sweepStatus, .partial(loaded: 1, deferred: 1))
+    }
+
+    func testRepeatedSubmenuOpenDoesNotInflateDeferredCount() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.maxBackgroundTargets = 2
+        let fixture = try makeResolver(limits: limits, gateFirstSwitch: true)
+        let request = OhMyPiThinkingSweepRequest(
+            wireIDs: ["cursor/a", "cursor/b", "cursor/c"], selectedRawModel: nil, workspacePath: nil
+        )
+        _ = await fixture.resolver.requestSweep(request)
+        try await waitUntil { await fixture.client.metrics().switches == ["cursor/a"] }
+        _ = await fixture.resolver.requestSweep(request)
+        _ = await fixture.resolver.requestSweep(request)
+        await fixture.client.release()
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        XCTAssertEqual(fixture.resolver.sweepStatus, .partial(loaded: 2, deferred: 1))
+    }
+
+    func testDeferredPromotionRemovesIdentityAndRunsNext() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.maxBackgroundTargets = 1
+        let fixture = try makeResolver(limits: limits, gateFirstSwitch: true)
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/a", "cursor/b", "cursor/c"], selectedRawModel: nil, workspacePath: nil
+        ))
+        try await waitUntil { await fixture.client.metrics().switches == ["cursor/a"] }
+        let promotion = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/c", workspacePath: nil, manual: false
+        )
+        XCTAssertEqual(promotion, .enqueued)
+        await fixture.client.release()
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        let metrics = await fixture.client.metrics()
+        XCTAssertEqual(metrics.switches, ["cursor/a", "cursor/c"])
+        XCTAssertEqual(fixture.resolver.sweepStatus, .partial(loaded: 2, deferred: 1))
+    }
+
+    func testRequestDuringDelayedCleanupStaysQueuedAndStartsAfterCleanup() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.perSwitchSeconds = 0.02
+        let fixture = try makeResolver(
+            limits: limits, gateFirstSwitch: true, cancellationDisposalDelay: 0.15
+        )
+        _ = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/a", workspacePath: nil, manual: true
+        )
+        try await waitUntil { fixture.resolver.state(for: "cursor/a") == .failed }
+        let queued = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/b", workspacePath: nil, manual: true
+        )
+        XCTAssertEqual(queued, .enqueued)
+        XCTAssertEqual(fixture.resolver.state(for: "cursor/b"), .queued)
+        try await waitUntil { await fixture.client.metrics().disposals == 2 }
+        XCTAssertEqual(fixture.resolver.state(for: "cursor/b"), .idle)
+    }
+
+    func testBackgroundRequestDuringDelayedCleanupStartsSecondRunWithoutPhantomQueuedRows() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.perSwitchSeconds = 0.02
+        let fixture = try makeResolver(
+            limits: limits, gateFirstSwitch: true, cancellationDisposalDelay: 0.15
+        )
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/a"], selectedRawModel: nil, workspacePath: nil
+        ))
+        try await waitUntil { fixture.resolver.state(for: "cursor/a") == .failed }
+        let queued = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/b"], selectedRawModel: nil, workspacePath: nil
+        ))
+        XCTAssertEqual(queued, .enqueued)
+        XCTAssertEqual(fixture.resolver.state(for: "cursor/b"), .queued)
+        try await waitUntil { await fixture.client.metrics().disposals == 2 }
+        let metrics = await fixture.client.metrics()
+        XCTAssertEqual(metrics.bootstraps, 2)
+        XCTAssertEqual(metrics.switches, ["cursor/a", "cursor/b"])
+        XCTAssertNotEqual(fixture.resolver.state(for: "cursor/a"), .queued)
+        XCTAssertNotEqual(fixture.resolver.state(for: "cursor/b"), .queued)
+    }
+
+    func testCompletedBackgroundSwitchesContinueConsumingControllerPassCap() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.maxBackgroundTargets = 2
+        let fixture = try makeResolver(limits: limits, gateAfterFirstSwitch: true)
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/a"], selectedRawModel: nil, workspacePath: nil
+        ))
+        try await waitUntil {
+            await fixture.client.metrics().switches == ["cursor/a"]
+                && fixture.resolver.state(for: "cursor/a") == .idle
+        }
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/b", "cursor/c", "cursor/d"], selectedRawModel: nil, workspacePath: nil
+        ))
+        await fixture.client.release()
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        let metrics = await fixture.client.metrics()
+        XCTAssertEqual(metrics.switches, ["cursor/a", "cursor/b"])
+        XCTAssertEqual(fixture.resolver.sweepStatus, .partial(loaded: 2, deferred: 2))
+    }
+
+    func testBudgetExpiredBeforeWillSwitchDefersWithoutCooldownAndResumesNextOpen() async throws {
+        let fixture = try makeResolver(expireBudgetBeforeFirstSwitch: true)
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/a"], selectedRawModel: nil, workspacePath: nil
+        ))
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        XCTAssertEqual(fixture.resolver.state(for: "cursor/a"), .idle)
+        XCTAssertEqual(fixture.resolver.sweepStatus, .partial(loaded: 0, deferred: 1))
+        let resumed = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/a"], selectedRawModel: nil, workspacePath: nil
+        ))
+        XCTAssertEqual(resumed, .enqueued)
+        try await waitUntil { await fixture.client.metrics().disposals == 2 }
+        let metrics = await fixture.client.metrics()
+        XCTAssertEqual(metrics.switches, ["cursor/a", "cursor/a"])
+        XCTAssertEqual(fixture.resolver.state(for: "cursor/a"), .idle)
+    }
+
+    func testDeferredBackgroundPassCarriesForwardWithPerControllerCap() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.maxBackgroundTargets = 2
+        let fixture = try makeResolver(limits: limits)
+        let request = OhMyPiThinkingSweepRequest(
+            wireIDs: ["cursor/a", "cursor/b", "cursor/c", "cursor/d", "cursor/e"],
+            selectedRawModel: nil, workspacePath: nil
+        )
+        _ = await fixture.resolver.requestSweep(request)
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/c", "cursor/d", "cursor/e"], selectedRawModel: nil, workspacePath: nil
+        ))
+        try await waitUntil { await fixture.client.metrics().disposals == 2 }
+        let metrics = await fixture.client.metrics()
+        XCTAssertEqual(metrics.switches, ["cursor/a", "cursor/b", "cursor/c", "cursor/d"])
+        XCTAssertEqual(fixture.resolver.sweepStatus, .partial(loaded: 2, deferred: 1))
+    }
+
+    func testSweepBootstrapsOnceAndSwitchesSequentiallyInPriorityOrder() async throws {
+        let fixture = try makeResolver()
+        let outcome = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/model-a", "cursor/model-b", "cursor/model-c"],
+            selectedRawModel: "cursor/model-b",
+            workspacePath: nil
+        ))
+        XCTAssertEqual(outcome, .enqueued)
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        let metrics = await fixture.client.metrics()
+        XCTAssertEqual(metrics.bootstraps, 1)
+        XCTAssertEqual(metrics.switches, ["cursor/model-b", "cursor/model-a", "cursor/model-c"])
+        XCTAssertEqual(metrics.maximumActiveSwitches, 1)
+    }
+
+    func testSweepSkipsCachedCooldownAndUnsupportedTargets() async throws {
+        let fixture = try makeResolver(results: ["cursor/unsupported": .unsupported])
         XCTAssertTrue(fixture.registry.record(
-            capabilityRecord(modelID: "model-a"),
+            capabilityRecord(modelID: "cursor/cached"),
             ompVersion: "99.0.0"
         ))
-
-        let outcome = await fixture.resolver.resolve(
-            exactModelID: "model-a",
-            workspacePath: nil,
-            manualRetry: false
+        _ = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/unsupported", workspacePath: nil, manual: true
         )
-
-        let calls = await fixture.client.metrics().calls
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        let before = await fixture.client.metrics().bootstraps
+        let outcome = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/cached", "cursor/unsupported"],
+            selectedRawModel: nil,
+            workspacePath: nil
+        ))
         XCTAssertEqual(outcome, .cached)
-        XCTAssertEqual(calls, 0)
+        let after = await fixture.client.metrics().bootstraps
+        XCTAssertEqual(after, before)
+    }
+
+    func testSubmenuOpenWithFreshRecordsSpawnsNothing() async throws {
+        let fixture = try makeResolver()
+        XCTAssertTrue(fixture.registry.record(
+            capabilityRecord(modelID: "cursor/model-a"),
+            ompVersion: "99.0.0"
+        ))
+        let outcome = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/model-a"], selectedRawModel: nil, workspacePath: nil
+        ))
+        XCTAssertEqual(outcome, .cached)
+        let metrics = await fixture.client.metrics()
+        XCTAssertEqual(metrics.bootstraps, 0)
+    }
+
+    func testExplicitSelectionDuringSweepPromotesToFrontInsteadOfSkipping() async throws {
+        let fixture = try makeResolver(gateFirstSwitch: true)
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/model-a", "cursor/model-b", "cursor/model-c"],
+            selectedRawModel: nil,
+            workspacePath: nil
+        ))
+        try await waitUntil { await fixture.client.metrics().switches == ["cursor/model-a"] }
+        let outcome = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/model-c", workspacePath: nil, manual: false
+        )
+        XCTAssertEqual(outcome, .enqueued)
+        await fixture.client.release()
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        let switches = await fixture.client.metrics().switches
+        XCTAssertEqual(switches, ["cursor/model-a", "cursor/model-c", "cursor/model-b"])
+    }
+
+    func testIdleExplicitSelectionRunsSingleTargetOnly() async throws {
+        let fixture = try makeResolver()
+        let outcome = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/model-a", workspacePath: nil, manual: false
+        )
+        XCTAssertEqual(outcome, .enqueued)
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        let switches = await fixture.client.metrics().switches
+        XCTAssertEqual(switches, ["cursor/model-a"])
+    }
+
+    func testManualLoadBypassesModelCooldown() async throws {
+        let fixture = try makeResolver(results: ["cursor/model-a": .failed("nope")])
+        _ = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/model-a", workspacePath: nil, manual: false
+        )
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        let cooldownOutcome = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/model-a", workspacePath: nil, manual: false
+        )
+        XCTAssertEqual(cooldownOutcome, .cooldownSkipped)
+        let manualOutcome = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/model-a", workspacePath: nil, manual: true
+        )
+        XCTAssertEqual(manualOutcome, .enqueued)
+        try await waitUntil { await fixture.client.metrics().disposals == 2 }
+    }
+
+    func testWallClockTimeoutExitsLoadingBeforeDisposalFinishes() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.perSwitchSeconds = 0.02
+        let fixture = try makeResolver(
+            limits: limits,
+            gateFirstSwitch: true,
+            cancellationDisposalDelay: 0.3
+        )
+        _ = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/model-a", workspacePath: nil, manual: true
+        )
+        try await waitUntil(timeoutNanoseconds: 100_000_000) {
+            fixture.resolver.state(for: "cursor/model-a") == .loading
+        }
+        try await waitUntil(timeoutNanoseconds: 100_000_000) {
+            fixture.resolver.state(for: "cursor/model-a") != .loading
+        }
+        XCTAssertEqual(fixture.resolver.state(for: "cursor/model-a"), .failed)
+        let disposalsBeforeCleanup = await fixture.client.metrics().disposals
+        XCTAssertEqual(disposalsBeforeCleanup, 0)
+        try await waitUntil(timeoutNanoseconds: 1_000_000_000) {
+            await fixture.client.metrics().disposals == 1
+        }
+    }
+
+    func testCancelOnAvailabilityLossOrVersionChangeResetsQueuedToIdleAndDisposesOnce() async throws {
+        for reason in [
+            OhMyPiThinkingSweepCancellationReason.availabilityLost,
+            .runtimeVersionChanged
+        ] {
+            let fixture = try makeResolver(gateFirstSwitch: true)
+            _ = await fixture.resolver.requestSweep(.init(
+                wireIDs: ["cursor/model-a", "cursor/model-b"],
+                selectedRawModel: nil,
+                workspacePath: nil
+            ))
+            try await waitUntil { fixture.resolver.state(for: "cursor/model-a") == .loading }
+            await fixture.resolver.cancel(reason: reason)
+            XCTAssertEqual(fixture.resolver.state(for: "cursor/model-a"), .idle)
+            XCTAssertEqual(fixture.resolver.state(for: "cursor/model-b"), .idle)
+            let disposals = await fixture.client.metrics().disposals
+            XCTAssertEqual(disposals, 1)
+        }
+    }
+
+    func testSweepStatusReportsMonotonicPartialProgress() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.maxBackgroundTargets = 2
+        let fixture = try makeResolver(limits: limits)
+        _ = await fixture.resolver.requestSweep(.init(
+            wireIDs: ["cursor/a", "cursor/b", "cursor/c"],
+            selectedRawModel: nil,
+            workspacePath: nil
+        ))
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        XCTAssertEqual(fixture.resolver.sweepStatus, .partial(loaded: 2, deferred: 1))
+    }
+
+    func testVersionTransitionClearsVisibleUnsupportedStateAndSweepCooldownScope() async throws {
+        let version = LockedTestVersion("1.0.0")
+        let fixture = try makeResolver(
+            results: ["cursor/model-a": .unsupported],
+            runtimeVersion: { version.value }
+        )
+        _ = await fixture.resolver.requestPriority(
+            exactModelID: "cursor/model-a", workspacePath: nil, manual: true
+        )
+        try await waitUntil { await fixture.client.metrics().disposals == 1 }
+        XCTAssertEqual(fixture.resolver.state(for: "cursor/model-a"), .unsupported)
+        version.value = "2.0.0"
+        let outcome = await fixture.resolver.requestSweep(.init(
+            wireIDs: [AgentModel.defaultModel.rawValue], selectedRawModel: nil, workspacePath: nil
+        ))
+        XCTAssertEqual(outcome, .cached)
+        XCTAssertEqual(fixture.resolver.state(for: "cursor/model-a"), .idle)
+    }
+
+    func testLateRecordFromChangedRuntimeVersionIsDropped() throws {
+        let fixture = try makeResolver()
+        let runtime = OhMyPiRuntimeVersionRegistry(capabilityRegistry: fixture.registry)
+        runtime.observe([99, 0, 0])
+        XCTAssertFalse(runtime.recordCapabilityIfCurrent(
+            capabilityRecord(modelID: "cursor/model-a"),
+            expectedVersion: "98.0.0"
+        ))
+        XCTAssertNil(fixture.registry.snapshot(for: "cursor/model-a"))
     }
 
     func testMenuConstructionStartsNoProbe() async throws {
-        let fixture = try makeResolver(behavior: .success)
-        await MainActor.run {
-            var selections = OhMyPiThinkingSelections()
-            let destination = ModelDestination(
-                id: "anti-probing",
-                getter: { "provider/model-a" },
-                applier: { _ in },
-                thinkingGetter: { selections },
-                thinkingApplier: { selections = $0 }
-            )
-            let models = [
-                AgentModelOption(
-                    rawValue: "provider/model-a",
-                    displayName: "Model A",
-                    description: nil,
-                    isDefault: true
-                )
-            ]
-            _ = AgentModelStableMenuItems.ohMyPiModelItems(
-                options: models,
-                selectedAgent: .ohMyPi,
-                selectedModelRaw: "provider/model-a",
-                thinkingDestination: destination,
-                onSelect: { _, _ in }
-            )
-            _ = OhMyPiThinkingMenuBuilder.rows(
-                capability: nil,
-                probeState: fixture.resolver.state(for: "provider/model-a"),
-                storedChoice: nil
+        let fixture = try makeResolver()
+        let menu = await MainActor.run {
+            StableMenuItem.lazySubmenu(
+                AgentProviderKind.ohMyPi.displayName,
+                onOpen: {
+                    OhMyPiThinkingSweepTrigger.onProviderSubmenuOpen(
+                        wireIDs: ["cursor/model-a"],
+                        selectedRawModel: nil,
+                        workspacePath: nil,
+                        resolver: fixture.resolver
+                    )
+                },
+                items: {
+                    OhMyPiThinkingMenuBuilder.stableMenuItems(
+                        exactModelID: "cursor/model-a",
+                        destination: ModelDestination(
+                            id: "lazy-test",
+                            getter: { "cursor/model-a" },
+                            applier: { _ in }
+                        ),
+                        resolver: fixture.resolver
+                    )
+                }
             )
         }
-        let calls = await fixture.client.metrics().calls
-        XCTAssertEqual(calls, 0)
-    }
-
-    func testExactModelSingleFlightAndNoCrossModelQueue() async throws {
-        let fixture = try makeResolver(behavior: .gated)
-        let first = Task {
-            await fixture.resolver.resolve(
-                exactModelID: "model-a",
-                workspacePath: nil,
-                manualRetry: false
-            )
-        }
-        try await waitUntil { await fixture.client.metrics().calls == 1 }
-
-        let sameModelOutcome = await fixture.resolver.resolve(
-            exactModelID: "model-a",
-            workspacePath: nil,
-            manualRetry: false
-        )
-        let otherModelOutcome = await fixture.resolver.resolve(
-            exactModelID: "model-b",
-            workspacePath: nil,
-            manualRetry: false
-        )
-        await fixture.client.release()
-        let firstOutcome = await first.value
-
-        XCTAssertEqual(sameModelOutcome, .coalesced)
-        XCTAssertEqual(otherModelOutcome, .busySkipped)
-        XCTAssertEqual(firstOutcome, .loaded)
-
+        _ = menu.submenuItems
         let metrics = await fixture.client.metrics()
-        XCTAssertEqual(metrics.calls, 1)
-        XCTAssertEqual(metrics.maximumActive, 1)
-        XCTAssertEqual(metrics.disposals, 1)
+        XCTAssertEqual(metrics.bootstraps, 0)
     }
 
-    func testExplicitSelectionTriggerIsFireAndForgetAndOMPOnly() async throws {
-        let fixture = try makeResolver(behavior: .gated)
-
-        OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
-            agent: .ohMyPi,
-            rawModel: "model-a",
-            resolver: fixture.resolver
-        )
-        try await waitUntil { await fixture.client.metrics().calls == 1 }
-
-        OhMyPiThinkingSelectionProbeTrigger.afterExplicitSelection(
-            agent: .codexExec,
-            rawModel: "model-b",
-            resolver: fixture.resolver
-        )
-        try await Task.sleep(nanoseconds: 5_000_000)
-        let callsBeforeRelease = await fixture.client.metrics().calls
-        await fixture.client.release()
-        try await waitUntil { await fixture.client.metrics().active == 0 }
-
-        XCTAssertEqual(callsBeforeRelease, 1)
-    }
-
-    func testCooldownAndManualRetry() async throws {
-        let fixture = try makeResolver(behavior: .failure)
-        let initialOutcome = await fixture.resolver.resolve(
-            exactModelID: "model-a",
-            workspacePath: nil,
-            manualRetry: false
-        )
-        let cooldownOutcome = await fixture.resolver.resolve(
-            exactModelID: "model-a",
-            workspacePath: nil,
-            manualRetry: false
-        )
-        let manualOutcome = await fixture.resolver.resolve(
-            exactModelID: "model-a",
-            workspacePath: nil,
-            manualRetry: true
-        )
-        let metrics = await fixture.client.metrics()
-
-        XCTAssertEqual(initialOutcome, .failed)
-        XCTAssertEqual(cooldownOutcome, .cooldownSkipped)
-        XCTAssertEqual(manualOutcome, .failed)
-        XCTAssertEqual(metrics.calls, 2)
-        XCTAssertEqual(metrics.disposals, 2)
-    }
-
-    func testControllerProbeShutdownRunsOutsideCancelledTaskScope() async throws {
+    func testControllerSweepShutdownRunsOutsideCancelledTaskScope() async throws {
         let gate = ProbeCancellationGate()
         let recorder = ProbeCancellationRecorder()
         let task = Task {
             await gate.wait()
-            await OhMyPiThinkingCapabilityControllerProbeClient.testRunCancellationShieldedShutdown {
+            await OhMyPiThinkingCapabilityControllerSweepClient.testRunCancellationShieldedShutdown {
                 await recorder.record(isCancelled: Task.isCancelled)
             }
         }
@@ -304,46 +582,35 @@ final class OhMyPiThinkingCapabilityResolverTests: XCTestCase {
         task.cancel()
         await gate.release()
         await task.value
-
         let snapshot = await recorder.snapshot()
         XCTAssertEqual(snapshot.calls, 1)
         XCTAssertFalse(snapshot.wasCancelled)
     }
 
-    func testProbeDisposesOnSuccessFailureAndDeadlineCancellation() async throws {
-        for behavior in [ProbeClient.Behavior.success, .failure, .suspended] {
-            let deadline: UInt64 = behavior == .suspended ? 20_000_000 : 1_000_000_000
-            let fixture = try makeResolver(
-                behavior: behavior,
-                deadlineNanoseconds: deadline
-            )
-            _ = await fixture.resolver.resolve(
-                exactModelID: "model-\(behavior)",
-                workspacePath: nil,
-                manualRetry: true
-            )
-            let metrics = await fixture.client.metrics()
-            XCTAssertEqual(metrics.calls, 1, "\(behavior)")
-            XCTAssertEqual(metrics.disposals, 1, "\(behavior)")
-            XCTAssertEqual(metrics.active, 0, "\(behavior)")
-        }
-    }
-
     private func makeResolver(
-        behavior: ProbeClient.Behavior,
-        deadlineNanoseconds: UInt64 = 1_000_000_000
+        results: [String: OhMyPiThinkingSwitchResult] = [:],
+        limits: OhMyPiThinkingSweepLimits = OhMyPiThinkingSweepLimits(),
+        gateFirstSwitch: Bool = false,
+        cancellationDisposalDelay: TimeInterval = 0,
+        gateAfterFirstSwitch: Bool = false,
+        expireBudgetBeforeFirstSwitch: Bool = false,
+        runtimeVersion: @escaping @Sendable () -> String? = { "99.0.0" }
     ) throws -> (
         resolver: OhMyPiThinkingCapabilityResolver,
-        client: ProbeClient,
+        client: SweepClient,
         registry: OhMyPiThinkingCapabilityRegistry
     ) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("omp-thinking-resolver-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: directory)
-        }
-        let client = ProbeClient(behavior: behavior)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let client = SweepClient(
+            results: results,
+            gateFirstSwitch: gateFirstSwitch,
+            cancellationDisposalDelay: cancellationDisposalDelay,
+            gateAfterFirstSwitch: gateAfterFirstSwitch,
+            expireBudgetBeforeFirstSwitch: expireBudgetBeforeFirstSwitch
+        )
         let registry = OhMyPiThinkingCapabilityRegistry(
             store: OhMyPiThinkingCapabilityStore(
                 fileURL: directory.appendingPathComponent("capabilities.json")
@@ -354,9 +621,9 @@ final class OhMyPiThinkingCapabilityResolverTests: XCTestCase {
                 client: client,
                 registry: registry,
                 statusStore: OhMyPiThinkingCapabilityProbeStatusStore(),
-                deadlineNanoseconds: deadlineNanoseconds,
-                cooldown: 60,
-                runtimeVersion: { "99.0.0" }
+                limits: limits,
+                runtimeVersion: runtimeVersion,
+                isAvailable: { true }
             ),
             client,
             registry
@@ -385,6 +652,90 @@ final class OhMyPiThinkingCapabilityResolverTests: XCTestCase {
             }
             try await Task.sleep(nanoseconds: 1_000_000)
         }
+    }
+}
+
+final class OhMyPiThinkingCapabilityControllerSweepClientTests: XCTestCase {
+    func testProductionClientContinuesAfterModelLocalFailureAndKeepsSequentialOrder() async throws {
+        let fixture = try makeClient(classifications: ["cursor/b": .modelLocal])
+        let events = SweepEventRecorder()
+        let targets = SweepTargetQueue(["cursor/a", "cursor/b", "cursor/c"])
+        do {
+            try await fixture.client.run(
+                workspacePath: nil,
+                limits: .init(),
+                nextTarget: { await targets.next() },
+                report: { await events.append($0) }
+            )
+        } catch { XCTFail("Unexpected abort: \(error)") }
+        let snapshot = await fixture.controller.snapshot()
+        XCTAssertEqual(snapshot.models, ["cursor/a", "cursor/b", "cursor/c"])
+        XCTAssertEqual(snapshot.shutdowns, 1)
+        let terminals = await events.terminals()
+        XCTAssertEqual(terminals, [.completed])
+    }
+
+    func testProductionClientTripsConsecutiveFailureBreakerAndDisposesOnce() async throws {
+        var limits = OhMyPiThinkingSweepLimits()
+        limits.consecutiveFailureLimit = 3
+        let fixture = try makeClient(classifications: [
+            "cursor/a": .modelLocal, "cursor/b": .modelLocal, "cursor/c": .modelLocal
+        ])
+        let events = SweepEventRecorder()
+        let targets = SweepTargetQueue(["cursor/a", "cursor/b", "cursor/c", "cursor/d"])
+        do {
+            try await fixture.client.run(
+                workspacePath: nil, limits: limits,
+                nextTarget: { await targets.next() },
+                report: { await events.append($0) }
+            )
+            XCTFail("Expected breaker abort")
+        } catch {}
+        let snapshot = await fixture.controller.snapshot()
+        XCTAssertEqual(snapshot.models, ["cursor/a", "cursor/b", "cursor/c"])
+        XCTAssertEqual(snapshot.shutdowns, 1)
+        let terminals = await events.terminals()
+        XCTAssertEqual(terminals.count, 1)
+    }
+
+    func testProductionClientSessionFatalAbortsBeforeFollowingTargetAndDisposesOnce() async throws {
+        let fixture = try makeClient(classifications: ["cursor/a": .sessionFatal])
+        let events = SweepEventRecorder()
+        let targets = SweepTargetQueue(["cursor/a", "cursor/b"])
+        do {
+            try await fixture.client.run(
+                workspacePath: nil, limits: .init(),
+                nextTarget: { await targets.next() },
+                report: { await events.append($0) }
+            )
+            XCTFail("Expected fatal abort")
+        } catch {}
+        let snapshot = await fixture.controller.snapshot()
+        XCTAssertEqual(snapshot.models, ["cursor/a"])
+        XCTAssertEqual(snapshot.shutdowns, 1)
+    }
+
+    private func makeClient(
+        classifications: [String: OhMyPiThinkingControllerFailureClassification]
+    ) throws -> (client: OhMyPiThinkingCapabilityControllerSweepClient, controller: TestSweepController) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omp-production-client-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let registry = OhMyPiThinkingCapabilityRegistry(store: .init(fileURL: directory.appendingPathComponent("capabilities.json")))
+        let runtime = OhMyPiRuntimeVersionRegistry(capabilityRegistry: registry)
+        runtime.observe([99, 0, 0])
+        let controller = TestSweepController(classifications: classifications)
+        let factory = TestSweepSessionFactory(controller: controller)
+        return (
+            OhMyPiThinkingCapabilityControllerSweepClient(
+                registry: registry,
+                runtimeVersionRegistry: runtime,
+                sessionFactory: factory,
+                isAvailable: { true }
+            ),
+            controller
+        )
     }
 }
 
@@ -468,6 +819,57 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         XCTAssertEqual(failed.first?.title, "Default")
         XCTAssertTrue(failed.first?.isEnabled == true)
         XCTAssertEqual(failed.last?.action, .load)
+    }
+
+    func testQueuedStateRendersDisabledRowAndLoadNow() {
+        let rows = OhMyPiThinkingMenuBuilder.rows(
+            capability: nil,
+            probeState: .queued,
+            storedChoice: nil
+        )
+        let queued = rows.first { $0.title == "Queued — loading in background…" }
+        XCTAssertEqual(queued?.isEnabled, false)
+        XCTAssertEqual(queued?.action, OhMyPiThinkingMenuBuilder.Action.none)
+        let loadNow = rows.first { $0.title == "Load now" }
+        XCTAssertEqual(loadNow?.isEnabled, true)
+        XCTAssertEqual(loadNow?.action, .load)
+    }
+
+    func testUnsupportedStateRendersInformationalRowWithoutLoad() {
+        let rows = OhMyPiThinkingMenuBuilder.rows(
+            capability: nil,
+            probeState: .unsupported,
+            storedChoice: nil
+        )
+        XCTAssertTrue(rows.contains {
+            $0.title == "This model does not advertise thinking levels." && !$0.isEnabled
+        })
+        XCTAssertFalse(rows.contains { $0.action == .load })
+    }
+
+    func testSweepHeaderReflectsRunningPartialFailedCompletedIdle() {
+        let now = Date(timeIntervalSince1970: 100)
+        XCTAssertNil(OhMyPiThinkingSweepStatusPresentation.headerText(.idle))
+        XCTAssertEqual(
+            OhMyPiThinkingSweepStatusPresentation.headerText(
+                .running(done: 12, total: 24, current: "cursor/cursor-grok-4.6")
+            ),
+            "Loading thinking levels… 12/24 · cursor/cursor-grok-4.6"
+        )
+        XCTAssertEqual(
+            OhMyPiThinkingSweepStatusPresentation.headerText(.partial(loaded: 18, deferred: 6)),
+            "Loaded 18 · 6 deferred — open this menu again to continue"
+        )
+        XCTAssertEqual(
+            OhMyPiThinkingSweepStatusPresentation.headerText(.failed(reason: "three models", at: now)),
+            "Thinking levels: three models — hover away and back to refresh"
+        )
+        XCTAssertEqual(
+            OhMyPiThinkingSweepStatusPresentation.headerText(
+                .completed(loaded: 18, failed: 3, unsupported: 2, at: now)
+            ),
+            "Thinking levels: 3 failed — hover away and back to refresh"
+        )
     }
 
     func testStableAgentSurfaceNestsThinkingUnderEachValidModelNotAsSibling() {
@@ -683,7 +1085,7 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         XCTAssertNil(selections[googleRaw])
     }
 
-    func testCollapsedGrokPairKeepsGroupingAndExposesThinkingOnAgentAndSettingsSurfaces() throws {
+    func testPositionHCollapsesSingletonDefaultBranchesAcrossAgentAndSettingsSurfaces() throws {
         let rawModels = [
             "cursor/cursor-grok-4.6",
             "cursor/cursor-grok-4.6-fast"
@@ -722,13 +1124,18 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             thinkingDestination: destination,
             onSelect: { _, option in selectedRaw = option.rawValue }
         )
+        let agentCursor = try stableMenuItem(at: ["cursor"], in: agentItems)
         XCTAssertEqual(
-            try stableMenuItem(at: ["cursor", "cursor-grok-4.6", "Default"], in: agentItems)
+            agentCursor.submenuItems?.map(\.title),
+            ["cursor-grok-4.6", "cursor-grok-4.6 Fast"]
+        )
+        XCTAssertEqual(
+            try stableMenuItem(at: ["cursor", "cursor-grok-4.6"], in: agentItems)
                 .submenuItems?.first?.title,
             "Default"
         )
         XCTAssertEqual(
-            try stableMenuItem(at: ["cursor", "cursor-grok-4.6", "Fast", "Default"], in: agentItems)
+            try stableMenuItem(at: ["cursor", "cursor-grok-4.6 Fast"], in: agentItems)
                 .submenuItems?.first?.title,
             "Default"
         )
@@ -739,13 +1146,18 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             destination: destination,
             onModelCommit: { selectedRaw = $0.modelName }
         )
+        let settingsCursor = try stableMenuItem(at: ["cursor"], in: settingsItems)
         XCTAssertEqual(
-            try stableMenuItem(at: ["cursor", "cursor-grok-4.6", "Default"], in: settingsItems)
+            settingsCursor.submenuItems?.map(\.title),
+            ["cursor-grok-4.6", "cursor-grok-4.6 Fast"]
+        )
+        XCTAssertEqual(
+            try stableMenuItem(at: ["cursor", "cursor-grok-4.6"], in: settingsItems)
                 .submenuItems?.first?.title,
             "Default"
         )
         XCTAssertEqual(
-            try stableMenuItem(at: ["cursor", "cursor-grok-4.6", "Fast", "Default"], in: settingsItems)
+            try stableMenuItem(at: ["cursor", "cursor-grok-4.6 Fast"], in: settingsItems)
                 .submenuItems?.first?.title,
             "Default"
         )
@@ -996,7 +1408,7 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             )
         )
         let resolver = OhMyPiThinkingCapabilityResolver(
-            client: ProbeClient(behavior: .failure),
+            client: SweepClient(results: [rawModel: .failed("fixture failure")]),
             registry: capabilityRegistry,
             statusStore: OhMyPiThinkingCapabilityProbeStatusStore(),
             runtimeVersion: { "99.0.0" }
@@ -1177,6 +1589,94 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
     }
 }
 
+private final class LockedTestVersion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: String
+    init(_ value: String) {
+        stored = value
+    }
+
+    var value: String {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+}
+
+private enum TestSweepError: Error { case model }
+
+private actor TestSweepController: OhMyPiThinkingCapabilitySweepController {
+    struct Snapshot { let models: [String]
+        let shutdowns: Int
+    }
+
+    private let classifications: [String: OhMyPiThinkingControllerFailureClassification]
+    private var models: [String] = []
+    private var shutdowns = 0
+
+    init(classifications: [String: OhMyPiThinkingControllerFailureClassification]) {
+        self.classifications = classifications
+    }
+
+    func start() async throws {}
+    func setSessionModel(_ modelID: String) async throws {
+        models.append(modelID)
+        if classifications[modelID] != nil { throw TestSweepError.model }
+    }
+
+    func normalizedErrorDescription(_: Error) async -> String {
+        "fixture failure"
+    }
+
+    func classifyConfigurationMutationFailure(_: Error) async -> OhMyPiThinkingControllerFailureClassification {
+        classifications[models.last ?? ""] ?? .modelLocal
+    }
+
+    func shutdown() async {
+        shutdowns += 1
+    }
+
+    func snapshot() -> Snapshot {
+        .init(models: models, shutdowns: shutdowns)
+    }
+}
+
+private struct TestSweepPreparedSession: OhMyPiThinkingCapabilityPreparedSession {
+    let ompVersion = "99.0.0"
+    let controller: TestSweepController
+    func makeController(publisher _: @escaping OhMyPiThinkingCapabilityPublisher) throws -> any OhMyPiThinkingCapabilitySweepController {
+        controller
+    }
+}
+
+private struct TestSweepSessionFactory: OhMyPiThinkingCapabilitySessionFactory {
+    let controller: TestSweepController
+    func prepare(workspacePath _: String?, limits _: OhMyPiThinkingSweepLimits) async throws -> any OhMyPiThinkingCapabilityPreparedSession {
+        TestSweepPreparedSession(controller: controller)
+    }
+}
+
+private actor SweepEventRecorder {
+    private var values: [OhMyPiThinkingSweepEvent] = []
+    func append(_ event: OhMyPiThinkingSweepEvent) {
+        values.append(event)
+    }
+
+    func terminals() -> [OhMyPiThinkingSweepTerminal] {
+        values.compactMap { if case let .terminal(value) = $0 { value } else { nil } }
+    }
+}
+
+private actor SweepTargetQueue {
+    private var values: [String]
+    init(_ values: [String]) {
+        self.values = values
+    }
+
+    func next() -> String? {
+        values.isEmpty ? nil : values.removeFirst()
+    }
+}
+
 private actor ProbeCancellationGate {
     private var continuation: CheckedContinuation<Void, Never>?
     private(set) var isWaiting = false
@@ -1206,75 +1706,102 @@ private actor ProbeCancellationRecorder {
     }
 }
 
-private actor ProbeClient: OhMyPiThinkingCapabilityProbeClient {
-    enum Behavior: CaseIterable, CustomStringConvertible, Equatable {
-        case success
-        case failure
-        case gated
-        case suspended
-
-        var description: String {
-            switch self {
-            case .success: "success"
-            case .failure: "failure"
-            case .gated: "gated"
-            case .suspended: "suspended"
-            }
-        }
-    }
-
+private actor SweepClient: OhMyPiThinkingCapabilitySweepClient {
     struct Metrics {
-        let calls: Int
-        let active: Int
-        let maximumActive: Int
+        let bootstraps: Int
+        let switches: [String]
+        let activeSwitches: Int
+        let maximumActiveSwitches: Int
         let disposals: Int
     }
 
-    private let behavior: Behavior
-    private var isReleased = false
-    private var calls = 0
-    private var active = 0
-    private var maximumActive = 0
+    private let results: [String: OhMyPiThinkingSwitchResult]
+    private let gateFirstSwitch: Bool
+    private let cancellationDisposalDelay: TimeInterval
+    private let gateAfterFirstSwitch: Bool
+    private let expireBudgetBeforeFirstSwitch: Bool
+    private var released = false
+    private var bootstraps = 0
+    private var switches: [String] = []
+    private var activeSwitches = 0
+    private var maximumActiveSwitches = 0
     private var disposals = 0
 
-    init(behavior: Behavior) {
-        self.behavior = behavior
+    init(
+        results: [String: OhMyPiThinkingSwitchResult] = [:],
+        gateFirstSwitch: Bool = false,
+        cancellationDisposalDelay: TimeInterval = 0,
+        gateAfterFirstSwitch: Bool = false,
+        expireBudgetBeforeFirstSwitch: Bool = false
+    ) {
+        self.results = results
+        self.gateFirstSwitch = gateFirstSwitch
+        self.cancellationDisposalDelay = cancellationDisposalDelay
+        self.gateAfterFirstSwitch = gateAfterFirstSwitch
+        self.expireBudgetBeforeFirstSwitch = expireBudgetBeforeFirstSwitch
     }
 
-    func probe(exactModelID _: String, workspacePath _: String?) async throws {
-        calls += 1
-        active += 1
-        maximumActive = max(maximumActive, active)
-        defer {
-            active -= 1
-            disposals += 1
-        }
-        switch behavior {
-        case .success:
-            return
-        case .failure:
-            throw ProbeFailure()
-        case .gated:
-            while !isReleased {
-                try await Task.sleep(nanoseconds: 1_000_000)
+    func run(
+        workspacePath _: String?,
+        limits _: OhMyPiThinkingSweepLimits,
+        nextTarget: @escaping @Sendable () async -> String?,
+        report: @escaping @Sendable (OhMyPiThinkingSweepEvent) async -> Void
+    ) async throws {
+        bootstraps += 1
+        await report(.bootstrapped(ompVersion: "99.0.0"))
+        do {
+            while let modelID = await nextTarget() {
+                switches.append(modelID)
+                activeSwitches += 1
+                maximumActiveSwitches = max(maximumActiveSwitches, activeSwitches)
+                if expireBudgetBeforeFirstSwitch, bootstraps == 1, switches.count == 1 {
+                    await report(.terminal(.workBudgetExpired(current: modelID)))
+                    throw OhMyPiThinkingSweepAbort.terminal(.workBudgetExpired(current: modelID))
+                }
+                await report(.willSwitch(modelID))
+                if gateFirstSwitch, switches.count == 1 {
+                    while !released {
+                        try await Task.sleep(nanoseconds: 1_000_000)
+                    }
+                }
+                let result = results[modelID] ?? .loaded
+                await report(.switched(modelID, result, elapsed: 0.001))
+                activeSwitches -= 1
+                if gateAfterFirstSwitch, switches.count == 1 {
+                    while !released {
+                        try await Task.sleep(nanoseconds: 1_000_000)
+                    }
+                }
             }
-        case .suspended:
-            try await Task.sleep(nanoseconds: 10_000_000_000)
+            await report(.terminal(.completed))
+        } catch {
+            await report(.terminal(.cancelled(.availabilityLost)))
+            activeSwitches = max(0, activeSwitches - 1)
+            let disposalDelay = cancellationDisposalDelay
+            if disposalDelay > 0 {
+                await Task.detached {
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(disposalDelay * 1_000_000_000)
+                    )
+                }.value
+            }
+            disposals += 1
+            throw error
         }
+        disposals += 1
     }
 
     func release() {
-        isReleased = true
+        released = true
     }
 
     func metrics() -> Metrics {
         Metrics(
-            calls: calls,
-            active: active,
-            maximumActive: maximumActive,
+            bootstraps: bootstraps,
+            switches: switches,
+            activeSwitches: activeSwitches,
+            maximumActiveSwitches: maximumActiveSwitches,
             disposals: disposals
         )
     }
-
-    private struct ProbeFailure: Error {}
 }

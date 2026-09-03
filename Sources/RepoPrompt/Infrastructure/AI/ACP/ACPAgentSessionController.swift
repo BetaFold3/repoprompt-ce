@@ -6,6 +6,11 @@ enum ACPDynamicModelPublicationPolicy {
     case capabilityOnly
 }
 
+enum ACPConfigurationMutationFailureClassification {
+    case modelLocal
+    case sessionFatal
+}
+
 actor ACPAgentSessionController {
     struct RequestTimeouts {
         let bootstrapSeconds: TimeInterval
@@ -404,6 +409,18 @@ actor ACPAgentSessionController {
 
     func normalizeError(_ error: Error) -> Error {
         provider.normalizeError(error)
+    }
+
+    nonisolated func classifyConfigurationMutationFailureForSweep(
+        _ error: Error
+    ) -> ACPConfigurationMutationFailureClassification {
+        guard let controllerError = error as? ControllerError else { return .sessionFatal }
+        switch controllerError {
+        case .requestFailed:
+            return .modelLocal
+        case .invalidState, .processNotRunning, .protocolViolation, .requestTimedOut, .transportClosed:
+            return .sessionFatal
+        }
     }
 
     #if DEBUG

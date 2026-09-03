@@ -58,6 +58,8 @@ Two independent Oracle lanes received identical prompts and produced opposing po
 2. Position B's "inverts zero pinned tests" claim is false: `OhMyPiModelCatalogTests.testProjectorEnforcesAdversarialParsingCorroborationAndStableOrdering` (Tests/RepoPromptTests/AI/OhMyPiModelCatalogTests.swift:307-310) pins `ns/pair` + `ns/pair-fast` as `isFamily == true` with Default/Default titles; the guard flips that grouping contract plus all pure-pair presentation. Both policies invert pinned tests, neutralizing that argument; Position A's inversions are confined to accessory flags while grouping stays byte-identical.
 
 **Residual costs of the adopted policy, accepted deliberately:**
+
+Supersession note (2026-09-03): the redundant `Default > Default` presentation cost below is superseded by Position H singleton branch collapse in `2026-09-03-omp-thinking-capability-sweep-plan.md`.
 - Previously suppressed stored values for effort-nil family IDs (e.g. `provider/sparse-fast`-shaped, mixed-family bare IDs) resume being sent. Live evidence shows those IDs advertise runtime thinking; a policy-independent hardening (emission-time capability validation) is filed as follow-up, not a blocker.
 - Mild UX redundancy in mixed families (runtime `High` under the bare leaf next to a terminal `-high` sibling). These are distinct upstream wire IDs with independently keyed state; no double assignment can occur (effort-suffixed leaves stay terminal, and only one model is selected per destination).
 - `Default > Default` nesting for the collapsed pair (outer = family slot without effort suffix; inner = no runtime assignment). Cosmetic; any relabeling is a separate cross-surface UX change.

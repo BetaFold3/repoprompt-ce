@@ -167,6 +167,8 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             }
 
             // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
+            // Stop capability discovery before the shared agent/session teardown begins.
+            await OhMyPiThinkingCapabilityResolver.shared.cancel(reason: .appTermination)
             // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
             // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()

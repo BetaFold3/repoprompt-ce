@@ -224,6 +224,225 @@ final class OhMyPiModelCatalogTests: XCTestCase {
         XCTAssertTrue(projection.allLeaves.filter { $0.effort != nil }.allSatisfy { !$0.allowsThinkingAccessory })
     }
 
+    func testSweepTargetsExcludeEffortEncodedLeavesAndOrderSelectedFirst() {
+        let targets = OhMyPiThinkingSweepTargets.compute(
+            wireIDs: [
+                "cursor/gpt-5.2",
+                "cursor/gpt-5.2-high",
+                "cursor/gpt-5.2-fast",
+                "cursor/gpt-5.2-high-fast",
+                "google/gemini-3.7-flash"
+            ],
+            selectedRawModel: "cursor/gpt-5.2-fast"
+        )
+
+        XCTAssertEqual(targets.first, "cursor/gpt-5.2-fast")
+        XCTAssertTrue(targets.contains("cursor/gpt-5.2"))
+        XCTAssertTrue(targets.contains("google/gemini-3.7-flash"))
+        XCTAssertFalse(targets.contains("cursor/gpt-5.2-high"))
+        XCTAssertFalse(targets.contains("cursor/gpt-5.2-high-fast"))
+    }
+
+    func testThinkingRowsExposeQueuedPromotionAndUnsupportedState() {
+        let queued = OhMyPiThinkingMenuBuilder.rows(
+            capability: nil,
+            probeState: .queued,
+            storedChoice: nil
+        )
+        XCTAssertEqual(queued.map(\.title), [
+            "Default",
+            "Queued — loading in background…",
+            "Load now"
+        ])
+        XCTAssertFalse(queued[1].isEnabled)
+        XCTAssertEqual(queued[2].action, .load)
+
+        let unsupported = OhMyPiThinkingMenuBuilder.rows(
+            capability: nil,
+            probeState: .unsupported,
+            storedChoice: nil
+        )
+        XCTAssertEqual(unsupported.map(\.title), [
+            "Default",
+            "This model does not advertise thinking levels."
+        ])
+        XCTAssertFalse(unsupported.contains { $0.action == .load })
+    }
+
+    func testSweepStatusHeaderReflectsRunningPartialFailedCompletedAndIdle() {
+        XCTAssertNil(OhMyPiThinkingSweepStatusPresentation.headerText(.idle))
+        XCTAssertEqual(
+            OhMyPiThinkingSweepStatusPresentation.headerText(
+                .running(done: 12, total: 24, current: "cursor/cursor-grok-4.6")
+            ),
+            "Loading thinking levels… 12/24 · cursor/cursor-grok-4.6"
+        )
+        XCTAssertEqual(
+            OhMyPiThinkingSweepStatusPresentation.headerText(.partial(loaded: 18, deferred: 6)),
+            "Loaded 18 · 6 deferred — open this menu again to continue"
+        )
+        XCTAssertEqual(
+            OhMyPiThinkingSweepStatusPresentation.headerText(
+                .completed(loaded: 18, failed: 3, unsupported: 2, at: Date(timeIntervalSince1970: 0))
+            ),
+            "Thinking levels: 3 failed — hover away and back to refresh"
+        )
+        XCTAssertNotNil(OhMyPiThinkingSweepStatusPresentation.headerText(
+            .failed(reason: "unavailable", at: Date(timeIntervalSince1970: 0))
+        ))
+    }
+
+    func testProjectorShapeForCollapsedPairsAndMixedGpt52Family() throws {
+        let wireIDs = try fixtureWireIDs(named: "models-18.1.3.json")
+        let projection = OhMyPiModelMenuProjector.project(wireIDs.enumerated().map {
+            .init(sourceID: "source-\($0.offset)", wireID: $0.element, displayName: $0.element)
+        })
+        let cursor = try XCTUnwrap(projection.namespaceGroups.first { $0.namespace == "cursor" })
+
+        for title in ["cursor-grok-4.5", "cursor-grok-4.6"] {
+            let group = try XCTUnwrap(cursor.modelGroups.first { $0.title == title })
+            XCTAssertEqual(
+                group.shape,
+                .init(collapsesNormal: true, collapsesFast: true),
+                title
+            )
+        }
+
+        let mixed = try XCTUnwrap(cursor.modelGroups.first { $0.title == "gpt-5.2" })
+        XCTAssertEqual(
+            mixed.shape,
+            .init(collapsesNormal: false, collapsesFast: false)
+        )
+    }
+
+    func testSelectionIndexTitlesMatchProjectorShape() {
+        let wireIDs = [
+            "cursor/cursor-grok-4.6",
+            "cursor/cursor-grok-4.6-fast",
+            "cursor/mixed",
+            "cursor/mixed-low",
+            "cursor/mixed-fast"
+        ]
+        let options = wireIDs.map {
+            AgentModelOption(
+                rawValue: $0,
+                displayName: $0,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        }
+        let index = AgentModelSelectionIndex.local(
+            agents: [.ohMyPi],
+            optionsByAgent: [.ohMyPi: options],
+            selected: nil,
+            selectionDefaults: .standard
+        )
+        let titlesByWireID = Dictionary(uniqueKeysWithValues: index.leaves.map {
+            ($0.id.modelRaw, $0.title)
+        })
+
+        XCTAssertEqual(titlesByWireID["cursor/cursor-grok-4.6"], "cursor-grok-4.6")
+        XCTAssertEqual(titlesByWireID["cursor/cursor-grok-4.6-fast"], "cursor-grok-4.6 Fast")
+        XCTAssertEqual(titlesByWireID["cursor/mixed"], "mixed")
+        XCTAssertEqual(titlesByWireID["cursor/mixed-low"], "mixed Low")
+        XCTAssertEqual(titlesByWireID["cursor/mixed-fast"], "mixed Fast")
+    }
+
+    @MainActor
+    func testPositionHCollapsesSingletonDefaultBranchesAcrossStableSurfaces() throws {
+        let wireIDs = ["cursor/cursor-grok-4.6", "cursor/cursor-grok-4.6-fast"]
+        let options = wireIDs.map {
+            AgentModelOption(
+                rawValue: $0,
+                displayName: $0,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        }
+        let agentItems = AgentModelStableMenuItems.ohMyPiModelItems(
+            options: options,
+            selectedAgent: .ohMyPi,
+            selectedModelRaw: wireIDs[0]
+        ) { _, _ in }
+        let agentCursor = try XCTUnwrap(agentItems.first { $0.title == "cursor" })
+        XCTAssertEqual(
+            agentCursor.submenuItems?.map(\.title),
+            ["cursor-grok-4.6", "cursor-grok-4.6 Fast"]
+        )
+
+        let models = wireIDs.map(AIModel.ohMyPiCustom(name:))
+        let destination = ModelDestination(
+            id: "position-h-test",
+            getter: { models[0].rawValue },
+            applier: { _ in }
+        )
+        let settingsItems = OhMyPiModelMenuBuilder.stableMenuItems(
+            for: models,
+            destination: destination,
+            onModelCommit: { _ in }
+        )
+        let settingsCursor = try XCTUnwrap(settingsItems.first { $0.title == "cursor" })
+        XCTAssertEqual(
+            settingsCursor.submenuItems?.map(\.title),
+            ["cursor-grok-4.6", "cursor-grok-4.6 Fast"]
+        )
+    }
+
+    @MainActor
+    func testPositionHKeepsMixedFamilyContainerAndCollapsesFastLeaf() throws {
+        let options = [
+            "cursor/mixed",
+            "cursor/mixed-low",
+            "cursor/mixed-fast"
+        ].map {
+            AgentModelOption(
+                rawValue: $0,
+                displayName: $0,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        }
+        let items = AgentModelStableMenuItems.ohMyPiModelItems(
+            options: options,
+            selectedAgent: .ohMyPi,
+            selectedModelRaw: options[0].rawValue
+        ) { _, _ in }
+        let namespace = try XCTUnwrap(items.first { $0.title == "cursor" })
+        let family = try XCTUnwrap(namespace.submenuItems?.first { $0.title == "mixed" })
+
+        XCTAssertEqual(family.submenuItems?.map(\.title), ["Default", "Low", "Fast"])
+        XCTAssertNil(family.submenuItems?.last?.submenuItems)
+    }
+
+    @MainActor
+    func testPositionHKeepsEffortEncodedSingletonBranchesNested() throws {
+        let options = [
+            "cursor/effort-high",
+            "cursor/effort-high-fast"
+        ].map {
+            AgentModelOption(
+                rawValue: $0,
+                displayName: $0,
+                description: nil,
+                isPlaceholderDefault: false,
+                isProviderDefault: false
+            )
+        }
+        let items = AgentModelStableMenuItems.ohMyPiModelItems(
+            options: options,
+            selectedAgent: .ohMyPi,
+            selectedModelRaw: options[0].rawValue
+        ) { _, _ in }
+        let namespace = try XCTUnwrap(items.first { $0.title == "cursor" })
+        let family = try XCTUnwrap(namespace.submenuItems?.first { $0.title == "effort" })
+
+        XCTAssertEqual(family.submenuItems?.map(\.title), ["High", "Fast"])
+        XCTAssertEqual(family.submenuItems?.last?.submenuItems?.map(\.title), ["High"])
+    }
+
     func testOhMyPiIgnoresGroupOpenCodeFlagAndAlwaysProjects() throws {
         let wireIDs = try fixtureWireIDs()
         XCTAssertEqual(wireIDs.count, 203)

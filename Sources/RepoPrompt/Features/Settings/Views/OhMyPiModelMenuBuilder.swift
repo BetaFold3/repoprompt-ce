@@ -18,6 +18,7 @@ enum OhMyPiModelMenuBuilder {
         let normalLeaves: [Leaf]
         let fastLeaves: [Leaf]
         let isFamily: Bool
+        let shape: OhMyPiModelMenuProjector.ModelGroup.Shape
 
         var allLeaves: [Leaf] {
             normalLeaves + fastLeaves
@@ -80,7 +81,8 @@ enum OhMyPiModelMenuBuilder {
                 title: projectedGroup.title,
                 normalLeaves: projectedGroup.normalLeaves.compactMap(leaf),
                 fastLeaves: projectedGroup.fastLeaves.compactMap(leaf),
-                isFamily: projectedGroup.isFamily
+                isFamily: projectedGroup.isFamily,
+                shape: projectedGroup.shape
             )
         }
 
@@ -102,8 +104,8 @@ enum OhMyPiModelMenuBuilder {
         titleTransform: (String) -> String = { $0 },
         onModelCommit: @escaping (AIModel) -> Void
     ) -> [StableMenuItem] {
-        func modelItem(_ leaf: Leaf) -> StableMenuItem {
-            let title = titleTransform(leaf.title)
+        func modelItem(_ leaf: Leaf, title titleOverride: String? = nil) -> StableMenuItem {
+            let title = titleTransform(titleOverride ?? leaf.title)
             guard leaf.allowsThinkingAccessory,
                   destination.hasThinkingAccessory,
                   let exactModelID = OhMyPiCanonicalModelIdentity.exactWireID(for: leaf.model)
@@ -130,28 +132,47 @@ enum OhMyPiModelMenuBuilder {
             )
         }
 
-        func modelGroupItem(_ group: ModelGroup) -> StableMenuItem {
+        func modelGroupItems(_ group: ModelGroup) -> [StableMenuItem] {
             guard group.isFamily else {
-                return group.normalLeaves.first.map(modelItem) ?? .separator
+                return [group.normalLeaves.first.map { modelItem($0) } ?? .separator]
             }
-            var items = group.normalLeaves.map(modelItem)
-            if !group.fastLeaves.isEmpty {
+            if group.shape.collapsesNormal, let normal = group.normalLeaves.first {
+                var items = [modelItem(normal, title: group.title)]
+                if group.shape.collapsesFast, let fast = group.fastLeaves.first {
+                    items.append(modelItem(fast, title: "\(group.title) Fast"))
+                } else if !group.fastLeaves.isEmpty {
+                    items.append(.submenu(
+                        "\(group.title) Fast",
+                        items: group.fastLeaves.map { modelItem($0) }
+                    ))
+                }
+                return items
+            }
+            var items = group.normalLeaves.map { modelItem($0) }
+            if group.shape.collapsesFast, let fast = group.fastLeaves.first {
+                items.append(modelItem(fast, title: "Fast"))
+            } else if !group.fastLeaves.isEmpty {
                 items.append(.submenu(
                     "Fast",
-                    items: group.fastLeaves.map(modelItem)
+                    items: group.fastLeaves.map { modelItem($0) }
                 ))
             }
-            return .submenu(group.title, items: items)
+            return [.submenu(group.title, items: items)]
         }
 
         let projection = projection(for: models)
-        var items = projection.rootLeaves.map(modelItem)
+        var items = projection.rootLeaves.map { modelItem($0) }
         items.append(contentsOf: projection.namespaceGroups.map { namespaceGroup in
             .submenu(
                 namespaceGroup.namespace,
-                items: namespaceGroup.modelGroups.map(modelGroupItem)
+                items: namespaceGroup.modelGroups.flatMap(modelGroupItems)
             )
         })
+        if let header = OhMyPiThinkingSweepStatusPresentation.headerItem(
+            OhMyPiThinkingCapabilityResolver.shared.sweepStatus
+        ) {
+            items.insert(header, at: 0)
+        }
         return items
     }
 

@@ -1039,8 +1039,27 @@ struct AgentComposerView: View, Equatable {
         for agent in props.availableAgents {
             let canSelectAgent = actions.canSelectAgentInCurrentChat(agent)
             if canSelectAgent {
-                let modelItems = inputBarModelMenuItems(for: agent)
-                items.append(.submenu(agent.displayName, items: modelItems))
+                if agent == .ohMyPi {
+                    items.append(.lazySubmenu(
+                        agent.displayName,
+                        onOpen: {
+                            let options = inputBarModelOptions(for: .ohMyPi)
+                            OhMyPiThinkingSweepTrigger.onProviderSubmenuOpen(
+                                wireIDs: options.map(\.rawValue),
+                                selectedRawModel: props.selectedAgent == .ohMyPi
+                                    ? props.selectedModelRaw
+                                    : nil,
+                                workspacePath: nil
+                            )
+                        },
+                        items: {
+                            inputBarModelMenuItems(for: .ohMyPi)
+                        }
+                    ))
+                } else {
+                    let modelItems = inputBarModelMenuItems(for: agent)
+                    items.append(.submenu(agent.displayName, items: modelItems))
+                }
             } else {
                 items.append(.action(
                     agent.displayName,

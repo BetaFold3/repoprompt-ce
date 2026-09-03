@@ -152,6 +152,7 @@ final class OhMyPiThinkingCapabilityRegistry: @unchecked Sendable {
     private var warmTask: Task<[String: OhMyPiThinkingCapabilitySnapshot], Never>?
     private var didWarmStore = false
     private var warmGeneration: UInt64 = 0
+    private var recentlyInvalidatedModelIDs: Set<String> = []
 
     init(store: OhMyPiThinkingCapabilityStore = .standard()) {
         self.store = store
@@ -194,10 +195,12 @@ final class OhMyPiThinkingCapabilityRegistry: @unchecked Sendable {
         let filtered = currentVersion.map { version in
             loaded.filter { $0.value.ompVersion == version }
         } ?? loaded
+        let removedIDs = Set(loaded.keys).subtracting(filtered.keys)
         let shouldRewrite = filtered.count != loaded.count
         let didApply = lock.withLock { () -> Bool in
             guard state.generation == warmGeneration else { return false }
             persistedByModelID = filtered
+            recentlyInvalidatedModelIDs.formUnion(removedIDs)
             didWarmStore = true
             warmTask = nil
             if shouldRewrite {
@@ -216,6 +219,21 @@ final class OhMyPiThinkingCapabilityRegistry: @unchecked Sendable {
     func record(
         _ record: OhMyPiThinkingCapabilityRecord,
         ompVersion: String? = OhMyPiRuntimeVersionRegistry.shared.currentVersion,
+        observedAt: Date = Date()
+    ) -> Bool {
+        let didChange = recordWithoutNotification(
+            record,
+            ompVersion: ompVersion,
+            observedAt: observedAt
+        )
+        if didChange { postCapabilitiesDidChange() }
+        return didChange
+    }
+
+    @discardableResult
+    func recordWithoutNotification(
+        _ record: OhMyPiThinkingCapabilityRecord,
+        ompVersion: String?,
         observedAt: Date = Date()
     ) -> Bool {
         let version = ompVersion?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -250,6 +268,7 @@ final class OhMyPiThinkingCapabilityRegistry: @unchecked Sendable {
         if didChange {
             liveByModelID[modelID] = snapshot
             persistedByModelID[modelID] = snapshot
+            recentlyInvalidatedModelIDs.remove(modelID)
         }
         guard didChange || removedVersionMismatch else {
             lock.unlock()
@@ -257,21 +276,23 @@ final class OhMyPiThinkingCapabilityRegistry: @unchecked Sendable {
         }
         store.save(mergedRecordsLocked())
         lock.unlock()
-        NotificationCenter.default.post(name: .ohMyPiThinkingCapabilitiesDidChange, object: self)
         return true
     }
 
-    func invalidateForRuntimeVersionChange(to ompVersion: String) {
+    @discardableResult
+    func invalidateWithoutNotification(forRuntimeVersion ompVersion: String) -> Bool {
         let version = ompVersion.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !version.isEmpty else { return }
+        guard !version.isEmpty else { return false }
         lock.lock()
         let didChange = removeVersionMismatchesLocked(currentVersion: version)
-        guard didChange else {
-            lock.unlock()
-            return
+        if didChange {
+            store.save(mergedRecordsLocked())
         }
-        store.save(mergedRecordsLocked())
         lock.unlock()
+        return didChange
+    }
+
+    func postCapabilitiesDidChange() {
         NotificationCenter.default.post(name: .ohMyPiThinkingCapabilitiesDidChange, object: self)
     }
 
@@ -282,18 +303,24 @@ final class OhMyPiThinkingCapabilityRegistry: @unchecked Sendable {
         warmTask?.cancel()
         warmTask = nil
         didWarmStore = false
+        recentlyInvalidatedModelIDs.removeAll()
         warmGeneration &+= 1
         store.remove()
         lock.unlock()
         NotificationCenter.default.post(name: .ohMyPiThinkingCapabilitiesDidChange, object: self)
     }
 
+    func recentlyInvalidatedIDs() -> Set<String> {
+        lock.withLock { recentlyInvalidatedModelIDs }
+    }
+
     private func removeVersionMismatchesLocked(currentVersion: String) -> Bool {
-        let oldLiveCount = liveByModelID.count
-        let oldPersistedCount = persistedByModelID.count
+        let removedIDs = Set(liveByModelID.filter { $0.value.ompVersion != currentVersion }.keys)
+            .union(persistedByModelID.filter { $0.value.ompVersion != currentVersion }.keys)
         liveByModelID = liveByModelID.filter { $0.value.ompVersion == currentVersion }
         persistedByModelID = persistedByModelID.filter { $0.value.ompVersion == currentVersion }
-        return oldLiveCount != liveByModelID.count || oldPersistedCount != persistedByModelID.count
+        recentlyInvalidatedModelIDs.formUnion(removedIDs)
+        return !removedIDs.isEmpty
     }
 
     private func mergedRecordsLocked() -> [String: OhMyPiThinkingCapabilitySnapshot] {
@@ -316,10 +343,21 @@ final class OhMyPiThinkingCapabilityRegistry: @unchecked Sendable {
 }
 
 final class OhMyPiRuntimeVersionRegistry: @unchecked Sendable {
-    static let shared = OhMyPiRuntimeVersionRegistry()
+    static let shared = OhMyPiRuntimeVersionRegistry(
+        capabilityRegistry: .shared
+    )
 
     private let lock = NSLock()
+    private let capabilityRegistry: OhMyPiThinkingCapabilityRegistry
     private var storedVersion: String?
+
+    #if DEBUG
+        private var conditionalRecordBarrier: (@Sendable () -> Void)?
+    #endif
+
+    init(capabilityRegistry: OhMyPiThinkingCapabilityRegistry = .shared) {
+        self.capabilityRegistry = capabilityRegistry
+    }
 
     var currentVersion: String? {
         lock.lock()
@@ -333,17 +371,54 @@ final class OhMyPiRuntimeVersionRegistry: @unchecked Sendable {
         lock.lock()
         let didChange = storedVersion != version
         storedVersion = version
+        let capabilitiesChanged = didChange
+            ? capabilityRegistry.invalidateWithoutNotification(forRuntimeVersion: version)
+            : false
         lock.unlock()
-        if didChange {
-            OhMyPiThinkingCapabilityRegistry.shared.invalidateForRuntimeVersionChange(to: version)
+        if capabilitiesChanged {
+            capabilityRegistry.postCapabilitiesDidChange()
         }
         return version
+    }
+
+    @discardableResult
+    func recordCapabilityIfCurrent(
+        _ record: OhMyPiThinkingCapabilityRecord,
+        expectedVersion: String
+    ) -> Bool {
+        lock.lock()
+        guard storedVersion == expectedVersion else {
+            lock.unlock()
+            return false
+        }
+        #if DEBUG
+            conditionalRecordBarrier?()
+        #endif
+        let didChange = capabilityRegistry.recordWithoutNotification(
+            record,
+            ompVersion: expectedVersion
+        )
+        lock.unlock()
+        if didChange {
+            capabilityRegistry.postCapabilitiesDidChange()
+        }
+        return didChange
     }
 
     #if DEBUG
         @_spi(TestSupport)
         public func test_reset() {
-            lock.withLock { storedVersion = nil }
+            lock.withLock {
+                storedVersion = nil
+                conditionalRecordBarrier = nil
+            }
+        }
+
+        @_spi(TestSupport)
+        public func test_setConditionalRecordBarrier(
+            _ barrier: (@Sendable () -> Void)?
+        ) {
+            lock.withLock { conditionalRecordBarrier = barrier }
         }
     #endif
 }

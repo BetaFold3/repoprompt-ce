@@ -1,6 +1,8 @@
 # Completion record
 
 Status: **Completed and closed on 2026-08-16.**
+
+Supersession note (2026-09-03): D3/T5's no-hover and no-cross-model-queue discovery clauses are superseded by the bounded OMP provider-submenu sweep contract in `2026-09-03-omp-thinking-capability-sweep-plan.md`.
 Last-verified: 2026-08-16
 
 Outcome: **T1–T5 implemented and fully validated.** Tracker-owned OMP transcript authority, hierarchical exact-wire model projection, typed thinking transport, destination-owned persistence, separate capability authority, bounded explicit-selection probing, and shared thinking UI are shipped.

@@ -173,6 +173,23 @@ struct AIModelDropdown: View {
             if provider == .claudeCode {
                 return aiModelClaudeCodeTopLevelMenuItems(for: models)
             }
+            if provider == .ohMyPi {
+                return [.lazySubmenu(
+                    AIProviderType.displayName(for: provider),
+                    onOpen: {
+                        OhMyPiThinkingSweepTrigger.onProviderSubmenuOpen(
+                            wireIDs: models.compactMap { OhMyPiCanonicalModelIdentity.exactWireID(for: $0) },
+                            selectedRawModel: OhMyPiThinkingMenuBuilder.exactModelID(
+                                from: destination.currentRawValue
+                            ),
+                            workspacePath: nil
+                        )
+                    },
+                    items: {
+                        aiModelOhMyPiItems(for: models)
+                    }
+                )]
+            }
 
             let providerItems: [StableMenuItem] = if provider == .codex {
                 AIModel.codexMenuGroups(for: models).map { group in
@@ -191,8 +208,6 @@ struct AIModelDropdown: View {
                     guard providerGroup.rendersAsSubmenu else { return modelItems }
                     return [.submenu(providerGroup.displayName, items: modelItems)]
                 }
-            } else if provider == .ohMyPi {
-                aiModelOhMyPiItems(for: models)
             } else {
                 models.map(aiModelMenuItem)
             }

@@ -81,10 +81,36 @@ enum OhMyPiThinkingMenuBuilder {
         }
 
         switch probeState {
+        case .queued:
+            rows.append(Row(
+                id: "queued",
+                title: "Queued — loading in background…",
+                isEnabled: false,
+                isSelected: false,
+                style: .informational,
+                action: .none
+            ))
+            rows.append(Row(
+                id: "load-now",
+                title: "Load now",
+                isEnabled: true,
+                isSelected: false,
+                style: .normal,
+                action: .load
+            ))
         case .loading:
             rows.append(Row(
                 id: "loading",
                 title: "Loading thinking levels…",
+                isEnabled: false,
+                isSelected: false,
+                style: .informational,
+                action: .none
+            ))
+        case .unsupported:
+            rows.append(Row(
+                id: "unsupported",
+                title: "This model does not advertise thinking levels.",
                 isEnabled: false,
                 isSelected: false,
                 style: .informational,
@@ -204,5 +230,39 @@ enum OhMyPiThinkingMenuBuilder {
     static func exactModelID(from rawAIModelValue: String) -> String? {
         guard let model = AIModel.fromModelName(rawAIModelValue) else { return nil }
         return OhMyPiCanonicalModelIdentity.exactWireID(for: model)
+    }
+}
+
+enum OhMyPiThinkingSweepStatusPresentation {
+    static func headerText(_ status: OhMyPiThinkingSweepStatus) -> String? {
+        switch status {
+        case .idle:
+            return nil
+        case .preflight:
+            return "Loading thinking levels…"
+        case let .running(done, total, current):
+            if let current, !current.isEmpty {
+                return "Loading thinking levels… \(done)/\(total) · \(current)"
+            }
+            return "Loading thinking levels… \(done)/\(total)"
+        case let .partial(loaded, deferred):
+            return "Loaded \(loaded) · \(deferred) deferred — open this menu again to continue"
+        case let .failed(reason, _):
+            return "Thinking levels: \(reason) — hover away and back to refresh"
+        case let .completed(loaded, failed, unsupported, _):
+            if failed > 0 {
+                return "Thinking levels: \(failed) failed — hover away and back to refresh"
+            }
+            if unsupported > 0 {
+                return "Loaded \(loaded) · \(unsupported) unsupported"
+            }
+            return "Loaded thinking levels for \(loaded) models"
+        case .cancelled:
+            return "Thinking-level loading cancelled."
+        }
+    }
+
+    static func headerItem(_ status: OhMyPiThinkingSweepStatus) -> StableMenuItem? {
+        headerText(status).map(StableMenuItem.header)
     }
 }

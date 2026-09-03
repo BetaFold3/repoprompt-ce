@@ -71,6 +71,7 @@ struct StableMenuItem {
     private enum Kind {
         case action(() -> Void)
         case submenu([StableMenuItem])
+        case lazySubmenu(onOpen: () -> Void, items: () -> [StableMenuItem])
         case separator
         case header
     }
@@ -139,6 +140,25 @@ struct StableMenuItem {
         )
     }
 
+    static func lazySubmenu(
+        _ title: String,
+        isSelected: Bool = false,
+        imageSystemName: String? = nil,
+        style: StableMenuItemStyle = .normal,
+        toolTip: String? = nil,
+        onOpen: @escaping () -> Void,
+        items: @escaping () -> [StableMenuItem]
+    ) -> StableMenuItem {
+        StableMenuItem(
+            title: title,
+            kind: .lazySubmenu(onOpen: onOpen, items: items),
+            isSelected: isSelected,
+            imageSystemName: imageSystemName,
+            style: style,
+            toolTip: toolTip
+        )
+    }
+
     static func header(_ title: String) -> StableMenuItem {
         StableMenuItem(title: title, kind: .header, isEnabled: false)
     }
@@ -152,8 +172,14 @@ struct StableMenuItem {
     }
 
     var submenuItems: [StableMenuItem]? {
-        guard case let .submenu(items) = kind else { return nil }
-        return items
+        switch kind {
+        case let .submenu(items):
+            items
+        case let .lazySubmenu(_, items):
+            items()
+        default:
+            nil
+        }
     }
 
     #if DEBUG
@@ -163,6 +189,10 @@ struct StableMenuItem {
             guard case let .action(action) = kind else { return false }
             action()
             return true
+        }
+
+        func makeMenuItemForTesting() -> NSMenuItem {
+            makeMenuItem()
         }
     #endif
 
@@ -197,6 +227,24 @@ struct StableMenuItem {
             configureTitle(on: item, fontPreset: fontPreset)
             item.toolTip = toolTip
             return item
+        case let .lazySubmenu(onOpen, items):
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = isEnabled
+            item.state = isSelected ? .on : .off
+            let submenu = NSMenu()
+            submenu.autoenablesItems = false
+            let delegate = StableMenuSubmenuDelegate(
+                onOpen: onOpen,
+                items: items,
+                fontPreset: fontPreset
+            )
+            submenu.delegate = delegate
+            item.representedObject = delegate
+            item.submenu = submenu
+            configureImage(on: item)
+            configureTitle(on: item, fontPreset: fontPreset)
+            item.toolTip = toolTip
+            return item
         }
     }
 
@@ -225,6 +273,33 @@ struct StableMenuItem {
             attributes[.foregroundColor] = NSColor.systemOrange
         }
         item.attributedTitle = NSAttributedString(string: title, attributes: attributes)
+    }
+}
+
+private final class StableMenuSubmenuDelegate: NSObject, NSMenuDelegate {
+    private let onOpen: () -> Void
+    private let items: () -> [StableMenuItem]
+    private let fontPreset: FontScalePreset
+
+    init(
+        onOpen: @escaping () -> Void,
+        items: @escaping () -> [StableMenuItem],
+        fontPreset: FontScalePreset
+    ) {
+        self.onOpen = onOpen
+        self.items = items
+        self.fontPreset = fontPreset
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        onOpen()
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        for item in items() {
+            menu.addItem(item.makeMenuItem(fontPreset: fontPreset))
+        }
     }
 }
 
