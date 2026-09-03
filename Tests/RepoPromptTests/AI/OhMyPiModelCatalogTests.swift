@@ -189,6 +189,41 @@ final class OhMyPiModelCatalogTests: XCTestCase {
         XCTAssertEqual(multiset(selectedSourceIDs), multiset(inputs.map(\.sourceID)))
     }
 
+    func testOMP1813FixtureProjectsCollapsedGrokLeavesAsThinkingCapable() throws {
+        let wireIDs = try fixtureWireIDs(named: "models-18.1.3.json")
+        XCTAssertEqual(wireIDs.count, 144)
+        XCTAssertEqual(
+            wireIDs.filter { $0.hasPrefix("cursor/cursor-grok-4.5") },
+            ["cursor/cursor-grok-4.5", "cursor/cursor-grok-4.5-fast"]
+        )
+        XCTAssertEqual(
+            wireIDs.filter { $0.hasPrefix("cursor/cursor-grok-4.6") },
+            ["cursor/cursor-grok-4.6", "cursor/cursor-grok-4.6-fast"]
+        )
+        XCTAssertTrue(wireIDs.contains("cursor/gpt-5.2"))
+        XCTAssertTrue(wireIDs.contains("cursor/gpt-5.2-fast"))
+        XCTAssertTrue(wireIDs.contains("cursor/gpt-5.2-high"))
+        XCTAssertTrue(wireIDs.contains("cursor/gpt-5.2-high-fast"))
+
+        let projection = OhMyPiModelMenuProjector.project(wireIDs.enumerated().map {
+            .init(sourceID: "source-\($0.offset)", wireID: $0.element, displayName: $0.element)
+        })
+        let cursor = try XCTUnwrap(projection.namespaceGroups.first { $0.namespace == "cursor" })
+        for title in ["cursor-grok-4.5", "cursor-grok-4.6"] {
+            let family = try XCTUnwrap(cursor.modelGroups.first { $0.title == title })
+            XCTAssertTrue(family.isFamily)
+            XCTAssertEqual(family.normalLeaves.map(\.title), ["Default"])
+            XCTAssertEqual(family.fastLeaves.map(\.title), ["Default"])
+            XCTAssertTrue(family.allLeaves.allSatisfy { $0.effort == nil && $0.allowsThinkingAccessory })
+        }
+
+        let gpt52 = try XCTUnwrap(cursor.modelGroups.first { $0.title == "gpt-5.2" })
+        XCTAssertTrue(gpt52.isFamily)
+        XCTAssertTrue(gpt52.allLeaves.filter { $0.effort == nil }.allSatisfy(\.allowsThinkingAccessory))
+        XCTAssertTrue(gpt52.allLeaves.filter { $0.effort != nil }.allSatisfy { !$0.allowsThinkingAccessory })
+        XCTAssertTrue(projection.allLeaves.filter { $0.effort != nil }.allSatisfy { !$0.allowsThinkingAccessory })
+    }
+
     func testOhMyPiIgnoresGroupOpenCodeFlagAndAlwaysProjects() throws {
         let wireIDs = try fixtureWireIDs()
         XCTAssertEqual(wireIDs.count, 203)
@@ -341,6 +376,55 @@ final class OhMyPiModelCatalogTests: XCTestCase {
         XCTAssertEqual(reversed, projection)
     }
 
+    func testPerLeafThinkingEligibilitySurvivesFamilyDriftAndPinsSuffixAmbiguity() throws {
+        let base = "cursor/gpt-5.2"
+        let fast = "cursor/gpt-5.2-fast"
+        let high = "cursor/gpt-5.2-high"
+        let highFast = "cursor/gpt-5.2-high-fast"
+        let purePair = [base, fast]
+        let expanded = [base, fast, high, highFast]
+
+        for wireIDs in [purePair, expanded] {
+            let options = wireIDs.map {
+                AgentModelOption(
+                    rawValue: $0,
+                    displayName: $0,
+                    description: nil,
+                    isDefault: false
+                )
+            }
+            let projection = OhMyPiModelMenuProjector.project(options.map {
+                .init(sourceID: $0.rawValue, wireID: $0.rawValue, displayName: $0.displayName)
+            })
+            let leavesByWireID = Dictionary(uniqueKeysWithValues: projection.allLeaves.map { ($0.wireID, $0) })
+            XCTAssertTrue(try XCTUnwrap(leavesByWireID[base]).allowsThinkingAccessory)
+            XCTAssertTrue(try XCTUnwrap(leavesByWireID[fast]).allowsThinkingAccessory)
+
+            let snapshot = ACPDiscoveredSessionModels(options: options, currentModelRaw: base)
+            XCTAssertTrue(OhMyPiThinkingExecutionEligibility.allowsAssignment(for: base, snapshot: snapshot))
+            XCTAssertTrue(OhMyPiThinkingExecutionEligibility.allowsAssignment(for: fast, snapshot: snapshot))
+            if wireIDs == expanded {
+                XCTAssertFalse(try XCTUnwrap(leavesByWireID[high]).allowsThinkingAccessory)
+                XCTAssertFalse(try XCTUnwrap(leavesByWireID[highFast]).allowsThinkingAccessory)
+                XCTAssertFalse(OhMyPiThinkingExecutionEligibility.allowsAssignment(for: high, snapshot: snapshot))
+                XCTAssertFalse(OhMyPiThinkingExecutionEligibility.allowsAssignment(for: highFast, snapshot: snapshot))
+            }
+        }
+
+        let standalone = OhMyPiModelMenuProjector.project([
+            .init(sourceID: "standalone", wireID: "provider/model-high", displayName: "Model High")
+        ])
+        XCTAssertTrue(try XCTUnwrap(standalone.allLeaves.first).allowsThinkingAccessory)
+
+        let corroborated = OhMyPiModelMenuProjector.project([
+            .init(sourceID: "low", wireID: "provider/model-low", displayName: "Model Low"),
+            .init(sourceID: "high", wireID: "provider/model-high", displayName: "Model High")
+        ])
+        let corroboratedHigh = try XCTUnwrap(corroborated.allLeaves.first { $0.wireID == "provider/model-high" })
+        XCTAssertEqual(corroboratedHigh.effort, .high)
+        XCTAssertFalse(corroboratedHigh.allowsThinkingAccessory)
+    }
+
     func testProjectorMeetsBoundedStressBudget() {
         let inputs = (0 ..< 5000).flatMap { index in
             [
@@ -365,11 +449,11 @@ final class OhMyPiModelCatalogTests: XCTestCase {
         XCTAssertLessThan(elapsed, .seconds(5))
     }
 
-    private func fixtureWireIDs() throws -> [String] {
+    private func fixtureWireIDs(named fixtureName: String = "models-17.3.4.json") throws -> [String] {
         let url = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("AgentMode/Fixtures/OhMyPiACP/models-17.3.4.json")
+            .appendingPathComponent("AgentMode/Fixtures/OhMyPiACP/\(fixtureName)")
         return try JSONDecoder().decode([String].self, from: Data(contentsOf: url))
     }
 

@@ -117,18 +117,26 @@ extension ACPAgentSessionControllerModeConfigTests {
             selections: selections
         ).isEmpty)
 
-        for sparseFamilyModelID in ["provider/sparse-fast", "provider/sparse-low-fast"] {
-            selections.setValue("low", for: sparseFamilyModelID)
-            XCTAssertTrue(
-                selections.assignments(for: .ohMyPiCustom(name: sparseFamilyModelID)).isEmpty,
-                "Default and explicit effort leaves in a corroborated fast-only family stay terminal"
-            )
-            XCTAssertTrue(AgentModeRunService.ohMyPiConfigAssignments(
-                agent: .ohMyPi,
-                exactWireModelID: sparseFamilyModelID,
-                selections: selections
-            ).isEmpty)
-        }
+        let sparseDefaultID = "provider/sparse-fast"
+        selections.setValue("low", for: sparseDefaultID)
+        XCTAssertEqual(
+            selections.assignments(for: .ohMyPiCustom(name: sparseDefaultID)),
+            [.ohMyPiThinking("low")]
+        )
+        XCTAssertEqual(AgentModeRunService.ohMyPiConfigAssignments(
+            agent: .ohMyPi,
+            exactWireModelID: sparseDefaultID,
+            selections: selections
+        ), [.ohMyPiThinking("low")])
+
+        let sparseLowID = "provider/sparse-low-fast"
+        selections.setValue("low", for: sparseLowID)
+        XCTAssertTrue(selections.assignments(for: .ohMyPiCustom(name: sparseLowID)).isEmpty)
+        XCTAssertTrue(AgentModeRunService.ohMyPiConfigAssignments(
+            agent: .ohMyPi,
+            exactWireModelID: sparseLowID,
+            selections: selections
+        ).isEmpty)
 
         XCTAssertTrue(
             OhMyPiThinkingExecutionEligibility.allowsAssignment(
@@ -144,6 +152,56 @@ extension ACPAgentSessionControllerModeConfigTests {
             ),
             "An exact model absent from the resolved catalog remains fail-open"
         )
+    }
+
+    @MainActor
+    func testEffortNilFamilyAssignmentsFlowAndExplicitEffortAssignmentsStaySuppressed() {
+        let grok = "cursor/cursor-grok-4.6"
+        let grokFast = "cursor/cursor-grok-4.6-fast"
+        let grokHigh = "cursor/cursor-grok-4.6-high"
+        let sparseFast = "provider/sparse-fast"
+        let sparseLowFast = "provider/sparse-low-fast"
+        let wireIDs = [grok, grokFast, grokHigh, sparseFast, sparseLowFast]
+        AgentACPModelRegistry.shared.reset(providerID: .ohMyPi)
+        defer { AgentACPModelRegistry.shared.reset(providerID: .ohMyPi) }
+        XCTAssertTrue(AgentACPModelRegistry.shared.updateDiscoveredModels(
+            ACPDiscoveredSessionModels(
+                options: wireIDs.map {
+                    AgentModelOption(
+                        rawValue: $0,
+                        displayName: $0,
+                        description: nil,
+                        isDefault: false
+                    )
+                },
+                currentModelRaw: grok
+            ),
+            for: .ohMyPi
+        ))
+
+        var selections = OhMyPiThinkingSelections()
+        for wireID in [grok, grokFast, sparseFast] {
+            selections.setValue("high", for: wireID)
+            XCTAssertEqual(
+                selections.assignments(for: .ohMyPiCustom(name: wireID)),
+                [.ohMyPiThinking("high")]
+            )
+            XCTAssertEqual(AgentModeRunService.ohMyPiConfigAssignments(
+                agent: .ohMyPi,
+                exactWireModelID: wireID,
+                selections: selections
+            ), [.ohMyPiThinking("high")])
+        }
+
+        for wireID in [grokHigh, sparseLowFast] {
+            selections.setValue("high", for: wireID)
+            XCTAssertTrue(selections.assignments(for: .ohMyPiCustom(name: wireID)).isEmpty)
+            XCTAssertTrue(AgentModeRunService.ohMyPiConfigAssignments(
+                agent: .ohMyPi,
+                exactWireModelID: wireID,
+                selections: selections
+            ).isEmpty)
+        }
     }
 
     func testOhMyPiThinkingSelectionsLegacyDecodeAndNonemptyOnlyEncoding() throws {

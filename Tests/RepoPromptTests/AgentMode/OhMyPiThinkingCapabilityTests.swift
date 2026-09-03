@@ -503,9 +503,10 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         XCTAssertEqual(countTitle("Thinking", in: items), 0)
     }
 
-    func testStableAgentSurfaceKeepsFamilyLeavesTerminalAndStandaloneGoogleThinkingCapable() throws {
+    func testStableAgentSurfaceUsesPerLeafThinkingAccessoryAndPreservesStandaloneBehavior() throws {
         let rootRaw = "root-high"
         let googleRaw = "google-antigravity/gemini-3.7-flash"
+        let familyDefaultRaw = "cursor/cursor-grok-4.6"
         let familyHighRaw = "cursor/cursor-grok-4.6-high"
         let fastXHighRaw = "cursor/cursor-grok-4.6-xhigh-fast"
         let sparseFastDefaultRaw = "provider/sparse-fast"
@@ -513,7 +514,7 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         let rawModels = [
             rootRaw,
             googleRaw,
-            "cursor/cursor-grok-4.6",
+            familyDefaultRaw,
             "cursor/cursor-grok-4.6-low",
             familyHighRaw,
             "cursor/cursor-grok-4.6-low-fast",
@@ -533,6 +534,8 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         var selections = OhMyPiThinkingSelections()
         selections.setValue("high", for: rootRaw)
         selections.setValue("high", for: googleRaw)
+        selections.setValue("high", for: familyDefaultRaw)
+        selections.setValue("low", for: sparseFastDefaultRaw)
         var events: [String] = []
         let destination = ModelDestination(
             id: "agent-family-vs-standalone",
@@ -587,11 +590,23 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             at: ["provider", "sparse", "Fast", "Low"],
             in: items
         )
-        XCTAssertNil(familyDefault.submenuItems)
+        XCTAssertEqual(familyDefault.submenuItems?.first?.title, "Default")
         XCTAssertNil(familyHigh.submenuItems)
         XCTAssertNil(fastXHigh.submenuItems)
-        XCTAssertNil(sparseFastDefault.submenuItems)
+        XCTAssertEqual(sparseFastDefault.submenuItems?.first?.title, "Default")
         XCTAssertNil(sparseFastLow.submenuItems)
+
+        let familyThinkingDefault = try stableMenuItem(
+            at: ["cursor", "cursor-grok-4.6", "Default", "Default"],
+            in: items
+        )
+        XCTAssertTrue(familyThinkingDefault.performActionForTesting())
+        XCTAssertEqual(events, ["model:\(familyDefaultRaw)", "thinking"])
+        XCTAssertNil(selections[familyDefaultRaw])
+        XCTAssertEqual(selections[googleRaw]?.value, "high")
+        XCTAssertEqual(selections[sparseFastDefaultRaw]?.value, "low")
+
+        events.removeAll()
         XCTAssertTrue(familyHigh.performActionForTesting())
         XCTAssertEqual(events, ["model:\(familyHighRaw)"])
         XCTAssertEqual(selections[googleRaw]?.value, "high")
@@ -606,11 +621,13 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         XCTAssertNil(selections[googleRaw])
     }
 
-    func testStableSettingsSurfaceKeepsFamilyLeavesTerminalAndStandaloneGoogleThinkingCapable() throws {
+    func testStableSettingsSurfaceUsesPerLeafThinkingAccessoryAndPreservesStandaloneBehavior() throws {
         let googleRaw = "google-antigravity/gemini-3.7-flash"
+        let familyDefaultRaw = "cursor/cursor-grok-4.6"
         let familyHighRaw = "cursor/cursor-grok-4.6-high"
         let models: [AIModel] = [
             .ohMyPiCustom(name: googleRaw),
+            .ohMyPiCustom(name: familyDefaultRaw),
             .ohMyPiCustom(name: "cursor/cursor-grok-4.6-low"),
             .ohMyPiCustom(name: familyHighRaw),
             .ohMyPiCustom(name: "cursor/cursor-grok-4.6-xhigh-fast")
@@ -643,10 +660,15 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
             events.append("model:\(model.modelName)")
         }
 
+        let familyDefault = try stableMenuItem(
+            at: ["cursor", "cursor-grok-4.6", "Default"],
+            in: items
+        )
         let familyHigh = try stableMenuItem(
             at: ["cursor", "cursor-grok-4.6", "High"],
             in: items
         )
+        XCTAssertEqual(familyDefault.submenuItems?.first?.title, "Default")
         XCTAssertNil(familyHigh.submenuItems)
         XCTAssertTrue(familyHigh.performActionForTesting())
         XCTAssertEqual(events, ["model:\(familyHighRaw)"])
@@ -659,6 +681,74 @@ final class OhMyPiThinkingMenuBuilderTests: XCTestCase {
         XCTAssertTrue(googleDefault.performActionForTesting())
         XCTAssertEqual(events, ["model:\(googleRaw)", "thinking"])
         XCTAssertNil(selections[googleRaw])
+    }
+
+    func testCollapsedGrokPairKeepsGroupingAndExposesThinkingOnAgentAndSettingsSurfaces() throws {
+        let rawModels = [
+            "cursor/cursor-grok-4.6",
+            "cursor/cursor-grok-4.6-fast"
+        ]
+        let options = rawModels.map {
+            AgentModelOption(
+                rawValue: $0,
+                displayName: $0,
+                description: nil,
+                isDefault: false
+            )
+        }
+        let projection = OhMyPiModelMenuProjector.project(options.map {
+            .init(sourceID: $0.rawValue, wireID: $0.rawValue, displayName: $0.displayName)
+        })
+        let cursor = try XCTUnwrap(projection.namespaceGroups.first { $0.namespace == "cursor" })
+        let family = try XCTUnwrap(cursor.modelGroups.first { $0.title == "cursor-grok-4.6" })
+        XCTAssertTrue(family.isFamily)
+        XCTAssertEqual(family.normalLeaves.map(\.wireID), [rawModels[0]])
+        XCTAssertEqual(family.fastLeaves.map(\.wireID), [rawModels[1]])
+        XCTAssertTrue(family.allLeaves.allSatisfy { $0.effort == nil && $0.allowsThinkingAccessory })
+
+        var selectedRaw = rawModels[0]
+        var selections = OhMyPiThinkingSelections()
+        let destination = ModelDestination(
+            id: "collapsed-grok-pair",
+            getter: { selectedRaw },
+            applier: { selectedRaw = $0 },
+            thinkingGetter: { selections },
+            thinkingApplier: { selections = $0 }
+        )
+        let agentItems = AgentModelStableMenuItems.ohMyPiModelItems(
+            options: options,
+            selectedAgent: .ohMyPi,
+            selectedModelRaw: selectedRaw,
+            thinkingDestination: destination,
+            onSelect: { _, option in selectedRaw = option.rawValue }
+        )
+        XCTAssertEqual(
+            try stableMenuItem(at: ["cursor", "cursor-grok-4.6", "Default"], in: agentItems)
+                .submenuItems?.first?.title,
+            "Default"
+        )
+        XCTAssertEqual(
+            try stableMenuItem(at: ["cursor", "cursor-grok-4.6", "Fast", "Default"], in: agentItems)
+                .submenuItems?.first?.title,
+            "Default"
+        )
+
+        let models = rawModels.map(AIModel.ohMyPiCustom(name:))
+        let settingsItems = OhMyPiModelMenuBuilder.stableMenuItems(
+            for: models,
+            destination: destination,
+            onModelCommit: { selectedRaw = $0.modelName }
+        )
+        XCTAssertEqual(
+            try stableMenuItem(at: ["cursor", "cursor-grok-4.6", "Default"], in: settingsItems)
+                .submenuItems?.first?.title,
+            "Default"
+        )
+        XCTAssertEqual(
+            try stableMenuItem(at: ["cursor", "cursor-grok-4.6", "Fast", "Default"], in: settingsItems)
+                .submenuItems?.first?.title,
+            "Default"
+        )
     }
 
     func testContextBuilderSurfaceNestsThinkingUnderValidLeavesEvenWhenSelectedAgentIsNonOMP() throws {

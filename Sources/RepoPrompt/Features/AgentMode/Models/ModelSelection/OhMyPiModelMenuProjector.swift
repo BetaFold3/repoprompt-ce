@@ -2,8 +2,9 @@ import Foundation
 
 /// Presentation-only hierarchy for Oh My Pi model catalogs.
 ///
-/// Grouping is derived exclusively from exact wire IDs. Display names are retained only
-/// for standalone leaf labels and never participate in parsing or family corroboration.
+/// Grouping is derived exclusively from exact wire IDs and is presentational only. Display
+/// names are retained only for standalone leaf labels and never participate in parsing or family
+/// corroboration. Thinking-accessory eligibility is derived per leaf from its effort suffix.
 enum OhMyPiModelMenuProjector {
     struct Input: Hashable {
         let sourceID: String
@@ -317,8 +318,12 @@ enum OhMyPiModelMenuProjector {
             title: entry.effort?.displayName ?? "Default",
             effort: entry.effort,
             isFast: entry.isFast,
-            allowsThinkingAccessory: false
+            allowsThinkingAccessory: !wireIDEncodesExplicitEffort(entry)
         )
+    }
+
+    private static func wireIDEncodesExplicitEffort(_ entry: ParsedEntry) -> Bool {
+        entry.effort != nil
     }
 
     private static func standaloneLeaf(input: Input, modelSegment: String) -> Leaf {
