@@ -212,6 +212,7 @@ struct AgentProviderRuntimePermissionBinding: Equatable {
 enum CodexToolSettingMutation: Equatable {
     case bashTool(enabled: Bool)
     case searchTool(enabled: Bool)
+    case computerUse(enabled: Bool)
     case goalSupport(enabled: Bool)
     case reasoningSummaries(enabled: Bool)
     case mcpServer(normalizedName: String, enabled: Bool)
@@ -226,12 +227,13 @@ enum ClaudeToolSettingMutation: Equatable {
 
 /// Persisted Codex tool preference snapshot for editing/display.
 ///
-/// Permission profiles are applied through `AgentProviderRuntimePermissionBinding`; these
-/// values intentionally mirror existing UserDefaults-backed tool preferences even when a
-/// caller is rendering an externally managed or MCP-safe permission profile.
+/// Permission profiles are applied through `AgentProviderRuntimePermissionBinding`.
+/// User-configured values mirror stored preferences; MCP-safe snapshots apply the Safe
+/// Managed overrides defined by `codexToolSettingsBinding(profile:)`.
 struct CodexToolSettingsBinding: Equatable {
     let bashToolEnabled: Bool
     let searchToolEnabled: Bool
+    let computerUseEnabled: Bool
     let goalSupportEnabled: Bool
     /// Controls Codex Agent Mode app-server reasoning summary config only; this is not a
     /// general model reasoning-effort preference.

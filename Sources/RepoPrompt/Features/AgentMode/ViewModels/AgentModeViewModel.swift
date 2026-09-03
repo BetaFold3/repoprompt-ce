@@ -2045,7 +2045,11 @@ final class AgentModeViewModel: ObservableObject {
                 suppressThirdPartyMCPServers: isKnowledge ? true : permissionProfile.codexSuppressesThirdPartyMCPServers,
                 goalSupportEnabledProvider: { isKnowledge ? false : CodexGoalSupport.isEnabled },
                 reasoningSummariesEnabledProvider: { CodexReasoningSummaries.isEnabled },
-                computerUseEnabledProvider: { isKnowledge ? false : computerUseEnabled }
+                computerUseEnabledProvider: {
+                    isKnowledge || permissionProfile == .mcpSafeDefaults
+                        ? false
+                        : computerUseEnabled
+                }
             )
             return CodexNativeSessionController(
                 client: client,
