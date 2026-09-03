@@ -165,6 +165,8 @@ final class AgentProviderPreferenceSnapshotStore {
             CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
         case let .searchTool(enabled):
             CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
+        case let .computerUse(enabled):
+            CodexAgentModeBooleanPreference.computerUse.setEnabled(enabled, defaults: defaults)
         case let .goalSupport(enabled):
             CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
         case let .reasoningSummaries(enabled):
@@ -187,6 +189,10 @@ final class AgentProviderPreferenceSnapshotStore {
 
     func setCodexSearchToolEnabled(_ enabled: Bool) {
         applyCodexToolSettingMutation(.searchTool(enabled: enabled))
+    }
+
+    func setCodexComputerUseEnabled(_ enabled: Bool) {
+        applyCodexToolSettingMutation(.computerUse(enabled: enabled))
     }
 
     func setCodexGoalSupportEnabled(_ enabled: Bool) {
@@ -391,6 +397,7 @@ final class AgentProviderPreferenceSnapshotStore {
             return CodexToolSettingsBinding(
                 bashToolEnabled: CodexAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions),
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
+                computerUseEnabled: codexComputerUseEnabled(),
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 mcpServerEntries: entries,
@@ -406,6 +413,7 @@ final class AgentProviderPreferenceSnapshotStore {
             return CodexToolSettingsBinding(
                 bashToolEnabled: true,
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
+                computerUseEnabled: false,
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 reasoningSummariesEnabled: codexReasoningSummariesEnabled(),
                 mcpServerEntries: entries,
@@ -445,6 +453,10 @@ final class AgentProviderPreferenceSnapshotStore {
                 agentModePromptDelivery: ClaudeAgentToolPreferences.agentModePromptDelivery(defaults: defaults)
             )
         }
+    }
+
+    private func codexComputerUseEnabled() -> Bool {
+        CodexAgentModeBooleanPreference.computerUse.isEnabled(defaults: defaults)
     }
 
     private func codexGoalSupportEnabled() -> Bool {

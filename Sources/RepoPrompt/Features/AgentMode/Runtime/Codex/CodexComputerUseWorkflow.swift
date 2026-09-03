@@ -2,6 +2,7 @@ import Foundation
 
 extension Notification.Name {
     static let codexGoalSupportDidChange = Notification.Name("RepoPrompt.codexGoalSupportDidChange")
+    static let codexComputerUseDidChange = Notification.Name("RepoPrompt.codexComputerUseDidChange")
 }
 
 private enum CodexNativeFeatureGate: Hashable {
@@ -129,10 +130,43 @@ enum CodexGoalSupport {
 
 enum CodexComputerUseWorkflow {
     static let commandName = "computer-use"
-    static let disabledMessage = "Codex computer-use is currently disabled in RepoPrompt because it requires additional computer permissions/accessibility setup."
+    static let disabledMessage = "Codex computer use is turned off. Enable Codex Computer Use in settings or set app_settings key 'agent_mode.codex_computer_use_enabled' to true to use /computer-use."
+    static let safeManagedDisabledMessage = "/computer-use isn't available in Safe Managed (MCP-initiated) Codex sessions."
 
+    @MainActor
     static var isEnabled: Bool {
-        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: false)
+        GlobalSettingsStore.shared.codexComputerUseEnabled()
+    }
+
+    static func isEnabled(defaults: UserDefaults) -> Bool {
+        precondition(
+            defaults !== UserDefaults.standard,
+            "Use GlobalSettingsStore for the standard Codex computer-use preference."
+        )
+        return CodexNativeFeatureGate.computerUse.isEnabled(defaults: defaults)
+    }
+
+    static func isEnabled(persistedValue: Bool) -> Bool {
+        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: persistedValue)
+    }
+
+    static func isEnabled(persistedValue: Bool?) -> Bool {
+        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: persistedValue)
+    }
+
+    static func setEnabled(_ value: Bool, defaults: UserDefaults) {
+        precondition(
+            defaults !== UserDefaults.standard,
+            "Use GlobalSettingsStore for the standard Codex computer-use preference."
+        )
+        let oldValue = isEnabled(defaults: defaults)
+        CodexNativeFeatureGate.computerUse.setEnabled(value, defaults: defaults)
+        postDidChangeIfNeeded(previousValue: oldValue, currentValue: isEnabled(defaults: defaults))
+    }
+
+    static func postDidChangeIfNeeded(previousValue: Bool, currentValue: Bool) {
+        guard currentValue != previousValue else { return }
+        NotificationCenter.default.post(name: .codexComputerUseDidChange, object: nil)
     }
 
     #if DEBUG
@@ -171,6 +205,7 @@ enum CodexComputerUseWorkflow {
         - Do not treat RepoPrompt MCP auto-approval as approval for non-RepoPrompt MCP, plugin, browser, or computer-use tools.
         - Keep RepoPrompt workspace file edits separate from external UI automation; explain which surface you are acting on.
         - Prefer non-destructive inspection and reporting before taking action.
+        - If macOS explicitly reports an Accessibility or Screen Recording permission error, report the error exactly and direct the user to System Settings → Privacy & Security to grant the required permission instead of retrying.
 
         <user_instructions>
         \(instructionBlock)

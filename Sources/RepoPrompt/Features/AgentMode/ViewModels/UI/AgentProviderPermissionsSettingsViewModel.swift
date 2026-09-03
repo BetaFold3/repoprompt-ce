@@ -106,6 +106,8 @@ final class AgentProviderPermissionsSettingsViewModel: ObservableObject {
                 CodexAgentToolPreferences.setBashToolEnabled(enabled, defaults: defaults, secureStore: securePermissions)
             case let .searchTool(enabled):
                 CodexAgentToolPreferences.setSearchToolEnabled(enabled, defaults: defaults)
+            case let .computerUse(enabled):
+                CodexAgentModeBooleanPreference.computerUse.setEnabled(enabled, defaults: defaults)
             case let .goalSupport(enabled):
                 CodexAgentModeBooleanPreference.goalSupport.setEnabled(enabled, defaults: defaults)
             case let .reasoningSummaries(enabled):

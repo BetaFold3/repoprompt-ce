@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Computer-Use Enablement — Technical Report</title>
+<style>
+:root{color-scheme:light dark;--bg:#f6f7f9;--panel:#fff;--text:#172033;--muted:#5d6678;--line:#d9deea;--accent:#087ea4;--good:#166534;--warn:#92400e;--code:#eef2f7}
+@media(prefers-color-scheme:dark){:root{--bg:#10131a;--panel:#171b24;--text:#edf1f7;--muted:#aeb7c8;--line:#343b49;--accent:#67d3f5;--good:#86efac;--warn:#fbbf24;--code:#222837}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{width:min(980px,calc(100% - 32px));margin:32px auto 72px}header,section{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:24px;margin:18px 0}
+h1{margin:0 0 8px;font-size:clamp(1.8rem,4vw,2.7rem);line-height:1.15}h2{margin:0 0 14px;font-size:1.45rem}h3{margin:22px 0 8px;font-size:1.08rem}
+p,li{max-width:78ch}.lede{color:var(--muted);font-size:1.08rem}.tag{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 10px;margin:4px 5px 0 0;color:var(--muted);font-size:.86rem}
+.callout{border-left:4px solid var(--accent);padding:10px 14px;background:color-mix(in srgb,var(--accent) 8%,var(--panel))}.warn{border-left-color:var(--warn)}.good{color:var(--good);font-weight:650}
+code{background:var(--code);border-radius:5px;padding:.12em .35em;font:.92em ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px;overflow:auto}pre code{padding:0;background:transparent;overflow-wrap:normal}
+table{width:100%;border-collapse:collapse;font-size:.94rem}th,td{text-align:left;vertical-align:top;border-bottom:1px solid var(--line);padding:10px 8px}th{color:var(--muted)}ol.steps>li{margin:18px 0;padding-left:5px}.small{color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body><main>
+<header>
+<h1>Codex computer-use enablement</h1>
+<p class="lede">Technical implementation, troubleshooting, and live-test report for the work in <code>rp/agent/2802da8c-agent</code>.</p>
+<span class="tag">Report date: 2026-09-03</span><span class="tag">Live smoke test passed</span><span class="tag">macOS authorization fix included</span>
+</header>
+
+<section>
+<h2>Outcome</h2>
+<p>The change adds a saved, default-off gate for Codex computer use.</p>
+<p>A gate is a switch that must be on before a feature can run.</p>
+<p>The user turns the gate on through RepoPrompt CE's <code>app_settings</code> tool.</p>
+<p>The user then starts one computer-use turn with <code>/computer-use</code> in a normal Codex Agent Mode session.</p>
+<p>The change does not add a visible Settings-screen toggle.</p>
+<p>The change does not install a computer-use server.</p>
+<p>The change does not grant macOS permissions.</p>
+<p>The implementation now declares why RepoPrompt sends Apple Events. An Apple Event is a macOS message that one application sends to another for automation.</p>
+<p class="good">A live read-only computer-use test passed after the server path and macOS authorization issues were corrected.</p>
+<p class="callout"><strong>Expected safety rule.</strong> Safe Managed sessions and Knowledge sessions cannot enable computer use. Safe Managed means a session started through MCP with restricted defaults. MCP is the protocol that lets an agent call tools supplied by another process.</p>
+</section>
+
+<section>
+<h2>Why this changed</h2>
+<p><strong>Observed in the session.</strong> Computer use already had a slash workflow and runtime support. RepoPrompt kept the feature disabled with a fixed value.</p>
+<p>The requested plan made the feature opt-in.</p>
+<p>The plan also required one saved source of truth.</p>
+<p>The implementation uses the global settings document for that source.</p>
+<p>The environment variable <code>RP_CODEX_COMPUTER_USE</code> can still force the gate on.</p>
+<p>Injected <code>UserDefaults</code> remain available for isolated tests only.</p>
+</section>
+
+<section>
+<h2>What changed</h2>
+<table><thead><tr><th>Area</th><th>Files</th><th>Change</th></tr></thead><tbody>
+<tr><td>Saved setting</td><td><code>GlobalSettingsDocument.swift</code><br><code>GlobalSettingsManager.swift</code></td><td>Adds the optional <code>codexComputerUseEnabled</code> value. Missing values mean off. Writes send a change notification only when the effective value changes.</td></tr>
+<tr><td>Feature gate</td><td><code>CodexComputerUseWorkflow.swift</code><br><code>CodexAgentModeBooleanPreference.swift</code></td><td>Reads production state from <code>GlobalSettingsStore</code>. Keeps the test shim and environment override. Adds clear disabled and Safe Managed messages. Adds macOS permission guidance to the workflow prompt.</td></tr>
+<tr><td>Provider settings</td><td><code>AgentProviderBindingModels.swift</code><br><code>AgentProviderPreferenceSnapshotStore.swift</code><br><code>AgentProviderPermissionsSettingsViewModel.swift</code></td><td>Adds a computer-use field and mutation to the shared Codex settings path. Safe Managed snapshots always report this field as off.</td></tr>
+<tr><td>Runtime safety</td><td><code>CodexAgentModeCoordinator.swift</code><br><code>AgentModeViewModel.swift</code></td><td>Rejects the slash command in Safe Managed sessions. Clears stale activation. Clamps the controller option to off for Safe Managed and Knowledge sessions.</td></tr>
+<tr><td>Tool API</td><td><code>AppSettingsMCPService.swift</code></td><td>Adds the boolean key <code>agent_mode.codex_computer_use_enabled</code>.</td></tr>
+<tr><td>Tests</td><td><code>CodexGoalSupportDefaultTests.swift</code><br><code>AppSettingsMCPServiceAgentModeSettingsTests.swift</code></td><td>Covers defaults, true and false values, notifications, Safe Managed rejection, and the settings tool round trip.</td></tr>
+<tr><td>macOS authorization</td><td><code>AppBundle/Info.plist.template</code><br><code>AppBundle/RepoPrompt.entitlements.template</code><br><code>AppBundle/RepoPrompt.local-self-signed.entitlements.template</code><br><code>Scripts/test_release_tooling.py</code><br><code>Scripts/source_layout_guardrails.sh</code></td><td>Adds the required <code>NSAppleEventsUsageDescription</code> declaration. Adds the <code>com.apple.security.automation.apple-events</code> entitlement to both hardened-runtime templates. Adds a focused packaging assertion so future app bundles keep both parts. Allowlists this durable report.</td></tr>
+</tbody></table>
+<p class="small">The original twelve Swift files were staged before the live test. The app-bundle declaration, its test, and this report were added after troubleshooting found the cross-process authorization requirement.</p>
+</section>
+
+<section>
+<h2>What to expect</h2>
+<ul>
+<li>The setting starts off for users who have no saved value.</li>
+<li><code>/computer-use</code> shows a direct disabled message while the setting is off.</li>
+<li>Turning the setting on makes the slash workflow eligible in a normal Codex session.</li>
+<li>The slash command enables computer use for that explicit turn. It does not enable every Codex turn.</li>
+<li>The current turn must be idle, or waiting for the user.</li>
+<li>The command cannot be combined with attachments, tagged files, or another selected workflow.</li>
+<li>A configured MCP server named <code>computer-use</code> is still needed for actual computer-use tools.</li>
+<li>Codex should report missing tools instead of inventing tool calls.</li>
+<li>macOS may ask RepoPrompt for Automation access to ChatGPT Computer Use and System Events.</li>
+<li>macOS may also ask the computer-use helper for Accessibility or Screen Recording access. Debug and release identities can need separate grants.</li>
+<li>Full-auto mode may accept requests from the <code>computer-use</code> server for that explicit turn. Other permission policies still show approval prompts.</li>
+</ul>
+</section>
+
+<section>
+<h2>How to test it</h2>
+<p>Run these commands from the root of the repository checkout or implementation worktree.</p>
+<pre><code>git status --short --branch</code></pre>
+
+<h3>1. Run the focused automated checks</h3>
+<ol class="steps">
+<li>Check Swift style.<pre><code>make dev-lint</code></pre></li>
+<li>Test the saved gate and Safe Managed rejection.<pre><code>make dev-test FILTER=CodexGoalSupportDefaultTests</code></pre></li>
+<li>Test the <code>app_settings</code> catalog, read, and write path.<pre><code>make dev-test FILTER=AppSettingsMCPServiceAgentModeSettingsTests</code></pre></li>
+<li>Build the app product.<pre><code>make dev-swift-build PRODUCT=RepoPrompt</code></pre></li>
+</ol>
+<p><strong>Expected result.</strong> Each command exits with status zero. The two filtered test commands must report that they ran tests. A zero-test run is not a pass.</p>
+
+<h3>2. Build and launch the worktree app</h3>
+<p>This step changes the visible app. Close or preserve work in any running debug app first.</p>
+<pre><code>make dev-run</code></pre>
+<p>The coordinated build writes the debug app to <code>.build/debug/RepoPrompt.app</code>.</p>
+
+<h3>3. Check the CE debug CLI</h3>
+<pre><code>make debug-cli-status</code></pre>
+<p>If the debug CLI is missing or stale, install the one built from this checkout.</p>
+<pre><code>make install-debug-cli</code></pre>
+<p>Use <code>rpce-cli-debug</code>. Do not use the production <code>rp-cli</code>.</p>
+
+<h3>4. Find the target window</h3>
+<pre><code>rpce-cli-debug -e 'windows'</code></pre>
+<p>Choose the positive window ID for the debug app. Replace <code>&lt;window-id&gt;</code> below.</p>
+
+<h3>5. Confirm that the new setting exists and starts off</h3>
+<pre><code>rpce-cli-debug -w &lt;window-id&gt; -c app_settings -j '{"op":"get","key":"agent_mode.codex_computer_use_enabled"}'</code></pre>
+<p>Expect a boolean value. A new profile should return <code>false</code>.</p>
+
+<h3>6. Confirm the disabled user path</h3>
+<ol><li>Open a standard Agent Mode tab in the debug app.</li><li>Select Codex.</li><li>Enter <code>/computer-use inspect the frontmost app without changing anything</code>.</li><li>Send the turn.</li></ol>
+<p>Expect the message that Codex computer use is turned off. The message should name the settings key.</p>
+
+<h3>7. Turn on the gate</h3>
+<pre><code>rpce-cli-debug -w &lt;window-id&gt; -c app_settings -j '{"op":"set","key":"agent_mode.codex_computer_use_enabled","value":true}'</code></pre>
+<p>Expect <code>status</code> to be <code>ok</code>. Expect <code>new_value</code> to be <code>true</code>.</p>
+
+<h3>8. Check the eligible workflow</h3>
+<ol><li>Use a normal Codex Agent Mode session.</li><li>Make sure no other workflow is selected.</li><li>Do not attach images or files.</li><li>Enter <code>/computer-use inspect the frontmost app and report what you see; do not click or type</code>.</li><li>Send the turn.</li></ol>
+<p>Expect a user bubble marked <code>/computer-use</code>.</p>
+<p>If a computer-use MCP server is configured, expect Codex to discover or call its tools.</p>
+<p>If no such server is configured, expect Codex to say that no computer-use tools are available.</p>
+
+<h3>9. Check macOS permission handling</h3>
+<p>Only do this with a non-destructive inspection request.</p>
+<p>Open System Settings → Privacy &amp; Security → Automation.</p>
+<p>Allow the RepoPrompt debug app to control <strong>ChatGPT Computer Use</strong> and <strong>System Events</strong>.</p>
+<p>Use Privacy &amp; Security → Screen Recording to let ChatGPT Computer Use inspect visible pixels.</p>
+<p>Grant Accessibility only when you want it to click, type, or otherwise control the interface.</p>
+<p>If the Automation prompts are stale, quit RepoPrompt and reset the debug identity before relaunching:</p>
+<pre><code>tccutil reset AppleEvents com.pvncher.repoprompt.ce.debug</code></pre>
+<p>This resets every Automation decision for the debug app. It does not reset Accessibility or Screen Recording.</p>
+
+<h3>10. Turn the gate off again</h3>
+<pre><code>rpce-cli-debug -w &lt;window-id&gt; -c app_settings -j '{"op":"set","key":"agent_mode.codex_computer_use_enabled","value":false}'</code></pre>
+<p>Repeat step 6. Expect the disabled message again.</p>
+
+<h3>Optional contribution check</h3>
+<p>Run this before a commit. It checks the staged files.</p>
+<pre><code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code></pre>
+<p class="callout warn"><strong>Known baseline issue.</strong> The prior session reported that this preflight reached a guardrail failure caused by seven tracked documentation paths outside this change. Do not bypass that policy. Review the current output because the repository may have changed.</p>
+</section>
+
+<section>
+<h2>Live troubleshooting record</h2>
+<ol class="steps">
+<li><strong>The gate worked.</strong> The <code>app_settings</code> call changed <code>agent_mode.codex_computer_use_enabled</code> from false to true. The Agent Mode bubble showed the computer icon and <code>/computer-use</code> label. This proved that RepoPrompt parsed the workflow.</li>
+<li><strong>The first run had no tool.</strong> Codex said no computer-use tool was available. The active Codex profiles used a relative MCP command such as <code>./Codex Computer Use.app/...</code> with <code>cwd = "."</code>. RepoPrompt starts Codex from the selected workspace. The relative path therefore pointed to the wrong location.</li>
+<li><strong>The MCP paths were repaired locally.</strong> On the test machine, the affected <code>~/.codex/config.toml</code> and profile-specific files under <code>~/.codex-auth-switcher/app-server/workers/</code> now use the absolute helper path under <code>~/.codex/computer-use/</code>. These user-level configuration edits are not repository changes. The saved server remains disabled. The explicit workflow enables it for one turn.</li>
+<li><strong>The second run reached macOS.</strong> The helper reported error <code>-1743</code>. This code means an Apple Event was not authorized. Enabling RepoPrompt → System Events removed that direct denial.</li>
+<li><strong>The next runs timed out.</strong> Three tool calls each waited about two minutes and returned <code>-1712</code>, or <code>errAETimeout</code>. The delay made the receiver look hung.</li>
+<li><strong>The macOS log showed the hidden denial.</strong> <code>SkyComputerUseClient</code> sent an Apple Event to <code>SkyComputerUseService</code>. TCC, the macOS privacy service, attributed the request to <code>com.pvncher.repoprompt.ce.debug</code>. It denied RepoPrompt access to <code>com.openai.sky.CUAService</code>. The client then surfaced only a timeout.</li>
+<li><strong>The app bundle lacked the required declaration.</strong> Both the coordinated debug bundle and <code>/Applications/RepoPrompt CE Dev.app</code> lacked <code>NSAppleEventsUsageDescription</code>. The repository template now contains it. Both hardened-runtime entitlement templates now allow Apple Events automation. The entitlement addition came after the validated debug rebuild and still needs verification in a hardened-runtime artifact.</li>
+<li><strong>The rebuilt app succeeded.</strong> The debug app was rebuilt. Its Automation decisions were reset. The user allowed the new prompts. The same read-only <code>/computer-use</code> test then worked.</li>
+</ol>
+<p class="callout"><strong>Identity detail.</strong> The coordinated debug app and <code>RepoPrompt CE Dev.app</code> use bundle ID <code>com.pvncher.repoprompt.ce.debug</code> with the same development signing identity. The release app uses <code>com.pvncher.repoprompt.ce</code> and a different signing identity. macOS permissions follow those identities, not only the visible application name.</p>
+</section>
+
+<section>
+<h2>Validation already completed</h2>
+<p>The table combines automated evidence from the implementation and direct evidence from the live troubleshooting run.</p>
+<table><thead><tr><th>Check</th><th>Result</th></tr></thead><tbody>
+<tr><td><code>make dev-lint</code></td><td class="good">Passed</td></tr>
+<tr><td><code>make dev-test FILTER=CodexGoalSupportDefaultTests</code></td><td class="good">Passed. 20 tests ran.</td></tr>
+<tr><td><code>make dev-test FILTER=AppSettingsMCPServiceAgentModeSettingsTests</code></td><td class="good">Passed. 6 tests ran.</td></tr>
+<tr><td><code>make dev-swift-build PRODUCT=RepoPrompt</code></td><td class="good">Passed</td></tr>
+<tr><td><code>git diff --cached --check</code></td><td class="good">Passed</td></tr>
+<tr><td>Staged secret scan</td><td class="good">Passed</td></tr>
+<tr><td>Full test suite</td><td>Not run</td></tr>
+<tr><td>Focused release-tooling packaging test for the purpose string and both hardened-runtime entitlement templates</td><td class="good">Passed</td></tr>
+<tr><td><code>make dev-build</code> after the plist fix</td><td class="good">Passed. The generated and signed debug bundle contains <code>NSAppleEventsUsageDescription</code>.</td></tr>
+<tr><td>Hardened-runtime signed build with the new entitlement</td><td>Not run. Debug packaging does not use the hardened runtime. Verify the signed entitlement during the next release or release-candidate run.</td></tr>
+<tr><td>Live computer-use smoke test</td><td class="good">Passed after correcting the MCP path, rebuilding the app, resetting Automation decisions, and accepting the prompts.</td></tr>
+<tr><td>Commit preflight</td><td>Blocked by unrelated tracked documentation guardrails</td></tr>
+</tbody></table>
+<p>One intermediate test build failed because a test factory closure had the wrong number of arguments.</p>
+<p>The implementation corrected the closure.</p>
+<p>The final focused tests then passed.</p>
+</section>
+
+<section>
+<h2>Major decisions and turns</h2>
+<ol class="steps">
+<li><strong>Use one production authority.</strong> The implementation moved the production gate to <code>GlobalSettingsStore</code>. This avoids two saved values that could disagree.</li>
+<li><strong>Keep compatibility narrow.</strong> The old <code>UserDefaults</code> key remains only for injected test stores. The environment variable remains a force-on switch. The code does not migrate a stale user value into the new global setting.</li>
+<li><strong>Keep the default off.</strong> Computer control has security and privacy effects. Users must opt in.</li>
+<li><strong>Require an explicit slash turn.</strong> Enabling the setting does not activate tools on ordinary turns. The user must type <code>/computer-use</code>.</li>
+<li><strong>Add the tool API before UI polish.</strong> The plan asked for the <code>app_settings</code> key. It did not ask for a visible Settings toggle. The shared binding supports a future toggle, but the current view does not render it.</li>
+<li><strong>Expand safety after review.</strong> OracleB found that Safe Managed could still reach activation paths. The implementation added checks at slash validation, pending activation, desired controller state, and controller construction.</li>
+<li><strong>Correct a test integration error.</strong> The first test build found a factory closure with the wrong arity. The closure was updated to match the live signature.</li>
+<li><strong>Stop the review loop when high-priority findings closed.</strong> OracleA closed its source-of-truth and comment findings. OracleB closed its Safe Managed P1 after fresh re-reviews.</li>
+<li><strong>Use runtime evidence when the visible error was misleading.</strong> Repeated <code>-1712</code> errors looked like a hung receiver. Unified macOS logs showed a hidden TCC denial instead.</li>
+<li><strong>Fix the app declaration, not only local permissions.</strong> Manual toggles could not supply the missing Apple Events purpose string. Adding it to the committed template fixes every newly packaged app.</li>
+</ol>
+</section>
+
+<section>
+<h2>Review outcomes</h2>
+<p><strong>Observed in the supplied session record.</strong></p>
+<p>OracleA first raised a split-authority risk and an inaccurate binding comment.</p>
+<p>The implementation clarified the production store and corrected the comment.</p>
+<p>OracleA's fresh re-review closed both findings.</p>
+<p>OracleB raised a P1 safety finding about Safe Managed activation.</p>
+<p>P1 means a high-priority issue.</p>
+<p>The implementation added fail-closed checks at several runtime boundaries.</p>
+<p>OracleB's second fresh re-review closed the P1.</p>
+<p>No P0 or P1 finding remained open.</p>
+<p>OracleB left lower-priority follow-ups. These include a visible toggle, a shared permission predicate, direct factory-clamp coverage, and review of the release behavior for the test-only precondition.</p>
+</section>
+
+<section>
+<h2>Action items</h2>
+<h3>For you now</h3>
+<ol><li>Keep the live test read-only until you intend to authorize interaction.</li><li>Expect separate permission prompts if you switch between debug and release builds.</li><li>Inspect the commit-preflight guardrail output. Resolve the unrelated baseline outside this change or ask the maintainer how to proceed.</li></ol>
+<h3>Possible follow-up work</h3>
+<ul><li>Add a visible Codex Computer Use toggle to the Settings view.</li><li>Add a direct test for the production controller factory clamp.</li><li>Centralize the repeated Safe Managed eligibility rule if later changes add more call sites.</li><li>Decide whether the test-only precondition should fail in release builds.</li></ul>
+</section>
+
+<section>
+<h2>Risks and limits</h2>
+<ul>
+<li>The report is based on the live staged diff and the supplied session record.</li>
+<li>The exact computer-use MCP package and its setup are outside this change.</li>
+<li>macOS permissions follow code identity. A debug grant does not automatically cover the release app.</li>
+<li>The Apple Events entitlement ships in every hardened-runtime build, even when the saved computer-use gate is off. macOS still requires per-target Automation consent before RepoPrompt can control another app.</li>
+<li>The environment variable can force the feature on even when the saved value is false.</li>
+<li>Safe Managed and Knowledge sessions still clamp the runtime capability off.</li>
+<li>No dependency, database, <code>version.env</code> release metadata, signing identity, bundle ID, or schema-version changes are present. The app-bundle Info.plist template gains one Apple Events purpose string. The two hardened-runtime templates gain the matching Apple Events entitlement.</li>
+</ul>
+</section>
+
+<section>
+<h2>Key code references</h2>
+<ul>
+<li><code>CodexComputerUseWorkflow</code> defines the gate, messages, notification, and safety prompt.</li>
+<li><code>GlobalSettingsManager.codexComputerUseEnabled</code> reads and writes the saved value.</li>
+<li>The <code>AppSettingsMCPService</code> registry exposes <code>agent_mode.codex_computer_use_enabled</code>.</li>
+<li><code>CodexAgentModeCoordinator.nativeSlashCommandAvailabilityMessage</code> rejects unsafe slash dispatch.</li>
+<li><code>CodexAgentModeCoordinator.ensureCodexNativeSession</code> clears and clamps activation state.</li>
+<li>The Codex controller factory in <code>AgentModeViewModel</code> clamps the production controller option.</li>
+<li><code>Tests/RepoPromptTests/AgentMode/Codex/CodexGoalSupportDefaultTests.swift</code> covers preference and dispatch behavior.</li>
+<li><code>Tests/RepoPromptTests/MCP/AppSettingsMCPServiceAgentModeSettingsTests.swift</code> covers the tool API.</li>
+<li><code>AppBundle/Info.plist.template</code> declares the Apple Events purpose.</li>
+<li><code>AppBundle/RepoPrompt.entitlements.template</code> and <code>AppBundle/RepoPrompt.local-self-signed.entitlements.template</code> allow Apple Events in hardened-runtime builds.</li>
+<li><code>ReleaseToolingTests.test_app_declares_apple_events_automation</code> protects the declaration and both entitlements.</li>
+</ul>
+<p class="small">Symbol names match the worktree at report creation. Later refactors may rename or move them.</p>
+</section>
+
+<section>
+<h2>Maintainer-guidance check</h2>
+<p><strong>User impact and invariant.</strong> Users can opt into one explicit computer-use turn. Restricted sessions must stay unable to activate it.</p>
+<p><strong>Root-cause confidence.</strong> Confirmed. The old production gate read a fixed false value.</p>
+<p><strong>Authority.</strong> <code>GlobalSettingsStore</code> owns the production value.</p>
+<p><strong>State safety.</strong> Missing saved state stays off. Safe Managed and Knowledge sessions fail closed.</p>
+<p><strong>Scale and visibility.</strong> The change adds no background scan or worker. The slash workflow remains visible in the transcript.</p>
+<p><strong>Recommended scope.</strong> Keep the current staged capability. Treat the Settings-screen toggle and extra unit coverage as follow-up work.</p>
+<p><strong>Validation boundary.</strong> Focused store, MCP, and packaging tests cover deterministic behavior. The live debug test also covered the cross-process MCP launch and macOS permission path.</p>
+</section>
+
+<footer class="small">Generated from repository and AI-session evidence on 2026-09-03. No external assets are used.</footer>
+</main></body></html>

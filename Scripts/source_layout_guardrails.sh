@@ -425,6 +425,7 @@ allowed_tracked_docs=(
   "docs/technical_implementation_reports/2026-08-06-claude-cli-executable-path-override.html"
   "docs/technical_implementation_reports/2026-08-08-build-test-performance-optimization.html"
   "docs/technical_implementation_reports/2026-08-08-quick-model-picker-and-handoff-hud.html"
+  "docs/technical_implementation_reports/2026-09-03-codex-computer-use-enablement-report.html"
 )
 while IFS= read -r path; do
   allowed_tracked_docs+=("$path")

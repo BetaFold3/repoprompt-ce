@@ -153,6 +153,24 @@ class ReleaseToolingTests(unittest.TestCase):
             policy,
         )
 
+    def test_app_declares_apple_events_automation(self) -> None:
+        root = SCRIPT_DIR.parent
+        info_plist = plistlib.loads((root / "AppBundle" / "Info.plist.template").read_bytes())
+        self.assertIn("NSAppleEventsUsageDescription", info_plist)
+        # Keep this user-visible privacy explanation deliberate and reviewable when its wording changes.
+        self.assertEqual(
+            info_plist["NSAppleEventsUsageDescription"],
+            "RepoPrompt CE uses automation to let explicitly requested agent workflows inspect and control other applications.",
+        )
+
+        for template_name in (
+            "RepoPrompt.entitlements.template",
+            "RepoPrompt.local-self-signed.entitlements.template",
+        ):
+            with self.subTest(template_name=template_name):
+                entitlements = plistlib.loads((root / "AppBundle" / template_name).read_bytes())
+                self.assertIs(entitlements.get("com.apple.security.automation.apple-events"), True)
+
     def test_info_plist_url_scheme_is_rendered_per_build_channel(self) -> None:
         template = (SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template").read_text(encoding="utf-8")
         self.assertIn("__URL_SCHEME__", template)

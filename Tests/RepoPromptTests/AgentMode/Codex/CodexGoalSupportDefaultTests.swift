@@ -36,6 +36,29 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         XCTAssertTrue(CodexGoalSupport.isEnabled(defaults: defaults))
     }
 
+    func testMissingUserDefaultsComputerUseKeyDefaultsDisabled() throws {
+        try skipIfEnvironmentFlagEnabled("RP_CODEX_COMPUTER_USE")
+        let defaults = try makeIsolatedDefaults()
+
+        XCTAssertNil(defaults.object(forKey: "enableCodexComputerUse"))
+        XCTAssertFalse(CodexComputerUseWorkflow.isEnabled(defaults: defaults))
+    }
+
+    func testExplicitUserDefaultsComputerUseTrueEnablesWorkflow() throws {
+        let defaults = try makeIsolatedDefaults()
+        CodexComputerUseWorkflow.setEnabled(true, defaults: defaults)
+
+        XCTAssertTrue(CodexComputerUseWorkflow.isEnabled(defaults: defaults))
+    }
+
+    func testExplicitUserDefaultsComputerUseFalseDisablesWorkflow() throws {
+        try skipIfEnvironmentFlagEnabled("RP_CODEX_COMPUTER_USE")
+        let defaults = try makeIsolatedDefaults()
+        CodexComputerUseWorkflow.setEnabled(false, defaults: defaults)
+
+        XCTAssertFalse(CodexComputerUseWorkflow.isEnabled(defaults: defaults))
+    }
+
     func testMissingUserDefaultsReasoningSummariesKeyDefaultsDisabled() throws {
         let defaults = try makeIsolatedDefaults()
 
@@ -80,6 +103,83 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         ))
 
         XCTAssertTrue(store.codexGoalSupportEnabled())
+    }
+
+    func testMissingGlobalSettingsComputerUseScalarDefaultsDisabled() throws {
+        try skipIfEnvironmentFlagEnabled("RP_CODEX_COMPUTER_USE")
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+
+        XCTAssertFalse(store.codexComputerUseEnabled())
+    }
+
+    func testExplicitGlobalSettingsComputerUseTrueEnablesWorkflow() throws {
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init(codexComputerUseEnabled: true))
+        ))
+
+        XCTAssertTrue(store.codexComputerUseEnabled())
+    }
+
+    func testExplicitGlobalSettingsComputerUseFalseDisablesWorkflow() throws {
+        try skipIfEnvironmentFlagEnabled("RP_CODEX_COMPUTER_USE")
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init(codexComputerUseEnabled: false))
+        ))
+
+        XCTAssertFalse(store.codexComputerUseEnabled())
+    }
+
+    func testComputerUseNotificationPostsOnlyOnEffectiveChange() throws {
+        try skipIfEnvironmentFlagEnabled("RP_CODEX_COMPUTER_USE")
+        let store = try makeStore(document: GlobalSettingsDocument(
+            scalarPreferences: GlobalScalarPreferences(agentMode: .init())
+        ))
+        let notification = XCTNSNotificationExpectation(
+            name: .codexComputerUseDidChange,
+            object: nil,
+            notificationCenter: .default
+        )
+        notification.expectedFulfillmentCount = 1
+        notification.assertForOverFulfill = true
+
+        store.setCodexComputerUseEnabled(false, commit: false)
+        store.setCodexComputerUseEnabled(true, commit: false)
+        store.setCodexComputerUseEnabled(true, commit: false)
+
+        wait(for: [notification], timeout: 0.1)
+    }
+
+    func testSafeManagedComputerUseIsRejectedBeforeDispatch() {
+        let viewModel = AgentModeViewModel(
+            codexControllerFactory: { _, _, _, _, _, _ in
+                fatalError("Controller creation is not expected for availability validation.")
+            }
+        )
+        let session = viewModel.session(for: UUID())
+        session.selectedAgent = .codexExec
+        session.permissionProfile = .mcpSafeDefaults
+
+        XCTAssertEqual(
+            viewModel.test_codexCoordinator.nativeSlashCommandAvailabilityMessage(
+                .computerUse,
+                session: session
+            ),
+            CodexComputerUseWorkflow.safeManagedDisabledMessage
+        )
+
+        #if DEBUG
+            CodexComputerUseWorkflow.setEnabledForTesting(true)
+            defer { CodexComputerUseWorkflow.setEnabledForTesting(nil) }
+            session.permissionProfile = .userConfigured
+            XCTAssertNil(
+                viewModel.test_codexCoordinator.nativeSlashCommandAvailabilityMessage(
+                    .computerUse,
+                    session: session
+                )
+            )
+        #endif
     }
 
     func testMissingGlobalSettingsReasoningSummariesScalarDefaultsDisabled() throws {
@@ -142,6 +242,7 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
     private func resetTestingOverrides() {
         #if DEBUG
             CodexGoalSupport.setEnabledForTesting(nil)
+            CodexComputerUseWorkflow.setEnabledForTesting(nil)
         #endif
     }
 }

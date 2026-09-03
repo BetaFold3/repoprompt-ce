@@ -923,6 +923,14 @@ private enum AppSettingsMCPRegistry {
             write: { try $0.setCodexGoalSupportEnabled(requiredBool(from: $1)) }
         ),
         boolSetting(
+            key: "agent_mode.codex_computer_use_enabled",
+            group: "agent_mode",
+            label: "Codex Computer Use",
+            description: "Opt-in capability gate for explicit Codex /computer-use turns. /computer-use remains unavailable in Safe Managed (MCP-initiated) sessions regardless of this setting. Enabling it does not activate computer use by itself, bypass Codex approval policy, or grant macOS permissions. A configured computer-use MCP entry may be enabled for that turn without changing its saved preference. Protected-action prompts are attributed to the Codex helper, and debug and release helpers need separate grants. Full-auto computer-use turns auto-accept computer-use server elicitations; other policies surface them.",
+            read: { .bool($0.codexComputerUseEnabled()) },
+            write: { try $0.setCodexComputerUseEnabled(requiredBool(from: $1)) }
+        ),
+        boolSetting(
             key: "agent_mode.codex_reasoning_summaries_enabled",
             group: "agent_mode",
             label: "Codex Reasoning Summaries",

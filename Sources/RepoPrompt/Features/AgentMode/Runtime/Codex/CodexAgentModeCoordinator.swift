@@ -1353,6 +1353,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return nil
         case .computerUse:
+            if session.permissionProfile == .mcpSafeDefaults {
+                return CodexComputerUseWorkflow.safeManagedDisabledMessage
+            }
             guard CodexComputerUseWorkflow.isEnabled else {
                 return CodexComputerUseWorkflow.disabledMessage
             }
@@ -3782,10 +3785,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let wantsGoalSupport = session.profile == .standard && CodexGoalSupport.isEnabled
         let wantsReasoningSummaries = CodexReasoningSummaries.isEnabled
         let codexComputerUseFeatureEnabled = CodexComputerUseWorkflow.isEnabled
-        if !codexComputerUseFeatureEnabled || session.profile == .knowledge {
+        let permissionProfileAllowsComputerUse = session.permissionProfile != .mcpSafeDefaults
+        if !codexComputerUseFeatureEnabled
+            || session.profile == .knowledge
+            || !permissionProfileAllowsComputerUse
+        {
             session.pendingCodexComputerUseActivation = nil
         }
         let wantsComputerUse = session.profile == .standard
+            && permissionProfileAllowsComputerUse
             && session.wantsCodexComputerUseForNextTurn
             && codexComputerUseFeatureEnabled
         let desiredFeatureState = AgentModeViewModel.TabSession.CodexControllerFeatureState(
