@@ -30,6 +30,10 @@ final class AnthropicDiscoveredModelStoreTests: XCTestCase {
         XCTAssertTrue(store.replace(with: firstModels, fetchedAt: firstDate))
         XCTAssertEqual(store.snapshot, .init(fetchedAt: firstDate, models: firstModels))
         XCTAssertEqual(store.revision, 1)
+        XCTAssertEqual(
+            store.revisionedModels,
+            .init(revision: 1, models: firstModels)
+        )
 
         XCTAssertTrue(store.replace(with: firstModels, fetchedAt: secondDate))
         XCTAssertEqual(store.snapshot, .init(fetchedAt: secondDate, models: firstModels))

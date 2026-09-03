@@ -12,11 +12,35 @@ enum ClaudeCodeAIModelCatalog {
         let modelDisplayName: String
     }
 
-    private struct ModelDefinition: Hashable {
+    struct ModelDefinition: Hashable {
         let runtimeModelRaw: String
         let displayName: String
         let supportedEfforts: [ClaudeCodeEffortLevel]
     }
+
+    private final class EffectiveDefinitionsCacheEntry {
+        weak var store: AnthropicDiscoveredModelStore?
+        let revision: UInt64
+        let definitions: [ModelDefinition]
+
+        init(
+            store: AnthropicDiscoveredModelStore,
+            revision: UInt64,
+            definitions: [ModelDefinition]
+        ) {
+            self.store = store
+            self.revision = revision
+            self.definitions = definitions
+        }
+    }
+
+    private static let effectiveDefinitionsCacheLock = NSLock()
+    private nonisolated(unsafe) static var effectiveDefinitionsCache: EffectiveDefinitionsCacheEntry?
+    private static let maximumRegistryDisplayNameLength = 80
+    /// Hard resource bound: `String.count` counts grapheme clusters, so a
+    /// single grapheme stuffed with combining scalars would pass the UI-length
+    /// check alone. 4 bytes per allowed character caps total payload size.
+    private static let maximumRegistryDisplayNameUTF8Bytes = 320
 
     private static let pickerEffortOrder: [ClaudeCodeEffortLevel] = [
         .low, .medium, .high, .max, .xhigh
@@ -63,7 +87,10 @@ enum ClaudeCodeAIModelCatalog {
         }
     }
 
-    static func validatedModel(specifier rawSpecifier: String) -> AIModel? {
+    static func validatedModel(
+        specifier rawSpecifier: String,
+        store: AnthropicDiscoveredModelStore = .shared
+    ) -> AIModel? {
         let normalized = normalizedSpecifier(rawSpecifier)
         if compatibleBackendDescriptor(specifier: normalized) != nil {
             return .claudeCodeModel(specifier: normalized)
@@ -75,8 +102,18 @@ enum ClaudeCodeAIModelCatalog {
         guard let baseModel = parsed.baseModel else {
             return nil
         }
-        guard let definition = definition(forBaseModelRaw: baseModel) else {
-            return validatedAgentCatalogEffortModel(specifier: normalized)
+        guard let definition = definition(forBaseModelRaw: baseModel, store: store) else {
+            guard let pointRelease = ClaudeModelFamilyCatalog.pointRelease(baseModel) else {
+                return validatedAgentCatalogEffortModel(specifier: normalized)
+            }
+            if let effort = parsed.explicitEffortLevel {
+                guard pointRelease.family.supportedEfforts.contains(effort) else { return nil }
+                return .claudeCodeModel(specifier: encodedSpecifier(
+                    baseModelRaw: pointRelease.rawModelID,
+                    effort: effort
+                ))
+            }
+            return .claudeCodeModel(specifier: pointRelease.rawModelID)
         }
         if let effort = parsed.explicitEffortLevel {
             if definition.supportedEfforts.contains(effort) {
@@ -102,12 +139,23 @@ enum ClaudeCodeAIModelCatalog {
         return .claudeCodeModel(specifier: canonical)
     }
 
-    static func displayName(for specifier: String) -> String {
+    static func displayName(
+        for specifier: String,
+        store: AnthropicDiscoveredModelStore = .shared
+    ) -> String {
         if let descriptor = compatibleBackendDescriptor(specifier: specifier) {
             return descriptor.modelDisplayName
         }
         let parsed = ClaudeModelSpecifier(raw: specifier)
-        guard let definition = definition(forBaseModelRaw: parsed.baseModel) else {
+        guard let definition = definition(forBaseModelRaw: parsed.baseModel, store: store) else {
+            if let baseModel = parsed.baseModel,
+               let pointRelease = ClaudeModelFamilyCatalog.pointRelease(baseModel)
+            {
+                if let effort = parsed.explicitEffortLevel {
+                    return "Claude Code \(pointRelease.generatedDisplayName) \(effort.displayName)"
+                }
+                return "Claude Code \(pointRelease.generatedDisplayName)"
+            }
             if let canonical = canonicalAgentCatalogEffortSpecifier(specifier),
                validatedAgentCatalogEffortModel(specifier: canonical) != nil
             {
@@ -127,17 +175,26 @@ enum ClaudeCodeAIModelCatalog {
         return "Claude Code \(definition.displayName)"
     }
 
-    static func modelsForPicker() -> [AIModel] {
+    static func modelsForPicker(
+        store: AnthropicDiscoveredModelStore = .shared
+    ) -> [AIModel] {
         var models: [AIModel] = [.claudeCode]
-        for definition in modelDefinitions {
-            if let legacyModel = legacyModel(forBaseModelRaw: definition.runtimeModelRaw) {
-                models.append(legacyModel)
-            } else {
-                models.append(.claudeCodeModel(specifier: definition.runtimeModelRaw))
+        var seenRawValues = Set(models.map { $0.rawValue.lowercased() })
+        for definition in effectiveDefinitions(store: store) {
+            let baseModel = legacyModel(forBaseModelRaw: definition.runtimeModelRaw)
+                ?? .claudeCodeModel(specifier: definition.runtimeModelRaw)
+            if seenRawValues.insert(baseModel.rawValue.lowercased()).inserted {
+                models.append(baseModel)
             }
-            models.append(contentsOf: definition.supportedEfforts.map {
-                .claudeCodeModel(specifier: encodedSpecifier(baseModelRaw: definition.runtimeModelRaw, effort: $0))
-            })
+            for effort in definition.supportedEfforts {
+                let model = AIModel.claudeCodeModel(specifier: encodedSpecifier(
+                    baseModelRaw: definition.runtimeModelRaw,
+                    effort: effort
+                ))
+                if seenRawValues.insert(model.rawValue.lowercased()).inserted {
+                    models.append(model)
+                }
+            }
         }
         return models
     }
@@ -171,8 +228,14 @@ enum ClaudeCodeAIModelCatalog {
         compatibleBackendDescriptor(for: model)?.backendID
     }
 
-    static func menu(for models: [AIModel]) -> AIModel.ClaudeCodePickerMenu {
-        let sortedModels = AIModel.sortedForPicker(models.filter { $0.providerType == .claudeCode })
+    static func menu(
+        for models: [AIModel],
+        store: AnthropicDiscoveredModelStore = .shared
+    ) -> AIModel.ClaudeCodePickerMenu {
+        let definitions = effectiveDefinitions(store: store)
+        let sortedModels = models
+            .filter { $0.providerType == .claudeCode }
+            .sorted { modelPrecedes($0, $1, definitions: definitions) }
 
         struct Entry {
             let model: AIModel
@@ -193,8 +256,11 @@ enum ClaudeCodeAIModelCatalog {
                 return nil
             }
             let specifier = ClaudeModelSpecifier(raw: rawSpecifier)
-            guard let definition = definition(forBaseModelRaw: specifier.baseModel),
-                  let index = modelDefinitions.firstIndex(of: definition)
+            guard let definition = definition(
+                forBaseModelRaw: specifier.baseModel,
+                definitions: definitions
+            ),
+                let index = definitions.firstIndex(of: definition)
             else {
                 return nil
             }
@@ -238,8 +304,8 @@ enum ClaudeCodeAIModelCatalog {
                 rendersAsSubmenu: hasEffortVariants
             )
         }.sorted { lhs, rhs in
-            let leftRank = baseSortRank(lhs.baseModelRaw)
-            let rightRank = baseSortRank(rhs.baseModelRaw)
+            let leftRank = baseSortRank(lhs.baseModelRaw, definitions: definitions)
+            let rightRank = baseSortRank(rhs.baseModelRaw, definitions: definitions)
             if leftRank != rightRank {
                 return leftRank < rightRank
             }
@@ -250,7 +316,22 @@ enum ClaudeCodeAIModelCatalog {
         return AIModel.ClaudeCodePickerMenu(defaultOption: nil, groups: groups + compatibleGroups)
     }
 
-    static func modelPrecedes(_ lhs: AIModel, _ rhs: AIModel) -> Bool {
+    static func modelPrecedes(
+        _ lhs: AIModel,
+        _ rhs: AIModel,
+        store: AnthropicDiscoveredModelStore = .shared
+    ) -> Bool {
+        modelPrecedes(lhs, rhs, definitions: effectiveDefinitions(store: store))
+    }
+
+    /// Definitions-taking variant so multi-comparison callers (sorting, menu
+    /// assembly) evaluate one coherent snapshot instead of reacquiring the
+    /// effective definitions per comparison.
+    private static func modelPrecedes(
+        _ lhs: AIModel,
+        _ rhs: AIModel,
+        definitions: [ModelDefinition]
+    ) -> Bool {
         let lhsCompatible = compatibleBackendDescriptor(for: lhs)
         let rhsCompatible = compatibleBackendDescriptor(for: rhs)
         if lhsCompatible != nil || rhsCompatible != nil {
@@ -258,8 +339,8 @@ enum ClaudeCodeAIModelCatalog {
             if rhsCompatible == nil { return false }
             return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
         }
-        let leftBaseRank = baseSortRank(baseModelRaw(for: lhs))
-        let rightBaseRank = baseSortRank(baseModelRaw(for: rhs))
+        let leftBaseRank = baseSortRank(baseModelRaw(for: lhs), definitions: definitions)
+        let rightBaseRank = baseSortRank(baseModelRaw(for: rhs), definitions: definitions)
         if leftBaseRank != rightBaseRank {
             return leftBaseRank < rightBaseRank
         }
@@ -277,11 +358,159 @@ enum ClaudeCodeAIModelCatalog {
         return lhs.rawValue.localizedCaseInsensitiveCompare(rhs.rawValue) == .orderedAscending
     }
 
-    private static func definition(forBaseModelRaw raw: String?) -> ModelDefinition? {
+    static func effectiveDefinitions(
+        store: AnthropicDiscoveredModelStore = .shared
+    ) -> [ModelDefinition] {
+        let registry = store.revisionedModels
+
+        effectiveDefinitionsCacheLock.lock()
+        if let cached = effectiveDefinitionsCache,
+           cached.store === store,
+           cached.revision == registry.revision
+        {
+            effectiveDefinitionsCacheLock.unlock()
+            return cached.definitions
+        }
+        effectiveDefinitionsCacheLock.unlock()
+
+        let staticRawValues = Set(modelDefinitions.map {
+            normalizedSpecifier($0.runtimeModelRaw)
+        })
+        let dynamicDefinitions = registry.models.compactMap { model -> ModelDefinition? in
+            guard let pointRelease = ClaudeModelFamilyCatalog.pointRelease(model.id),
+                  !staticRawValues.contains(normalizedSpecifier(model.id))
+            else {
+                return nil
+            }
+            return ModelDefinition(
+                runtimeModelRaw: model.id,
+                displayName: dynamicDisplayName(
+                    trustedRegistryName: trustedRegistryDisplayName(model.displayName),
+                    pointRelease: pointRelease
+                ),
+                supportedEfforts: pointRelease.family.supportedEfforts
+            )
+        }
+
+        let staticPositions = Dictionary(uniqueKeysWithValues: modelDefinitions.enumerated().map {
+            (normalizedSpecifier($0.element.runtimeModelRaw), $0.offset)
+        })
+        let definitions = (modelDefinitions + dynamicDefinitions).sorted {
+            definitionPrecedes($0, $1, staticPositions: staticPositions)
+        }
+
+        effectiveDefinitionsCacheLock.lock()
+        effectiveDefinitionsCache = EffectiveDefinitionsCacheEntry(
+            store: store,
+            revision: registry.revision,
+            definitions: definitions
+        )
+        effectiveDefinitionsCacheLock.unlock()
+        return definitions
+    }
+
+    private static func definitionPrecedes(
+        _ lhs: ModelDefinition,
+        _ rhs: ModelDefinition,
+        staticPositions: [String: Int]
+    ) -> Bool {
+        let leftFamily = ClaudeModelFamilyCatalog.family(for: lhs.runtimeModelRaw)
+        let rightFamily = ClaudeModelFamilyCatalog.family(for: rhs.runtimeModelRaw)
+
+        if let leftFamily, let rightFamily, leftFamily.identity == rightFamily.identity {
+            let leftPointRelease = ClaudeModelFamilyCatalog.pointRelease(lhs.runtimeModelRaw)
+            let rightPointRelease = ClaudeModelFamilyCatalog.pointRelease(rhs.runtimeModelRaw)
+            switch (leftPointRelease, rightPointRelease) {
+            case let (.some(left), .some(right)):
+                return ClaudeModelFamilyCatalog.pointReleasePrecedes(left, right)
+            case (.some, .none):
+                return true
+            case (.none, .some):
+                return false
+            case (.none, .none):
+                break
+            }
+        }
+
+        let leftRank = definitionFamilyRank(
+            lhs,
+            family: leftFamily,
+            staticPositions: staticPositions
+        )
+        let rightRank = definitionFamilyRank(
+            rhs,
+            family: rightFamily,
+            staticPositions: staticPositions
+        )
+        if leftRank != rightRank {
+            return leftRank < rightRank
+        }
+        return ModelPickerStringOrdering.precedes(
+            lhs.runtimeModelRaw,
+            rhs.runtimeModelRaw
+        )
+    }
+
+    private static func definitionFamilyRank(
+        _ definition: ModelDefinition,
+        family: ClaudeModelFamilyCatalog.Family?,
+        staticPositions: [String: Int]
+    ) -> Int {
+        if let family,
+           let anchorRank = staticPositions[normalizedSpecifier(family.anchor)]
+        {
+            return anchorRank
+        }
+        return staticPositions[normalizedSpecifier(definition.runtimeModelRaw)] ?? Int.max
+    }
+
+    /// Dated point releases must stay visibly distinct from an undated static
+    /// twin with the same numeric label, so every dated dynamic entry is
+    /// date-qualified even when the registry supplies a trusted display name —
+    /// unless that name already contains the exact date suffix.
+    private static func dynamicDisplayName(
+        trustedRegistryName: String?,
+        pointRelease: ClaudeModelFamilyCatalog.PointRelease
+    ) -> String {
+        guard let trustedRegistryName else {
+            return pointRelease.generatedDisplayName
+        }
+        guard let dateSuffix = pointRelease.dateSuffix,
+              !trustedRegistryName.contains(dateSuffix)
+        else {
+            return trustedRegistryName
+        }
+        return "\(trustedRegistryName) (\(dateSuffix))"
+    }
+
+    private static func trustedRegistryDisplayName(_ displayName: String?) -> String? {
+        guard let displayName else { return nil }
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.count <= maximumRegistryDisplayNameLength,
+              trimmed.utf8.count <= maximumRegistryDisplayNameUTF8Bytes,
+              !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func definition(
+        forBaseModelRaw raw: String?,
+        store: AnthropicDiscoveredModelStore
+    ) -> ModelDefinition? {
+        definition(forBaseModelRaw: raw, definitions: effectiveDefinitions(store: store))
+    }
+
+    private static func definition(
+        forBaseModelRaw raw: String?,
+        definitions: [ModelDefinition]
+    ) -> ModelDefinition? {
         guard let raw else { return nil }
         let normalized = normalizedSpecifier(raw)
         guard !normalized.isEmpty else { return nil }
-        return modelDefinitions.first {
+        return definitions.first {
             $0.runtimeModelRaw.caseInsensitiveCompare(normalized) == .orderedSame
         }
     }
@@ -505,10 +734,13 @@ enum ClaudeCodeAIModelCatalog {
         return ClaudeModelSpecifier(raw: rawSpecifier).explicitEffortLevel
     }
 
-    private static func baseSortRank(_ raw: String?) -> Int {
+    private static func baseSortRank(
+        _ raw: String?,
+        definitions: [ModelDefinition]
+    ) -> Int {
         guard let raw else { return -1 }
         let normalized = normalizedSpecifier(raw)
-        return modelDefinitions.firstIndex {
+        return definitions.firstIndex {
             $0.runtimeModelRaw.caseInsensitiveCompare(normalized) == .orderedSame
         } ?? Int.max
     }

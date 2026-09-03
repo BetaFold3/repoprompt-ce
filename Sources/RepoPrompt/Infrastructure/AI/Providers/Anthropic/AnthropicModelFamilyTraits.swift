@@ -15,15 +15,27 @@ struct AnthropicModelFamilyTraits: Equatable {
         if let exact = exactOverrides[modelID] {
             return exact
         }
-
-        // Phase 1b only requires a segment boundary; Phase 3 adds the stricter numeric grammar.
-        if let family = anchoredFamilies.first(where: {
-            modelID == $0.anchor || modelID.hasPrefix("\($0.anchor)-")
-        }) {
-            return family.traits
+        if let family = ClaudeModelFamilyCatalog.family(for: modelID) {
+            return traits(for: family)
         }
-
         return legacy
+    }
+
+    private static func traits(
+        for family: ClaudeModelFamilyCatalog.Family
+    ) -> AnthropicModelFamilyTraits {
+        let requestShape: RequestShape = switch family.apiRequestShape {
+        case .adaptiveEffort: .adaptiveEffort
+        case .legacy: .legacy
+        }
+        return AnthropicModelFamilyTraits(
+            requestShape: requestShape,
+            defaultMaxTokens: family.defaultMaxTokens,
+            // API-known metadata only: the family's CLI context window is a
+            // separate fact and must never leak into API-path capability claims.
+            knownContextWindowTokens: family.apiKnownContextWindowTokens,
+            knownMaxOutputTokens: family.apiKnownMaxOutputTokens
+        )
     }
 
     private static let legacy = AnthropicModelFamilyTraits(
@@ -33,28 +45,11 @@ struct AnthropicModelFamilyTraits: Equatable {
         knownMaxOutputTokens: nil
     )
 
-    private static let adaptiveEffort = AnthropicModelFamilyTraits(
-        requestShape: .adaptiveEffort,
-        defaultMaxTokens: nil,
-        knownContextWindowTokens: nil,
-        knownMaxOutputTokens: nil
-    )
-
-    private static let fable5 = AnthropicModelFamilyTraits(
-        requestShape: .adaptiveEffort,
-        // Anthropic's Fable migration guidance uses 16K at high effort to leave room for adaptive thinking.
-        defaultMaxTokens: 16000,
-        knownContextWindowTokens: 1_000_000,
-        knownMaxOutputTokens: 128_000
-    )
-
-    private static let exactOverrides: [String: AnthropicModelFamilyTraits] = [
-        "claude-opus-5": adaptiveEffort
-    ]
-
-    private static let anchoredFamilies: [(anchor: String, traits: AnthropicModelFamilyTraits)] = [
-        ("claude-fable-5", fable5),
-        // Keep Sonnet 5 legacy until the plan's U3 live API contract probe is complete.
-        ("claude-sonnet-5", legacy)
-    ]
+    /// Exact full-model-ID rows are consulted before the family grammar and
+    /// always win. Keep this empty until a live contract divergence requires
+    /// pinning one exact model; the intended one-line override form is e.g.:
+    /// `"claude-fable-5-3": AnthropicModelFamilyTraits(requestShape: .legacy,
+    /// defaultMaxTokens: nil, knownContextWindowTokens: 1_000_000,
+    /// knownMaxOutputTokens: 128_000)`.
+    private static let exactOverrides: [String: AnthropicModelFamilyTraits] = [:]
 }

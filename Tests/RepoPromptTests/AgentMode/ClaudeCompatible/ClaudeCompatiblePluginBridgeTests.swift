@@ -528,6 +528,238 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         )
     }
 
+    func testClaudeCodeAdapterSnapshotSplicesRegistryPointReleasesBeforeFamilyAnchor() throws {
+        let store = AnthropicDiscoveredModelStore.transient()
+        XCTAssertTrue(store.replace(with: [
+            AnthropicDiscoveredModel(
+                id: "claude-fable-5-2",
+                displayName: "  Registry Fable 5.2  "
+            ),
+            AnthropicDiscoveredModel(id: "claude-fable-5-10"),
+            AnthropicDiscoveredModel(id: "claude-opus-5-2"),
+            AnthropicDiscoveredModel(id: "claude-fable-5-preview"),
+            AnthropicDiscoveredModel(id: "claude-fable-5-1")
+        ]))
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            zaiConfigured: true,
+            kimiConfigured: true
+        )
+
+        let baseSnapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
+            for: .claudeCode,
+            availability: availability,
+            includeClaudeEffortVariants: false,
+            store: store
+        ))
+        XCTAssertEqual(baseSnapshot.defaultModelRaw, "opus")
+        let baseRaws = baseSnapshot.options.map(\.rawValue)
+        XCTAssertEqual(
+            baseRaws.filter { $0.hasPrefix("claude-fable-5") },
+            [
+                "claude-fable-5-10",
+                "claude-fable-5-2",
+                "claude-fable-5-1",
+                "claude-fable-5"
+            ]
+        )
+        XCTAssertFalse(baseRaws.contains("claude-fable-5-preview"))
+        XCTAssertEqual(baseRaws.count { $0 == "claude-fable-5-1" }, 1)
+        let opus52Index = try XCTUnwrap(baseRaws.firstIndex(of: "claude-opus-5-2"))
+        let opusAnchorIndex = try XCTUnwrap(baseRaws.firstIndex(of: "claude-opus-5"))
+        let opusLatestIndex = try XCTUnwrap(baseRaws.firstIndex(of: "opus"))
+        XCTAssertEqual(opus52Index, opusAnchorIndex - 1)
+        XCTAssertLessThan(opusLatestIndex, opus52Index)
+        let fable52Base = try XCTUnwrap(baseSnapshot.options.first { $0.rawValue == "claude-fable-5-2" })
+        XCTAssertEqual(fable52Base.displayName, "Registry Fable 5.2")
+        XCTAssertEqual(fable52Base.supportedEffortLevels, ["low", "medium", "high", "max", "xhigh"])
+        let opus52Base = try XCTUnwrap(baseSnapshot.options.first { $0.rawValue == "claude-opus-5-2" })
+        XCTAssertEqual(opus52Base.displayName, "Opus 5.2")
+
+        let expandedSnapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
+            for: .claudeCode,
+            availability: availability,
+            includeClaudeEffortVariants: true,
+            store: store
+        ))
+        let expandedRaws = expandedSnapshot.options.map(\.rawValue)
+        XCTAssertEqual(
+            expandedRaws.filter { $0.hasPrefix("claude-fable-5-2") },
+            [
+                "claude-fable-5-2:low",
+                "claude-fable-5-2:medium",
+                "claude-fable-5-2:high",
+                "claude-fable-5-2:max",
+                "claude-fable-5-2:xhigh"
+            ]
+        )
+        XCTAssertFalse(expandedRaws.contains("claude-fable-5-2"))
+        let firstFableExpanded = try XCTUnwrap(expandedRaws.first { $0.hasPrefix("claude-fable-5") })
+        XCTAssertEqual(firstFableExpanded, "claude-fable-5-10:low")
+        let expandedXHigh = try XCTUnwrap(expandedSnapshot.options.first { $0.rawValue == "claude-fable-5-2:xhigh" })
+        XCTAssertEqual(expandedXHigh.displayName, "Registry Fable 5.2 XHigh")
+
+        // Compatible backends never receive dynamic Claude entries.
+        let glmSnapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
+            for: .claudeCodeGLM,
+            availability: availability,
+            includeClaudeEffortVariants: true,
+            store: store
+        ))
+        XCTAssertFalse(glmSnapshot.options.contains { $0.rawValue.contains("claude-fable-5-2") })
+        let kimiSnapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
+            for: .kimiCode,
+            availability: availability,
+            includeClaudeEffortVariants: true,
+            store: store
+        ))
+        XCTAssertFalse(kimiSnapshot.options.contains { $0.rawValue.contains("claude-fable-5-2") })
+    }
+
+    func testClaudeCodeAdapterAcceptsGrammarPointReleasesIndependentOfRegistry() {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: true,
+            zaiConfigured: true,
+            kimiConfigured: true,
+            customClaudeCompatibleConfigured: true
+        )
+
+        // Grammar-valid point releases validate without any registry entry and
+        // without an AgentModel case, including effort membership and xhigh.
+        for raw in [
+            "claude-fable-5-2",
+            "claude-fable-5-2:max",
+            "claude-fable-5-2:xhigh",
+            "claude-fable-5-7-20260902:xhigh",
+            "claude-sonnet-5-1:xhigh",
+            "claude-opus-5-3"
+        ] {
+            XCTAssertTrue(
+                ClaudeCompatibleModelCatalogAdapter.isValid(
+                    rawModel: raw,
+                    for: .claudeCode,
+                    availability: availability
+                ) ?? false,
+                "\(raw) should be grammar-valid for .claudeCode"
+            )
+        }
+        for raw in [
+            "claude-fable-50",
+            "claude-fable-5-2-preview",
+            "claude-fable-6-1",
+            "claude-fable-5-2:ultra"
+        ] {
+            XCTAssertFalse(
+                ClaudeCompatibleModelCatalogAdapter.isValid(
+                    rawModel: raw,
+                    for: .claudeCode,
+                    availability: availability
+                ) ?? true,
+                "\(raw) should be rejected for .claudeCode"
+            )
+        }
+
+        XCTAssertTrue(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
+            .xhigh,
+            isSupportedForBaseModelRaw: "claude-fable-5-2",
+            agentKind: .claudeCode
+        ))
+        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
+            .xhigh,
+            isSupportedForBaseModelRaw: "claude-fable-50",
+            agentKind: .claudeCode
+        ))
+
+        // Grammar acceptance is scoped to the first-party Claude Code path.
+        for agentKind in [AgentProviderKind.claudeCodeGLM, .kimiCode, .customClaudeCompatible] {
+            XCTAssertFalse(
+                ClaudeCompatibleModelCatalogAdapter.isValid(
+                    rawModel: "claude-fable-5-2",
+                    for: agentKind,
+                    availability: availability
+                ) ?? true,
+                "\(agentKind) must not accept dynamic Claude point releases"
+            )
+        }
+        // The grammar xhigh fallback shares the same .claudeCode gate: a nil
+        // agent kind never unlocks it.
+        XCTAssertFalse(ClaudeCompatibleModelCatalogAdapter.claudeEffort(
+            .xhigh,
+            isSupportedForBaseModelRaw: "claude-fable-5-2",
+            agentKind: nil
+        ))
+
+        // Top-level validation seam: a grammar-valid raw that no registry lists
+        // (withdrawn/unlisted) still validates through AgentModelCatalog for
+        // .claudeCode only, and lookalikes stay rejected end to end.
+        XCTAssertTrue(AgentModelCatalog.isValid(
+            rawModel: "claude-fable-5-7-20260902:xhigh",
+            for: .claudeCode,
+            availability: availability
+        ))
+        XCTAssertFalse(AgentModelCatalog.isValid(
+            rawModel: "claude-fable-50:xhigh",
+            for: .claudeCode,
+            availability: availability
+        ))
+        XCTAssertFalse(AgentModelCatalog.isValid(
+            rawModel: "claude-fable-5-7-20260902:xhigh",
+            for: .claudeCodeGLM,
+            availability: availability
+        ))
+    }
+
+    func testClaudeCodeDiscoverySplicesUntaggedDynamicPointReleaseWithFamilyContextWindow() throws {
+        let store = AnthropicDiscoveredModelStore.transient()
+        XCTAssertTrue(store.replace(with: [
+            AnthropicDiscoveredModel(id: "claude-fable-5-2"),
+            AnthropicDiscoveredModel(id: "claude-opus-5-2"),
+            AnthropicDiscoveredModel(id: "claude-sonnet-5-1")
+        ]))
+
+        let availability = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true)
+        let discovery = try XCTUnwrap(
+            AgentModelCatalog.discoveryAgents(availability: availability, store: store)
+                .first { $0.agent == .claudeCode }
+        )
+        let modelIDs = discovery.models.map(\.id)
+
+        // Every dynamic entry: exact raw ID before its family anchor region,
+        // family context window, generated group name, and NO tags — the
+        // untagged guarantee is structural, never generic string inference.
+        let expectations: [(dynamicID: String, staticNeighborID: String, name: String)] = [
+            ("claude-fable-5-2", "claude-fable-5-1", "Fable 5.2"),
+            ("claude-opus-5-2", "claude-opus-5", "Opus 5.2"),
+            ("claude-sonnet-5-1", "claude-sonnet-5", "Sonnet 5.1")
+        ]
+        for expectation in expectations {
+            let dynamicIndex = try XCTUnwrap(
+                modelIDs.firstIndex(of: expectation.dynamicID),
+                "\(expectation.dynamicID) missing from discovery"
+            )
+            let staticIndex = try XCTUnwrap(modelIDs.firstIndex(of: expectation.staticNeighborID))
+            XCTAssertLessThan(dynamicIndex, staticIndex)
+
+            let dynamicModel = try XCTUnwrap(discovery.models.first { $0.id == expectation.dynamicID })
+            XCTAssertEqual(dynamicModel.name, expectation.name)
+            XCTAssertEqual(dynamicModel.contextWindowTokens, 1_000_000)
+            XCTAssertEqual(dynamicModel.tags, [], "\(expectation.dynamicID) must stay untagged")
+            XCTAssertEqual(
+                dynamicModel.startTargets.first { $0.modelRaw == "\(expectation.dynamicID):xhigh" }?
+                    .contextWindowTokens,
+                1_000_000
+            )
+            XCTAssertEqual(
+                dynamicModel.startTargets.map(\.modelRaw),
+                ["low", "medium", "high", "max", "xhigh"].map { "\(expectation.dynamicID):\($0)" }
+            )
+        }
+
+        // Static recommendation targets keep their tags; dynamic entries are not promoted.
+        let fable51 = try XCTUnwrap(discovery.models.first { $0.id == "claude-fable-5-1" })
+        XCTAssertEqual(Set(fable51.tags), Set([.complex, .engineering, .pair, .extendedContext]))
+    }
+
     private func makeIsolatedDefaults() throws -> UserDefaults {
         let suiteName = "ClaudeCompatiblePluginBridgeTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))

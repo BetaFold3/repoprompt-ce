@@ -5,7 +5,7 @@ Authority: Authoritative
 Last-verified: 2026-09-02
 
 - **Date:** 2026-09-02
-- **Status:** Phases 1a/1b and 2 implemented; Phases 3–4 planned
+- **Status:** Phases 1a/1b, 2, and 3 implemented; Phase 4 planned
 - **Provenance:** Two independent Oracle consultations (OracleE, OracleD) received an identical prompt with verified repo/upstream facts; material disagreements were cross-examined anonymously over two rounds; minor points were resolved by the orchestrating agent with its own verification. Lane identity checks (`model_preset_id`/`model_preset_name`) passed on every send.
 
 ## 1. Goals

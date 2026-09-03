@@ -20,6 +20,12 @@ final class AnthropicDiscoveredModelStore: @unchecked Sendable {
         let models: [AnthropicDiscoveredModel]
     }
 
+    // swiftformat:disable:next redundantSendable
+    struct RevisionedModels: Equatable, Sendable {
+        let revision: UInt64
+        let models: [AnthropicDiscoveredModel]
+    }
+
     static let storageKey = "AnthropicModelCatalogV1"
     static let shared = AnthropicDiscoveredModelStore(defaults: .standard)
 
@@ -96,6 +102,15 @@ final class AnthropicDiscoveredModelStore: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storedRevision
+    }
+
+    var revisionedModels: RevisionedModels {
+        lock.lock()
+        defer { lock.unlock() }
+        return RevisionedModels(
+            revision: storedRevision,
+            models: storedSnapshot?.models ?? []
+        )
     }
 
     @discardableResult

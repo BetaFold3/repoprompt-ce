@@ -78,6 +78,239 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(selection.effortLevel, .xhigh)
     }
 
+    func testClaudeCodeEffectiveDefinitionsUseInjectedRegistryAndNumericFamilyOrdering() {
+        let store = AnthropicDiscoveredModelStore.transient()
+        XCTAssertTrue(store.replace(with: [
+            AnthropicDiscoveredModel(
+                id: "claude-fable-5-2",
+                displayName: "  Registry Fable 5.2  "
+            ),
+            AnthropicDiscoveredModel(id: "claude-fable-5-10"),
+            AnthropicDiscoveredModel(
+                id: "claude-opus-5-2",
+                displayName: String(repeating: "x", count: 81)
+            ),
+            AnthropicDiscoveredModel(id: "claude-fable-5-preview"),
+            AnthropicDiscoveredModel(
+                id: "claude-fable-5-1",
+                displayName: "Duplicate Static Name"
+            ),
+            AnthropicDiscoveredModel(
+                id: "claude-sonnet-5-2",
+                // One grapheme cluster (count == 1) hiding 400 combining
+                // scalars: must fail the UTF-8 byte bound, not just count.
+                displayName: "e" + String(repeating: "\u{0301}", count: 400)
+            )
+        ]))
+
+        let definitions = ClaudeCodeAIModelCatalog.effectiveDefinitions(store: store)
+        XCTAssertEqual(
+            Array(definitions.map(\.runtimeModelRaw).prefix(4)),
+            [
+                "claude-fable-5-10",
+                "claude-fable-5-2",
+                "claude-fable-5-1",
+                "claude-fable-5"
+            ]
+        )
+        XCTAssertEqual(
+            definitions.first { $0.runtimeModelRaw == "claude-fable-5-2" }?.displayName,
+            "Registry Fable 5.2"
+        )
+        XCTAssertEqual(
+            definitions.first { $0.runtimeModelRaw == "claude-opus-5-2" }?.displayName,
+            "Opus 5.2"
+        )
+        XCTAssertEqual(
+            definitions.first { $0.runtimeModelRaw == "claude-sonnet-5-2" }?.displayName,
+            "Sonnet 5.2"
+        )
+        XCTAssertEqual(
+            definitions.count { $0.runtimeModelRaw == "claude-fable-5-1" },
+            1
+        )
+        XCTAssertFalse(definitions.contains {
+            $0.runtimeModelRaw == "claude-fable-5-preview"
+        })
+
+        let pickerModels = ClaudeCodeAIModelCatalog.modelsForPicker(store: store)
+        XCTAssertTrue(pickerModels.contains(
+            .claudeCodeModel(specifier: "claude-fable-5-10:xhigh")
+        ))
+        XCTAssertFalse(pickerModels.contains(
+            .claudeCodeModel(specifier: "claude-fable-5-preview")
+        ))
+
+        let menu = ClaudeCodeAIModelCatalog.menu(for: pickerModels, store: store)
+        XCTAssertEqual(
+            Array(menu.groups.map(\.baseModelRaw).prefix(4)),
+            [
+                "claude-fable-5-10",
+                "claude-fable-5-2",
+                "claude-fable-5-1",
+                "claude-fable-5"
+            ]
+        )
+        XCTAssertEqual(
+            menu.groups.first { $0.baseModelRaw == "claude-fable-5-2" }?.displayName,
+            "Registry Fable 5.2"
+        )
+    }
+
+    func testClaudeCodeDatedTwinPointReleaseStaysDistinctFromUndatedStaticEntry() {
+        let store = AnthropicDiscoveredModelStore.transient()
+        XCTAssertTrue(store.replace(with: [
+            AnthropicDiscoveredModel(
+                id: "claude-fable-5-1-20260315",
+                // Registry-trusted name matching the static label must still
+                // come out date-qualified — without double-appending the date.
+                displayName: "Fable 5.1"
+            ),
+            AnthropicDiscoveredModel(id: "claude-fable-5-20260101")
+        ]))
+
+        let definitions = ClaudeCodeAIModelCatalog.effectiveDefinitions(store: store)
+        XCTAssertEqual(
+            Array(definitions.map(\.runtimeModelRaw).prefix(4)),
+            [
+                "claude-fable-5-20260101",
+                "claude-fable-5-1-20260315",
+                "claude-fable-5-1",
+                "claude-fable-5"
+            ]
+        )
+        XCTAssertEqual(
+            definitions.count { $0.runtimeModelRaw == "claude-fable-5-1-20260315" },
+            1
+        )
+        XCTAssertEqual(
+            definitions.count { $0.runtimeModelRaw == "claude-fable-5-1" },
+            1
+        )
+        XCTAssertEqual(
+            definitions.first { $0.runtimeModelRaw == "claude-fable-5-1-20260315" }?.displayName,
+            "Fable 5.1 (20260315)"
+        )
+        XCTAssertEqual(
+            definitions.first { $0.runtimeModelRaw == "claude-fable-5-1" }?.displayName,
+            "Fable 5.1"
+        )
+        XCTAssertEqual(
+            definitions.first { $0.runtimeModelRaw == "claude-fable-5-20260101" }?.displayName,
+            "Fable 5.20260101"
+        )
+
+        let pickerModels = ClaudeCodeAIModelCatalog.modelsForPicker(store: store)
+        XCTAssertEqual(
+            pickerModels.count {
+                $0 == .claudeCodeModel(specifier: "claude-fable-5-1-20260315:xhigh")
+            },
+            1
+        )
+        XCTAssertTrue(pickerModels.contains(
+            .claudeCodeModel(specifier: "claude-fable-5-1:xhigh")
+        ))
+
+        let menu = ClaudeCodeAIModelCatalog.menu(for: pickerModels, store: store)
+        XCTAssertEqual(
+            menu.groups.first { $0.baseModelRaw == "claude-fable-5-1-20260315" }?.displayName,
+            "Fable 5.1 (20260315)"
+        )
+        XCTAssertEqual(
+            menu.groups.first { $0.baseModelRaw == "claude-fable-5-1" }?.displayName,
+            "Fable 5.1"
+        )
+
+        // The promoted static recommendation target stays on the undated raw;
+        // the dated twin never resolves to it.
+        XCTAssertEqual(AgentModel.claudeFable51.rawValue, "claude-fable-5-1")
+        XCTAssertFalse(AgentModel.claudeFable51.discoveryTags.isEmpty)
+        XCTAssertNil(AgentModel.resolvedModel(
+            forRaw: "claude-fable-5-1-20260315",
+            agentKind: .claudeCode
+        ))
+    }
+
+    func testClaudeCodeDynamicValidationIsRegistryIndependentAfterWithdrawal() {
+        let store = AnthropicDiscoveredModelStore.transient()
+        XCTAssertTrue(store.replace(with: [
+            AnthropicDiscoveredModel(id: "claude-fable-5-7-20260902")
+        ]))
+        XCTAssertTrue(
+            ClaudeCodeAIModelCatalog.modelsForPicker(store: store).contains(
+                .claudeCodeModel(specifier: "claude-fable-5-7-20260902:xhigh")
+            )
+        )
+
+        XCTAssertTrue(store.replace(with: []))
+
+        XCTAssertFalse(
+            ClaudeCodeAIModelCatalog.modelsForPicker(store: store).contains(
+                .claudeCodeModel(specifier: "claude-fable-5-7-20260902")
+            )
+        )
+        XCTAssertEqual(
+            ClaudeCodeAIModelCatalog.validatedModel(
+                specifier: "claude-fable-5-7-20260902:xhigh",
+                store: store
+            ),
+            .claudeCodeModel(specifier: "claude-fable-5-7-20260902:xhigh")
+        )
+        XCTAssertEqual(
+            ClaudeCodeAIModelCatalog.displayName(
+                for: "claude-fable-5-7-20260902:xhigh",
+                store: store
+            ),
+            "Claude Code Fable 5.7 (20260902) XHigh"
+        )
+        XCTAssertNil(ClaudeCodeAIModelCatalog.validatedModel(
+            specifier: "claude-fable-5-7-preview",
+            store: store
+        ))
+        XCTAssertNil(ClaudeCodeAIModelCatalog.validatedModel(
+            specifier: "claude-fable-5-7:ultra",
+            store: store
+        ))
+    }
+
+    func testClaudeCodeEffectiveDefinitionMemoizationSeparatesStoreIdentityAndRevision() {
+        let firstStore = AnthropicDiscoveredModelStore.transient()
+        let secondStore = AnthropicDiscoveredModelStore.transient()
+        XCTAssertTrue(firstStore.replace(with: [
+            AnthropicDiscoveredModel(id: "claude-fable-5-2")
+        ]))
+        XCTAssertTrue(secondStore.replace(with: [
+            AnthropicDiscoveredModel(id: "claude-fable-5-3")
+        ]))
+
+        XCTAssertTrue(
+            ClaudeCodeAIModelCatalog.effectiveDefinitions(store: firstStore)
+                .contains { $0.runtimeModelRaw == "claude-fable-5-2" }
+        )
+        let secondDefinitions = ClaudeCodeAIModelCatalog.effectiveDefinitions(
+            store: secondStore
+        )
+        XCTAssertTrue(secondDefinitions.contains {
+            $0.runtimeModelRaw == "claude-fable-5-3"
+        })
+        XCTAssertFalse(secondDefinitions.contains {
+            $0.runtimeModelRaw == "claude-fable-5-2"
+        })
+
+        XCTAssertTrue(firstStore.replace(with: [
+            AnthropicDiscoveredModel(id: "claude-fable-5-4")
+        ]))
+        let revisedDefinitions = ClaudeCodeAIModelCatalog.effectiveDefinitions(
+            store: firstStore
+        )
+        XCTAssertTrue(revisedDefinitions.contains {
+            $0.runtimeModelRaw == "claude-fable-5-4"
+        })
+        XCTAssertFalse(revisedDefinitions.contains {
+            $0.runtimeModelRaw == "claude-fable-5-2"
+        })
+    }
+
     func testClaudeCodePickerExposesSonnet5WithAllOfficialEffortVariants() throws {
         let models = AIModel.modelsForProvider(.claudeCode)
         XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-sonnet-5")))

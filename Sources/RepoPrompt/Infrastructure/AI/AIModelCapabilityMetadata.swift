@@ -25,12 +25,22 @@ enum AIModelCapabilityMetadata {
     }
 
     static func resolve(for model: AIModel) -> Snapshot {
+        resolve(for: model, store: .shared)
+    }
+
+    static func resolve(
+        for model: AIModel,
+        store: AnthropicDiscoveredModelStore
+    ) -> Snapshot {
         if case let .openAIServiceTierVariant(base, _) = model {
-            return resolve(for: base)
+            return resolve(for: base, store: store)
         }
-        let window = contextWindowMetadata(for: model)
+        let window = contextWindowMetadata(for: model, store: store)
         let maxOutputTokens: Int? = if case let .anthropicCustom(name) = model {
-            AnthropicModelFamilyTraits.resolve(modelID: name).knownMaxOutputTokens
+            // Registry metadata enriches capability numbers only; request shaping
+            // reads AnthropicModelFamilyTraits directly and never this snapshot.
+            discoveredModel(named: name, store: store)?.maxOutputTokens
+                ?? AnthropicModelFamilyTraits.resolve(modelID: name).knownMaxOutputTokens
                 ?? model.maxTokens
         } else {
             model.maxTokens
@@ -65,10 +75,11 @@ enum AIModelCapabilityMetadata {
     }
 
     private static func contextWindowMetadata(
-        for model: AIModel
+        for model: AIModel,
+        store: AnthropicDiscoveredModelStore
     ) -> (tokens: Int?, source: WindowSource?) {
         if case let .openAIServiceTierVariant(base, _) = model {
-            return contextWindowMetadata(for: base)
+            return contextWindowMetadata(for: base, store: store)
         }
 
         switch model {
@@ -81,6 +92,12 @@ enum AIModelCapabilityMetadata {
             ) {
                 return (resolved.contextWindowTokens, .exact)
             }
+            if let baseModel = ClaudeModelSpecifier(raw: specifier).baseModel,
+               let familyContextWindow = ClaudeModelFamilyCatalog.pointRelease(baseModel)?
+               .family.contextWindowTokens
+            {
+                return (familyContextWindow, .exact)
+            }
             return (200_000, .providerFallback)
         case .geminiFlashLatest, .gemini2flashlite, .geminiProLatest,
              .geminiFlash2, .geminiFlash25, .geminiFlash25LitePreview,
@@ -91,6 +108,9 @@ enum AIModelCapabilityMetadata {
         case .openrouterClaude4Sonnet, .openrouterClaude4Opus:
             return (200_000, .exact)
         case let .anthropicCustom(name):
+            if let registryInputTokens = discoveredModel(named: name, store: store)?.maxInputTokens {
+                return (registryInputTokens, .exact)
+            }
             let traits = AnthropicModelFamilyTraits.resolve(modelID: name)
             if let knownContextWindowTokens = traits.knownContextWindowTokens {
                 return (knownContextWindowTokens, .exact)
@@ -106,6 +126,13 @@ enum AIModelCapabilityMetadata {
             break
         }
         return providerDefaultContextWindow(for: model.providerType)
+    }
+
+    private static func discoveredModel(
+        named name: String,
+        store: AnthropicDiscoveredModelStore
+    ) -> AnthropicDiscoveredModel? {
+        store.models.first { $0.id == name }
     }
 
     private static func providerDefaultContextWindow(

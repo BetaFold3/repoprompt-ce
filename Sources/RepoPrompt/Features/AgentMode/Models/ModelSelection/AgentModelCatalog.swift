@@ -336,7 +336,8 @@ enum AgentModelCatalog {
         for agentKind: AgentProviderKind,
         availability: AvailabilityContext = .current,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
-        includeClaudeEffortVariants: Bool = true
+        includeClaudeEffortVariants: Bool = true,
+        store: AnthropicDiscoveredModelStore = .shared
     ) -> [AgentModelOption] {
         guard isAgentAvailable(agentKind, availability: availability) else { return [] }
         if agentKind == .cursor {
@@ -381,7 +382,8 @@ enum AgentModelCatalog {
             return ClaudeCompatibleModelCatalogAdapter.options(
                 for: agentKind,
                 availability: availability,
-                includeClaudeEffortVariants: includeClaudeEffortVariants
+                includeClaudeEffortVariants: includeClaudeEffortVariants,
+                store: store
             ) ?? []
         case .openCode, .cursor, .ohMyPi:
             return AgentModel.modelsForAgent(agentKind)
@@ -2083,12 +2085,13 @@ enum AgentModelCatalog {
 
     /// Builds a comprehensive discovery payload for all agents, suitable for `list_agents`.
     static func discoveryAgents(
-        availability: AvailabilityContext = .current
+        availability: AvailabilityContext = .current,
+        store: AnthropicDiscoveredModelStore = .shared
     ) -> [DiscoveryAgent] {
         AgentProviderKind.allCases.filter {
             $0 != .ohMyPi || availability.ohMyPiAvailable
         }.map { agent in
-            discoveryAgent(agent, availability: availability)
+            discoveryAgent(agent, availability: availability, store: store)
         }
     }
 
@@ -2113,10 +2116,11 @@ enum AgentModelCatalog {
 
     private static func discoveryAgent(
         _ agent: AgentProviderKind,
-        availability: AvailabilityContext
+        availability: AvailabilityContext,
+        store: AnthropicDiscoveredModelStore = .shared
     ) -> DiscoveryAgent {
         let available = isAgentAvailable(agent, availability: availability)
-        let agentOptions = options(for: agent, availability: availability)
+        let agentOptions = options(for: agent, availability: availability, store: store)
         let defaultRaw = available ? defaultModelRaw(for: agent, availability: availability) : nil
 
         let models: [DiscoveryModel] = if agent == .codexExec {
@@ -2252,6 +2256,7 @@ enum AgentModelCatalog {
                     forRequestedModelRaw: option.rawValue,
                     agentKind: agent
                 ) ?? AgentModel.resolvedModel(forRaw: option.rawValue, agentKind: agent)?.contextWindowTokens
+                    ?? claudeFamilyContextWindowTokens(forRawModel: option.rawValue, agentKind: agent)
                 return DiscoveryStartTarget(
                     selectionID: selectionID,
                     modelRaw: option.rawValue,
@@ -2267,8 +2272,16 @@ enum AgentModelCatalog {
             let representative = group.options.first
             let representativeModel = AgentModel.resolvedModel(forRaw: group.baseModelRaw, agentKind: agent)
             let childTags = Set(group.options.flatMap { option -> [AgentModelDiscoveryTag] in
-                AgentModel.resolvedModel(forRaw: option.rawValue, agentKind: agent)?.discoveryTags
-                    ?? AgentModelDiscoveryTag.infer(from: option.rawValue)
+                if let resolved = AgentModel.resolvedModel(forRaw: option.rawValue, agentKind: agent) {
+                    return resolved.discoveryTags
+                }
+                // Structural guarantee: unresolved grammar-valid Claude Code point
+                // releases are deliberately untagged. Usability never implies
+                // recommendation promotion, and generic inference must not apply.
+                if isDynamicClaudePointRelease(rawModel: option.rawValue, agentKind: agent) {
+                    return []
+                }
+                return AgentModelDiscoveryTag.infer(from: option.rawValue)
             })
             let tags = AgentModelDiscoveryTag.displayOrder.filter(childTags.contains)
 
@@ -2281,7 +2294,8 @@ enum AgentModelCatalog {
                 contextWindowTokens: ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
                     forRequestedModelRaw: group.baseModelRaw,
                     agentKind: agent
-                ) ?? representativeModel?.contextWindowTokens,
+                ) ?? representativeModel?.contextWindowTokens
+                    ?? claudeFamilyContextWindowTokens(forRawModel: group.baseModelRaw, agentKind: agent),
                 supportedReasoningEfforts: [],
                 defaultReasoningEffort: nil,
                 startTargets: targets
@@ -2289,6 +2303,38 @@ enum AgentModelCatalog {
         }
 
         return models
+    }
+
+    /// True when a raw selection is a registry-style dynamic Claude Code point
+    /// release: `.claudeCode` agent, no static `AgentModel` resolution, and a
+    /// grammar-valid same-family point release.
+    private static func isDynamicClaudePointRelease(
+        rawModel: String?,
+        agentKind: AgentProviderKind
+    ) -> Bool {
+        guard agentKind == .claudeCode,
+              let baseModel = ClaudeModelSpecifier(raw: rawModel).baseModel,
+              AgentModel.resolvedModel(forRaw: baseModel, agentKind: agentKind) == nil
+        else {
+            return false
+        }
+        return ClaudeModelFamilyCatalog.pointRelease(baseModel) != nil
+    }
+
+    /// Family-grammar context-window fallback for registry-listed dynamic Claude
+    /// point releases that have no static `AgentModel` case. `.claudeCode` only;
+    /// dynamic entries stay untagged and never gain generic inference here.
+    private static func claudeFamilyContextWindowTokens(
+        forRawModel rawModel: String?,
+        agentKind: AgentProviderKind
+    ) -> Int? {
+        guard agentKind == .claudeCode,
+              let baseModel = ClaudeModelSpecifier(raw: rawModel).baseModel,
+              let pointRelease = ClaudeModelFamilyCatalog.pointRelease(baseModel)
+        else {
+            return nil
+        }
+        return pointRelease.family.contextWindowTokens
     }
 
     private static func discoveryModel(

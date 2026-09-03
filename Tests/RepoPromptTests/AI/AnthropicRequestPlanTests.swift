@@ -31,7 +31,11 @@ final class AnthropicRequestPlanTests: XCTestCase {
     }
 
     func testFable5FamilyUsesAdaptiveThinkingWithDefaultAndRequestedEffort() throws {
-        for modelID in ["claude-fable-5", "claude-fable-5-1"] {
+        for modelID in [
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-fable-5-2-20260902"
+        ] {
             let defaultConfiguration = try AnthropicModelConfiguration.resolve(modelID: modelID)
             XCTAssertEqual(defaultConfiguration.apiModelID, modelID)
             XCTAssertEqual(defaultConfiguration.thinking, .adaptive)
@@ -66,8 +70,13 @@ final class AnthropicRequestPlanTests: XCTestCase {
         XCTAssertEqual(configuration.defaultMaxTokens, 16000)
     }
 
-    func testFable50AndSonnet5RemainLegacy() throws {
-        for modelID in ["claude-fable-50", "claude-sonnet-5"] {
+    func testMalformedFableLookalikesAndSonnet5FamilyRemainLegacy() throws {
+        for modelID in [
+            "claude-fable-50",
+            "claude-fable-5-2-preview",
+            "claude-sonnet-5",
+            "claude-sonnet-5-1"
+        ] {
             let plan = try AnthropicRequestPlan.resolve(
                 modelID: modelID,
                 requestedMaxTokens: nil,
@@ -199,6 +208,111 @@ final class AnthropicRequestPlanTests: XCTestCase {
         XCTAssertEqual(metadata.contextWindowTokens, 1_000_000)
         XCTAssertEqual(metadata.maxOutputTokens, 128_000)
         XCTAssertEqual(metadata.windowSource, .exact)
+    }
+
+    func testAnthropicCustomCapabilityMetadataPrefersRegistryExactTokensBeforeTraits() {
+        let store = AnthropicDiscoveredModelStore.transient()
+        XCTAssertTrue(store.replace(with: [
+            AnthropicDiscoveredModel(
+                id: "claude-fable-5-1",
+                displayName: "Fable 5.1",
+                maxInputTokens: 900_000,
+                maxOutputTokens: 64000
+            ),
+            AnthropicDiscoveredModel(id: "claude-fable-5-3")
+        ]))
+
+        let registryBacked = AIModelCapabilityMetadata.resolve(
+            for: .anthropicCustom(name: "claude-fable-5-1"),
+            store: store
+        )
+        XCTAssertEqual(registryBacked.contextWindowTokens, 900_000)
+        XCTAssertEqual(registryBacked.windowSource, .exact)
+        XCTAssertEqual(registryBacked.maxOutputTokens, 64000)
+
+        // A discovered ID without token metadata falls back to family traits
+        // (Fable is the only API-verified family carrying known limits).
+        let traitsFallback = AIModelCapabilityMetadata.resolve(
+            for: .anthropicCustom(name: "claude-fable-5-3"),
+            store: store
+        )
+        XCTAssertEqual(traitsFallback.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(traitsFallback.windowSource, .exact)
+
+        // Undiscovered non-family IDs keep the existing unknown-window contract.
+        let unknown = AIModelCapabilityMetadata.resolve(
+            for: .anthropicCustom(name: "claude-mystery-9"),
+            store: store
+        )
+        XCTAssertNil(unknown.contextWindowTokens)
+        XCTAssertNil(unknown.windowSource)
+    }
+
+    func testClaudeCodeDynamicPointReleaseCapabilityMetadataUsesFamilyWindow() {
+        let dynamic = AIModelCapabilityMetadata.resolve(
+            for: .claudeCodeModel(specifier: "claude-fable-5-2:xhigh")
+        )
+        XCTAssertEqual(dynamic.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(dynamic.windowSource, .exact)
+
+        let lookalike = AIModelCapabilityMetadata.resolve(
+            for: .claudeCodeModel(specifier: "claude-fable-50")
+        )
+        XCTAssertEqual(lookalike.contextWindowTokens, 200_000)
+        XCTAssertEqual(lookalike.windowSource, .providerFallback)
+    }
+
+    func testSonnetAndOpusAPIKnownMetadataStayUnknownUntilProbeWhileClaudeCodeKeepsFamilyWindow() {
+        // .anthropicCustom Sonnet without registry corroboration stays unknown
+        // on the API path until the plan's U3 live contract probe.
+        let unknownSonnet = AIModelCapabilityMetadata.resolve(
+            for: .anthropicCustom(name: "claude-sonnet-5"),
+            store: AnthropicDiscoveredModelStore.transient()
+        )
+        XCTAssertNil(unknownSonnet.contextWindowTokens)
+        XCTAssertNil(unknownSonnet.windowSource)
+
+        // Exact registry tokens win once the official API corroborates them.
+        let store = AnthropicDiscoveredModelStore.transient()
+        XCTAssertTrue(store.replace(with: [
+            AnthropicDiscoveredModel(
+                id: "claude-sonnet-5-2",
+                maxInputTokens: 1_000_000,
+                maxOutputTokens: 64000
+            )
+        ]))
+        let registryBacked = AIModelCapabilityMetadata.resolve(
+            for: .anthropicCustom(name: "claude-sonnet-5-2"),
+            store: store
+        )
+        XCTAssertEqual(registryBacked.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(registryBacked.windowSource, .exact)
+        XCTAssertEqual(registryBacked.maxOutputTokens, 64000)
+
+        // The Claude Code path keeps the known 1M family window — CLI metadata
+        // is decoupled from API-known metadata.
+        let cli = AIModelCapabilityMetadata.resolve(
+            for: .claudeCodeModel(specifier: "claude-sonnet-5-2:high"),
+            store: AnthropicDiscoveredModelStore.transient()
+        )
+        XCTAssertEqual(cli.contextWindowTokens, 1_000_000)
+        XCTAssertEqual(cli.windowSource, .exact)
+
+        // Opus keeps adaptive request shaping with pre-Phase-3 nil API-known
+        // limits; Fable's verified fallback is untouched.
+        let opusTraits = AnthropicModelFamilyTraits.resolve(modelID: "claude-opus-5")
+        XCTAssertEqual(opusTraits.requestShape, .adaptiveEffort)
+        XCTAssertNil(opusTraits.knownContextWindowTokens)
+        XCTAssertNil(opusTraits.knownMaxOutputTokens)
+
+        let sonnetTraits = AnthropicModelFamilyTraits.resolve(modelID: "claude-sonnet-5-2")
+        XCTAssertEqual(sonnetTraits.requestShape, .legacy)
+        XCTAssertNil(sonnetTraits.knownContextWindowTokens)
+        XCTAssertNil(sonnetTraits.knownMaxOutputTokens)
+
+        let fableTraits = AnthropicModelFamilyTraits.resolve(modelID: "claude-fable-5-1")
+        XCTAssertEqual(fableTraits.knownContextWindowTokens, 1_000_000)
+        XCTAssertEqual(fableTraits.knownMaxOutputTokens, 128_000)
     }
 
     func testAnthropicRefusalTerminalClassificationIsTypedAndModelSpecific() {

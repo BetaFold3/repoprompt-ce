@@ -55,7 +55,20 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             {
                 return compatibleContextWindow
             }
-            return model?.contextWindowTokens
+            if let modelContextWindow = model?.contextWindowTokens {
+                return modelContextWindow
+            }
+            // Registry-listed dynamic Claude point releases (no static AgentModel
+            // case) resolve through the family grammar before the generic
+            // 200K provider fallback below.
+            if selectedAgent == .claudeCode,
+               let baseModel = ClaudeModelSpecifier(raw: selectedModelRaw).baseModel,
+               let familyContextWindow = ClaudeModelFamilyCatalog.pointRelease(baseModel)?
+               .family.contextWindowTokens
+            {
+                return familyContextWindow
+            }
+            return nil
         }
 
         var effectiveContextWindowTokens: Int {

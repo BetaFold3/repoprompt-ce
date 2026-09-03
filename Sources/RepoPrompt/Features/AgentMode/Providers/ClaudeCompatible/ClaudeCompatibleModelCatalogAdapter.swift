@@ -9,7 +9,8 @@ enum ClaudeCompatibleModelCatalogAdapter {
     static func catalogSnapshot(
         for agentKind: AgentProviderKind,
         availability: AgentModelCatalog.AvailabilityContext = .current,
-        includeClaudeEffortVariants: Bool = true
+        includeClaudeEffortVariants: Bool = true,
+        store: AnthropicDiscoveredModelStore = .shared
     ) -> ClaudeCompatiblePluginModelCatalogSnapshot? {
         guard let pluginID = ClaudeCompatiblePluginBridge.pluginID(for: agentKind) else { return nil }
         let snapshot = pluginCatalogSnapshot(
@@ -17,8 +18,15 @@ enum ClaudeCompatibleModelCatalogAdapter {
             agentKind: agentKind,
             includeClaudeEffortVariants: includeClaudeEffortVariants
         )
+        let splicedOptions = agentKind == .claudeCode
+            ? optionsSplicingDynamicClaudePointReleases(
+                into: snapshot.options,
+                includeClaudeEffortVariants: includeClaudeEffortVariants,
+                store: store
+            )
+            : snapshot.options
         let mappedOptions = AgentModelCatalog.isAgentAvailable(agentKind, availability: availability)
-            ? snapshot.options.map { canonicalPluginModelOption($0, for: agentKind) }
+            ? splicedOptions.map { canonicalPluginModelOption($0, for: agentKind) }
             : []
         return ClaudeCompatiblePluginModelCatalogSnapshot(
             pluginID: snapshot.pluginID,
@@ -45,12 +53,14 @@ enum ClaudeCompatibleModelCatalogAdapter {
     static func options(
         for agentKind: AgentProviderKind,
         availability: AgentModelCatalog.AvailabilityContext = .current,
-        includeClaudeEffortVariants: Bool = true
+        includeClaudeEffortVariants: Bool = true,
+        store: AnthropicDiscoveredModelStore = .shared
     ) -> [AgentModelOption]? {
         catalogSnapshot(
             for: agentKind,
             availability: availability,
-            includeClaudeEffortVariants: includeClaudeEffortVariants
+            includeClaudeEffortVariants: includeClaudeEffortVariants,
+            store: store
         ).map { modelOptions(from: $0.options, for: agentKind) }
     }
 
@@ -187,7 +197,20 @@ enum ClaudeCompatibleModelCatalogAdapter {
         {
             return false
         }
-        guard let known = AgentModel.resolvedModel(forRaw: baseModel, agentKind: agentKind) else { return false }
+        guard let known = AgentModel.resolvedModel(forRaw: baseModel, agentKind: agentKind) else {
+            // Grammar-valid same-family point releases stay runnable on the first-party
+            // Claude Code path even when no static AgentModel case exists. Validation is
+            // deliberately registry-independent so stored selections survive withdrawal.
+            guard agentKind == .claudeCode,
+                  let pointRelease = ClaudeModelFamilyCatalog.pointRelease(baseModel)
+            else {
+                return false
+            }
+            if let effort = specifier.effortLevel {
+                return pointRelease.family.supportedEfforts.contains(effort)
+            }
+            return true
+        }
         guard known.isValidFor(agentKind) else { return false }
         return known.isAvailable
     }
@@ -214,7 +237,101 @@ enum ClaudeCompatibleModelCatalogAdapter {
         }
         guard let baseModelRaw else { return false }
         let normalized = baseModelRaw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return claudeXHighEligibleBaseRaws.contains(normalized)
+        if claudeXHighEligibleBaseRaws.contains(normalized) {
+            return true
+        }
+        // Grammar-based xhigh eligibility shares the `.claudeCode` gate with the
+        // grammar branch in `isValid`; every caller with dynamic-model access
+        // passes a concrete agent kind, so nil never unlocks the grammar path.
+        guard agentKind == .claudeCode else { return false }
+        return ClaudeModelFamilyCatalog.pointRelease(normalized)?.family.xhighEligible == true
+    }
+
+    /// Splices registry-corroborated dynamic Claude point releases into the
+    /// `.claudeCode` plugin snapshot. Listing stays registry-gated: only IDs the
+    /// official Anthropic models API returned (and that pass the strict family
+    /// grammar via `ClaudeCodeAIModelCatalog.effectiveDefinitions`) appear, with
+    /// their exact discovered raw IDs, sorted descending minor before the family
+    /// anchor. The provider package snapshot itself stays untouched, and
+    /// compatible backends (GLM/Kimi/custom) never receive dynamic entries.
+    private static func optionsSplicingDynamicClaudePointReleases(
+        into pluginOptions: [ClaudeCompatiblePluginModelOption],
+        includeClaudeEffortVariants: Bool,
+        store: AnthropicDiscoveredModelStore
+    ) -> [ClaudeCompatiblePluginModelOption] {
+        let staticBaseRaws = Set(pluginOptions.compactMap { option -> String? in
+            ClaudeModelSpecifier(raw: option.rawValue).baseModel?.lowercased()
+        })
+        let dynamicDefinitions = ClaudeCodeAIModelCatalog.effectiveDefinitions(store: store)
+            .compactMap { definition -> (ClaudeModelFamilyCatalog.PointRelease, ClaudeCodeAIModelCatalog.ModelDefinition)? in
+                guard let pointRelease = ClaudeModelFamilyCatalog.pointRelease(definition.runtimeModelRaw),
+                      AgentModel.resolvedModel(forRaw: definition.runtimeModelRaw, agentKind: .claudeCode) == nil,
+                      !staticBaseRaws.contains(definition.runtimeModelRaw.lowercased())
+                else {
+                    return nil
+                }
+                return (pointRelease, definition)
+            }
+        guard !dynamicDefinitions.isEmpty else { return pluginOptions }
+
+        var options = pluginOptions
+        for (pointRelease, definition) in dynamicDefinitions {
+            options.insert(
+                contentsOf: dynamicPluginOptions(
+                    for: definition,
+                    includeEffortVariants: includeClaudeEffortVariants
+                ),
+                at: dynamicSpliceIndex(for: pointRelease, in: options)
+            )
+        }
+        return options
+    }
+
+    private static func dynamicSpliceIndex(
+        for pointRelease: ClaudeModelFamilyCatalog.PointRelease,
+        in options: [ClaudeCompatiblePluginModelOption]
+    ) -> Int {
+        for (index, option) in options.enumerated() {
+            guard let base = ClaudeModelSpecifier(raw: option.rawValue).baseModel else { continue }
+            if base.caseInsensitiveCompare(pointRelease.family.anchor) == .orderedSame {
+                return index
+            }
+            guard let existing = ClaudeModelFamilyCatalog.pointRelease(base.lowercased()),
+                  existing.family.anchor == pointRelease.family.anchor,
+                  ClaudeModelFamilyCatalog.pointReleasePrecedes(pointRelease, existing)
+            else {
+                continue
+            }
+            return index
+        }
+        return options.count
+    }
+
+    private static func dynamicPluginOptions(
+        for definition: ClaudeCodeAIModelCatalog.ModelDefinition,
+        includeEffortVariants: Bool
+    ) -> [ClaudeCompatiblePluginModelOption] {
+        let description = "Registry-discovered Claude point release, listed automatically from Anthropic's official models API."
+        guard includeEffortVariants, !definition.supportedEfforts.isEmpty else {
+            return [ClaudeCompatiblePluginModelOption(
+                rawValue: definition.runtimeModelRaw,
+                displayName: definition.displayName,
+                description: description,
+                isPlaceholderDefault: false,
+                isProviderDefault: false,
+                supportedEffortLevels: definition.supportedEfforts.map(\.rawValue)
+            )]
+        }
+        return definition.supportedEfforts.map { effort in
+            ClaudeCompatiblePluginModelOption(
+                rawValue: "\(definition.runtimeModelRaw):\(effort.rawValue)",
+                displayName: "\(definition.displayName) \(effort.displayName)",
+                description: description,
+                isPlaceholderDefault: false,
+                isProviderDefault: false,
+                supportedEffortLevels: []
+            )
+        }
     }
 
     private static func pluginCatalogSnapshot(

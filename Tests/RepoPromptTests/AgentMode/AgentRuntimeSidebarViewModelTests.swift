@@ -211,6 +211,47 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 200_000)
     }
 
+    func testDynamicClaudePointReleaseSelectionUsesFamilyContextWindowFallback() {
+        let store = AgentRuntimeMetricsUIStore()
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-fable-5-2"
+        )
+        XCTAssertNil(store.runtimeVM.snapshot.contextWindowTokens)
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-fable-5-2:xhigh"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-opus-5-3-20260902:max"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        // Grammar lookalikes stay on the generic 200K fallback.
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-fable-50"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 200_000)
+    }
+
     func testGLMSlotSelectionsUseBackendContextWindowFallback() {
         let store = AgentRuntimeMetricsUIStore()
         store.update(
