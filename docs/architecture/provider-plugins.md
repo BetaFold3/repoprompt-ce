@@ -1,6 +1,6 @@
 # Agent Provider Plugin Seam
 
-Current as of 2026-08-16. This document is contributor-facing: use it when you are wiring a new autonomous-agent provider, editing the Claude-compatible runtime, or moving code across the core ↔ plugin boundary.
+Current as of 2026-09-03. This document is contributor-facing: use it when you are wiring a new autonomous-agent provider, editing the Claude-compatible runtime, or moving code across the core ↔ plugin boundary.
 
 ## Scope and goals
 
@@ -116,6 +116,8 @@ The remote-by-default policy avoids breaking checkouts that do not have a siblin
 | Provider-neutral RepoPrompt workflow prompt catalog and renderers (`Infrastructure/AI/Prompts/Workflows`) | core |
 | Headless wrapper (`ClaudeCodeAgentProvider`) | core (delegates pure rules to package) |
 | `AgentModel` raw values, option DTOs, defaults | core (adapter forwards plugin DTOs back to these) |
+| Claude family grammar and persisted Anthropic models registry | core (`ClaudeModelFamilyCatalog`, `AnthropicAPIModelsClient`, `AnthropicDiscoveredModelStore`) |
+| Dynamic point-release overlay | core; standard Claude Code only (package snapshot remains static; GLM/Kimi/custom catalogs excluded) |
 | Plugin IDs (`ClaudeCompatibleProviderPluginID`), runtime variants, backend IDs | package DTOs |
 | Claude SDK protocol codec and NDJSON translator | package |
 | Prompt delivery rules (XML wrapping, system-prompt overrides) | package |

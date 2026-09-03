@@ -1,3 +1,25 @@
+# Completion outcome — 2026-09-03
+
+Phase 4 is complete: the static-catalog consistency guard and durable documentation were implemented. The original implementation plan follows intact below for historical context; normal work is routed through `docs/context/claude-model-family-catalog.md`. The original body's `Scope:`, `Authority:`, and `Status:` lines are historical and superseded by that durable document.
+
+## Outcome and validation
+
+- `ClaudeStaticCatalogConsistencyTests`: passed, 1 test / 0 failures.
+- `make dev-lint`: passed.
+- `make dev-swift-build PRODUCT=RepoPrompt`: passed.
+- `make dev-build`: packaged successfully.
+- `Scripts/check-agent-context` and `Scripts/test-check-agent-context`: passed.
+- `make dev-test-parallel`: built and ran, but failed only because `OhMyPiACPProviderTests` crashed twice. A focused serial rerun isolated unrelated local-environment behavior: `testLaunchResolutionErrorsProvideActionableInstallAndExecutableRepairGuidance` expected bare PATH discovery to fail, but local OMP discovery succeeded.
+- Ledger verification enumerated successfully; the repository has pre-existing reconciliation drift of 295 missing and 3 stale entries, unrelated to the Phase 4 added/removed IDs.
+- `make guardrails`: remains blocked by seven already-tracked docs outside the explicit durable-doc allowlist; no unrelated allowlist entries were added.
+
+## Live validation disposition
+
+- `ANTHROPIC_API_KEY` was unset, so the U3 Sonnet 5 and U5 two-turn Fable 5.1 direct API probes were not run.
+- At the just-in-time visible-relaunch prompt, the user chose **Skip smoke**. No app relaunch or stop occurred, and the Fable 5.1 CE debug-app smoke was not run.
+
+---
+
 # Fable 5.1 Support + Dynamic Claude Model Family Catalog — Implementation Plan
 
 Scope: read when the task touches Claude Fable 5.1 static catalog support, Anthropic adaptive-effort family shaping, or the planned dynamic Claude model-family registry and grammar.
