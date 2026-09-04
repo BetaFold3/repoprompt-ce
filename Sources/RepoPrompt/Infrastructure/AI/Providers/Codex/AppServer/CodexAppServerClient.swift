@@ -112,6 +112,12 @@ actor CodexAppServerClient {
         let description: String
     }
 
+    struct RemoteServiceTier: Hashable {
+        let id: String
+        let name: String
+        let description: String
+    }
+
     struct RemoteModel: Hashable {
         let id: String
         let model: String
@@ -120,6 +126,42 @@ actor CodexAppServerClient {
         let isDefault: Bool
         let supportedReasoningEfforts: [RemoteReasoningEffort]
         let defaultReasoningEffort: String?
+        let additionalSpeedTiers: [String]
+        let serviceTiers: [RemoteServiceTier]
+        let defaultServiceTier: String?
+        let hasSupportedReasoningEffortsEvidence: Bool
+        let hasAdditionalSpeedTiersEvidence: Bool
+        let hasServiceTiersEvidence: Bool
+
+        init(
+            id: String,
+            model: String,
+            displayName: String,
+            description: String,
+            isDefault: Bool,
+            supportedReasoningEfforts: [RemoteReasoningEffort] = [],
+            defaultReasoningEffort: String? = nil,
+            additionalSpeedTiers: [String] = [],
+            serviceTiers: [RemoteServiceTier] = [],
+            defaultServiceTier: String? = nil,
+            hasSupportedReasoningEffortsEvidence: Bool = true,
+            hasAdditionalSpeedTiersEvidence: Bool = true,
+            hasServiceTiersEvidence: Bool = true
+        ) {
+            self.id = id
+            self.model = model
+            self.displayName = displayName
+            self.description = description
+            self.isDefault = isDefault
+            self.supportedReasoningEfforts = supportedReasoningEfforts
+            self.defaultReasoningEffort = defaultReasoningEffort
+            self.additionalSpeedTiers = additionalSpeedTiers
+            self.serviceTiers = serviceTiers
+            self.defaultServiceTier = defaultServiceTier
+            self.hasSupportedReasoningEffortsEvidence = hasSupportedReasoningEffortsEvidence
+            self.hasAdditionalSpeedTiersEvidence = hasAdditionalSpeedTiersEvidence
+            self.hasServiceTiersEvidence = hasServiceTiersEvidence
+        }
     }
 
     struct ServerRequest {
@@ -852,38 +894,9 @@ actor CodexAppServerClient {
             }
 
             for entry in pageItems {
-                guard
-                    let id = entry["id"] as? String,
-                    !id.isEmpty
-                else { continue }
-                guard seenModelIDs.insert(id).inserted else { continue }
-
-                let model = (entry["model"] as? String) ?? id
-                let displayName = (entry["displayName"] as? String) ?? model
-                let description = (entry["description"] as? String) ?? ""
-                let isDefault = entry["isDefault"] as? Bool ?? false
-                let defaultReasoningEffort = entry["defaultReasoningEffort"] as? String
-                let supportedReasoningEfforts = (entry["supportedReasoningEfforts"] as? [[String: Any]] ?? [])
-                    .compactMap { effortEntry -> RemoteReasoningEffort? in
-                        guard let reasoningEffort = effortEntry["reasoningEffort"] as? String,
-                              !reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        else {
-                            return nil
-                        }
-                        let effortDescription = (effortEntry["description"] as? String) ?? ""
-                        return RemoteReasoningEffort(reasoningEffort: reasoningEffort, description: effortDescription)
-                    }
-                models.append(
-                    RemoteModel(
-                        id: id,
-                        model: model,
-                        displayName: displayName,
-                        description: description,
-                        isDefault: isDefault,
-                        supportedReasoningEfforts: supportedReasoningEfforts,
-                        defaultReasoningEffort: defaultReasoningEffort
-                    )
-                )
+                guard let remoteModel = Self.parseRemoteModel(entry) else { continue }
+                guard seenModelIDs.insert(remoteModel.id).inserted else { continue }
+                models.append(remoteModel)
             }
 
             let nextCursor = result["nextCursor"] as? String
@@ -894,6 +907,48 @@ actor CodexAppServerClient {
         }
 
         return models
+    }
+
+    static func parseRemoteModel(_ entry: [String: Any]) -> RemoteModel? {
+        guard let id = entry["id"] as? String, !id.isEmpty else { return nil }
+        let model = (entry["model"] as? String) ?? id
+        let supportedReasoningEfforts = (entry["supportedReasoningEfforts"] as? [[String: Any]] ?? [])
+            .compactMap { effortEntry -> RemoteReasoningEffort? in
+                guard let reasoningEffort = effortEntry["reasoningEffort"] as? String,
+                      !reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else { return nil }
+                return RemoteReasoningEffort(
+                    reasoningEffort: reasoningEffort,
+                    description: (effortEntry["description"] as? String) ?? ""
+                )
+            }
+        let additionalSpeedTiers = (entry["additionalSpeedTiers"] as? [String] ?? [])
+        let serviceTiers = (entry["serviceTiers"] as? [[String: Any]] ?? []).compactMap {
+            tier -> RemoteServiceTier? in
+            guard let id = tier["id"] as? String,
+                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            return RemoteServiceTier(
+                id: id,
+                name: (tier["name"] as? String) ?? "",
+                description: (tier["description"] as? String) ?? ""
+            )
+        }
+        return RemoteModel(
+            id: id,
+            model: model,
+            displayName: (entry["displayName"] as? String) ?? model,
+            description: (entry["description"] as? String) ?? "",
+            isDefault: entry["isDefault"] as? Bool ?? false,
+            supportedReasoningEfforts: supportedReasoningEfforts,
+            defaultReasoningEffort: entry["defaultReasoningEffort"] as? String,
+            additionalSpeedTiers: additionalSpeedTiers,
+            serviceTiers: serviceTiers,
+            defaultServiceTier: entry["defaultServiceTier"] as? String,
+            hasSupportedReasoningEffortsEvidence: entry.keys.contains("supportedReasoningEfforts"),
+            hasAdditionalSpeedTiersEvidence: entry.keys.contains("additionalSpeedTiers"),
+            hasServiceTiersEvidence: entry.keys.contains("serviceTiers")
+        )
     }
 
     private func initializeIfNeeded() async throws {

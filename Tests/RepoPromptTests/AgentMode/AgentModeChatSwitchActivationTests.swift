@@ -296,12 +296,12 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             let codexOptions = fixture.viewModel.modelOptions(for: .codexExec)
             let encodedCodexOption = try XCTUnwrap(
                 codexOptions.first {
-                    CodexModelSpecifier(raw: $0.rawValue).reasoningEffort != nil
+                    CodexModelSpecifier(raw: $0.rawValue, capabilities: .seedOnly).reasoningEffort != nil
                 },
                 "Expected an encoded dynamic Codex option; got \(codexOptions.map(\.rawValue))"
             )
             let encodedEffort = try XCTUnwrap(
-                CodexModelSpecifier(raw: encodedCodexOption.rawValue).reasoningEffort
+                CodexModelSpecifier(raw: encodedCodexOption.rawValue, capabilities: .seedOnly).reasoningEffort
             )
             let contradictoryEffort = try XCTUnwrap(
                 CodexReasoningEffort.allCases.first { $0 != encodedEffort }
@@ -314,7 +314,7 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             )
             XCTAssertEqual(
                 session.selectedModelRaw,
-                CodexModelSpecifier(raw: encodedCodexOption.rawValue).baseModel
+                CodexModelSpecifier(raw: encodedCodexOption.rawValue, capabilities: .seedOnly).baseModel
             )
             XCTAssertEqual(
                 session.selectedReasoningEffortRaw,
@@ -332,6 +332,137 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             ) { error in
                 XCTAssertEqual(error.localizedDescription, "The selected model is no longer available.")
             }
+        }
+    }
+
+    @MainActor
+    func testCodexNormalizationPreservesWithdrawnAndNormalizesPresentCapabilities() async throws {
+        try await withFixture { fixture in
+            let session = fixture.sessionA
+            let present = CodexAppServerClient.RemoteModel(
+                id: "gpt-daybreak-blue-latest",
+                model: "gpt-daybreak-blue-latest",
+                displayName: "Daybreak",
+                description: "",
+                isDefault: true,
+                supportedReasoningEfforts: [.init(reasoningEffort: "high", description: "")]
+            )
+            fixture.viewModel.updateCodexDynamicModels([present])
+            fixture.viewModel.test_setModelOptionsOverride(
+                [
+                    AgentModelOption(
+                        rawValue: "gpt-daybreak-blue-latest",
+                        displayName: "Daybreak",
+                        description: nil,
+                        isPlaceholderDefault: false,
+                        isProviderDefault: true,
+                        supportedReasoningEfforts: [.high],
+                        defaultReasoningEffort: .high
+                    )
+                ],
+                for: .codexExec
+            )
+            session.selectedAgent = .codexExec
+
+            session.selectedModelRaw = "withdrawn-model"
+            session.selectedReasoningEffortRaw = CodexReasoningEffort.ultra.rawValue
+            fixture.viewModel.codexCoordinator.normalizeCodexSelectionForSession(
+                session,
+                preservingExplicitEffort: true
+            )
+            XCTAssertEqual(session.selectedModelRaw, "withdrawn-model")
+            XCTAssertEqual(session.selectedReasoningEffortRaw, CodexReasoningEffort.ultra.rawValue)
+
+            session.selectedModelRaw = "gpt-daybreak-blue-latest"
+            session.selectedReasoningEffortRaw = CodexReasoningEffort.ultra.rawValue
+            fixture.viewModel.codexCoordinator.normalizeCodexSelectionForSession(
+                session,
+                preservingExplicitEffort: true
+            )
+            XCTAssertEqual(session.selectedModelRaw, "gpt-daybreak-blue-latest")
+            XCTAssertEqual(session.selectedReasoningEffortRaw, CodexReasoningEffort.high.rawValue)
+
+            let emptyEffortModel = CodexAppServerClient.RemoteModel(
+                id: "gpt-daybreak-blue-latest",
+                model: "gpt-daybreak-blue-latest",
+                displayName: "Daybreak",
+                description: "",
+                isDefault: true,
+                supportedReasoningEfforts: []
+            )
+            fixture.viewModel.updateCodexDynamicModels([emptyEffortModel])
+            session.selectedModelRaw = "gpt-daybreak-blue-latest"
+            session.selectedReasoningEffortRaw = CodexReasoningEffort.high.rawValue
+            fixture.viewModel.codexCoordinator.normalizeCodexSelectionForSession(
+                session,
+                preservingExplicitEffort: true
+            )
+            XCTAssertNil(session.selectedReasoningEffortRaw)
+            var effective = fixture.viewModel.codexCoordinator.effectiveCodexSelection(for: session)
+            XCTAssertEqual(effective.model, "gpt-daybreak-blue-latest")
+            XCTAssertNil(effective.reasoningEffort)
+
+            let unknownEffortModel = CodexAppServerClient.RemoteModel(
+                id: "gpt-daybreak-blue-latest",
+                model: "gpt-daybreak-blue-latest",
+                displayName: "Daybreak",
+                description: "",
+                isDefault: true,
+                supportedReasoningEfforts: [],
+                hasSupportedReasoningEffortsEvidence: false
+            )
+            fixture.viewModel.updateCodexDynamicModels([unknownEffortModel])
+            session.selectedReasoningEffortRaw = CodexReasoningEffort.high.rawValue
+            fixture.viewModel.codexCoordinator.normalizeCodexSelectionForSession(
+                session,
+                preservingExplicitEffort: true
+            )
+            XCTAssertEqual(session.selectedReasoningEffortRaw, CodexReasoningEffort.high.rawValue)
+            effective = fixture.viewModel.codexCoordinator.effectiveCodexSelection(for: session)
+            XCTAssertEqual(effective.reasoningEffort, CodexReasoningEffort.high.rawValue)
+
+            session.selectedModelRaw = AgentModel.defaultModel.rawValue
+            session.selectedReasoningEffortRaw = CodexReasoningEffort.high.rawValue
+            fixture.viewModel.codexCoordinator.normalizeCodexSelectionForSession(
+                session,
+                preservingExplicitEffort: true
+            )
+            XCTAssertNil(session.selectedReasoningEffortRaw)
+            effective = fixture.viewModel.codexCoordinator.effectiveCodexSelection(for: session)
+            XCTAssertNil(effective.model)
+            XCTAssertNil(effective.reasoningEffort)
+
+            let shorterLiveModel = CodexAppServerClient.RemoteModel(
+                id: "gpt-5.1-codex",
+                model: "gpt-5.1-codex",
+                displayName: "GPT-5.1 Codex",
+                description: "",
+                isDefault: true,
+                supportedReasoningEfforts: [.init(reasoningEffort: "max", description: "")]
+            )
+            fixture.viewModel.updateCodexDynamicModels([shorterLiveModel])
+            session.selectedModelRaw = "gpt-5.1-codex-max"
+            session.selectedReasoningEffortRaw = CodexReasoningEffort.ultra.rawValue
+            fixture.viewModel.codexCoordinator.normalizeCodexSelectionForSession(
+                session,
+                preservingExplicitEffort: true
+            )
+            XCTAssertEqual(session.selectedModelRaw, "gpt-5.1-codex-max")
+            XCTAssertEqual(session.selectedReasoningEffortRaw, CodexReasoningEffort.ultra.rawValue)
+            effective = fixture.viewModel.codexCoordinator.effectiveCodexSelection(for: session)
+            XCTAssertEqual(effective.model, "gpt-5.1-codex-max")
+            XCTAssertEqual(effective.reasoningEffort, CodexReasoningEffort.ultra.rawValue)
+
+            let ineligible = CodexModelCapabilitySnapshot(capabilities: [
+                .init(base: "gpt-daybreak-blue-latest", efforts: [.high], speedTiers: [])
+            ])
+            XCTAssertEqual(
+                CodexAgentModeCoordinator.normalizedCodexSelectionModelRaw(
+                    from: "gpt-daybreak-blue-latest-fast",
+                    capabilities: ineligible
+                ),
+                "gpt-daybreak-blue-latest"
+            )
         }
     }
 

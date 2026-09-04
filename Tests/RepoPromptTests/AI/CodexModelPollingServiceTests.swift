@@ -3,7 +3,7 @@ import XCTest
 
 final class CodexModelPollingServiceTests: XCTestCase {
     func testLastSubscriberStopsOwnedClientAndLaterSubscriberRestartsPolling() async throws {
-        let client = PollingClientSpy()
+        let client = PollingClientSpy(responses: [.models([]), .models([])])
         let service = CodexModelPollingService(
             client: client,
             intervalNanos: 60_000_000_000,
@@ -23,6 +23,62 @@ final class CodexModelPollingServiceTests: XCTestCase {
         await secondConsumer.value
         try await waitUntil { await client.stopCallCount >= 2 }
 
+        await service.shutdown()
+    }
+
+    func testZeroAndFailurePreserveLastGoodWhileOutcomeRemainsObservable() async throws {
+        let suiteName = "CodexModelPollingServiceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let knownRegistry = CodexKnownModelBaseRegistry(defaults: defaults)
+        let registry = AgentCodexModelRegistry(
+            defaults: defaults,
+            knownModelBaseRegistry: knownRegistry
+        )
+        let model = CodexAppServerClient.RemoteModel(
+            id: "gpt-daybreak-blue-latest",
+            model: "gpt-daybreak-blue-latest",
+            displayName: "Daybreak",
+            description: "",
+            isDefault: true,
+            supportedReasoningEfforts: [.init(reasoningEffort: "ultra", description: "")]
+        )
+        let client = PollingClientSpy(responses: [
+            .models([model]),
+            .models([model]),
+            .models([]),
+            .failure("offline")
+        ])
+        let service = CodexModelPollingService(client: client, registry: registry)
+
+        await service.refreshNow()
+        let first = await service.latestSnapshot()
+        XCTAssertEqual(first?.models, [model])
+        XCTAssertNotNil(knownRegistry.capabilitySnapshot().capability(forBase: model.id))
+
+        await service.refreshNow()
+        let unchanged = await service.latestSnapshot()
+        XCTAssertEqual(unchanged, first, "unchanged snapshots are not republished")
+
+        await service.refreshNow()
+        let afterZero = await service.latestSnapshot()
+        XCTAssertEqual(afterZero, first)
+        guard case let .success(modelCount, _) = await service.lastPollOutcome() else {
+            return XCTFail("Expected an observable zero-model outcome")
+        }
+        XCTAssertEqual(modelCount, 0)
+        XCTAssertEqual(registry.currentLiveModels(), [model])
+        XCTAssertNotNil(knownRegistry.capabilitySnapshot().capability(forBase: model.id))
+
+        await service.refreshNow()
+        guard case let .failure(message, _) = await service.lastPollOutcome() else {
+            return XCTFail("Expected an observable failure outcome")
+        }
+        XCTAssertEqual(message, "offline")
+        let afterFailure = await service.latestSnapshot()
+        XCTAssertEqual(afterFailure, first)
+        XCTAssertEqual(registry.currentLiveModels(), [model])
         await service.shutdown()
     }
 
@@ -52,15 +108,38 @@ final class CodexModelPollingServiceTests: XCTestCase {
 }
 
 private actor PollingClientSpy: CodexModelListingClient {
+    enum Response {
+        case models([CodexAppServerClient.RemoteModel])
+        case failure(String)
+    }
+
     private(set) var listCallCount = 0
     private(set) var stopCallCount = 0
+    private var responses: [Response]
+
+    init(responses: [Response]) {
+        self.responses = responses
+    }
 
     func listModels(limit: Int) async throws -> [CodexAppServerClient.RemoteModel] {
         listCallCount += 1
-        return []
+        guard !responses.isEmpty else { return [] }
+        switch responses.removeFirst() {
+        case let .models(models):
+            return models
+        case let .failure(message):
+            throw PollingError(message: message)
+        }
     }
 
     func stop() async {
         stopCallCount += 1
+    }
+}
+
+private struct PollingError: LocalizedError {
+    let message: String
+    var errorDescription: String? {
+        message
     }
 }

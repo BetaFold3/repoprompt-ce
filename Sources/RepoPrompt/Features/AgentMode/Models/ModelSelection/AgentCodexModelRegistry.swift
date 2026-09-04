@@ -4,15 +4,25 @@ final class AgentCodexModelRegistry {
     static let shared = AgentCodexModelRegistry()
 
     private let lock = NSLock()
+    private let defaults: UserDefaults
+    private let knownModelBaseRegistry: CodexKnownModelBaseRegistry
     private var liveModels: [CodexAppServerClient.RemoteModel] = []
     private var liveModelSignature: [CodexDynamicModelRecord] = []
 
-    private init() {}
+    init(
+        defaults: UserDefaults = .standard,
+        knownModelBaseRegistry: CodexKnownModelBaseRegistry = .shared
+    ) {
+        self.defaults = defaults
+        self.knownModelBaseRegistry = knownModelBaseRegistry
+    }
 
     @discardableResult
     func updateLiveModels(_ models: [CodexAppServerClient.RemoteModel]) -> Bool {
         let signature = CodexDynamicModelStore.canonicalRecords(from: models)
+        guard !signature.isEmpty else { return false }
         let normalized = remoteModels(from: signature)
+        knownModelBaseRegistry.unionObserved(records: signature)
 
         lock.lock()
         let didChange = signature != liveModelSignature
@@ -23,7 +33,7 @@ final class AgentCodexModelRegistry {
         lock.unlock()
 
         guard didChange else { return false }
-        CodexDynamicModelStore.save(normalized)
+        CodexDynamicModelStore.save(normalized, defaults: defaults)
         return true
     }
 
@@ -37,69 +47,92 @@ final class AgentCodexModelRegistry {
         staticOptions: [AgentModelOption],
         preferredLiveModels: [CodexAppServerClient.RemoteModel]? = nil
     ) -> [AgentModelOption] {
+        let capabilities = knownModelBaseRegistry.capabilitySnapshot()
         if let preferredLiveModels {
             if !preferredLiveModels.isEmpty {
                 return resolvedOptions(
                     dynamicOptions: codexDynamicOptions(from: preferredLiveModels),
-                    staticOptions: staticOptions
+                    staticOptions: staticOptions,
+                    capabilities: capabilities
                 )
             }
-            let cachedOptions = CodexDynamicModelStore.modelOptions()
+            let cachedOptions = CodexDynamicModelStore.modelOptions(defaults: defaults)
             if !cachedOptions.isEmpty {
                 return resolvedOptions(
                     dynamicOptions: codexDynamicOptions(from: cachedOptions),
-                    staticOptions: staticOptions
+                    staticOptions: staticOptions,
+                    capabilities: capabilities
                 )
             }
-            return codexOptionsByAddingFastVariants(staticOptions)
+            return codexOptionsByAddingFastVariants(staticOptions, capabilities: capabilities)
         }
 
         let knownLiveModels = currentLiveModels()
         if !knownLiveModels.isEmpty {
             return resolvedOptions(
                 dynamicOptions: codexDynamicOptions(from: knownLiveModels),
-                staticOptions: staticOptions
+                staticOptions: staticOptions,
+                capabilities: capabilities
             )
         }
 
-        let cachedOptions = CodexDynamicModelStore.modelOptions()
+        let cachedOptions = CodexDynamicModelStore.modelOptions(defaults: defaults)
         if !cachedOptions.isEmpty {
             return resolvedOptions(
                 dynamicOptions: codexDynamicOptions(from: cachedOptions),
-                staticOptions: staticOptions
+                staticOptions: staticOptions,
+                capabilities: capabilities
             )
         }
 
-        return codexOptionsByAddingFastVariants(staticOptions)
+        return codexOptionsByAddingFastVariants(staticOptions, capabilities: capabilities)
     }
 
     private func resolvedOptions(
         dynamicOptions: [AgentModelOption],
-        staticOptions: [AgentModelOption]
+        staticOptions: [AgentModelOption],
+        capabilities: CodexModelCapabilitySnapshot
     ) -> [AgentModelOption] {
-        let dynamicOptionsWithFastVariants = codexOptionsByAddingFastVariants(dynamicOptions)
-        let staticOptionsWithFastVariants = codexOptionsByAddingFastVariants(staticOptions)
-        if shouldBackfillRecommendedDefaults(dynamicOptionsWithFastVariants) {
-            return mergeCodexOptions(primary: dynamicOptionsWithFastVariants, fallback: staticOptionsWithFastVariants)
+        let dynamicOptionsWithFastVariants = codexOptionsByAddingFastVariants(
+            dynamicOptions,
+            capabilities: capabilities
+        )
+        let staticOptionsWithFastVariants = codexOptionsByAddingFastVariants(
+            staticOptions,
+            capabilities: capabilities
+        )
+        if shouldBackfillRecommendedDefaults(dynamicOptionsWithFastVariants, capabilities: capabilities) {
+            return mergeCodexOptions(
+                primary: dynamicOptionsWithFastVariants,
+                fallback: staticOptionsWithFastVariants,
+                capabilities: capabilities
+            )
         }
         return dynamicOptionsWithFastVariants
     }
 
-    private func codexOptionsByAddingFastVariants(_ options: [AgentModelOption]) -> [AgentModelOption] {
-        options + synthesizedFastAgentOptions(from: options)
+    private func codexOptionsByAddingFastVariants(
+        _ options: [AgentModelOption],
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> [AgentModelOption] {
+        options + synthesizedFastAgentOptions(from: options, capabilities: capabilities)
     }
 
-    private func synthesizedFastAgentOptions(from options: [AgentModelOption]) -> [AgentModelOption] {
+    private func synthesizedFastAgentOptions(
+        from options: [AgentModelOption],
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> [AgentModelOption] {
         var synthesized: [AgentModelOption] = []
         var seen = Set(options.map { $0.rawValue.lowercased() })
 
         for option in options where !option.isPlaceholderDefault {
-            let specifier = CodexModelSpecifier(raw: option.rawValue)
+            let specifier = CodexModelSpecifier(raw: option.rawValue, capabilities: capabilities)
             guard specifier.serviceTier == nil,
                   let baseModel = specifier.baseModel,
                   let fastID = CodexServiceTierVariantCatalog.fastVariantID(
                       baseModelID: baseModel,
-                      reasoningEffort: specifier.reasoningEffort
+                      reasoningEffort: specifier.reasoningEffort,
+                      capabilities: capabilities
                   ) else { continue }
             guard seen.insert(fastID.lowercased()).inserted else { continue }
 
@@ -168,12 +201,15 @@ final class AgentCodexModelRegistry {
 
     private func mergeCodexOptions(
         primary: [AgentModelOption],
-        fallback: [AgentModelOption]
+        fallback: [AgentModelOption],
+        capabilities: CodexModelCapabilitySnapshot
     ) -> [AgentModelOption] {
         var merged = primary
-        var seen = Set(primary.flatMap { codexEquivalenceKeys(for: $0.rawValue) })
+        var seen = Set(primary.flatMap {
+            codexEquivalenceKeys(for: $0.rawValue, capabilities: capabilities)
+        })
         for option in fallback {
-            let keys = codexEquivalenceKeys(for: option.rawValue)
+            let keys = codexEquivalenceKeys(for: option.rawValue, capabilities: capabilities)
             guard !keys.isEmpty, keys.allSatisfy({ !seen.contains($0) }) else { continue }
             seen.formUnion(keys)
             merged.append(option)
@@ -181,8 +217,13 @@ final class AgentCodexModelRegistry {
         return merged
     }
 
-    private func shouldBackfillRecommendedDefaults(_ options: [AgentModelOption]) -> Bool {
-        let keys = Set(options.flatMap { codexEquivalenceKeys(for: $0.rawValue) })
+    private func shouldBackfillRecommendedDefaults(
+        _ options: [AgentModelOption],
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> Bool {
+        let keys = Set(options.flatMap {
+            codexEquivalenceKeys(for: $0.rawValue, capabilities: capabilities)
+        })
         let requiredKeyGroups: [[String]] = [
             ["gpt-5.6-sol-low", "gpt-5.6-low"],
             ["gpt-5.6-sol-medium", "gpt-5.6-medium"],
@@ -194,11 +235,14 @@ final class AgentCodexModelRegistry {
         }
     }
 
-    private func codexEquivalenceKeys(for rawValue: String) -> Set<String> {
+    private func codexEquivalenceKeys(
+        for rawValue: String,
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> Set<String> {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !normalized.isEmpty else { return [] }
         var keys: Set<String> = [normalized]
-        let specifier = CodexModelSpecifier(raw: normalized)
+        let specifier = CodexModelSpecifier(raw: normalized, capabilities: capabilities)
         if let base = specifier.baseModel?.lowercased() {
             if base == "gpt-5.3-codex",
                specifier.reasoningEffort == nil || specifier.reasoningEffort == .medium
@@ -239,7 +283,19 @@ final class AgentCodexModelRegistry {
                         description: $0.description
                     )
                 },
-                defaultReasoningEffort: record.defaultReasoningEffort
+                defaultReasoningEffort: record.defaultReasoningEffort,
+                additionalSpeedTiers: record.additionalSpeedTiers,
+                serviceTiers: record.serviceTiers.map {
+                    CodexAppServerClient.RemoteServiceTier(
+                        id: $0.id,
+                        name: $0.name,
+                        description: $0.description
+                    )
+                },
+                defaultServiceTier: record.defaultServiceTier,
+                hasSupportedReasoningEffortsEvidence: record.hasSupportedReasoningEffortsEvidence,
+                hasAdditionalSpeedTiersEvidence: record.hasAdditionalSpeedTiersEvidence,
+                hasServiceTiersEvidence: record.hasServiceTiersEvidence
             )
         }
     }
@@ -250,7 +306,11 @@ final class AgentCodexModelRegistry {
             primary: [AgentModelOption],
             fallback: [AgentModelOption]
         ) -> [AgentModelOption] {
-            mergeCodexOptions(primary: primary, fallback: fallback)
+            mergeCodexOptions(
+                primary: primary,
+                fallback: fallback,
+                capabilities: knownModelBaseRegistry.capabilitySnapshot()
+            )
         }
     #endif
 }

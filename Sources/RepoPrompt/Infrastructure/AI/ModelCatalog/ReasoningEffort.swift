@@ -39,6 +39,10 @@ public enum CodexReasoningEffort: String, CaseIterable, Codable, Sendable {
         }
     }
 
+    var isExtended: Bool {
+        self == .max || self == .ultra
+    }
+
     var displayName: String {
         switch self {
         case .none:

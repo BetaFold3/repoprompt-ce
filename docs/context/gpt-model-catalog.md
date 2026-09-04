@@ -1,6 +1,6 @@
 # GPT model catalog
 
-Scope: read when the task touches direct OpenAI API model visibility, trusted model metadata, configured-model projection, static OpenAI wire-ID ownership, or adding a newly released GPT model.
+Scope: read when the task touches direct OpenAI API model visibility, trusted model metadata, configured-model projection, static OpenAI wire-ID ownership, Codex app-server model capability discovery, Codex model parsing or Fast variants, or adding a newly released GPT model.
 Authority: Authoritative
 Last-verified: 2026-09-04
 
@@ -45,11 +45,31 @@ Withdrawal hides a configured row from new visible choices but does not rewrite 
 
 Token metadata describes capability only and does not synthesize output limits into requests.
 
+## Codex app-server authority and persistence
+
+Codex app-server `model/list` is the capability authority for observed Codex bases. `CodexDynamicModelRecords` remains the active last-good snapshot used by current picker consumers. A separate `CodexKnownModelBases` schema-v1 ledger retains parser capability history; it is not a second active catalog. `AgentCodexModelRegistry.updateLiveModels` is the only production persistence trigger for the ledger: each non-empty poll replaces the active snapshot, unions historical effort knowledge, and records the latest additional speed tiers, service tiers, source, and last-seen data for each observed base.
+
+When the ledger key is absent, legacy dynamic records are folded in memory. Field presence is preserved from the app-server wire response through the active record: missing historical or current effort/tier fields are absence of evidence and retain prior capability, while explicit current empty tier arrays are authoritative and remove Fast eligibility for that base. The next non-empty observed update persists the fold. The ledger preserves seeded bases and is capped at 2,048 entries. An unknown ledger schema is never interpreted as compatible data: readers use seed-only capability and do not overwrite the future-schema payload for the process lifetime. Tests use isolated `UserDefaults` and injected immutable snapshots rather than mutating `UserDefaults.standard`.
+
+A successful zero-model poll is no evidence. It records an in-memory poll outcome for later status presentation but does not clear or publish over the active last-good snapshot and does not change the ledger. Poll failures likewise record an in-memory failure outcome while preserving both stores. A non-empty poll still replaces the active snapshot even when it represents partial withdrawal; an unchanged canonical snapshot is not republished.
+
+## Codex model grammar and withdrawal
+
+`CodexModelSpecifier` parses against a cached immutable capability snapshot of `(base, efforts, speed tiers)` with precomputed longest-base ordering. Exact known bases win first, then the longest known base may consume an advertised effort suffix. `max` and its `maximum` alias, plus `ultra`, are extended efforts and are stripped only with capability evidence. Ordinary legacy effort suffixes retain their broad compatibility behavior. This keeps exact IDs such as `gpt-5.1-codex-max` intact, while an observed base such as `gpt-daybreak-blue-latest` automatically gains `-max` and `-ultra` parsing when advertised. Unknown `gpt-6-astra-max` remains one uninterpreted model ID until Codex supplies evidence.
+
+The seed preserves static Codex bases and current extended-effort behavior: `gpt-5.6`, `gpt-5.6-sol`, and `gpt-5.6-terra` advertise seed `max` and `ultra`; `gpt-5.6-luna` advertises seed `max`; other static bases advertise no extended effort unless observed.
+
+A withdrawn dynamic model disappears from new picker choices, but normalization resolves availability using durable known-base knowledge plus current live evidence, with exact-base-wins and longest-match semantics. A present base may normalize changed effort capability; an authoritative explicit empty effort list clears stale effort in both stored selection and request shaping; missing effort metadata preserves the existing effort as unknown evidence; a present now-ineligible Fast selection degrades to that same base; and a genuinely withdrawn explicit raw model plus explicit effort remain unchanged across every normalization and request-selection call site. Parsing knowledge remains in the ledger, and execution sends the same base and effort without neighbor substitution, aliasing, or downgrade. `shouldBackfillRecommendedDefaults` remains separate product policy and is intentionally unchanged.
+
+## Codex Fast authority
+
+Fast eligibility is evidence-driven; there is no GPT version heuristic. An observed record, including one with an empty `additionalSpeedTiers`, overrides seed capability for that exact base. Fast is offered only when the latest capability entry contains exact tier token `fast`. The offline seed grants Fast to exactly `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, and `gpt-5.4`.
+
+The UI variant remains `<base>-fast[-<effort>]`, and the request wire value remains `service_tier=fast`; upstream `serviceTiers[].id == priority` is descriptive metadata, not the request token. A persisted `-fast` selection whose base is no longer eligible degrades to the same base without sending a service tier. Do not infer Fast for new versions or for `gpt-5.4-mini`, `gpt-5.3-codex-spark`, Daybreak, or Astra without explicit `additionalSpeedTiers` evidence.
+
 ## Deferred work
 
-Configured-model service-tier gating and the OpenAI catalog status UI remain PR 3 work. Although schema v2 can decode `service_tiers`, PR 1 does not make metadata the configured-model tier projection authority. Existing static and unknown-custom tier behavior also remains unchanged pending the separately audited follow-up described by the [active plan](plans/2026-09-04-dynamic-gpt-model-catalog-plan.md).
-
-Codex model grammar, capability history, and Fast-tier evidence belong to PR 2 and are not owned by this document yet.
+Configured-model service-tier gating and the OpenAI catalog status UI remain PR 3 work. Although schema v2 can decode `service_tiers`, the current implementation does not make metadata the configured-model tier projection authority. Existing static and unknown-custom tier behavior also remains unchanged pending the separately audited follow-up described by the [active plan](plans/2026-09-04-dynamic-gpt-model-catalog-plan.md).
 
 ## Add a model
 

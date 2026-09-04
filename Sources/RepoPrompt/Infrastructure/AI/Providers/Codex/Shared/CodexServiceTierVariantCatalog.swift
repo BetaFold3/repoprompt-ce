@@ -4,73 +4,65 @@ enum CodexServiceTierVariantCatalog {
     static let fastServiceTier = "fast"
     static let fastCostWarningText = "Fast service tier uses your usage limits about 2× faster."
 
-    static func isFastEligible(baseModelID: String) -> Bool {
-        guard let version = gptVersion(from: baseModelID) else { return false }
-        return version.major > 5 || (version.major == 5 && version.minor >= 3)
+    static func isFastEligible(
+        baseModelID: String,
+        capabilities: CodexModelCapabilitySnapshot = .shared
+    ) -> Bool {
+        capabilities.capability(forBase: baseModelID)?.speedTiers.contains(fastServiceTier) == true
     }
 
-    private static func gptVersion(from baseModelID: String) -> (major: Int, minor: Int)? {
-        let normalized = baseModelID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalized.hasPrefix("gpt-") else { return nil }
-
-        let versionStart = normalized.index(normalized.startIndex, offsetBy: 4)
-        var versionEnd = versionStart
-        while versionEnd < normalized.endIndex {
-            let character = normalized[versionEnd]
-            guard character.isNumber || character == "." else { break }
-            versionEnd = normalized.index(after: versionEnd)
-        }
-
-        let versionString = String(normalized[versionStart ..< versionEnd])
-        let components = versionString.split(separator: ".", omittingEmptySubsequences: false)
-        guard let majorString = components.first,
-              let major = Int(majorString) else { return nil }
-        let minor: Int
-        if components.count > 1 {
-            guard let parsedMinor = Int(components[1]) else { return nil }
-            minor = parsedMinor
-        } else {
-            minor = 0
-        }
-        return (major, minor)
-    }
-
-    static func isFastVariant(rawModel: String?) -> Bool {
-        let specifier = CodexModelSpecifier(raw: rawModel)
+    static func isFastVariant(
+        rawModel: String?,
+        capabilities: CodexModelCapabilitySnapshot = .shared
+    ) -> Bool {
+        let specifier = CodexModelSpecifier(raw: rawModel, capabilities: capabilities)
         guard let baseModel = specifier.baseModel else { return false }
         return supportedServiceTier(
             baseModelID: baseModel,
-            serviceTier: specifier.serviceTier
+            serviceTier: specifier.serviceTier,
+            capabilities: capabilities
         ) == fastServiceTier
     }
 
-    static func serviceTierAwareBaseID(for rawModel: String) -> String {
+    static func serviceTierAwareBaseID(
+        for rawModel: String,
+        capabilities: CodexModelCapabilitySnapshot = .shared
+    ) -> String {
         let trimmed = rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        let specifier = CodexModelSpecifier(raw: trimmed)
+        let specifier = CodexModelSpecifier(raw: trimmed, capabilities: capabilities)
         var baseID = (specifier.baseModel ?? trimmed).trimmingCharacters(in: .whitespacesAndNewlines)
         if let tier = supportedServiceTier(
             baseModelID: baseID,
-            serviceTier: specifier.serviceTier
+            serviceTier: specifier.serviceTier,
+            capabilities: capabilities
         ) {
             baseID += "-\(tier)"
         }
         return baseID
     }
 
-    static func supportedServiceTier(baseModelID: String, serviceTier: String?) -> String? {
+    static func supportedServiceTier(
+        baseModelID: String,
+        serviceTier: String?,
+        capabilities: CodexModelCapabilitySnapshot = .shared
+    ) -> String? {
         guard let serviceTier else { return nil }
         let normalizedTier = serviceTier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard normalizedTier == fastServiceTier,
-              isFastEligible(baseModelID: baseModelID) else { return nil }
+              isFastEligible(baseModelID: baseModelID, capabilities: capabilities)
+        else { return nil }
         return normalizedTier
     }
 
     static func fastVariantID(
         baseModelID: String,
-        reasoningEffort: CodexReasoningEffort?
+        reasoningEffort: CodexReasoningEffort?,
+        capabilities: CodexModelCapabilitySnapshot = .shared
     ) -> String? {
         let baseModelID = baseModelID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !baseModelID.isEmpty, isFastEligible(baseModelID: baseModelID) else { return nil }
+        guard !baseModelID.isEmpty,
+              isFastEligible(baseModelID: baseModelID, capabilities: capabilities)
+        else { return nil }
         if let reasoningEffort {
             return "\(baseModelID)-\(fastServiceTier)-\(reasoningEffort.rawValue)"
         }

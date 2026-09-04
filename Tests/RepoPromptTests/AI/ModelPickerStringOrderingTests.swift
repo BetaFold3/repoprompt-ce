@@ -70,6 +70,31 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testCodexRefreshClassifiesSelectionByStoredBaseIdentity() {
+        let live = CodexAppServerClient.RemoteModel(
+            id: "gpt-daybreak-blue-latest",
+            model: "gpt-daybreak-blue-latest",
+            displayName: "Daybreak",
+            description: "",
+            isDefault: false,
+            supportedReasoningEfforts: [.init(reasoningEffort: "ultra", description: "")]
+        )
+
+        XCTAssertTrue(CodexAgentModeCoordinator.shouldPreserveWithdrawnExplicitSelection(
+            rawModel: "withdrawn-model-ultra",
+            refreshedModels: [live]
+        ))
+        XCTAssertFalse(CodexAgentModeCoordinator.shouldPreserveWithdrawnExplicitSelection(
+            rawModel: "gpt-daybreak-blue-latest-ultra",
+            refreshedModels: [live]
+        ))
+        XCTAssertFalse(CodexAgentModeCoordinator.shouldPreserveWithdrawnExplicitSelection(
+            rawModel: AgentModel.defaultModel.rawValue,
+            refreshedModels: [live]
+        ))
+    }
+
     func testSemanticOrderingUsesFamilyBeforeDisplayNameAcrossFamilies() {
         let sorted = AIModel.sortedForPicker([
             .customProvider(name: "Aardvark", provider: "custom", model: "zzz-1"),
@@ -397,10 +422,10 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(CodexReasoningEffort.parse("max"), .max)
         XCTAssertEqual(CodexReasoningEffort.parse("maximum"), .max)
         XCTAssertEqual(CodexReasoningEffort.parse("ultra"), .ultra)
-        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-max").baseModel, "gpt-5.6-sol")
-        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-max").reasoningEffort, .max)
-        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-ultra").baseModel, "gpt-5.6-sol")
-        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-ultra").reasoningEffort, .ultra)
+        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-max", capabilities: .seedOnly).baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-max", capabilities: .seedOnly).reasoningEffort, .max)
+        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-ultra", capabilities: .seedOnly).baseModel, "gpt-5.6-sol")
+        XCTAssertEqual(CodexModelSpecifier(raw: "gpt-5.6-sol-ultra", capabilities: .seedOnly).reasoningEffort, .ultra)
         XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-5.6-sol-max", agentKind: .codexExec), .gpt56SolMax)
         XCTAssertEqual(AgentModel.resolvedModel(forRaw: "gpt-5.6-sol-ultra", agentKind: .codexExec), .gpt56SolUltra)
         XCTAssertEqual(AIModel.fromModelName("codex_cli_gpt-5.6-sol-max"), .codexCliGpt56SolMax)
@@ -410,15 +435,15 @@ final class ModelPickerStringOrderingTests: XCTestCase {
     }
 
     func testCodexModelSpecifierDoesNotMisparseGpt51CodexMaxBase() {
-        let base = CodexModelSpecifier(raw: "gpt-5.1-codex-max")
+        let base = CodexModelSpecifier(raw: "gpt-5.1-codex-max", capabilities: .seedOnly)
         XCTAssertEqual(base.baseModel, "gpt-5.1-codex-max")
         XCTAssertNil(base.reasoningEffort)
 
-        let low = CodexModelSpecifier(raw: "gpt-5.1-codex-max-low")
+        let low = CodexModelSpecifier(raw: "gpt-5.1-codex-max-low", capabilities: .seedOnly)
         XCTAssertEqual(low.baseModel, "gpt-5.1-codex-max")
         XCTAssertEqual(low.reasoningEffort, .low)
 
-        let high = CodexModelSpecifier(raw: "gpt-5.1-codex-max-high")
+        let high = CodexModelSpecifier(raw: "gpt-5.1-codex-max-high", capabilities: .seedOnly)
         XCTAssertEqual(high.baseModel, "gpt-5.1-codex-max")
         XCTAssertEqual(high.reasoningEffort, .high)
     }
@@ -493,7 +518,7 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertNil(AgentModel(rawValue: "gpt-5.6-luna-ultra"))
         XCTAssertNil(AgentModel.resolvedModel(forRaw: "gpt-5.6-luna-ultra", agentKind: .codexExec))
         XCTAssertNil(AIModel.fromModelName("codex_cli_gpt-5.6-luna-ultra"))
-        XCTAssertNil(CodexModelSpecifier(raw: "gpt-5.6-luna-ultra").reasoningEffort)
+        XCTAssertNil(CodexModelSpecifier(raw: "gpt-5.6-luna-ultra", capabilities: .seedOnly).reasoningEffort)
         XCTAssertTrue(AgentModel.gpt56SolMax.description.contains("choose intentionally"))
         XCTAssertTrue(AgentModel.gpt56SolUltra.description.contains("choose intentionally"))
     }
@@ -594,7 +619,7 @@ final class ModelPickerStringOrderingTests: XCTestCase {
             option(raw: "gpt-5.6-sol-low", displayName: "GPT-5.6 Sol Low"),
             option(raw: "gpt-5.4-fast-low", displayName: "GPT-5.4 Fast Low"),
             option(raw: "gpt-5.6-sol-Low", displayName: "GPT-5.6 Sol Low")
-        ])
+        ], capabilities: .seedOnly)
 
         XCTAssertEqual(menu.defaultOption?.rawValue, AgentModel.defaultModel.rawValue)
         XCTAssertEqual(menu.groups.map(\.baseModelID), [

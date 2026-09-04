@@ -647,7 +647,10 @@ enum AgentModelCatalog {
         return OpenCodeMenu(providerGroups: providerGroups, groups: groups)
     }
 
-    static func codexMenu(for options: [AgentModelOption]) -> CodexMenu {
+    static func codexMenu(
+        for options: [AgentModelOption],
+        capabilities: CodexModelCapabilitySnapshot = .shared
+    ) -> CodexMenu {
         let defaultOption = options.first { $0.isPlaceholderDefault }
         let modelOptions = options.filter { !$0.isPlaceholderDefault }
         guard !modelOptions.isEmpty else {
@@ -718,7 +721,7 @@ enum AgentModelCatalog {
             baseModelID: String,
             fallbackDisplayName: String
         ) -> String {
-            let specifier = CodexModelSpecifier(raw: baseModelID)
+            let specifier = CodexModelSpecifier(raw: baseModelID, capabilities: capabilities)
             guard let serviceTier = specifier.serviceTier,
                   let baseModel = specifier.baseModel
             else {
@@ -746,9 +749,12 @@ enum AgentModelCatalog {
         }
 
         let entries = modelOptions.map { option -> Entry in
-            let specifier = CodexModelSpecifier(raw: option.rawValue)
+            let specifier = CodexModelSpecifier(raw: option.rawValue, capabilities: capabilities)
             let normalizedRaw = option.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            let baseModelID = CodexServiceTierVariantCatalog.serviceTierAwareBaseID(for: normalizedRaw)
+            let baseModelID = CodexServiceTierVariantCatalog.serviceTierAwareBaseID(
+                for: normalizedRaw,
+                capabilities: capabilities
+            )
             let reasoningEffort = specifier.reasoningEffort ?? effortFromDisplayName(option.displayName)
             let groupDisplayName = displayNameForBaseModel(
                 baseModelID: baseModelID,

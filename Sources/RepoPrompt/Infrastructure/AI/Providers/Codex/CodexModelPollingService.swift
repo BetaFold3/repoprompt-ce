@@ -36,10 +36,16 @@ actor CodexModelPollingService {
         let fetchedAt: Date
     }
 
+    enum LastPollOutcome: Equatable {
+        case success(modelCount: Int, fetchedAt: Date)
+        case failure(message: String, failedAt: Date)
+    }
+
     private let client: any CodexModelListingClient
     private let intervalNanos: UInt64
     private let stopClientOnShutdown: Bool
     private let stopClientWhenIdle: Bool
+    private let registry: AgentCodexModelRegistry
 
     private var pollingTask: Task<Void, Never>?
     private var inFlightRefresh: Task<Void, Never>?
@@ -48,6 +54,7 @@ actor CodexModelPollingService {
         private var testSubscriberCountObservers: [UUID: AsyncStream<Int>.Continuation] = [:]
     #endif
     private var latest: Snapshot?
+    private var pollOutcome: LastPollOutcome?
     private var isShutdown = false
     private var isStoppingClientForIdle = false
 
@@ -55,17 +62,23 @@ actor CodexModelPollingService {
         client: any CodexModelListingClient,
         intervalNanos: UInt64 = 60_000_000_000,
         stopClientOnShutdown: Bool = false,
-        stopClientWhenIdle: Bool = false
+        stopClientWhenIdle: Bool = false,
+        registry: AgentCodexModelRegistry = .shared
     ) {
         self.client = client
         self.intervalNanos = intervalNanos
         self.stopClientOnShutdown = stopClientOnShutdown
         self.stopClientWhenIdle = stopClientWhenIdle
+        self.registry = registry
     }
 
     /// Returns the most recent snapshot if available (non-blocking).
     func latestSnapshot() -> Snapshot? {
         latest
+    }
+
+    func lastPollOutcome() -> LastPollOutcome? {
+        pollOutcome
     }
 
     #if DEBUG
@@ -223,7 +236,8 @@ actor CodexModelPollingService {
                 let snapshot = Snapshot(models: models, fetchedAt: Date())
                 await applyRefreshResult(snapshot)
             } catch {
-                // Keep existing cache when refresh fails; callers fall back to static list when empty.
+                guard !Task.isCancelled else { return }
+                await recordPollFailure(error)
             }
         }
         inFlightRefresh = task
@@ -233,14 +247,21 @@ actor CodexModelPollingService {
 
     private func applyRefreshResult(_ snapshot: Snapshot) {
         guard !isShutdown else { return }
+        pollOutcome = .success(modelCount: snapshot.models.count, fetchedAt: snapshot.fetchedAt)
+        guard !snapshot.models.isEmpty else { return }
 
         // Single canonical registry update — no other call site should write to the registry.
-        let didChange = AgentCodexModelRegistry.shared.updateLiveModels(snapshot.models)
+        let didChange = registry.updateLiveModels(snapshot.models)
         guard didChange else { return }
         latest = snapshot
 
         for continuation in continuations.values {
             continuation.yield(snapshot)
         }
+    }
+
+    private func recordPollFailure(_ error: Error) {
+        guard !isShutdown else { return }
+        pollOutcome = .failure(message: error.localizedDescription, failedAt: Date())
     }
 }

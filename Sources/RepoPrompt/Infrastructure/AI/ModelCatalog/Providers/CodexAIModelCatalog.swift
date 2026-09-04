@@ -5,6 +5,12 @@ struct CodexDynamicReasoningRecord: Codable, Hashable {
     let description: String
 }
 
+struct CodexDynamicServiceTierRecord: Codable, Hashable {
+    let id: String
+    let name: String
+    let description: String
+}
+
 struct CodexDynamicModelRecord: Codable, Hashable {
     let id: String
     let model: String
@@ -13,6 +19,12 @@ struct CodexDynamicModelRecord: Codable, Hashable {
     let isDefault: Bool
     let supportedReasoningEfforts: [CodexDynamicReasoningRecord]
     let defaultReasoningEffort: String?
+    let additionalSpeedTiers: [String]
+    let serviceTiers: [CodexDynamicServiceTierRecord]
+    let defaultServiceTier: String?
+    let hasSupportedReasoningEffortsEvidence: Bool
+    let hasAdditionalSpeedTiersEvidence: Bool
+    let hasServiceTiersEvidence: Bool
 
     init(
         id: String,
@@ -21,7 +33,13 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         description: String,
         isDefault: Bool,
         supportedReasoningEfforts: [CodexDynamicReasoningRecord] = [],
-        defaultReasoningEffort: String? = nil
+        defaultReasoningEffort: String? = nil,
+        additionalSpeedTiers: [String] = [],
+        serviceTiers: [CodexDynamicServiceTierRecord] = [],
+        defaultServiceTier: String? = nil,
+        hasSupportedReasoningEffortsEvidence: Bool = true,
+        hasAdditionalSpeedTiersEvidence: Bool = true,
+        hasServiceTiersEvidence: Bool = true
     ) {
         self.id = id
         self.model = model
@@ -30,6 +48,12 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         self.isDefault = isDefault
         self.supportedReasoningEfforts = supportedReasoningEfforts
         self.defaultReasoningEffort = defaultReasoningEffort
+        self.additionalSpeedTiers = additionalSpeedTiers
+        self.serviceTiers = serviceTiers
+        self.defaultServiceTier = defaultServiceTier
+        self.hasSupportedReasoningEffortsEvidence = hasSupportedReasoningEffortsEvidence
+        self.hasAdditionalSpeedTiersEvidence = hasAdditionalSpeedTiersEvidence
+        self.hasServiceTiersEvidence = hasServiceTiersEvidence
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -40,6 +64,9 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         case isDefault
         case supportedReasoningEfforts
         case defaultReasoningEffort
+        case additionalSpeedTiers
+        case serviceTiers
+        case defaultServiceTier
     }
 
     init(from decoder: Decoder) throws {
@@ -51,6 +78,12 @@ struct CodexDynamicModelRecord: Codable, Hashable {
         isDefault = try container.decode(Bool.self, forKey: .isDefault)
         supportedReasoningEfforts = try container.decodeIfPresent([CodexDynamicReasoningRecord].self, forKey: .supportedReasoningEfforts) ?? []
         defaultReasoningEffort = try container.decodeIfPresent(String.self, forKey: .defaultReasoningEffort)
+        additionalSpeedTiers = try container.decodeIfPresent([String].self, forKey: .additionalSpeedTiers) ?? []
+        serviceTiers = try container.decodeIfPresent([CodexDynamicServiceTierRecord].self, forKey: .serviceTiers) ?? []
+        defaultServiceTier = try container.decodeIfPresent(String.self, forKey: .defaultServiceTier)
+        hasSupportedReasoningEffortsEvidence = container.contains(.supportedReasoningEfforts)
+        hasAdditionalSpeedTiersEvidence = container.contains(.additionalSpeedTiers)
+        hasServiceTiersEvidence = container.contains(.serviceTiers)
     }
 }
 
@@ -81,7 +114,15 @@ enum CodexDynamicModelMapper {
                 supportedReasoningEfforts: model.supportedReasoningEfforts.map {
                     CodexDynamicReasoningRecord(reasoningEffort: $0.reasoningEffort, description: $0.description)
                 },
-                defaultReasoningEffort: model.defaultReasoningEffort
+                defaultReasoningEffort: model.defaultReasoningEffort,
+                additionalSpeedTiers: model.additionalSpeedTiers,
+                serviceTiers: model.serviceTiers.map {
+                    CodexDynamicServiceTierRecord(id: $0.id, name: $0.name, description: $0.description)
+                },
+                defaultServiceTier: model.defaultServiceTier,
+                hasSupportedReasoningEffortsEvidence: model.hasSupportedReasoningEffortsEvidence,
+                hasAdditionalSpeedTiersEvidence: model.hasAdditionalSpeedTiersEvidence,
+                hasServiceTiersEvidence: model.hasServiceTiersEvidence
             )
         }
         return options(from: records)
@@ -373,6 +414,22 @@ enum CodexDynamicModelStore {
             )
         }
 
+        let additionalSpeedTiers = Set(model.additionalSpeedTiers.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }.filter { !$0.isEmpty }).sorted()
+        var serviceTiersByID: [String: CodexDynamicServiceTierRecord] = [:]
+        for tier in model.serviceTiers {
+            let tierID = tier.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !tierID.isEmpty else { continue }
+            serviceTiersByID[tierID] = CodexDynamicServiceTierRecord(
+                id: tierID,
+                name: tier.name.trimmingCharacters(in: .whitespacesAndNewlines),
+                description: tier.description.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        let defaultServiceTier = model.defaultServiceTier?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
         return CodexDynamicModelRecord(
             id: id,
             model: canonicalModel.isEmpty ? id : canonicalModel,
@@ -380,7 +437,13 @@ enum CodexDynamicModelStore {
             description: description,
             isDefault: model.isDefault,
             supportedReasoningEfforts: reasoningEfforts,
-            defaultReasoningEffort: defaultReasoningEffort
+            defaultReasoningEffort: defaultReasoningEffort,
+            additionalSpeedTiers: additionalSpeedTiers,
+            serviceTiers: serviceTiersByID.values.sorted { $0.id < $1.id },
+            defaultServiceTier: defaultServiceTier?.isEmpty == false ? defaultServiceTier : nil,
+            hasSupportedReasoningEffortsEvidence: model.hasSupportedReasoningEffortsEvidence,
+            hasAdditionalSpeedTiersEvidence: model.hasAdditionalSpeedTiersEvidence,
+            hasServiceTiersEvidence: model.hasServiceTiersEvidence
         )
     }
 
@@ -411,26 +474,43 @@ enum CodexDynamicModelStore {
 }
 
 enum CodexAIModelCatalog {
-    static func modelsForPicker(staticModels: [AIModel]) -> [AIModel] {
-        let dynamicModels = dynamicModelsFromStore()
+    static func modelsForPicker(
+        staticModels: [AIModel],
+        capabilities: CodexModelCapabilitySnapshot = .shared,
+        defaults: UserDefaults = .standard
+    ) -> [AIModel] {
+        let dynamicModels = dynamicModelsFromStore(defaults: defaults)
         if !dynamicModels.isEmpty {
-            let dynamicWithFastVariants = dynamicModels + synthesizedFastAIModels(from: dynamicModels)
-            return backfilledRecommendedModels(primary: dynamicWithFastVariants, fallback: staticModels)
+            let dynamicWithFastVariants = dynamicModels + synthesizedFastAIModels(
+                from: dynamicModels,
+                capabilities: capabilities
+            )
+            return backfilledRecommendedModels(
+                primary: dynamicWithFastVariants,
+                fallback: staticModels,
+                capabilities: capabilities
+            )
         }
         return staticModels
     }
 
-    private static func dynamicModelsFromStore() -> [AIModel] {
-        CodexDynamicModelStore.modelOptions().map { .codexCustom(name: $0.id) }
+    private static func dynamicModelsFromStore(defaults: UserDefaults) -> [AIModel] {
+        CodexDynamicModelStore.modelOptions(defaults: defaults).map { .codexCustom(name: $0.id) }
     }
 
-    private static func backfilledRecommendedModels(primary: [AIModel], fallback: [AIModel]) -> [AIModel] {
-        guard shouldBackfillRecommendedModels(primary) else { return primary }
+    private static func backfilledRecommendedModels(
+        primary: [AIModel],
+        fallback: [AIModel],
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> [AIModel] {
+        guard shouldBackfillRecommendedModels(primary, capabilities: capabilities) else { return primary }
 
         var merged = primary
-        var seen = Set(primary.compactMap { codexOptionIdentity(for: $0) })
+        var seen = Set(primary.compactMap {
+            codexOptionIdentity(for: $0, capabilities: capabilities)
+        })
         for model in fallback {
-            guard let identity = codexOptionIdentity(for: model) else { continue }
+            guard let identity = codexOptionIdentity(for: model, capabilities: capabilities) else { continue }
             if seen.insert(identity).inserted {
                 merged.append(model)
             }
@@ -438,8 +518,13 @@ enum CodexAIModelCatalog {
         return merged
     }
 
-    private static func shouldBackfillRecommendedModels(_ models: [AIModel]) -> Bool {
-        let identities = Set(models.compactMap { codexOptionIdentity(for: $0) })
+    private static func shouldBackfillRecommendedModels(
+        _ models: [AIModel],
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> Bool {
+        let identities = Set(models.compactMap {
+            codexOptionIdentity(for: $0, capabilities: capabilities)
+        })
         let requiredIdentityGroups: [[String]] = [
             ["gpt-5.6-sol-low"],
             ["gpt-5.6-sol-medium"],
@@ -451,22 +536,32 @@ enum CodexAIModelCatalog {
         }
     }
 
-    private static func codexOptionIdentity(for model: AIModel) -> String? {
+    private static func codexOptionIdentity(
+        for model: AIModel,
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> String? {
         switch model {
         case let .codexCustom(name):
             let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return normalized.isEmpty ? nil : canonicalCodexOptionIdentity(normalized)
+            return normalized.isEmpty
+                ? nil
+                : canonicalCodexOptionIdentity(normalized, capabilities: capabilities)
         default:
             let rawValue = model.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let prefix = "codex_cli_"
             guard rawValue.lowercased().hasPrefix(prefix) else { return nil }
             let identity = String(rawValue.dropFirst(prefix.count)).lowercased()
-            return identity.isEmpty ? nil : canonicalCodexOptionIdentity(identity)
+            return identity.isEmpty
+                ? nil
+                : canonicalCodexOptionIdentity(identity, capabilities: capabilities)
         }
     }
 
-    private static func canonicalCodexOptionIdentity(_ raw: String) -> String {
-        let specifier = CodexModelSpecifier(raw: raw)
+    private static func canonicalCodexOptionIdentity(
+        _ raw: String,
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> String {
+        let specifier = CodexModelSpecifier(raw: raw, capabilities: capabilities)
         guard let base = specifier.baseModel?.lowercased(), base == "gpt-5.6" else {
             return raw
         }
@@ -474,18 +569,22 @@ enum CodexAIModelCatalog {
         return "gpt-5.6-sol-\(effort.rawValue)"
     }
 
-    private static func synthesizedFastAIModels(from models: [AIModel]) -> [AIModel] {
+    private static func synthesizedFastAIModels(
+        from models: [AIModel],
+        capabilities: CodexModelCapabilitySnapshot
+    ) -> [AIModel] {
         var synthesized: [AIModel] = []
         var seen = Set(models.map { $0.modelName.lowercased() })
 
         for model in models {
             guard case let .codexCustom(name) = model else { continue }
-            let specifier = CodexModelSpecifier(raw: name)
+            let specifier = CodexModelSpecifier(raw: name, capabilities: capabilities)
             guard specifier.serviceTier == nil,
                   let baseModel = specifier.baseModel,
                   let fastID = CodexServiceTierVariantCatalog.fastVariantID(
                       baseModelID: baseModel,
-                      reasoningEffort: specifier.reasoningEffort
+                      reasoningEffort: specifier.reasoningEffort,
+                      capabilities: capabilities
                   ) else { continue }
             guard seen.insert(fastID.lowercased()).inserted else { continue }
             synthesized.append(.codexCustom(name: fastID))
