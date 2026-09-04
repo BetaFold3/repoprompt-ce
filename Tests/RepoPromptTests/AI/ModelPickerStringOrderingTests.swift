@@ -39,6 +39,37 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         ])
     }
 
+    func testConfiguredAstraUsesTrustedDisplayOrderingAndStaticSolFallback() throws {
+        let registry = OpenAIAPIModelMetadataRegistry.shared
+        let previousRows = registry.rows
+        try registry.resetForTesting(rows: OpenAIAPIModelMetadataBaseline.decode().document.models)
+        defer { registry.resetForTesting(rows: previousRows) }
+
+        func configured(
+            id: String,
+            effort: CodexReasoningEffort
+        ) throws -> AIModel {
+            let selection = try XCTUnwrap(OpenAIConfiguredModelSelection(
+                modelID: id,
+                reasoningMode: .standard,
+                reasoningEffort: effort,
+                supportsStreaming: true
+            ))
+            return .openAIConfigured(selection: selection)
+        }
+
+        let astraHigh = try configured(id: "gpt-6-astra", effort: .high)
+        let astraLow = try configured(id: "gpt-6-astra", effort: .low)
+        let solHigh = try configured(id: "gpt-5.6-sol", effort: .high)
+
+        XCTAssertEqual(astraHigh.displayName, "GPT-6 Astra · Standard · High")
+        XCTAssertEqual(solHigh.displayName, "GPT-5.6 Sol · Standard · High")
+        XCTAssertEqual(
+            AIModel.sortedForPicker([solHigh, astraHigh, astraLow]),
+            [astraLow, astraHigh, solHigh]
+        )
+    }
+
     func testSemanticOrderingUsesFamilyBeforeDisplayNameAcrossFamilies() {
         let sorted = AIModel.sortedForPicker([
             .customProvider(name: "Aardvark", provider: "custom", model: "zzz-1"),

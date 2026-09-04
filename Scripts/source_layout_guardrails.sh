@@ -369,6 +369,7 @@ allowed_tracked_docs=(
   "docs/context/archive/2026-07-30-CLAUDE.md"
   "docs/context/archive/MANIFEST.md"
   "docs/context/claude-model-family-catalog.md"
+  "docs/context/gpt-model-catalog.md"
   "docs/context/plans/completed/2026-08-29-transcript-preview-deeplink-plan.md"
   "docs/context/plans/completed/2026-09-02-fable-5-1-dynamic-model-catalog-plan.md"
   "docs/context/plans/completed/quick-model-picker-and-handoff-hud.md"

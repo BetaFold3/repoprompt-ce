@@ -21,6 +21,11 @@ enum OpenAIAPIReasoningEffort: String, CaseIterable {
     case max
 }
 
+enum OpenAIAPIServiceTier: String, CaseIterable {
+    case flex
+    case priority
+}
+
 struct OpenAIAPIReasoningMetadata: Equatable {
     let modes: [OpenAIAPIReasoningMode]
     let efforts: [OpenAIAPIReasoningEffort]
@@ -39,6 +44,7 @@ struct OpenAIAPIModelMetadata: Equatable {
     let reasoning: OpenAIAPIReasoningMetadata?
     let supportsStreaming: Bool
     let tokens: OpenAIAPITokenMetadata?
+    let serviceTiers: [OpenAIAPIServiceTier]
 
     fileprivate init(
         id: String,
@@ -46,7 +52,8 @@ struct OpenAIAPIModelMetadata: Equatable {
         protocols: [OpenAIAPIModelProtocol],
         reasoning: OpenAIAPIReasoningMetadata?,
         supportsStreaming: Bool,
-        tokens: OpenAIAPITokenMetadata?
+        tokens: OpenAIAPITokenMetadata?,
+        serviceTiers: [OpenAIAPIServiceTier]
     ) {
         self.id = id
         self.displayName = displayName
@@ -54,14 +61,44 @@ struct OpenAIAPIModelMetadata: Equatable {
         self.reasoning = reasoning
         self.supportsStreaming = supportsStreaming
         self.tokens = tokens
+        self.serviceTiers = serviceTiers
     }
 }
 
 struct OpenAIAPIModelMetadataDocument: Equatable {
-    static let currentSchemaVersion = 1
+    static let currentSchemaVersion = 2
 
     let schemaVersion: Int
     let models: [OpenAIAPIModelMetadata]
+    let disabledModelIDs: [String]
+}
+
+enum OpenAIAPIModelMetadataRowRejectionReason: String, Error, Equatable {
+    case notAnObject
+    case invalidModelID
+    case invalidProtocols
+    case invalidDisplayName
+    case invalidReasoning
+    case invalidStreaming
+    case invalidTokens
+    case invalidServiceTiers
+}
+
+struct OpenAIAPIModelMetadataRejectedRow: Equatable {
+    let index: Int
+    let modelID: String?
+    let reason: OpenAIAPIModelMetadataRowRejectionReason
+}
+
+struct OpenAIAPIModelMetadataDuplicateWarning: Equatable {
+    let index: Int
+    let modelID: String
+}
+
+struct OpenAIAPIModelMetadataDecodeReport: Equatable {
+    let document: OpenAIAPIModelMetadataDocument
+    let rejectedRows: [OpenAIAPIModelMetadataRejectedRow]
+    let duplicateWarnings: [OpenAIAPIModelMetadataDuplicateWarning]
 }
 
 enum OpenAIAPIModelMetadataError: Error, Equatable {
@@ -78,16 +115,30 @@ enum OpenAIAPIModelMetadataDecoder {
     static let maximumDocumentByteCount = 1_048_576
     static let maximumModelCount = 2048
 
-    private static let rootKeys: Set<String> = ["schema_version", "models"]
-    private static let modelKeys: Set<String> = [
+    private static let versionOneRootKeys: Set<String> = ["schema_version", "models"]
+    private static let versionTwoRootKeys: Set<String> = [
+        "schema_version", "models", "disabled_model_ids"
+    ]
+    private static let versionOneModelKeys: Set<String> = [
         "id", "display_name", "protocols", "reasoning", "streaming", "tokens"
     ]
+    private static let versionTwoModelKeys = versionOneModelKeys.union(["service_tiers"])
     private static let reasoningKeys: Set<String> = ["modes", "efforts"]
     private static let tokenKeys: Set<String> = [
         "context_window_tokens", "max_input_tokens", "max_output_tokens"
     ]
 
     static func decode(contentsOf fileURL: URL) throws -> OpenAIAPIModelMetadataDocument {
+        try decodeWithReport(contentsOf: fileURL).document
+    }
+
+    static func decode(_ data: Data) throws -> OpenAIAPIModelMetadataDocument {
+        try decodeWithReport(data).document
+    }
+
+    static func decodeWithReport(
+        contentsOf fileURL: URL
+    ) throws -> OpenAIAPIModelMetadataDecodeReport {
         guard fileURL.isFileURL else { throw OpenAIAPIModelMetadataError.unreadable }
         if let fileSize = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize,
            fileSize > maximumDocumentByteCount
@@ -97,10 +148,10 @@ enum OpenAIAPIModelMetadataDecoder {
         guard let data = try? Data(contentsOf: fileURL, options: [.mappedIfSafe]) else {
             throw OpenAIAPIModelMetadataError.unreadable
         }
-        return try decode(data)
+        return try decodeWithReport(data)
     }
 
-    static func decode(_ data: Data) throws -> OpenAIAPIModelMetadataDocument {
+    static func decodeWithReport(_ data: Data) throws -> OpenAIAPIModelMetadataDecodeReport {
         guard data.count <= maximumDocumentByteCount else {
             throw OpenAIAPIModelMetadataError.documentTooLarge
         }
@@ -111,86 +162,167 @@ enum OpenAIAPIModelMetadataDecoder {
         } catch {
             throw OpenAIAPIModelMetadataError.malformedJSON
         }
-        guard let root = value as? [String: Any] else {
+        guard let root = value as? [String: Any],
+              let schemaVersion = exactPositiveInteger(root["schema_version"])
+        else {
             throw OpenAIAPIModelMetadataError.invalidDocument
+        }
+
+        let rootKeys: Set<String>
+        let modelKeys: Set<String>
+        switch schemaVersion {
+        case 1:
+            rootKeys = versionOneRootKeys
+            modelKeys = versionOneModelKeys
+        case 2:
+            rootKeys = versionTwoRootKeys
+            modelKeys = versionTwoModelKeys
+        default:
+            throw OpenAIAPIModelMetadataError.unsupportedSchemaVersion(schemaVersion)
         }
         try rejectUnknownKeys(in: root, allowed: rootKeys, path: "$")
 
-        guard let schemaVersion = exactPositiveInteger(root["schema_version"]) else {
+        guard let rawModels = root["models"] as? [Any],
+              rawModels.count <= maximumModelCount
+        else {
             throw OpenAIAPIModelMetadataError.invalidDocument
         }
-        guard schemaVersion == OpenAIAPIModelMetadataDocument.currentSchemaVersion else {
-            throw OpenAIAPIModelMetadataError.unsupportedSchemaVersion(schemaVersion)
+        let disabledModelIDs = try parseDisabledModelIDs(root, schemaVersion: schemaVersion)
+
+        var seen = Set<String>()
+        var models: [OpenAIAPIModelMetadata] = []
+        var rejectedRows: [OpenAIAPIModelMetadataRejectedRow] = []
+        var duplicateWarnings: [OpenAIAPIModelMetadataDuplicateWarning] = []
+
+        for (index, rawModel) in rawModels.enumerated() {
+            guard let dictionary = rawModel as? [String: Any] else {
+                rejectedRows.append(.init(index: index, modelID: nil, reason: .notAnObject))
+                continue
+            }
+            try rejectUnknownKeys(in: dictionary, allowed: modelKeys, path: "models[\(index)]")
+            try rejectUnknownNestedKeys(in: dictionary, index: index)
+
+            switch parseModel(dictionary, schemaVersion: schemaVersion) {
+            case let .success(model):
+                guard seen.insert(model.id).inserted else {
+                    duplicateWarnings.append(.init(index: index, modelID: model.id))
+                    continue
+                }
+                models.append(model)
+            case let .failure(reason):
+                rejectedRows.append(.init(
+                    index: index,
+                    modelID: normalizedModelID(dictionary["id"]),
+                    reason: reason
+                ))
+            }
         }
-        guard let rawModels = root["models"] as? [Any], rawModels.count <= maximumModelCount else {
+
+        if schemaVersion == 1, models.isEmpty {
+            throw OpenAIAPIModelMetadataError.noValidModels
+        }
+        if schemaVersion == 2, models.isEmpty, !rawModels.isEmpty,
+           rejectedRows.count == rawModels.count
+        {
+            throw OpenAIAPIModelMetadataError.noValidModels
+        }
+
+        return OpenAIAPIModelMetadataDecodeReport(
+            document: OpenAIAPIModelMetadataDocument(
+                schemaVersion: schemaVersion,
+                models: models,
+                disabledModelIDs: disabledModelIDs
+            ),
+            rejectedRows: rejectedRows,
+            duplicateWarnings: duplicateWarnings
+        )
+    }
+
+    private static func parseDisabledModelIDs(
+        _ root: [String: Any],
+        schemaVersion: Int
+    ) throws -> [String] {
+        guard schemaVersion == 2 else { return [] }
+        guard root.keys.contains("disabled_model_ids") else { return [] }
+        guard let values = root["disabled_model_ids"] as? [Any],
+              values.count <= maximumModelCount
+        else {
             throw OpenAIAPIModelMetadataError.invalidDocument
         }
 
         var seen = Set<String>()
-        var models: [OpenAIAPIModelMetadata] = []
-        for (index, rawModel) in rawModels.enumerated() {
-            guard let dictionary = rawModel as? [String: Any] else { continue }
-            try rejectUnknownKeys(
-                in: dictionary,
-                allowed: modelKeys,
-                path: "models[\(index)]"
-            )
-            guard let model = try parseModel(dictionary, index: index),
-                  seen.insert(model.id).inserted
-            else {
-                continue
+        var result: [String] = []
+        for value in values {
+            guard let id = normalizedModelID(value) else {
+                throw OpenAIAPIModelMetadataError.invalidDocument
             }
-            models.append(model)
+            if seen.insert(id).inserted {
+                result.append(id)
+            }
         }
+        return result
+    }
 
-        guard !models.isEmpty else {
-            throw OpenAIAPIModelMetadataError.noValidModels
+    private static func rejectUnknownNestedKeys(
+        in dictionary: [String: Any],
+        index: Int
+    ) throws {
+        if let reasoning = dictionary["reasoning"] as? [String: Any] {
+            try rejectUnknownKeys(
+                in: reasoning,
+                allowed: reasoningKeys,
+                path: "models[\(index)].reasoning"
+            )
         }
-        return OpenAIAPIModelMetadataDocument(schemaVersion: schemaVersion, models: models)
+        if let tokens = dictionary["tokens"] as? [String: Any] {
+            try rejectUnknownKeys(
+                in: tokens,
+                allowed: tokenKeys,
+                path: "models[\(index)].tokens"
+            )
+        }
     }
 
     private static func parseModel(
         _ dictionary: [String: Any],
-        index: Int
-    ) throws -> OpenAIAPIModelMetadata? {
-        guard let id = normalizedModelID(dictionary["id"]),
-              let protocols = enumArray(dictionary["protocols"], as: OpenAIAPIModelProtocol.self),
-              !protocols.isEmpty,
-              let supportsStreaming = exactBool(dictionary["streaming"])
-        else {
-            return nil
+        schemaVersion: Int
+    ) -> Result<OpenAIAPIModelMetadata, OpenAIAPIModelMetadataRowRejectionReason> {
+        guard let id = normalizedModelID(dictionary["id"]) else {
+            return .failure(.invalidModelID)
+        }
+        guard let protocols = enumArray(
+            dictionary["protocols"],
+            as: OpenAIAPIModelProtocol.self
+        ), !protocols.isEmpty else {
+            return .failure(.invalidProtocols)
+        }
+        guard let supportsStreaming = exactBool(dictionary["streaming"]) else {
+            return .failure(.invalidStreaming)
         }
 
         let displayName: String
         if dictionary.keys.contains("display_name") {
-            guard let normalizedDisplayName = normalizedDisplayName(dictionary["display_name"]) else {
-                return nil
+            guard let normalized = normalizedDisplayName(dictionary["display_name"]) else {
+                return .failure(.invalidDisplayName)
             }
-            displayName = normalizedDisplayName
+            displayName = normalized
         } else {
             displayName = id
         }
 
         let reasoning: OpenAIAPIReasoningMetadata?
         if let rawReasoning = dictionary["reasoning"] {
-            guard let reasoningDictionary = rawReasoning as? [String: Any] else { return nil }
-            try rejectUnknownKeys(
-                in: reasoningDictionary,
-                allowed: reasoningKeys,
-                path: "models[\(index)].reasoning"
-            )
-            guard let modes = enumArray(
-                reasoningDictionary["modes"],
-                as: OpenAIAPIReasoningMode.self
-            ),
-                !modes.isEmpty,
-                let efforts = enumArray(
-                    reasoningDictionary["efforts"],
-                    as: OpenAIAPIReasoningEffort.self
-                ),
-                !efforts.isEmpty
+            guard let reasoningDictionary = rawReasoning as? [String: Any],
+                  let modes = enumArray(
+                      reasoningDictionary["modes"],
+                      as: OpenAIAPIReasoningMode.self
+                  ), !modes.isEmpty,
+                  let efforts = enumArray(
+                      reasoningDictionary["efforts"],
+                      as: OpenAIAPIReasoningEffort.self
+                  ), !efforts.isEmpty
             else {
-                return nil
+                return .failure(.invalidReasoning)
             }
             reasoning = OpenAIAPIReasoningMetadata(modes: modes, efforts: efforts)
         } else {
@@ -199,15 +331,12 @@ enum OpenAIAPIModelMetadataDecoder {
 
         let tokens: OpenAIAPITokenMetadata?
         if let rawTokens = dictionary["tokens"] {
-            guard let tokenDictionary = rawTokens as? [String: Any] else { return nil }
-            try rejectUnknownKeys(
-                in: tokenDictionary,
-                allowed: tokenKeys,
-                path: "models[\(index)].tokens"
-            )
-            guard let contextWindow = exactPositiveInteger(tokenDictionary["context_window_tokens"])
+            guard let tokenDictionary = rawTokens as? [String: Any],
+                  let contextWindow = exactPositiveInteger(
+                      tokenDictionary["context_window_tokens"]
+                  )
             else {
-                return nil
+                return .failure(.invalidTokens)
             }
             let maxInput = optionalPositiveInteger(tokenDictionary, key: "max_input_tokens")
             let maxOutput = optionalPositiveInteger(tokenDictionary, key: "max_output_tokens")
@@ -221,7 +350,7 @@ enum OpenAIAPIModelMetadataDecoder {
                       contextWindow: contextWindow
                   )
             else {
-                return nil
+                return .failure(.invalidTokens)
             }
             tokens = OpenAIAPITokenMetadata(
                 contextWindowTokens: contextWindow,
@@ -232,14 +361,28 @@ enum OpenAIAPIModelMetadataDecoder {
             tokens = nil
         }
 
-        return OpenAIAPIModelMetadata(
+        let serviceTiers: [OpenAIAPIServiceTier]
+        if schemaVersion == 2, dictionary.keys.contains("service_tiers") {
+            guard let parsed = enumArray(
+                dictionary["service_tiers"],
+                as: OpenAIAPIServiceTier.self
+            ) else {
+                return .failure(.invalidServiceTiers)
+            }
+            serviceTiers = parsed
+        } else {
+            serviceTiers = []
+        }
+
+        return .success(OpenAIAPIModelMetadata(
             id: id,
             displayName: displayName,
             protocols: protocols,
             reasoning: reasoning,
             supportsStreaming: supportsStreaming,
-            tokens: tokens
-        )
+            tokens: tokens,
+            serviceTiers: serviceTiers
+        ))
     }
 
     private static func rejectUnknownKeys(
@@ -275,7 +418,9 @@ enum OpenAIAPIModelMetadataDecoder {
         guard let rawValue = value as? String else { return nil }
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty, normalized.utf8.count <= 256 else { return nil }
-        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/-")
+        let allowed = CharacterSet(
+            charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/-"
+        )
         guard normalized.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
         return normalized
     }
@@ -311,8 +456,7 @@ enum OpenAIAPIModelMetadataDecoder {
         guard doubleValue.isFinite,
               doubleValue > 0,
               doubleValue.rounded(.towardZero) == doubleValue,
-              // Double(Int.max) rounds up to an out-of-range boundary on 64-bit platforms.
-              // Keep the comparison strict so the conversion below cannot trap.
+              // Keep this strict: Double(Int.max) rounds to 2^63 and Int conversion would trap.
               doubleValue < Double(Int.max)
         else {
             return nil

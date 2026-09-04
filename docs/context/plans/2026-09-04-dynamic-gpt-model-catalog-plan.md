@@ -4,8 +4,10 @@ Scope: read when the task touches OpenAI direct-API model discovery or trusted c
 Authority: Authoritative
 Last-verified: 2026-09-04
 
-Status: **Plan only — not implemented.**
+Status: **Partial implementation — Phase 0 and PR 1 implemented; PR 2 and PR 3 pending.**
 Date: 2026-09-04
+
+PR 1 outcome (2026-09-04): adopted §3.1 Position 1 whole-wire-ID static ownership and implemented the embedded schema-v2 baseline with v1 compatibility, local override resolution, registry-backed names, trusted official-host projection, and live-session static filtering. The remaining PR 2 and PR 3 sections below are still planning history.
 
 Provenance: drafted from two independent Oracle plan consultations (presets OracleE and OracleD, identical initial prompts, preset identity verified via `model_preset_id` on every turn), followed by two rounds of anonymous cross-challenge on the material disagreements. Every load-bearing code claim below was verified against live source in this session at the cited lines; two facts (Codex app-server tier fields, app-target packaging) were discovered during verification and were not available to either lane's first draft.
 

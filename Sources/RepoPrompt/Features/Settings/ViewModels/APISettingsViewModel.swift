@@ -1453,6 +1453,8 @@ public class APISettingsViewModel: ObservableObject {
     private let claudeFamilyModelAvailabilityRefreshBoundary: (@MainActor @Sendable () async -> Void)?
     private let codexModelPollingService: CodexModelPollingService
     private let apiModelCatalog: APIModelCatalog
+    private let openAIModelMetadataResolver: OpenAIAPIModelMetadataResolver
+    private let openAIModelMetadataRegistry: OpenAIAPIModelMetadataRegistry
     private let anthropicDiscoveredModelStore: AnthropicDiscoveredModelStore
     private let anthropicModelsLoader: @Sendable (String) async throws -> [AnthropicDiscoveredModel]
     private let anthropicKeyValidationOperation: @Sendable (String) async throws -> Bool
@@ -1463,6 +1465,8 @@ public class APISettingsViewModel: ObservableObject {
     private var anthropicModelRefreshIdentityScope: APIModelCatalogScope?
     private var anthropicModelRefreshEpoch: UInt64 = 0
     private var activeOpenAIModelCatalogScope: APIModelCatalogScope?
+    private var openAIModelLiveRefreshScope: APIModelCatalogScope?
+    private var resolvedOpenAIModelMetadata: [OpenAIAPIModelMetadata] = []
     private var hasPreparedForWindowClose = false
 
     init(
@@ -1471,6 +1475,8 @@ public class APISettingsViewModel: ObservableObject {
         loadStoredDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared,
         apiModelCatalog: APIModelCatalog? = nil,
+        openAIModelMetadataResolver: OpenAIAPIModelMetadataResolver? = nil,
+        openAIModelMetadataRegistry: OpenAIAPIModelMetadataRegistry = .shared,
         cliExecutableOverrideDefaults: UserDefaults = .standard,
         claudeExecutableDraftValidator: ((String) async -> ClaudeExecutableDraftAssessment)? = nil,
         claudeExecutableProbeOperation: ((CLIProcessConfiguration, TimeInterval) async -> ClaudeExecutableProbeOutcome)? = nil,
@@ -1500,6 +1506,9 @@ public class APISettingsViewModel: ObservableObject {
         self.claudeFamilyModelAvailabilityRefreshBoundary = claudeFamilyModelAvailabilityRefreshBoundary
         self.codexModelPollingService = codexModelPollingService
         self.apiModelCatalog = apiModelCatalog ?? Self.makeDefaultAPIModelCatalog()
+        self.openAIModelMetadataResolver = openAIModelMetadataResolver
+            ?? Self.makeDefaultOpenAIModelMetadataResolver()
+        self.openAIModelMetadataRegistry = openAIModelMetadataRegistry
         self.anthropicDiscoveredModelStore = anthropicDiscoveredModelStore
         self.anthropicModelsLoader = anthropicModelsLoader ?? { apiKey in
             try await AnthropicAPIModelsClient(apiKey: apiKey).fetchModels()
@@ -2046,7 +2055,7 @@ public class APISettingsViewModel: ObservableObject {
         } else {
             invalidateAnthropicModelRefreshIdentity()
         }
-        if isOpenAIKeyValid { startOpenAIModelsRefresh() }
+        startOpenAIModelsRefresh()
         if isDeepSeekKeyValid { deepSeekModelsTask = Task { await self.updateDeepSeekModels() } }
         if isFireworksKeyValid { fireworksModelsTask = Task { await self.updateFireworksModels() } }
         if isGrokKeyValid { grokModelsTask = Task { await self.updateGrokModels() } }
@@ -2237,15 +2246,22 @@ public class APISettingsViewModel: ObservableObject {
         }
 
         if isOpenAIKeyValid {
-            modelSet.formUnion(AIModel.modelsForProvider(.openAI))
-            modelSet.formUnion(configuredOpenAIModels(from: availableOpenAIModelMetadata))
-            if !openAICustomModel.isEmpty {
-                if shouldUseResponsesRoutingForOpenAICustomModel {
-                    modelSet.formUnion(AIModel.openAICustomResponsesVariants(for: openAICustomModel))
-                } else {
-                    modelSet.insert(.openaiCustom(name: openAICustomModel))
-                }
-            }
+            let isOfficialHost = shouldUseResponsesRoutingForOpenAICustomModel
+            let staticModels = Set(AIModel.modelsForProvider(.openAI))
+            modelSet.formUnion(OpenAIConfiguredModelProjection.staticModels(
+                staticModels,
+                visibleModelIDs: availableOpenAIModels,
+                isOfficialOpenAIHost: isOfficialHost,
+                hasSuccessfulLiveRefresh: activeOpenAIModelCatalogScope != nil
+                    && openAIModelLiveRefreshScope == activeOpenAIModelCatalogScope
+            ))
+            modelSet.formUnion(OpenAIConfiguredModelProjection.models(
+                rows: resolvedOpenAIModelMetadata,
+                visibleModelIDs: availableOpenAIModels,
+                typedCustomModelID: openAICustomModel,
+                isOfficialOpenAIHost: isOfficialHost,
+                staticWireModelNames: AIModel.staticOpenAIWireModelNames
+            ))
 
             // Generate service tier variants for OpenAI Responses API models when enabled
             if openAIShowServiceTierVariants {
@@ -4309,6 +4325,7 @@ public class APISettingsViewModel: ObservableObject {
         openAIModelsTask?.cancel()
         openAIModelsTask = nil
         activeOpenAIModelCatalogScope = nil
+        openAIModelLiveRefreshScope = nil
         availableOpenAIModels = []
         availableOpenAIModelMetadata = []
         return scope
@@ -4461,8 +4478,10 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func updateOpenAIModels() async {
+        reloadOpenAIModelMetadata()
         guard isOpenAIKeyValid else {
             activeOpenAIModelCatalogScope = nil
+            openAIModelLiveRefreshScope = nil
             availableOpenAIModels = []
             availableOpenAIModelMetadata = []
             await updateAvailableModels()
@@ -4471,6 +4490,7 @@ public class APISettingsViewModel: ObservableObject {
 
         guard let request = openAIModelCatalogRequest(apiKey: openAIApiKey) else {
             activeOpenAIModelCatalogScope = nil
+            openAIModelLiveRefreshScope = nil
             availableOpenAIModels = []
             availableOpenAIModelMetadata = []
             await updateAvailableModels()
@@ -4480,6 +4500,7 @@ public class APISettingsViewModel: ObservableObject {
 
         if activeOpenAIModelCatalogScope != scope {
             activeOpenAIModelCatalogScope = scope
+            openAIModelLiveRefreshScope = nil
             availableOpenAIModels = []
             availableOpenAIModelMetadata = []
             await updateAvailableModels()
@@ -4488,7 +4509,7 @@ public class APISettingsViewModel: ObservableObject {
         let capturedBase = request.baseURL
         let capturedKey = openAIApiKey
         let capturedVersion = request.apiVersion
-        let snapshots = await apiModelCatalog.snapshots(for: scope) { _ in
+        let snapshots = await apiModelCatalog.snapshots(for: scope, payloadLoader: { [weak self] _ in
             let provider = CustomOpenAIProvider(
                 baseURL: capturedBase,
                 apiKey: capturedKey,
@@ -4496,8 +4517,14 @@ public class APISettingsViewModel: ObservableObject {
                 defaultTemperature: 0.7,
                 apiVersion: capturedVersion
             )
-            return try await provider.getAvailableModels()
-        }
+            let modelIDs = try await provider.getAvailableModels()
+            return APIModelCatalogRefreshPayload(
+                modelIDs: modelIDs,
+                acceptedCommit: { [weak self] in
+                    await self?.commitOpenAILiveRefresh(scope: scope, apiKey: capturedKey)
+                }
+            )
+        })
 
         for await snapshot in snapshots {
             guard !Task.isCancelled,
@@ -4507,50 +4534,39 @@ public class APISettingsViewModel: ObservableObject {
                 return
             }
             availableOpenAIModels = snapshot.modelIDs
-            availableOpenAIModelMetadata = OpenAIAPIModelCatalogMerge.merge(
-                visibleModelIDs: snapshot.modelIDs,
-                trustedMetadata: loadLocalOpenAIModelMetadata()
-            )
+            updateVisibleOpenAIModelMetadata()
+            await updateAvailableModels()
+        }
+
+        if openAIModelLiveRefreshScope == scope {
             await updateAvailableModels()
         }
     }
 
-    private func configuredOpenAIModels(
-        from metadata: [OpenAIAPIModelMetadata]
-    ) -> Set<AIModel> {
-        var models = Set<AIModel>()
-        for descriptor in metadata
-            where descriptor.id != AIModel.gpt56Sol.modelName
-            && descriptor.protocols.contains(.responses)
-        {
-            guard let reasoning = descriptor.reasoning else { continue }
-            for mode in reasoning.modes {
-                guard let reasoningMode = OpenAIReasoningMode(rawValue: mode.rawValue) else { continue }
-                for effort in reasoning.efforts {
-                    guard let reasoningEffort = CodexReasoningEffort(rawValue: effort.rawValue),
-                          let selection = OpenAIConfiguredModelSelection(
-                              modelID: descriptor.id,
-                              reasoningMode: reasoningMode,
-                              reasoningEffort: reasoningEffort,
-                              supportsStreaming: descriptor.supportsStreaming
-                          )
-                    else {
-                        continue
-                    }
-                    models.insert(.openAIConfigured(selection: selection))
-                }
-            }
+    private func commitOpenAILiveRefresh(scope: APIModelCatalogScope, apiKey: String) {
+        guard isOpenAIKeyValid,
+              activeOpenAIModelCatalogScope == scope,
+              openAIApiKey == apiKey
+        else {
+            return
         }
-        return models
+        openAIModelLiveRefreshScope = scope
     }
 
-    private func loadLocalOpenAIModelMetadata() -> [OpenAIAPIModelMetadata] {
-        guard let document = try? OpenAIAPIModelMetadataDecoder.decode(
-            contentsOf: Self.openAIModelMetadataFileURL
-        ) else {
-            return []
-        }
-        return document.models
+    private func reloadOpenAIModelMetadata() {
+        let resolution = openAIModelMetadataResolver.reloadFromFile()
+        resolvedOpenAIModelMetadata = resolution.rows
+        openAIModelMetadataRegistry.update(resolution: resolution)
+        updateVisibleOpenAIModelMetadata()
+    }
+
+    private func updateVisibleOpenAIModelMetadata() {
+        availableOpenAIModelMetadata = shouldUseResponsesRoutingForOpenAICustomModel
+            ? OpenAIAPIModelCatalogMerge.merge(
+                visibleModelIDs: availableOpenAIModels,
+                trustedMetadata: resolvedOpenAIModelMetadata
+            )
+            : []
     }
 
     private static func makeDefaultAPIModelCatalog() -> APIModelCatalog {
@@ -4575,6 +4591,17 @@ public class APISettingsViewModel: ObservableObject {
             "openai-model-metadata-v1.json",
             isDirectory: false
         )
+    }
+
+    private static func makeDefaultOpenAIModelMetadataResolver() -> OpenAIAPIModelMetadataResolver {
+        do {
+            return try OpenAIAPIModelMetadataResolver(
+                overrideFileURL: openAIModelMetadataFileURL,
+                staticModelIDs: AIModel.staticOpenAIWireModelNames
+            )
+        } catch {
+            preconditionFailure("Invalid built-in OpenAI model metadata: \(error)")
+        }
     }
 
     private func updateDeepSeekModels() async {

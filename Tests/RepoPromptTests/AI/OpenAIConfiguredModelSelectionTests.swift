@@ -299,6 +299,63 @@ final class OpenAIConfiguredModelSelectionTests: XCTestCase {
         }
     }
 
+    func testAstraRawRoundTripsAndEncodesEverySupportedEffortForStandardAndPro() throws {
+        let input = AIMessage(systemPrompt: "System", userMessage: "Hello").openAIResponsesInput()
+        let efforts: [CodexReasoningEffort] = [.low, .medium, .high, .xhigh, .max]
+
+        for mode in OpenAIReasoningMode.allCases {
+            for effort in efforts {
+                let selection = try XCTUnwrap(OpenAIConfiguredModelSelection(
+                    modelID: "gpt-6-astra",
+                    reasoningMode: mode,
+                    reasoningEffort: effort,
+                    supportsStreaming: true
+                ))
+                XCTAssertEqual(
+                    selection.rawValue,
+                    "openai_api_selection_v2__gpt-6-astra__\(mode.rawValue)__\(effort.rawValue)__streaming"
+                )
+                XCTAssertEqual(OpenAIConfiguredModelSelection(rawValue: selection.rawValue), selection)
+
+                let model = AIModel.openAIConfigured(selection: selection)
+                XCTAssertEqual(AIModel.fromModelName(model.rawValue), model)
+                let plan = OpenAIResponseRequestPlan.make(model: model, defaultServiceTier: nil)
+                let parameters = plan.parameters(
+                    input: input,
+                    instructions: "System",
+                    maxOutputTokens: 8192,
+                    delivery: .foreground
+                )
+                let body = try jsonObject(plan.encodedBody(for: parameters))
+                let reasoning = try XCTUnwrap(body["reasoning"] as? [String: Any])
+
+                XCTAssertEqual(body["model"] as? String, "gpt-6-astra")
+                XCTAssertEqual(reasoning["effort"] as? String, effort.rawValue)
+                if mode == .pro {
+                    XCTAssertEqual(reasoning["mode"] as? String, "pro")
+                } else {
+                    XCTAssertNil(reasoning["mode"])
+                }
+                XCTAssertNil(body["temperature"])
+                XCTAssertNil(body["top_p"])
+                XCTAssertEqual(body["max_output_tokens"] as? Int, 8192)
+            }
+        }
+    }
+
+    func testWithdrawnConfiguredRawSelectionStillDecodes() throws {
+        let raw = "openai_api_selection_v2__gpt-6-withdrawn__pro__max__completion"
+        let selection = try XCTUnwrap(OpenAIConfiguredModelSelection(rawValue: raw))
+        let model = try XCTUnwrap(AIModel.fromModelName(raw))
+
+        XCTAssertEqual(selection.modelID, "gpt-6-withdrawn")
+        XCTAssertEqual(selection.reasoningMode, .pro)
+        XCTAssertEqual(selection.reasoningEffort, .max)
+        XCTAssertEqual(selection.supportsStreaming, false)
+        XCTAssertEqual(model, .openAIConfigured(selection: selection))
+        XCTAssertEqual(model.rawValue, raw)
+    }
+
     func testHistoricalProModelIDsRemainLiteralWireModels() {
         let cases: [(AIModel, String)] = [
             (.gpt5Pro, "gpt-5.2-pro"),

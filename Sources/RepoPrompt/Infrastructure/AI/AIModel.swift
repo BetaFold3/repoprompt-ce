@@ -470,6 +470,24 @@ public enum AIModel: Equatable, Hashable {
         return groups
     }()
 
+    static func staticOpenAIRequestWireModelID(for model: AIModel) -> String {
+        OpenAIResponseRequestPlan.make(model: model, defaultServiceTier: nil).modelID
+    }
+
+    static let staticOpenAIWireModelNames = Set(
+        modelGroups[ProviderIndex.openAI].map(staticOpenAIRequestWireModelID(for:))
+    )
+
+    private static func openAIConfiguredBaseDisplayName(for modelID: String) -> String {
+        if let trustedName = OpenAIAPIModelMetadataRegistry.shared.displayName(for: modelID) {
+            return trustedName
+        }
+        return baseModelDefinitions.first {
+            $0.provider == ProviderIndex.openAI
+                && ($0.actualName ?? $0.rawValue) == modelID
+        }?.displayName ?? modelID
+    }
+
     // MARK: - Service Tier Variant Helpers
 
     private static let openAITierPrefix = "openai_tier__"
@@ -574,9 +592,7 @@ public enum AIModel: Equatable, Hashable {
         if case let .openaiCustomResponses(n) = self { return "\(n)" }
         if case let .openaiCustomReasoning(n, effort) = self { return "\(n) \(effort.displayName)" }
         if case let .openAIConfigured(selection) = self {
-            let name = selection.modelID == AIModel.gpt56Sol.modelName
-                ? "GPT-5.6 Sol"
-                : selection.modelID
+            let name = Self.openAIConfiguredBaseDisplayName(for: selection.modelID)
             return "\(name) · \(selection.reasoningMode.displayName) · \(selection.reasoningEffort.displayName)"
         }
         if case let .claudeCodeModel(specifier) = self { return ClaudeCodeAIModelCatalog.displayName(for: specifier) }
@@ -1750,7 +1766,13 @@ public enum AIModel: Equatable, Hashable {
     }
 
     private static func semanticSortMetadata(for model: AIModel) -> SemanticSortMetadata {
-        let identifier = model.providerType == .codex ? codexBaseModelID(for: model) : model.modelName
+        let identifier = if model.providerType == .codex {
+            codexBaseModelID(for: model)
+        } else if case let .openAIConfigured(selection) = model {
+            openAIConfiguredBaseDisplayName(for: selection.modelID)
+        } else {
+            model.modelName
+        }
         let reasoningEffort = codexReasoningEffort(for: model)
             ?? reasoningEffort(in: model.modelName)
             ?? reasoningEffort(in: model.displayName)
