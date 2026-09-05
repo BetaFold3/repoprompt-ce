@@ -105,6 +105,30 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    private var codexModelCatalogCaption: String? {
+        guard let status = viewModel.codexModelCatalogStatus else { return nil }
+
+        let base: String
+        if let fetchedAt = status.fetchedAt {
+            let time = DateFormatter.localizedString(
+                from: fetchedAt,
+                dateStyle: .none,
+                timeStyle: .short
+            )
+            if status.modelCount == 0 {
+                base = "Codex reported 0 models at \(time) · \(status.knownBaseCount) known bases"
+            } else {
+                let noun = status.modelCount == 1 ? "model" : "models"
+                base = "\(status.modelCount) \(noun) from Codex app-server · \(time) · \(status.knownBaseCount) known bases"
+            }
+        } else {
+            base = "No successful Codex model poll · \(status.knownBaseCount) known bases"
+        }
+
+        guard let error = status.lastPollError, !error.isEmpty else { return base }
+        return "\(base) · Last poll error: \(error)"
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -1810,6 +1834,13 @@ struct CLIProvidersSettingsView: View {
                        !resolvedExecutable.isEmpty
                     {
                         Text("Using `\(resolvedExecutable)`")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if let codexModelCatalogCaption {
+                        Text(codexModelCatalogCaption)
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

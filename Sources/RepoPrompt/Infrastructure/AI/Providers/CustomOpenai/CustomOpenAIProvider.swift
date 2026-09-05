@@ -88,6 +88,29 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
             let description: String?
             let summary: String?
             let tags: [String]?
+            let shutdown_date: TimeInterval?
+
+            private enum CodingKeys: String, CodingKey {
+                case id, name, friendly_name, model_version, publisher, model_family
+                case model_registry, license, task, description, summary, tags, shutdown_date
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                id = try container.decode(String.self, forKey: .id)
+                name = try container.decodeIfPresent(String.self, forKey: .name)
+                friendly_name = try container.decodeIfPresent(String.self, forKey: .friendly_name)
+                model_version = try container.decodeIfPresent(Int.self, forKey: .model_version)
+                publisher = try container.decodeIfPresent(String.self, forKey: .publisher)
+                model_family = try container.decodeIfPresent(String.self, forKey: .model_family)
+                model_registry = try container.decodeIfPresent(String.self, forKey: .model_registry)
+                license = try container.decodeIfPresent(String.self, forKey: .license)
+                task = try container.decodeIfPresent(String.self, forKey: .task)
+                description = try container.decodeIfPresent(String.self, forKey: .description)
+                summary = try container.decodeIfPresent(String.self, forKey: .summary)
+                tags = try container.decodeIfPresent([String].self, forKey: .tags)
+                shutdown_date = try? container.decodeIfPresent(TimeInterval.self, forKey: .shutdown_date)
+            }
         }
 
         let data: [Model]?
@@ -353,7 +376,21 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
         throw lastError ?? CustomOpenAIProviderError.serverError(message: "Retry failed after \(maxAttempts) attempts")
     }
 
+    func getAvailableModelDescriptors() async throws -> [APIModelCatalogModelDescriptor] {
+        let models = try await fetchAvailableModels()
+        return models.map { model in
+            APIModelCatalogModelDescriptor(
+                id: model.id,
+                shutdownDate: model.shutdown_date.map(Date.init(timeIntervalSince1970:))
+            )
+        }
+    }
+
     func getAvailableModels() async throws -> [String] {
+        try await fetchAvailableModels().map(\.id)
+    }
+
+    private func fetchAvailableModels() async throws -> [ModelsResponse.Model] {
         guard let url = urlFor(path: "models") else {
             throw CustomOpenAIProviderError.invalidResponse(message: "Invalid base URL: \(baseURL)")
         }
@@ -373,7 +410,7 @@ class CustomOpenAIProvider: AIProvider, AIModelGetter {
 
         do {
             let modelsResponse = try await HTTPDecoding.decode(ModelsResponse.self, from: response.data)
-            return modelsResponse.allModels.map(\.id)
+            return modelsResponse.allModels
         } catch {
             throw CustomOpenAIProviderError.invalidResponse(
                 message: "Failed to decode models: \(error)"

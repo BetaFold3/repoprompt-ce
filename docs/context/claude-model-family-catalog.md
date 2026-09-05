@@ -17,6 +17,8 @@ Keep these authorities separate:
 
 The in-repo `RepoPromptClaudeCompatibleProvider` package remains the static Claude-compatible catalog and runtime seam. Dynamic registry, grammar, persistence, and request shaping are app-core concerns. The overlay never extends GLM, Kimi, or custom Claude-compatible backend catalogs.
 
+For direct OpenAI configured-model authority, service-tier gating, catalog observability, and Codex dynamic-model rules, use the separate [GPT model catalog](gpt-model-catalog.md); those rules do not apply to Claude-family projection.
+
 ## Strict family grammar
 
 The curated anchors are `claude-fable-5`, `claude-opus-5`, and `claude-sonnet-5`. An anchor identifies a family; a dynamic point release must match:

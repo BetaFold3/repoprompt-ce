@@ -226,6 +226,125 @@ final class OpenAIConfiguredModelProjectionTests: XCTestCase {
         XCTAssertEqual(projected, statics)
     }
 
+    func testProjectedMetadataRowCountExcludesResolvedButNonVisibleRows() throws {
+        let rows = try metadataRows(
+            """
+            {"schema_version":2,"models":[
+              {"id":"visible","protocols":["responses"],"reasoning":{"modes":["standard"],"efforts":["medium"]},"streaming":true},
+              {"id":"resolved-not-visible","protocols":["responses"],"reasoning":{"modes":["standard"],"efforts":["medium"]},"streaming":true}
+            ]}
+            """
+        )
+
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(OpenAIConfiguredModelProjection.projectedMetadataRowCount(
+            rows: rows,
+            visibleModelIDs: ["visible"],
+            typedCustomModelID: nil,
+            isOfficialOpenAIHost: true,
+            staticWireModelNames: []
+        ), 1)
+        XCTAssertEqual(OpenAIConfiguredModelProjection.projectedMetadataRowCount(
+            rows: rows,
+            visibleModelIDs: ["visible"],
+            typedCustomModelID: nil,
+            isOfficialOpenAIHost: false,
+            staticWireModelNames: []
+        ), 0)
+    }
+
+    func testProjectedMetadataRowCountUsesTypedTrustedProjectionSemantics() throws {
+        let rows = try astraRows()
+
+        XCTAssertEqual(OpenAIConfiguredModelProjection.projectedMetadataRowCount(
+            rows: rows,
+            visibleModelIDs: [],
+            typedCustomModelID: "gpt-6-astra",
+            isOfficialOpenAIHost: true,
+            staticWireModelNames: []
+        ), 1)
+        XCTAssertEqual(OpenAIConfiguredModelProjection.projectedMetadataRowCount(
+            rows: rows,
+            visibleModelIDs: [],
+            typedCustomModelID: "unknown-model",
+            isOfficialOpenAIHost: true,
+            staticWireModelNames: []
+        ), 0)
+        XCTAssertEqual(OpenAIConfiguredModelProjection.projectedMetadataRowCount(
+            rows: rows,
+            visibleModelIDs: [],
+            typedCustomModelID: "gpt-6-astra",
+            isOfficialOpenAIHost: false,
+            staticWireModelNames: []
+        ), 0)
+    }
+
+    func testLegacyTierVariantsStructurallyExcludeConfiguredModels() throws {
+        let configured = try XCTUnwrap(OpenAIConfiguredModelSelection(
+            modelID: "configured-but-not-projected",
+            reasoningMode: .standard,
+            reasoningEffort: .medium
+        ))
+        let configuredBase = AIModel.openAIConfigured(selection: configured)
+        let unknownCustom = AIModel.openaiCustomResponses(name: "unknown-custom")
+        let variants = OpenAIConfiguredModelProjection.legacyServiceTierVariants(
+            for: [configuredBase, unknownCustom],
+            enabled: true
+        )
+
+        XCTAssertEqual(variants.count, 3)
+        XCTAssertTrue(variants.allSatisfy { model in
+            guard case let .openAIServiceTierVariant(base, tier) = model else { return false }
+            return base == unknownCustom && ["default", "flex", "priority"].contains(tier)
+        })
+        XCTAssertFalse(variants.contains { model in
+            guard case let .openAIServiceTierVariant(base, _) = model else { return false }
+            return base == configuredBase
+        })
+    }
+
+    func testServiceTierVariantsUseExactlyRowDeclaredTiers() throws {
+        let rows = try metadataRows(
+            """
+            {"schema_version":2,"models":[
+              {"id":"none","protocols":["responses"],"reasoning":{"modes":["standard"],"efforts":["medium"]},"streaming":true},
+              {"id":"flex","protocols":["responses"],"reasoning":{"modes":["standard"],"efforts":["medium"]},"streaming":true,"service_tiers":["flex"]},
+              {"id":"both","protocols":["responses"],"reasoning":{"modes":["standard"],"efforts":["medium"]},"streaming":true,"service_tiers":["flex","priority"]}
+            ]}
+            """
+        )
+        let bases = OpenAIConfiguredModelProjection.models(
+            rows: rows,
+            visibleModelIDs: rows.map(\.id),
+            typedCustomModelID: nil,
+            isOfficialOpenAIHost: true,
+            staticWireModelNames: []
+        )
+
+        XCTAssertTrue(OpenAIConfiguredModelProjection.serviceTierVariants(
+            for: bases,
+            rows: rows,
+            enabled: false
+        ).isEmpty)
+
+        let variants = OpenAIConfiguredModelProjection.serviceTierVariants(
+            for: bases,
+            rows: rows,
+            enabled: true
+        )
+        let tiersByID = Dictionary(grouping: variants.compactMap { model -> (String, String)? in
+            guard case let .openAIServiceTierVariant(base, tier) = model,
+                  case let .openAIConfigured(selection) = base
+            else { return nil }
+            return (selection.modelID, tier)
+        }, by: \.0).mapValues { Set($0.map(\.1)) }
+
+        XCTAssertEqual(variants.count, 6)
+        XCTAssertEqual(tiersByID["none"], ["default"])
+        XCTAssertEqual(tiersByID["flex"], ["default", "flex"])
+        XCTAssertEqual(tiersByID["both"], ["default", "flex", "priority"])
+    }
+
     private func astraRows() throws -> [OpenAIAPIModelMetadata] {
         try OpenAIAPIModelMetadataBaseline.decode().document.models
     }

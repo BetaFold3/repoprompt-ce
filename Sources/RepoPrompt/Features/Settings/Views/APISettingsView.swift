@@ -16,6 +16,7 @@ struct APISettingsView: View {
     @State private var isLoadingAnthropic = false
     @State private var isLoadingOpenAI = false
     @State private var isLoadingOpenAIBaseURL = false
+    @State private var isRefreshingOpenAIModelDiscovery = false
     @State private var isLoadingOllama = false
     @State private var isLoadingGemini = false
     @State private var isLoadingAzure = false
@@ -169,6 +170,8 @@ struct APISettingsView: View {
                 }
                 .padding(.top, 6)
 
+                openAIModelCatalogStatusSection
+
                 Divider()
                     .padding(.horizontal, -24)
 
@@ -280,6 +283,9 @@ struct APISettingsView: View {
             .padding()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear {
+            viewModel.reloadOpenAIModelCatalogMetadata()
+        }
         .sheet(isPresented: $showSecureStorageRepair) {
             SecureStorageRepairView(viewModel: secureStorageRepairViewModel) {
                 Task {
@@ -300,6 +306,144 @@ struct APISettingsView: View {
     private func openURL(_ urlString: String) {
         if let url = URL(string: urlString) {
             NSWorkspace.shared.open(url)
+        }
+    }
+
+    private var openAIModelCatalogStatusSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("OpenAI Model Catalog")
+                .font(.headline)
+
+            if let status = viewModel.openAIModelCatalogStatus {
+                Text(openAIMetadataSourceText(status.metadataSource))
+                Text(openAIOverrideText(status.overrideState))
+                    .textSelection(.enabled)
+
+                let counts = status.resolverCounts
+                Text("Rows: \(counts.baseline) baseline · \(counts.override) override · \(counts.overridden) overridden · \(counts.disabled) disabled · \(counts.rejected) rejected · \(counts.projected) projected")
+                if !counts.rejectedByReason.isEmpty {
+                    Text("Rejections: \(openAIRejectionReasonsText(counts.rejectedByReason))")
+                }
+
+                Text(openAIDiscoveryText(status))
+                if let error = status.lastError, !error.isEmpty {
+                    Text("Last discovery error: \(error)")
+                        .foregroundColor(.red)
+                } else {
+                    Text("Last discovery error: None")
+                }
+
+                Text("Endpoint: \(status.normalizedEndpoint ?? "Not available")")
+                    .textSelection(.enabled)
+                Text(openAITypedCustomModelText(status))
+                    .textSelection(.enabled)
+
+                ForEach(status.shutdownDatesByModelID.keys.sorted(), id: \.self) { modelID in
+                    if let date = status.shutdownDatesByModelID[modelID] {
+                        Text("Shutdown date: \(modelID) · \(formattedCatalogDate(date))")
+                    }
+                }
+            } else {
+                Text("Catalog status is not available yet.")
+            }
+
+            HStack(spacing: 10) {
+                Button("Reveal Override", action: revealOpenAIModelMetadataOverride)
+                    .buttonStyle(CustomButtonStyle())
+
+                Button(action: refreshOpenAIModelDiscovery) {
+                    if isRefreshingOpenAIModelDiscovery {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                            Text("Refreshing…")
+                        }
+                    } else {
+                        Text("Refresh Discovery")
+                    }
+                }
+                .disabled(isRefreshingOpenAIModelDiscovery)
+                .buttonStyle(CustomButtonStyle())
+            }
+        }
+        .font(.caption)
+        .foregroundColor(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func openAIMetadataSourceText(_ source: OpenAIModelCatalogStatus.MetadataSource) -> String {
+        switch source {
+        case let .baselineOnly(version):
+            "Metadata: Built-in baseline \(version) only"
+        case let .baselineWithOverride(version):
+            "Metadata: Built-in baseline \(version) + local override"
+        }
+    }
+
+    private func openAIOverrideText(_ state: OpenAIModelCatalogStatus.OverrideState) -> String {
+        switch state {
+        case let .absent(path):
+            "Override: Absent · \(path)"
+        case let .loaded(path):
+            "Override: Loaded · \(path)"
+        case let .failed(message, path):
+            "Override: Failed — \(message) · \(path)"
+        }
+    }
+
+    private func openAIRejectionReasonsText(
+        _ reasons: [OpenAIAPIModelMetadataRowRejectionReason: Int]
+    ) -> String {
+        reasons
+            .sorted { $0.key.rawValue < $1.key.rawValue }
+            .map { "\($0.key.rawValue): \($0.value)" }
+            .joined(separator: " · ")
+    }
+
+    private func openAIDiscoveryText(_ status: OpenAIModelCatalogStatus) -> String {
+        let source = switch status.discoverySource {
+        case .live: "Live"
+        case .cached: "Cached"
+        case .none: "None"
+        }
+        let refreshed = status.lastRefreshAt.map(formattedCatalogDate) ?? "Never"
+        return "Discovery: \(source) · Last refresh: \(refreshed) · \(status.visibleModelIDCount) visible ID(s)"
+    }
+
+    private func openAITypedCustomModelText(_ status: OpenAIModelCatalogStatus) -> String {
+        guard let modelID = status.typedCustomModelID else {
+            return "Typed custom ID: None"
+        }
+        let visibility = status.isTypedCustomModelIDVisible ? "visible" : "not reported"
+        return "Typed custom ID: \(modelID) · \(visibility)"
+    }
+
+    private func formattedCatalogDate(_ date: Date) -> String {
+        DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .short)
+    }
+
+    private func revealOpenAIModelMetadataOverride() {
+        do {
+            let url = try viewModel.openAIModelMetadataRevealURL()
+            if FileManager.default.fileExists(atPath: url.path) {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } else {
+                NSWorkspace.shared.open(url.deletingLastPathComponent())
+            }
+        } catch {
+            alertMessage = "Unable to reveal the OpenAI model metadata override: \(error.asFriendlyString())"
+            showAlert = true
+        }
+    }
+
+    private func refreshOpenAIModelDiscovery() {
+        guard !isRefreshingOpenAIModelDiscovery else { return }
+        isRefreshingOpenAIModelDiscovery = true
+        Task {
+            await viewModel.refreshOpenAIModelDiscovery()
+            await MainActor.run {
+                isRefreshingOpenAIModelDiscovery = false
+            }
         }
     }
 
@@ -463,7 +607,7 @@ struct APISettingsView: View {
                             onAPIKeyUpdated?()
                         }
 
-                    Text("Selecting a tier-variant model overrides the global tier for that request.")
+                    Text("Configured dynamic models receive only metadata-declared Flex or Priority variants. Static models and registry-miss unknown custom Responses IDs keep their existing tier behavior. Selecting a tier-variant model overrides the global tier for that request.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }

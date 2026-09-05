@@ -8,11 +8,13 @@ enum OpenAIAPIModelMetadataOverrideState: Equatable {
 
 struct OpenAIAPIModelMetadataResolutionStatus: Equatable {
     let overrideState: OpenAIAPIModelMetadataOverrideState
+    let hasLastGoodOverride: Bool
     let baselineCount: Int
     let overrideCount: Int
     let overriddenCount: Int
     let disabledCount: Int
     let rejectedCount: Int
+    let rejectedByReason: [OpenAIAPIModelMetadataRowRejectionReason: Int]
     let duplicateWarningCount: Int
     let staticCollisionCount: Int
     let resolvedCount: Int
@@ -129,14 +131,20 @@ final class OpenAIAPIModelMetadataResolver: @unchecked Sendable {
         let staticOwnedRows = enabledRows.filter { staticModelIDs.contains($0.id) }
         let rows = enabledRows.filter { !staticModelIDs.contains($0.id) }
 
+        let rejectedRows = baselineReport.rejectedRows
+            + (overrideReport?.rejectedRows ?? [])
+        let rejectedByReason = Dictionary(grouping: rejectedRows, by: \.reason)
+            .mapValues(\.count)
+
         let status = OpenAIAPIModelMetadataResolutionStatus(
             overrideState: overrideState,
+            hasLastGoodOverride: overrideReport != nil,
             baselineCount: baselineReport.document.models.count,
             overrideCount: overrideReport?.document.models.count ?? 0,
             overriddenCount: overriddenCount,
             disabledCount: disabledIDs.count,
-            rejectedCount: (overrideReport?.rejectedRows.count ?? 0)
-                + baselineReport.rejectedRows.count,
+            rejectedCount: rejectedRows.count,
+            rejectedByReason: rejectedByReason,
             duplicateWarningCount: (overrideReport?.duplicateWarnings.count ?? 0)
                 + baselineReport.duplicateWarnings.count,
             staticCollisionCount: staticOwnedRows.count,

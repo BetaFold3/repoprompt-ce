@@ -287,6 +287,7 @@ public class APISettingsViewModel: ObservableObject {
     @Published var isOpenAIBaseURLValid: Bool = false
     @Published var openAIServiceTier: String = UserDefaults.standard.string(forKey: "openAIServiceTier") ?? "auto"
     @Published var openAIShowServiceTierVariants: Bool = UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants")
+    @Published private(set) var openAIModelCatalogStatus: OpenAIModelCatalogStatus?
     @Published var ollamaURL: String = "http://localhost:11434"
     @Published var customProviderURL: String = ""
     @Published var customProviderApiKey: String = ""
@@ -379,6 +380,7 @@ public class APISettingsViewModel: ObservableObject {
     @Published var codexError: String? = nil
     @Published private(set) var codexConnectionPhase: CodexConnectionPhase = UserDefaults.standard.bool(forKey: "CodexCLIConnected") ? .connected(resolvedExecutable: nil) : .idle
     @Published private(set) var availableCodexModels: [CodexAppServerClient.RemoteModel] = []
+    @Published private(set) var codexModelCatalogStatus: CodexModelCatalogStatus?
     private var codexLogCollector: CLIProcessLogCollector?
     // OpenCode CLI / ACP
     @Published var isOpenCodeConnected: Bool = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
@@ -445,6 +447,7 @@ public class APISettingsViewModel: ObservableObject {
     private var grokModelsTask: Task<Void, Never>? // NEW
     private var groqModelsTask: Task<Void, Never>? // NEW
     private var codexModelsTask: Task<Void, Never>?
+    private var codexCatalogStatusTask: Task<Void, Never>?
     private var openCodeModelsTask: Task<Void, Never>?
     private var ohMyPiModelsTask: Task<Void, Never>?
     private var cursorModelsTask: Task<Void, Never>?
@@ -1467,6 +1470,7 @@ public class APISettingsViewModel: ObservableObject {
     private var activeOpenAIModelCatalogScope: APIModelCatalogScope?
     private var openAIModelLiveRefreshScope: APIModelCatalogScope?
     private var resolvedOpenAIModelMetadata: [OpenAIAPIModelMetadata] = []
+    private var openAIModelCatalogSnapshot: APIModelCatalogSnapshot?
     private var hasPreparedForWindowClose = false
 
     init(
@@ -1523,6 +1527,7 @@ public class APISettingsViewModel: ObservableObject {
         installCLIConnectionObservers()
         installAgentAvailabilityObservers()
         refreshAgentAvailability()
+        reloadOpenAIModelCatalogMetadata()
         if loadStoredDataOnInit {
             initialLoadTask = Task { [weak self] in
                 guard let self else { return }
@@ -1579,6 +1584,7 @@ public class APISettingsViewModel: ObservableObject {
         grokModelsTask?.cancel() // NEW
         groqModelsTask?.cancel()
         codexModelsTask?.cancel()
+        codexCatalogStatusTask?.cancel()
         openCodeModelsTask?.cancel()
         ohMyPiModelsTask?.cancel()
         cursorModelsTask?.cancel()
@@ -1900,6 +1906,8 @@ public class APISettingsViewModel: ObservableObject {
         groqModelsTask = nil
         codexModelsTask?.cancel()
         codexModelsTask = nil
+        codexCatalogStatusTask?.cancel()
+        codexCatalogStatusTask = nil
         openCodeModelsTask?.cancel()
         openCodeModelsTask = nil
         ohMyPiModelsTask?.cancel()
@@ -2093,6 +2101,7 @@ public class APISettingsViewModel: ObservableObject {
         }
         Task {
             await updateAvailableModels()
+            await updateOpenAIModelCatalogStatus()
         }
     }
 
@@ -2255,26 +2264,30 @@ public class APISettingsViewModel: ObservableObject {
                 hasSuccessfulLiveRefresh: activeOpenAIModelCatalogScope != nil
                     && openAIModelLiveRefreshScope == activeOpenAIModelCatalogScope
             ))
-            modelSet.formUnion(OpenAIConfiguredModelProjection.models(
+            let projectedModels = OpenAIConfiguredModelProjection.models(
                 rows: resolvedOpenAIModelMetadata,
                 visibleModelIDs: availableOpenAIModels,
                 typedCustomModelID: openAICustomModel,
                 isOfficialOpenAIHost: isOfficialHost,
                 staticWireModelNames: AIModel.staticOpenAIWireModelNames
-            ))
+            )
+            modelSet.formUnion(projectedModels)
 
-            // Generate service tier variants for OpenAI Responses API models when enabled
             if openAIShowServiceTierVariants {
-                let baseOpenAIModels = modelSet.filter {
-                    $0.providerType == .openAI &&
-                        $0.usesResponsesAPI &&
-                        !$0.isOpenAIServiceTierVariant
-                }
-                for base in baseOpenAIModels {
-                    modelSet.insert(.openAIServiceTierVariant(base: base, tier: "default"))
-                    modelSet.insert(.openAIServiceTierVariant(base: base, tier: "flex"))
-                    modelSet.insert(.openAIServiceTierVariant(base: base, tier: "priority"))
-                }
+                let configuredBases = Set(projectedModels.filter {
+                    if case .openAIConfigured = $0 { return true }
+                    return false
+                })
+                modelSet.formUnion(OpenAIConfiguredModelProjection.serviceTierVariants(
+                    for: configuredBases,
+                    rows: resolvedOpenAIModelMetadata,
+                    enabled: true
+                ))
+
+                modelSet.formUnion(OpenAIConfiguredModelProjection.legacyServiceTierVariants(
+                    for: modelSet,
+                    enabled: true
+                ))
             }
         }
 
@@ -4328,6 +4341,7 @@ public class APISettingsViewModel: ObservableObject {
         openAIModelLiveRefreshScope = nil
         availableOpenAIModels = []
         availableOpenAIModelMetadata = []
+        openAIModelCatalogSnapshot = nil
         return scope
     }
 
@@ -4482,18 +4496,22 @@ public class APISettingsViewModel: ObservableObject {
         guard isOpenAIKeyValid else {
             activeOpenAIModelCatalogScope = nil
             openAIModelLiveRefreshScope = nil
+            openAIModelCatalogSnapshot = nil
             availableOpenAIModels = []
             availableOpenAIModelMetadata = []
             await updateAvailableModels()
+            await updateOpenAIModelCatalogStatus()
             return
         }
 
         guard let request = openAIModelCatalogRequest(apiKey: openAIApiKey) else {
             activeOpenAIModelCatalogScope = nil
             openAIModelLiveRefreshScope = nil
+            openAIModelCatalogSnapshot = nil
             availableOpenAIModels = []
             availableOpenAIModelMetadata = []
             await updateAvailableModels()
+            await updateOpenAIModelCatalogStatus()
             return
         }
         let scope = request.scope
@@ -4501,6 +4519,7 @@ public class APISettingsViewModel: ObservableObject {
         if activeOpenAIModelCatalogScope != scope {
             activeOpenAIModelCatalogScope = scope
             openAIModelLiveRefreshScope = nil
+            openAIModelCatalogSnapshot = nil
             availableOpenAIModels = []
             availableOpenAIModelMetadata = []
             await updateAvailableModels()
@@ -4517,9 +4536,10 @@ public class APISettingsViewModel: ObservableObject {
                 defaultTemperature: 0.7,
                 apiVersion: capturedVersion
             )
-            let modelIDs = try await provider.getAvailableModels()
+            let descriptors = try await provider.getAvailableModelDescriptors()
             return APIModelCatalogRefreshPayload(
-                modelIDs: modelIDs,
+                modelIDs: descriptors.map(\.id),
+                models: descriptors,
                 acceptedCommit: { [weak self] in
                     await self?.commitOpenAILiveRefresh(scope: scope, apiKey: capturedKey)
                 }
@@ -4533,6 +4553,7 @@ public class APISettingsViewModel: ObservableObject {
             else {
                 return
             }
+            openAIModelCatalogSnapshot = snapshot
             availableOpenAIModels = snapshot.modelIDs
             updateVisibleOpenAIModelMetadata()
             await updateAvailableModels()
@@ -4541,6 +4562,7 @@ public class APISettingsViewModel: ObservableObject {
         if openAIModelLiveRefreshScope == scope {
             await updateAvailableModels()
         }
+        await updateOpenAIModelCatalogStatus()
     }
 
     private func commitOpenAILiveRefresh(scope: APIModelCatalogScope, apiKey: String) {
@@ -4553,11 +4575,77 @@ public class APISettingsViewModel: ObservableObject {
         openAIModelLiveRefreshScope = scope
     }
 
+    func reloadOpenAIModelCatalogMetadata() {
+        reloadOpenAIModelMetadata()
+        Task {
+            await updateAvailableModels()
+            await updateOpenAIModelCatalogStatus()
+        }
+    }
+
     private func reloadOpenAIModelMetadata() {
         let resolution = openAIModelMetadataResolver.reloadFromFile()
         resolvedOpenAIModelMetadata = resolution.rows
         openAIModelMetadataRegistry.update(resolution: resolution)
         updateVisibleOpenAIModelMetadata()
+        publishOpenAIModelCatalogStatus(
+            resolution: resolution,
+            refreshFailure: nil,
+            preservedLastError: openAIModelCatalogStatus?.lastError
+        )
+    }
+
+    func refreshOpenAIModelDiscovery() async {
+        await startOpenAIModelsRefresh().value
+    }
+
+    func openAIModelMetadataRevealURL(fileManager: FileManager = .default) throws -> URL {
+        try fileManager.createDirectory(
+            at: Self.openAIModelCatalogDirectoryURL,
+            withIntermediateDirectories: true
+        )
+        return Self.openAIModelMetadataFileURL
+    }
+
+    private func updateOpenAIModelCatalogStatus() async {
+        let failure: APIModelCatalogRefreshFailure? = if let scope = activeOpenAIModelCatalogScope {
+            await apiModelCatalog.refreshFailure(for: scope)
+        } else {
+            nil
+        }
+        publishOpenAIModelCatalogStatus(
+            resolution: openAIModelMetadataResolver.currentResolution(),
+            refreshFailure: failure
+        )
+    }
+
+    private func publishOpenAIModelCatalogStatus(
+        resolution: OpenAIAPIModelMetadataResolution,
+        refreshFailure: APIModelCatalogRefreshFailure?,
+        preservedLastError: String? = nil
+    ) {
+        let request = openAIModelCatalogRequest(apiKey: openAIApiKey)
+        openAIModelCatalogStatus = OpenAIModelCatalogStatus.make(
+            resolution: resolution,
+            baselineVersion: OpenAIAPIModelMetadataBaseline.baselineVersion,
+            overrideFileURL: Self.openAIModelMetadataFileURL,
+            snapshot: openAIModelCatalogSnapshot,
+            hasSuccessfulLiveRefresh: OpenAIModelCatalogStatus.hasSuccessfulLiveRefresh(
+                requestScope: request?.scope,
+                liveRefreshScope: openAIModelLiveRefreshScope
+            ),
+            refreshFailure: refreshFailure,
+            preservedLastError: preservedLastError,
+            normalizedEndpoint: request?.scope.normalizedEndpoint,
+            typedCustomModelID: openAICustomModel,
+            projectedMetadataRowCount: OpenAIConfiguredModelProjection.projectedMetadataRowCount(
+                rows: resolvedOpenAIModelMetadata,
+                visibleModelIDs: availableOpenAIModels,
+                typedCustomModelID: openAICustomModel,
+                isOfficialOpenAIHost: shouldUseResponsesRoutingForOpenAICustomModel,
+                staticWireModelNames: AIModel.staticOpenAIWireModelNames
+            )
+        )
     }
 
     private func updateVisibleOpenAIModelMetadata() {
@@ -4644,6 +4732,13 @@ public class APISettingsViewModel: ObservableObject {
         guard !hasPreparedForWindowClose else { return }
         guard codexModelsTask == nil else { return }
         let codexModelPollingService = codexModelPollingService
+        codexCatalogStatusTask = Task { [weak self, codexModelPollingService] in
+            let statuses = await codexModelPollingService.subscribeToCatalogStatus()
+            for await status in statuses {
+                guard let self, !Task.isCancelled else { return }
+                codexModelCatalogStatus = status
+            }
+        }
         codexModelsTask = Task { [weak self, codexModelPollingService] in
             guard let self else { return }
 
@@ -4664,6 +4759,8 @@ public class APISettingsViewModel: ObservableObject {
     private func stopCodexModelsSubscription() {
         codexModelsTask?.cancel()
         codexModelsTask = nil
+        codexCatalogStatusTask?.cancel()
+        codexCatalogStatusTask = nil
     }
 
     #if DEBUG
@@ -4692,10 +4789,14 @@ public class APISettingsViewModel: ObservableObject {
         }
 
         func test_cancelAndDrainCodexModelsSubscription() async {
-            let task = codexModelsTask
-            task?.cancel()
+            let modelsTask = codexModelsTask
+            let statusTask = codexCatalogStatusTask
+            modelsTask?.cancel()
+            statusTask?.cancel()
             codexModelsTask = nil
-            await task?.value
+            codexCatalogStatusTask = nil
+            await modelsTask?.value
+            await statusTask?.value
         }
     #endif
 

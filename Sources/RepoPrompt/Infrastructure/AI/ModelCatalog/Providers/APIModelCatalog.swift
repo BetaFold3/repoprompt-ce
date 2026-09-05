@@ -71,11 +71,63 @@ struct APIModelCatalogScope: Codable, Hashable {
     }
 }
 
+struct APIModelCatalogModelDescriptor: Codable, Equatable {
+    let id: String
+    let shutdownDate: Date?
+}
+
 struct APIModelCatalogSnapshot: Codable, Equatable {
     let scope: APIModelCatalogScope
     let modelIDs: [String]
     let refreshedAt: Date
     let generation: UInt64
+    let models: [APIModelCatalogModelDescriptor]
+
+    init(
+        scope: APIModelCatalogScope,
+        modelIDs: [String],
+        refreshedAt: Date,
+        generation: UInt64,
+        models: [APIModelCatalogModelDescriptor] = []
+    ) {
+        self.scope = scope
+        self.modelIDs = modelIDs
+        self.refreshedAt = refreshedAt
+        self.generation = generation
+        self.models = models
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case scope, modelIDs, refreshedAt, generation, models
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        scope = try container.decode(APIModelCatalogScope.self, forKey: .scope)
+        modelIDs = try container.decode([String].self, forKey: .modelIDs)
+        refreshedAt = try container.decode(Date.self, forKey: .refreshedAt)
+        generation = try container.decode(UInt64.self, forKey: .generation)
+        models = try container.decodeIfPresent([APIModelCatalogModelDescriptor].self, forKey: .models) ?? []
+    }
+}
+
+struct APIModelCatalogRefreshFailure: Equatable {
+    enum Reason: Equatable {
+        case requestFailed
+        case emptyResponse
+    }
+
+    let reason: Reason
+    let failedAt: Date
+
+    var message: String {
+        switch reason {
+        case .requestFailed:
+            "Model discovery failed. Try refreshing again."
+        case .emptyResponse:
+            "The model endpoint returned no usable model IDs."
+        }
+    }
 }
 
 protocol APIModelCatalogStorage: Sendable {
@@ -141,15 +193,18 @@ actor APIModelCatalogFileStorage: APIModelCatalogStorage {
 
 struct APIModelCatalogRefreshPayload {
     let modelIDs: [String]
+    let models: [APIModelCatalogModelDescriptor]
     let acceptsEmptyResponse: Bool
     let acceptedCommit: (@Sendable () async -> Void)?
 
     init(
         modelIDs: [String],
+        models: [APIModelCatalogModelDescriptor] = [],
         acceptsEmptyResponse: Bool = false,
         acceptedCommit: (@Sendable () async -> Void)? = nil
     ) {
         self.modelIDs = modelIDs
+        self.models = models
         self.acceptsEmptyResponse = acceptsEmptyResponse
         self.acceptedCommit = acceptedCommit
     }
@@ -166,6 +221,7 @@ actor APIModelCatalog {
         var didLoadStorage = false
         var loadTask: Task<APIModelCatalogSnapshot?, Never>?
         var refreshTask: Task<APIModelCatalogSnapshot?, Never>?
+        var refreshFailure: APIModelCatalogRefreshFailure?
     }
 
     private struct StorageMutation {
@@ -191,6 +247,10 @@ actor APIModelCatalog {
 
     func cachedSnapshot(for scope: APIModelCatalogScope) async -> APIModelCatalogSnapshot? {
         await ensureCachedSnapshotLoaded(for: scope)
+    }
+
+    func refreshFailure(for scope: APIModelCatalogScope) -> APIModelCatalogRefreshFailure? {
+        entries[scope]?.refreshFailure
     }
 
     func snapshots(
@@ -280,7 +340,14 @@ actor APIModelCatalog {
                     payload: payload
                 )
             } catch {
-                return await self?.completeRefreshFailure(for: scope, generation: generation)
+                guard !(error is CancellationError), !Task.isCancelled else {
+                    return await self?.completeCancelledRefresh(for: scope, generation: generation)
+                }
+                return await self?.completeRefreshFailure(
+                    for: scope,
+                    generation: generation,
+                    reason: .requestFailed
+                )
             }
         }
         entry.refreshTask = task
@@ -297,6 +364,7 @@ actor APIModelCatalog {
         entry.didLoadStorage = true
         entry.loadTask = nil
         entry.refreshTask = nil
+        entry.refreshFailure = nil
         entries[scope] = entry
         let storage = storage
         await enqueueStorageMutation(for: scope) {
@@ -342,11 +410,16 @@ actor APIModelCatalog {
         entry.loadTask = nil
 
         if let stored, stored.scope == scope {
+            let acceptedModelIDs = normalizedModelIDs(stored.modelIDs)
             entry.snapshot = APIModelCatalogSnapshot(
                 scope: scope,
-                modelIDs: normalizedModelIDs(stored.modelIDs),
+                modelIDs: acceptedModelIDs,
                 refreshedAt: stored.refreshedAt,
-                generation: generation
+                generation: generation,
+                models: normalizedDescriptors(
+                    stored.models,
+                    acceptedModelIDs: Set(acceptedModelIDs)
+                )
             )
         }
         entries[scope] = entry
@@ -369,14 +442,19 @@ actor APIModelCatalog {
         } else if payload.acceptsEmptyResponse, payload.modelIDs.isEmpty {
             acceptedModelIDs = []
         } else {
-            return completeRefreshFailure(for: scope, generation: generation)
+            return completeRefreshFailure(
+                for: scope,
+                generation: generation,
+                reason: .emptyResponse
+            )
         }
 
         let snapshot = APIModelCatalogSnapshot(
             scope: scope,
             modelIDs: acceptedModelIDs,
             refreshedAt: clock(),
-            generation: generation
+            generation: generation,
+            models: normalizedDescriptors(payload.models, acceptedModelIDs: Set(acceptedModelIDs))
         )
         let storage = storage
         await enqueueStorageMutation(for: scope) {
@@ -389,12 +467,27 @@ actor APIModelCatalog {
         entry.snapshot = snapshot
         entry.didLoadStorage = true
         entry.refreshTask = nil
+        entry.refreshFailure = nil
         entries[scope] = entry
         await payload.acceptedCommit?()
         return snapshot
     }
 
     private func completeRefreshFailure(
+        for scope: APIModelCatalogScope,
+        generation: UInt64,
+        reason: APIModelCatalogRefreshFailure.Reason
+    ) -> APIModelCatalogSnapshot? {
+        guard var entry = entries[scope], entry.generation == generation else {
+            return entries[scope]?.snapshot
+        }
+        entry.refreshTask = nil
+        entry.refreshFailure = APIModelCatalogRefreshFailure(reason: reason, failedAt: clock())
+        entries[scope] = entry
+        return entry.snapshot
+    }
+
+    private func completeCancelledRefresh(
         for scope: APIModelCatalogScope,
         generation: UInt64
     ) -> APIModelCatalogSnapshot? {
@@ -425,18 +518,45 @@ actor APIModelCatalog {
         }
     }
 
+    private func normalizedDescriptors(
+        _ descriptors: [APIModelCatalogModelDescriptor],
+        acceptedModelIDs: Set<String>
+    ) -> [APIModelCatalogModelDescriptor] {
+        var seen = Set<String>()
+        return descriptors.compactMap { descriptor in
+            guard let modelID = normalizedModelID(descriptor.id),
+                  acceptedModelIDs.contains(modelID),
+                  seen.insert(modelID).inserted
+            else {
+                return nil
+            }
+            return APIModelCatalogModelDescriptor(
+                id: modelID,
+                shutdownDate: descriptor.shutdownDate
+            )
+        }.sorted { $0.id < $1.id }
+    }
+
     private func normalizedModelIDs(_ rawModelIDs: [String]) -> [String] {
         var seen = Set<String>()
         return rawModelIDs.compactMap { rawValue in
-            let modelID = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !modelID.isEmpty,
-                  modelID.utf8.count <= 512,
-                  !modelID.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+            guard let modelID = normalizedModelID(rawValue),
                   seen.insert(modelID).inserted
             else {
                 return nil
             }
             return modelID
         }.sorted()
+    }
+
+    private func normalizedModelID(_ rawValue: String) -> String? {
+        let modelID = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelID.isEmpty,
+              modelID.utf8.count <= 512,
+              !modelID.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else {
+            return nil
+        }
+        return modelID
     }
 }

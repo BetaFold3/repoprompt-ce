@@ -1,3 +1,15 @@
+# Completion outcome (2026-09-04)
+
+This plan is complete. The status and PR notes below are preserved verbatim as historical planning context.
+
+- **PR 1:** shipped the strict schema-v2 OpenAI baseline and GPT-6 Astra data-only support, local whole-row overrides/disables, trusted official-host projection, registry-backed identity/display, and withdrawal-safe visibility behavior.
+- **PR 2:** shipped Codex app-server capability parsing, the bounded known-base history ledger, capability-aware extended-effort parsing, evidence-driven Fast eligibility, no-evidence zero/failure retention, and withdrawn-selection preservation.
+- **PR 3:** shipped metadata-gated service-tier variants for configured dynamic OpenAI models, OpenAI/Codex catalog status projections, explicit reload/reveal/refresh actions, Settings observability, privacy-safe endpoint/error presentation, status-only shutdown dates, and the durable documentation updates.
+- **Decision summary:** whole-wire-ID ownership remains authoritative for static OpenAI cases; metadata gates tiers only for configured dynamic models, while static and registry-miss unknown-custom Responses tier behavior is deliberately deferred; Codex keeps the additive history-ledger design.
+- **Validation state:** the prior data/view-model slice was reported validated before this completion slice. Final integration ran a successful `make dev-build` and successful `Scripts/test-check-agent-context`. `Scripts/check-agent-context` remains blocked by the unrelated active Codex computer-use plan's missing header and route. `make guardrails` reaches repository checks outside the sandbox but remains blocked by the current tracked-document allowlist findings; no unrelated allowlist was expanded.
+
+---
+
 # Dynamic GPT Model Catalog Plan (GPT-6 Astra first)
 
 Scope: read when the task touches OpenAI direct-API model discovery or trusted capability metadata (`Sources/RepoPrompt/Infrastructure/AI/ModelCatalog/Providers/APIModelCatalog.swift`, `OpenAIAPIModelMetadata.swift`, `OpenAIResponseRequestPlan.swift`, `APISettingsViewModel.swift` OpenAI projection), Codex dynamic model parsing or Fast-tier synthesis (`CodexModelSpecifier.swift`, `CodexServiceTierVariantCatalog.swift`, `CodexAIModelCatalog.swift`, `AgentCodexModelRegistry.swift`, `CodexModelPollingService.swift`), or adding a newly released GPT model such as `gpt-6-astra`.

@@ -7,6 +7,13 @@ protocol CodexModelListingClient: Sendable {
 
 extension CodexAppServerClient: CodexModelListingClient {}
 
+struct CodexModelCatalogStatus: Equatable {
+    let modelCount: Int
+    let fetchedAt: Date?
+    let knownBaseCount: Int
+    let lastPollError: String?
+}
+
 // SEARCH-HELPER: Codex model polling, centralized, shared client, model list, subscribe
 /// Centralized polling service for Codex dynamic models.
 ///
@@ -50,11 +57,14 @@ actor CodexModelPollingService {
     private var pollingTask: Task<Void, Never>?
     private var inFlightRefresh: Task<Void, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
+    private var outcomeContinuations: [UUID: AsyncStream<LastPollOutcome>.Continuation] = [:]
+    private var catalogStatusContinuations: [UUID: AsyncStream<CodexModelCatalogStatus>.Continuation] = [:]
     #if DEBUG
         private var testSubscriberCountObservers: [UUID: AsyncStream<Int>.Continuation] = [:]
     #endif
     private var latest: Snapshot?
     private var pollOutcome: LastPollOutcome?
+    private var catalogStatus: CodexModelCatalogStatus?
     private var isShutdown = false
     private var isStoppingClientForIdle = false
 
@@ -79,6 +89,10 @@ actor CodexModelPollingService {
 
     func lastPollOutcome() -> LastPollOutcome? {
         pollOutcome
+    }
+
+    func latestCatalogStatus() -> CodexModelCatalogStatus? {
+        catalogStatus
     }
 
     #if DEBUG
@@ -129,6 +143,42 @@ actor CodexModelPollingService {
         return stream
     }
 
+    func subscribeToOutcomes() -> AsyncStream<LastPollOutcome> {
+        guard !isShutdown else {
+            return AsyncStream { $0.finish() }
+        }
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<LastPollOutcome>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        outcomeContinuations[id] = continuation
+        if let pollOutcome {
+            continuation.yield(pollOutcome)
+        }
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeOutcomeSubscriber(id) }
+        }
+        return stream
+    }
+
+    func subscribeToCatalogStatus() -> AsyncStream<CodexModelCatalogStatus> {
+        guard !isShutdown else {
+            return AsyncStream { $0.finish() }
+        }
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<CodexModelCatalogStatus>.makeStream(
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        catalogStatusContinuations[id] = continuation
+        if let catalogStatus {
+            continuation.yield(catalogStatus)
+        }
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeCatalogStatusSubscriber(id) }
+        }
+        return stream
+    }
+
     /// Force an immediate model refresh (e.g. after connectivity test succeeds).
     /// Updates the registry and only broadcasts when the normalized model payload changes.
     /// Coalesces with any in-flight refresh to avoid overlapping network/process calls.
@@ -154,6 +204,16 @@ actor CodexModelPollingService {
                 publishTestSubscriberCount()
             #endif
             for continuation in activeContinuations.values {
+                continuation.finish()
+            }
+            let activeOutcomeContinuations = outcomeContinuations
+            outcomeContinuations.removeAll()
+            for continuation in activeOutcomeContinuations.values {
+                continuation.finish()
+            }
+            let activeCatalogStatusContinuations = catalogStatusContinuations
+            catalogStatusContinuations.removeAll()
+            for continuation in activeCatalogStatusContinuations.values {
                 continuation.finish()
             }
         }
@@ -201,6 +261,14 @@ actor CodexModelPollingService {
         }
     }
 
+    private func removeOutcomeSubscriber(_ id: UUID) {
+        outcomeContinuations.removeValue(forKey: id)
+    }
+
+    private func removeCatalogStatusSubscriber(_ id: UUID) {
+        catalogStatusContinuations.removeValue(forKey: id)
+    }
+
     private func removeSubscriber(_ id: UUID) async {
         continuations.removeValue(forKey: id)
         #if DEBUG
@@ -236,7 +304,7 @@ actor CodexModelPollingService {
                 let snapshot = Snapshot(models: models, fetchedAt: Date())
                 await applyRefreshResult(snapshot)
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !(error is CancellationError), !Task.isCancelled else { return }
                 await recordPollFailure(error)
             }
         }
@@ -247,21 +315,64 @@ actor CodexModelPollingService {
 
     private func applyRefreshResult(_ snapshot: Snapshot) {
         guard !isShutdown else { return }
-        pollOutcome = .success(modelCount: snapshot.models.count, fetchedAt: snapshot.fetchedAt)
-        guard !snapshot.models.isEmpty else { return }
 
-        // Single canonical registry update — no other call site should write to the registry.
-        let didChange = registry.updateLiveModels(snapshot.models)
-        guard didChange else { return }
+        var didChange = false
+        if !snapshot.models.isEmpty {
+            // Single canonical registry update — no other call site should write to the registry.
+            didChange = registry.updateLiveModels(snapshot.models)
+        }
+
+        let status = CodexModelCatalogStatus(
+            modelCount: snapshot.models.count,
+            fetchedAt: snapshot.fetchedAt,
+            knownBaseCount: registry.knownModelBaseCount(),
+            lastPollError: nil
+        )
+        catalogStatus = status
+        publishCatalogStatus(status)
+
+        let outcome = LastPollOutcome.success(
+            modelCount: snapshot.models.count,
+            fetchedAt: snapshot.fetchedAt
+        )
+        pollOutcome = outcome
+        publishOutcome(outcome)
+
+        guard !snapshot.models.isEmpty, didChange else { return }
         latest = snapshot
-
         for continuation in continuations.values {
             continuation.yield(snapshot)
         }
     }
 
     private func recordPollFailure(_ error: Error) {
-        guard !isShutdown else { return }
-        pollOutcome = .failure(message: error.localizedDescription, failedAt: Date())
+        guard !isShutdown, !(error is CancellationError), !Task.isCancelled else { return }
+        let message = error.localizedDescription
+        let failedAt = Date()
+        let retained = catalogStatus
+        let status = CodexModelCatalogStatus(
+            modelCount: retained?.modelCount ?? 0,
+            fetchedAt: retained?.fetchedAt,
+            knownBaseCount: registry.knownModelBaseCount(),
+            lastPollError: message
+        )
+        catalogStatus = status
+        publishCatalogStatus(status)
+
+        let outcome = LastPollOutcome.failure(message: message, failedAt: failedAt)
+        pollOutcome = outcome
+        publishOutcome(outcome)
+    }
+
+    private func publishOutcome(_ outcome: LastPollOutcome) {
+        for continuation in outcomeContinuations.values {
+            continuation.yield(outcome)
+        }
+    }
+
+    private func publishCatalogStatus(_ status: CodexModelCatalogStatus) {
+        for continuation in catalogStatusContinuations.values {
+            continuation.yield(status)
+        }
     }
 }

@@ -52,9 +52,14 @@ final class CodexModelPollingServiceTests: XCTestCase {
         ])
         let service = CodexModelPollingService(client: client, registry: registry)
 
+        let initialKnownBaseCount = knownRegistry.entries().count
         await service.refreshNow()
         let first = await service.latestSnapshot()
+        let firstStatus = await service.latestCatalogStatus()
         XCTAssertEqual(first?.models, [model])
+        XCTAssertEqual(firstStatus?.modelCount, 1)
+        XCTAssertEqual(firstStatus?.knownBaseCount, initialKnownBaseCount + 1)
+        XCTAssertNil(firstStatus?.lastPollError)
         XCTAssertNotNil(knownRegistry.capabilitySnapshot().capability(forBase: model.id))
 
         await service.refreshNow()
@@ -68,6 +73,11 @@ final class CodexModelPollingServiceTests: XCTestCase {
             return XCTFail("Expected an observable zero-model outcome")
         }
         XCTAssertEqual(modelCount, 0)
+        let currentZeroStatus = await service.latestCatalogStatus()
+        let zeroStatus = try XCTUnwrap(currentZeroStatus)
+        XCTAssertEqual(zeroStatus.modelCount, 0)
+        XCTAssertNotNil(zeroStatus.fetchedAt)
+        XCTAssertNil(zeroStatus.lastPollError)
         XCTAssertEqual(registry.currentLiveModels(), [model])
         XCTAssertNotNil(knownRegistry.capabilitySnapshot().capability(forBase: model.id))
 
@@ -76,9 +86,94 @@ final class CodexModelPollingServiceTests: XCTestCase {
             return XCTFail("Expected an observable failure outcome")
         }
         XCTAssertEqual(message, "offline")
+        let currentFailureStatus = await service.latestCatalogStatus()
+        let failureStatus = try XCTUnwrap(currentFailureStatus)
+        XCTAssertEqual(failureStatus.modelCount, zeroStatus.modelCount)
+        XCTAssertEqual(failureStatus.fetchedAt, zeroStatus.fetchedAt)
+        XCTAssertEqual(failureStatus.lastPollError, "offline")
+
+        let freshStream = await service.subscribeToCatalogStatus()
+        var freshIterator = freshStream.makeAsyncIterator()
+        let freshStatus = await freshIterator.next()
+        XCTAssertEqual(freshStatus, failureStatus)
+
         let afterFailure = await service.latestSnapshot()
         XCTAssertEqual(afterFailure, first)
         XCTAssertEqual(registry.currentLiveModels(), [model])
+        await service.shutdown()
+    }
+
+    func testFreshCatalogStatusSubscriberRetainsSuccessStateAfterFailure() async throws {
+        let model = CodexAppServerClient.RemoteModel(
+            id: "status-model",
+            model: "status-model",
+            displayName: "Status",
+            description: "",
+            isDefault: true
+        )
+        let client = PollingClientSpy(responses: [.models([model]), .failure("offline")])
+        let service = CodexModelPollingService(client: client)
+
+        await service.refreshNow()
+        let currentSuccess = await service.latestCatalogStatus()
+        let success = try XCTUnwrap(currentSuccess)
+        await service.refreshNow()
+        let currentFailure = await service.latestCatalogStatus()
+        let failure = try XCTUnwrap(currentFailure)
+
+        XCTAssertEqual(failure.modelCount, success.modelCount)
+        XCTAssertEqual(failure.fetchedAt, success.fetchedAt)
+        XCTAssertEqual(failure.lastPollError, "offline")
+
+        let stream = await service.subscribeToCatalogStatus()
+        var iterator = stream.makeAsyncIterator()
+        let initialStatus = await iterator.next()
+        XCTAssertEqual(initialStatus, failure)
+        await service.shutdown()
+    }
+
+    func testCancellationDoesNotPublishFailureAndRetainsPriorStatus() async throws {
+        let model = CodexAppServerClient.RemoteModel(
+            id: "cancel-model",
+            model: "cancel-model",
+            displayName: "Cancel",
+            description: "",
+            isDefault: true
+        )
+        let client = PollingClientSpy(responses: [.models([model]), .cancellation])
+        let service = CodexModelPollingService(client: client)
+
+        await service.refreshNow()
+        let currentPriorStatus = await service.latestCatalogStatus()
+        let priorStatus = try XCTUnwrap(currentPriorStatus)
+        let priorOutcome = await service.lastPollOutcome()
+        await service.refreshNow()
+
+        let retainedStatus = await service.latestCatalogStatus()
+        let retainedOutcome = await service.lastPollOutcome()
+        XCTAssertEqual(retainedStatus, priorStatus)
+        XCTAssertEqual(retainedOutcome, priorOutcome)
+        XCTAssertNil(retainedStatus?.lastPollError)
+        await service.shutdown()
+    }
+
+    func testOutcomeStreamPublishesSuccessIncludingZeroAndFailure() async {
+        let client = PollingClientSpy(responses: [.models([]), .failure("offline")])
+        let service = CodexModelPollingService(client: client)
+        let stream = await service.subscribeToOutcomes()
+        var iterator = stream.makeAsyncIterator()
+
+        await service.refreshNow()
+        guard case let .success(modelCount, _) = await iterator.next() else {
+            return XCTFail("Expected success outcome")
+        }
+        XCTAssertEqual(modelCount, 0)
+
+        await service.refreshNow()
+        guard case let .failure(message, _) = await iterator.next() else {
+            return XCTFail("Expected failure outcome")
+        }
+        XCTAssertEqual(message, "offline")
         await service.shutdown()
     }
 
@@ -111,6 +206,7 @@ private actor PollingClientSpy: CodexModelListingClient {
     enum Response {
         case models([CodexAppServerClient.RemoteModel])
         case failure(String)
+        case cancellation
     }
 
     private(set) var listCallCount = 0
@@ -129,6 +225,8 @@ private actor PollingClientSpy: CodexModelListingClient {
             return models
         case let .failure(message):
             throw PollingError(message: message)
+        case .cancellation:
+            throw CancellationError()
         }
     }
 

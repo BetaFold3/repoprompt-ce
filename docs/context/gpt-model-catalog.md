@@ -67,9 +67,28 @@ Fast eligibility is evidence-driven; there is no GPT version heuristic. An obser
 
 The UI variant remains `<base>-fast[-<effort>]`, and the request wire value remains `service_tier=fast`; upstream `serviceTiers[].id == priority` is descriptive metadata, not the request token. A persisted `-fast` selection whose base is no longer eligible degrades to the same base without sending a service tier. Do not infer Fast for new versions or for `gpt-5.4-mini`, `gpt-5.3-codex-spark`, Daybreak, or Astra without explicit `additionalSpeedTiers` evidence.
 
-## Deferred work
+## Configured service-tier authority
 
-Configured-model service-tier gating and the OpenAI catalog status UI remain PR 3 work. Although schema v2 can decode `service_tiers`, the current implementation does not make metadata the configured-model tier projection authority. Existing static and unknown-custom tier behavior also remains unchanged pending the separately audited follow-up described by the [active plan](plans/2026-09-04-dynamic-gpt-model-catalog-plan.md).
+For `.openAIConfigured` models, the resolved metadata row is the service-tier authority. The default choice always remains available; Flex and Priority wrappers are projected only when the row declares the corresponding `service_tiers` value. An absent list therefore produces no Flex or Priority configured variants. Runtime request shaping continues to send the exact tier encoded by the selected wrapper.
+
+This authority is intentionally limited to configured dynamic models. Static OpenAI Responses cases and registry-miss unknown custom Responses IDs retain their existing default/Flex/Priority behavior. Changing those paths is deferred until the static families have audited metadata rows and the billing-impacting migration has explicit compatibility and request-equivalence coverage.
+
+## Settings observability and refresh
+
+`APISettingsView` owns the OpenAI Model Catalog status block after the OpenAI key/base-URL controls. Its single `OpenAIModelCatalogStatus` projection presents:
+
+- embedded baseline version and whether the resolved source includes a last-good local override;
+- override absent, loaded, or failed state, including the decoder-safe message and exact override path;
+- baseline, override, overridden, disabled, rejected, and projected counts, with rejected rows grouped by reason;
+- discovery source (`live`, last-good `cached`, or `none`), last refresh time, visible-ID count, and the last bounded refresh error;
+- the normalized credential-free endpoint and whether the typed custom ID is visible or was not reported for the active key;
+- any parsed `shutdown_date` values by exact model ID.
+
+The status surface must never display an API-key fingerprint, API key, embedded URL credentials, authorization header, or another credential-bearing value. Endpoint normalization is the only endpoint presentation. `shutdown_date` is status-only information: it does not hide, disable, rewrite, substitute, or schedule removal of a model.
+
+Metadata reload occurs when API Settings appears, after relevant credential/base-URL transitions through the existing view-model paths, and through the explicit reload action used by the view model. There is no filesystem watcher. **Reveal Override** creates the `ModelCatalog` directory, then selects the override file when present or opens that directory when absent. **Refresh Discovery** invokes the explicit async discovery action and shows a bounded busy state until it returns.
+
+`CLIProvidersSettingsView` owns the connected Codex catalog caption after the resolved executable path and before direct provider controls. A non-empty success reports `<N> model(s) from Codex app-server · <time> · <K> known bases`; a successful zero reports `Codex reported 0 models at <time> · <K> known bases`. A later poll error is appended while the previous count and successful fetch time remain visible. Poll cancellation during teardown is not recorded or presented as a failure.
 
 ## Add a model
 
@@ -79,4 +98,6 @@ Configured-model service-tier gating and the OpenAI catalog status UI remain PR 
 4. Confirm strict decoding, v1 compatibility, whole-row override precedence, disables, and malformed-versus-missing override behavior.
 5. Verify official-host typed exact matching, live-visibility projection, cached/failed refresh behavior, stable display naming, and withdrawal preservation.
 6. Pin the model's exact capabilities and projected choice count in tests, plus request encoding for every supported mode and effort. Verify unsupported efforts and tiers are absent.
-7. Update this document when the authority, trust boundary, compatibility contract, or model capability row changes.
+7. If the row declares service tiers, verify configured variants are exactly metadata-gated; do not infer tiers from family names or `/v1/models`.
+8. Confirm the Settings status counts, source/override states, typed-ID visibility, credential-free endpoint, refresh failure retention, and any status-only shutdown date.
+9. Update this document when the authority, trust boundary, compatibility contract, observability contract, or model capability row changes.

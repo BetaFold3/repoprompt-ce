@@ -37,6 +37,10 @@ final class AgentCodexModelRegistry {
         return true
     }
 
+    func knownModelBaseCount() -> Int {
+        knownModelBaseRegistry.entries().count
+    }
+
     func currentLiveModels() -> [CodexAppServerClient.RemoteModel] {
         lock.lock()
         defer { lock.unlock() }

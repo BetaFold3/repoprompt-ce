@@ -73,7 +73,7 @@ struct OpenAIAPIModelMetadataDocument: Equatable {
     let disabledModelIDs: [String]
 }
 
-enum OpenAIAPIModelMetadataRowRejectionReason: String, Error, Equatable {
+enum OpenAIAPIModelMetadataRowRejectionReason: String, Error, Equatable, Hashable {
     case notAnObject
     case invalidModelID
     case invalidProtocols

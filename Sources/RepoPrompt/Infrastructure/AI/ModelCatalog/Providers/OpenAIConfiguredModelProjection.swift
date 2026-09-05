@@ -36,6 +36,75 @@ enum OpenAIConfiguredModelProjection {
         return models
     }
 
+    static func projectedMetadataRowCount(
+        rows: [OpenAIAPIModelMetadata],
+        visibleModelIDs: [String],
+        typedCustomModelID: String?,
+        isOfficialOpenAIHost: Bool,
+        staticWireModelNames: Set<String>
+    ) -> Int {
+        let projected = models(
+            rows: rows,
+            visibleModelIDs: visibleModelIDs,
+            typedCustomModelID: typedCustomModelID,
+            isOfficialOpenAIHost: isOfficialOpenAIHost,
+            staticWireModelNames: staticWireModelNames
+        )
+        return Set(projected.compactMap { model -> String? in
+            guard case let .openAIConfigured(selection) = model else { return nil }
+            return selection.modelID
+        }).count
+    }
+
+    static func serviceTierVariants(
+        for baseModels: Set<AIModel>,
+        rows: [OpenAIAPIModelMetadata],
+        enabled: Bool
+    ) -> Set<AIModel> {
+        guard enabled else { return [] }
+        let tiersByModelID = Dictionary(
+            rows.map { ($0.id, $0.serviceTiers) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        var variants = Set<AIModel>()
+
+        for base in baseModels {
+            guard case let .openAIConfigured(selection) = base else { continue }
+            variants.insert(.openAIServiceTierVariant(base: base, tier: "default"))
+            for tier in tiersByModelID[selection.modelID] ?? [] {
+                variants.insert(.openAIServiceTierVariant(base: base, tier: tier.rawValue))
+            }
+        }
+        return variants
+    }
+
+    static func legacyServiceTierVariants(
+        for baseModels: Set<AIModel>,
+        enabled: Bool
+    ) -> Set<AIModel> {
+        guard enabled else { return [] }
+        let eligibleBases = baseModels.filter { model in
+            guard model.providerType == .openAI,
+                  model.usesResponsesAPI,
+                  !model.isOpenAIServiceTierVariant
+            else {
+                return false
+            }
+            if case .openAIConfigured = model {
+                return false
+            }
+            return true
+        }
+
+        return Set(eligibleBases.flatMap { base in
+            [
+                AIModel.openAIServiceTierVariant(base: base, tier: "default"),
+                AIModel.openAIServiceTierVariant(base: base, tier: "flex"),
+                AIModel.openAIServiceTierVariant(base: base, tier: "priority")
+            ]
+        })
+    }
+
     static func staticModels(
         _ models: Set<AIModel>,
         visibleModelIDs: [String],

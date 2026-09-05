@@ -54,6 +54,20 @@ final class OpenAIAPIModelMetadataResolverTests: XCTestCase {
         XCTAssertEqual(failed.rows.map(\.id), ["baseline", "local"])
         XCTAssertEqual(failed.status.overrideState, .failed(.malformedJSON))
         XCTAssertEqual(failed.status.overrideCount, 1)
+        XCTAssertTrue(failed.status.hasLastGoodOverride)
+    }
+
+    func testMalformedOverrideRetainsEmptyValidLastGoodLayerIdentity() throws {
+        let resolver = try makeResolver()
+        let loaded = resolver.reload(overrideData: data(
+            #"{"schema_version":2,"models":[]}"#
+        ))
+        XCTAssertTrue(loaded.status.hasLastGoodOverride)
+        XCTAssertEqual(loaded.status.overrideCount, 0)
+
+        let failed = resolver.reload(overrideData: Data("{".utf8))
+        XCTAssertTrue(failed.status.hasLastGoodOverride)
+        XCTAssertEqual(failed.status.overrideState, .failed(.malformedJSON))
     }
 
     func testMissingOverrideFileClearsLastGoodLocalLayer() throws {
@@ -124,7 +138,38 @@ final class OpenAIAPIModelMetadataResolverTests: XCTestCase {
         ))
 
         XCTAssertEqual(resolution.status.rejectedCount, 1)
+        XCTAssertEqual(resolution.status.rejectedByReason, [.invalidModelID: 1])
         XCTAssertEqual(resolution.status.duplicateWarningCount, 1)
+    }
+
+    func testRejectionReasonsCombineBaselineAndLastGoodOverride() throws {
+        let resolver = try OpenAIAPIModelMetadataResolver(
+            baselineData: data(
+                """
+                {"schema_version":2,"models":[
+                  {"id":"baseline","protocols":["responses"],"streaming":true},
+                  {"id":"bad id","protocols":["responses"],"streaming":true}
+                ]}
+                """
+            )
+        )
+        _ = resolver.reload(overrideData: data(
+            """
+            {"schema_version":2,"models":[
+              {"id":"override","protocols":["responses"],"streaming":true},
+              {"id":"bad-protocol","protocols":["unknown"],"streaming":true}
+            ]}
+            """
+        ))
+
+        let failed = resolver.reload(overrideData: Data("{".utf8))
+
+        XCTAssertEqual(failed.status.rejectedCount, 2)
+        XCTAssertEqual(failed.status.rejectedByReason, [
+            .invalidModelID: 1,
+            .invalidProtocols: 1
+        ])
+        XCTAssertEqual(failed.status.overrideState, .failed(.malformedJSON))
     }
 
     private func makeResolver(

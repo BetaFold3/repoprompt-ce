@@ -139,6 +139,148 @@ final class APIModelCatalogTests: XCTestCase {
         let retained = await catalog.cachedSnapshot(for: scope)
         XCTAssertEqual(failedResult, knownGood)
         XCTAssertEqual(retained, knownGood)
+        let reportedFailure = await catalog.refreshFailure(for: scope)
+        XCTAssertNotNil(reportedFailure)
+
+        let recoveredRefresh = Task { await catalog.refresh(for: scope) }
+        await loader.waitForCallCount(4)
+        await loader.succeed(call: 3, modelIDs: ["recovered"])
+        let recoveredResult = await recoveredRefresh.value
+        let clearedFailure = await catalog.refreshFailure(for: scope)
+        XCTAssertEqual(recoveredResult?.modelIDs, ["recovered"])
+        XCTAssertNil(clearedFailure)
+    }
+
+    func testOpenAIModelsResponseLossilyParsesShutdownDateThroughHTTPDecoder() async throws {
+        let response = try await HTTPDecoding.decode(
+            CustomOpenAIProvider.ModelsResponse.self,
+            from: Data(
+                #"{"data":[{"id":"numeric","shutdown_date":1800000000},{"id":"absent"},{"id":"null","shutdown_date":null},{"id":"string","shutdown_date":"secret"},{"id":"object","shutdown_date":{"value":1800000000}}]}"#.utf8
+            )
+        )
+
+        XCTAssertEqual(response.allModels.map(\.id), ["numeric", "absent", "null", "string", "object"])
+        XCTAssertEqual(response.allModels.first?.shutdown_date, 1_800_000_000)
+        XCTAssertTrue(response.allModels.dropFirst().allSatisfy { $0.shutdown_date == nil })
+    }
+
+    func testDescriptorPayloadPersistsShutdownDateAndLegacyCacheDecodes() async throws {
+        let scope = try makeScope()
+        let shutdown = Date(timeIntervalSince1970: 1_800_000_000)
+        let catalog = APIModelCatalog()
+
+        let snapshot = await catalog.refresh(for: scope, payloadLoader: { _ in
+            APIModelCatalogRefreshPayload(
+                modelIDs: ["gpt-future"],
+                models: [.init(id: "gpt-future", shutdownDate: shutdown)]
+            )
+        })
+        XCTAssertEqual(snapshot?.models, [.init(id: "gpt-future", shutdownDate: shutdown)])
+
+        let legacy = """
+        {"scope":{"providerID":"openai","normalizedEndpoint":"https://api.openai.com/v1","keyFingerprint":"fingerprint"},"modelIDs":["legacy"],"refreshedAt":0,"generation":1}
+        """
+        let decoded = try JSONDecoder().decode(APIModelCatalogSnapshot.self, from: Data(legacy.utf8))
+        XCTAssertEqual(decoded.modelIDs, ["legacy"])
+        XCTAssertTrue(decoded.models.isEmpty)
+    }
+
+    func testStorageLoadNormalizesFiltersAndDeduplicatesDescriptors() async throws {
+        let scope = try makeScope()
+        let firstDate = Date(timeIntervalSince1970: 1_800_000_000)
+        let duplicateDate = Date(timeIntervalSince1970: 1_900_000_000)
+        let stored = APIModelCatalogSnapshot(
+            scope: scope,
+            modelIDs: [" valid ", "valid", "bad\u{0001}"],
+            refreshedAt: Date(timeIntervalSince1970: 10),
+            generation: 4,
+            models: [
+                .init(id: " valid ", shutdownDate: firstDate),
+                .init(id: "valid", shutdownDate: duplicateDate),
+                .init(id: "bad\u{0001}", shutdownDate: duplicateDate),
+                .init(id: "unmatched", shutdownDate: duplicateDate)
+            ]
+        )
+        let catalog = APIModelCatalog(storage: APIModelCatalogStorageSpy(initial: [scope: stored]))
+
+        let loadedSnapshot = await catalog.cachedSnapshot(for: scope)
+        let loaded = try XCTUnwrap(loadedSnapshot)
+        XCTAssertEqual(loaded.modelIDs, ["valid"])
+        XCTAssertEqual(loaded.models, [.init(id: "valid", shutdownDate: firstDate)])
+
+        let resolver = try OpenAIAPIModelMetadataResolver()
+        let status = OpenAIModelCatalogStatus.make(
+            resolution: resolver.currentResolution(),
+            baselineVersion: "baseline",
+            overrideFileURL: URL(fileURLWithPath: "/tmp/metadata.json"),
+            snapshot: loaded,
+            hasSuccessfulLiveRefresh: false,
+            refreshFailure: nil,
+            normalizedEndpoint: scope.normalizedEndpoint,
+            typedCustomModelID: nil,
+            projectedMetadataRowCount: 0
+        )
+        XCTAssertEqual(status.shutdownDatesByModelID, ["valid": firstDate])
+    }
+
+    func testCancellationRetainsSnapshotWithoutPublishingFailure() async throws {
+        let scope = try makeScope()
+        let catalog = APIModelCatalog()
+        let knownGood = await catalog.refresh(for: scope, payloadLoader: { _ in
+            APIModelCatalogRefreshPayload(modelIDs: ["known-good"])
+        })
+
+        let cancelled = await catalog.refresh(for: scope, payloadLoader: { _ in
+            throw CancellationError()
+        })
+
+        let retained = await catalog.cachedSnapshot(for: scope)
+        let failure = await catalog.refreshFailure(for: scope)
+        XCTAssertEqual(cancelled, knownGood)
+        XCTAssertEqual(retained, knownGood)
+        XCTAssertNil(failure)
+    }
+
+    func testArbitraryRefreshErrorBecomesBoundedDisplaySafeFailure() async throws {
+        let scope = try makeScope()
+        let sentinels = [
+            "sk-live-secret",
+            String(repeating: "f", count: 64),
+            "user:password",
+            "query-token",
+            "Authorization: Bearer",
+            "%2Fsecret",
+            String(repeating: "x", count: 2000)
+        ]
+        let catalog = APIModelCatalog()
+
+        _ = await catalog.refresh(for: scope, payloadLoader: { _ in
+            throw APIModelCatalogSensitiveError(message: sentinels.joined(separator: "|"))
+        })
+
+        let reportedFailure = await catalog.refreshFailure(for: scope)
+        let failure = try XCTUnwrap(reportedFailure)
+        XCTAssertEqual(failure.reason, .requestFailed)
+        XCTAssertLessThanOrEqual(failure.message.count, 80)
+
+        let resolver = try OpenAIAPIModelMetadataResolver()
+        let status = OpenAIModelCatalogStatus.make(
+            resolution: resolver.currentResolution(),
+            baselineVersion: "baseline",
+            overrideFileURL: URL(fileURLWithPath: "/tmp/metadata.json"),
+            snapshot: nil,
+            hasSuccessfulLiveRefresh: false,
+            refreshFailure: failure,
+            normalizedEndpoint: "https://api.openai.com/v1",
+            typedCustomModelID: nil,
+            projectedMetadataRowCount: 0
+        )
+        let displayable = String(describing: status)
+        XCTAssertLessThanOrEqual(status.lastError?.count ?? .max, 80)
+        for sentinel in sentinels {
+            XCTAssertFalse(failure.message.contains(sentinel))
+            XCTAssertFalse(displayable.contains(sentinel))
+        }
     }
 
     func testInvalidationGenerationPreventsOlderRefreshFromOverwritingNewerResult() async throws {
@@ -165,9 +307,11 @@ final class APIModelCatalogTests: XCTestCase {
         _ = await olderRefresh.value
 
         let retainedModelIDs = await catalog.cachedSnapshot(for: scope)?.modelIDs
+        let staleFailure = await catalog.refreshFailure(for: scope)
         let savedModelIDs = await storage.savedSnapshots.map(\.modelIDs)
         XCTAssertEqual(newer.modelIDs, ["newer"])
         XCTAssertEqual(retainedModelIDs, ["newer"])
+        XCTAssertNil(staleFailure)
         XCTAssertEqual(savedModelIDs, [["newer"]])
     }
 
@@ -249,6 +393,13 @@ final class APIModelCatalogTests: XCTestCase {
 
 private enum APIModelCatalogTestError: Error {
     case failed
+}
+
+private struct APIModelCatalogSensitiveError: LocalizedError {
+    let message: String
+    var errorDescription: String? {
+        message
+    }
 }
 
 private actor APIModelCatalogLoaderProbe {

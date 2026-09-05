@@ -85,6 +85,13 @@ final class OpenAIAPIModelMetadataTests: XCTestCase {
         XCTAssertEqual(document.models.only?.serviceTiers, [.flex, .priority])
     }
 
+    func testInvalidServiceTierRejectsTheRow() {
+        assertError(
+            #"{"schema_version":2,"models":[{"id":"gpt","protocols":["responses"],"streaming":true,"service_tiers":["batch"]}]}"#,
+            equals: .noValidModels
+        )
+    }
+
     func testVersionTwoAllowsEmptyAndDisableOnlyDocuments() throws {
         let empty = try decode(#"{"schema_version":2,"models":[]}"#)
         let disableOnly = try decode(
