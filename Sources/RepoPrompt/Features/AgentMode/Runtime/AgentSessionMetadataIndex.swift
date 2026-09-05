@@ -58,6 +58,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var agentReasoningEffortRaw: String?
     var lastRunStateRaw: String?
     var autoEditEnabled: Bool
+    var branchRootSessionID: UUID?
     var parentSessionID: UUID?
     var remoteHostID: String?
     var remoteHostName: String?
@@ -142,6 +143,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentReasoningEffortRaw: String?,
         lastRunStateRaw: String?,
         autoEditEnabled: Bool,
+        branchRootSessionID: UUID? = nil,
         parentSessionID: UUID?,
         remoteHostID: String? = nil,
         remoteHostName: String? = nil,
@@ -177,6 +179,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.agentReasoningEffortRaw = agentReasoningEffortRaw
         self.lastRunStateRaw = lastRunStateRaw
         self.autoEditEnabled = autoEditEnabled
+        self.branchRootSessionID = branchRootSessionID
         self.parentSessionID = parentSessionID
         self.remoteHostID = remoteHostID
         self.remoteHostName = remoteHostName
@@ -214,6 +217,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case agentReasoningEffortRaw
         case lastRunStateRaw
         case autoEditEnabled
+        case branchRootSessionID
         case parentSessionID
         case remoteHostID
         case remoteHostName
@@ -272,6 +276,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         agentReasoningEffortRaw = try container.decodeIfPresent(String.self, forKey: .agentReasoningEffortRaw)
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
+        branchRootSessionID = try container.decodeIfPresent(UUID.self, forKey: .branchRootSessionID)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         remoteHostID = try container.decodeIfPresent(String.self, forKey: .remoteHostID)
         remoteHostName = try container.decodeIfPresent(String.self, forKey: .remoteHostName)
@@ -357,6 +362,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && agentReasoningEffortRaw == other.agentReasoningEffortRaw
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
+            && branchRootSessionID == other.branchRootSessionID
             && parentSessionID == other.parentSessionID
             && remoteHostID == other.remoteHostID
             && remoteHostName == other.remoteHostName
@@ -406,6 +412,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentReasoningEffortRaw: session.agentReasoningEffort,
             lastRunStateRaw: session.lastRunState,
             autoEditEnabled: session.autoEditEnabled,
+            branchRootSessionID: session.branchOrigin?.rootSessionID,
             parentSessionID: session.parentSessionID,
             remoteHostID: session.remoteHost?.hostID,
             remoteHostName: session.remoteHost?.hostDisplayName,

@@ -822,6 +822,22 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
+    func hasActiveQuery(agentModeSessionID: UUID) -> Bool {
+        sessions.contains { session in
+            session.agentModeSessionID == agentModeSessionID
+                && runStateBySession[session.id]?.activeQueryId != nil
+        }
+    }
+
+    #if DEBUG
+        @MainActor
+        func test_setActiveQueryID(_ queryID: UUID?, for sessionID: UUID) {
+            ensureSessionStorage(sessionID)
+            runStateBySession[sessionID]?.activeQueryId = queryID
+        }
+    #endif
+
+    @MainActor
     private func recomputeWorkspaceBusyAndFontFreeze() {
         let anyStreaming = !streamingSessions.isEmpty
         workspaceManager.isChatBusy = anyStreaming

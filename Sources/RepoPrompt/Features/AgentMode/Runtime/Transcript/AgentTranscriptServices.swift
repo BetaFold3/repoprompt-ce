@@ -2184,6 +2184,14 @@ enum AgentSourceItemIDRepair {
     }
 }
 
+enum AgentTranscriptBranchPrefixError: Error, Equatable {
+    case missingTranscript
+    case turnNotFound
+    case turnNotFullyRetained
+    case turnNotCompleted
+    case missingFinalAssistantReply
+}
+
 enum AgentTranscriptIO {
     private static let hiddenTranscriptToolNames: Set<String> = [
         "wait_for_next_user_instruction",
@@ -2267,6 +2275,86 @@ enum AgentTranscriptIO {
             nextSequenceIndex: nextSequenceIndex
         )
         return compact ? AgentTranscriptCompactor.compact(transcript, protection: protection) : transcript
+    }
+
+    static func branchPrefix(
+        of transcript: AgentTranscript,
+        throughTurnID turnID: UUID
+    ) throws -> AgentTranscript {
+        guard let targetIndex = transcript.turns.firstIndex(where: { $0.id == turnID }) else {
+            throw AgentTranscriptBranchPrefixError.turnNotFound
+        }
+        let targetTurn = transcript.turns[targetIndex]
+        guard targetTurn.retentionTier == .full else {
+            throw AgentTranscriptBranchPrefixError.turnNotFullyRetained
+        }
+        guard targetTurn.completedAt != nil,
+              targetTurn.terminalState == nil || targetTurn.terminalState == .completed,
+              targetTurn.responseSpans.allSatisfy({ $0.lifecycle == .completed })
+        else {
+            throw AgentTranscriptBranchPrefixError.turnNotCompleted
+        }
+        guard let conclusionActivityID = targetTurn.conclusionActivityID,
+              let conclusion = targetTurn.allActivities.first(where: { $0.id == conclusionActivityID }),
+              conclusion.itemKind == .assistant || conclusion.itemKind == .assistantInline,
+              !conclusion.isStreaming,
+              AgentDisplayableText.hasDisplayableBody(conclusion.text),
+              terminalAssistantResponseText(in: targetTurn) != nil
+        else {
+            throw AgentTranscriptBranchPrefixError.missingFinalAssistantReply
+        }
+
+        let retainedTurns = Array(transcript.turns.prefix(through: targetIndex))
+        let clampedFrontier: AgentTranscriptCompactionFrontier? = if let frontier = transcript.compactionFrontier {
+            if frontier.frozenPrefixTurnCount > 0 {
+                AgentTranscriptCompactionFrontier(
+                    version: frontier.version,
+                    frozenPrefixTurnCount: min(frontier.frozenPrefixTurnCount, retainedTurns.count),
+                    lastFrozenTurnID: retainedTurns[min(frontier.frozenPrefixTurnCount, retainedTurns.count) - 1].id
+                )
+            } else {
+                nil
+            }
+        } else {
+            nil
+        }
+        return AgentTranscript(
+            version: transcript.version,
+            turns: retainedTurns,
+            nextSequenceIndex: transcript.nextSequenceIndex,
+            compactionFrontier: clampedFrontier
+        )
+    }
+
+    /// Produces the session-owned persistence payload for a branch without changing lineage or identity.
+    /// The orchestration layer must assign the new session ID and branch origin.
+    static func branchPrefix(
+        of session: AgentSession,
+        throughTurnID turnID: UUID
+    ) throws -> AgentSession {
+        guard let transcript = session.transcript else {
+            throw AgentTranscriptBranchPrefixError.missingTranscript
+        }
+        let prefix = try branchPrefix(of: transcript, throughTurnID: turnID)
+        let projection = AgentTranscriptProjectionBuilder.build(from: prefix)
+        let retainedRowIDs = Set((projection.archivedRows + projection.workingRows).map(\.id.uuidString))
+        let projectionCounts = AgentTranscriptProjectionBuilder.projectionCounts(for: prefix)
+        let completedAt = prefix.turns.last?.completedAt
+
+        var copy = session
+        copy.items = []
+        copy.transcript = prefix
+        copy.uiToolResultPayloadsByItemID = session.uiToolResultPayloadsByItemID.filter {
+            retainedRowIDs.contains($0.key)
+        }
+        copy.itemCount = projectionCounts.canonicalVisibleRowCount
+        copy.transcriptProjectionCounts = projectionCounts
+        copy.lastUserMessageAt = lastUserInteractionDate(in: prefix)
+        copy.providerTokenUsageByTurn = session.providerTokenUsageByTurn.filter { usage in
+            guard let completedAt else { return false }
+            return usage.timestamp <= completedAt
+        }
+        return copy
     }
 
     /// Canonical compatibility projection for handoff callers that only retain legacy items.

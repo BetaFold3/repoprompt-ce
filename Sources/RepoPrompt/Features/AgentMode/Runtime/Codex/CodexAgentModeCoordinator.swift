@@ -8981,6 +8981,61 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         await teardown?()
     }
 
+    func prepareControllerForBranching(
+        session: AgentModeViewModel.TabSession
+    ) async throws -> any CodexSessionControlling {
+        cancelCodexIdleShutdown(for: session.tabID)
+        if session.codexController?.hasActiveThread != true || session.codexNeedsReconnect {
+            await ensureCodexNativeSession(
+                session: session,
+                policyAlreadyInstalled: false,
+                allowMissingRolloutFallback: false,
+                allowResumeTimeoutFallback: false,
+                preserveExistingRunID: true,
+                semanticRunState: .idle
+            )
+        }
+        guard session.runState == .idle,
+              let controller = session.codexController,
+              controller.hasActiveThread
+        else {
+            throw CodexBranchOperationError.exactResumeFailed
+        }
+        return controller
+    }
+
+    func hasPendingTerminalSettle(for tabID: UUID) -> Bool {
+        pendingCodexTerminalSettleByTabID[tabID] != nil
+    }
+
+    func finishBranchOperation(session: AgentModeViewModel.TabSession) {
+        scheduleCodexIdleShutdownIfNeeded(for: session, reason: "branch-operation-finished")
+    }
+
+    func collectBranchManifest(
+        controller: any CodexSessionControlling,
+        threadID: String
+    ) async throws -> CodexForkStructuralVerifier.Manifest {
+        var slices: [CodexForkStructuralVerifier.PageSlice] = []
+        var cursor: String?
+        var seen: Set<String> = []
+        repeat {
+            let requestedCursor = cursor
+            let page = try await controller.listThreadTurns(
+                threadID: threadID,
+                cursor: requestedCursor,
+                limit: 100,
+                sortDirection: .descending
+            )
+            slices.append(.init(requestedCursor: requestedCursor, page: page))
+            cursor = page.nextCursor
+            if let cursor, !seen.insert(cursor).inserted {
+                throw CodexForkStructuralVerificationError.repeatedCursor(cursor)
+            }
+        } while cursor != nil
+        return try CodexForkStructuralVerifier.collectManifestFromDescendingPages(slices)
+    }
+
     func shutdownCodexSession(
         _ session: AgentModeViewModel.TabSession,
         clearTabScopedCoordinatorState: Bool = true,

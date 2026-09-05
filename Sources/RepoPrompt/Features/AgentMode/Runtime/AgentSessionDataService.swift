@@ -12,6 +12,30 @@ enum AgentSessionDataError: Error {
 
 // MARK: - Agent Session Metadata
 
+struct AgentSessionBranchTree: Equatable {
+    let rootSessionID: UUID
+    let records: [AgentSessionMetadataRecord]
+
+    var requiresExactResume: Bool {
+        records.contains { $0.branchRootSessionID != nil }
+    }
+}
+
+enum AgentSessionBranchTreeQueryResult: Equatable {
+    case available(AgentSessionBranchTree)
+    case unavailable
+
+    /// Fail closed: unavailable index evidence must never authorize a fallback resume.
+    var requiresExactResume: Bool {
+        switch self {
+        case let .available(tree):
+            tree.requiresExactResume
+        case .unavailable:
+            true
+        }
+    }
+}
+
 /// Lightweight metadata for agent session listing
 struct AgentSessionMeta {
     let id: UUID
@@ -169,6 +193,7 @@ actor AgentSessionDataService {
         let codexLastTotalTokens: Int?
         let codexTotalTotalTokens: Int?
         let codexMcpSessionKey: String?
+        let branchOrigin: AgentSessionBranchOrigin?
         let parentSessionID: UUID?
         let worktreeBindings: [AgentSessionWorktreeBinding]?
         let worktreeMergeOperations: [AgentSessionWorktreeMergeOperation]?
@@ -206,6 +231,7 @@ actor AgentSessionDataService {
             case codexLastTotalTokens
             case codexTotalTotalTokens
             case codexMcpSessionKey
+            case branchOrigin
             case parentSessionID
             case worktreeBindings
             case worktreeMergeOperations
@@ -251,6 +277,7 @@ actor AgentSessionDataService {
             codexLastTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexLastTotalTokens)
             codexTotalTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexTotalTotalTokens)
             codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
+            branchOrigin = try container.decodeIfPresent(AgentSessionBranchOrigin.self, forKey: .branchOrigin)
             parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
             worktreeBindings = try container.decodeIfPresent(
                 [AgentSessionWorktreeBinding].self,
@@ -1024,6 +1051,61 @@ actor AgentSessionDataService {
         try await metadataRecords(for: workspace)
     }
 
+    struct IndexedBranchMembership: Equatable {
+        let memberIDs: Set<UUID>
+        let isComplete: Bool
+    }
+
+    /// Returns positive branch-tree membership from the warm metadata index, rebuilding it only
+    /// when no index exists. Quarantined files make the evidence incomplete, so callers must
+    /// preserve already-known positive membership until a complete reconciliation confirms removal.
+    func indexedAgentSessionBranchMemberIDs(for workspace: WorkspaceModel) async -> IndexedBranchMembership? {
+        do {
+            guard let index = try await metadataIndex(for: workspace, mode: .backfillIfMissing) else {
+                return nil
+            }
+            let rootIDs = Set(index.entries.compactMap(\.branchRootSessionID))
+            let memberIDs = Set(index.entries.compactMap { record in
+                if rootIDs.contains(record.id) || record.branchRootSessionID.map(rootIDs.contains) == true {
+                    return record.id
+                }
+                return nil
+            }).union(rootIDs)
+            return IndexedBranchMembership(
+                memberIDs: memberIDs,
+                isComplete: index.quarantinedFiles.isEmpty
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    /// Returns the exact persisted branch tree containing `sessionID`.
+    /// A forced rebuild makes session files authoritative; any unreadable session fails closed.
+    func agentSessionBranchTree(
+        containing sessionID: UUID,
+        for workspace: WorkspaceModel
+    ) async -> AgentSessionBranchTreeQueryResult {
+        do {
+            guard let index = try await metadataIndex(for: workspace, mode: .forceReconcile),
+                  index.quarantinedFiles.isEmpty,
+                  let sessionRecord = index.entries.first(where: { $0.id == sessionID })
+            else {
+                return .unavailable
+            }
+            let rootSessionID = sessionRecord.branchRootSessionID ?? sessionRecord.id
+            let records = index.entries.filter { record in
+                record.id == rootSessionID || record.branchRootSessionID == rootSessionID
+            }.sortedForAgentSessionMetadataIndex()
+            guard records.contains(where: { $0.id == sessionID }) else {
+                return .unavailable
+            }
+            return .available(AgentSessionBranchTree(rootSessionID: rootSessionID, records: records))
+        } catch {
+            return .unavailable
+        }
+    }
+
     func sidebarStreamMetadataRecords(for workspace: WorkspaceModel) async throws -> [AgentSessionMetadataRecord] {
         let folder = try ensureAgentSessionsFolder(for: workspace)
         if let index = await readMetadataIndexIfAvailable(folder: folder) {
@@ -1213,6 +1295,7 @@ actor AgentSessionDataService {
                 codexLastTotalTokens: header.codexLastTotalTokens,
                 codexTotalTotalTokens: header.codexTotalTotalTokens,
                 codexMcpSessionKey: header.codexMcpSessionKey,
+                branchOrigin: header.branchOrigin,
                 parentSessionID: header.parentSessionID,
                 pendingHandoffPayload: header.pendingHandoffPayload,
                 pendingHandoffCreatedAt: header.pendingHandoffCreatedAt,

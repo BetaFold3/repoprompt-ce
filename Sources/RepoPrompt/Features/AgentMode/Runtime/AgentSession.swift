@@ -159,6 +159,16 @@ struct AgentSessionRemoteHostBinding: Codable, Equatable {
 // MARK: - Agent Session
 
 // swiftformat:disable:next redundantSendable
+struct AgentSessionBranchOrigin: Codable, Equatable, Sendable {
+    let rootSessionID: UUID
+    let sourceSessionID: UUID
+    let sourceTurnID: UUID
+    let sourceCodexTurnID: String
+    let sourceTurnOrdinal: Int
+    let createdAt: Date
+}
+
+// swiftformat:disable:next redundantSendable
 struct PersistedRemoteResendPayload: Codable, Sendable, Equatable {
     let providerText: String
     let wasStart: Bool
@@ -289,6 +299,9 @@ struct AgentSession: Codable, Identifiable {
     var codexTotalTotalTokens: Int?
     var codexMcpSessionKey: String?
 
+    /// Branch lineage. Root sessions keep this nil.
+    var branchOrigin: AgentSessionBranchOrigin?
+
     /// Parent session ID for thread nesting (child sessions spawned from another session)
     var parentSessionID: UUID?
 
@@ -354,6 +367,7 @@ struct AgentSession: Codable, Identifiable {
         codexLastTotalTokens: Int? = nil,
         codexTotalTotalTokens: Int? = nil,
         codexMcpSessionKey: String? = nil,
+        branchOrigin: AgentSessionBranchOrigin? = nil,
         parentSessionID: UUID? = nil,
         pendingHandoffPayload: String? = nil,
         pendingHandoffCreatedAt: Date? = nil,
@@ -398,6 +412,7 @@ struct AgentSession: Codable, Identifiable {
         self.codexLastTotalTokens = codexLastTotalTokens
         self.codexTotalTotalTokens = codexTotalTotalTokens
         self.codexMcpSessionKey = codexMcpSessionKey
+        self.branchOrigin = branchOrigin
         self.parentSessionID = parentSessionID
         self.pendingHandoffPayload = pendingHandoffPayload
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
@@ -445,6 +460,7 @@ struct AgentSession: Codable, Identifiable {
         case codexLastTotalTokens
         case codexTotalTotalTokens
         case codexMcpSessionKey
+        case branchOrigin
         case parentSessionID
         case pendingHandoffPayload
         case pendingHandoffCreatedAt
@@ -503,6 +519,7 @@ struct AgentSession: Codable, Identifiable {
         codexLastTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexLastTotalTokens)
         codexTotalTotalTokens = try container.decodeIfPresent(Int.self, forKey: .codexTotalTotalTokens)
         codexMcpSessionKey = try container.decodeIfPresent(String.self, forKey: .codexMcpSessionKey)
+        branchOrigin = try container.decodeIfPresent(AgentSessionBranchOrigin.self, forKey: .branchOrigin)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         pendingHandoffPayload = try container.decodeIfPresent(String.self, forKey: .pendingHandoffPayload)
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)

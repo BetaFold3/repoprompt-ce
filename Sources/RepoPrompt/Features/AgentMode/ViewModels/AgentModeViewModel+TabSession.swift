@@ -198,6 +198,7 @@ extension AgentModeViewModel {
         /// Session provenance (plan §6.4). `.user` unless MCP control created or
         /// claimed this session.
         var origin: AgentSessionOrigin = .user
+        var branchOrigin: AgentSessionBranchOrigin?
         /// Whether this session was originally created by an MCP client (derived from `origin`).
         var isMCPOriginated: Bool {
             origin.isMCPOriginated
@@ -556,17 +557,33 @@ extension AgentModeViewModel {
             didSet {
                 guard draftText != oldValue else { return }
                 draftMutationGeneration &+= 1
+                composerMutationGeneration &+= 1
             }
         }
 
         private(set) var draftMutationGeneration: UInt64 = 0
+        private(set) var composerMutationGeneration: UInt64 = 0
 
         /// Selected workflow template for next message
-        var selectedWorkflow: AgentWorkflowDefinition?
+        var selectedWorkflow: AgentWorkflowDefinition? {
+            didSet {
+                composerMutationGeneration &+= 1
+            }
+        }
 
-        // Pending image attachments for the next user turn
-        @Published var pendingImageAttachments: [AgentImageAttachment] = []
-        @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
+        /// Pending image attachments for the next user turn
+        @Published var pendingImageAttachments: [AgentImageAttachment] = [] {
+            didSet {
+                composerMutationGeneration &+= 1
+            }
+        }
+
+        @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = [] {
+            didSet {
+                composerMutationGeneration &+= 1
+            }
+        }
+
         var attachmentsPendingProviderConsumptionCleanup: [AgentImageAttachment] = []
         var attachmentTurnState: AttachmentTurnState = .idle
 
@@ -673,11 +690,18 @@ extension AgentModeViewModel {
         }
 
         private(set) var bindingTransitionGeneration: UInt64 = 0
+        var isBranchOperationInProgress = false
+        var exactResumePreflightToken: UUID?
+        var isExactResumePreflightInProgress: Bool {
+            exactResumePreflightToken != nil
+        }
+
         private(set) var bindingTransitionInProgress: Bool = false
         private(set) var persistenceMutationGeneration: UInt64 = 0
         var saveRequestGeneration: UInt64 = 0
         var parentSessionID: UUID?
         var hasLoadedPersistedState: Bool = false
+        var didSucceedPersistedHydrationForCurrentBinding = false
         private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
         private(set) var authoritativeHydratedBindingTransitionGeneration: UInt64?
         var persistedLoadTask: Task<Void, Never>?

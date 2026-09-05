@@ -5,6 +5,33 @@ import XCTest
 
 @MainActor
 final class AgentOraclePillRoutingTests: XCTestCase {
+    func testActiveQueryOccupancyMatchesOwningAgentSessionOnly() async throws {
+        let fixture = try await makeFixture()
+        defer { fixture.cleanup() }
+        let ownerID = UUID()
+        let owned = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            agentModeSessionID: ownerID,
+            name: "Owned active lane"
+        )
+        let other = ChatSession(
+            workspaceID: fixture.workspace.id,
+            composeTabID: fixture.tabID,
+            agentModeSessionID: UUID(),
+            name: "Other lane"
+        )
+        fixture.oracleViewModel.sessions = [owned, other]
+
+        XCTAssertFalse(fixture.oracleViewModel.hasActiveQuery(agentModeSessionID: ownerID))
+        fixture.oracleViewModel.test_setActiveQueryID(UUID(), for: other.id)
+        XCTAssertFalse(fixture.oracleViewModel.hasActiveQuery(agentModeSessionID: ownerID))
+        fixture.oracleViewModel.test_setActiveQueryID(UUID(), for: owned.id)
+        XCTAssertTrue(fixture.oracleViewModel.hasActiveQuery(agentModeSessionID: ownerID))
+        fixture.oracleViewModel.test_setActiveQueryID(nil, for: owned.id)
+        XCTAssertFalse(fixture.oracleViewModel.hasActiveQuery(agentModeSessionID: ownerID))
+    }
+
     func testExplicitRequestStateRejectsBlankStaleTabAndMismatchedSession() throws {
         let tabID = UUID()
         let otherTabID = UUID()

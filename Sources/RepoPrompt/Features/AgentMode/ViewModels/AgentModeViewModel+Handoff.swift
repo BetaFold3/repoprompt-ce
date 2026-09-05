@@ -270,7 +270,8 @@ extension AgentModeViewModel {
         guard let session = sessions[tabID],
               ObjectIdentifier(session) == identity,
               session.remoteHost?.hostID == hostID,
-              session.remoteHost?.remoteSessionID == remoteSessionID
+              session.remoteHost?.remoteSessionID == remoteSessionID,
+              !session.isBranchOperationInProgress
         else {
             throw AgentHandoffConfigurationError.sourceUnavailable
         }

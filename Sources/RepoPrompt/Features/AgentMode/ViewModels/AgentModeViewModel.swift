@@ -694,6 +694,9 @@ final class AgentModeViewModel: ObservableObject {
     private var activeSessionIndexRefreshHasPublishedFullBatch = false
     private var saveInFlightSessionIDs: Set<UUID> = []
     private var saveRequestedWhileInFlightSessionIDs: Set<UUID> = []
+    private var knownCodexBranchTreeMemberIDsByWorkspaceID: [UUID: Set<UUID>] = [:]
+    private var branchSwitchTargetReservations: [UUID: UUID] = [:]
+    private var branchOperationSourceReservations: [UUID: UUID] = [:]
     var sidebarAutoArchiveTask: Task<Void, Never>?
     var isApplyingSidebarAutoArchive = false
     let sidebarAutoArchivePolicy = AgentModeSidebarAutoArchivePolicy()
@@ -742,6 +745,19 @@ final class AgentModeViewModel: ObservableObject {
 
         var test_dataService: AgentSessionDataService {
             dataService
+        }
+
+        func test_setLastKnownWorkspaceSnapshot(_ workspace: WorkspaceModel?) {
+            lastKnownWorkspaceSnapshot = workspace
+        }
+
+        var test_branchFailureInjector: ((String) -> Error?)?
+        var test_oracleBranchOccupancyOverride: Bool?
+        var test_exactResumePreflightDidFinish: (() -> Void)?
+        var test_rebindBeforeFinalAwait: (() async -> Void)?
+
+        func test_reconcileCodexBranchTreeMembership(for workspace: WorkspaceModel) async {
+            await reconcileCodexBranchTreeMembership(for: workspace)
         }
 
         var test_codexCoordinator: CodexAgentModeCoordinator {
@@ -940,9 +956,25 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_rebindPersistentSession(
             _ sessionID: UUID,
-            to session: TabSession
+            to session: TabSession,
+            allowTransferFromAnotherTab: Bool = true
         ) async throws -> AgentPersistentSessionBindingIdentity {
-            try await rebindPersistentSession(sessionID, to: session)
+            try await rebindPersistentSession(
+                sessionID,
+                to: session,
+                allowTransferFromAnotherTab: allowTransferFromAnotherTab
+            )
+        }
+
+        func test_reserveBranchSwitchTarget(_ sessionID: UUID, for tabID: UUID) {
+            branchSwitchTargetReservations[sessionID] = tabID
+        }
+
+        static func test_reconciledBranchMembership(
+            existing: Set<UUID>,
+            evidence: AgentSessionDataService.IndexedBranchMembership
+        ) -> Set<UUID> {
+            reconciledBranchMembership(existing: existing, evidence: evidence)
         }
 
         func test_saveCommitToken(for session: TabSession, workspaceID: UUID) -> SessionSaveCommitToken? {
@@ -4060,6 +4092,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         if invalidateAsyncWork {
+            session.exactResumePreflightToken = nil
             cancelPersistedLoad(for: session)
             removePendingUIRefresh(for: session.tabID)
         }
@@ -4207,6 +4240,9 @@ final class AgentModeViewModel: ObservableObject {
         switch persistentBindingResolution(for: sessionID) {
         case let .unique(tabID):
             guard let session = sessions[tabID], session.activeAgentSessionID == sessionID else { return nil }
+            guard !session.isBranchOperationInProgress else {
+                throw MCPError.invalidParams("branch_operation_in_progress: Finish branching before mutating this agent session.")
+            }
             return session
         case .notFound:
             return nil
@@ -4247,8 +4283,19 @@ final class AgentModeViewModel: ObservableObject {
         _ requestedSessionID: UUID,
         to targetSession: TabSession,
         expectedTransition: PersistentBindingTransitionToken? = nil,
-        requiresHydration: Bool = false
+        requiresHydration: Bool = false,
+        allowTransferFromAnotherTab: Bool = true
     ) async throws -> AgentPersistentSessionBindingIdentity {
+        if let reservedTabID = branchSwitchTargetReservations[requestedSessionID],
+           reservedTabID != targetSession.tabID
+        {
+            throw CodexBranchOperationError.targetOpenElsewhere
+        }
+        if let reservedTabID = branchOperationSourceReservations[requestedSessionID],
+           reservedTabID != targetSession.tabID
+        {
+            throw CodexBranchOperationError.targetOpenElsewhere
+        }
         if targetSession.activeAgentSessionID == requestedSessionID,
            let binding = targetSession.persistentSessionBindingIdentity
         {
@@ -4261,6 +4308,9 @@ final class AgentModeViewModel: ObservableObject {
         case .ambiguous: throw ambiguousAgentSessionError()
         }
         let sourceSession = existingSourceTabID.flatMap { sessions[$0] }
+        if !allowTransferFromAnotherTab, sourceSession != nil, sourceSession !== targetSession {
+            throw CodexBranchOperationError.targetOpenElsewhere
+        }
         let targetCurrentSessionID = targetSession.activeAgentSessionID
 
         let targetToken: PersistentBindingTransitionToken
@@ -4339,6 +4389,53 @@ final class AgentModeViewModel: ObservableObject {
             }
         }
 
+        if !allowTransferFromAnotherTab {
+            switch persistentBindingResolution(for: requestedSessionID) {
+            case let .unique(ownerTabID) where ownerTabID != targetSession.tabID:
+                throw CodexBranchOperationError.targetOpenElsewhere
+            case .ambiguous:
+                throw CodexBranchOperationError.targetOpenElsewhere
+            case .unique, .notFound:
+                break
+            }
+        }
+
+        #if DEBUG
+            await test_rebindBeforeFinalAwait?()
+        #endif
+        if let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
+            await releaseSessionWorktreeOwnership(sessionID: targetCurrentSessionID)
+        }
+        guard persistentBindingTransitionIsCurrent(targetToken) else {
+            throw PersistentBindingMutationError.staleTransition
+        }
+        if let sourceToken, !persistentBindingTransitionIsCurrent(sourceToken) {
+            throw PersistentBindingMutationError.staleTransition
+        }
+        if let reservedTabID = branchSwitchTargetReservations[requestedSessionID],
+           reservedTabID != targetSession.tabID
+        {
+            throw CodexBranchOperationError.targetOpenElsewhere
+        }
+        if let reservedTabID = branchOperationSourceReservations[requestedSessionID],
+           reservedTabID != targetSession.tabID
+        {
+            throw CodexBranchOperationError.targetOpenElsewhere
+        }
+        if !allowTransferFromAnotherTab {
+            switch persistentBindingResolution(for: requestedSessionID) {
+            case let .unique(ownerTabID) where ownerTabID != targetSession.tabID:
+                throw CodexBranchOperationError.targetOpenElsewhere
+            case .ambiguous:
+                throw CodexBranchOperationError.targetOpenElsewhere
+            case .unique, .notFound:
+                break
+            }
+        }
+        guard !bindingHasSynchronousOwnership(targetSession) else {
+            throw PersistentBindingMutationError.blockedByOwnership
+        }
+
         if let sourceSession, sourceSession !== targetSession {
             _ = installPersistentSessionBinding(
                 sessionID: nil,
@@ -4347,15 +4444,14 @@ final class AgentModeViewModel: ObservableObject {
                 invalidateAsyncWork: true
             )
             guard sourceSession.activeAgentSessionID == nil else {
+                _ = installPersistentSessionBinding(
+                    sessionID: requestedSessionID,
+                    on: sourceSession,
+                    updateWorkspaceMetadata: true,
+                    invalidateAsyncWork: true
+                )
                 throw PersistentBindingMutationError.staleTransition
             }
-        }
-
-        if let targetCurrentSessionID, targetCurrentSessionID != requestedSessionID {
-            await releaseSessionWorktreeOwnership(sessionID: targetCurrentSessionID)
-        }
-        if requiresHydration {
-            targetSession.hasLoadedPersistedState = false
         }
         guard let binding = installPersistentSessionBinding(
             sessionID: requestedSessionID,
@@ -4373,10 +4469,18 @@ final class AgentModeViewModel: ObservableObject {
             }
             throw PersistentBindingMutationError.staleTransition
         }
+        if requiresHydration {
+            targetSession.hasLoadedPersistedState = false
+            targetSession.didSucceedPersistedHydrationForCurrentBinding = false
+        }
         return binding
     }
 
-    private func loadSessionFromDisk(for session: TabSession) async {
+    private func loadSessionFromDisk(
+        for session: TabSession,
+        allowBranchOperation: Bool = false
+    ) async {
+        guard allowBranchOperation || !session.isBranchOperationInProgress else { return }
         #if DEBUG
             let loadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             let debugTabID = session.tabID
@@ -4605,6 +4709,8 @@ final class AgentModeViewModel: ObservableObject {
                 #endif
                 return
             }
+            session.didSucceedPersistedHydrationForCurrentBinding = true
+            await reconcileCodexBranchTreeMembership(for: workspace)
             #if DEBUG
                 if let applyStartMS {
                     applyDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: applyStartMS)
@@ -4722,6 +4828,7 @@ final class AgentModeViewModel: ObservableObject {
         session.hasSentFirstMessage = payload.transcript.turns.contains { $0.request != nil }
         session.parentSessionID = agentSession.parentSessionID
         session.origin = agentSession.origin
+        session.branchOrigin = agentSession.branchOrigin
         session.remoteHost = agentSession.remoteHost
         session.locallyAttributedStartItemID = agentSession.locallyAttributedStartItemID
         rehydratePendingRemoteOptimisticUserItemIDs(for: session)
@@ -11787,6 +11894,11 @@ final class AgentModeViewModel: ObservableObject {
         _ tabIDs: Set<UUID>,
         reason: PromptViewModel.ComposeTabRemovalReason
     ) async {
+        for tabID in tabIDs {
+            while let session = sessions[tabID], session.isBranchOperationInProgress {
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+        }
         // Drop any sidebar attention / observed run-state for tabs that are
         // going away so we don't leave dangling entries referring to dead IDs.
         cleanupSidebarRunAttention(tabIDs: tabIDs)
@@ -11835,8 +11947,12 @@ final class AgentModeViewModel: ObservableObject {
                 sessions.removeValue(forKey: tabID)
                 tabsWithActiveAgentRun.remove(tabID)
             case .close:
-                if let workspace = workspaceManager?.activeWorkspace {
-                    try? await dataService.deleteAgentSessions(forComposeTabID: tabID, for: workspace)
+                if let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot {
+                    if let boundID {
+                        try? await dataService.deleteAgentSession(id: boundID, for: workspace)
+                    } else {
+                        try? await dataService.deleteAgentSessions(forComposeTabID: tabID, for: workspace)
+                    }
                 }
                 removeSessionIndex(forTabID: tabID)
                 tabDraftText.removeValue(forKey: tabID)
@@ -11845,8 +11961,12 @@ final class AgentModeViewModel: ObservableObject {
                 sessions.removeValue(forKey: tabID)
                 tabsWithActiveAgentRun.remove(tabID)
             case .deleteStashed:
-                if let workspace = workspaceManager?.activeWorkspace {
-                    try? await dataService.deleteAgentSessions(forComposeTabID: tabID, for: workspace)
+                if let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot {
+                    if let boundID {
+                        try? await dataService.deleteAgentSession(id: boundID, for: workspace)
+                    } else {
+                        try? await dataService.deleteAgentSessions(forComposeTabID: tabID, for: workspace)
+                    }
                 }
                 removeSessionIndex(forTabID: tabID)
                 tabDraftText.removeValue(forKey: tabID)
@@ -11974,6 +12094,13 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func saveSession(for tabID: UUID) async {
+        try? await saveSessionThrowing(for: tabID)
+    }
+
+    private func saveSessionThrowing(
+        for tabID: UUID,
+        requireCommittedSave: Bool = false
+    ) async throws {
         #if DEBUG
             let diagnosticsStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
             AgentModePerfDiagnostics.increment("save.session.invoked", tabID: tabID)
@@ -11982,12 +12109,16 @@ final class AgentModeViewModel: ObservableObject {
             #if DEBUG
                 AgentModePerfDiagnostics.event("save.session.skipped", tabID: tabID, fields: ["reason": "suppressed"])
             #endif
+            if requireCommittedSave { throw CodexBranchOperationError.sourceSessionMissing }
             return
         }
         guard let session = sessions[tabID],
-              let workspace = workspaceManager?.activeWorkspace,
-              session.isDirty || session.activeAgentSessionID == nil
+              let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
         else {
+            if requireCommittedSave { throw CodexBranchOperationError.sourceSessionMissing }
+            return
+        }
+        guard session.isDirty || session.activeAgentSessionID == nil else {
             #if DEBUG
                 AgentModePerfDiagnostics.event("save.session.skipped", tabID: tabID, fields: ["reason": "missingOrClean"])
             #endif
@@ -11999,11 +12130,13 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
         guard let sessionID = ensureSessionBoundToTab(session) else {
+            if requireCommittedSave { throw CodexBranchOperationError.sourceSessionMissing }
             return
         }
         session.saveRequestGeneration &+= 1
         if saveInFlightSessionIDs.contains(sessionID) {
             saveRequestedWhileInFlightSessionIDs.insert(sessionID)
+            if requireCommittedSave { throw CodexBranchOperationError.staleOperation }
             return
         }
         saveInFlightSessionIDs.insert(sessionID)
@@ -12230,7 +12363,7 @@ final class AgentModeViewModel: ObservableObject {
         var agentSession = AgentSession(
             id: sessionID,
             workspaceID: workspace.id,
-            composeTabID: tabID,
+            composeTabID: session.branchOrigin == nil ? tabID : nil,
             name: sessionName,
             items: [],
             uiToolResultPayloadsByItemID: uiToolResultPayloadsByItemID,
@@ -12249,6 +12382,7 @@ final class AgentModeViewModel: ObservableObject {
             locallyAttributedStartItemID: session.locallyAttributedStartItemID,
             autoEditEnabled: session.autoEditEnabled,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
+            branchOrigin: session.branchOrigin,
             parentSessionID: session.parentSessionID,
             pendingHandoffPayload: session.pendingHandoff.payload,
             pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
@@ -12261,9 +12395,11 @@ final class AgentModeViewModel: ObservableObject {
             worktreeMergeOperations: session.worktreeMergeOperations
         )
         codexCoordinator.applyCodexPersistence(from: session, to: &agentSession)
+        let requireWorkspaceMatch = workspaceManager?.activeWorkspace != nil
         guard let saveToken = makeSaveCommitToken(for: session, workspaceID: workspace.id),
-              isSaveCommitTokenCurrent(saveToken)
+              isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: requireWorkspaceMatch)
         else {
+            if requireCommittedSave { throw CodexBranchOperationError.staleOperation }
             requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
             return
         }
@@ -12276,7 +12412,8 @@ final class AgentModeViewModel: ObservableObject {
                 trustedCanonicalItemCount: canonicalItemCount
             )
             agentSession.fileURL = fileURL
-            guard isSaveCommitTokenCurrent(saveToken) else {
+            guard isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: requireWorkspaceMatch) else {
+                if requireCommittedSave { throw CodexBranchOperationError.staleOperation }
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
                 return
             }
@@ -12326,7 +12463,14 @@ final class AgentModeViewModel: ObservableObject {
                 AgentModePerfDiagnostics.event("save.session.error", tabID: tabID, fields: ["error": String(describing: error)])
             #endif
             print("[AgentModeVM] Failed to save session: \(error)")
+            throw error
         }
+    }
+
+    func flushSaveThrowing(for tabID: UUID) async throws {
+        guard let session = sessions[tabID] else { return }
+        session.saveDebounceTask?.cancel()
+        try await saveSessionThrowing(for: tabID, requireCommittedSave: true)
     }
 
     func flushSave(for tabID: UUID) async {
@@ -13012,6 +13156,9 @@ final class AgentModeViewModel: ObservableObject {
         codexAttemptID: UUID? = nil
     ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
+        guard !session.isBranchOperationInProgress else {
+            return .blocked(message: "Finish branching before sending another message.")
+        }
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachmentsToSend = session.pendingImageAttachments
         let taggedFilesToSend = session.pendingTaggedFileAttachments
@@ -13024,6 +13171,10 @@ final class AgentModeViewModel: ObservableObject {
             }
         }
 
+        let submissionIdentityPin = makePersistentSubmissionIdentityPin(
+            session: session,
+            tabID: tabID
+        )
         scheduleSkillCatalogRefresh()
 
         let activeWorkflow = session.selectedWorkflow
@@ -13105,11 +13256,27 @@ final class AgentModeViewModel: ObservableObject {
             return invocation.definition.asBubbleWorkflowDefinition()
         }()
 
+        let exactResumePreflightToken: UUID?
+        if session.selectedAgent == .codexExec,
+           session.activeAgentSessionID != nil,
+           codexRequiresExactResumePreflight(session)
+        {
+            if session.isExactResumePreflightInProgress {
+                return .blocked(message: "Codex is reopening this conversation. Please wait before sending again.")
+            }
+            let token = UUID()
+            session.exactResumePreflightToken = token
+            exactResumePreflightToken = token
+        } else {
+            exactResumePreflightToken = nil
+        }
+
         // Capture and clear workflow before sending
         session.selectedWorkflow = nil
         selectedWorkflow = nil
         session.pendingImageAttachments.removeAll()
         session.pendingTaggedFileAttachments.removeAll()
+        let clearedComposerMutationGeneration = session.composerMutationGeneration
 
         if session.activeAgentSessionID != nil, !session.hasLoadedPersistedState {
             Self.logCodexDebug("[AgentModeVM][RunID] deferring send until hydration completes for tab \(tabID)")
@@ -13122,12 +13289,51 @@ final class AgentModeViewModel: ObservableObject {
                     taggedFilesToSend: taggedFilesToSend,
                     activeWorkflow: bubbleWorkflow,
                     nativePreparedTurn: nativePreparedTurn,
-                    codexAttemptID: codexAttemptID
+                    codexAttemptID: codexAttemptID,
+                    exactResumePreflightToken: exactResumePreflightToken,
+                    composerMutationGeneration: clearedComposerMutationGeneration,
+                    submissionIdentityPin: submissionIdentityPin
                 )
             }
             return .submitted
         }
 
+        if session.selectedAgent == .codexExec, session.activeAgentSessionID != nil {
+            guard codexRequiresExactResumePreflight(session) else {
+                guard persistentSubmissionIdentityIsCurrent(submissionIdentityPin) else {
+                    return .blocked(message: "The session changed before this message could be sent.")
+                }
+                return submitPreparedUserTurn(
+                    tabID: tabID,
+                    session: session,
+                    trimmedText: trimmedText,
+                    attachmentsToSend: attachmentsToSend,
+                    taggedFilesToSend: taggedFilesToSend,
+                    activeWorkflow: bubbleWorkflow,
+                    nativePreparedTurn: nativePreparedTurn,
+                    codexAttemptID: codexAttemptID
+                )
+            }
+            Task { [weak self] in
+                await self?.submitCodexUserTurnAfterExactResumePreflight(
+                    tabID: tabID,
+                    expectedSession: session,
+                    trimmedText: trimmedText,
+                    attachmentsToSend: attachmentsToSend,
+                    taggedFilesToSend: taggedFilesToSend,
+                    activeWorkflow: bubbleWorkflow,
+                    nativePreparedTurn: nativePreparedTurn,
+                    codexAttemptID: codexAttemptID,
+                    exactResumePreflightToken: exactResumePreflightToken,
+                    composerMutationGeneration: clearedComposerMutationGeneration,
+                    submissionIdentityPin: submissionIdentityPin
+                )
+            }
+            return .submitted
+        }
+        guard persistentSubmissionIdentityIsCurrent(submissionIdentityPin) else {
+            return .blocked(message: "The session changed before this message could be sent.")
+        }
         return submitPreparedUserTurn(
             tabID: tabID,
             session: session,
@@ -13674,14 +13880,387 @@ final class AgentModeViewModel: ObservableObject {
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
         nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
-        codexAttemptID: UUID? = nil
+        codexAttemptID: UUID? = nil,
+        exactResumePreflightToken: UUID?,
+        composerMutationGeneration: UInt64,
+        submissionIdentityPin: PersistentSubmissionIdentityPin
     ) async {
-        guard let session = sessions[tabID] else { return }
-        await prepareSessionForRunStart(tabID: tabID, session: session)
-        guard let hydratedSession = sessions[tabID] else { return }
+        await prepareSessionForRunStart(tabID: tabID, session: submissionIdentityPin.session)
+        guard persistentSubmissionIdentityIsCurrent(submissionIdentityPin) else {
+            if submissionIdentityPin.session.exactResumePreflightToken == exactResumePreflightToken {
+                submissionIdentityPin.session.exactResumePreflightToken = nil
+            }
+            restoreUnsentExactResumeSubmission(
+                tabID: tabID,
+                expectedComposerMutationGeneration: composerMutationGeneration,
+                text: trimmedText,
+                images: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                workflow: activeWorkflow
+            )
+            #if DEBUG
+                test_exactResumePreflightDidFinish?()
+            #endif
+            return
+        }
+        let hydratedSession = submissionIdentityPin.session
+        if hydratedSession.selectedAgent == .codexExec,
+           hydratedSession.activeAgentSessionID != nil
+        {
+            await submitCodexUserTurnAfterExactResumePreflight(
+                tabID: tabID,
+                expectedSession: hydratedSession,
+                trimmedText: trimmedText,
+                attachmentsToSend: attachmentsToSend,
+                taggedFilesToSend: taggedFilesToSend,
+                activeWorkflow: activeWorkflow,
+                nativePreparedTurn: nativePreparedTurn,
+                codexAttemptID: codexAttemptID,
+                exactResumePreflightToken: exactResumePreflightToken,
+                composerMutationGeneration: composerMutationGeneration,
+                submissionIdentityPin: submissionIdentityPin
+            )
+            return
+        }
+        if hydratedSession.exactResumePreflightToken == exactResumePreflightToken {
+            hydratedSession.exactResumePreflightToken = nil
+        }
         _ = submitPreparedUserTurn(
             tabID: tabID,
             session: hydratedSession,
+            trimmedText: trimmedText,
+            attachmentsToSend: attachmentsToSend,
+            taggedFilesToSend: taggedFilesToSend,
+            activeWorkflow: activeWorkflow,
+            nativePreparedTurn: nativePreparedTurn,
+            codexAttemptID: codexAttemptID
+        )
+    }
+
+    private struct CodexNativeResumeReference: Equatable {
+        let conversationID: String?
+        let rolloutPath: String?
+
+        init(conversationID: String?, rolloutPath: String?) {
+            func normalized(_ value: String?) -> String? {
+                guard let value else { return nil }
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+            self.conversationID = normalized(conversationID)
+            self.rolloutPath = normalized(rolloutPath)
+        }
+
+        var hasReference: Bool {
+            conversationID != nil || rolloutPath != nil
+        }
+
+        func isStillRepresented(by current: CodexNativeResumeReference) -> Bool {
+            if !hasReference {
+                return true
+            }
+            if let conversationID, current.conversationID != conversationID {
+                return false
+            }
+            if let rolloutPath, current.rolloutPath != rolloutPath {
+                return false
+            }
+            return current.hasReference
+        }
+    }
+
+    private struct PersistentSubmissionIdentityPin {
+        let session: TabSession
+        let tabID: UUID
+        let binding: AgentPersistentSessionBindingIdentity?
+        let bindingTransitionGeneration: UInt64
+        let workspaceID: UUID?
+        let nativeReference: CodexNativeResumeReference
+    }
+
+    private struct ExactResumeSubmissionPin {
+        let submissionIdentity: PersistentSubmissionIdentityPin
+        let resolvedNativeReference: CodexNativeResumeReference
+        let token: UUID
+    }
+
+    private func makePersistentSubmissionIdentityPin(
+        session: TabSession,
+        tabID: UUID
+    ) -> PersistentSubmissionIdentityPin {
+        PersistentSubmissionIdentityPin(
+            session: session,
+            tabID: tabID,
+            binding: session.persistentSessionBindingIdentity,
+            bindingTransitionGeneration: session.bindingTransitionGeneration,
+            workspaceID: (workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot)?.id,
+            nativeReference: CodexNativeResumeReference(
+                conversationID: session.codexConversationID,
+                rolloutPath: session.codexRolloutPath
+            )
+        )
+    }
+
+    private func persistentSubmissionBindingIsCurrent(_ pin: PersistentSubmissionIdentityPin) -> Bool {
+        sessions[pin.tabID] === pin.session
+            && pin.session.persistentSessionBindingIdentity == pin.binding
+            && pin.session.bindingTransitionGeneration == pin.bindingTransitionGeneration
+            && (workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot)?.id == pin.workspaceID
+    }
+
+    private func persistentSubmissionIdentityIsCurrent(_ pin: PersistentSubmissionIdentityPin) -> Bool {
+        persistentSubmissionBindingIsCurrent(pin)
+            && pin.nativeReference.isStillRepresented(
+                by: CodexNativeResumeReference(
+                    conversationID: pin.session.codexConversationID,
+                    rolloutPath: pin.session.codexRolloutPath
+                )
+            )
+    }
+
+    private static func reconciledBranchMembership(
+        existing: Set<UUID>,
+        evidence: AgentSessionDataService.IndexedBranchMembership
+    ) -> Set<UUID> {
+        evidence.isComplete ? evidence.memberIDs : existing.union(evidence.memberIDs)
+    }
+
+    private func reconcileCodexBranchTreeMembership(for workspace: WorkspaceModel) async {
+        guard let evidence = await dataService.indexedAgentSessionBranchMemberIDs(for: workspace) else {
+            return
+        }
+        knownCodexBranchTreeMemberIDsByWorkspaceID[workspace.id] = Self.reconciledBranchMembership(
+            existing: knownCodexBranchTreeMemberIDsByWorkspaceID[workspace.id] ?? [],
+            evidence: evidence
+        )
+    }
+
+    private func codexRequiresExactResumePreflight(_ session: TabSession) -> Bool {
+        let hasLiveNativeThread = session.runState.isActive
+            || (session.codexController?.hasActiveThread == true && !session.codexNeedsReconnect)
+        let hasSavedNativeMetadata =
+            session.codexConversationID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                || session.codexRolloutPath?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let workspaceID = (workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot)?.id
+        let isKnownTreeMember = session.branchOrigin != nil
+            || workspaceID.flatMap { knownCodexBranchTreeMemberIDsByWorkspaceID[$0] }?.contains(
+                session.activeAgentSessionID ?? UUID()
+            ) == true
+        return !hasLiveNativeThread && hasSavedNativeMetadata && isKnownTreeMember
+    }
+
+    private func exactResumeSubmissionIsCurrent(_ pin: ExactResumeSubmissionPin) -> Bool {
+        persistentSubmissionBindingIsCurrent(pin.submissionIdentity)
+            && pin.resolvedNativeReference.isStillRepresented(
+                by: CodexNativeResumeReference(
+                    conversationID: pin.submissionIdentity.session.codexConversationID,
+                    rolloutPath: pin.submissionIdentity.session.codexRolloutPath
+                )
+            )
+            && !pin.submissionIdentity.session.isBranchOperationInProgress
+            && pin.submissionIdentity.session.exactResumePreflightToken == pin.token
+    }
+
+    private func restoreUnsentExactResumeSubmission(
+        tabID: UUID,
+        expectedComposerMutationGeneration: UInt64,
+        text: String,
+        images: [AgentImageAttachment],
+        taggedFiles: [AgentTaggedFileAttachment],
+        workflow: AgentWorkflowDefinition?
+    ) {
+        guard let session = sessions[tabID] else { return }
+        if session.composerMutationGeneration == expectedComposerMutationGeneration {
+            let existingDraft = session.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if existingDraft.isEmpty || existingDraft == text {
+                session.draftText = text
+            } else {
+                session.draftText = text + "\n\n" + session.draftText
+            }
+            session.pendingImageAttachments = images
+            session.pendingTaggedFileAttachments = taggedFiles
+            session.selectedWorkflow = workflow
+        } else {
+            let newerDraft = session.draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if newerDraft.isEmpty {
+                session.draftText = text
+            } else if newerDraft != text {
+                session.draftText = text + "\n\n" + session.draftText
+            }
+            let imageIDs = Set(session.pendingImageAttachments.map(\.id))
+            session.pendingImageAttachments.insert(contentsOf: images.filter { !imageIDs.contains($0.id) }, at: 0)
+            let taggedFileIDs = Set(session.pendingTaggedFileAttachments.map(\.id))
+            session.pendingTaggedFileAttachments.insert(contentsOf: taggedFiles.filter { !taggedFileIDs.contains($0.id) }, at: 0)
+            if session.selectedWorkflow == nil {
+                session.selectedWorkflow = workflow
+            }
+        }
+        requestUIRefresh(tabID: tabID, urgent: true)
+    }
+
+    private func submitCodexUserTurnAfterExactResumePreflight(
+        tabID: UUID,
+        expectedSession: TabSession,
+        trimmedText: String,
+        attachmentsToSend: [AgentImageAttachment],
+        taggedFilesToSend: [AgentTaggedFileAttachment],
+        activeWorkflow: AgentWorkflowDefinition?,
+        nativePreparedTurn: NativeSlashPreparedUserTurn?,
+        codexAttemptID: UUID?,
+        exactResumePreflightToken suppliedToken: UUID?,
+        composerMutationGeneration: UInt64,
+        submissionIdentityPin: PersistentSubmissionIdentityPin
+    ) async {
+        guard expectedSession === submissionIdentityPin.session,
+              persistentSubmissionIdentityIsCurrent(submissionIdentityPin),
+              !expectedSession.isBranchOperationInProgress
+        else {
+            if expectedSession.exactResumePreflightToken == suppliedToken {
+                expectedSession.exactResumePreflightToken = nil
+            }
+            restoreUnsentExactResumeSubmission(
+                tabID: tabID,
+                expectedComposerMutationGeneration: composerMutationGeneration,
+                text: trimmedText,
+                images: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                workflow: activeWorkflow
+            )
+            #if DEBUG
+                test_exactResumePreflightDidFinish?()
+            #endif
+            return
+        }
+        guard codexRequiresExactResumePreflight(expectedSession) else {
+            if expectedSession.exactResumePreflightToken == suppliedToken {
+                expectedSession.exactResumePreflightToken = nil
+            }
+            _ = submitPreparedUserTurn(
+                tabID: tabID,
+                session: expectedSession,
+                trimmedText: trimmedText,
+                attachmentsToSend: attachmentsToSend,
+                taggedFilesToSend: taggedFilesToSend,
+                activeWorkflow: activeWorkflow,
+                nativePreparedTurn: nativePreparedTurn,
+                codexAttemptID: codexAttemptID
+            )
+            return
+        }
+
+        let token: UUID
+        if let suppliedToken {
+            guard expectedSession.exactResumePreflightToken == suppliedToken else {
+                restoreUnsentExactResumeSubmission(
+                    tabID: tabID,
+                    expectedComposerMutationGeneration: composerMutationGeneration,
+                    text: trimmedText,
+                    images: attachmentsToSend,
+                    taggedFiles: taggedFilesToSend,
+                    workflow: activeWorkflow
+                )
+                return
+            }
+            token = suppliedToken
+        } else {
+            guard expectedSession.exactResumePreflightToken == nil else {
+                restoreUnsentExactResumeSubmission(
+                    tabID: tabID,
+                    expectedComposerMutationGeneration: composerMutationGeneration,
+                    text: trimmedText,
+                    images: attachmentsToSend,
+                    taggedFiles: taggedFilesToSend,
+                    workflow: activeWorkflow
+                )
+                return
+            }
+            token = UUID()
+            expectedSession.exactResumePreflightToken = token
+        }
+        defer {
+            if expectedSession.exactResumePreflightToken == token {
+                expectedSession.exactResumePreflightToken = nil
+            }
+            #if DEBUG
+                test_exactResumePreflightDidFinish?()
+            #endif
+        }
+
+        let resolvedNativeReference = CodexNativeResumeReference(
+            conversationID: expectedSession.codexConversationID,
+            rolloutPath: expectedSession.codexRolloutPath
+        )
+        guard submissionIdentityPin.binding != nil,
+              submissionIdentityPin.workspaceID != nil,
+              resolvedNativeReference.hasReference
+        else {
+            restoreUnsentExactResumeSubmission(
+                tabID: tabID,
+                expectedComposerMutationGeneration: composerMutationGeneration,
+                text: trimmedText,
+                images: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                workflow: activeWorkflow
+            )
+            return
+        }
+        let pin = ExactResumeSubmissionPin(
+            submissionIdentity: submissionIdentityPin,
+            resolvedNativeReference: resolvedNativeReference,
+            token: token
+        )
+        guard exactResumeSubmissionIsCurrent(pin) else {
+            restoreUnsentExactResumeSubmission(
+                tabID: tabID,
+                expectedComposerMutationGeneration: composerMutationGeneration,
+                text: trimmedText,
+                images: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                workflow: activeWorkflow
+            )
+            return
+        }
+
+        do {
+            defer { codexCoordinator.finishBranchOperation(session: expectedSession) }
+            _ = try await codexCoordinator.prepareControllerForBranching(session: expectedSession)
+        } catch {
+            restoreUnsentExactResumeSubmission(
+                tabID: tabID,
+                expectedComposerMutationGeneration: composerMutationGeneration,
+                text: trimmedText,
+                images: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                workflow: activeWorkflow
+            )
+            if sessions[tabID] === expectedSession {
+                expectedSession.appendItem(.error(CodexBranchOperationError.exactResumeFailed.localizedDescription))
+                requestUIRefresh(tabID: tabID, urgent: true)
+            }
+            return
+        }
+        let resumedPin = ExactResumeSubmissionPin(
+            submissionIdentity: submissionIdentityPin,
+            resolvedNativeReference: CodexNativeResumeReference(
+                conversationID: expectedSession.codexConversationID,
+                rolloutPath: expectedSession.codexRolloutPath
+            ),
+            token: token
+        )
+        guard exactResumeSubmissionIsCurrent(resumedPin) else {
+            restoreUnsentExactResumeSubmission(
+                tabID: tabID,
+                expectedComposerMutationGeneration: composerMutationGeneration,
+                text: trimmedText,
+                images: attachmentsToSend,
+                taggedFiles: taggedFilesToSend,
+                workflow: activeWorkflow
+            )
+            return
+        }
+        _ = submitPreparedUserTurn(
+            tabID: tabID,
+            session: expectedSession,
             trimmedText: trimmedText,
             attachmentsToSend: attachmentsToSend,
             taggedFilesToSend: taggedFilesToSend,
@@ -17787,6 +18366,7 @@ final class AgentModeViewModel: ObservableObject {
 
     /// Delete a session completely (clear chat and close tab)
     func deleteSession(tabID: UUID) async {
+        guard sessions[tabID]?.isBranchOperationInProgress != true else { return }
         #if DEBUG
             let deleteSessionStartMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
@@ -17821,6 +18401,7 @@ final class AgentModeViewModel: ObservableObject {
            let sessionID
         {
             try? await dataService.deleteAgentSession(id: sessionID, for: workspace)
+            await reconcileCodexBranchTreeMembership(for: workspace)
             removeSessionIndex(sessionID: sessionID)
         } else {
             removeSessionIndex(forTabID: tabID)
@@ -18627,6 +19208,427 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
             syncSidebarUIState(refresh: true, reason: .sortDates)
         case .sessionList:
             syncSidebarUIState(refresh: true, reason: .sessionList)
+        }
+    }
+}
+
+enum CodexBranchOperationError: Error, LocalizedError, Equatable {
+    case unavailable(AgentSessionBranchAvailability.Reason)
+    case staleOperation
+    case sourceSessionMissing
+    case targetSessionMissing
+    case targetOpenElsewhere
+    case exactResumeFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            "This turn is not available for native branching."
+        case .staleOperation:
+            "The session changed while branching. Nothing was changed here."
+        case .sourceSessionMissing:
+            "Couldn't reopen the saved source session."
+        case .targetSessionMissing:
+            "The requested branch is no longer available."
+        case .targetOpenElsewhere:
+            "This branch is open in another tab."
+        case .exactResumeFailed:
+            "Codex couldn't reopen this conversation (rollout missing). Your message wasn't sent. The other paths may still be available in the branch menu; you can hand this transcript off to a new session."
+        }
+    }
+}
+
+@MainActor
+extension AgentModeViewModel {
+    private struct BranchOperationPin {
+        let session: TabSession
+        let tabID: UUID
+        let sessionID: UUID
+        let bindingGeneration: UInt64
+        let persistenceGeneration: UInt64
+        let sourceItemsRevision: Int
+        let conversationID: String
+    }
+
+    private func branchOccupancy(for session: TabSession) -> AgentSessionBranchGate.Occupancy {
+        let oracleRequestActive: Bool
+        #if DEBUG
+            if let test_oracleBranchOccupancyOverride {
+                oracleRequestActive = test_oracleBranchOccupancyOverride
+            } else if let oracleViewModel, let sessionID = session.activeAgentSessionID {
+                oracleRequestActive = oracleViewModel.hasActiveQuery(agentModeSessionID: sessionID)
+            } else {
+                oracleRequestActive = true
+            }
+        #else
+            if let oracleViewModel, let sessionID = session.activeAgentSessionID {
+                oracleRequestActive = oracleViewModel.hasActiveQuery(agentModeSessionID: sessionID)
+            } else {
+                oracleRequestActive = true
+            }
+        #endif
+        return AgentSessionBranchGate.Occupancy(
+            oracleRequestActive: oracleRequestActive,
+            codexTerminalSettlePending: codexCoordinator.hasPendingTerminalSettle(for: session.tabID)
+        )
+    }
+
+    private func beginBranchOperation(
+        session: TabSession,
+        turnID: UUID?
+    ) throws -> BranchOperationPin {
+        guard !session.isExactResumePreflightInProgress else {
+            throw CodexBranchOperationError.unavailable(.notIdle)
+        }
+        let occupancy = branchOccupancy(for: session)
+        if let turnID {
+            let availability = AgentSessionBranchGate.evaluate(
+                session: session,
+                turnID: turnID,
+                occupancy: occupancy
+            )
+            guard case .available = availability else {
+                if case let .unavailable(reason) = availability {
+                    throw CodexBranchOperationError.unavailable(reason)
+                }
+                throw CodexBranchOperationError.staleOperation
+            }
+        } else if let reason = AgentSessionBranchGate.operationUnavailableReason(
+            session: session,
+            occupancy: occupancy
+        ) {
+            throw CodexBranchOperationError.unavailable(reason)
+        }
+        guard let sessionID = session.activeAgentSessionID,
+              let conversationID = session.codexConversationID
+        else {
+            throw CodexBranchOperationError.sourceSessionMissing
+        }
+        session.isBranchOperationInProgress = true
+        branchOperationSourceReservations[sessionID] = session.tabID
+        return BranchOperationPin(
+            session: session,
+            tabID: session.tabID,
+            sessionID: sessionID,
+            bindingGeneration: session.bindingTransitionGeneration,
+            persistenceGeneration: session.persistenceMutationGeneration,
+            sourceItemsRevision: session.sourceItemsRevision,
+            conversationID: conversationID
+        )
+    }
+
+    private func validateBranchOperation(_ pin: BranchOperationPin) throws {
+        let occupancy = branchOccupancy(for: pin.session)
+        guard sessions[pin.tabID] === pin.session,
+              pin.session.isBranchOperationInProgress,
+              pin.session.activeAgentSessionID == pin.sessionID,
+              pin.session.bindingTransitionGeneration == pin.bindingGeneration,
+              pin.session.persistenceMutationGeneration == pin.persistenceGeneration,
+              pin.session.sourceItemsRevision == pin.sourceItemsRevision,
+              pin.session.codexConversationID == pin.conversationID,
+              pin.session.runState == .idle,
+              !occupancy.oracleRequestActive,
+              !occupancy.codexTerminalSettlePending
+        else {
+            throw CodexBranchOperationError.staleOperation
+        }
+    }
+
+    private func endBranchOperation(_ pin: BranchOperationPin, rescheduleIdleShutdown: Bool) {
+        if branchOperationSourceReservations[pin.sessionID] == pin.tabID {
+            branchOperationSourceReservations.removeValue(forKey: pin.sessionID)
+        }
+        pin.session.isBranchOperationInProgress = false
+        if rescheduleIdleShutdown {
+            codexCoordinator.finishBranchOperation(session: pin.session)
+        }
+    }
+
+    func branchFromTurn(_ turnID: UUID, tabID: UUID) async throws -> UUID {
+        guard let session = sessions[tabID],
+              let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
+        else {
+            throw CodexBranchOperationError.sourceSessionMissing
+        }
+        let pin = try beginBranchOperation(session: session, turnID: turnID)
+        var childThreadID: String?
+        var childWasPersisted = false
+        var branchController: (any CodexSessionControlling)?
+        let preservedDraft = session.draftText
+        do {
+            #if DEBUG
+                if let error = test_branchFailureInjector?("sourceSave") { throw error }
+            #endif
+            try await flushSaveThrowing(for: tabID)
+            try validateBranchOperation(pin)
+
+            let controller = try await codexCoordinator.prepareControllerForBranching(session: session)
+            branchController = controller
+            try validateBranchOperation(pin)
+
+            let preManifest = try await codexCoordinator.collectBranchManifest(
+                controller: controller,
+                threadID: pin.conversationID
+            )
+            try validateBranchOperation(pin)
+
+            guard let ledger = session.codexTurnCheckpoints,
+                  let checkpointIndex = ledger.entries.firstIndex(where: { $0.turnID == turnID })
+            else {
+                throw CodexBranchOperationError.unavailable(.noCheckpoint)
+            }
+            let checkpoint = ledger.entries[checkpointIndex]
+            let retainedCheckpoints = Array(ledger.entries[...checkpointIndex])
+            try CodexForkStructuralVerifier.validatePreFork(
+                manifest: preManifest,
+                ledgerTurnIDsThroughCheckpoint: retainedCheckpoints.map(\.codexTurnID),
+                checkpointTurnID: checkpoint.codexTurnID
+            )
+
+            guard let source = try await dataService.loadAgentSession(id: pin.sessionID, for: workspace) else {
+                throw CodexBranchOperationError.sourceSessionMissing
+            }
+            try validateBranchOperation(pin)
+            guard let sourceTranscript = source.transcript,
+                  let sourceTurnIndex = sourceTranscript.turns.firstIndex(where: { $0.id == turnID })
+            else {
+                throw CodexBranchOperationError.sourceSessionMissing
+            }
+            let prefixed = try AgentTranscriptIO.branchPrefix(of: source, throughTurnID: turnID)
+            try validateBranchOperation(pin)
+
+            let childRef = try await controller.forkThread(checkpoint.codexTurnID)
+            let validatedChildThreadID = childRef.conversationID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !validatedChildThreadID.isEmpty else {
+                throw CodexForkStructuralVerificationError.invalidChildThreadID
+            }
+            guard validatedChildThreadID != pin.conversationID else {
+                throw CodexForkStructuralVerificationError.childMatchesSource
+            }
+            childThreadID = validatedChildThreadID
+            try validateBranchOperation(pin)
+
+            let childManifest = try await codexCoordinator.collectBranchManifest(
+                controller: controller,
+                threadID: validatedChildThreadID
+            )
+            try validateBranchOperation(pin)
+            try CodexForkStructuralVerifier.validatePostFork(
+                sourceManifest: preManifest,
+                childManifest: childManifest,
+                sourceThreadID: pin.conversationID,
+                childThreadID: validatedChildThreadID,
+                checkpointTurnID: checkpoint.codexTurnID
+            )
+
+            let sourceReread = try await codexCoordinator.collectBranchManifest(
+                controller: controller,
+                threadID: pin.conversationID
+            )
+            try validateBranchOperation(pin)
+            try CodexForkStructuralVerifier.validateSourceReread(preFork: preManifest, reread: sourceReread)
+
+            let childID = UUID()
+            let rootID = source.branchOrigin?.rootSessionID ?? source.id
+            let childLedger = CodexTurnCheckpointLedger(
+                threadID: validatedChildThreadID,
+                entries: retainedCheckpoints
+            )
+            let child = AgentSession(
+                id: childID,
+                workspaceID: workspace.id,
+                composeTabID: nil,
+                name: "\(source.name) (branch)",
+                items: prefixed.items,
+                uiToolResultPayloadsByItemID: prefixed.uiToolResultPayloadsByItemID,
+                transcript: prefixed.transcript,
+                itemCount: prefixed.itemCount,
+                transcriptProjectionCounts: prefixed.transcriptProjectionCounts,
+                lastUserMessageAt: prefixed.lastUserMessageAt,
+                agentKind: AgentProviderKind.codexExec.rawValue,
+                agentModel: source.agentModel,
+                ohMyPiThinkingSelections: source.ohMyPiThinkingSelections,
+                agentReasoningEffort: source.agentReasoningEffort,
+                lastRunState: AgentSessionRunState.idle.rawValue,
+                autoEditEnabled: source.autoEditEnabled,
+                codexConversationID: validatedChildThreadID,
+                codexRolloutPath: childRef.rolloutPath,
+                codexTurnCheckpoints: childLedger,
+                codexModel: childRef.model ?? source.codexModel,
+                codexReasoningEffort: childRef.reasoningEffort ?? source.codexReasoningEffort,
+                branchOrigin: AgentSessionBranchOrigin(
+                    rootSessionID: rootID,
+                    sourceSessionID: source.id,
+                    sourceTurnID: turnID,
+                    sourceCodexTurnID: checkpoint.codexTurnID,
+                    sourceTurnOrdinal: sourceTurnIndex + 1,
+                    createdAt: Date()
+                ),
+                parentSessionID: nil,
+                isMCPOriginated: false,
+                origin: .user,
+                profile: source.profile
+            )
+            #if DEBUG
+                if let error = test_branchFailureInjector?("branchSave") { throw error }
+            #endif
+            _ = try await dataService.saveAgentSession(
+                child,
+                for: workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: child.itemCount
+            )
+            childWasPersisted = true
+            knownCodexBranchTreeMemberIDsByWorkspaceID[workspace.id, default: []].formUnion([
+                rootID,
+                source.id,
+                childID
+            ])
+            await reconcileCodexBranchTreeMembership(for: workspace)
+            try validateBranchOperation(pin)
+
+            await codexCoordinator.shutdownCodexSession(session)
+            try validateBranchOperation(pin)
+            #if DEBUG
+                if let error = test_branchFailureInjector?("restore") { throw error }
+            #endif
+            _ = try await rebindPersistentSession(
+                childID,
+                to: session,
+                requiresHydration: true,
+                allowTransferFromAnotherTab: false
+            )
+            #if DEBUG
+                if let error = test_branchFailureInjector?("restoreAfterRebind") { throw error }
+            #endif
+            await loadSessionFromDisk(for: session, allowBranchOperation: true)
+            guard session.activeAgentSessionID == childID,
+                  session.hasLoadedPersistedState,
+                  session.didSucceedPersistedHydrationForCurrentBinding
+            else {
+                throw CodexBranchOperationError.staleOperation
+            }
+            session.draftText = preservedDraft
+            endBranchOperation(pin, rescheduleIdleShutdown: false)
+            session.appendItem(.system(
+                "Branched from “\(source.name)” after turn \(sourceTurnIndex + 1). Conversation context was restored to that point. Files on disk, Oracle chats, worktrees and child sessions were not changed."
+            ))
+            requestUIRefresh(tabID: tabID, urgent: true)
+            scheduleSave(for: tabID)
+            return childID
+        } catch {
+            if let childThreadID,
+               childThreadID != pin.conversationID,
+               !childThreadID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !childWasPersisted,
+               let controller = branchController
+            {
+                try? await controller.archiveThread(threadID: childThreadID)
+            }
+            if session.activeAgentSessionID != pin.sessionID {
+                _ = try? await rebindPersistentSession(
+                    pin.sessionID,
+                    to: session,
+                    requiresHydration: true,
+                    allowTransferFromAnotherTab: false
+                )
+                await loadSessionFromDisk(for: session, allowBranchOperation: true)
+            }
+            session.draftText = preservedDraft
+            endBranchOperation(pin, rescheduleIdleShutdown: true)
+            throw error
+        }
+    }
+
+    func switchToBranch(sessionID targetSessionID: UUID, tabID: UUID) async throws {
+        guard let session = sessions[tabID] else {
+            throw CodexBranchOperationError.sourceSessionMissing
+        }
+        if targetSessionID == session.activeAgentSessionID { return }
+        if let reservedTabID = branchSwitchTargetReservations[targetSessionID], reservedTabID != tabID {
+            throw CodexBranchOperationError.targetOpenElsewhere
+        }
+        switch persistentBindingResolution(for: targetSessionID) {
+        case let .unique(existingTabID) where existingTabID != tabID:
+            throw CodexBranchOperationError.targetOpenElsewhere
+        case .ambiguous:
+            throw CodexBranchOperationError.targetOpenElsewhere
+        case .unique, .notFound:
+            break
+        }
+        guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot else {
+            throw CodexBranchOperationError.sourceSessionMissing
+        }
+        branchSwitchTargetReservations[targetSessionID] = tabID
+        defer {
+            if branchSwitchTargetReservations[targetSessionID] == tabID {
+                branchSwitchTargetReservations.removeValue(forKey: targetSessionID)
+            }
+        }
+
+        let pin = try beginBranchOperation(session: session, turnID: nil)
+        let preservedDraft = session.draftText
+        do {
+            try await flushSaveThrowing(for: tabID)
+            try validateBranchOperation(pin)
+
+            guard let persistedSource = try await dataService.loadAgentSession(id: pin.sessionID, for: workspace) else {
+                throw CodexBranchOperationError.sourceSessionMissing
+            }
+            try validateBranchOperation(pin)
+            guard let persistedTarget = try await dataService.loadAgentSession(id: targetSessionID, for: workspace) else {
+                throw CodexBranchOperationError.targetSessionMissing
+            }
+            try validateBranchOperation(pin)
+            let sourceRootID = persistedSource.branchOrigin?.rootSessionID ?? persistedSource.id
+            let targetRootID = persistedTarget.branchOrigin?.rootSessionID ?? persistedTarget.id
+            guard persistedTarget.agentKind == AgentProviderKind.codexExec.rawValue,
+                  persistedTarget.remoteHost == nil,
+                  sourceRootID == targetRootID
+            else {
+                throw CodexBranchOperationError.targetSessionMissing
+            }
+
+            await codexCoordinator.shutdownCodexSession(session)
+            try validateBranchOperation(pin)
+            guard branchSwitchTargetReservations[targetSessionID] == tabID else {
+                throw CodexBranchOperationError.targetOpenElsewhere
+            }
+            #if DEBUG
+                if let error = test_branchFailureInjector?("switchBeforeRebind") { throw error }
+            #endif
+            _ = try await rebindPersistentSession(
+                targetSessionID,
+                to: session,
+                requiresHydration: true,
+                allowTransferFromAnotherTab: false
+            )
+            #if DEBUG
+                if let error = test_branchFailureInjector?("switchAfterRebind") { throw error }
+            #endif
+            await loadSessionFromDisk(for: session, allowBranchOperation: true)
+            guard session.activeAgentSessionID == targetSessionID,
+                  session.hasLoadedPersistedState,
+                  session.didSucceedPersistedHydrationForCurrentBinding
+            else {
+                throw CodexBranchOperationError.targetSessionMissing
+            }
+            session.draftText = preservedDraft
+            endBranchOperation(pin, rescheduleIdleShutdown: false)
+            requestUIRefresh(tabID: tabID, urgent: true)
+        } catch {
+            if session.activeAgentSessionID != pin.sessionID {
+                _ = try? await rebindPersistentSession(
+                    pin.sessionID,
+                    to: session,
+                    requiresHydration: true,
+                    allowTransferFromAnotherTab: false
+                )
+                await loadSessionFromDisk(for: session, allowBranchOperation: true)
+            }
+            session.draftText = preservedDraft
+            endBranchOperation(pin, rescheduleIdleShutdown: true)
+            throw error
         }
     }
 }
