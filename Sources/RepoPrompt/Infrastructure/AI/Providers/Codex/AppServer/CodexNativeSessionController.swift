@@ -77,6 +77,14 @@ protocol CodexSessionControlling: AnyObject {
         includeTurns: Bool,
         timeout: TimeInterval?
     ) async throws -> CodexNativeSessionController.ThreadSnapshot
+    func forkThread(_ lastTurnID: String) async throws -> CodexNativeSessionController.SessionRef
+    func listThreadTurns(
+        threadID: String,
+        cursor: String?,
+        limit: Int?,
+        sortDirection: CodexNativeSessionController.ThreadTurnsSortDirection
+    ) async throws -> CodexNativeSessionController.ThreadTurnsPage
+    func archiveThread(threadID: String) async throws
     func setThreadName(_ name: String, threadID: String?) async throws
     func startUserTurn(
         text: String,
@@ -395,6 +403,69 @@ final class CodexNativeSessionController {
         var reasoningEffort: String?
     }
 
+    enum ThreadPrimitiveError: Error, LocalizedError, Equatable {
+        case invalidInput
+        case unsupportedOperation
+        case unboundController
+        case nonIdleController
+        case invalidResponse
+        case ambiguousForkOutcome(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidInput:
+                "The Codex thread operation received an invalid identifier or limit."
+            case .unsupportedOperation:
+                "This Codex session controller does not support thread branching operations."
+            case .unboundController:
+                "The Codex session controller is not bound to a live thread."
+            case .nonIdleController:
+                "The Codex session controller must be idle before forking its thread."
+            case .invalidResponse:
+                "Codex app-server returned an invalid thread operation response."
+            case let .ambiguousForkOutcome(message):
+                "Codex did not confirm whether the thread was forked: \(message)"
+            }
+        }
+    }
+
+    enum ThreadTurnsSortDirection: String, Equatable {
+        case ascending = "asc"
+        case descending = "desc"
+    }
+
+    enum ThreadTurnStatus: String, Equatable {
+        case completed
+        case interrupted
+        case failed
+        case inProgress
+    }
+
+    enum ThreadTurnItemsView: String, Equatable {
+        case notLoaded
+        case summary
+        case full
+    }
+
+    struct ThreadTurnItem: Equatable {
+        let type: String
+    }
+
+    struct ThreadTurn: Equatable {
+        let id: String
+        let status: ThreadTurnStatus
+        let items: [ThreadTurnItem]
+        let itemsView: ThreadTurnItemsView
+        let startedAt: Int64?
+        let completedAt: Int64?
+    }
+
+    struct ThreadTurnsPage: Equatable {
+        let data: [ThreadTurn]
+        let nextCursor: String?
+        let backwardsCursor: String?
+    }
+
     enum ThreadGoalStatus: String, Equatable {
         case active
         case paused
@@ -566,6 +637,69 @@ final class CodexNativeSessionController {
         let kind: LifecycleAuthorityObservationKind
     }
 
+    private final class ForkRequestEnqueueLatch: @unchecked Sendable {
+        enum Outcome: Equatable {
+            case enqueued
+            case failedBeforeEnqueue
+        }
+
+        private let lock = NSLock()
+        private var outcome: Outcome?
+        private var continuation: CheckedContinuation<Outcome, Never>?
+
+        func wait() async -> Outcome {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let outcome {
+                    lock.unlock()
+                    continuation.resume(returning: outcome)
+                } else {
+                    self.continuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func signal(_ outcome: Outcome) {
+            lock.lock()
+            guard self.outcome == nil else {
+                lock.unlock()
+                return
+            }
+            self.outcome = outcome
+            let continuation = continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(returning: outcome)
+        }
+    }
+
+    private final class ForkRequestTaskHolder: @unchecked Sendable {
+        typealias RequestTask = Task<[String: Any], Error>
+
+        private let lock = NSLock()
+        private var requestTask: RequestTask?
+        private var cancellationRequested = false
+
+        func install(_ task: RequestTask) {
+            lock.lock()
+            requestTask = task
+            let shouldCancel = cancellationRequested
+            lock.unlock()
+            if shouldCancel {
+                task.cancel()
+            }
+        }
+
+        func cancel() {
+            lock.lock()
+            cancellationRequested = true
+            let task = requestTask
+            lock.unlock()
+            task?.cancel()
+        }
+    }
+
     private let client: CodexAppServerClient
     private let runID: UUID
     private let tabID: UUID
@@ -606,6 +740,12 @@ final class CodexNativeSessionController {
     private var terminalFileChangeItemIDs: Set<String> = []
     private var commandExecutionMirrorStateByItemID: [String: CommandExecutionMirrorState] = [:]
     private var appServerRequestValueStyle: CodexAgentToolPreferences.AppServerRequestValueStyle = .configStyle
+    /// Protected by `eventHandlingMutex`; owns the validation-to-submission boundary.
+    private var forkReservationID: UUID?
+    #if DEBUG
+        private var forkBeforeEnqueueTestHook: (@Sendable () async -> Void)?
+        private var forkRequestTaskBeforeEnqueueTestHook: (@Sendable () async -> Void)?
+    #endif
 
     var hasActiveThread: Bool {
         threadID?.isEmpty == false
@@ -1265,6 +1405,226 @@ final class CodexNativeSessionController {
         return Self.parseThreadSnapshot(from: result, fallbackEffort: nil)
     }
 
+    func forkThread(_ lastTurnID: String) async throws -> SessionRef {
+        guard !lastTurnID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ThreadPrimitiveError.invalidInput
+        }
+
+        // Configuration may suspend on MainActor-backed settings. Resolve it before taking the
+        // final event-owned snapshot so a turn accepted during that suspension blocks submission.
+        let configOverrides = await options.configOverridesProvider()
+        let submission = try await eventHandlingMutex.withLock {
+            guard forkReservationID == nil else {
+                throw ThreadPrimitiveError.nonIdleController
+            }
+            guard withEventsStateLock({ lifecycleState == .active }),
+                  let sourceThreadID = threadID,
+                  !sourceThreadID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else {
+                throw ThreadPrimitiveError.unboundController
+            }
+            guard activeTurnIDs.isEmpty,
+                  routingCurrentTurnID == nil,
+                  authoritativeLifecycleTurnID == nil,
+                  pendingLifecycleAuthorityReconciliation == nil,
+                  !isBindingSession
+            else {
+                throw ThreadPrimitiveError.nonIdleController
+            }
+            let reservationID = UUID()
+            forkReservationID = reservationID
+            return (sourceThreadID, appServerRequestValueStyle, reservationID)
+        }
+
+        var params: [String: Any] = [
+            "threadId": submission.0,
+            "lastTurnId": lastTurnID,
+            "excludeTurns": true,
+            "ephemeral": false,
+            "approvalPolicy": options.approvalPolicyProvider().appServerRequestValue(style: submission.1),
+            "sandbox": options.sandboxModeProvider().appServerRequestValue(style: submission.1),
+            "approvalsReviewer": options.approvalReviewerProvider().appServerRequestValue
+        ]
+        if let workspacePath {
+            params["cwd"] = workspacePath
+        }
+        if !configOverrides.isEmpty {
+            params["config"] = configOverrides
+        }
+
+        #if DEBUG
+            if let forkBeforeEnqueueTestHook {
+                await forkBeforeEnqueueTestHook()
+            }
+        #endif
+
+        let enqueueLatch = ForkRequestEnqueueLatch()
+        let requestTaskHolder = ForkRequestTaskHolder()
+        #if DEBUG
+            let requestTaskBeforeEnqueueHook = forkRequestTaskBeforeEnqueueTestHook
+        #else
+            let requestTaskBeforeEnqueueHook: (@Sendable () async -> Void)? = nil
+        #endif
+        let requestTask: Task<[String: Any], Error>
+        let enqueueOutcome: ForkRequestEnqueueLatch.Outcome
+        do {
+            (requestTask, enqueueOutcome) = try await withTaskCancellationHandler {
+                try await eventHandlingMutex.withLock {
+                    guard forkReservationID == submission.2 else {
+                        throw ThreadPrimitiveError.nonIdleController
+                    }
+                    try Task.checkCancellation()
+                    guard withEventsStateLock({ lifecycleState == .active }),
+                          threadID == submission.0
+                    else {
+                        throw ThreadPrimitiveError.unboundController
+                    }
+                    guard activeTurnIDs.isEmpty,
+                          routingCurrentTurnID == nil,
+                          authoritativeLifecycleTurnID == nil,
+                          pendingLifecycleAuthorityReconciliation == nil,
+                          !isBindingSession
+                    else {
+                        throw ThreadPrimitiveError.nonIdleController
+                    }
+
+                    // Keep event admission serialized only until the irreversible request is written.
+                    let task = makeForkRequestTask(
+                        params: params,
+                        enqueueLatch: enqueueLatch,
+                        beforeEnqueue: requestTaskBeforeEnqueueHook
+                    )
+                    requestTaskHolder.install(task)
+                    let outcome = await enqueueLatch.wait()
+                    return (task, outcome)
+                }
+            } onCancel: {
+                // Installation and cancellation are ordered by the holder's lock, so cancellation
+                // is forwarded even when it races request-task creation.
+                requestTaskHolder.cancel()
+            }
+        } catch {
+            await clearForkReservation(ownedBy: submission.2)
+            throw error
+        }
+
+        let result: [String: Any]
+        do {
+            result = try await withTaskCancellationHandler {
+                try await requestTask.value
+            } onCancel: {
+                requestTask.cancel()
+            }
+        } catch {
+            await clearForkReservation(ownedBy: submission.2)
+            if enqueueOutcome == .failedBeforeEnqueue, error is CancellationError {
+                throw error
+            }
+            if Self.isAmbiguousForkTransportError(error) {
+                throw ThreadPrimitiveError.ambiguousForkOutcome(error.localizedDescription)
+            }
+            throw error
+        }
+
+        do {
+            let child = try Self.parseForkSessionRef(from: result)
+            await clearForkReservation(ownedBy: submission.2)
+            return child
+        } catch {
+            await clearForkReservation(ownedBy: submission.2)
+            throw ThreadPrimitiveError.ambiguousForkOutcome(error.localizedDescription)
+        }
+    }
+
+    private func makeForkRequestTask(
+        params: [String: Any],
+        enqueueLatch: ForkRequestEnqueueLatch,
+        beforeEnqueue: (@Sendable () async -> Void)?
+    ) -> Task<[String: Any], Error> {
+        Task { [client, options, requestExecutor] in
+            do {
+                if let beforeEnqueue {
+                    await beforeEnqueue()
+                }
+                try Task.checkCancellation()
+                if let requestExecutor {
+                    // The injected seam's signal is the admission boundary used by focused tests.
+                    try Task.checkCancellation()
+                    enqueueLatch.signal(.enqueued)
+                    return try await requestExecutor("thread/fork", params, options.requestTimeout)
+                }
+                return try await client.request(
+                    method: "thread/fork",
+                    params: params,
+                    timeout: options.requestTimeout,
+                    useDefaultTimeout: true,
+                    onEnqueued: {
+                        enqueueLatch.signal(.enqueued)
+                    }
+                )
+            } catch {
+                enqueueLatch.signal(.failedBeforeEnqueue)
+                throw error
+            }
+        }
+    }
+
+    private func clearForkReservation(ownedBy reservationID: UUID) async {
+        // Cleanup is shielded from caller cancellation, but it can release only its own operation.
+        await Task { [self] in
+            try? await eventHandlingMutex.withLock {
+                if forkReservationID == reservationID {
+                    forkReservationID = nil
+                }
+            }
+        }.value
+    }
+
+    func listThreadTurns(
+        threadID: String,
+        cursor: String? = nil,
+        limit: Int? = nil,
+        sortDirection: ThreadTurnsSortDirection = .descending
+    ) async throws -> ThreadTurnsPage {
+        guard !threadID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ThreadPrimitiveError.invalidInput
+        }
+        if let cursor, cursor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            throw ThreadPrimitiveError.invalidInput
+        }
+        if let limit, limit <= 0 {
+            throw ThreadPrimitiveError.invalidInput
+        }
+        var params: [String: Any] = [
+            "threadId": threadID,
+            "sortDirection": sortDirection.rawValue,
+            "itemsView": ThreadTurnItemsView.summary.rawValue
+        ]
+        if let cursor {
+            params["cursor"] = cursor
+        }
+        if let limit {
+            params["limit"] = limit
+        }
+        let result = try await performRequest(
+            method: "thread/turns/list",
+            params: params,
+            timeout: options.requestTimeout
+        )
+        return try Self.parseThreadTurnsPage(from: result)
+    }
+
+    func archiveThread(threadID: String) async throws {
+        guard !threadID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ThreadPrimitiveError.invalidInput
+        }
+        _ = try await performRequest(
+            method: "thread/archive",
+            params: ["threadId": threadID],
+            timeout: options.requestTimeout
+        )
+    }
+
     func setThreadName(_ name: String, threadID explicitThreadID: String?) async throws {
         let validatedName = AgentSession.validatedName(name)
         guard !validatedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -1832,15 +2192,109 @@ final class CodexNativeSessionController {
         return snapshot.sessionRef
     }
 
+    private static func parseForkSessionRef(from result: [String: Any]) throws -> SessionRef {
+        let sessionRef = parseSessionRef(from: result, fallbackEffort: nil)
+        guard !sessionRef.conversationID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ThreadPrimitiveError.invalidResponse
+        }
+        return sessionRef
+    }
+
+    private static func parseSessionRef(
+        from result: [String: Any],
+        fallbackEffort: String?
+    ) -> SessionRef {
+        let thread = result["thread"] as? [String: Any] ?? [:]
+        return SessionRef(
+            conversationID: firstString(in: thread, keys: ["id", "threadId", "thread_id", "threadID"]) ?? "",
+            rolloutPath: firstString(in: thread, keys: ["path"]),
+            model: result["model"] as? String,
+            reasoningEffort: result["reasoningEffort"] as? String ?? fallbackEffort
+        )
+    }
+
+    private static func parseThreadTurnsPage(from result: [String: Any]) throws -> ThreadTurnsPage {
+        guard let rawTurns = result["data"] as? [[String: Any]] else {
+            throw ThreadPrimitiveError.invalidResponse
+        }
+        let turns = try rawTurns.map { rawTurn -> ThreadTurn in
+            guard let id = firstString(in: rawTurn, keys: ["id"]),
+                  !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  let statusRaw = firstString(in: rawTurn, keys: ["status"]),
+                  let status = ThreadTurnStatus(rawValue: statusRaw),
+                  let rawItems = rawTurn["items"] as? [[String: Any]],
+                  let itemsViewRaw = firstString(in: rawTurn, keys: ["itemsView"]),
+                  let itemsView = ThreadTurnItemsView(rawValue: itemsViewRaw)
+            else {
+                throw ThreadPrimitiveError.invalidResponse
+            }
+            let items = try rawItems.map { rawItem -> ThreadTurnItem in
+                guard let type = firstString(in: rawItem, keys: ["type"]),
+                      !type.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else {
+                    throw ThreadPrimitiveError.invalidResponse
+                }
+                return ThreadTurnItem(type: type)
+            }
+            return ThreadTurn(
+                id: id,
+                status: status,
+                items: items,
+                itemsView: itemsView,
+                startedAt: integerValue(rawTurn["startedAt"]),
+                completedAt: integerValue(rawTurn["completedAt"])
+            )
+        }
+        return try ThreadTurnsPage(
+            data: turns,
+            nextCursor: optionalCursor(result["nextCursor"]),
+            backwardsCursor: optionalCursor(result["backwardsCursor"])
+        )
+    }
+
+    private static func optionalCursor(_ raw: Any?) throws -> String? {
+        guard let raw, !(raw is NSNull) else { return nil }
+        guard let cursor = raw as? String,
+              !cursor.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            throw ThreadPrimitiveError.invalidResponse
+        }
+        return cursor
+    }
+
+    private static func integerValue(_ raw: Any?) -> Int64? {
+        if let value = raw as? Int64 { return value }
+        if let value = raw as? Int { return Int64(value) }
+        if let value = raw as? NSNumber { return value.int64Value }
+        return nil
+    }
+
+    private static func isAmbiguousForkTransportError(_ error: Error) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        guard let clientError = error as? CodexAppServerClient.ClientError else {
+            return false
+        }
+        switch clientError {
+        case let .requestFailed(failure):
+            // Client-generated request timeouts have no provider code. A coded RPC failure is
+            // provider-declared and must propagate unchanged regardless of its message text.
+            return failure.code == nil && CodexAppServerClient.isTimeoutError(clientError)
+        case .processNotRunning, .transportWriteFailed, .transportReadSetupFailed,
+             .invalidResponse, .jsonDecodeFailed:
+            return true
+        case .executableUnavailable:
+            return false
+        }
+    }
+
     private static func parseThreadSnapshot(
         from result: [String: Any],
         fallbackEffort: String?
     ) -> ThreadSnapshot {
         let thread = result["thread"] as? [String: Any] ?? [:]
-        let conversationID = firstString(in: thread, keys: ["id", "threadId", "thread_id", "threadID"]) ?? ""
-        let rolloutPath = firstString(in: thread, keys: ["path"])
-        let model = result["model"] as? String
-        let reasoningEffort = result["reasoningEffort"] as? String ?? fallbackEffort
+        let sessionRef = parseSessionRef(from: result, fallbackEffort: fallbackEffort)
         let runtimeStatus = parseThreadRuntimeStatus(from: thread["status"])
         let turns = thread["turns"] as? [[String: Any]] ?? []
         var activeTurnIDs: [String] = []
@@ -1859,10 +2313,10 @@ final class CodexNativeSessionController {
             }
         }
         return ThreadSnapshot(
-            conversationID: conversationID,
-            rolloutPath: rolloutPath,
-            model: model,
-            reasoningEffort: reasoningEffort,
+            conversationID: sessionRef.conversationID,
+            rolloutPath: sessionRef.rolloutPath,
+            model: sessionRef.model,
+            reasoningEffort: sessionRef.reasoningEffort,
             runtimeStatus: runtimeStatus,
             currentTurnID: activeTurnIDs.last,
             activeTurnIDs: activeTurnIDs,
@@ -3343,6 +3797,83 @@ final class CodexNativeSessionController {
             deprecatedContextCompactionTurnOrder.removeAll(keepingCapacity: true)
             pendingTurnFailuresByScope.removeAll(keepingCapacity: true)
             pendingTurnFailureScopeOrder.removeAll(keepingCapacity: true)
+        }
+
+        func test_setForkBeforeEnqueueHook(
+            _ hook: (@Sendable () async -> Void)?
+        ) {
+            forkBeforeEnqueueTestHook = hook
+        }
+
+        func test_setForkRequestTaskBeforeEnqueueHook(
+            _ hook: (@Sendable () async -> Void)?
+        ) {
+            forkRequestTaskBeforeEnqueueTestHook = hook
+        }
+
+        func test_clearForkReservation(ownedBy reservationID: UUID) async {
+            await clearForkReservation(ownedBy: reservationID)
+        }
+
+        func test_installForkableThreadState(
+            threadID: String,
+            threadPath: String? = nil,
+            activeTurnIDs explicitActiveTurnIDs: Set<String>? = nil,
+            routingTurnID: String? = nil,
+            authoritativeTurnID: String? = nil,
+            pendingAuthorityReconciliation: Bool = false,
+            isBindingSession: Bool = false
+        ) async {
+            try? await eventHandlingMutex.withLock {
+                test_installThreadState(
+                    threadID: threadID,
+                    authoritativeTurnID: authoritativeTurnID,
+                    routingTurnID: routingTurnID
+                )
+                if let explicitActiveTurnIDs {
+                    activeTurnIDs = explicitActiveTurnIDs
+                    activeTurnOrder = Array(explicitActiveTurnIDs).sorted()
+                }
+                if pendingAuthorityReconciliation {
+                    pendingLifecycleAuthorityReconciliation = .init(
+                        expectedCurrentTurnID: "expected-turn",
+                        acceptedDispatchTurnID: "accepted-turn"
+                    )
+                }
+                self.isBindingSession = isBindingSession
+                self.threadPath = threadPath
+                withEventsStateLock {
+                    lifecycleState = .active
+                }
+            }
+        }
+
+        struct TestForkStateSnapshot: Equatable {
+            let threadID: String?
+            let threadPath: String?
+            let routingCurrentTurnID: String?
+            let authoritativeLifecycleTurnID: String?
+            let activeTurnIDs: Set<String>
+            let hasPendingAuthorityReconciliation: Bool
+            let isBindingSession: Bool
+            let isForkInFlight: Bool
+            let forkReservationID: UUID?
+            let requestValueStyle: CodexAgentToolPreferences.AppServerRequestValueStyle
+        }
+
+        var test_forkStateSnapshot: TestForkStateSnapshot {
+            TestForkStateSnapshot(
+                threadID: threadID,
+                threadPath: threadPath,
+                routingCurrentTurnID: routingCurrentTurnID,
+                authoritativeLifecycleTurnID: authoritativeLifecycleTurnID,
+                activeTurnIDs: activeTurnIDs,
+                hasPendingAuthorityReconciliation: pendingLifecycleAuthorityReconciliation != nil,
+                isBindingSession: isBindingSession,
+                isForkInFlight: forkReservationID != nil,
+                forkReservationID: forkReservationID,
+                requestValueStyle: appServerRequestValueStyle
+            )
         }
 
         func test_handleNotification(
@@ -8219,6 +8750,23 @@ extension CodexSessionControlling {
     ) async throws -> CodexNativeSessionController.ThreadSnapshot {
         assertionFailure("\(type(of: self)) must implement readThreadSnapshot(includeTurns:timeout:)")
         throw CodexAppServerClient.ClientError.invalidResponse
+    }
+
+    func forkThread(_: String) async throws -> CodexNativeSessionController.SessionRef {
+        throw CodexNativeSessionController.ThreadPrimitiveError.unsupportedOperation
+    }
+
+    func listThreadTurns(
+        threadID _: String,
+        cursor _: String?,
+        limit _: Int?,
+        sortDirection _: CodexNativeSessionController.ThreadTurnsSortDirection
+    ) async throws -> CodexNativeSessionController.ThreadTurnsPage {
+        throw CodexNativeSessionController.ThreadPrimitiveError.unsupportedOperation
+    }
+
+    func archiveThread(threadID _: String) async throws {
+        throw CodexNativeSessionController.ThreadPrimitiveError.unsupportedOperation
     }
 
     func setThreadName(_: String, threadID _: String?) async throws {}

@@ -4,7 +4,7 @@ Scope: read when the task touches Agent Mode conversation branching, the Codex t
 Authority: Authoritative
 Last-verified: 2026-09-05
 
-Status: **Phase 0 GO and Phase 1 Capture implemented; Phases 2–4 remain.** Phase 0 selected Outcome A (no compaction checkpoint field/gate) and D3 Position A (future fork on the live bound idle controller).
+Status: **Phases 0–2 implemented; Phases 3–4 remain.** Phase 0 selected Outcome A (no compaction checkpoint field/gate) and D3 Position A (fork on the live bound idle controller).
 Date: 2026-09-05
 Provenance: two independent Oracle plan consultations (presets OracleC and OracleD, identical initial prompt, `model_preset_id` verified on every send), followed by two rounds of anonymous cross-challenge on every material disagreement, then synthesis. Every load-bearing repository claim below was verified by direct reads at the cited lines in this session; every upstream claim was verified against the installed `codex-cli 0.153.3` app-server JSON schema (`codex app-server generate-json-schema`), the official app-server docs, and the Pi upstream sources.
 
@@ -40,7 +40,7 @@ Upstream (installed codex-cli 0.153.3 schema):
 
 ### 3.1 Provider primitive
 
-`thread/fork` with `threadId` = source, `lastTurnId` = checkpoint turn ID (always supplied), `excludeTurns: true`, `ephemeral: false`, `cwd` = pinned source runtime cwd (no worktree substitution), the same approval/sandbox/config values `startOrResume` sends, **no** `baseInstructions`, **no** prompt, **no** model change merely to branch. One attempt; a transport timeout or disconnect after submission is reported as *ambiguous*, never auto-retried.
+`thread/fork` with `threadId` = source, `lastTurnId` = checkpoint turn ID (always supplied), `excludeTurns: true`, `ephemeral: false`, `cwd` = pinned source runtime cwd (no worktree substitution), the same approval/sandbox/config values `startOrResume` sends, **no** `baseInstructions`, **no** prompt, **no** model change merely to branch. One attempt; a locally generated timeout, disconnect/transport uncertainty, cancellation after submission, or undecodable/malformed confirmation is reported as *ambiguous*, never auto-retried. A coded provider `requestFailed` error propagates unchanged regardless of message text. Final idle/binding/thread revalidation and request enqueue are serialized with event handling: the event mutex is released as soon as the fork JSON line is written (or enqueue fails), never held while awaiting the RPC response. The reservation is owned by a per-operation UUID, and cleanup clears only that UUID. A lock-protected holder forwards caller cancellation to the request task throughout the validation-to-enqueue handshake, including cancellation that races task installation. If cancellation wins before the JSON write, no fork is submitted and cancellation propagates unchanged; if the write wins, the result is conservatively ambiguous. The injected request executor checks cancellation before signaling enqueue admission. Once enqueue is confirmed, response waiting remains isolated in the request task and caller cancellation yields the post-submission ambiguous outcome.
 
 Rejected: `thread/revert` (destroys the original path), `thread/rollback` (deprecated), `ephemeral: true` (not resumable), `excludeTurns: false` (deprecated hydration; CE is the presentation authority), Pi-style branch summary (contaminates context).
 
@@ -94,7 +94,7 @@ struct AgentSessionBranchOrigin: Codable, Equatable, Sendable {
 
 ### 3.5 Runtime seam (converged)
 
-`NativeAgentRuntimeControlling` untouched. Add to `CodexSessionControlling` (CodexNativeSessionController.swift:54) and every test double: `forkThread(_:) -> SessionRef` (pure request: no `applyThreadResponse`, no `beginBindingSession`, no change to `threadID`/`threadPath`/`routingCurrentTurnID`/`activeTurnIDs`; precondition bound + idle), `listThreadTurns(threadID:cursor:limit:sortDirection:)`, `archiveThread(threadID:)`. Branchability is an Agent-Mode capability, not a runtime feature:
+`NativeAgentRuntimeControlling` untouched. Add to `CodexSessionControlling` (CodexNativeSessionController.swift:54), with protocol defaults that throw `unsupportedOperation` so existing test doubles and conformers only implement primitives they exercise: `forkThread(_:) -> SessionRef` (pure request: no `applyThreadResponse`, no `beginBindingSession`, no change to `threadID`/`threadPath`/`routingCurrentTurnID`/`activeTurnIDs`; precondition bound + idle), `listThreadTurns(threadID:cursor:limit:sortDirection:)`, `archiveThread(threadID:)`. Branchability is an Agent-Mode capability, not a runtime feature:
 
 ```swift
 enum AgentSessionBranchAvailability { case available(CodexTurnCheckpoint), unavailable(Reason) }
@@ -216,7 +216,7 @@ If gate 1 fails (fork does not restore native context through `lastTurnId`), sto
 |---|---|---|
 | 0 Spike | **Complete: GO; Outcome A and D3 Position A selected.** Evidence doc; U1–U5 answered | 2–4 d |
 | 1 Capture | **Complete.** Ledger types, coordinator recording + sealing + side-effect classification, `AgentSession`/`TabSession` fields, sync/prune, tests. Ships alone so sessions accumulate branch points | 3–5 d |
-| 2 Primitive | `forkThread`/`listThreadTurns`/`archiveThread`, DTOs, errors, fakes, structural verification helper, controller tests | 3–5 d |
+| 2 Primitive | **Complete.** `forkThread`/`listThreadTurns`/`archiveThread`, DTOs, errors, protocol defaults, structural verification helper, controller tests | 3–5 d |
 | 3 Model | `branchOrigin`, prefix builder, orchestration (`branchFromTurn`, `switchToBranch`), guard, MetadataIndex field + tree query, exact-resume policy, persistence tests | 1 wk |
 | 4 UI + hazards | menu item, sheet, picker, badge, disabled reasons, Oracle error copy, UI tests, docs; live smoke | 1 wk |
 | Later | edit-earlier-prompt (fork through the previous turn + prefill composer); tree browser; checkpoint backfill; worktree-bound sessions; Oracle clone-at-checkpoint; durable operation journal if a real failure mode appears; `agent_manage.branch_session`; Claude spike; Pi after its native runtime lands | — |

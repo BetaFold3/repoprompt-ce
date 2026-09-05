@@ -770,7 +770,8 @@ actor CodexAppServerClient {
             method: method,
             params: params,
             timeout: timeout,
-            useDefaultTimeout: true
+            useDefaultTimeout: true,
+            onEnqueued: nil
         )
     }
 
@@ -778,7 +779,8 @@ actor CodexAppServerClient {
         method: String,
         params: [String: Any]?,
         timeout: TimeInterval?,
-        useDefaultTimeout: Bool
+        useDefaultTimeout: Bool,
+        onEnqueued: (@Sendable () -> Void)? = nil
     ) async throws -> [String: Any] {
         try Task.checkCancellation()
         guard process != nil else { throw ClientError.processNotRunning }
@@ -808,6 +810,7 @@ actor CodexAppServerClient {
                 }
                 do {
                     try sendJSONLine(payload, method: method)
+                    onEnqueued?()
                 } catch {
                     failPendingRequestIfPresent(id: requestID, error: error)
                 }
