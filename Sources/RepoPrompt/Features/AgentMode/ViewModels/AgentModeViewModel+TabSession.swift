@@ -578,9 +578,18 @@ extension AgentModeViewModel {
         var pendingNonCodexUserInputTokenQueue: [Int] = []
         var activeNonCodexTurnTokenAccumulator: NonCodexTurnTokenAccumulator?
 
-        // Codex native session identifiers and metadata
-        var codexConversationID: String?
+        /// Codex native session identifiers and metadata
+        var codexConversationID: String? {
+            didSet {
+                guard let codexConversationID,
+                      codexTurnCheckpoints?.threadID != codexConversationID
+                else { return }
+                codexTurnCheckpoints = nil
+            }
+        }
+
         var codexRolloutPath: String?
+        var codexTurnCheckpoints: CodexTurnCheckpointLedger?
         var codexModel: String?
         var codexReasoningEffort: String?
         @Published var codexContextUsage: AgentContextUsage? = nil

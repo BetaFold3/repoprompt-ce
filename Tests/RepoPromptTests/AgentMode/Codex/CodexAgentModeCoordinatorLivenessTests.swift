@@ -1419,6 +1419,541 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    func testAcceptedAuthoritativeUserStartCapturesCheckpoint() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        session.codexPendingTurnKind = .user
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "accepted"),
+            session: session
+        )
+
+        let checkpoint = try XCTUnwrap(session.codexTurnCheckpoints?.entries.first)
+        XCTAssertEqual(session.codexTurnCheckpoints?.threadID, "fake")
+        XCTAssertEqual(checkpoint.turnID, user.id)
+        XCTAssertEqual(checkpoint.codexTurnID, "accepted")
+        XCTAssertEqual(checkpoint.status, .inProgress)
+    }
+
+    func testAcceptedReplacementStartReplacesCheckpointForSameCERequest() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+        let prior = try XCTUnwrap(session.codexAuthoritativeActiveTurn)
+        session.codexPendingSteerLifecycleReconciliation = .init(
+            priorIdentity: prior,
+            acceptedDispatchTurnID: "replacement"
+        )
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "replacement"),
+            session: session
+        )
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.count, 1)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.turnID, user.id)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.codexTurnID, "replacement")
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+    }
+
+    func testCompletedCheckpointSealsOnlyAfterTerminalSettlement() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+        let scope = CodexNativeSessionController.ItemScope(
+            turnID: "turn",
+            itemID: "assistant-final"
+        )
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "answer", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+
+        await viewModel.test_codexCoordinator.test_forcePendingCodexTerminalSettleTimeout(session: session)
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .completed)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.sideEffect, .readOnly)
+    }
+
+    func testStaleNativeCompletionDoesNotMutateReplacementCheckpoint() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "replacement")
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "stale", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.codexTurnID, "replacement")
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        XCTAssertNil(session.codexTurnCheckpoints?.entries.first?.sideEffect)
+    }
+
+    func testFailedAndInterruptedCompletionsSealTerminalCheckpointStatuses() async {
+        for (nativeStatus, expectedStatus) in [
+            (CodexNativeSessionController.TurnStatus.failed, CodexTurnCheckpoint.Status.failed),
+            (.interrupted, .cancelled)
+        ] {
+            let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+            let viewModel = makeViewModel(controller: controller)
+            let session = preparedCodexSession(in: viewModel, controller: controller)
+            let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+            session.appendItem(user)
+            session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+            session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+                .turnCompleted(turnID: "turn", status: nativeStatus),
+                session: session
+            )
+
+            XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, expectedStatus)
+            XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.sideEffect, .unknown)
+        }
+    }
+
+    func testCodexPersistencePrunesToRetainedTurnsAndInvalidatesMismatch() {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let retainedID = UUID()
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(
+            threadID: "fake",
+            entries: [
+                CodexTurnCheckpoint(
+                    turnID: retainedID,
+                    codexTurnID: "retained",
+                    status: .completed,
+                    sideEffect: .readOnly,
+                    recordedAt: Date()
+                ),
+                CodexTurnCheckpoint(
+                    turnID: UUID(),
+                    codexTurnID: "removed",
+                    status: .completed,
+                    sideEffect: .unknown,
+                    recordedAt: Date()
+                )
+            ]
+        )
+        var persisted = AgentSession(
+            transcript: AgentTranscript(turns: [
+                AgentTranscriptTurn(id: retainedID, startedAt: Date())
+            ])
+        )
+
+        viewModel.test_codexCoordinator.applyCodexPersistence(from: session, to: &persisted)
+
+        XCTAssertEqual(persisted.codexTurnCheckpoints?.entries.map(\.turnID), [retainedID])
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.count, 2)
+
+        persisted.codexConversationID = "different"
+        persisted.codexTurnCheckpoints = CodexTurnCheckpointLedger(
+            threadID: "stale",
+            entries: persisted.codexTurnCheckpoints?.entries ?? []
+        )
+        viewModel.test_codexCoordinator.restoreCodexMetadata(from: persisted, session: session)
+        XCTAssertNil(session.codexTurnCheckpoints)
+    }
+
+    func testNormalizerExplicitErrorEvidenceSealsCheckpointUnknown() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+        let toolName = "mcp__\(MCPIntegrationHelper.repoPromptMCPServerName)__read_file"
+
+        let toolResult = AgentChatItem.toolResult(
+            name: toolName,
+            invocationID: UUID(),
+            argsJSON: #"{"path":"README.md"}"#,
+            resultJSON: #"{"status":"completed","isError":true}"#,
+            isError: nil,
+            sequenceIndex: session.nextSequenceIndex
+        )
+        session.appendItem(toolResult)
+        let normalized = try XCTUnwrap(AgentTranscriptToolNormalizer.toolExecution(for: toolResult))
+        XCTAssertEqual(normalized.status, .success)
+        XCTAssertEqual(normalized.toolName, "read_file")
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .completed)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.sideEffect, .unknown)
+    }
+
+    func testRecordSaveWithNilOrLaggingTranscriptPreservesCheckpointUntilSeal() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        session.codexPendingTurnKind = .user
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "accepted"),
+            session: session
+        )
+
+        var nilTranscriptSave = AgentSession()
+        viewModel.test_codexCoordinator.applyCodexPersistence(from: session, to: &nilTranscriptSave)
+        XCTAssertEqual(nilTranscriptSave.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+
+        var laggingTranscriptSave = AgentSession(transcript: AgentTranscript(turns: []))
+        viewModel.test_codexCoordinator.applyCodexPersistence(from: session, to: &laggingTranscriptSave)
+        XCTAssertEqual(laggingTranscriptSave.codexTurnCheckpoints?.entries.first?.turnID, user.id)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.turnID, user.id)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "accepted", status: .completed),
+            session: session
+        )
+
+        let checkpoint = try XCTUnwrap(session.codexTurnCheckpoints?.entries.first)
+        XCTAssertEqual(checkpoint.status, .completed)
+        XCTAssertEqual(checkpoint.sideEffect, .readOnly)
+    }
+
+    func testIDBearingStartWithNilCompletionSealsCorrelatedCheckpoint() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+        let scope = CodexNativeSessionController.ItemScope(turnID: "turn", itemID: "assistant-final")
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .canonicalAssistantDelta(text: "answer", scope: scope),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: nil, status: .completed),
+            session: session
+        )
+        XCTAssertTrue(viewModel.test_codexCoordinator.test_hasPendingCodexTerminalSettle(tabID: session.tabID))
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        await viewModel.test_codexCoordinator.test_forcePendingCodexTerminalSettleTimeout(session: session)
+
+        let checkpoint = try XCTUnwrap(session.codexTurnCheckpoints?.entries.first)
+        XCTAssertEqual(checkpoint.status, .completed)
+        XCTAssertEqual(checkpoint.sideEffect, .readOnly)
+    }
+
+    func testCompactAuthoritativeStartDoesNotCreateCheckpoint() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        session.codexPendingTurnKind = .compact
+        session.appendItem(.user("prior request", sequenceIndex: session.nextSequenceIndex))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "compact"),
+            session: session
+        )
+
+        XCTAssertNil(session.codexTurnCheckpoints)
+    }
+
+    func testLocalFailureAndCancellationSealLatestRunCheckpointUnknown() async {
+        let failedController = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let failedViewModel = makeViewModel(controller: failedController)
+        let failedSession = preparedCodexSession(in: failedViewModel, controller: failedController)
+        let failedUser = AgentChatItem.user("request", sequenceIndex: failedSession.nextSequenceIndex)
+        failedSession.appendItem(failedUser)
+        failedSession.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        failedSession.codexTurnCheckpoints?.record(turnID: failedUser.id, codexTurnID: "turn")
+
+        await failedViewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .error("terminal failure"),
+            session: failedSession
+        )
+        XCTAssertEqual(failedSession.codexTurnCheckpoints?.entries.first?.status, .failed)
+        XCTAssertEqual(failedSession.codexTurnCheckpoints?.entries.first?.sideEffect, .unknown)
+
+        let cancelledController = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let cancelledViewModel = makeViewModel(controller: cancelledController)
+        let cancelledSession = preparedCodexSession(in: cancelledViewModel, controller: cancelledController)
+        let cancelledUser = AgentChatItem.user("request", sequenceIndex: cancelledSession.nextSequenceIndex)
+        cancelledSession.appendItem(cancelledUser)
+        cancelledSession.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        cancelledSession.codexTurnCheckpoints?.record(turnID: cancelledUser.id, codexTurnID: "turn")
+
+        await cancelledViewModel.cancelAgentRun(tabID: cancelledSession.tabID)
+        XCTAssertEqual(cancelledSession.codexTurnCheckpoints?.entries.first?.status, .cancelled)
+        XCTAssertEqual(cancelledSession.codexTurnCheckpoints?.entries.first?.sideEffect, .unknown)
+    }
+
+    func testTransientNilConversationIDPreservesCheckpointLedger() {
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let checkpoint = CodexTurnCheckpoint(
+            turnID: UUID(),
+            codexTurnID: "turn",
+            status: .inProgress,
+            sideEffect: nil,
+            recordedAt: Date()
+        )
+        session.codexConversationID = "thread"
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "thread", entries: [checkpoint])
+
+        session.codexConversationID = nil
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries, [checkpoint])
+    }
+
+    func testDifferentNonNilConversationIDInvalidatesCheckpointLedger() {
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.codexConversationID = "thread"
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(
+            threadID: "thread",
+            entries: [CodexTurnCheckpoint(
+                turnID: UUID(),
+                codexTurnID: "turn",
+                status: .inProgress,
+                sideEffect: nil,
+                recordedAt: Date()
+            )]
+        )
+
+        session.codexConversationID = "replacement"
+
+        XCTAssertNil(session.codexTurnCheckpoints)
+    }
+
+    func testRestoreRejectsMismatchedCheckpointLedgerRegardlessOfAssignmentOrder() {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "existing")
+        let persisted = AgentSession(
+            codexConversationID: "restored",
+            codexTurnCheckpoints: CodexTurnCheckpointLedger(
+                threadID: "stale",
+                entries: [CodexTurnCheckpoint(
+                    turnID: UUID(),
+                    codexTurnID: "turn",
+                    status: .completed,
+                    sideEffect: .readOnly,
+                    recordedAt: Date()
+                )]
+            )
+        )
+
+        viewModel.test_codexCoordinator.restoreCodexMetadata(from: persisted, session: session)
+
+        XCTAssertEqual(session.codexConversationID, "restored")
+        XCTAssertNil(session.codexTurnCheckpoints)
+    }
+
+    func testCommitInProgressRejectionWaitsForMatchingRevisionThenSealsCheckpoint() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        session.terminalCommitInProgress = true
+
+        let finalizeTask = Task {
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+                .error("terminal failure"),
+                session: session
+            )
+        }
+        try await waitUntil { session.codexAuthoritativeActiveTurn == nil }
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        var initiallyPersisted = AgentSession()
+        viewModel.test_codexCoordinator.applyCodexPersistence(from: session, to: &initiallyPersisted)
+        XCTAssertEqual(initiallyPersisted.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        session.saveDebounceTask?.cancel()
+        session.saveDebounceTask = nil
+        let saveGenerationBeforeRecovery = session.saveRequestGeneration
+        session.lastTerminalCommitRevision = makeTerminalRevision(
+            ownership: ownership,
+            terminalState: .failed,
+            session: session
+        )
+        session.terminalCommitInProgress = false
+
+        await finalizeTask.value
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .failed)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.sideEffect, .unknown)
+        XCTAssertEqual(session.saveRequestGeneration, saveGenerationBeforeRecovery + 1)
+        XCTAssertNotNil(session.saveDebounceTask)
+        var recoveredPersistence = AgentSession()
+        viewModel.test_codexCoordinator.applyCodexPersistence(from: session, to: &recoveredPersistence)
+        XCTAssertEqual(recoveredPersistence.codexTurnCheckpoints?.entries.first?.status, .failed)
+        XCTAssertEqual(recoveredPersistence.codexTurnCheckpoints?.entries.first?.sideEffect, .unknown)
+        session.saveDebounceTask?.cancel()
+    }
+
+    func testRejectedTerminalWaitDoesNotSealMismatchedOwnershipRevision() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        let mismatchedOwnership = AgentRunOwnership(
+            attemptID: UUID(),
+            binding: ownership.binding,
+            turnEpoch: ownership.turnEpoch
+        )
+        session.terminalCommitInProgress = true
+
+        let finalizeTask = Task {
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+                .error("terminal failure"),
+                session: session
+            )
+        }
+        try await waitUntil { session.codexAuthoritativeActiveTurn == nil }
+        session.lastTerminalCommitRevision = makeTerminalRevision(
+            ownership: mismatchedOwnership,
+            terminalState: .failed,
+            session: session
+        )
+        session.terminalCommitInProgress = false
+
+        await finalizeTask.value
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        XCTAssertNil(session.codexTurnCheckpoints?.entries.first?.sideEffect)
+    }
+
+    func testRejectedTerminalWaitDoesNotSealMismatchedTerminalStateRevision() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        session.terminalCommitInProgress = true
+
+        let finalizeTask = Task {
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+                .error("terminal failure"),
+                session: session
+            )
+        }
+        try await waitUntil { session.codexAuthoritativeActiveTurn == nil }
+        session.lastTerminalCommitRevision = makeTerminalRevision(
+            ownership: ownership,
+            terminalState: .completed,
+            session: session
+        )
+        session.terminalCommitInProgress = false
+
+        await finalizeTask.value
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        XCTAssertNil(session.codexTurnCheckpoints?.entries.first?.sideEffect)
+    }
+
+    func testDuplicateCommitRevisionSealsWhenPrepareHookWasSkipped() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let user = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(user)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "fake")
+        session.codexTurnCheckpoints?.record(turnID: user.id, codexTurnID: "turn")
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        session.lastTerminalCommitRevision = makeTerminalRevision(
+            ownership: ownership,
+            terminalState: .failed,
+            session: session
+        )
+        var initiallyPersisted = AgentSession()
+        viewModel.test_codexCoordinator.applyCodexPersistence(from: session, to: &initiallyPersisted)
+        XCTAssertEqual(initiallyPersisted.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        session.saveDebounceTask?.cancel()
+        session.saveDebounceTask = nil
+        let saveGenerationBeforeRecovery = session.saveRequestGeneration
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .error("duplicate terminal failure"),
+            session: session
+        )
+
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .failed)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.sideEffect, .unknown)
+        XCTAssertEqual(session.saveRequestGeneration, saveGenerationBeforeRecovery + 1)
+        XCTAssertNotNil(session.saveDebounceTask)
+        var recoveredPersistence = AgentSession()
+        viewModel.test_codexCoordinator.applyCodexPersistence(from: session, to: &recoveredPersistence)
+        XCTAssertEqual(recoveredPersistence.codexTurnCheckpoints?.entries.first?.status, .failed)
+        XCTAssertEqual(recoveredPersistence.codexTurnCheckpoints?.entries.first?.sideEffect, .unknown)
+        session.saveDebounceTask?.cancel()
+    }
+
+    private func makeTerminalRevision(
+        ownership: AgentRunOwnership,
+        terminalState: AgentSessionRunState,
+        session: AgentModeViewModel.TabSession
+    ) -> AgentRunTerminalCommitRevision {
+        AgentRunTerminalCommitRevision(
+            commitID: UUID(),
+            ownership: ownership,
+            terminalState: terminalState,
+            expectedRunID: session.runID,
+            sourceItemsRevision: session.sourceItemsRevision,
+            assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
+            providerDrainGeneration: session.providerTerminalDrainGeneration,
+            mcpPublicationEnvelope: nil,
+            successorKind: nil,
+            providerSuccessorID: nil
+        )
+    }
+
     private func makeViewModel(
         controller: LivenessFakeCodexController,
         drain: AgentModeViewModel.CodexAgentRunWaitDrain? = nil

@@ -332,6 +332,10 @@ final class CodexFallbackFIFOTests: XCTestCase {
             steerResults: [.failure(nonSteerable), .failure(nonSteerable)]
         )
         let (viewModel, session) = makeRunningSession(controller: controller)
+        let checkpointUser = AgentChatItem.user("request", sequenceIndex: session.nextSequenceIndex)
+        session.appendItem(checkpointUser)
+        session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: "thread")
+        session.codexTurnCheckpoints?.record(turnID: checkpointUser.id, codexTurnID: "turn")
 
         _ = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -352,6 +356,8 @@ final class CodexFallbackFIFOTests: XCTestCase {
         try await waitUntil { controller.startCount == 1 }
         XCTAssertEqual(session.codexFallbackQueue.count, 1)
         XCTAssertNotNil(session.codexFallbackDispatchInFlight)
+        XCTAssertEqual(session.codexTurnCheckpoints?.entries.first?.status, .inProgress)
+        XCTAssertNil(session.codexTurnCheckpoints?.entries.first?.sideEffect)
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
             .turnCompleted(turnID: "turn", status: .completed),

@@ -4,7 +4,7 @@ Scope: read when the task touches Agent Mode conversation branching, the Codex t
 Authority: Authoritative
 Last-verified: 2026-09-05
 
-Status: **Plan only — not implemented.**
+Status: **Phase 0 GO and Phase 1 Capture implemented; Phases 2–4 remain.** Phase 0 selected Outcome A (no compaction checkpoint field/gate) and D3 Position A (future fork on the live bound idle controller).
 Date: 2026-09-05
 Provenance: two independent Oracle plan consultations (presets OracleC and OracleD, identical initial prompt, `model_preset_id` verified on every send), followed by two rounds of anonymous cross-challenge on every material disagreement, then synthesis. Every load-bearing repository claim below was verified by direct reads at the cited lines in this session; every upstream claim was verified against the installed `codex-cli 0.153.3` app-server JSON schema (`codex app-server generate-json-schema`), the official app-server docs, and the Pi upstream sources.
 
@@ -52,13 +52,12 @@ New `Runtime/Codex/CodexTurnCheckpointLedger.swift`:
 struct CodexTurnCheckpointLedger: Codable, Equatable, Sendable {
     var threadID: String                      // thread the turn IDs belong to
     var entries: [CodexTurnCheckpoint]        // Codex turn order
-    var compactionBoundaryTurnID: String?     // newest completed entry when thread/compacted last fired (see §3.6)
 }
 struct CodexTurnCheckpoint: Codable, Equatable, Sendable {
     let turnID: UUID          // CE turn id == user row id (stable across rebuilds)
     let codexTurnID: String   // turn.id from turn/started
     var status: Status        // inProgress | completed | failed | cancelled
-    var sideEffect: SideEffect? // readOnly | modified(paths:) | unknown — sealed at .turnCompleted (§3.8)
+    var sideEffect: SideEffect? // readOnly | modified(paths:) | unknown — sealed at final terminal settlement (§3.8)
     let recordedAt: Date
 }
 ```
@@ -125,7 +124,7 @@ Exact resume for every tree member: `allowMissingRolloutFallback: false` when `s
 
 ### 3.8 Read-only classification and gating (D4, converged)
 
-Classification is **informational, never a creation gate**. Sealed per checkpoint at `.turnCompleted` from the turn's `AgentTranscriptToolExecution`s (before retention demotion can drop activities): `readOnly` (only recognized RepoPrompt MCP read tools — read_file, file_search, get_file_tree, get_code_structure, workspace_context; matched by trusted server identity + canonical tool name), `modified(paths:)` (affirmative successful write/edit/move/delete evidence), `unknown` (shell/command execution, arbitrary or dynamic MCP tools, `manage_selection`/prompt/chat-mutating tools, incomplete tool lifecycle, compacted evidence). Never parse shell command strings. Aggregate worst-of over all omitted turns. Rationale: Codex explores through native `shell`/`command_execution`, so "unknown = blocked" would kill the primary use case; the promise is conversation rollback, not side-effect undo.
+Classification is **informational, never a creation gate**. Sealed per checkpoint only at the CE request's final terminal settlement, from live `AgentChatItem` tool-execution rows normalized through `AgentTranscriptToolNormalizer` before retention or persistence can demote evidence. The classifier preserves each row's raw prefixed `toolName` after normalization because that prefix is the available trusted RepoPrompt MCP server-identity proof: `readOnly` (only recognized RepoPrompt MCP read tools — read_file, file_search, get_file_tree, get_code_structure, workspace_context; matched by trusted server identity + canonical tool name), `modified(paths:)` (affirmative successful write/edit/move/delete evidence), `unknown` (shell/command execution, arbitrary or dynamic MCP tools, `manage_selection`/prompt/chat-mutating tools, incomplete tool lifecycle, compacted evidence). Never parse shell command strings. Aggregate worst-of over all omitted turns. Rationale: Codex explores through native `shell`/`command_execution`, so "unknown = blocked" would kill the primary use case; the promise is conversation rollback, not side-effect undo.
 
 Hard gate (`.available` only when all hold): local `.codexExec`, `remoteHost == nil`, `origin == .user`, `parentSessionID == nil`, no worktree bindings/merge operations, `runState == .idle` with no pending Codex interactions, terminal settle, steering queue, attachment work, or in-flight Oracle request bound to the source, no `pendingHandoff`, no branch operation in progress, ledger thread == `codexConversationID`, checkpoint `completed` and not `.beforeCompaction`. Knowledge profile is allowed (profile copied; no provider change). Composer draft text is preserved, never sent.
 
@@ -181,7 +180,7 @@ Confirmation sheet: title "Branch from this reply?"; body "Keeps turns 1–{n}. 
 | — | `serializationVersion` bump | 7→8 | none | **Resolved by verification, no bump** (DataService:524 would rewrite every session; decoders ignore unknown keys). |
 | — | Knowledge profile | unsupported | allowed | Resolved by judgment: **allowed** (profile copied; no provider change). |
 
-### D3 (open): fork on the live tab controller vs. an operation-owned controller
+### D3 (resolved by Phase 0): fork on the live tab controller
 
 *Position A — live, bound, idle tab controller, fork before shutdown* (lane 2's final): the source thread is already loaded in that process, so `thread/fork {threadId}` is the documented case; no second `codex app-server` is spawned (each client spawns one, CodexAppServerClient.swift:1009); MCP initialization, if the fork triggers any, arrives on the already-registered PID; foreign-thread notifications are already dropped (:3047–3051). Invariants to test: state snapshot equal before/after `forkThread`; precondition bound + no turn in flight; synthetic child-ID `thread/started`/`item/*` notifications never enter the source transcript; idle shutdown cancelled for the duration. Cold session (`codexNeedsReconnect`, no controller): run the normal reconnect with `allowMissingRolloutFallback: false` first (a fork of a fallback-created fresh thread would be a branch of nothing; this also proves the root is resumable).
 
@@ -215,8 +214,8 @@ If gate 1 fails (fork does not restore native context through `lastTurnId`), sto
 
 | Phase | Ships | Size |
 |---|---|---|
-| 0 Spike | evidence doc; U1–U5 answered; go/no-go | 2–4 d |
-| 1 Capture | ledger types, coordinator recording + sealing + side-effect classification, `AgentSession`/`TabSession` fields, sync/prune, tests. **Ships alone** so sessions accumulate branch points | 3–5 d |
+| 0 Spike | **Complete: GO; Outcome A and D3 Position A selected.** Evidence doc; U1–U5 answered | 2–4 d |
+| 1 Capture | **Complete.** Ledger types, coordinator recording + sealing + side-effect classification, `AgentSession`/`TabSession` fields, sync/prune, tests. Ships alone so sessions accumulate branch points | 3–5 d |
 | 2 Primitive | `forkThread`/`listThreadTurns`/`archiveThread`, DTOs, errors, fakes, structural verification helper, controller tests | 3–5 d |
 | 3 Model | `branchOrigin`, prefix builder, orchestration (`branchFromTurn`, `switchToBranch`), guard, MetadataIndex field + tree query, exact-resume policy, persistence tests | 1 wk |
 | 4 UI + hazards | menu item, sheet, picker, badge, disabled reasons, Oracle error copy, UI tests, docs; live smoke | 1 wk |

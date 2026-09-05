@@ -322,6 +322,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let generation: UUID
         let expectedRunID: UUID?
         let turnID: String?
+        let checkpointCodexTurnID: String?
         let turnStatus: CodexNativeSessionController.TurnStatus
         let reason: String
         let errorMessage: String?
@@ -335,6 +336,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let scope: CodexNativeSessionController.ItemScope
         let rowID: UUID?
         let reason: String
+    }
+
+    struct CodexCheckpointTerminalTarget {
+        let turnID: UUID
+        let codexTurnID: String
     }
 
     private struct RunningBashProcessScanEntry {
@@ -1402,8 +1408,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         from agentSession: AgentSession,
         session: AgentModeViewModel.TabSession
     ) {
+        let restoredCheckpoints = agentSession.codexTurnCheckpoints?.matching(
+            threadID: agentSession.codexConversationID
+        )
         session.codexConversationID = agentSession.codexConversationID
         session.codexRolloutPath = agentSession.codexRolloutPath
+        session.codexTurnCheckpoints = restoredCheckpoints
         session.codexModel = agentSession.codexModel
         session.codexReasoningEffort = agentSession.codexReasoningEffort
         session.codexContextUsage = AgentContextUsage(
@@ -1424,6 +1434,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     ) {
         agentSession.codexConversationID = session.codexConversationID
         agentSession.codexRolloutPath = session.codexRolloutPath
+        var persistedCheckpoints = session.codexTurnCheckpoints?.matching(
+            threadID: session.codexConversationID
+        )
+        if let transcript = agentSession.transcript {
+            persistedCheckpoints?.pruneForPersistence(
+                retainedTerminalTurnIDs: Set(transcript.turns.map(\.id)),
+                currentUserTurnIDs: Set(session.items.lazy.filter { $0.kind == .user }.map(\.id))
+            )
+        }
+        agentSession.codexTurnCheckpoints = persistedCheckpoints
         agentSession.codexModel = session.codexModel
         agentSession.codexReasoningEffort = session.codexReasoningEffort
         agentSession.codexContextWindow = session.codexContextUsage?.modelContextWindow
@@ -1725,6 +1745,135 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     private func beginTrackedCodexUserTurn(_ session: AgentModeViewModel.TabSession) {
         session.codexPendingTurnKind = .user
+    }
+
+    private func recordCodexCheckpointStartIfNeeded(
+        turnID: String?,
+        turnKind: AgentModeViewModel.TabSession.CodexTurnKind,
+        session: AgentModeViewModel.TabSession
+    ) {
+        guard turnKind == .user,
+              let codexTurnID = turnID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !codexTurnID.isEmpty,
+              let threadID = session.codexConversationID,
+              let ceTurnID = session.items.last(where: { $0.kind == .user })?.id
+        else {
+            return
+        }
+        if session.codexTurnCheckpoints == nil {
+            session.codexTurnCheckpoints = CodexTurnCheckpointLedger(threadID: threadID)
+        } else {
+            session.codexTurnCheckpoints?.bind(to: threadID)
+        }
+        session.codexTurnCheckpoints?.record(turnID: ceTurnID, codexTurnID: codexTurnID)
+        session.isDirty = true
+        viewModel?.scheduleSave(for: session.tabID)
+    }
+
+    private func captureCodexCheckpointTerminalTarget(
+        turnStatus: CodexNativeSessionController.TurnStatus,
+        authoritativeCodexTurnID: String?,
+        allowUncorrelatedFailure: Bool,
+        session: AgentModeViewModel.TabSession
+    ) -> CodexCheckpointTerminalTarget? {
+        guard session.codexTurnCheckpoints?.threadID == session.codexConversationID,
+              let ceTurnID = session.items.last(where: { $0.kind == .user })?.id
+        else {
+            return nil
+        }
+        let checkpoint: CodexTurnCheckpoint? = if let authoritativeCodexTurnID {
+            session.codexTurnCheckpoints?.entries.last(where: {
+                $0.turnID == ceTurnID
+                    && $0.codexTurnID == authoritativeCodexTurnID
+                    && $0.status == .inProgress
+            })
+        } else if turnStatus != .completed, allowUncorrelatedFailure {
+            session.codexTurnCheckpoints?.entries.last(where: {
+                $0.turnID == ceTurnID && $0.status == .inProgress
+            })
+        } else {
+            nil
+        }
+        guard let checkpoint else { return nil }
+        return CodexCheckpointTerminalTarget(
+            turnID: checkpoint.turnID,
+            codexTurnID: checkpoint.codexTurnID
+        )
+    }
+
+    @discardableResult
+    private func sealCodexCheckpointIfNeeded(
+        target: CodexCheckpointTerminalTarget,
+        turnStatus: CodexNativeSessionController.TurnStatus,
+        session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        guard session.codexTurnCheckpoints?.threadID == session.codexConversationID,
+              session.codexTurnCheckpoints?.entries.contains(where: {
+                  $0.turnID == target.turnID
+                      && $0.codexTurnID == target.codexTurnID
+                      && $0.status == .inProgress
+              }) == true
+        else {
+            return false
+        }
+        let status: CodexTurnCheckpoint.Status
+        let sideEffect: CodexTurnCheckpoint.SideEffect
+        switch turnStatus {
+        case .completed:
+            status = .completed
+            sideEffect = CodexTurnSideEffectClassifier.classify(
+                executions: checkpointToolExecutions(turnID: target.turnID, session: session)
+            )
+        case .failed:
+            status = .failed
+            sideEffect = .unknown
+        case .interrupted:
+            status = .cancelled
+            sideEffect = .unknown
+        }
+        let didTransition = session.codexTurnCheckpoints?.transition(
+            turnID: target.turnID,
+            codexTurnID: target.codexTurnID,
+            to: status,
+            sideEffect: sideEffect
+        ) == true
+        if didTransition {
+            session.isDirty = true
+        }
+        return didTransition
+    }
+
+    private func checkpointToolExecutions(
+        turnID: UUID,
+        session: AgentModeViewModel.TabSession
+    ) -> [AgentTranscriptToolExecution] {
+        guard let userIndex = session.items.firstIndex(where: { $0.id == turnID && $0.kind == .user }) else {
+            return [AgentTranscriptToolExecution(
+                stableExecutionID: "missing-turn-evidence",
+                toolName: nil,
+                invocationID: nil,
+                argsJSON: nil,
+                resultJSON: nil,
+                toolIsError: nil,
+                status: .unknown,
+                summaryOnly: true
+            )]
+        }
+        let endIndex = session.items[(userIndex + 1)...].firstIndex(where: { $0.kind == .user })
+            ?? session.items.endIndex
+        var executionsByID: [String: AgentTranscriptToolExecution] = [:]
+        var order: [String] = []
+        for item in session.items[(userIndex + 1) ..< endIndex] {
+            guard var execution = AgentTranscriptToolNormalizer.toolExecution(for: item) else { continue }
+            // The normalizer intentionally canonicalizes names for presentation. Checkpoint classification
+            // retains the raw prefixed name so trusted RepoPrompt MCP server identity remains provable.
+            execution.toolName = item.toolName
+            if executionsByID[execution.stableExecutionID] == nil {
+                order.append(execution.stableExecutionID)
+            }
+            executionsByID[execution.stableExecutionID] = execution
+        }
+        return order.compactMap { executionsByID[$0] }
     }
 
     private func installAuthoritativeCodexTurnForStart(
@@ -5688,7 +5837,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             turnStatus: pending.turnStatus,
             reason: "\(pending.reason)-settled-\(trigger)",
             errorMessage: pending.errorMessage,
-            providerSuccessor: pending.providerSuccessor
+            providerSuccessor: pending.providerSuccessor,
+            checkpointCodexTurnID: pending.checkpointCodexTurnID
         )
     }
 
@@ -5730,6 +5880,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func deferCodexTerminalFinalizeIfNeeded(
         session: AgentModeViewModel.TabSession,
         turnID: String?,
+        checkpointCodexTurnID: String?,
         status: CodexNativeSessionController.TurnStatus,
         failureMessage: String?,
         providerSuccessor: AgentRunTerminalCommitBarrier.ProviderSuccessor?
@@ -5778,6 +5929,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             generation: generation,
             expectedRunID: expectedRunID,
             turnID: turnID,
+            checkpointCodexTurnID: checkpointCodexTurnID,
             turnStatus: status,
             reason: "turn-completed-\(status)",
             errorMessage: failureMessage,
@@ -5801,7 +5953,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         errorMessage: String? = nil,
         notifyOnCompleted: Bool = true,
         deleteDeferredFilesWhenFailureHasNoInFlight: Bool = false,
-        providerSuccessor: AgentRunTerminalCommitBarrier.ProviderSuccessor? = nil
+        providerSuccessor: AgentRunTerminalCommitBarrier.ProviderSuccessor? = nil,
+        checkpointCodexTurnID: String? = nil,
+        allowUncorrelatedFailureCheckpoint: Bool = true
     ) async {
         cancelPendingCodexTerminalSettle(for: session.tabID, reason: "finalize-\(reason)")
         guard let ownership = session.activeRunOwnership,
@@ -5810,6 +5964,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         let expectedRunID = session.runID
+        let checkpointTarget = captureCodexCheckpointTerminalTarget(
+            turnStatus: turnStatus,
+            authoritativeCodexTurnID: checkpointCodexTurnID,
+            allowUncorrelatedFailure: allowUncorrelatedFailureCheckpoint,
+            session: session
+        )
         drainCodexTerminalOutput(session, turnStatus: turnStatus)
 
         clearCodexRecoveryAttempt(for: session.runID)
@@ -5862,6 +6022,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             providerBuffersAreDrained: { [weak self] in
                 self?.codexTerminalBuffersAreDrained(session) == true
             },
+            prepareProviderState: { [weak self] in
+                if providerSuccessor == nil, let checkpointTarget {
+                    self?.sealCodexCheckpointIfNeeded(
+                        target: checkpointTarget,
+                        turnStatus: turnStatus,
+                        session: session
+                    )
+                }
+                return nil
+            },
             postCommit: { [weak self] in
                 guard let self else { return }
                 viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
@@ -5871,7 +6041,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 }
             }
         )
-        _ = await terminalCommitBarrier.commit(request)
+        let committedRevision = await terminalCommitBarrier.commit(request)
+        if committedRevision == nil {
+            await terminalCommitBarrier.awaitTerminalPublication(for: ownership, session: session)
+        }
+        let terminalRevision = committedRevision ?? session.lastTerminalCommitRevision
+        if providerSuccessor == nil,
+           terminalRevision?.ownership == ownership,
+           terminalRevision?.terminalState == terminalState,
+           let checkpointTarget
+        {
+            if sealCodexCheckpointIfNeeded(
+                target: checkpointTarget,
+                turnStatus: turnStatus,
+                session: session
+            ) {
+                viewModel?.scheduleSave(for: session.tabID)
+            }
+        }
         if let providerSuccessor {
             scheduleCodexFallbackSuccessorRetryIfNeeded(
                 session: session,
@@ -6398,6 +6585,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             ) else {
                 return
             }
+            recordCodexCheckpointStartIfNeeded(
+                turnID: turnID,
+                turnKind: turnKind,
+                session: session
+            )
             if let identity = session.codexAuthoritativeActiveTurn {
                 bindCodexFallbackQueueToStartedTurn(identity, session: session)
             }
@@ -6448,7 +6640,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     turnStatus: status,
                     reason: "compact-turn-completed-\(status)",
                     errorMessage: failureMessage,
-                    providerSuccessor: providerSuccessor
+                    providerSuccessor: providerSuccessor,
+                    allowUncorrelatedFailureCheckpoint: false
                 )
                 AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] compact turnCompleted turnID=\(turnID ?? "nil") status=\(status) runState=\(session.runState)")
                 return
@@ -6458,6 +6651,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             if await deferCodexTerminalFinalizeIfNeeded(
                 session: session,
                 turnID: turnID,
+                checkpointCodexTurnID: completedIdentity?.turnID,
                 status: status,
                 failureMessage: failureMessage,
                 providerSuccessor: providerSuccessor
@@ -6469,7 +6663,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 turnStatus: status,
                 reason: "turn-completed-\(status)",
                 errorMessage: failureMessage,
-                providerSuccessor: providerSuccessor
+                providerSuccessor: providerSuccessor,
+                checkpointCodexTurnID: completedIdentity?.turnID
             )
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] turnCompleted turnID=\(turnID ?? "nil") status=\(status) items=\(session.items.count) runState=\(session.runState)")
         case .contextCompacted:
@@ -8668,6 +8863,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     struct CodexCancellationTarget {
         let controller: any CodexSessionControlling
         let authoritativeTurnIdentity: AgentModeViewModel.TabSession.CodexAuthoritativeTurnIdentity?
+        let checkpointTarget: CodexCheckpointTerminalTarget?
     }
 
     func captureCodexCancellationTarget(
@@ -8688,7 +8884,13 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
         return .init(
             controller: controller,
-            authoritativeTurnIdentity: authoritativeTurnIdentity
+            authoritativeTurnIdentity: authoritativeTurnIdentity,
+            checkpointTarget: captureCodexCheckpointTerminalTarget(
+                turnStatus: .interrupted,
+                authoritativeCodexTurnID: authoritativeTurnIdentity?.turnID,
+                allowUncorrelatedFailure: true,
+                session: session
+            )
         )
     }
 
@@ -8700,6 +8902,20 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard session.selectedAgent == .codexExec else { return nil }
         let controller = capturedTarget?.controller ?? session.codexController
         let authoritativeTurnIdentity = capturedTarget?.authoritativeTurnIdentity
+        let checkpointTarget = capturedTarget?.checkpointTarget
+            ?? captureCodexCheckpointTerminalTarget(
+                turnStatus: .interrupted,
+                authoritativeCodexTurnID: authoritativeTurnIdentity?.turnID,
+                allowUncorrelatedFailure: true,
+                session: session
+            )
+        if let checkpointTarget {
+            sealCodexCheckpointIfNeeded(
+                target: checkpointTarget,
+                turnStatus: .interrupted,
+                session: session
+            )
+        }
         if session.codexConversationID != nil || session.codexRolloutPath != nil {
             markCodexReconnectNeeded(for: session, source: "user-cancel-detached", scheduleSave: false)
         }
