@@ -697,6 +697,15 @@ final class AgentModeViewModel: ObservableObject {
     private var knownCodexBranchTreeMemberIDsByWorkspaceID: [UUID: Set<UUID>] = [:]
     private var branchSwitchTargetReservations: [UUID: UUID] = [:]
     private var branchOperationSourceReservations: [UUID: UUID] = [:]
+    private var conversationBranchPickerTreeCache: (
+        target: ConversationBranchPickerTarget,
+        tree: AgentSessionBranchTree
+    )?
+    private var conversationBranchPickerResolvedTarget: ConversationBranchPickerTarget?
+    private var conversationBranchPickerRefreshTask: Task<Void, Never>?
+    private var conversationBranchPickerRefreshTarget: ConversationBranchPickerTarget?
+    private var conversationBranchPickerRefreshGeneration: UInt64 = 0
+    var conversationBranchPickerSnapshotDidChange: ((UUID) -> Void)?
     var sidebarAutoArchiveTask: Task<Void, Never>?
     var isApplyingSidebarAutoArchive = false
     let sidebarAutoArchivePolicy = AgentModeSidebarAutoArchivePolicy()
@@ -2432,6 +2441,7 @@ final class AgentModeViewModel: ObservableObject {
         skillCatalogRefreshDebounceTask?.cancel()
         initialSystemWorkspaceSessionListRefreshDeferralFallbackTask?.cancel()
         sessionListCacheTask?.cancel()
+        conversationBranchPickerRefreshTask?.cancel()
         sidebarAutoArchiveTask?.cancel()
         sessionListCacheGeneration &+= 1
     }
@@ -3455,6 +3465,10 @@ final class AgentModeViewModel: ObservableObject {
         stopCursorModelsSubscription()
         sidebarAutoArchiveTask?.cancel()
         sidebarAutoArchiveTask = nil
+        conversationBranchPickerRefreshTask?.cancel()
+        conversationBranchPickerRefreshTask = nil
+        conversationBranchPickerRefreshTarget = nil
+        conversationBranchPickerSnapshotDidChange = nil
         uiRefreshTask?.cancel()
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
@@ -4110,6 +4124,7 @@ final class AgentModeViewModel: ObservableObject {
             previousSessionID: previousSessionID,
             sessionID: sessionID
         )
+        scheduleConversationBranchPickerRefresh(tabID: session.tabID, force: true)
 
         if session.tabID == currentTabID {
             publishLoadingTranscriptPresentation(tabID: session.tabID)
@@ -6958,6 +6973,9 @@ final class AgentModeViewModel: ObservableObject {
                 agentModelRaw: existingEntry.agentModelRaw,
                 agentReasoningEffortRaw: existingEntry.agentReasoningEffortRaw,
                 autoEditEnabled: existingEntry.autoEditEnabled,
+                branchRootSessionID: existingEntry.branchRootSessionID,
+                branchSourceTurnOrdinal: existingEntry.branchSourceTurnOrdinal,
+                branchCreatedAt: existingEntry.branchCreatedAt,
                 parentSessionID: parentSessionID,
                 hasUnknownConversationContent: existingEntry.hasUnknownConversationContent,
                 remoteHostID: existingEntry.remoteHostID ?? session.remoteHost?.hostID,
@@ -11042,6 +11060,9 @@ final class AgentModeViewModel: ObservableObject {
         agentModelRaw: String?,
         agentReasoningEffortRaw: String?,
         autoEditEnabled: Bool,
+        branchRootSessionID: UUID? = nil,
+        branchSourceTurnOrdinal: Int? = nil,
+        branchCreatedAt: Date? = nil,
         parentSessionID: UUID? = nil,
         hasUnknownConversationContent: Bool = false,
         isMCPOriginated: Bool = false,
@@ -11065,6 +11086,9 @@ final class AgentModeViewModel: ObservableObject {
             agentModelRaw: agentModelRaw,
             agentReasoningEffortRaw: agentReasoningEffortRaw,
             autoEditEnabled: autoEditEnabled,
+            branchRootSessionID: branchRootSessionID,
+            branchSourceTurnOrdinal: branchSourceTurnOrdinal,
+            branchCreatedAt: branchCreatedAt,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             remoteHostID: remoteHostID,
@@ -12436,6 +12460,9 @@ final class AgentModeViewModel: ObservableObject {
                 agentModelRaw: agentSession.agentModel,
                 agentReasoningEffortRaw: agentSession.agentReasoningEffort,
                 autoEditEnabled: agentSession.autoEditEnabled,
+                branchRootSessionID: agentSession.branchOrigin?.rootSessionID,
+                branchSourceTurnOrdinal: agentSession.branchOrigin?.sourceTurnOrdinal,
+                branchCreatedAt: agentSession.branchOrigin?.createdAt,
                 parentSessionID: agentSession.parentSessionID,
                 isMCPOriginated: agentSession.isMCPOriginated,
                 origin: agentSession.origin,
@@ -19203,6 +19230,9 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
         switch reason {
         case .sessionIndex:
             syncSidebarUIState(refresh: true, reason: .sessionIndex)
+            if let currentTabID {
+                scheduleConversationBranchPickerRefresh(tabID: currentTabID, force: true)
+            }
             scheduleSidebarAutoArchiveIfReady(reason: .sessionIndexChanged)
         case .sortDates:
             syncSidebarUIState(refresh: true, reason: .sortDates)
@@ -19214,6 +19244,7 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
 
 enum CodexBranchOperationError: Error, LocalizedError, Equatable {
     case unavailable(AgentSessionBranchAvailability.Reason)
+    case staleConfirmation
     case staleOperation
     case sourceSessionMissing
     case targetSessionMissing
@@ -19224,6 +19255,8 @@ enum CodexBranchOperationError: Error, LocalizedError, Equatable {
         switch self {
         case .unavailable:
             "This turn is not available for native branching."
+        case .staleConfirmation:
+            "This branch confirmation is stale. Cancel and reopen it."
         case .staleOperation:
             "The session changed while branching. Nothing was changed here."
         case .sourceSessionMissing:
@@ -19248,6 +19281,335 @@ extension AgentModeViewModel {
         let persistenceGeneration: UInt64
         let sourceItemsRevision: Int
         let conversationID: String
+    }
+
+    func isConversationBranchSession(sessionID: UUID?, tabID: UUID?) -> Bool {
+        if let tabID,
+           let session = sessions[tabID],
+           session.activeAgentSessionID == sessionID,
+           session.branchOrigin != nil
+        {
+            return true
+        }
+        guard let sessionID else { return false }
+        return ownerValidatedSessionIndex[sessionID]?.branchRootSessionID != nil
+    }
+
+    func conversationBranchPickerTargetIsValid(_ target: ConversationBranchPickerTarget) -> Bool {
+        guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot,
+              workspace.id == target.workspaceID,
+              workspace.composeTabs.contains(where: { $0.id == target.tabID }),
+              let session = sessions[target.tabID]
+        else {
+            return false
+        }
+        return session.activeAgentSessionID == target.activeSessionID
+            && session.bindingTransitionGeneration == target.bindingTransitionGeneration
+    }
+
+    func conversationBranchPickerSnapshot(tabID: UUID) -> ConversationBranchPickerSnapshot? {
+        guard let target = conversationBranchPickerTarget(tabID: tabID),
+              let cached = conversationBranchPickerTreeCache,
+              cached.target == target,
+              Self.conversationBranchPickerShouldBeVisible(tree: cached.tree)
+        else {
+            scheduleConversationBranchPickerRefresh(tabID: tabID)
+            return nil
+        }
+        return makeConversationBranchPickerSnapshot(target: target, tree: cached.tree)
+    }
+
+    func hasConversationBranches(tabID: UUID) -> Bool {
+        guard let target = conversationBranchPickerTarget(tabID: tabID),
+              let cached = conversationBranchPickerTreeCache,
+              cached.target == target
+        else {
+            scheduleConversationBranchPickerRefresh(tabID: tabID)
+            return false
+        }
+        return Self.conversationBranchPickerShouldBeVisible(tree: cached.tree)
+    }
+
+    static func projectedConversationBranchMemberCount(tree: AgentSessionBranchTree) -> Int {
+        let projectedBranchCount = tree.records.count {
+            $0.id != tree.rootSessionID && $0.branchRootSessionID == tree.rootSessionID
+        }
+        return 1 + projectedBranchCount
+    }
+
+    static func conversationBranchPickerShouldBeVisible(tree: AgentSessionBranchTree) -> Bool {
+        projectedConversationBranchMemberCount(tree: tree) > 1
+    }
+
+    static func shouldScheduleConversationBranchPickerRefresh(
+        requestedTabID: UUID,
+        currentTabID: UUID?,
+        hasCurrentResult: Bool,
+        hasRefreshInFlight: Bool,
+        force: Bool
+    ) -> Bool {
+        guard requestedTabID == currentTabID else { return false }
+        return force || (!hasCurrentResult && !hasRefreshInFlight)
+    }
+
+    static func shouldPublishConversationBranchPickerRefresh(
+        completedTarget: ConversationBranchPickerTarget,
+        currentTarget: ConversationBranchPickerTarget?,
+        completedGeneration: UInt64,
+        currentGeneration: UInt64,
+        isCancelled: Bool
+    ) -> Bool {
+        !isCancelled
+            && completedGeneration == currentGeneration
+            && completedTarget == currentTarget
+    }
+
+    private func conversationBranchPickerTarget(tabID: UUID) -> ConversationBranchPickerTarget? {
+        guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot,
+              workspace.composeTabs.contains(where: { $0.id == tabID }),
+              let session = sessions[tabID],
+              let activeSessionID = session.activeAgentSessionID
+        else {
+            return nil
+        }
+        return ConversationBranchPickerTarget(
+            workspaceID: workspace.id,
+            tabID: tabID,
+            activeSessionID: activeSessionID,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+    }
+
+    private func scheduleConversationBranchPickerRefresh(tabID: UUID, force: Bool = false) {
+        guard tabID == currentTabID else { return }
+        guard let target = conversationBranchPickerTarget(tabID: tabID),
+              let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
+        else {
+            conversationBranchPickerRefreshTask?.cancel()
+            conversationBranchPickerRefreshTask = nil
+            conversationBranchPickerResolvedTarget = nil
+            conversationBranchPickerRefreshTarget = nil
+            conversationBranchPickerTreeCache = nil
+            return
+        }
+        let hasCurrentResult = conversationBranchPickerResolvedTarget == target
+        let hasRefreshInFlight = conversationBranchPickerRefreshTask != nil
+            && conversationBranchPickerRefreshTarget == target
+        guard Self.shouldScheduleConversationBranchPickerRefresh(
+            requestedTabID: tabID,
+            currentTabID: currentTabID,
+            hasCurrentResult: hasCurrentResult,
+            hasRefreshInFlight: hasRefreshInFlight,
+            force: force
+        ) else {
+            return
+        }
+
+        if force {
+            conversationBranchPickerResolvedTarget = nil
+        }
+        conversationBranchPickerRefreshGeneration &+= 1
+        let generation = conversationBranchPickerRefreshGeneration
+        conversationBranchPickerRefreshTask?.cancel()
+        conversationBranchPickerRefreshTarget = target
+        conversationBranchPickerRefreshTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await dataService.indexedAgentSessionBranchTree(
+                containing: target.activeSessionID,
+                for: workspace
+            )
+            let currentTarget = currentTabID.flatMap(conversationBranchPickerTarget(tabID:))
+            guard Self.shouldPublishConversationBranchPickerRefresh(
+                completedTarget: target,
+                currentTarget: currentTarget,
+                completedGeneration: generation,
+                currentGeneration: conversationBranchPickerRefreshGeneration,
+                isCancelled: Task.isCancelled
+            ) else {
+                clearConversationBranchPickerRefreshIfOwned(generation: generation)
+                return
+            }
+            conversationBranchPickerResolvedTarget = target
+            switch result {
+            case let .available(tree):
+                conversationBranchPickerTreeCache = (target, tree)
+            case .unavailable:
+                conversationBranchPickerTreeCache = nil
+            }
+            clearConversationBranchPickerRefreshIfOwned(generation: generation)
+            conversationBranchPickerSnapshotDidChange?(tabID)
+        }
+    }
+
+    private func clearConversationBranchPickerRefreshIfOwned(generation: UInt64) {
+        guard generation == conversationBranchPickerRefreshGeneration else { return }
+        conversationBranchPickerRefreshTask = nil
+        conversationBranchPickerRefreshTarget = nil
+    }
+
+    private func makeConversationBranchPickerSnapshot(
+        target: ConversationBranchPickerTarget,
+        tree: AgentSessionBranchTree
+    ) -> ConversationBranchPickerSnapshot {
+        let session = sessions[target.tabID]
+        let gateReason = session.flatMap {
+            AgentSessionBranchGate.operationUnavailableReason(
+                session: $0,
+                occupancy: branchOccupancy(for: $0)
+            )
+        }
+        let rootRecord = tree.records.first(where: { $0.id == tree.rootSessionID })
+        var items = [
+            conversationBranchPickerItem(
+                sessionID: tree.rootSessionID,
+                sourceTurnOrdinal: nil,
+                date: rootRecord?.savedAt,
+                isOriginal: true,
+                isDeleted: rootRecord == nil,
+                target: target,
+                gateReason: gateReason
+            )
+        ]
+        let branches = tree.records
+            .filter { $0.id != tree.rootSessionID && $0.branchRootSessionID == tree.rootSessionID }
+            .sorted(by: ConversationBranchRecordOrdering.areInIncreasingOrder)
+        items.append(contentsOf: branches.map { record in
+            conversationBranchPickerItem(
+                sessionID: record.id,
+                sourceTurnOrdinal: record.branchSourceTurnOrdinal,
+                date: record.branchCreatedAt ?? record.savedAt,
+                isOriginal: false,
+                isDeleted: false,
+                target: target,
+                gateReason: gateReason
+            )
+        })
+        return ConversationBranchPickerSnapshot(target: target, items: items)
+    }
+
+    private func conversationBranchPickerItem(
+        sessionID: UUID,
+        sourceTurnOrdinal: Int?,
+        date: Date?,
+        isOriginal: Bool,
+        isDeleted: Bool,
+        target: ConversationBranchPickerTarget,
+        gateReason: AgentSessionBranchAvailability.Reason?
+    ) -> ConversationBranchPickerItem {
+        let isActive = sessionID == target.activeSessionID
+        let isOccupiedElsewhere: Bool = {
+            if branchSwitchTargetReservations[sessionID].map({ $0 != target.tabID }) == true
+                || branchOperationSourceReservations[sessionID].map({ $0 != target.tabID }) == true
+            {
+                return true
+            }
+            switch persistentBindingResolution(for: sessionID) {
+            case let .unique(tabID):
+                return tabID != target.tabID
+            case .ambiguous:
+                return true
+            case .notFound:
+                return false
+            }
+        }()
+        let disabledHelpText: String? = if isDeleted {
+            "The original conversation was deleted."
+        } else if !isActive, isOccupiedElsewhere {
+            "This branch is open in another tab."
+        } else if !isActive, gateReason != nil {
+            "Finish the pending operation before switching branches."
+        } else {
+            nil
+        }
+        return ConversationBranchPickerItem(
+            id: sessionID,
+            sourceTurnOrdinal: sourceTurnOrdinal,
+            date: date,
+            isOriginal: isOriginal,
+            isDeleted: isDeleted,
+            isActive: isActive,
+            isEnabled: disabledHelpText == nil,
+            disabledHelpText: disabledHelpText
+        )
+    }
+
+    func replyBranchPresentation(
+        turnID: UUID,
+        tabID: UUID
+    ) -> AgentReplyBranchPresentation? {
+        guard let session = sessions[tabID] else { return nil }
+        return AgentReplyBranchPresentation(
+            turnID: turnID,
+            availability: AgentSessionBranchGate.evaluate(
+                session: session,
+                turnID: turnID,
+                occupancy: branchOccupancy(for: session)
+            ),
+            isOperationInProgress: session.isBranchOperationInProgress
+        )
+    }
+
+    func replyBranchConfirmation(
+        turnID: UUID,
+        tabID: UUID,
+        sourceOwnedOracleChatCount: Int
+    ) -> AgentReplyBranchConfirmation? {
+        guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot,
+              workspace.composeTabs.contains(where: { $0.id == tabID }),
+              let session = sessions[tabID],
+              let pin = ReplyBranchConfirmationPin(
+                  workspaceID: workspace.id,
+                  session: session,
+                  turnID: turnID
+              )
+        else {
+            return nil
+        }
+        let presentation = AgentReplyBranchPresentation(
+            turnID: turnID,
+            availability: AgentSessionBranchGate.evaluate(
+                session: session,
+                turnID: turnID,
+                occupancy: branchOccupancy(for: session)
+            ),
+            transcriptTurnIDs: session.transcript.turns.map(\.id),
+            ledger: session.codexTurnCheckpoints,
+            sourceOwnedOracleChatCount: sourceOwnedOracleChatCount,
+            isOperationInProgress: session.isBranchOperationInProgress
+        )
+        guard presentation.canPresentConfirmation else { return nil }
+        return AgentReplyBranchConfirmation(
+            presentation: presentation,
+            performBranch: { [weak self] in
+                guard let self else {
+                    throw CodexBranchOperationError.staleConfirmation
+                }
+                _ = try await branchFromTurn(
+                    turnID,
+                    tabID: tabID,
+                    confirmationPin: pin
+                )
+            }
+        )
+    }
+
+    private func validateReplyBranchConfirmation(
+        _ pin: ReplyBranchConfirmationPin,
+        turnID: UUID,
+        tabID: UUID
+    ) throws {
+        guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot,
+              workspace.composeTabs.contains(where: { $0.id == tabID }),
+              let session = sessions[tabID],
+              pin.matches(
+                  workspaceID: workspace.id,
+                  tabID: tabID,
+                  session: session,
+                  turnID: turnID
+              )
+        else {
+            throw CodexBranchOperationError.staleConfirmation
+        }
     }
 
     private func branchOccupancy(for session: TabSession) -> AgentSessionBranchGate.Occupancy {
@@ -19306,6 +19668,7 @@ extension AgentModeViewModel {
         }
         session.isBranchOperationInProgress = true
         branchOperationSourceReservations[sessionID] = session.tabID
+        syncActiveUIState(tabID: session.tabID, invalidation: [.composer, .runInteraction])
         return BranchOperationPin(
             session: session,
             tabID: session.tabID,
@@ -19339,12 +19702,24 @@ extension AgentModeViewModel {
             branchOperationSourceReservations.removeValue(forKey: pin.sessionID)
         }
         pin.session.isBranchOperationInProgress = false
+        syncActiveUIState(tabID: pin.tabID, invalidation: [.composer, .runInteraction])
         if rescheduleIdleShutdown {
             codexCoordinator.finishBranchOperation(session: pin.session)
         }
     }
 
-    func branchFromTurn(_ turnID: UUID, tabID: UUID) async throws -> UUID {
+    func branchFromTurn(
+        _ turnID: UUID,
+        tabID: UUID,
+        confirmationPin: ReplyBranchConfirmationPin? = nil
+    ) async throws -> UUID {
+        if let confirmationPin {
+            try validateReplyBranchConfirmation(
+                confirmationPin,
+                turnID: turnID,
+                tabID: tabID
+            )
+        }
         guard let session = sessions[tabID],
               let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
         else {
@@ -19485,6 +19860,7 @@ extension AgentModeViewModel {
                 childID
             ])
             await reconcileCodexBranchTreeMembership(for: workspace)
+            scheduleConversationBranchPickerRefresh(tabID: tabID, force: true)
             try validateBranchOperation(pin)
 
             await codexCoordinator.shutdownCodexSession(session)

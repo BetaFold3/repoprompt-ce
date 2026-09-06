@@ -1,3 +1,5 @@
+> **Completed outcome (2026-09-05).** Phases 0–4 are implemented. V1 uses the live bound idle Codex controller for durable `thread/fork`, one persisted session per branch with child-only lineage, metadata-index tree projection, fail-closed exact resume for every tree member, exact-session Oracle ownership, and the reply/titlebar/sidebar UI. The durable contract now lives in [Codex conversation branching](../../codex-conversation-branching.md). The original plan follows intact for historical design context.
+
 # Plan: Codex Conversation Branching (Pi-style "tree" rollback) in Agent Mode
 
 Scope: read when the task touches Agent Mode conversation branching, the Codex turn-checkpoint ledger, `thread/fork` wiring in `CodexNativeSessionController`, branch switching inside a compose tab, or the `branchOrigin` session lineage field.

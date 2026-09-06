@@ -162,6 +162,104 @@ final class AgentChatTitlebarSafetyTests: XCTestCase {
         }
     }
 
+    func testBackgroundBranchPickerRefreshIsIgnoredWhileActiveRefreshIsPending() {
+        let activeTabID = UUID()
+        let backgroundTabID = UUID()
+
+        XCTAssertFalse(AgentModeViewModel.shouldScheduleConversationBranchPickerRefresh(
+            requestedTabID: backgroundTabID,
+            currentTabID: activeTabID,
+            hasCurrentResult: false,
+            hasRefreshInFlight: true,
+            force: true
+        ))
+        XCTAssertTrue(AgentModeViewModel.shouldScheduleConversationBranchPickerRefresh(
+            requestedTabID: activeTabID,
+            currentTabID: activeTabID,
+            hasCurrentResult: false,
+            hasRefreshInFlight: false,
+            force: false
+        ))
+    }
+
+    func testBackgroundBranchPickerRefreshIsIgnoredAfterActiveCacheIsValid() {
+        let activeTabID = UUID()
+        let backgroundTabID = UUID()
+
+        XCTAssertFalse(AgentModeViewModel.shouldScheduleConversationBranchPickerRefresh(
+            requestedTabID: backgroundTabID,
+            currentTabID: activeTabID,
+            hasCurrentResult: true,
+            hasRefreshInFlight: false,
+            force: true
+        ))
+        XCTAssertTrue(AgentModeViewModel.shouldScheduleConversationBranchPickerRefresh(
+            requestedTabID: activeTabID,
+            currentTabID: activeTabID,
+            hasCurrentResult: true,
+            hasRefreshInFlight: false,
+            force: true
+        ))
+    }
+
+    func testDelayedBackgroundBranchPickerCompletionCannotPublishAfterReturningToCachedTab() {
+        let workspaceID = UUID()
+        let sessionAID = UUID()
+        let sessionBID = UUID()
+        let targetA = AgentConversationBranchPickerTarget(
+            workspaceID: workspaceID,
+            tabID: UUID(),
+            activeSessionID: sessionAID,
+            bindingTransitionGeneration: 1
+        )
+        let targetB = AgentConversationBranchPickerTarget(
+            workspaceID: workspaceID,
+            tabID: UUID(),
+            activeSessionID: sessionBID,
+            bindingTransitionGeneration: 1
+        )
+        let generation: UInt64 = 7
+
+        XCTAssertTrue(AgentModeViewModel.shouldPublishConversationBranchPickerRefresh(
+            completedTarget: targetA,
+            currentTarget: targetA,
+            completedGeneration: generation,
+            currentGeneration: generation,
+            isCancelled: false
+        ))
+        XCTAssertTrue(AgentModeViewModel.shouldPublishConversationBranchPickerRefresh(
+            completedTarget: targetB,
+            currentTarget: targetB,
+            completedGeneration: generation,
+            currentGeneration: generation,
+            isCancelled: false
+        ))
+
+        XCTAssertFalse(AgentModeViewModel.shouldPublishConversationBranchPickerRefresh(
+            completedTarget: targetB,
+            currentTarget: targetA,
+            completedGeneration: generation,
+            currentGeneration: generation,
+            isCancelled: false
+        ))
+    }
+
+    func testConversationBranchPickerTargetFailsClosedAfterBindingChange() async throws {
+        try await withFixture { fixture in
+            let target = AgentConversationBranchPickerTarget(
+                workspaceID: fixture.workspaceID,
+                tabID: fixture.tabAID,
+                activeSessionID: fixture.sessionAID,
+                bindingTransitionGeneration: fixture.sessionA.bindingTransitionGeneration
+            )
+            XCTAssertTrue(fixture.viewModel.conversationBranchPickerTargetIsValid(target))
+
+            fixture.sessionA.testInstallPersistentSessionBinding(sessionID: UUID())
+
+            XCTAssertFalse(fixture.viewModel.conversationBranchPickerTargetIsValid(target))
+        }
+    }
+
     func testGuardedCloseAndStashRejectStaleMutationContext() async throws {
         try await withFixture { fixture in
             await fixture.window.promptManager.closeComposeTab(

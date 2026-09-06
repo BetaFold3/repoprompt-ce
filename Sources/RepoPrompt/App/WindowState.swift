@@ -405,6 +405,10 @@ class WindowState: ObservableObject {
 
         // Set up additional actions
         setupSendPromptAction()
+        agentModeViewModel.conversationBranchPickerSnapshotDidChange = { [weak self] tabID in
+            guard let self, tabID == promptManager.activeComposeTabID else { return }
+            refreshAgentChatTitleCluster()
+        }
         #if DEBUG
             if AppLaunchConfiguration.current.forcesMCPAutoStart {
                 setupMCPAutoStart()
@@ -812,6 +816,26 @@ class WindowState: ObservableObject {
         )
     }
 
+    func agentConversationBranchPickerSnapshot() -> AgentConversationBranchPickerSnapshot? {
+        guard let chatTarget = currentAgentTitlebarChatOptionsTarget(),
+              let snapshot = agentModeViewModel.conversationBranchPickerSnapshot(tabID: chatTarget.tabID),
+              snapshot.target.workspaceID == chatTarget.workspaceID,
+              snapshot.target.activeSessionID == chatTarget.agentSessionID,
+              agentModeViewModel.conversationBranchPickerTargetIsValid(snapshot.target)
+        else {
+            return nil
+        }
+        return snapshot
+    }
+
+    func agentConversationBranchMenuActions() -> AgentConversationBranchMenuActions {
+        AgentConversationBranchMenuActions(
+            switchBranch: { [weak self] target, sessionID in
+                self?.switchConversationBranchFromTitlebar(target: target, sessionID: sessionID)
+            }
+        )
+    }
+
     func agentChatTitleClusterMenuActions() -> AgentChatOptionsMenuActions {
         AgentChatOptionsMenuActions(
             togglePin: { [weak self] target in
@@ -830,10 +854,54 @@ class WindowState: ObservableObject {
     }
 
     private func refreshAgentChatTitleCluster() {
+        let chatTarget = currentAgentTitlebarChatOptionsTarget()
+        let showsConversationBranches = chatTarget.map {
+            agentModeViewModel.hasConversationBranches(tabID: $0.tabID)
+        } ?? false
         agentChatTitleCluster.update(
             title: displayedWindowTitle,
-            showsChatOptions: currentAgentTitlebarChatOptionsTarget() != nil
+            showsConversationBranches: showsConversationBranches,
+            showsChatOptions: chatTarget != nil
         )
+    }
+
+    private func switchConversationBranchFromTitlebar(
+        target: AgentConversationBranchPickerTarget,
+        sessionID: UUID
+    ) {
+        guard let current = currentAgentTitlebarChatOptionsTarget(),
+              current.workspaceID == target.workspaceID,
+              current.tabID == target.tabID,
+              current.agentSessionID == target.activeSessionID,
+              agentModeViewModel.conversationBranchPickerTargetIsValid(target)
+        else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let current = currentAgentTitlebarChatOptionsTarget(),
+                  current.workspaceID == target.workspaceID,
+                  current.tabID == target.tabID,
+                  current.agentSessionID == target.activeSessionID,
+                  agentModeViewModel.conversationBranchPickerTargetIsValid(target)
+            else {
+                return
+            }
+            do {
+                try await agentModeViewModel.switchToBranch(sessionID: sessionID, tabID: target.tabID)
+            } catch {
+                let alert = NSAlert()
+                alert.messageText = "Couldn't switch conversation branch"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                if let window = nsWindow {
+                    await alert.beginSheetModal(for: window)
+                } else {
+                    _ = alert.runModal()
+                }
+            }
+        }
     }
 
     private func toggleAgentChatPinFromTitlebar(target: AgentChatOptionsMenuTarget) {

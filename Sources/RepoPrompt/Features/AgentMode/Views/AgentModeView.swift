@@ -229,6 +229,7 @@ struct AgentModeChatDetailView: View {
     @State private var isTranscriptWindowExpanded = false
     @State private var previewLinkResolutionTask: Task<Bool, Never>?
     @StateObject private var viewportRegistry = AgentTranscriptViewportRegistry()
+    @StateObject private var replyBranchConfirmation = AgentReplyBranchConfirmationState()
 
     // MARK: - Assistant transcript search & ephemeral expansion (Workstream 5 item 1)
 
@@ -2028,6 +2029,18 @@ struct AgentModeChatDetailView: View {
         .onDisappear {
             cancelPreviewLinkResolution()
         }
+        .sheet(
+            isPresented: Binding(
+                get: { replyBranchConfirmation.confirmation != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        replyBranchConfirmation.dismiss()
+                    }
+                }
+            )
+        ) {
+            AgentReplyBranchConfirmationSheet(state: replyBranchConfirmation)
+        }
     }
 
     private func handleTranscriptURL(_ url: URL) -> OpenURLAction.Result {
@@ -3004,6 +3017,7 @@ struct AgentModeChatDetailView: View {
             ),
             promptManager: promptManager,
             handoffConfig: handoffConfig(for: item.id),
+            replyBranchConfig: replyBranchConfig(for: block, ownerTabID: ownerTabID),
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),
             rawToolResultPayloadRenderRevision: transcriptSnapshot.presentation
                 .rawToolResultPayloadRenderRevisionByItemID[item.id] ?? 0,
@@ -3474,7 +3488,42 @@ struct AgentModeChatDetailView: View {
         transcriptBlockDefaultExpansion = nextDefaults
     }
 
-    // MARK: - Handoff
+    // MARK: - Reply actions
+
+    private func sourceOwnedOracleChatCount(for tabID: UUID) -> Int {
+        guard let sourceSessionID = agentModeVM.sessions[tabID]?.activeAgentSessionID else { return 0 }
+        return oracleViewModel.sessions.count { $0.agentModeSessionID == sourceSessionID }
+    }
+
+    private func replyBranchConfig(
+        for block: AgentTranscriptRenderBlock,
+        ownerTabID: UUID?
+    ) -> AgentReplyBranchConfig? {
+        guard AgentReplyBranchPresentation.isEligibleBlock(block.kind),
+              let sourceTabID = ownerTabID,
+              let presentation = agentModeVM.replyBranchPresentation(
+                  turnID: block.turnID,
+                  tabID: sourceTabID
+              )
+        else {
+            return nil
+        }
+        return AgentReplyBranchConfig(
+            presentation: presentation,
+            requestPresentation: { [weak agentModeVM] in
+                guard let agentModeVM,
+                      let confirmation = agentModeVM.replyBranchConfirmation(
+                          turnID: block.turnID,
+                          tabID: sourceTabID,
+                          sourceOwnedOracleChatCount: sourceOwnedOracleChatCount(for: sourceTabID)
+                      )
+                else {
+                    return
+                }
+                replyBranchConfirmation.present(confirmation)
+            }
+        )
+    }
 
     private func handoffConfig(for itemID: UUID) -> AgentHandoffConfig? {
         guard runInteractionSnapshot.canForkCurrentSession,

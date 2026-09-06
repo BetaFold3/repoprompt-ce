@@ -1102,6 +1102,39 @@ extension OracleViewModel {
         return "Chat with ID '\(chatID)' belongs to a different Agent Mode owner (\(detail))"
     }
 
+    static func branchAwareOracleOwnerContinuationRejection(
+        _ session: ChatSession,
+        chatID: String,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?,
+        workspace: WorkspaceModel?,
+        dataService: AgentSessionDataService = .shared
+    ) async -> String? {
+        guard let genericRejection = oracleOwnerContinuationRejection(
+            session,
+            chatID: chatID,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID
+        ) else { return nil }
+
+        guard let ownerSessionID = session.agentModeSessionID,
+              let agentModeSessionID,
+              ownerSessionID != agentModeSessionID,
+              let workspace,
+              session.workspaceID == workspace.id,
+              case let .available(tree) = await dataService.indexedAgentSessionBranchTree(
+                  containing: agentModeSessionID,
+                  for: workspace
+              ),
+              tree.records.first(where: { $0.id == agentModeSessionID })?.branchRootSessionID != nil,
+              tree.records.contains(where: { $0.id == ownerSessionID })
+        else {
+            return genericRejection
+        }
+
+        return "This Oracle chat belongs to another branch of this conversation. Start a new Oracle chat here to continue."
+    }
+
     /// Returns a handoff-specific hint only when the caller already owns the mapped
     /// destination clone. The old ID remains invalid and is never resolved as an alias.
     @MainActor
@@ -1405,11 +1438,12 @@ extension OracleViewModel {
             guard Self.sessionBelongsToResolvedTab(existing, tabID: resolvedTabID) else {
                 throw ChatToolError.invalidParams("Chat with ID '\(idString)' belongs to a different tab")
             }
-            if let rejection = Self.oracleOwnerContinuationRejection(
+            if let rejection = await Self.branchAwareOracleOwnerContinuationRejection(
                 existing,
                 chatID: idString,
                 agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID
+                agentModeRunID: agentModeRunID,
+                workspace: workspaceManager.activeWorkspace
             ) {
                 throw ChatToolError.invalidParams(rejection)
             }
@@ -2357,11 +2391,12 @@ extension OracleViewModel {
                     "Chat with ID '\(normalizedChatID)' belongs to a different tab. oracle_utils op='log' can only read chats from the current tab during agent mode."
                 )
             }
-            if let rejection = Self.oracleOwnerContinuationRejection(
+            if let rejection = await Self.branchAwareOracleOwnerContinuationRejection(
                 found,
                 chatID: normalizedChatID,
                 agentModeSessionID: agentModeSessionID,
-                agentModeRunID: agentModeRunID
+                agentModeRunID: agentModeRunID,
+                workspace: workspaceManager.activeWorkspace
             ) {
                 throw ChatToolError.invalidParams(rejection)
             }

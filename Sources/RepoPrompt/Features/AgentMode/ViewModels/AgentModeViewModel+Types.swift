@@ -664,6 +664,97 @@ extension AgentModeViewModel {
         )
     }
 
+    struct ConversationBranchPickerTarget: Equatable {
+        let workspaceID: UUID
+        let tabID: UUID
+        let activeSessionID: UUID
+        let bindingTransitionGeneration: UInt64
+    }
+
+    struct ReplyBranchConfirmationPin: Equatable {
+        let workspaceID: UUID
+        let tabID: UUID
+        let tabSessionIdentity: ObjectIdentifier
+        let activeSessionID: UUID
+        let bindingTransitionGeneration: UInt64
+        let persistenceMutationGeneration: UInt64
+        let sourceItemsRevision: Int
+        let turnID: UUID
+
+        @MainActor
+        init?(
+            workspaceID: UUID,
+            session: TabSession,
+            turnID: UUID
+        ) {
+            guard let activeSessionID = session.activeAgentSessionID else { return nil }
+            self.workspaceID = workspaceID
+            tabID = session.tabID
+            tabSessionIdentity = ObjectIdentifier(session)
+            self.activeSessionID = activeSessionID
+            bindingTransitionGeneration = session.bindingTransitionGeneration
+            persistenceMutationGeneration = session.persistenceMutationGeneration
+            sourceItemsRevision = session.sourceItemsRevision
+            self.turnID = turnID
+        }
+
+        @MainActor
+        func matches(
+            workspaceID: UUID,
+            tabID: UUID,
+            session: TabSession,
+            turnID: UUID
+        ) -> Bool {
+            self.workspaceID == workspaceID
+                && self.tabID == tabID
+                && tabSessionIdentity == ObjectIdentifier(session)
+                && session.activeAgentSessionID == activeSessionID
+                && session.bindingTransitionGeneration == bindingTransitionGeneration
+                && session.persistenceMutationGeneration == persistenceMutationGeneration
+                && session.sourceItemsRevision == sourceItemsRevision
+                && self.turnID == turnID
+        }
+    }
+
+    enum ConversationBranchRecordOrdering {
+        static func areInIncreasingOrder(
+            _ lhs: AgentSessionMetadataRecord,
+            _ rhs: AgentSessionMetadataRecord
+        ) -> Bool {
+            switch (lhs.branchSourceTurnOrdinal, rhs.branchSourceTurnOrdinal) {
+            case let (lhsOrdinal?, rhsOrdinal?) where lhsOrdinal != rhsOrdinal:
+                return lhsOrdinal < rhsOrdinal
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                break
+            }
+
+            let lhsDate = lhs.branchCreatedAt ?? lhs.savedAt
+            let rhsDate = rhs.branchCreatedAt ?? rhs.savedAt
+            if lhsDate != rhsDate { return lhsDate < rhsDate }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
+    }
+
+    struct ConversationBranchPickerItem: Equatable, Identifiable {
+        let id: UUID
+        let sourceTurnOrdinal: Int?
+        let date: Date?
+        let isOriginal: Bool
+        let isDeleted: Bool
+        let isActive: Bool
+        let isEnabled: Bool
+        let disabledHelpText: String?
+    }
+
+    struct ConversationBranchPickerSnapshot: Equatable {
+        let target: ConversationBranchPickerTarget
+        let items: [ConversationBranchPickerItem]
+    }
+
     struct SidebarSession: Identifiable, Equatable {
         let id: UUID
         let tabID: UUID

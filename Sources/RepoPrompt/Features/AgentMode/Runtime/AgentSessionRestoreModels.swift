@@ -12,6 +12,12 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var agentModelRaw: String?
     var agentReasoningEffortRaw: String?
     var autoEditEnabled: Bool
+    // swiftformat:disable:next redundantNilInit
+    var branchRootSessionID: UUID? = nil
+    // swiftformat:disable:next redundantNilInit
+    var branchSourceTurnOrdinal: Int? = nil
+    // swiftformat:disable:next redundantNilInit
+    var branchCreatedAt: Date? = nil
     var parentSessionID: UUID?
     var hasUnknownConversationContent: Bool
     var remoteHostID: String?

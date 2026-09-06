@@ -188,6 +188,63 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
         XCTAssertFalse(fixture.session.isBranchOperationInProgress)
     }
 
+    func testConfirmationRejectsSameTurnRebindBeforeForkSubmission() async throws {
+        let fixture = try await makeBranchFixture(childTurns: [threadTurn("source-1")])
+        defer { fixture.cleanup() }
+        let pin = try XCTUnwrap(AgentModeViewModel.ReplyBranchConfirmationPin(
+            workspaceID: fixture.workspaceID,
+            session: fixture.session,
+            turnID: fixture.sourceTurnID
+        ))
+        fixture.viewModel.test_setLastKnownWorkspaceSnapshot(WorkspaceModel(
+            id: fixture.workspaceID,
+            name: "Codex branch",
+            repoPaths: ["/tmp/repo"],
+            customStoragePath: fixture.workspaceDirectory,
+            composeTabs: [ComposeTabState(id: fixture.tabID, name: "Agent")],
+            activeComposeTabID: fixture.tabID
+        ))
+        XCTAssertTrue(pin.matches(
+            workspaceID: fixture.workspaceID,
+            tabID: fixture.tabID,
+            session: fixture.session,
+            turnID: fixture.sourceTurnID
+        ))
+
+        _ = fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(),
+            on: fixture.session
+        )
+        _ = fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: fixture.sourceSessionID,
+            on: fixture.session
+        )
+        XCTAssertFalse(pin.matches(
+            workspaceID: fixture.workspaceID,
+            tabID: fixture.tabID,
+            session: fixture.session,
+            turnID: fixture.sourceTurnID
+        ))
+
+        do {
+            _ = try await fixture.viewModel.branchFromTurn(
+                fixture.sourceTurnID,
+                tabID: fixture.tabID,
+                confirmationPin: pin
+            )
+            XCTFail("Expected stale-confirmation rejection")
+        } catch {
+            XCTAssertEqual(error as? CodexBranchOperationError, .staleConfirmation)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "This branch confirmation is stale. Cancel and reopen it."
+            )
+        }
+
+        XCTAssertTrue(fixture.controller.operations.isEmpty)
+        XCTAssertFalse(fixture.session.isBranchOperationInProgress)
+    }
+
     func testPostForkVerificationFailureArchivesKnownChildAndKeepsSourceBound() async throws {
         let fixture = try await makeBranchFixture(childTurns: [])
         defer { fixture.cleanup() }

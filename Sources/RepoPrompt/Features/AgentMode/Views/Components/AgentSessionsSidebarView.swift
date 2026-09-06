@@ -406,6 +406,10 @@ struct AgentModeSessionsListView: View {
                                 title: session.title,
                                 isActive: session.tabID == currentTabID,
                                 isPinned: session.isPinned,
+                                isBranch: agentModeVM.isConversationBranchSession(
+                                    sessionID: session.sessionID,
+                                    tabID: session.tabID
+                                ),
                                 isMCPControlled: session.isMCPControlled,
                                 runState: agentModeVM.runState(for: session.tabID),
                                 isWaiting: agentModeVM.isTabWaiting(session.tabID),
@@ -1030,6 +1034,10 @@ struct ArchivedSessionsPagedList: View {
                     let stashed = row.stashed
                     AgentStashedSessionRow(
                         stashed: stashed,
+                        isBranch: agentModeVM.isConversationBranchSession(
+                            sessionID: stashed.tab.activeAgentSessionID,
+                            tabID: stashed.tab.id
+                        ),
                         onRestore: {
                             Task { await promptManager.unstashTab(stashed.id) }
                         },

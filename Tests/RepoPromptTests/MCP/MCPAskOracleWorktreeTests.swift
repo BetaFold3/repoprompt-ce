@@ -320,6 +320,144 @@ import XCTest
             )
         }
 
+        func testExplicitOracleContinuationUsesActionableCopyOnlyWithinPersistedBranchTree() async throws {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("MCPAskOracleWorktreeTests", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+
+            let workspace = WorkspaceModel(
+                name: "Oracle branch ownership",
+                repoPaths: ["/tmp/repo"],
+                customStoragePath: directory
+            )
+            let rootSessionID = UUID()
+            let branchSessionID = UUID()
+            let siblingBranchSessionID = UUID()
+            let unrelatedSessionID = UUID()
+            let root = AgentSession(
+                id: rootSessionID,
+                workspaceID: workspace.id,
+                name: "Root",
+                itemCount: 0,
+                autoEditEnabled: true
+            )
+            let branch = AgentSession(
+                id: branchSessionID,
+                workspaceID: workspace.id,
+                name: "Branch",
+                itemCount: 0,
+                autoEditEnabled: true,
+                branchOrigin: AgentSessionBranchOrigin(
+                    rootSessionID: rootSessionID,
+                    sourceSessionID: rootSessionID,
+                    sourceTurnID: UUID(),
+                    sourceCodexTurnID: "codex-turn",
+                    sourceTurnOrdinal: 1,
+                    createdAt: Date(timeIntervalSinceReferenceDate: 1)
+                )
+            )
+            let siblingBranch = AgentSession(
+                id: siblingBranchSessionID,
+                workspaceID: workspace.id,
+                name: "Sibling branch",
+                itemCount: 0,
+                autoEditEnabled: true,
+                branchOrigin: AgentSessionBranchOrigin(
+                    rootSessionID: rootSessionID,
+                    sourceSessionID: rootSessionID,
+                    sourceTurnID: UUID(),
+                    sourceCodexTurnID: "codex-turn",
+                    sourceTurnOrdinal: 1,
+                    createdAt: Date(timeIntervalSinceReferenceDate: 2)
+                )
+            )
+            let unrelated = AgentSession(
+                id: unrelatedSessionID,
+                workspaceID: workspace.id,
+                name: "Unrelated",
+                itemCount: 0,
+                autoEditEnabled: true
+            )
+            let dataService = AgentSessionDataService.shared
+            for agentSession in [root, branch, siblingBranch, unrelated] {
+                _ = try await dataService.saveAgentSession(
+                    agentSession,
+                    for: workspace,
+                    preparation: .alreadyCanonicalTranscript,
+                    trustedCanonicalItemCount: 0
+                )
+            }
+
+            let warmTreeResult = await dataService.indexedAgentSessionBranchTree(
+                containing: branchSessionID,
+                for: workspace
+            )
+            guard case let .available(warmTree) = warmTreeResult else {
+                return XCTFail("Expected the warm metadata index to project the branch tree")
+            }
+            XCTAssertEqual(warmTree.rootSessionID, rootSessionID)
+            XCTAssertEqual(Set(warmTree.records.map(\.id)), Set([rootSessionID, branchSessionID, siblingBranchSessionID]))
+            let indexedBranch = try XCTUnwrap(warmTree.records.first(where: { $0.id == branchSessionID }))
+            XCTAssertEqual(indexedBranch.branchSourceTurnOrdinal, 1)
+            XCTAssertEqual(indexedBranch.branchCreatedAt, Date(timeIntervalSinceReferenceDate: 1))
+            let indexedSibling = try XCTUnwrap(warmTree.records.first(where: { $0.id == siblingBranchSessionID }))
+            XCTAssertEqual(indexedSibling.branchSourceTurnOrdinal, 1)
+            XCTAssertEqual(indexedSibling.branchCreatedAt, Date(timeIntervalSinceReferenceDate: 2))
+
+            let expected = "This Oracle chat belongs to another branch of this conversation. Start a new Oracle chat here to continue."
+            let rootOwnedChat = ChatSession(
+                workspaceID: workspace.id,
+                agentModeSessionID: rootSessionID
+            )
+            let branchOwnedChat = ChatSession(
+                workspaceID: workspace.id,
+                agentModeSessionID: branchSessionID
+            )
+
+            let branchToRootRejection = await OracleViewModel.branchAwareOracleOwnerContinuationRejection(
+                rootOwnedChat,
+                chatID: "root-chat",
+                agentModeSessionID: branchSessionID,
+                agentModeRunID: UUID(),
+                workspace: workspace,
+                dataService: dataService
+            )
+            XCTAssertEqual(branchToRootRejection, expected)
+
+            let siblingToBranchRejection = await OracleViewModel.branchAwareOracleOwnerContinuationRejection(
+                branchOwnedChat,
+                chatID: "branch-chat",
+                agentModeSessionID: siblingBranchSessionID,
+                agentModeRunID: UUID(),
+                workspace: workspace,
+                dataService: dataService
+            )
+            XCTAssertEqual(siblingToBranchRejection, expected)
+
+            let rootToBranchRejection = await OracleViewModel.branchAwareOracleOwnerContinuationRejection(
+                branchOwnedChat,
+                chatID: "branch-chat",
+                agentModeSessionID: rootSessionID,
+                agentModeRunID: UUID(),
+                workspace: workspace,
+                dataService: dataService
+            )
+            XCTAssertTrue(rootToBranchRejection?.contains("different Agent Mode owner") == true)
+            XCTAssertFalse(rootToBranchRejection?.contains("another branch of this conversation") == true)
+
+            let unrelatedRejection = await OracleViewModel.branchAwareOracleOwnerContinuationRejection(
+                rootOwnedChat,
+                chatID: "root-chat",
+                agentModeSessionID: unrelatedSessionID,
+                agentModeRunID: UUID(),
+                workspace: workspace,
+                dataService: dataService
+            )
+            XCTAssertTrue(unrelatedRejection?.contains("different Agent Mode owner") == true)
+            XCTAssertFalse(unrelatedRejection?.contains("another branch of this conversation") == true)
+        }
+
         func testOracleLogLookupPrefersExactRunThenStaleSameSessionNeverLegacy() {
             let tabID = UUID()
             let sessionID = UUID()

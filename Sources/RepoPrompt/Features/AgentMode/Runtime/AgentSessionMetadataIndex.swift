@@ -59,6 +59,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var lastRunStateRaw: String?
     var autoEditEnabled: Bool
     var branchRootSessionID: UUID?
+    var branchSourceTurnOrdinal: Int?
+    var branchCreatedAt: Date?
     var parentSessionID: UUID?
     var remoteHostID: String?
     var remoteHostName: String?
@@ -144,6 +146,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         lastRunStateRaw: String?,
         autoEditEnabled: Bool,
         branchRootSessionID: UUID? = nil,
+        branchSourceTurnOrdinal: Int? = nil,
+        branchCreatedAt: Date? = nil,
         parentSessionID: UUID?,
         remoteHostID: String? = nil,
         remoteHostName: String? = nil,
@@ -180,6 +184,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.lastRunStateRaw = lastRunStateRaw
         self.autoEditEnabled = autoEditEnabled
         self.branchRootSessionID = branchRootSessionID
+        self.branchSourceTurnOrdinal = branchSourceTurnOrdinal
+        self.branchCreatedAt = branchCreatedAt
         self.parentSessionID = parentSessionID
         self.remoteHostID = remoteHostID
         self.remoteHostName = remoteHostName
@@ -218,6 +224,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case lastRunStateRaw
         case autoEditEnabled
         case branchRootSessionID
+        case branchSourceTurnOrdinal
+        case branchCreatedAt
         case parentSessionID
         case remoteHostID
         case remoteHostName
@@ -277,6 +285,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
         branchRootSessionID = try container.decodeIfPresent(UUID.self, forKey: .branchRootSessionID)
+        branchSourceTurnOrdinal = try container.decodeIfPresent(Int.self, forKey: .branchSourceTurnOrdinal)
+        branchCreatedAt = try container.decodeIfPresent(Date.self, forKey: .branchCreatedAt)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
         remoteHostID = try container.decodeIfPresent(String.self, forKey: .remoteHostID)
         remoteHostName = try container.decodeIfPresent(String.self, forKey: .remoteHostName)
@@ -311,6 +321,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             agentModelRaw: agentModelRaw,
             agentReasoningEffortRaw: agentReasoningEffortRaw,
             autoEditEnabled: autoEditEnabled,
+            branchRootSessionID: branchRootSessionID,
+            branchSourceTurnOrdinal: branchSourceTurnOrdinal,
+            branchCreatedAt: branchCreatedAt,
             parentSessionID: parentSessionID,
             hasUnknownConversationContent: hasUnknownConversationContent,
             remoteHostID: remoteHostID,
@@ -363,6 +376,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
             && branchRootSessionID == other.branchRootSessionID
+            && branchSourceTurnOrdinal == other.branchSourceTurnOrdinal
+            && branchCreatedAt == other.branchCreatedAt
             && parentSessionID == other.parentSessionID
             && remoteHostID == other.remoteHostID
             && remoteHostName == other.remoteHostName
@@ -413,6 +428,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             lastRunStateRaw: session.lastRunState,
             autoEditEnabled: session.autoEditEnabled,
             branchRootSessionID: session.branchOrigin?.rootSessionID,
+            branchSourceTurnOrdinal: session.branchOrigin?.sourceTurnOrdinal,
+            branchCreatedAt: session.branchOrigin?.createdAt,
             parentSessionID: session.parentSessionID,
             remoteHostID: session.remoteHost?.hostID,
             remoteHostName: session.remoteHost?.hostDisplayName,

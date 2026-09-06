@@ -1080,14 +1080,54 @@ actor AgentSessionDataService {
         }
     }
 
+    /// Returns a warm-index branch-tree projection without forcing reconciliation.
+    /// Missing or quarantined evidence fails closed; callers may retain their last valid snapshot.
+    func indexedAgentSessionBranchTree(
+        containing sessionID: UUID,
+        for workspace: WorkspaceModel
+    ) async -> AgentSessionBranchTreeQueryResult {
+        let warmResult = await agentSessionBranchTree(
+            containing: sessionID,
+            for: workspace,
+            metadataIndexMode: .backfillIfMissing
+        )
+        guard case let .available(tree) = warmResult,
+              tree.records.contains(where: {
+                  $0.branchRootSessionID != nil
+                      && ($0.branchSourceTurnOrdinal == nil || $0.branchCreatedAt == nil)
+              })
+        else {
+            return warmResult
+        }
+        // Older additive index records decode safely without these fields. Reconcile once
+        // on the async cache path so picker labels are complete without loading sessions.
+        return await agentSessionBranchTree(
+            containing: sessionID,
+            for: workspace,
+            metadataIndexMode: .forceReconcile
+        )
+    }
+
     /// Returns the exact persisted branch tree containing `sessionID`.
     /// A forced rebuild makes session files authoritative; any unreadable session fails closed.
     func agentSessionBranchTree(
         containing sessionID: UUID,
         for workspace: WorkspaceModel
     ) async -> AgentSessionBranchTreeQueryResult {
+        await agentSessionBranchTree(
+            containing: sessionID,
+            for: workspace,
+            metadataIndexMode: .forceReconcile
+        )
+    }
+
+    private func agentSessionBranchTree(
+        containing sessionID: UUID,
+        for workspace: WorkspaceModel,
+        metadataIndexMode: AgentSessionMetadataIndexLoadMode
+    ) async -> AgentSessionBranchTreeQueryResult {
         do {
-            guard let index = try await metadataIndex(for: workspace, mode: .forceReconcile),
+            guard let index = try await metadataIndex(for: workspace, mode: metadataIndexMode),
                   index.quarantinedFiles.isEmpty,
                   let sessionRecord = index.entries.first(where: { $0.id == sessionID })
             else {

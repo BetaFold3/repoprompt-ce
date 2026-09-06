@@ -18,6 +18,7 @@ private struct MessageFooterStrip: View {
     let timestamp: Date
     let isTrailing: Bool
     var handoffConfig: AgentHandoffConfig?
+    var replyBranchConfig: AgentReplyBranchConfig?
     let hasHandoffButton: Bool
     /// When non-nil, shows this message's frozen/live runtime marker beside the timestamp.
     var runtimeFooter: AgentMessageRuntimeFooter?
@@ -43,6 +44,7 @@ private struct MessageFooterStrip: View {
             } else {
                 copyButton
                 handoffButton
+                replyBranchButton
                 timestampText
                 elapsedStatusView
             }
@@ -120,6 +122,13 @@ private struct MessageFooterStrip: View {
     }
 
     @ViewBuilder
+    private var replyBranchButton: some View {
+        if let replyBranchConfig {
+            AgentReplyBranchControl(config: replyBranchConfig)
+        }
+    }
+
+    @ViewBuilder
     private var handoffButton: some View {
         if let config = handoffConfig {
             Button {
@@ -177,6 +186,7 @@ struct AgentMessageBubble: View {
     let contextBuilderContext: ContextBuilderCardContext?
     let promptManager: PromptViewModel?
     var handoffConfig: AgentHandoffConfig?
+    var replyBranchConfig: AgentReplyBranchConfig?
     let rawToolResultPayload: String?
     let rawToolResultPayloadRenderRevision: Int
     let showRunScopedToolCancel: Bool
@@ -209,6 +219,7 @@ struct AgentMessageBubble: View {
         contextBuilderContext: ContextBuilderCardContext? = nil,
         promptManager: PromptViewModel? = nil,
         handoffConfig: AgentHandoffConfig? = nil,
+        replyBranchConfig: AgentReplyBranchConfig? = nil,
         rawToolResultPayload: String? = nil,
         rawToolResultPayloadRenderRevision: Int = 0,
         showRunScopedToolCancel: Bool = false,
@@ -227,6 +238,7 @@ struct AgentMessageBubble: View {
         self.contextBuilderContext = contextBuilderContext
         self.promptManager = promptManager
         self.handoffConfig = handoffConfig
+        self.replyBranchConfig = replyBranchConfig
         self.rawToolResultPayload = rawToolResultPayload
         self.rawToolResultPayloadRenderRevision = rawToolResultPayloadRenderRevision
         self.showRunScopedToolCancel = showRunScopedToolCancel
@@ -448,6 +460,7 @@ struct AgentMessageBubble: View {
                     timestamp: item.timestamp,
                     isTrailing: false,
                     handoffConfig: handoffConfig,
+                    replyBranchConfig: replyBranchConfig,
                     hasHandoffButton: handoffConfig != nil,
                     runtimeFooter: runtimeFooter
                 )
@@ -471,6 +484,7 @@ struct AgentMessageBubble: View {
                     timestamp: item.timestamp,
                     isTrailing: false,
                     handoffConfig: handoffConfig,
+                    replyBranchConfig: replyBranchConfig,
                     hasHandoffButton: handoffConfig != nil,
                     runtimeFooter: runtimeFooter
                 )

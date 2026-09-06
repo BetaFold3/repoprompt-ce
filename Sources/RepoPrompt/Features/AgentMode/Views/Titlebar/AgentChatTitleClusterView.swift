@@ -5,17 +5,22 @@ import SwiftUI
 final class AgentChatTitleClusterModel: ObservableObject {
     struct State: Equatable {
         var title: String
+        var showsConversationBranches: Bool
         var showsChatOptions: Bool
     }
 
     @Published private(set) var state: State
 
     init(title: String) {
-        state = State(title: title, showsChatOptions: false)
+        state = State(title: title, showsConversationBranches: false, showsChatOptions: false)
     }
 
-    func update(title: String, showsChatOptions: Bool) {
-        let nextState = State(title: title, showsChatOptions: showsChatOptions)
+    func update(title: String, showsConversationBranches: Bool, showsChatOptions: Bool) {
+        let nextState = State(
+            title: title,
+            showsConversationBranches: showsConversationBranches,
+            showsChatOptions: showsChatOptions
+        )
         guard state != nextState else { return }
         state = nextState
     }
@@ -23,6 +28,8 @@ final class AgentChatTitleClusterModel: ObservableObject {
 
 struct AgentChatTitleClusterView: View {
     @ObservedObject var model: AgentChatTitleClusterModel
+    let branchMenuSnapshot: () -> AgentConversationBranchPickerSnapshot?
+    let branchMenuActions: AgentConversationBranchMenuActions
     let menuSnapshot: () -> AgentChatOptionsMenuSnapshot?
     let menuActions: AgentChatOptionsMenuActions
 
@@ -35,6 +42,13 @@ struct AgentChatTitleClusterView: View {
                 .frame(maxWidth: 520)
                 .accessibilityIdentifier("AgentChatTitle")
 
+            if model.state.showsConversationBranches {
+                AgentConversationBranchMenuButton(
+                    menuSnapshot: branchMenuSnapshot,
+                    menuActions: branchMenuActions
+                )
+            }
+
             if model.state.showsChatOptions {
                 AgentChatOptionsMenuButton(
                     menuSnapshot: menuSnapshot,
@@ -44,6 +58,83 @@ struct AgentChatTitleClusterView: View {
         }
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .contain)
+    }
+}
+
+final class AgentConversationBranchButton: NSButton {
+    init() {
+        super.init(frame: .zero)
+        image = NSImage(
+            systemSymbolName: "arrow.triangle.branch",
+            accessibilityDescription: "Conversation Branches"
+        )
+        imagePosition = .imageOnly
+        isBordered = false
+        focusRingType = .exterior
+        translatesAutoresizingMaskIntoConstraints = false
+        toolTip = "Conversation Branches"
+        setAccessibilityLabel("Conversation Branches")
+        setAccessibilityRole(.menuButton)
+        setAccessibilityIdentifier("AgentConversationBranchButton")
+        NSLayoutConstraint.activate([
+            widthAnchor.constraint(equalToConstant: 26),
+            heightAnchor.constraint(equalToConstant: 24)
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func mouseDown(with _: NSEvent) {
+        guard isEnabled, let action else { return }
+        NSApplication.shared.sendAction(action, to: target, from: self)
+    }
+}
+
+private struct AgentConversationBranchMenuButton: NSViewRepresentable {
+    let menuSnapshot: () -> AgentConversationBranchPickerSnapshot?
+    let menuActions: AgentConversationBranchMenuActions
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(menuSnapshot: menuSnapshot, menuActions: menuActions)
+    }
+
+    func makeNSView(context: Context) -> AgentConversationBranchButton {
+        let button = AgentConversationBranchButton()
+        button.target = context.coordinator
+        button.action = #selector(Coordinator.showMenu(_:))
+        return button
+    }
+
+    func updateNSView(_ nsView: AgentConversationBranchButton, context: Context) {
+        _ = nsView
+        context.coordinator.menuSnapshot = menuSnapshot
+        context.coordinator.menuActions = menuActions
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var menuSnapshot: () -> AgentConversationBranchPickerSnapshot?
+        var menuActions: AgentConversationBranchMenuActions
+
+        init(
+            menuSnapshot: @escaping () -> AgentConversationBranchPickerSnapshot?,
+            menuActions: AgentConversationBranchMenuActions
+        ) {
+            self.menuSnapshot = menuSnapshot
+            self.menuActions = menuActions
+        }
+
+        @objc func showMenu(_ sender: NSButton) {
+            guard let snapshot = menuSnapshot() else { return }
+            AgentConversationBranchMenuPresenter.popUp(
+                below: sender,
+                snapshot: snapshot,
+                actions: menuActions
+            )
+        }
     }
 }
 

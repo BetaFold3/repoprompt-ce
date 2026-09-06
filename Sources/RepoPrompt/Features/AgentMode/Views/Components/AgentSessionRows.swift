@@ -12,6 +12,7 @@ struct AgentSessionRow: View {
     let title: String
     let isActive: Bool
     let isPinned: Bool
+    var isBranch: Bool = false
     let isMCPControlled: Bool
     let runState: AgentSessionRunState
     let isWaiting: Bool
@@ -187,6 +188,10 @@ struct AgentSessionRow: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
 
+                    if isBranch {
+                        branchBadge
+                    }
+
                     if isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinFontSize))
@@ -336,6 +341,16 @@ struct AgentSessionRow: View {
                 }
             )
         }
+    }
+
+    private var branchBadge: some View {
+        Text("Branch")
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, chipHorizontalPadding)
+            .padding(.vertical, chipVerticalPadding)
+            .background(Color.secondary.opacity(0.12), in: Capsule())
+            .accessibilityLabel("Conversation branch")
     }
 
     /// True when this row should advertise that it was opened by an
@@ -811,6 +826,7 @@ struct AgentSessionRow: View {
 
 struct AgentStashedSessionRow: View {
     let stashed: StashedTab
+    var isBranch: Bool = false
     let onRestore: () -> Void
     let onDelete: () -> Void
 
@@ -878,6 +894,15 @@ struct AgentStashedSessionRow: View {
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 13))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                    if isBranch {
+                        Text("Branch")
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, fontPreset.scaledClamped(5, max: 7))
+                            .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
+                            .background(Color.secondary.opacity(0.12), in: Capsule())
+                            .accessibilityLabel("Conversation branch")
+                    }
                     if stashed.tab.isPinned {
                         Image(systemName: "pin.fill")
                             .font(.system(size: pinIconSize))
