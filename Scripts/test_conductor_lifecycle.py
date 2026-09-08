@@ -1271,6 +1271,8 @@ class ConductorTestContractTests(LifecycleTestCase):
                 "REPOPROMPT_CONDUCTOR_JOB_TICKET": "ticket-secret",
                 "UNRELATED_METADATA": "metadata",
                 "DEVELOPER_DIR": "/Applications/Xcode.app/Contents/Developer",
+                "RPCE_CLAUDE_BRANCH_SPIKE": "1",
+                "RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE": "/tmp/claude-spike",
                 "RPCE_RUN_SCALE_TESTS": "1",
             }
 
@@ -1297,6 +1299,11 @@ class ConductorTestContractTests(LifecycleTestCase):
                 environment["DEVELOPER_DIR"],
                 "/Applications/Xcode.app/Contents/Developer",
             )
+            self.assertEqual(environment["RPCE_CLAUDE_BRANCH_SPIKE"], "1")
+            self.assertEqual(
+                environment["RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE"],
+                "/tmp/claude-spike",
+            )
             self.assertEqual(environment["RPCE_RUN_SCALE_TESTS"], "1")
             self.assertEqual(
                 set(environment),
@@ -1304,8 +1311,17 @@ class ConductorTestContractTests(LifecycleTestCase):
                     "PATH",
                     "TMPDIR",
                     "DEVELOPER_DIR",
+                    "RPCE_CLAUDE_BRANCH_SPIKE",
+                    "RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE",
                     "RPCE_RUN_SCALE_TESTS",
                 },
+            )
+            with mock.patch.dict(os.environ, {}, clear=True):
+                default_environment = parallel_runner.xctest_runtime_environment(
+                    root / "default-tmp"
+                )
+            self.assertNotIn(
+                "RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE", default_environment
             )
 
     def test_parallel_runner_census_includes_multiple_modules_and_rejects_bad_test_lines(self) -> None:
@@ -3684,13 +3700,56 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 }
             )
 
+    def test_canonical_swift_forwards_claude_branch_spike_gate(self) -> None:
+        script = Path(conductor.__file__).with_name("canonical_swift.sh")
+        environment = os.environ.copy()
+        environment["RPCE_CLAUDE_BRANCH_SPIKE"] = "canonical-sentinel"
+        environment.pop("RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE", None)
+        environment["RPCE_UNRELATED_TEST_GATE"] = "must-not-forward"
+        result = subprocess.run(
+            ["/bin/bash", "-x", str(script), "--version"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("RPCE_CLAUDE_BRANCH_SPIKE=canonical-sentinel", result.stderr)
+        self.assertNotIn("RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE=", result.stderr)
+        self.assertNotIn("RPCE_UNRELATED_TEST_GATE=must-not-forward", result.stderr)
+
+        environment["RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE"] = "/tmp/claude-spike"
+        result = subprocess.run(
+            ["/bin/bash", "-x", str(script), "--version"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE=/tmp/claude-spike",
+            result.stderr,
+        )
+
     def test_test_gate_environment_survives_client_snapshot_and_job_prepare(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = conductor.OperationRegistry(Path(tmp))
+            with mock.patch.dict(os.environ, {}, clear=True):
+                default_snapshot = conductor.OperationRegistry.client_env_snapshot()
+            self.assertNotIn(
+                "RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE", default_snapshot
+            )
             with mock.patch.dict(
                 os.environ,
                 {
                     "RPCE_ENABLE_BENCHMARK_TESTS": "1",
+                    "RPCE_CLAUDE_BRANCH_SPIKE": "1",
+                    "RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE": "/tmp/claude-spike",
                     "RPCE_RUN_CODEMAP_E2E": "1",
                     "RPCE_RUN_SCALE_TESTS": "1",
                     "RPCE_UNRELATED_TEST_GATE": "1",
@@ -3700,6 +3759,11 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 snapshot = conductor.OperationRegistry.client_env_snapshot()
 
             self.assertEqual(snapshot["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
+            self.assertEqual(snapshot["RPCE_CLAUDE_BRANCH_SPIKE"], "1")
+            self.assertEqual(
+                snapshot["RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE"],
+                "/tmp/claude-spike",
+            )
             self.assertEqual(snapshot["RPCE_RUN_CODEMAP_E2E"], "1")
             self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
             self.assertNotIn("RPCE_UNRELATED_TEST_GATE", snapshot)
@@ -3713,6 +3777,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             )
 
         self.assertEqual(env["RPCE_ENABLE_BENCHMARK_TESTS"], "1")
+        self.assertEqual(env["RPCE_CLAUDE_BRANCH_SPIKE"], "1")
+        self.assertEqual(
+            env["RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE"], "/tmp/claude-spike"
+        )
         self.assertEqual(env["RPCE_RUN_CODEMAP_E2E"], "1")
         self.assertEqual(env["RPCE_RUN_SCALE_TESTS"], "1")
         self.assertNotIn("RPCE_UNRELATED_TEST_GATE", env)
@@ -3723,6 +3791,8 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         with mock.patch.dict(
             os.environ,
             {
+                "RPCE_CLAUDE_BRANCH_SPIKE": "1",
+                "RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE": "/tmp/claude-spike",
                 "RPCE_RUN_SCALE_TESTS": "1",
                 "GITHUB_TOKEN": "secret",
             },
@@ -3741,6 +3811,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 "REPOPROMPT_DEV_DAEMON_SOCKET": str(state.paths.socket_path),
             },
         )
+        self.assertEqual(snapshot["RPCE_CLAUDE_BRANCH_SPIKE"], "1")
+        self.assertEqual(
+            snapshot["RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE"], "/tmp/claude-spike"
+        )
         self.assertEqual(snapshot["RPCE_RUN_SCALE_TESTS"], "1")
         self.assertNotIn("GITHUB_TOKEN", snapshot)
 
@@ -3751,6 +3825,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 "args": {"workers": 2},
                 "env": snapshot,
             }
+        )
+        self.assertEqual(job_env["RPCE_CLAUDE_BRANCH_SPIKE"], "1")
+        self.assertEqual(
+            job_env["RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE"], "/tmp/claude-spike"
         )
         self.assertEqual(job_env["RPCE_RUN_SCALE_TESTS"], "1")
         self.assertNotIn("GITHUB_TOKEN", job_env)

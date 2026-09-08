@@ -20,6 +20,12 @@ if [[ -n "${RPCE_ENABLE_BENCHMARK_TESTS:-}" ]]; then
 fi
 # XCTest runtime gates must reach swift-test children; they are opt-in and
 # rare, so the steady-state (unset) environment stays canonical.
+if [[ -n "${RPCE_CLAUDE_BRANCH_SPIKE:-}" ]]; then
+    swift_env+=("RPCE_CLAUDE_BRANCH_SPIKE=$RPCE_CLAUDE_BRANCH_SPIKE")
+fi
+if [[ -n "${RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE:-}" ]]; then
+    swift_env+=("RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE=$RPCE_CLAUDE_BRANCH_SPIKE_EXECUTABLE")
+fi
 if [[ -n "${RPCE_RUN_CODEMAP_E2E:-}" ]]; then
     swift_env+=("RPCE_RUN_CODEMAP_E2E=$RPCE_RUN_CODEMAP_E2E")
 fi
