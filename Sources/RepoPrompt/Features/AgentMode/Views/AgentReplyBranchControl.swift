@@ -89,10 +89,17 @@ struct AgentReplyBranchPresentation: Equatable {
         }
         guard case let .unavailable(reason) = availability else { return nil }
         switch reason {
-        case .noCheckpoint, .turnNotCompleted, .threadMismatch:
+        case .noCheckpoint, .turnNotCompleted, .threadMismatch, .turnNotRetained,
+             .treeEvidenceUnavailable:
             return "No native checkpoint was recorded for this turn."
-        case .beforeCompaction:
+        case .beforeCompaction, .unsupportedHistory:
             return "Codex compacted this conversation after this checkpoint."
+        case .lineageProviderMismatch:
+            return "Branching is disabled because this branch's recorded source provider does not match its current provider."
+        case .runtimeCapabilityUnknown:
+            return "Native branching support is still being checked."
+        case .runtimeUnsupported:
+            return "Native branching is not supported by this provider runtime."
         case .notIdle, .operationInProgress, .pendingHandoff:
             return "Finish the pending operation before branching."
         case .providerUnsupported, .remoteSession, .mcpOriginated, .childSession, .worktreeBound:
@@ -146,20 +153,13 @@ struct AgentReplyBranchPresentation: Equatable {
         guard let ledger else {
             return turnIDs.isEmpty ? .readOnly : .unknown
         }
-        var checkpointByTurnID: [UUID: CodexTurnCheckpoint] = [:]
-        var duplicateTurnIDs = Set<UUID>()
-        checkpointByTurnID.reserveCapacity(ledger.entries.count)
-        for checkpoint in ledger.entries {
-            if checkpointByTurnID.updateValue(checkpoint, forKey: checkpoint.turnID) != nil {
-                duplicateTurnIDs.insert(checkpoint.turnID)
-            }
-        }
+        let checkpointIndex = ledger.checkpointIndex()
 
         var modifiedPaths: [String] = []
         var seenPaths = Set<String>()
         for turnID in turnIDs {
-            guard !duplicateTurnIDs.contains(turnID),
-                  let checkpoint = checkpointByTurnID[turnID],
+            guard !checkpointIndex.duplicateTurnIDs.contains(turnID),
+                  let checkpoint = checkpointIndex.byTurnID[turnID],
                   checkpoint.status == .completed,
                   let sideEffect = checkpoint.sideEffect
             else {

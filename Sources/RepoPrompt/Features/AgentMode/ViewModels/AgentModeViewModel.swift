@@ -4304,12 +4304,12 @@ final class AgentModeViewModel: ObservableObject {
         if let reservedTabID = branchSwitchTargetReservations[requestedSessionID],
            reservedTabID != targetSession.tabID
         {
-            throw CodexBranchOperationError.targetOpenElsewhere
+            throw AgentBranchOperationError.targetOpenElsewhere
         }
         if let reservedTabID = branchOperationSourceReservations[requestedSessionID],
            reservedTabID != targetSession.tabID
         {
-            throw CodexBranchOperationError.targetOpenElsewhere
+            throw AgentBranchOperationError.targetOpenElsewhere
         }
         if targetSession.activeAgentSessionID == requestedSessionID,
            let binding = targetSession.persistentSessionBindingIdentity
@@ -4324,7 +4324,7 @@ final class AgentModeViewModel: ObservableObject {
         }
         let sourceSession = existingSourceTabID.flatMap { sessions[$0] }
         if !allowTransferFromAnotherTab, sourceSession != nil, sourceSession !== targetSession {
-            throw CodexBranchOperationError.targetOpenElsewhere
+            throw AgentBranchOperationError.targetOpenElsewhere
         }
         let targetCurrentSessionID = targetSession.activeAgentSessionID
 
@@ -4407,9 +4407,9 @@ final class AgentModeViewModel: ObservableObject {
         if !allowTransferFromAnotherTab {
             switch persistentBindingResolution(for: requestedSessionID) {
             case let .unique(ownerTabID) where ownerTabID != targetSession.tabID:
-                throw CodexBranchOperationError.targetOpenElsewhere
+                throw AgentBranchOperationError.targetOpenElsewhere
             case .ambiguous:
-                throw CodexBranchOperationError.targetOpenElsewhere
+                throw AgentBranchOperationError.targetOpenElsewhere
             case .unique, .notFound:
                 break
             }
@@ -4430,19 +4430,19 @@ final class AgentModeViewModel: ObservableObject {
         if let reservedTabID = branchSwitchTargetReservations[requestedSessionID],
            reservedTabID != targetSession.tabID
         {
-            throw CodexBranchOperationError.targetOpenElsewhere
+            throw AgentBranchOperationError.targetOpenElsewhere
         }
         if let reservedTabID = branchOperationSourceReservations[requestedSessionID],
            reservedTabID != targetSession.tabID
         {
-            throw CodexBranchOperationError.targetOpenElsewhere
+            throw AgentBranchOperationError.targetOpenElsewhere
         }
         if !allowTransferFromAnotherTab {
             switch persistentBindingResolution(for: requestedSessionID) {
             case let .unique(ownerTabID) where ownerTabID != targetSession.tabID:
-                throw CodexBranchOperationError.targetOpenElsewhere
+                throw AgentBranchOperationError.targetOpenElsewhere
             case .ambiguous:
-                throw CodexBranchOperationError.targetOpenElsewhere
+                throw AgentBranchOperationError.targetOpenElsewhere
             case .unique, .notFound:
                 break
             }
@@ -12133,13 +12133,13 @@ final class AgentModeViewModel: ObservableObject {
             #if DEBUG
                 AgentModePerfDiagnostics.event("save.session.skipped", tabID: tabID, fields: ["reason": "suppressed"])
             #endif
-            if requireCommittedSave { throw CodexBranchOperationError.sourceSessionMissing }
+            if requireCommittedSave { throw AgentBranchOperationError.sourceSessionMissing }
             return
         }
         guard let session = sessions[tabID],
               let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
         else {
-            if requireCommittedSave { throw CodexBranchOperationError.sourceSessionMissing }
+            if requireCommittedSave { throw AgentBranchOperationError.sourceSessionMissing }
             return
         }
         guard session.isDirty || session.activeAgentSessionID == nil else {
@@ -12154,13 +12154,13 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
         guard let sessionID = ensureSessionBoundToTab(session) else {
-            if requireCommittedSave { throw CodexBranchOperationError.sourceSessionMissing }
+            if requireCommittedSave { throw AgentBranchOperationError.sourceSessionMissing }
             return
         }
         session.saveRequestGeneration &+= 1
         if saveInFlightSessionIDs.contains(sessionID) {
             saveRequestedWhileInFlightSessionIDs.insert(sessionID)
-            if requireCommittedSave { throw CodexBranchOperationError.staleOperation }
+            if requireCommittedSave { throw AgentBranchOperationError.staleOperation }
             return
         }
         saveInFlightSessionIDs.insert(sessionID)
@@ -12423,7 +12423,7 @@ final class AgentModeViewModel: ObservableObject {
         guard let saveToken = makeSaveCommitToken(for: session, workspaceID: workspace.id),
               isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: requireWorkspaceMatch)
         else {
-            if requireCommittedSave { throw CodexBranchOperationError.staleOperation }
+            if requireCommittedSave { throw AgentBranchOperationError.staleOperation }
             requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
             return
         }
@@ -12437,7 +12437,7 @@ final class AgentModeViewModel: ObservableObject {
             )
             agentSession.fileURL = fileURL
             guard isSaveCommitTokenCurrent(saveToken, requireWorkspaceMatch: requireWorkspaceMatch) else {
-                if requireCommittedSave { throw CodexBranchOperationError.staleOperation }
+                if requireCommittedSave { throw AgentBranchOperationError.staleOperation }
                 requestFreshSaveForCurrentOwner(sessionID: sessionID, fallbackSession: session)
                 return
             }
@@ -14261,7 +14261,7 @@ final class AgentModeViewModel: ObservableObject {
                 workflow: activeWorkflow
             )
             if sessions[tabID] === expectedSession {
-                expectedSession.appendItem(.error(CodexBranchOperationError.exactResumeFailed.localizedDescription))
+                expectedSession.appendItem(.error(AgentBranchOperationError.exactResumeFailed.localizedDescription))
                 requestUIRefresh(tabID: tabID, urgent: true)
             }
             return
@@ -19242,7 +19242,7 @@ extension AgentModeViewModel: AgentWorkspaceSessionIndexStoreDelegate {
     }
 }
 
-enum CodexBranchOperationError: Error, LocalizedError, Equatable {
+enum AgentBranchOperationError: Error, LocalizedError, Equatable {
     case unavailable(AgentSessionBranchAvailability.Reason)
     case staleConfirmation
     case staleOperation
@@ -19250,6 +19250,8 @@ enum CodexBranchOperationError: Error, LocalizedError, Equatable {
     case targetSessionMissing
     case targetOpenElsewhere
     case exactResumeFailed
+    case nativeIndeterminate(provider: AgentProviderKind, knownChildID: String?)
+    case childSavedButNotOpened(sessionID: UUID)
 
     var errorDescription: String? {
         switch self {
@@ -19267,9 +19269,19 @@ enum CodexBranchOperationError: Error, LocalizedError, Equatable {
             "This branch is open in another tab."
         case .exactResumeFailed:
             "Codex couldn't reopen this conversation (rollout missing). Your message wasn't sent. The other paths may still be available in the branch menu; you can hand this transcript off to a new session."
+        case let .nativeIndeterminate(provider, knownChildID):
+            if let knownChildID {
+                "Branching finished with an unverified \(provider.rawValue) session (\(knownChildID)). The original conversation is unchanged; the branch was not saved."
+            } else {
+                "Branching finished with an unverified \(provider.rawValue) session. The original conversation is unchanged; the branch was not saved."
+            }
+        case .childSavedButNotOpened:
+            "Branch created; could not open it."
         }
     }
 }
+
+typealias CodexBranchOperationError = AgentBranchOperationError
 
 @MainActor
 extension AgentModeViewModel {
@@ -19582,7 +19594,7 @@ extension AgentModeViewModel {
             presentation: presentation,
             performBranch: { [weak self] in
                 guard let self else {
-                    throw CodexBranchOperationError.staleConfirmation
+                    throw AgentBranchOperationError.staleConfirmation
                 }
                 _ = try await branchFromTurn(
                     turnID,
@@ -19608,7 +19620,7 @@ extension AgentModeViewModel {
                   turnID: turnID
               )
         else {
-            throw CodexBranchOperationError.staleConfirmation
+            throw AgentBranchOperationError.staleConfirmation
         }
     }
 
@@ -19640,7 +19652,7 @@ extension AgentModeViewModel {
         turnID: UUID?
     ) throws -> BranchOperationPin {
         guard !session.isExactResumePreflightInProgress else {
-            throw CodexBranchOperationError.unavailable(.notIdle)
+            throw AgentBranchOperationError.unavailable(.notIdle)
         }
         let occupancy = branchOccupancy(for: session)
         if let turnID {
@@ -19651,20 +19663,20 @@ extension AgentModeViewModel {
             )
             guard case .available = availability else {
                 if case let .unavailable(reason) = availability {
-                    throw CodexBranchOperationError.unavailable(reason)
+                    throw AgentBranchOperationError.unavailable(reason)
                 }
-                throw CodexBranchOperationError.staleOperation
+                throw AgentBranchOperationError.staleOperation
             }
         } else if let reason = AgentSessionBranchGate.operationUnavailableReason(
             session: session,
             occupancy: occupancy
         ) {
-            throw CodexBranchOperationError.unavailable(reason)
+            throw AgentBranchOperationError.unavailable(reason)
         }
         guard let sessionID = session.activeAgentSessionID,
               let conversationID = session.codexConversationID
         else {
-            throw CodexBranchOperationError.sourceSessionMissing
+            throw AgentBranchOperationError.sourceSessionMissing
         }
         session.isBranchOperationInProgress = true
         branchOperationSourceReservations[sessionID] = session.tabID
@@ -19693,7 +19705,7 @@ extension AgentModeViewModel {
               !occupancy.oracleRequestActive,
               !occupancy.codexTerminalSettlePending
         else {
-            throw CodexBranchOperationError.staleOperation
+            throw AgentBranchOperationError.staleOperation
         }
     }
 
@@ -19723,7 +19735,7 @@ extension AgentModeViewModel {
         guard let session = sessions[tabID],
               let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot
         else {
-            throw CodexBranchOperationError.sourceSessionMissing
+            throw AgentBranchOperationError.sourceSessionMissing
         }
         let pin = try beginBranchOperation(session: session, turnID: turnID)
         var childThreadID: String?
@@ -19750,7 +19762,7 @@ extension AgentModeViewModel {
             guard let ledger = session.codexTurnCheckpoints,
                   let checkpointIndex = ledger.entries.firstIndex(where: { $0.turnID == turnID })
             else {
-                throw CodexBranchOperationError.unavailable(.noCheckpoint)
+                throw AgentBranchOperationError.unavailable(.noCheckpoint)
             }
             let checkpoint = ledger.entries[checkpointIndex]
             let retainedCheckpoints = Array(ledger.entries[...checkpointIndex])
@@ -19761,13 +19773,13 @@ extension AgentModeViewModel {
             )
 
             guard let source = try await dataService.loadAgentSession(id: pin.sessionID, for: workspace) else {
-                throw CodexBranchOperationError.sourceSessionMissing
+                throw AgentBranchOperationError.sourceSessionMissing
             }
             try validateBranchOperation(pin)
             guard let sourceTranscript = source.transcript,
                   let sourceTurnIndex = sourceTranscript.turns.firstIndex(where: { $0.id == turnID })
             else {
-                throw CodexBranchOperationError.sourceSessionMissing
+                throw AgentBranchOperationError.sourceSessionMissing
             }
             let prefixed = try AgentTranscriptIO.branchPrefix(of: source, throughTurnID: turnID)
             try validateBranchOperation(pin)
@@ -19809,40 +19821,19 @@ extension AgentModeViewModel {
                 threadID: validatedChildThreadID,
                 entries: retainedCheckpoints
             )
-            let child = AgentSession(
-                id: childID,
+            let child = AgentSessionBranchSnapshotBuilder.codexChild(
+                source: source,
+                prefixedSource: prefixed,
                 workspaceID: workspace.id,
-                composeTabID: nil,
-                name: "\(source.name) (branch)",
-                items: prefixed.items,
-                uiToolResultPayloadsByItemID: prefixed.uiToolResultPayloadsByItemID,
-                transcript: prefixed.transcript,
-                itemCount: prefixed.itemCount,
-                transcriptProjectionCounts: prefixed.transcriptProjectionCounts,
-                lastUserMessageAt: prefixed.lastUserMessageAt,
-                agentKind: AgentProviderKind.codexExec.rawValue,
-                agentModel: source.agentModel,
-                ohMyPiThinkingSelections: source.ohMyPiThinkingSelections,
-                agentReasoningEffort: source.agentReasoningEffort,
-                lastRunState: AgentSessionRunState.idle.rawValue,
-                autoEditEnabled: source.autoEditEnabled,
-                codexConversationID: validatedChildThreadID,
-                codexRolloutPath: childRef.rolloutPath,
-                codexTurnCheckpoints: childLedger,
-                codexModel: childRef.model ?? source.codexModel,
-                codexReasoningEffort: childRef.reasoningEffort ?? source.codexReasoningEffort,
-                branchOrigin: AgentSessionBranchOrigin(
-                    rootSessionID: rootID,
-                    sourceSessionID: source.id,
-                    sourceTurnID: turnID,
-                    sourceCodexTurnID: checkpoint.codexTurnID,
-                    sourceTurnOrdinal: sourceTurnIndex + 1,
-                    createdAt: Date()
-                ),
-                parentSessionID: nil,
-                isMCPOriginated: false,
-                origin: .user,
-                profile: source.profile
+                childID: childID,
+                childThreadID: validatedChildThreadID,
+                childRolloutPath: childRef.rolloutPath,
+                childLedger: childLedger,
+                childModel: childRef.model,
+                childReasoningEffort: childRef.reasoningEffort,
+                sourceTurnID: turnID,
+                sourceNativeTurnRef: checkpoint.codexTurnID,
+                sourceTurnOrdinal: sourceTurnIndex + 1
             )
             #if DEBUG
                 if let error = test_branchFailureInjector?("branchSave") { throw error }
@@ -19882,7 +19873,7 @@ extension AgentModeViewModel {
                   session.hasLoadedPersistedState,
                   session.didSucceedPersistedHydrationForCurrentBinding
             else {
-                throw CodexBranchOperationError.staleOperation
+                throw AgentBranchOperationError.staleOperation
             }
             session.draftText = preservedDraft
             endBranchOperation(pin, rescheduleIdleShutdown: false)
@@ -19918,22 +19909,22 @@ extension AgentModeViewModel {
 
     func switchToBranch(sessionID targetSessionID: UUID, tabID: UUID) async throws {
         guard let session = sessions[tabID] else {
-            throw CodexBranchOperationError.sourceSessionMissing
+            throw AgentBranchOperationError.sourceSessionMissing
         }
         if targetSessionID == session.activeAgentSessionID { return }
         if let reservedTabID = branchSwitchTargetReservations[targetSessionID], reservedTabID != tabID {
-            throw CodexBranchOperationError.targetOpenElsewhere
+            throw AgentBranchOperationError.targetOpenElsewhere
         }
         switch persistentBindingResolution(for: targetSessionID) {
         case let .unique(existingTabID) where existingTabID != tabID:
-            throw CodexBranchOperationError.targetOpenElsewhere
+            throw AgentBranchOperationError.targetOpenElsewhere
         case .ambiguous:
-            throw CodexBranchOperationError.targetOpenElsewhere
+            throw AgentBranchOperationError.targetOpenElsewhere
         case .unique, .notFound:
             break
         }
         guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot else {
-            throw CodexBranchOperationError.sourceSessionMissing
+            throw AgentBranchOperationError.sourceSessionMissing
         }
         branchSwitchTargetReservations[targetSessionID] = tabID
         defer {
@@ -19949,11 +19940,11 @@ extension AgentModeViewModel {
             try validateBranchOperation(pin)
 
             guard let persistedSource = try await dataService.loadAgentSession(id: pin.sessionID, for: workspace) else {
-                throw CodexBranchOperationError.sourceSessionMissing
+                throw AgentBranchOperationError.sourceSessionMissing
             }
             try validateBranchOperation(pin)
             guard let persistedTarget = try await dataService.loadAgentSession(id: targetSessionID, for: workspace) else {
-                throw CodexBranchOperationError.targetSessionMissing
+                throw AgentBranchOperationError.targetSessionMissing
             }
             try validateBranchOperation(pin)
             let sourceRootID = persistedSource.branchOrigin?.rootSessionID ?? persistedSource.id
@@ -19962,13 +19953,13 @@ extension AgentModeViewModel {
                   persistedTarget.remoteHost == nil,
                   sourceRootID == targetRootID
             else {
-                throw CodexBranchOperationError.targetSessionMissing
+                throw AgentBranchOperationError.targetSessionMissing
             }
 
             await codexCoordinator.shutdownCodexSession(session)
             try validateBranchOperation(pin)
             guard branchSwitchTargetReservations[targetSessionID] == tabID else {
-                throw CodexBranchOperationError.targetOpenElsewhere
+                throw AgentBranchOperationError.targetOpenElsewhere
             }
             #if DEBUG
                 if let error = test_branchFailureInjector?("switchBeforeRebind") { throw error }
@@ -19987,7 +19978,7 @@ extension AgentModeViewModel {
                   session.hasLoadedPersistedState,
                   session.didSucceedPersistedHydrationForCurrentBinding
             else {
-                throw CodexBranchOperationError.targetSessionMissing
+                throw AgentBranchOperationError.targetSessionMissing
             }
             session.draftText = preservedDraft
             endBranchOperation(pin, rescheduleIdleShutdown: false)

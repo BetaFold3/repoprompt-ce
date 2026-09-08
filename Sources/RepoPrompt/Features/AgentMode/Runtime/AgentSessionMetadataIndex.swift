@@ -1,7 +1,7 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 6
+    static let currentSchemaVersion = 7
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -59,6 +59,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var lastRunStateRaw: String?
     var autoEditEnabled: Bool
     var branchRootSessionID: UUID?
+    var branchSourceSessionID: UUID?
+    var branchSourceTurnID: UUID?
     var branchSourceTurnOrdinal: Int?
     var branchCreatedAt: Date?
     var parentSessionID: UUID?
@@ -146,6 +148,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         lastRunStateRaw: String?,
         autoEditEnabled: Bool,
         branchRootSessionID: UUID? = nil,
+        branchSourceSessionID: UUID? = nil,
+        branchSourceTurnID: UUID? = nil,
         branchSourceTurnOrdinal: Int? = nil,
         branchCreatedAt: Date? = nil,
         parentSessionID: UUID?,
@@ -184,6 +188,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.lastRunStateRaw = lastRunStateRaw
         self.autoEditEnabled = autoEditEnabled
         self.branchRootSessionID = branchRootSessionID
+        self.branchSourceSessionID = branchSourceSessionID
+        self.branchSourceTurnID = branchSourceTurnID
         self.branchSourceTurnOrdinal = branchSourceTurnOrdinal
         self.branchCreatedAt = branchCreatedAt
         self.parentSessionID = parentSessionID
@@ -224,6 +230,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case lastRunStateRaw
         case autoEditEnabled
         case branchRootSessionID
+        case branchSourceSessionID
+        case branchSourceTurnID
         case branchSourceTurnOrdinal
         case branchCreatedAt
         case parentSessionID
@@ -285,6 +293,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         lastRunStateRaw = try container.decodeIfPresent(String.self, forKey: .lastRunStateRaw)
         autoEditEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoEditEnabled) ?? true
         branchRootSessionID = try container.decodeIfPresent(UUID.self, forKey: .branchRootSessionID)
+        branchSourceSessionID = try container.decodeIfPresent(UUID.self, forKey: .branchSourceSessionID)
+        branchSourceTurnID = try container.decodeIfPresent(UUID.self, forKey: .branchSourceTurnID)
         branchSourceTurnOrdinal = try container.decodeIfPresent(Int.self, forKey: .branchSourceTurnOrdinal)
         branchCreatedAt = try container.decodeIfPresent(Date.self, forKey: .branchCreatedAt)
         parentSessionID = try container.decodeIfPresent(UUID.self, forKey: .parentSessionID)
@@ -376,6 +386,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && lastRunStateRaw == other.lastRunStateRaw
             && autoEditEnabled == other.autoEditEnabled
             && branchRootSessionID == other.branchRootSessionID
+            && branchSourceSessionID == other.branchSourceSessionID
+            && branchSourceTurnID == other.branchSourceTurnID
             && branchSourceTurnOrdinal == other.branchSourceTurnOrdinal
             && branchCreatedAt == other.branchCreatedAt
             && parentSessionID == other.parentSessionID
@@ -428,6 +440,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             lastRunStateRaw: session.lastRunState,
             autoEditEnabled: session.autoEditEnabled,
             branchRootSessionID: session.branchOrigin?.rootSessionID,
+            branchSourceSessionID: session.branchOrigin?.sourceSessionID,
+            branchSourceTurnID: session.branchOrigin?.sourceTurnID,
             branchSourceTurnOrdinal: session.branchOrigin?.sourceTurnOrdinal,
             branchCreatedAt: session.branchOrigin?.createdAt,
             parentSessionID: session.parentSessionID,

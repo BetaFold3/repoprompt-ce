@@ -11,7 +11,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: UUID(),
             sourceSessionID: UUID(),
             sourceTurnID: UUID(),
-            sourceCodexTurnID: "turn",
+            sourceNativeTurnRef: "turn",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 2,
             createdAt: Date(timeIntervalSinceReferenceDate: 10)
         )
@@ -279,7 +280,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: fixture.sourceSessionID,
             sourceSessionID: fixture.sourceSessionID,
             sourceTurnID: fixture.sourceTurnID,
-            sourceCodexTurnID: "source-1",
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )
@@ -329,7 +331,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: fixture.sourceSessionID,
             sourceSessionID: fixture.sourceSessionID,
             sourceTurnID: fixture.sourceTurnID,
-            sourceCodexTurnID: "source-1",
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )
@@ -633,7 +636,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: fixture.sourceSessionID,
             sourceSessionID: fixture.sourceSessionID,
             sourceTurnID: fixture.sourceTurnID,
-            sourceCodexTurnID: "source-1",
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )
@@ -657,7 +661,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: fixture.sourceSessionID,
             sourceSessionID: fixture.sourceSessionID,
             sourceTurnID: fixture.sourceTurnID,
-            sourceCodexTurnID: "source-1",
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )
@@ -716,7 +721,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: rootID,
             sourceSessionID: rootID,
             sourceTurnID: sourceTurnID,
-            sourceCodexTurnID: "source-turn",
+            sourceNativeTurnRef: "source-turn",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )
@@ -876,7 +882,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: fixture.sourceSessionID,
             sourceSessionID: fixture.sourceSessionID,
             sourceTurnID: fixture.sourceTurnID,
-            sourceCodexTurnID: "source-1",
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )
@@ -911,7 +918,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: fixture.sourceSessionID,
             sourceSessionID: fixture.sourceSessionID,
             sourceTurnID: fixture.sourceTurnID,
-            sourceCodexTurnID: "source-1",
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )
@@ -973,7 +981,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: fixture.sourceSessionID,
             sourceSessionID: fixture.sourceSessionID,
             sourceTurnID: fixture.sourceTurnID,
-            sourceCodexTurnID: "source-1",
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )
@@ -1011,7 +1020,8 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             rootSessionID: fixture.sourceSessionID,
             sourceSessionID: fixture.sourceSessionID,
             sourceTurnID: fixture.sourceTurnID,
-            sourceCodexTurnID: "source-1",
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 1,
             createdAt: Date()
         )

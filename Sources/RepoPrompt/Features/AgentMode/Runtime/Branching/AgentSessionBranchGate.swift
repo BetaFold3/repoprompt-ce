@@ -1,7 +1,7 @@
 import Foundation
 
 enum AgentSessionBranchAvailability: Equatable {
-    case available(CodexTurnCheckpoint)
+    case available(AgentBranchCheckpoint)
     case unavailable(Reason)
 
     enum Reason: Equatable {
@@ -17,6 +17,18 @@ enum AgentSessionBranchAvailability: Equatable {
         case turnNotCompleted
         case beforeCompaction
         case threadMismatch
+        case runtimeCapabilityUnknown
+        case runtimeUnsupported(AgentBranchRuntimeCapability.UnsupportedReason)
+        case unsupportedHistory(UnsupportedHistoryReason)
+        case turnNotRetained
+        case lineageProviderMismatch
+        case treeEvidenceUnavailable
+    }
+
+    enum UnsupportedHistoryReason: Equatable {
+        case compaction
+        case sidechain
+        case ambiguousSegment
     }
 }
 
@@ -30,31 +42,43 @@ enum AgentSessionBranchGate {
     static func evaluate(
         session: AgentModeViewModel.TabSession,
         turnID: UUID,
-        occupancy: Occupancy = Occupancy()
+        occupancy: Occupancy = Occupancy(),
+        runtimeCapability: AgentBranchRuntimeCapability = .notApplicable
     ) -> AgentSessionBranchAvailability {
         if let reason = operationUnavailableReason(session: session, occupancy: occupancy) {
             return .unavailable(reason)
         }
-        guard let threadID = session.codexConversationID,
-              let ledger = session.codexTurnCheckpoints
-        else {
+        switch runtimeCapability {
+        case .notApplicable, .supported:
+            break
+        case .unknown:
+            return .unavailable(.runtimeCapabilityUnknown)
+        case let .unsupported(reason):
+            return .unavailable(.runtimeUnsupported(reason))
+        }
+        guard let binding = AgentBranchProviderSupport.nativeBinding(for: session) else {
             return .unavailable(.noCheckpoint)
         }
-        guard ledger.threadID == threadID else { return .unavailable(.threadMismatch) }
-        guard let checkpoint = ledger.entries.first(where: { $0.turnID == turnID }) else {
-            return .unavailable(.noCheckpoint)
+        switch binding {
+        case let .codex(conversationID, ledger):
+            guard ledger.threadID == conversationID else { return .unavailable(.threadMismatch) }
+            let index = binding.checkpointIndex
+            guard !index.duplicateTurnIDs.contains(turnID),
+                  let checkpoint = index.byTurnID[turnID]
+            else {
+                return .unavailable(.noCheckpoint)
+            }
+            guard checkpoint.status == .completed, checkpoint.sideEffect != nil else {
+                return .unavailable(.turnNotCompleted)
+            }
+            return .available(checkpoint)
         }
-        guard checkpoint.status == .completed, checkpoint.sideEffect != nil else {
-            return .unavailable(.turnNotCompleted)
-        }
-        return .available(checkpoint)
     }
 
-    static func operationUnavailableReason(
-        session: AgentModeViewModel.TabSession,
-        occupancy: Occupancy = Occupancy()
+    static func staticUnavailableReason(
+        session: AgentModeViewModel.TabSession
     ) -> AgentSessionBranchAvailability.Reason? {
-        guard session.selectedAgent == .codexExec else {
+        guard AgentBranchProviderSupport.isSupported(session.selectedAgent) else {
             return .providerUnsupported(session.selectedAgent)
         }
         guard session.remoteHost == nil else { return .remoteSession }
@@ -62,6 +86,21 @@ enum AgentSessionBranchGate {
         guard session.parentSessionID == nil else { return .childSession }
         guard session.worktreeBindings.isEmpty, session.worktreeMergeOperations.isEmpty else {
             return .worktreeBound
+        }
+        return nil
+    }
+
+    static func operationUnavailableReason(
+        session: AgentModeViewModel.TabSession,
+        occupancy: Occupancy = Occupancy()
+    ) -> AgentSessionBranchAvailability.Reason? {
+        if let reason = staticUnavailableReason(session: session) {
+            return reason
+        }
+        if let branchOrigin = session.branchOrigin,
+           branchOrigin.diagnosticSourceProviderKind != session.selectedAgent.rawValue
+        {
+            return .lineageProviderMismatch
         }
         guard !session.isBranchOperationInProgress else { return .operationInProgress }
         guard !session.pendingHandoff.hasPayload else { return .pendingHandoff }

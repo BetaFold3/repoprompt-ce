@@ -80,30 +80,32 @@ struct CodexTurnCheckpointLedger: Codable, Equatable, Sendable {
             return !retainedTerminalTurnIDs.contains(checkpoint.turnID)
         }
     }
+
+    func checkpointIndex() -> AgentBranchCheckpointIndex {
+        AgentBranchCheckpointIndex(checkpoints: entries.map(\.agentBranchCheckpoint))
+    }
 }
 
 // swiftformat:disable:next redundantSendable
 struct CodexTurnCheckpoint: Codable, Equatable, Sendable {
-    // swiftformat:disable:next redundantSendable
-    enum Status: String, Codable, Equatable, Sendable {
-        case inProgress
-        case completed
-        case failed
-        case cancelled
-    }
-
-    // swiftformat:disable:next redundantSendable
-    enum SideEffect: Codable, Equatable, Sendable {
-        case readOnly
-        case modified(paths: [String])
-        case unknown
-    }
+    typealias Status = AgentTurnCheckpointStatus
+    typealias SideEffect = AgentTurnSideEffect
 
     let turnID: UUID
     let codexTurnID: String
     var status: Status
     var sideEffect: SideEffect?
     let recordedAt: Date
+
+    var agentBranchCheckpoint: AgentBranchCheckpoint {
+        AgentBranchCheckpoint(
+            turnID: turnID,
+            status: status,
+            sideEffect: sideEffect,
+            nativeRef: .codexTurn(id: codexTurnID),
+            recordedAt: recordedAt
+        )
+    }
 }
 
 enum CodexTurnSideEffectClassifier {

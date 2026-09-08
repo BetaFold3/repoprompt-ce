@@ -13,8 +13,106 @@ enum AgentSessionDataError: Error {
 // MARK: - Agent Session Metadata
 
 struct AgentSessionBranchTree: Equatable {
+    enum RootState: Equatable {
+        case present
+        case deleted
+    }
+
+    enum SourceState: Equatable {
+        case complete
+        case sourceUnavailable
+        case deletedSource(UUID)
+    }
+
     let rootSessionID: UUID
+    let rootState: RootState
     let records: [AgentSessionMetadataRecord]
+    let lineageIncompleteIDs: Set<UUID>
+    private let sourceStateBySessionID: [UUID: SourceState]
+
+    init?(
+        rootSessionID: UUID,
+        records: [AgentSessionMetadataRecord],
+        knownSessionIDs: Set<UUID>? = nil
+    ) {
+        let recordIDs = Set(records.map(\.id))
+        guard recordIDs.count == records.count, !records.isEmpty else { return nil }
+        if let knownSessionIDs {
+            guard recordIDs.isSubset(of: knownSessionIDs) else { return nil }
+        }
+
+        let rootRecord = records.first { $0.id == rootSessionID }
+        if let rootRecord {
+            guard rootRecord.branchRootSessionID == nil,
+                  rootRecord.branchSourceSessionID == nil,
+                  rootRecord.branchSourceTurnID == nil,
+                  rootRecord.branchSourceTurnOrdinal == nil,
+                  rootRecord.branchCreatedAt == nil
+            else {
+                return nil
+            }
+        } else if knownSessionIDs?.contains(rootSessionID) == true {
+            return nil
+        }
+
+        var incompleteIDs: Set<UUID> = []
+        var sourceStates: [UUID: SourceState] = [:]
+
+        for record in records where record.id != rootSessionID {
+            guard record.branchRootSessionID == rootSessionID else { return nil }
+            if record.branchSourceTurnID == nil {
+                incompleteIDs.insert(record.id)
+            }
+            guard let parentID = record.branchSourceSessionID else {
+                incompleteIDs.insert(record.id)
+                sourceStates[record.id] = .sourceUnavailable
+                continue
+            }
+            if parentID == rootSessionID || recordIDs.contains(parentID) {
+                sourceStates[record.id] = .complete
+            } else {
+                guard let knownSessionIDs else { return nil }
+                guard !knownSessionIDs.contains(parentID) else { return nil }
+                sourceStates[record.id] = .deletedSource(parentID)
+            }
+        }
+
+        var visiting: Set<UUID> = []
+        var visited: Set<UUID> = []
+        let parentByID = Dictionary(uniqueKeysWithValues: records.compactMap { record in
+            record.branchSourceSessionID.map { (record.id, $0) }
+        })
+        func hasCycle(from id: UUID) -> Bool {
+            if visited.contains(id) { return false }
+            guard visiting.insert(id).inserted else { return true }
+            defer {
+                visiting.remove(id)
+                visited.insert(id)
+            }
+            guard let parentID = parentByID[id], recordIDs.contains(parentID) else {
+                return false
+            }
+            return hasCycle(from: parentID)
+        }
+        guard !records.contains(where: { hasCycle(from: $0.id) }) else { return nil }
+
+        self.rootSessionID = rootSessionID
+        rootState = rootRecord == nil ? .deleted : .present
+        self.records = records
+        lineageIncompleteIDs = incompleteIDs
+        sourceStateBySessionID = sourceStates
+    }
+
+    func children(of sessionID: UUID) -> [AgentSessionMetadataRecord] {
+        records.filter { record in
+            record.id != rootSessionID
+                && (record.branchSourceSessionID ?? rootSessionID) == sessionID
+        }
+    }
+
+    func sourceState(for sessionID: UUID) -> SourceState? {
+        sourceStateBySessionID[sessionID]
+    }
 
     var requiresExactResume: Bool {
         records.contains { $0.branchRootSessionID != nil }
@@ -1137,10 +1235,16 @@ actor AgentSessionDataService {
             let records = index.entries.filter { record in
                 record.id == rootSessionID || record.branchRootSessionID == rootSessionID
             }.sortedForAgentSessionMetadataIndex()
-            guard records.contains(where: { $0.id == sessionID }) else {
+            guard records.contains(where: { $0.id == sessionID }),
+                  let tree = AgentSessionBranchTree(
+                      rootSessionID: rootSessionID,
+                      records: records,
+                      knownSessionIDs: Set(index.entries.map(\.id))
+                  )
+            else {
                 return .unavailable
             }
-            return .available(AgentSessionBranchTree(rootSessionID: rootSessionID, records: records))
+            return .available(tree)
         } catch {
             return .unavailable
         }

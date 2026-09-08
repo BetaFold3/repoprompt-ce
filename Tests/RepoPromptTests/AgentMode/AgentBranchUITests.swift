@@ -86,6 +86,7 @@ final class AgentBranchUITests: XCTestCase {
             (.noCheckpoint, "No native checkpoint was recorded for this turn."),
             (.turnNotCompleted, "No native checkpoint was recorded for this turn."),
             (.beforeCompaction, "Codex compacted this conversation after this checkpoint."),
+            (.lineageProviderMismatch, "Branching is disabled because this branch's recorded source provider does not match its current provider."),
             (.notIdle, "Finish the pending operation before branching."),
             (.operationInProgress, "Finish the pending operation before branching."),
             (.pendingHandoff, "Finish the pending operation before branching.")
@@ -110,7 +111,7 @@ final class AgentBranchUITests: XCTestCase {
         let target = ledger.entries[0]
         let presentation = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(target),
+            availability: .available(target.agentBranchCheckpoint),
             transcriptTurnIDs: ledger.entries.map(\.turnID),
             ledger: ledger,
             isOperationInProgress: false
@@ -133,7 +134,7 @@ final class AgentBranchUITests: XCTestCase {
 
         let singular = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(ledger.entries[0]),
+            availability: .available(ledger.entries[0].agentBranchCheckpoint),
             transcriptTurnIDs: ledger.entries.map(\.turnID),
             ledger: ledger,
             sourceOwnedOracleChatCount: 1,
@@ -146,7 +147,7 @@ final class AgentBranchUITests: XCTestCase {
 
         let plural = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(ledger.entries[0]),
+            availability: .available(ledger.entries[0].agentBranchCheckpoint),
             transcriptTurnIDs: ledger.entries.map(\.turnID),
             ledger: ledger,
             sourceOwnedOracleChatCount: 2,
@@ -166,7 +167,7 @@ final class AgentBranchUITests: XCTestCase {
         )
         let modified = AgentReplyBranchPresentation(
             turnID: modifiedTargetID,
-            availability: .available(modifiedLedger.entries[0]),
+            availability: .available(modifiedLedger.entries[0].agentBranchCheckpoint),
             transcriptTurnIDs: modifiedLedger.entries.map(\.turnID),
             ledger: modifiedLedger,
             isOperationInProgress: false
@@ -181,7 +182,7 @@ final class AgentBranchUITests: XCTestCase {
         )
         let unknown = AgentReplyBranchPresentation(
             turnID: unknownTargetID,
-            availability: .available(unknownLedger.entries[0]),
+            availability: .available(unknownLedger.entries[0].agentBranchCheckpoint),
             transcriptTurnIDs: unknownLedger.entries.map(\.turnID),
             ledger: unknownLedger,
             isOperationInProgress: false
@@ -196,7 +197,7 @@ final class AgentBranchUITests: XCTestCase {
         let ledger = makeLedger(targetID: targetID, omitted: [])
         let presentation = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(ledger.entries[0]),
+            availability: .available(ledger.entries[0].agentBranchCheckpoint),
             transcriptTurnIDs: ledger.entries.map(\.turnID),
             ledger: ledger,
             isOperationInProgress: true
@@ -225,7 +226,7 @@ final class AgentBranchUITests: XCTestCase {
         )
         let presentation = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(ledger.entries[0]),
+            availability: .available(ledger.entries[0].agentBranchCheckpoint),
             transcriptTurnIDs: [targetID, firstOmittedID, missingOmittedID, lastOmittedID],
             ledger: ledger,
             isOperationInProgress: false
@@ -257,7 +258,7 @@ final class AgentBranchUITests: XCTestCase {
         )
         let presentation = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(target),
+            availability: .available(target.agentBranchCheckpoint),
             transcriptTurnIDs: [targetID, omittedID],
             ledger: CodexTurnCheckpointLedger(
                 threadID: "thread",
@@ -279,7 +280,7 @@ final class AgentBranchUITests: XCTestCase {
         )
         let presentation = AgentReplyBranchPresentation(
             turnID: turnID,
-            availability: .available(checkpoint),
+            availability: .available(checkpoint.agentBranchCheckpoint),
             transcriptTurnIDs: [turnID, turnID],
             ledger: CodexTurnCheckpointLedger(threadID: "thread", entries: [checkpoint]),
             isOperationInProgress: false
@@ -296,7 +297,7 @@ final class AgentBranchUITests: XCTestCase {
         let target = makeCheckpoint(turnID: targetID, codexTurnID: "target", sideEffect: .readOnly)
         let presentation = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(target),
+            availability: .available(target.agentBranchCheckpoint),
             transcriptTurnIDs: [earlierTurnID, targetID],
             ledger: CodexTurnCheckpointLedger(threadID: "thread", entries: [target]),
             isOperationInProgress: false
@@ -320,7 +321,7 @@ final class AgentBranchUITests: XCTestCase {
         )
         let presentation = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(target),
+            availability: .available(target.agentBranchCheckpoint),
             transcriptTurnIDs: [targetID, omittedID],
             ledger: CodexTurnCheckpointLedger(threadID: "thread", entries: [target, omitted]),
             isOperationInProgress: false
@@ -344,14 +345,14 @@ final class AgentBranchUITests: XCTestCase {
         )
         let originalPresentation = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(target),
+            availability: .available(target.agentBranchCheckpoint),
             transcriptTurnIDs: [targetID],
             ledger: CodexTurnCheckpointLedger(threadID: "thread", entries: [target]),
             isOperationInProgress: false
         )
         let replacementPresentation = AgentReplyBranchPresentation(
             turnID: replacementID,
-            availability: .available(replacement),
+            availability: .available(replacement.agentBranchCheckpoint),
             transcriptTurnIDs: [replacementID],
             ledger: CodexTurnCheckpointLedger(threadID: "thread", entries: [replacement]),
             isOperationInProgress: false
@@ -385,7 +386,7 @@ final class AgentBranchUITests: XCTestCase {
         let target = makeCheckpoint(turnID: targetID, codexTurnID: "target", sideEffect: .readOnly)
         let presentation = AgentReplyBranchPresentation(
             turnID: targetID,
-            availability: .available(target),
+            availability: .available(target.agentBranchCheckpoint),
             transcriptTurnIDs: [targetID],
             ledger: CodexTurnCheckpointLedger(threadID: "thread", entries: [target]),
             isOperationInProgress: false
@@ -477,7 +478,7 @@ final class AgentBranchUITests: XCTestCase {
     }
 
     @MainActor
-    func testDeletedRootWithSoleSurvivingBranchProjectsTwoVisibleMembers() {
+    func testDeletedRootWithSoleSurvivingBranchProjectsTwoVisibleMembers() throws {
         let rootID = UUID()
         let survivingBranch = makeBranchRecord(
             id: UUID(),
@@ -486,8 +487,14 @@ final class AgentBranchUITests: XCTestCase {
             createdAt: Date(timeIntervalSinceReferenceDate: 10),
             savedAt: Date(timeIntervalSinceReferenceDate: 10)
         )
-        let tree = AgentSessionBranchTree(rootSessionID: rootID, records: [survivingBranch])
+        let tree = try XCTUnwrap(AgentSessionBranchTree(
+            rootSessionID: rootID,
+            records: [survivingBranch]
+        ))
 
+        XCTAssertEqual(tree.rootState, .deleted)
+        XCTAssertEqual(tree.sourceState(for: survivingBranch.id), .complete)
+        XCTAssertTrue(tree.lineageIncompleteIDs.isEmpty)
         XCTAssertEqual(
             AgentModeViewModel.projectedConversationBranchMemberCount(tree: tree),
             2
@@ -600,7 +607,8 @@ final class AgentBranchUITests: XCTestCase {
             rootSessionID: rootID,
             sourceSessionID: rootID,
             sourceTurnID: UUID(),
-            sourceCodexTurnID: "turn-2",
+            sourceNativeTurnRef: "turn-2",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
             sourceTurnOrdinal: 2,
             createdAt: Date(timeIntervalSinceReferenceDate: 100)
         )
@@ -621,6 +629,8 @@ final class AgentBranchUITests: XCTestCase {
         let sidebarEntry = try XCTUnwrap(record.sidebarEntry())
 
         XCTAssertEqual(record.branchRootSessionID, rootID)
+        XCTAssertEqual(record.branchSourceSessionID, rootID)
+        XCTAssertEqual(record.branchSourceTurnID, origin.sourceTurnID)
         XCTAssertEqual(record.branchSourceTurnOrdinal, 2)
         XCTAssertEqual(record.branchCreatedAt, origin.createdAt)
         XCTAssertEqual(sidebarEntry.branchRootSessionID, rootID)
@@ -630,11 +640,15 @@ final class AgentBranchUITests: XCTestCase {
         let encoded = try JSONEncoder().encode(AgentSessionMetadataIndex(entries: [record]))
         var payload = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         var entries = try XCTUnwrap(payload["entries"] as? [[String: Any]])
+        entries[0].removeValue(forKey: "branchSourceSessionID")
+        entries[0].removeValue(forKey: "branchSourceTurnID")
         entries[0].removeValue(forKey: "branchSourceTurnOrdinal")
         entries[0].removeValue(forKey: "branchCreatedAt")
         payload["entries"] = entries
         let legacyData = try JSONSerialization.data(withJSONObject: payload)
         let legacy = try JSONDecoder().decode(AgentSessionMetadataIndex.self, from: legacyData)
+        XCTAssertNil(legacy.entries[0].branchSourceSessionID)
+        XCTAssertNil(legacy.entries[0].branchSourceTurnID)
         XCTAssertNil(legacy.entries[0].branchSourceTurnOrdinal)
         XCTAssertNil(legacy.entries[0].branchCreatedAt)
         XCTAssertEqual(legacy.schemaVersion, AgentSessionMetadataIndex.currentSchemaVersion)
@@ -659,7 +673,8 @@ final class AgentBranchUITests: XCTestCase {
                 rootSessionID: rootID,
                 sourceSessionID: rootID,
                 sourceTurnID: UUID(),
-                sourceCodexTurnID: "turn",
+                sourceNativeTurnRef: "turn",
+                sourceProviderKind: AgentProviderKind.codexExec.rawValue,
                 sourceTurnOrdinal: ordinal ?? 1,
                 createdAt: createdAt ?? savedAt
             )

@@ -86,6 +86,74 @@ final class AgentTranscriptBranchPrefixTests: XCTestCase {
         XCTAssertEqual(branch.providerTokenUsageByTurn.map(\.promptTokens), [10])
     }
 
+    func testBranchSnapshotBuilderPreservesPrunedProviderUsageAndCodexLineage() throws {
+        let fixture = makeThreeTurnFixture()
+        let childID = UUID()
+        let workspaceID = UUID()
+        var source = AgentSession(
+            name: "Source",
+            agentModel: "model",
+            agentReasoningEffort: "high",
+            autoEditEnabled: true,
+            codexModel: "source-model",
+            codexReasoningEffort: "medium"
+        )
+        source.transcript = fixture.transcript
+        source.providerTokenUsageByTurn = [
+            AgentTokenUsagePersist(
+                promptTokens: 10,
+                completionTokens: 1,
+                timestamp: Date(timeIntervalSinceReferenceDate: 5)
+            ),
+            AgentTokenUsagePersist(
+                promptTokens: 20,
+                completionTokens: 2,
+                timestamp: Date(timeIntervalSinceReferenceDate: 25)
+            )
+        ]
+        let prefixed = try AgentTranscriptIO.branchPrefix(
+            of: source,
+            throughTurnID: fixture.secondUser.id
+        )
+        let retainedCheckpoint = CodexTurnCheckpoint(
+            turnID: fixture.secondUser.id,
+            codexTurnID: "codex-turn-2",
+            status: .completed,
+            sideEffect: .readOnly,
+            recordedAt: Date(timeIntervalSinceReferenceDate: 13)
+        )
+
+        let child = AgentSessionBranchSnapshotBuilder.codexChild(
+            source: source,
+            prefixedSource: prefixed,
+            workspaceID: workspaceID,
+            childID: childID,
+            childThreadID: "child-thread",
+            childRolloutPath: "/tmp/rollout",
+            childLedger: CodexTurnCheckpointLedger(
+                threadID: "child-thread",
+                entries: [retainedCheckpoint]
+            ),
+            childModel: nil,
+            childReasoningEffort: nil,
+            sourceTurnID: fixture.secondUser.id,
+            sourceNativeTurnRef: retainedCheckpoint.codexTurnID,
+            sourceTurnOrdinal: 2,
+            createdAt: Date(timeIntervalSinceReferenceDate: 50)
+        )
+
+        XCTAssertEqual(child.id, childID)
+        XCTAssertEqual(child.workspaceID, workspaceID)
+        XCTAssertEqual(child.providerTokenUsageByTurn.map(\.promptTokens), [10])
+        XCTAssertEqual(child.codexConversationID, "child-thread")
+        XCTAssertEqual(child.codexModel, "source-model")
+        XCTAssertEqual(child.codexReasoningEffort, "medium")
+        XCTAssertEqual(child.branchOrigin?.sourceSessionID, source.id)
+        XCTAssertEqual(child.branchOrigin?.sourceTurnID, fixture.secondUser.id)
+        XCTAssertEqual(child.branchOrigin?.sourceNativeTurnRef, "codex-turn-2")
+        XCTAssertEqual(child.branchOrigin?.sourceProviderKind, AgentProviderKind.codexExec.rawValue)
+    }
+
     func testBranchPrefixRejectsMissingNonFullAndIncompleteTurns() throws {
         let fixture = makeThreeTurnFixture()
 

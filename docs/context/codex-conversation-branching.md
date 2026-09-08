@@ -2,7 +2,7 @@
 
 Scope: read when the task touches Codex Agent Mode conversation branching, native turn checkpoints, branch creation or switching, branch lineage and tree projection, branch UI, exact resume, or branch-aware Oracle ownership.
 Authority: Authoritative
-Last-verified: 2026-09-06
+Last-verified: 2026-09-08
 
 ## Shipped v1 contract
 
@@ -16,9 +16,9 @@ A turn is branchable only when the session is locally controlled and its run sta
 - Branch creation uses the live bound idle Codex controller and `thread/fork` with the source thread, the selected `lastTurnId`, `excludeTurns: true`, and a durable child. It does not mutate the controller's source binding.
 - Before the fork, CE exhaustively reads the source turn manifest and validates the checkpoint sequence. Afterward it exhaustively validates the child prefix and rereads the source to prove it is unchanged. Invalid or incomplete pagination, duplicate turns, an invalid child identity, or a structural mismatch fails the operation. A known unsaved child is archived best-effort after failure.
 - Fork submission is attempted once. Cancellation or transport/decode failure after enqueue is an ambiguous outcome and is never automatically retried because retrying could create another child.
-- The child transcript is an exact prefix through the selected completed turn. It preserves retained turn/span/row identity and the sequence high-water mark, filters omitted tool-result payloads and token usage, recomputes persistence projections, and never splits a turn.
+- The child transcript is an exact prefix through the selected completed turn. It preserves retained turn/span/row identity and the sequence high-water mark, filters omitted tool-result payloads, recomputes persistence projections, and never splits a turn. Branch child snapshots preserve only provider token-usage rows timestamped no later than the retained prefix completion.
 - Each branch is a new session file with a new session ID and `AgentSessionBranchOrigin`. Only branches carry lineage: root ID, source session and CE/Codex turn IDs, one-based source-turn ordinal, and creation date. The original session is not annotated or rewritten by branching beyond the ordinary pre-operation save.
-- Session serialization remains version 7 because the checkpoint and lineage keys are additive and optional. Metadata index schema remains compatible and projects branch root, ordinal, and creation date without loading full sessions.
+- `AgentSession` serialization remains version 7 because the checkpoint and lineage keys are additive and optional. Metadata index schema is 7 and projects `branchRootSessionID`, `branchSourceSessionID`, `branchSourceTurnID`, ordinal, and creation date without loading full sessions. The schema-six-to-seven transition triggers a one-time rebuild from lightweight session stubs.
 
 ## Tree, switching, and exact resume
 
@@ -59,8 +59,8 @@ For changes to this boundary, run the smallest focused suites that cover the cha
 ```bash
 make dev-lint
 make dev-swift-build PRODUCT=RepoPrompt
-RPCE_ALLOW_UNKNOWN_FILTER=1 make dev-test FILTER='CodexTurnCheckpointLedgerTests|CodexNativeSessionControllerForkTests|AgentTranscriptBranchPrefixTests|AgentSessionBranchGateTests|CodexAgentModeCoordinatorBranchTests|AgentSessionBranchOriginPersistenceTests|AgentBranchUITests|MCPAskOracleWorktreeTests'
-make dev-test FILTER='CodexNativeSessionController.*Tests|AgentHandoffUITests'
+RPCE_ALLOW_UNKNOWN_FILTER=1 make dev-test FILTER='CodexTurnCheckpointLedgerTests\|CodexNativeSessionControllerForkTests\|AgentTranscriptBranchPrefixTests\|AgentSessionBranchGateTests\|CodexAgentModeCoordinatorBranchTests\|AgentSessionBranchOriginPersistenceTests\|AgentSessionMetadataIndexLineageTests\|AgentSessionBranchTreeProjectionTests\|AgentBranchUITests\|MCPAskOracleWorktreeTests'
+make dev-test FILTER='CodexNativeSessionController.*Tests\|AgentHandoffUITests'
 make dev-test-parallel
 Scripts/check-agent-context
 make guardrails

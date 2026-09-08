@@ -163,9 +163,68 @@ struct AgentSessionBranchOrigin: Codable, Equatable, Sendable {
     let rootSessionID: UUID
     let sourceSessionID: UUID
     let sourceTurnID: UUID
-    let sourceCodexTurnID: String
+    let sourceNativeTurnRef: String
+    /// Diagnostic provider identity only; it is never runtime dispatch authority.
+    /// Runtime dispatch must use the session's native binding, but a contradiction may disable branching.
+    /// A missing value denotes legacy Codex lineage for diagnostic presentation.
+    let sourceProviderKind: String?
     let sourceTurnOrdinal: Int
     let createdAt: Date
+
+    var diagnosticSourceProviderKind: String {
+        sourceProviderKind ?? AgentProviderKind.codexExec.rawValue
+    }
+
+    init(
+        rootSessionID: UUID,
+        sourceSessionID: UUID,
+        sourceTurnID: UUID,
+        sourceNativeTurnRef: String,
+        sourceProviderKind: String? = nil,
+        sourceTurnOrdinal: Int,
+        createdAt: Date
+    ) {
+        self.rootSessionID = rootSessionID
+        self.sourceSessionID = sourceSessionID
+        self.sourceTurnID = sourceTurnID
+        self.sourceNativeTurnRef = sourceNativeTurnRef
+        self.sourceProviderKind = sourceProviderKind
+        self.sourceTurnOrdinal = sourceTurnOrdinal
+        self.createdAt = createdAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case rootSessionID
+        case sourceSessionID
+        case sourceTurnID
+        /// Legacy non-optional wire key retained so older builds preserve lineage on re-save.
+        case sourceNativeTurnRef = "sourceCodexTurnID"
+        case sourceProviderKind
+        case sourceTurnOrdinal
+        case createdAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        rootSessionID = try container.decode(UUID.self, forKey: .rootSessionID)
+        sourceSessionID = try container.decode(UUID.self, forKey: .sourceSessionID)
+        sourceTurnID = try container.decode(UUID.self, forKey: .sourceTurnID)
+        sourceNativeTurnRef = try container.decode(String.self, forKey: .sourceNativeTurnRef)
+        sourceProviderKind = try container.decodeIfPresent(String.self, forKey: .sourceProviderKind)
+        sourceTurnOrdinal = try container.decode(Int.self, forKey: .sourceTurnOrdinal)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(rootSessionID, forKey: .rootSessionID)
+        try container.encode(sourceSessionID, forKey: .sourceSessionID)
+        try container.encode(sourceTurnID, forKey: .sourceTurnID)
+        try container.encode(sourceNativeTurnRef, forKey: .sourceNativeTurnRef)
+        try container.encodeIfPresent(sourceProviderKind, forKey: .sourceProviderKind)
+        try container.encode(sourceTurnOrdinal, forKey: .sourceTurnOrdinal)
+        try container.encode(createdAt, forKey: .createdAt)
+    }
 }
 
 // swiftformat:disable:next redundantSendable

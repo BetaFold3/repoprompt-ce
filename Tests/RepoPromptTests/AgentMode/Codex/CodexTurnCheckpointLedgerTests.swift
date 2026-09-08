@@ -2,7 +2,62 @@ import Foundation
 @testable import RepoPromptApp
 import XCTest
 
+private struct LegacyCodexTurnCheckpoint: Codable {
+    enum Status: String, Codable {
+        case inProgress
+        case completed
+        case failed
+        case cancelled
+    }
+
+    enum SideEffect: Codable {
+        case readOnly
+        case modified(paths: [String])
+        case unknown
+    }
+
+    let turnID: UUID
+    let codexTurnID: String
+    let status: Status
+    let sideEffect: SideEffect?
+    let recordedAt: Date
+}
+
 final class CodexTurnCheckpointLedgerTests: XCTestCase {
+    func testNeutralFacadePreservesCodexCheckpointWireShapeAndDetectsDuplicates() throws {
+        let turnID = UUID()
+        let recordedAt = Date(timeIntervalSinceReferenceDate: 10)
+        let checkpoint = CodexTurnCheckpoint(
+            turnID: turnID,
+            codexTurnID: "native-turn",
+            status: .completed,
+            sideEffect: .modified(paths: ["Sources/A.swift"]),
+            recordedAt: recordedAt
+        )
+        let legacy = LegacyCodexTurnCheckpoint(
+            turnID: turnID,
+            codexTurnID: "native-turn",
+            status: .completed,
+            sideEffect: .modified(paths: ["Sources/A.swift"]),
+            recordedAt: recordedAt
+        )
+
+        let currentObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(checkpoint)) as? NSDictionary
+        )
+        let legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(legacy)) as? NSDictionary
+        )
+        XCTAssertEqual(currentObject, legacyObject)
+
+        let index = CodexTurnCheckpointLedger(
+            threadID: "thread",
+            entries: [checkpoint, checkpoint]
+        ).checkpointIndex()
+        XCTAssertEqual(index.byTurnID[turnID], checkpoint.agentBranchCheckpoint)
+        XCTAssertEqual(index.duplicateTurnIDs, [turnID])
+    }
+
     func testSameCETurnRecordingReplacesInProgressCandidate() {
         let turnID = UUID()
         let firstDate = Date(timeIntervalSinceReferenceDate: 1)

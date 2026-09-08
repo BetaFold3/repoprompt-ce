@@ -12,7 +12,7 @@ final class AgentSessionBranchGateTests: XCTestCase {
         let checkpoint = try XCTUnwrap(ledger.entries.first)
         XCTAssertEqual(
             AgentSessionBranchGate.evaluate(session: session, turnID: turnID),
-            .available(checkpoint)
+            .available(checkpoint.agentBranchCheckpoint)
         )
     }
 
@@ -94,7 +94,7 @@ final class AgentSessionBranchGateTests: XCTestCase {
             let checkpoint = try XCTUnwrap(session.codexTurnCheckpoints?.entries.first)
             XCTAssertEqual(
                 AgentSessionBranchGate.evaluate(session: session, turnID: turnID),
-                .available(checkpoint),
+                .available(checkpoint.agentBranchCheckpoint),
                 "Expected \(runState) to be quiescent"
             )
         }
@@ -136,6 +136,95 @@ final class AgentSessionBranchGateTests: XCTestCase {
                 occupancy: .init(codexTerminalSettlePending: true)
             ),
             .unavailable(.notIdle)
+        )
+    }
+
+    func testStaticAndTransientReasonsPreserveExistingPrecedence() {
+        let turnID = UUID()
+        let active = makeSession(turnID: turnID)
+        active.runState = .running
+        active.isBranchOperationInProgress = true
+
+        XCTAssertNil(AgentSessionBranchGate.staticUnavailableReason(session: active))
+        XCTAssertEqual(
+            AgentSessionBranchGate.operationUnavailableReason(session: active),
+            .operationInProgress
+        )
+
+        let remote = makeSession(turnID: turnID)
+        remote.remoteHost = AgentSessionRemoteHostBinding(
+            hostID: "host",
+            hostDisplayName: "Host",
+            remoteSessionID: "remote"
+        )
+        remote.isBranchOperationInProgress = true
+        XCTAssertEqual(
+            AgentSessionBranchGate.staticUnavailableReason(session: remote),
+            .remoteSession
+        )
+        XCTAssertEqual(
+            AgentSessionBranchGate.operationUnavailableReason(session: remote),
+            .remoteSession
+        )
+    }
+
+    func testProviderSupportAndRuntimeCapabilityRemainCodexOnly() {
+        let turnID = UUID()
+        let codex = makeSession(turnID: turnID)
+        XCTAssertTrue(AgentBranchProviderSupport.isSupported(.codexExec))
+        XCTAssertNotNil(AgentBranchProviderSupport.nativeBinding(for: codex))
+
+        let claude = makeSession(turnID: turnID)
+        claude.selectedAgent = .claudeCode
+        claude.providerSessionID = "claude-session"
+        XCTAssertFalse(AgentBranchProviderSupport.isSupported(.claudeCode))
+        XCTAssertNil(AgentBranchProviderSupport.nativeBinding(for: claude))
+        XCTAssertEqual(
+            AgentSessionBranchGate.evaluate(
+                session: codex,
+                turnID: turnID,
+                runtimeCapability: .unknown
+            ),
+            .unavailable(.runtimeCapabilityUnknown)
+        )
+        XCTAssertEqual(
+            AgentSessionBranchGate.evaluate(
+                session: codex,
+                turnID: turnID,
+                runtimeCapability: .unsupported(.flagMissing)
+            ),
+            .unavailable(.runtimeUnsupported(.flagMissing))
+        )
+
+        let contradictory = makeSession(turnID: turnID)
+        contradictory.branchOrigin = AgentSessionBranchOrigin(
+            rootSessionID: UUID(),
+            sourceSessionID: UUID(),
+            sourceTurnID: UUID(),
+            sourceNativeTurnRef: "native-turn",
+            sourceProviderKind: AgentProviderKind.claudeCode.rawValue,
+            sourceTurnOrdinal: 1,
+            createdAt: Date()
+        )
+        XCTAssertEqual(
+            AgentSessionBranchGate.evaluate(session: contradictory, turnID: turnID),
+            .unavailable(.lineageProviderMismatch)
+        )
+    }
+
+    func testDuplicateCheckpointEvidenceFailsClosed() throws {
+        let turnID = UUID()
+        let session = makeSession(turnID: turnID)
+        let checkpoint = try XCTUnwrap(session.codexTurnCheckpoints?.entries.first)
+        session.codexTurnCheckpoints?.entries.append(checkpoint)
+
+        XCTAssertEqual(
+            AgentSessionBranchGate.evaluate(session: session, turnID: turnID),
+            .unavailable(.noCheckpoint)
+        )
+        XCTAssertEqual(
+            session.codexTurnCheckpoints?.checkpointIndex().duplicateTurnIDs,
+            [turnID]
         )
     }
 

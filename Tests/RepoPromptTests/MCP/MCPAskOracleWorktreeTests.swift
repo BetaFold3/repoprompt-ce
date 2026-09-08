@@ -352,7 +352,8 @@ import XCTest
                     rootSessionID: rootSessionID,
                     sourceSessionID: rootSessionID,
                     sourceTurnID: UUID(),
-                    sourceCodexTurnID: "codex-turn",
+                    sourceNativeTurnRef: "codex-turn",
+                    sourceProviderKind: AgentProviderKind.codexExec.rawValue,
                     sourceTurnOrdinal: 1,
                     createdAt: Date(timeIntervalSinceReferenceDate: 1)
                 )
@@ -367,7 +368,8 @@ import XCTest
                     rootSessionID: rootSessionID,
                     sourceSessionID: rootSessionID,
                     sourceTurnID: UUID(),
-                    sourceCodexTurnID: "codex-turn",
+                    sourceNativeTurnRef: "codex-turn",
+                    sourceProviderKind: AgentProviderKind.codexExec.rawValue,
                     sourceTurnOrdinal: 1,
                     createdAt: Date(timeIntervalSinceReferenceDate: 2)
                 )
