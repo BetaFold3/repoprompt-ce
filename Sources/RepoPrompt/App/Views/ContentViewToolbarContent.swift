@@ -29,6 +29,7 @@ struct ContentViewToolbarContent: ToolbarContent {
         ToolbarItem(placement: .principal) {
             AgentChatTitleClusterView(
                 model: windowState.agentChatTitleCluster,
+                windowID: windowState.windowID,
                 branchMenuSnapshot: { [weak windowState] in
                     windowState?.agentConversationBranchPickerSnapshot()
                 },

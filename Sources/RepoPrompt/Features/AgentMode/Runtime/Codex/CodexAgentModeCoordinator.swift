@@ -8995,7 +8995,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 semanticRunState: .idle
             )
         }
-        guard session.runState == .idle,
+        guard !session.runState.isActive,
               let controller = session.codexController,
               controller.hasActiveThread
         else {

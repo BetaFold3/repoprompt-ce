@@ -65,7 +65,7 @@ enum AgentSessionBranchGate {
         }
         guard !session.isBranchOperationInProgress else { return .operationInProgress }
         guard !session.pendingHandoff.hasPayload else { return .pendingHandoff }
-        guard session.runState == .idle,
+        guard !session.runState.isActive,
               !occupancy.oracleRequestActive,
               !occupancy.codexTerminalSettlePending,
               session.instructionContinuation == nil,

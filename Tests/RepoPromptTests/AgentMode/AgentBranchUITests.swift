@@ -4,6 +4,65 @@ import Foundation
 import XCTest
 
 final class AgentBranchUITests: XCTestCase {
+    func testConversationBranchShortcutRequestIsWindowScopedAndRequiresMenu() {
+        XCTAssertTrue(
+            AgentConversationBranchMenuRequestGate.shouldAccept(
+                requestWindowID: 7,
+                currentWindowID: 7,
+                showsConversationBranches: true
+            )
+        )
+        XCTAssertFalse(
+            AgentConversationBranchMenuRequestGate.shouldAccept(
+                requestWindowID: 8,
+                currentWindowID: 7,
+                showsConversationBranches: true
+            )
+        )
+        XCTAssertFalse(
+            AgentConversationBranchMenuRequestGate.shouldAccept(
+                requestWindowID: nil,
+                currentWindowID: 7,
+                showsConversationBranches: true
+            )
+        )
+        XCTAssertFalse(
+            AgentConversationBranchMenuRequestGate.shouldAccept(
+                requestWindowID: 7,
+                currentWindowID: 7,
+                showsConversationBranches: false
+            )
+        )
+    }
+
+    func testConversationBranchShortcutPresentationConsumesEachRequestOnce() {
+        let requestID = UUID()
+        XCTAssertFalse(
+            AgentConversationBranchMenuRequestGate.shouldPresent(
+                requestID: nil,
+                lastPresentationRequestID: nil
+            )
+        )
+        XCTAssertTrue(
+            AgentConversationBranchMenuRequestGate.shouldPresent(
+                requestID: requestID,
+                lastPresentationRequestID: nil
+            )
+        )
+        XCTAssertFalse(
+            AgentConversationBranchMenuRequestGate.shouldPresent(
+                requestID: requestID,
+                lastPresentationRequestID: requestID
+            )
+        )
+        XCTAssertTrue(
+            AgentConversationBranchMenuRequestGate.shouldPresent(
+                requestID: UUID(),
+                lastPresentationRequestID: requestID
+            )
+        )
+    }
+
     func testOnlyConclusionBlocksAreEligibleForReplyBranchControl() {
         XCTAssertTrue(AgentReplyBranchPresentation.isEligibleBlock(.conclusion))
         let otherKinds: [AgentTranscriptRenderBlockKind] = [

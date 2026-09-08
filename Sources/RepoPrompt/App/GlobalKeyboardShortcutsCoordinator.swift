@@ -234,6 +234,7 @@ final class GlobalKeyboardShortcutsCoordinator {
         register(.toggleExpandAllAssistantReplies) { [weak self] in self?.toggleAssistantTranscriptExpandAllRepliesFromShortcut() }
         register(.toggleTranscriptWordWrap) { [weak self] in self?.toggleTranscriptWordWrapFromShortcut() }
         register(.openPromptSnippetPalette) { [weak self] in self?.openPromptSnippetPaletteFromShortcut() }
+        register(.showConversationBranches) { [weak self] in self?.showConversationBranchesFromShortcut() }
         register(.previousParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: false) }
         register(.nextParentAgentSession) { [weak self] in self?.focusAdjacentParentAgentSession(forward: true) }
         register(.showCurrentWindowAgentNavigationHUD) { [weak self] in self?.showAgentNavigationHUD(mode: .currentWindow) }
@@ -257,6 +258,15 @@ final class GlobalKeyboardShortcutsCoordinator {
             name: .openPromptSnippetPalette,
             object: nil,
             userInfo: [SnippetPaletteNotificationUserInfoKey.windowID: win.windowID]
+        )
+    }
+
+    private func showConversationBranchesFromShortcut() {
+        guard let win = guardedFocusedWindowState() else { return }
+        NotificationCenter.default.post(
+            name: .showAgentConversationBranches,
+            object: nil,
+            userInfo: ["windowID": win.windowID]
         )
     }
 

@@ -190,9 +190,11 @@ struct AgentReplyBranchControl: View {
     let config: AgentReplyBranchConfig
 
     var body: some View {
-        Button("Branch from here…") {
+        Button {
             guard config.presentation.isAvailable else { return }
             config.requestPresentation()
+        } label: {
+            Label("Branch from here…", systemImage: "arrow.triangle.branch")
         }
         .buttonStyle(.plain)
         .font(.system(size: 10, weight: .medium))

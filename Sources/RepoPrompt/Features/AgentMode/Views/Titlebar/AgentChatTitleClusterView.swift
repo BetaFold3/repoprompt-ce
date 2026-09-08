@@ -26,12 +26,31 @@ final class AgentChatTitleClusterModel: ObservableObject {
     }
 }
 
+enum AgentConversationBranchMenuRequestGate {
+    static func shouldAccept(
+        requestWindowID: Int?,
+        currentWindowID: Int,
+        showsConversationBranches: Bool
+    ) -> Bool {
+        requestWindowID == currentWindowID && showsConversationBranches
+    }
+
+    static func shouldPresent(
+        requestID: UUID?,
+        lastPresentationRequestID: UUID?
+    ) -> Bool {
+        requestID != nil && requestID != lastPresentationRequestID
+    }
+}
+
 struct AgentChatTitleClusterView: View {
     @ObservedObject var model: AgentChatTitleClusterModel
+    let windowID: Int
     let branchMenuSnapshot: () -> AgentConversationBranchPickerSnapshot?
     let branchMenuActions: AgentConversationBranchMenuActions
     let menuSnapshot: () -> AgentChatOptionsMenuSnapshot?
     let menuActions: AgentChatOptionsMenuActions
+    @State private var conversationBranchMenuRequestID: UUID?
 
     var body: some View {
         HStack(spacing: 4) {
@@ -44,6 +63,7 @@ struct AgentChatTitleClusterView: View {
 
             if model.state.showsConversationBranches {
                 AgentConversationBranchMenuButton(
+                    presentationRequestID: conversationBranchMenuRequestID,
                     menuSnapshot: branchMenuSnapshot,
                     menuActions: branchMenuActions
                 )
@@ -58,6 +78,14 @@ struct AgentChatTitleClusterView: View {
         }
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .contain)
+        .onReceive(NotificationCenter.default.publisher(for: .showAgentConversationBranches)) { notification in
+            guard AgentConversationBranchMenuRequestGate.shouldAccept(
+                requestWindowID: notification.userInfo?["windowID"] as? Int,
+                currentWindowID: windowID,
+                showsConversationBranches: model.state.showsConversationBranches
+            ) else { return }
+            conversationBranchMenuRequestID = UUID()
+        }
     }
 }
 
@@ -94,11 +122,16 @@ final class AgentConversationBranchButton: NSButton {
 }
 
 private struct AgentConversationBranchMenuButton: NSViewRepresentable {
+    let presentationRequestID: UUID?
     let menuSnapshot: () -> AgentConversationBranchPickerSnapshot?
     let menuActions: AgentConversationBranchMenuActions
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(menuSnapshot: menuSnapshot, menuActions: menuActions)
+        Coordinator(
+            presentationRequestID: presentationRequestID,
+            menuSnapshot: menuSnapshot,
+            menuActions: menuActions
+        )
     }
 
     func makeNSView(context: Context) -> AgentConversationBranchButton {
@@ -109,22 +142,38 @@ private struct AgentConversationBranchMenuButton: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: AgentConversationBranchButton, context: Context) {
-        _ = nsView
         context.coordinator.menuSnapshot = menuSnapshot
         context.coordinator.menuActions = menuActions
+        context.coordinator.presentMenuIfRequested(presentationRequestID, sender: nsView)
     }
 
     @MainActor
     final class Coordinator: NSObject {
         var menuSnapshot: () -> AgentConversationBranchPickerSnapshot?
         var menuActions: AgentConversationBranchMenuActions
+        private var lastPresentationRequestID: UUID?
 
         init(
+            presentationRequestID: UUID?,
             menuSnapshot: @escaping () -> AgentConversationBranchPickerSnapshot?,
             menuActions: AgentConversationBranchMenuActions
         ) {
+            lastPresentationRequestID = presentationRequestID
             self.menuSnapshot = menuSnapshot
             self.menuActions = menuActions
+        }
+
+        func presentMenuIfRequested(_ requestID: UUID?, sender: NSButton) {
+            guard AgentConversationBranchMenuRequestGate.shouldPresent(
+                requestID: requestID,
+                lastPresentationRequestID: lastPresentationRequestID
+            ), let requestID
+            else { return }
+            lastPresentationRequestID = requestID
+            Task { @MainActor [weak self, weak sender] in
+                guard let self, let sender else { return }
+                showMenu(sender)
+            }
         }
 
         @objc func showMenu(_ sender: NSButton) {

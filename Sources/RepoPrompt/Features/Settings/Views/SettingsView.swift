@@ -679,7 +679,14 @@ enum SettingsTab: String, CaseIterable {
                 "command option",
                 "workspace save shortcut",
                 "font size shortcut",
-                "agent shortcut"
+                "agent shortcut",
+                "branch",
+                "tree",
+                "conversation branches",
+                "command shift t",
+                "cmd shift t",
+                "command+shift+t",
+                "⌘⇧t"
             ]
         case .advanced:
             [

@@ -8,7 +8,7 @@ Last-verified: 2026-09-06
 
 Conversation branching is complete for local, top-level, user-owned Codex Agent Mode sessions. It restores Codex native context through a completed turn while preserving the original conversation path. Branching is not handoff: it creates a durable native Codex fork and a separate persisted `AgentSession`, then opens that branch in the same compose tab without sending a message.
 
-A turn is branchable only when the session is idle and locally controlled, the persisted checkpoint ledger matches the active Codex thread, and the selected fully retained turn has a completed checkpoint, a sealed side-effect classification, and a stored final assistant conclusion. Remote, MCP-originated, child-agent, worktree-bound, non-Codex, pending-handoff, active-Oracle, terminal-settle, and other non-idle states are unavailable. Existing sessions receive no checkpoint backfill.
+A turn is branchable only when the session is locally controlled and its run state is inactive, the persisted checkpoint ledger matches the active Codex thread, and the selected fully retained turn has a completed checkpoint, a sealed side-effect classification, and a stored final assistant conclusion. Completed, cancelled, and failed session states may branch from such a retained completed turn; they do not make an incomplete turn branchable. Remote, MCP-originated, child-agent, worktree-bound, non-Codex, pending-handoff, active-Oracle, terminal-settle, and other active or pending-work states are unavailable. Existing sessions receive no checkpoint backfill.
 
 ## Checkpoints, fork, and persistence
 
@@ -28,7 +28,7 @@ Switching is allowed only between persisted local Codex sessions in the same tre
 
 Every branch child and every root known to have branches requires exact native resume before its next send. CE must resume the stored Codex conversation/rollout with missing-rollout and resume-timeout fallback disabled. If exact resume cannot be proven, CE preserves the unsent composer content, sends nothing, and reports that the conversation could not be reopened. Unavailable tree evidence also requires exact resume; it never authorizes a fresh-thread fallback.
 
-Branch creation and switching pin session identity, binding generation, persistence/transcript generations, source thread, idle state, and operation ownership across every suspension point. While an operation is active, send, steer, handoff, session load, conflicting lifecycle work, and MCP entry points cannot take ownership.
+Branch creation and switching pin session identity, binding generation, persistence/transcript generations, source thread, inactive run state, and operation ownership across every suspension point. While an operation is active, send, steer, handoff, session load, conflicting lifecycle work, and MCP entry points cannot take ownership.
 
 ## Oracle ownership
 
@@ -36,9 +36,9 @@ Oracle chats remain owned by the exact `AgentSession` that created them; tree me
 
 ## v1 UI surfaces
 
-- Completed assistant conclusion rows expose **Branch from here…**. Disabled controls explain unsupported local state, missing native checkpoints, compaction, or pending work.
+- Completed assistant conclusion rows expose **Branch from here…** with the branch icon. Disabled controls explain unsupported local state, missing native checkpoints, compaction, or pending work.
 - The confirmation sheet states the retained and omitted turn counts, classifies omitted work as read-only, changed paths, or unknown, warns that disk/Git/workspace state is not rolled back, and discloses source-owned Oracle chats. Mutating or unknown suffixes require **Branch anyway**. Submission shows **Branching…** and cannot be cancelled after it starts.
-- When the projected tree has more than one member, the title bar exposes a **Conversation Branches** menu. Projection always includes the original slot, so a sole surviving branch whose root was deleted still shows the menu with **Original (deleted)** plus the child. It lists **Original** first, then branches by source-turn ordinal and creation date, checks the active path, and disables deleted or elsewhere-open targets with explanatory help; pending operation state disables other paths with **Finish the pending operation before switching branches.**
+- When the projected tree has more than one member, the title bar exposes a **Conversation Branches** menu. The configurable **Conversation Branches** shortcut (default ⌘⇧T) opens that same menu. Projection always includes the original slot, so a sole surviving branch whose root was deleted still shows the menu with **Original (deleted)** plus the child. It lists **Original** first, then branches by source-turn ordinal and creation date, checks the active path, and disables deleted or elsewhere-open targets with explanatory help; pending operation state disables other paths with **Finish the pending operation before switching branches.**
 - Active and archived Agent Mode sidebar rows display a **Branch** badge for lineage-bearing sessions.
 - After creation, the branch transcript receives a system note naming the source and turn and stating that files, Oracle chats, worktrees, and child sessions were not changed.
 

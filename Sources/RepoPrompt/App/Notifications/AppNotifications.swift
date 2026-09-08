@@ -108,6 +108,10 @@ extension Notification.Name {
     /// userInfo: ["tabID": UUID, "windowID": Int, "previousSessionID": UUID?, "sessionID": UUID?]
     static let agentSessionBindingDidChange = Notification.Name("agentSessionBindingDidChange")
 
+    /// Show the titlebar Conversation Branches menu for the focused window.
+    /// `userInfo["windowID"]` should be the target window ID.
+    static let showAgentConversationBranches = Notification.Name("showAgentConversationBranches")
+
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.
     static let toggleRepoPromptNavigationSidebar = Notification.Name("toggleRepoPromptNavigationSidebar")

@@ -1137,7 +1137,7 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
         session.codexConversationID = "source"
         session.codexRolloutPath = "/tmp/source-rollout.jsonl"
         session.codexController = controller
-        session.runState = .idle
+        session.runState = .completed
         session.draftText = "preserved draft"
 
         let items: [AgentChatItem] = [
@@ -1179,7 +1179,7 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
         persistedSource.items = items.map { AgentChatItemPersist(from: $0) }
         persistedSource.transcript = transcript
         persistedSource.agentKind = AgentProviderKind.codexExec.rawValue
-        persistedSource.lastRunState = AgentSessionRunState.idle.rawValue
+        persistedSource.lastRunState = AgentSessionRunState.completed.rawValue
         persistedSource.codexConversationID = "source"
         persistedSource.codexRolloutPath = "/tmp/source-rollout.jsonl"
         persistedSource.codexTurnCheckpoints = session.codexTurnCheckpoints

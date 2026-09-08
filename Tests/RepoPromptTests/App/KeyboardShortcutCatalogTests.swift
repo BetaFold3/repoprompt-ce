@@ -29,6 +29,33 @@ final class KeyboardShortcutCatalogTests: XCTestCase {
         XCTAssertNotEqual(modelPicker.name, handoff.name)
     }
 
+    func testAgentCatalogIncludesConversationBranchesBindingAndSearchTerms() throws {
+        let section = try XCTUnwrap(
+            KeyboardShortcutCatalog.sections.first { $0.id == "agent-layout" }
+        )
+        let binding = try XCTUnwrap(
+            section.bindings.first { $0.id == "conversation-branches" }
+        )
+
+        XCTAssertEqual(binding.title, "Conversation Branches")
+        XCTAssertEqual(binding.detail, "Open the branch tree for the active Agent session.")
+        XCTAssertEqual(binding.name.rawValue, "showConversationBranches")
+        XCTAssertEqual(binding.name.defaultShortcut?.key, .t)
+        XCTAssertEqual(binding.name.defaultShortcut?.modifiers, [.command, .shift])
+
+        let searchTags = SettingsTab.keyboardShortcuts.searchTags
+        for term in ["branch", "tree", "conversation branches", "command shift t", "⌘⇧t"] {
+            XCTAssertTrue(searchTags.contains(term), "Missing Keyboard Shortcuts search term: \(term)")
+        }
+    }
+
+    func testConversationBranchesNotificationContract() {
+        XCTAssertEqual(
+            Notification.Name.showAgentConversationBranches.rawValue,
+            "showAgentConversationBranches"
+        )
+    }
+
     func testSnippetPaletteNotificationContractPreservesPublicAndPrivateHops() {
         XCTAssertEqual(
             Notification.Name.openPromptSnippetPalette.rawValue,

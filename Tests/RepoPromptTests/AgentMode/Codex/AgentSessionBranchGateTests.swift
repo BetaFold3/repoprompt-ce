@@ -4,7 +4,7 @@ import XCTest
 
 @MainActor
 final class AgentSessionBranchGateTests: XCTestCase {
-    func testAvailableReturnsCompletedCheckpoint() throws {
+    func testCompletedSessionReturnsCompletedCheckpoint() throws {
         let turnID = UUID()
         let session = makeSession(turnID: turnID)
 
@@ -80,15 +80,44 @@ final class AgentSessionBranchGateTests: XCTestCase {
         )
     }
 
-    func testRuntimeActivityAndExternalOccupancyAreNotIdle() {
+    func testRunStateAvailabilityUsesActiveSemantics() throws {
         let turnID = UUID()
-        let running = makeSession(turnID: turnID)
-        running.runState = .running
-        XCTAssertEqual(
-            AgentSessionBranchGate.evaluate(session: running, turnID: turnID),
-            .unavailable(.notIdle)
-        )
+        let terminalStates: [AgentSessionRunState] = [
+            .idle,
+            .completed,
+            .cancelled,
+            .failed
+        ]
+        for runState in terminalStates {
+            let session = makeSession(turnID: turnID)
+            session.runState = runState
+            let checkpoint = try XCTUnwrap(session.codexTurnCheckpoints?.entries.first)
+            XCTAssertEqual(
+                AgentSessionBranchGate.evaluate(session: session, turnID: turnID),
+                .available(checkpoint),
+                "Expected \(runState) to be quiescent"
+            )
+        }
 
+        let activeStates: [AgentSessionRunState] = [
+            .running,
+            .waitingForUser,
+            .waitingForQuestion,
+            .waitingForApproval
+        ]
+        for runState in activeStates {
+            let session = makeSession(turnID: turnID)
+            session.runState = runState
+            XCTAssertEqual(
+                AgentSessionBranchGate.evaluate(session: session, turnID: turnID),
+                .unavailable(.notIdle),
+                "Expected \(runState) to block branching"
+            )
+        }
+    }
+
+    func testExternalOccupancyIsNotIdle() {
+        let turnID = UUID()
         let oracle = makeSession(turnID: turnID)
         XCTAssertEqual(
             AgentSessionBranchGate.evaluate(
@@ -145,6 +174,7 @@ final class AgentSessionBranchGateTests: XCTestCase {
     ) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .codexExec
+        session.runState = .completed
         session.codexConversationID = "thread"
         session.codexTurnCheckpoints = CodexTurnCheckpointLedger(
             threadID: "thread",

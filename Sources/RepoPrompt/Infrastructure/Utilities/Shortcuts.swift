@@ -47,6 +47,8 @@ extension KeyboardShortcuts.Name {
     static let toggleTranscriptWordWrap = Self("toggleTranscriptWordWrap", default: .init(.l, modifiers: [.command, .option]))
     /// Open the prompt snippet palette in the focused Agent composer.
     static let openPromptSnippetPalette = Self("openPromptSnippetPalette", default: .init(.p, modifiers: [.command, .shift]))
+    /// Open the active Agent session's Conversation Branches menu.
+    static let showConversationBranches = Self("showConversationBranches", default: .init(.t, modifiers: [.command, .shift]))
     /// Show the current-window Agent navigation HUD.
     static let showCurrentWindowAgentNavigationHUD = Self("showCurrentWindowAgentNavigationHUD", default: .init(.k, modifiers: [.command]))
     /// Show the all-active/recent Agents navigation HUD.

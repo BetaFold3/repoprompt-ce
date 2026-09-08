@@ -19689,7 +19689,7 @@ extension AgentModeViewModel {
               pin.session.persistenceMutationGeneration == pin.persistenceGeneration,
               pin.session.sourceItemsRevision == pin.sourceItemsRevision,
               pin.session.codexConversationID == pin.conversationID,
-              pin.session.runState == .idle,
+              !pin.session.runState.isActive,
               !occupancy.oracleRequestActive,
               !occupancy.codexTerminalSettlePending
         else {

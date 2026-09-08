@@ -23,6 +23,7 @@ enum KeyboardShortcutCatalog {
                 .init(id: "agent-nav-all", title: "Search all Agent sessions", detail: "Jump to active or recent Agent sessions across windows.", name: .showAllAgentsNavigationHUD),
                 .init(id: "agent-model-picker", title: "Quick model picker", detail: "Switch models in the active Agent session.", name: .showAgentQuickModelSelectionHUD),
                 .init(id: "agent-quick-handoff", title: "Quick handoff", detail: "Start a new session from the last completed assistant reply.", name: .showAgentQuickHandoffHUD),
+                .init(id: "conversation-branches", title: "Conversation Branches", detail: "Open the branch tree for the active Agent session.", name: .showConversationBranches),
                 .init(id: "snippet-palette", title: "Open prompt snippet palette", detail: "Insert a saved prompt at the cursor while typing in the Agent composer.", name: .openPromptSnippetPalette)
             ]
         ),
