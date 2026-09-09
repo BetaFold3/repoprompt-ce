@@ -706,6 +706,7 @@ final class AgentModeViewModel: ObservableObject {
     private var conversationBranchPickerRefreshTarget: ConversationBranchPickerTarget?
     private var conversationBranchPickerRefreshGeneration: UInt64 = 0
     var conversationBranchPickerSnapshotDidChange: ((UUID) -> Void)?
+    @Published private(set) var conversationTreePresentationRequest: AgentConversationTreePresentationRequest?
     var sidebarAutoArchiveTask: Task<Void, Never>?
     var isApplyingSidebarAutoArchive = false
     let sidebarAutoArchivePolicy = AgentModeSidebarAutoArchivePolicy()
@@ -758,6 +759,17 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setLastKnownWorkspaceSnapshot(_ workspace: WorkspaceModel?) {
             lastKnownWorkspaceSnapshot = workspace
+        }
+
+        func test_seedConversationBranchPickerUnavailable(
+            _ target: ConversationBranchPickerTarget
+        ) {
+            conversationBranchPickerRefreshGeneration &+= 1
+            conversationBranchPickerRefreshTask?.cancel()
+            conversationBranchPickerRefreshTask = nil
+            conversationBranchPickerRefreshTarget = nil
+            conversationBranchPickerResolvedTarget = target
+            conversationBranchPickerTreeCache = nil
         }
 
         var test_branchFailureInjector: ((String) -> Error?)?
@@ -1107,6 +1119,14 @@ final class AgentModeViewModel: ObservableObject {
             activeSessionLoadInProgressTabID = tabID
         }
     #endif
+
+    var activeAgentModeTabID: UUID? {
+        guard isAgentModeActive,
+              let tabID = currentTabID,
+              sessions[tabID] != nil
+        else { return nil }
+        return tabID
+    }
 
     /// Current tab ID from promptManager
     var currentTabID: UUID? {
@@ -19319,38 +19339,29 @@ extension AgentModeViewModel {
             && session.bindingTransitionGeneration == target.bindingTransitionGeneration
     }
 
-    func conversationBranchPickerSnapshot(tabID: UUID) -> ConversationBranchPickerSnapshot? {
-        guard let target = conversationBranchPickerTarget(tabID: tabID),
-              let cached = conversationBranchPickerTreeCache,
-              cached.target == target,
-              Self.conversationBranchPickerShouldBeVisible(tree: cached.tree)
-        else {
-            scheduleConversationBranchPickerRefresh(tabID: tabID)
-            return nil
-        }
-        return makeConversationBranchPickerSnapshot(target: target, tree: cached.tree)
-    }
-
-    func hasConversationBranches(tabID: UUID) -> Bool {
-        guard let target = conversationBranchPickerTarget(tabID: tabID),
-              let cached = conversationBranchPickerTreeCache,
-              cached.target == target
-        else {
-            scheduleConversationBranchPickerRefresh(tabID: tabID)
-            return false
-        }
-        return Self.conversationBranchPickerShouldBeVisible(tree: cached.tree)
-    }
-
-    static func projectedConversationBranchMemberCount(tree: AgentSessionBranchTree) -> Int {
-        let projectedBranchCount = tree.records.count {
-            $0.id != tree.rootSessionID && $0.branchRootSessionID == tree.rootSessionID
-        }
-        return 1 + projectedBranchCount
-    }
-
-    static func conversationBranchPickerShouldBeVisible(tree: AgentSessionBranchTree) -> Bool {
-        projectedConversationBranchMemberCount(tree: tree) > 1
+    private func conversationBranchPickerRecoveryIsValid(
+        requestID: UUID,
+        target: ConversationBranchPickerTarget,
+        childSessionID: UUID
+    ) -> Bool {
+        guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot,
+              workspace.id == target.workspaceID,
+              workspace.composeTabs.contains(where: { $0.id == target.tabID }),
+              let session = sessions[target.tabID],
+              session.activeAgentSessionID == target.activeSessionID,
+              session.persistentSessionBindingIdentity?.sessionID == target.activeSessionID,
+              !session.bindingTransitionInProgress,
+              session.hasLoadedPersistedState,
+              session.didSucceedPersistedHydrationForCurrentBinding,
+              !session.isBranchOperationInProgress,
+              branchOperationSourceReservations[target.activeSessionID] == nil,
+              branchSwitchTargetReservations[childSessionID] == nil,
+              let request = conversationTreePresentationRequest,
+              request.id == requestID,
+              request.target == target,
+              request.model.operation == .switching
+        else { return false }
+        return true
     }
 
     static func shouldScheduleConversationBranchPickerRefresh(
@@ -19445,8 +19456,25 @@ extension AgentModeViewModel {
             switch result {
             case let .available(tree):
                 conversationBranchPickerTreeCache = (target, tree)
+                publishConversationTreeRefresh(
+                    target: target,
+                    tree: tree,
+                    phase: .ready
+                )
             case .unavailable:
                 conversationBranchPickerTreeCache = nil
+                if let request = conversationTreePresentationRequest,
+                   request.target == target,
+                   let session = sessions[target.tabID]
+                {
+                    request.model.publishResolvedTree(
+                        phase: .failed("Conversation-tree evidence is unavailable. The current path remains available."),
+                        paths: [makeActiveConversationTreePath(
+                            session: session,
+                            sessionID: target.activeSessionID
+                        )]
+                    )
+                }
             }
             clearConversationBranchPickerRefreshIfOwned(generation: generation)
             conversationBranchPickerSnapshotDidChange?(tabID)
@@ -19459,90 +19487,312 @@ extension AgentModeViewModel {
         conversationBranchPickerRefreshTarget = nil
     }
 
-    private func makeConversationBranchPickerSnapshot(
-        target: ConversationBranchPickerTarget,
-        tree: AgentSessionBranchTree
-    ) -> ConversationBranchPickerSnapshot {
-        let session = sessions[target.tabID]
-        let gateReason = session.flatMap {
-            AgentSessionBranchGate.operationUnavailableReason(
-                session: $0,
-                occupancy: branchOccupancy(for: $0)
-            )
-        }
-        let rootRecord = tree.records.first(where: { $0.id == tree.rootSessionID })
-        var items = [
-            conversationBranchPickerItem(
-                sessionID: tree.rootSessionID,
-                sourceTurnOrdinal: nil,
-                date: rootRecord?.savedAt,
-                isOriginal: true,
-                isDeleted: rootRecord == nil,
-                target: target,
-                gateReason: gateReason
-            )
-        ]
-        let branches = tree.records
-            .filter { $0.id != tree.rootSessionID && $0.branchRootSessionID == tree.rootSessionID }
-            .sorted(by: ConversationBranchRecordOrdering.areInIncreasingOrder)
-        items.append(contentsOf: branches.map { record in
-            conversationBranchPickerItem(
-                sessionID: record.id,
-                sourceTurnOrdinal: record.branchSourceTurnOrdinal,
-                date: record.branchCreatedAt ?? record.savedAt,
-                isOriginal: false,
-                isDeleted: false,
-                target: target,
-                gateReason: gateReason
-            )
-        })
-        return ConversationBranchPickerSnapshot(target: target, items: items)
+    func showsConversationTreeButton(tabID: UUID) -> Bool {
+        guard let session = sessions[tabID] else { return false }
+        return AgentSessionBranchGate.staticUnavailableReason(session: session) == nil
+            || session.branchOrigin != nil
+            || session.activeAgentSessionID.flatMap { ownerValidatedSessionIndex[$0]?.branchRootSessionID } != nil
     }
 
-    private func conversationBranchPickerItem(
-        sessionID: UUID,
-        sourceTurnOrdinal: Int?,
-        date: Date?,
-        isOriginal: Bool,
-        isDeleted: Bool,
-        target: ConversationBranchPickerTarget,
-        gateReason: AgentSessionBranchAvailability.Reason?
-    ) -> ConversationBranchPickerItem {
-        let isActive = sessionID == target.activeSessionID
-        let isOccupiedElsewhere: Bool = {
-            if branchSwitchTargetReservations[sessionID].map({ $0 != target.tabID }) == true
-                || branchOperationSourceReservations[sessionID].map({ $0 != target.tabID }) == true
-            {
-                return true
-            }
-            switch persistentBindingResolution(for: sessionID) {
-            case let .unique(tabID):
-                return tabID != target.tabID
-            case .ambiguous:
-                return true
-            case .notFound:
-                return false
-            }
-        }()
-        let disabledHelpText: String? = if isDeleted {
-            "The original conversation was deleted."
-        } else if !isActive, isOccupiedElsewhere {
-            "This branch is open in another tab."
-        } else if !isActive, gateReason != nil {
-            "Finish the pending operation before switching branches."
-        } else {
-            nil
+    func requestConversationTreePresentation(tabID: UUID, initialTurnID: UUID? = nil) {
+        guard let session = sessions[tabID],
+              let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot,
+              workspace.composeTabs.contains(where: { $0.id == tabID })
+        else { return }
+
+        let activeID = session.activeAgentSessionID ?? tabID
+        let target = conversationBranchPickerTarget(tabID: tabID)
+        let cachedTree = target.flatMap { target in
+            conversationBranchPickerTreeCache.flatMap { $0.target == target ? $0.tree : nil }
         }
-        return ConversationBranchPickerItem(
-            id: sessionID,
-            sourceTurnOrdinal: sourceTurnOrdinal,
-            date: date,
-            isOriginal: isOriginal,
-            isDeleted: isDeleted,
-            isActive: isActive,
-            isEnabled: disabledHelpText == nil,
-            disabledHelpText: disabledHelpText
+        let hasResolvedUnavailable = target != nil
+            && conversationBranchPickerResolvedTarget == target
+            && cachedTree == nil
+        if target != nil, cachedTree == nil, !hasResolvedUnavailable {
+            scheduleConversationBranchPickerRefresh(tabID: tabID)
+        }
+
+        if let existing = conversationTreePresentationRequest,
+           existing.tabID == tabID
+        {
+            conversationTreePresentationRequest = existing
+            return
+        }
+
+        let activePath = makeActiveConversationTreePath(
+            session: session,
+            sessionID: activeID
         )
+        let paths = cachedTree.map {
+            makeConversationTreePickerPaths(
+                tree: $0,
+                activePath: activePath,
+                tabID: tabID
+            )
+        } ?? [activePath]
+
+        let initialID = initialTurnID.map {
+            AgentConversationTreeNode.ID.turn(.init(sessionID: activeID, turnID: $0))
+        }
+        let phase: AgentConversationTreePickerModel.Phase = if hasResolvedUnavailable {
+            .failed("Conversation-tree evidence is unavailable. The current path remains available.")
+        } else {
+            cachedTree == nil && target != nil ? .loading : .ready
+        }
+        let requestID = UUID()
+        let model = AgentConversationTreePickerModel(
+            phase: phase,
+            paths: paths,
+            initialSelection: initialID,
+            refreshActiveTurn: { [weak self] turnID in
+                guard let self,
+                      target.map(conversationBranchPickerTargetIsValid) ?? false,
+                      let current = sessions[tabID],
+                      let activeSessionID = current.activeAgentSessionID
+                else { return nil }
+                return makeActiveConversationTreePath(
+                    session: current,
+                    sessionID: activeSessionID
+                ).turns?.first { $0.id.turnID == turnID }
+            },
+            loadPath: { [weak self] sessionID in
+                guard let self,
+                      let target,
+                      conversationBranchPickerTargetIsValid(target),
+                      let request = conversationTreePresentationRequest,
+                      request.id == requestID,
+                      request.target == target,
+                      let base = request.model.paths.first(where: { $0.id == sessionID }),
+                      let persisted = try await dataService.loadAgentSession(id: sessionID, for: workspace),
+                      conversationBranchPickerTargetIsValid(target),
+                      let currentRequest = conversationTreePresentationRequest,
+                      currentRequest.id == requestID,
+                      currentRequest.target == target,
+                      let currentBase = currentRequest.model.paths.first(where: { $0.id == sessionID }),
+                      currentBase.savedAt == base.savedAt
+                else {
+                    throw AgentBranchOperationError.staleOperation
+                }
+                return makeColdConversationTreePath(persisted, base: currentBase)
+            },
+            performBranch: { [weak self] turn in
+                guard let self,
+                      let target,
+                      conversationBranchPickerTargetIsValid(target),
+                      let selection = branchSelection(turnID: turn.id.turnID, tabID: tabID),
+                      selection.safetySummary == turn.safetySummary
+                else {
+                    throw AgentBranchOperationError.staleConfirmation
+                }
+                _ = try await branchFromTurn(
+                    turn.id.turnID,
+                    tabID: tabID,
+                    selectionPin: selection.pin
+                )
+            },
+            performSwitch: { [weak self] sessionID in
+                guard let self,
+                      let target,
+                      conversationBranchPickerTargetIsValid(target)
+                else { throw AgentBranchOperationError.staleOperation }
+                try await switchToBranch(sessionID: sessionID, tabID: tabID)
+            },
+            performRecoverySwitch: { [weak self] sessionID in
+                guard let self,
+                      let target,
+                      conversationBranchPickerRecoveryIsValid(
+                          requestID: requestID,
+                          target: target,
+                          childSessionID: sessionID
+                      )
+                else { throw AgentBranchOperationError.staleOperation }
+                try await switchToBranch(sessionID: sessionID, tabID: tabID)
+            },
+            sourceIsValid: { [weak self] in
+                guard let self, let target else { return false }
+                return conversationBranchPickerTargetIsValid(target)
+            }
+        )
+        conversationTreePresentationRequest = AgentConversationTreePresentationRequest(
+            id: requestID,
+            tabID: tabID,
+            initialSelection: initialTurnID.map(AgentConversationTreeInitialSelection.turn)
+                ?? .latestCompletedTurn,
+            model: model,
+            target: target
+        )
+    }
+
+    func consumeConversationTreePresentationRequest(id: UUID) {
+        guard let request = conversationTreePresentationRequest,
+              request.id == id
+        else { return }
+        request.model.cancelLoads()
+        conversationTreePresentationRequest = nil
+        guard conversationBranchPickerRefreshTarget == request.target else { return }
+        conversationBranchPickerRefreshGeneration &+= 1
+        conversationBranchPickerRefreshTask?.cancel()
+        conversationBranchPickerRefreshTask = nil
+        conversationBranchPickerRefreshTarget = nil
+    }
+
+    private func publishConversationTreeRefresh(
+        target: ConversationBranchPickerTarget,
+        tree: AgentSessionBranchTree,
+        phase: AgentConversationTreePickerModel.Phase
+    ) {
+        guard conversationBranchPickerTarget(tabID: target.tabID) == target,
+              let request = conversationTreePresentationRequest,
+              request.target == target,
+              let session = sessions[target.tabID]
+        else { return }
+        let activePath = makeActiveConversationTreePath(
+            session: session,
+            sessionID: target.activeSessionID
+        )
+        request.model.publishResolvedTree(
+            phase: phase,
+            paths: makeConversationTreePickerPaths(
+                tree: tree,
+                activePath: activePath,
+                tabID: target.tabID
+            )
+        )
+    }
+
+    private func makeConversationTreePickerPaths(
+        tree: AgentSessionBranchTree,
+        activePath: AgentConversationTreePickerPath,
+        tabID: UUID
+    ) -> [AgentConversationTreePickerPath] {
+        let recordByID = Dictionary(uniqueKeysWithValues: tree.records.map { ($0.id, $0) })
+        var ids = Set(tree.records.map(\.id))
+        ids.insert(tree.rootSessionID)
+        return ids.map { id in
+            if id == activePath.id { return activePath }
+            let record = recordByID[id]
+            let sourceState = tree.sourceState(for: id)
+            let evidence: AgentConversationTreePickerPath.Evidence
+            let displaySourceID: UUID?
+            if id == tree.rootSessionID, record == nil {
+                evidence = .deleted
+                displaySourceID = nil
+            } else {
+                switch sourceState {
+                case .sourceUnavailable:
+                    evidence = .sourceUnavailable
+                    displaySourceID = nil
+                case let .deletedSource(parentID):
+                    evidence = .deletedSource
+                    displaySourceID = parentID
+                case .complete, nil:
+                    evidence = .available
+                    displaySourceID = record?.branchSourceSessionID
+                }
+            }
+            return AgentConversationTreePickerPath(
+                id: id,
+                name: record?.name ?? "Original (deleted)",
+                savedAt: record?.savedAt ?? .distantPast,
+                sourceSessionID: displaySourceID,
+                sourceTurnID: record?.branchSourceTurnID,
+                sourceTurnOrdinal: record?.branchSourceTurnOrdinal,
+                isActive: false,
+                isOpenElsewhere: conversationTreePathIsOpenElsewhere(id, sourceTabID: tabID),
+                evidence: evidence,
+                turns: nil
+            )
+        }
+    }
+
+    private func makeActiveConversationTreePath(
+        session: TabSession,
+        sessionID: UUID
+    ) -> AgentConversationTreePickerPath {
+        let checkpointIndex = AgentBranchProviderSupport.nativeBinding(for: session)?.checkpointIndex
+        let oracleCount = oracleViewModel?.sessions.count {
+            $0.agentModeSessionID == session.activeAgentSessionID
+        } ?? 0
+        let transcriptTurnIDs = session.transcript.turns.map(\.id)
+        let occupancy = branchOccupancy(for: session)
+        let turns = session.transcript.turns.enumerated().map { index, turn in
+            let availability = AgentSessionBranchGate.evaluate(
+                session: session,
+                turnID: turn.id,
+                occupancy: occupancy
+            )
+            let summary = AgentBranchSafetySummary(
+                turnID: turn.id,
+                transcriptTurnIDs: transcriptTurnIDs,
+                checkpointIndex: checkpointIndex,
+                sourceOwnedOracleChatCount: oracleCount
+            )
+            return AgentConversationTreePickerTurn(
+                id: .init(sessionID: sessionID, turnID: turn.id),
+                ordinal: index + 1,
+                prompt: turn.request?.text ?? turn.summary?.requestText ?? "(Prompt not retained)",
+                conclusion: turn.conclusionActivityID.flatMap { conclusionID in
+                    turn.allActivities.first(where: { $0.id == conclusionID })?.text
+                } ?? turn.summary?.conclusionText ?? turn.summary?.compactConclusionText,
+                availability: availability,
+                safetySummary: summary,
+                isCompleted: turn.completedAt != nil
+            )
+        }
+        return AgentConversationTreePickerPath(
+            id: sessionID,
+            name: "Current path",
+            savedAt: session.lastActivityAt,
+            sourceSessionID: session.branchOrigin?.sourceSessionID,
+            sourceTurnID: session.branchOrigin?.sourceTurnID,
+            sourceTurnOrdinal: session.branchOrigin?.sourceTurnOrdinal,
+            isActive: true,
+            isOpenElsewhere: false,
+            evidence: .available,
+            turns: turns
+        )
+    }
+
+    private func makeColdConversationTreePath(
+        _ persisted: AgentSession,
+        base: AgentConversationTreePickerPath
+    ) -> AgentConversationTreePickerPath {
+        let checkpointIndex = persisted.codexTurnCheckpoints?.checkpointIndex()
+        let persistedTurns = persisted.transcript?.turns ?? []
+        let transcriptTurnIDs = persistedTurns.map(\.id)
+        let turns = persistedTurns.enumerated().map { index, turn in
+            AgentConversationTreePickerTurn(
+                id: .init(sessionID: persisted.id, turnID: turn.id),
+                ordinal: index + 1,
+                prompt: turn.request?.text ?? turn.summary?.requestText ?? "(Prompt not retained)",
+                conclusion: turn.conclusionActivityID.flatMap { conclusionID in
+                    turn.allActivities.first(where: { $0.id == conclusionID })?.text
+                } ?? turn.summary?.conclusionText ?? turn.summary?.compactConclusionText,
+                availability: .unavailable(.noCheckpoint),
+                safetySummary: AgentBranchSafetySummary(
+                    turnID: turn.id,
+                    transcriptTurnIDs: transcriptTurnIDs,
+                    checkpointIndex: checkpointIndex
+                ),
+                isCompleted: turn.completedAt != nil
+            )
+        }
+        var result = base
+        result.turns = turns
+        return result
+    }
+
+    private func conversationTreePathIsOpenElsewhere(_ sessionID: UUID, sourceTabID: UUID) -> Bool {
+        if branchSwitchTargetReservations[sessionID].map({ $0 != sourceTabID }) == true
+            || branchOperationSourceReservations[sessionID].map({ $0 != sourceTabID }) == true
+        {
+            return true
+        }
+        switch persistentBindingResolution(for: sessionID) {
+        case let .unique(tabID): return tabID != sourceTabID
+        case .ambiguous: return true
+        case .notFound: return false
+        }
     }
 
     func replyBranchPresentation(
@@ -19550,6 +19800,7 @@ extension AgentModeViewModel {
         tabID: UUID
     ) -> AgentReplyBranchPresentation? {
         guard let session = sessions[tabID] else { return nil }
+        let staticReason = AgentSessionBranchGate.staticUnavailableReason(session: session)
         return AgentReplyBranchPresentation(
             turnID: turnID,
             availability: AgentSessionBranchGate.evaluate(
@@ -19557,15 +19808,12 @@ extension AgentModeViewModel {
                 turnID: turnID,
                 occupancy: branchOccupancy(for: session)
             ),
-            isOperationInProgress: session.isBranchOperationInProgress
+            isOperationInProgress: session.isBranchOperationInProgress,
+            isVisible: staticReason == nil
         )
     }
 
-    func replyBranchConfirmation(
-        turnID: UUID,
-        tabID: UUID,
-        sourceOwnedOracleChatCount: Int
-    ) -> AgentReplyBranchConfirmation? {
+    func branchSelection(turnID: UUID, tabID: UUID) -> AgentBranchSelection? {
         guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot,
               workspace.composeTabs.contains(where: { $0.id == tabID }),
               let session = sessions[tabID],
@@ -19577,35 +19825,32 @@ extension AgentModeViewModel {
         else {
             return nil
         }
-        let presentation = AgentReplyBranchPresentation(
+        let availability = AgentSessionBranchGate.evaluate(
+            session: session,
             turnID: turnID,
-            availability: AgentSessionBranchGate.evaluate(
-                session: session,
-                turnID: turnID,
-                occupancy: branchOccupancy(for: session)
-            ),
-            transcriptTurnIDs: session.transcript.turns.map(\.id),
-            ledger: session.codexTurnCheckpoints,
-            sourceOwnedOracleChatCount: sourceOwnedOracleChatCount,
-            isOperationInProgress: session.isBranchOperationInProgress
+            occupancy: branchOccupancy(for: session)
         )
-        guard presentation.canPresentConfirmation else { return nil }
-        return AgentReplyBranchConfirmation(
-            presentation: presentation,
-            performBranch: { [weak self] in
-                guard let self else {
-                    throw AgentBranchOperationError.staleConfirmation
-                }
-                _ = try await branchFromTurn(
-                    turnID,
-                    tabID: tabID,
-                    confirmationPin: pin
-                )
-            }
+        guard case .available = availability else { return nil }
+        let sourceSessionID = session.activeAgentSessionID
+        let oracleCount = sourceSessionID.map { sourceID in
+            oracleViewModel?.sessions.count { $0.agentModeSessionID == sourceID } ?? 0
+        } ?? 0
+        let summary = AgentBranchSafetySummary(
+            turnID: turnID,
+            transcriptTurnIDs: session.transcript.turns.map(\.id),
+            checkpointIndex: AgentBranchProviderSupport.nativeBinding(for: session)?.checkpointIndex,
+            sourceOwnedOracleChatCount: oracleCount
+        )
+        guard summary.hasResolvedTurn else { return nil }
+        return AgentBranchSelection(
+            turnID: turnID,
+            tabID: tabID,
+            safetySummary: summary,
+            pin: pin
         )
     }
 
-    private func validateReplyBranchConfirmation(
+    private func validateReplyBranchSelection(
         _ pin: ReplyBranchConfirmationPin,
         turnID: UUID,
         tabID: UUID
@@ -19723,11 +19968,11 @@ extension AgentModeViewModel {
     func branchFromTurn(
         _ turnID: UUID,
         tabID: UUID,
-        confirmationPin: ReplyBranchConfirmationPin? = nil
+        selectionPin: ReplyBranchConfirmationPin? = nil
     ) async throws -> UUID {
-        if let confirmationPin {
-            try validateReplyBranchConfirmation(
-                confirmationPin,
+        if let selectionPin {
+            try validateReplyBranchSelection(
+                selectionPin,
                 turnID: turnID,
                 tabID: tabID
             )
@@ -19739,6 +19984,7 @@ extension AgentModeViewModel {
         }
         let pin = try beginBranchOperation(session: session, turnID: turnID)
         var childThreadID: String?
+        var persistedChildID: UUID?
         var childWasPersisted = false
         var branchController: (any CodexSessionControlling)?
         let preservedDraft = session.draftText
@@ -19845,6 +20091,7 @@ extension AgentModeViewModel {
                 trustedCanonicalItemCount: child.itemCount
             )
             childWasPersisted = true
+            persistedChildID = childID
             knownCodexBranchTreeMemberIDsByWorkspaceID[workspace.id, default: []].formUnion([
                 rootID,
                 source.id,
@@ -19903,6 +20150,9 @@ extension AgentModeViewModel {
             }
             session.draftText = preservedDraft
             endBranchOperation(pin, rescheduleIdleShutdown: true)
+            if let persistedChildID {
+                throw AgentBranchOperationError.childSavedButNotOpened(sessionID: persistedChildID)
+            }
             throw error
         }
     }

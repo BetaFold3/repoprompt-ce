@@ -739,22 +739,6 @@ extension AgentModeViewModel {
         }
     }
 
-    struct ConversationBranchPickerItem: Equatable, Identifiable {
-        let id: UUID
-        let sourceTurnOrdinal: Int?
-        let date: Date?
-        let isOriginal: Bool
-        let isDeleted: Bool
-        let isActive: Bool
-        let isEnabled: Bool
-        let disabledHelpText: String?
-    }
-
-    struct ConversationBranchPickerSnapshot: Equatable {
-        let target: ConversationBranchPickerTarget
-        let items: [ConversationBranchPickerItem]
-    }
-
     struct SidebarSession: Identifiable, Equatable {
         let id: UUID
         let tabID: UUID

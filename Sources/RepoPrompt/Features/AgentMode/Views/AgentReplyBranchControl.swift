@@ -1,20 +1,10 @@
 import SwiftUI
 
 struct AgentReplyBranchPresentation: Equatable {
-    enum OmittedTurnImpact: Equatable {
-        case readOnly
-        case modified(paths: [String])
-        case unknown
-    }
-
     let turnID: UUID
     let availability: AgentSessionBranchAvailability
-    let retainedTurnCount: Int
-    let omittedTurnCount: Int
-    let omittedTurnImpact: OmittedTurnImpact
-    let sourceOwnedOracleChatCount: Int
     let isOperationInProgress: Bool
-    let hasResolvedTranscriptTurn: Bool
+    let isVisible: Bool
 
     static func isEligibleBlock(_ kind: AgentTranscriptRenderBlockKind) -> Bool {
         kind == .conclusion
@@ -23,55 +13,13 @@ struct AgentReplyBranchPresentation: Equatable {
     init(
         turnID: UUID,
         availability: AgentSessionBranchAvailability,
-        isOperationInProgress: Bool
+        isOperationInProgress: Bool,
+        isVisible: Bool = true
     ) {
         self.turnID = turnID
         self.availability = availability
-        retainedTurnCount = 0
-        omittedTurnCount = 0
-        omittedTurnImpact = .unknown
-        sourceOwnedOracleChatCount = 0
         self.isOperationInProgress = isOperationInProgress
-        hasResolvedTranscriptTurn = false
-    }
-
-    init(
-        turnID: UUID,
-        availability: AgentSessionBranchAvailability,
-        transcriptTurnIDs: [UUID],
-        ledger: CodexTurnCheckpointLedger?,
-        sourceOwnedOracleChatCount: Int = 0,
-        isOperationInProgress: Bool
-    ) {
-        self.turnID = turnID
-        self.availability = availability
-        self.sourceOwnedOracleChatCount = max(0, sourceOwnedOracleChatCount)
-        self.isOperationInProgress = isOperationInProgress
-
-        var selectedIndex: Int?
-        for (index, transcriptTurnID) in transcriptTurnIDs.enumerated() where transcriptTurnID == turnID {
-            guard selectedIndex == nil else {
-                retainedTurnCount = 0
-                omittedTurnCount = 0
-                omittedTurnImpact = .unknown
-                hasResolvedTranscriptTurn = false
-                return
-            }
-            selectedIndex = index
-        }
-        guard let selectedIndex else {
-            retainedTurnCount = 0
-            omittedTurnCount = 0
-            omittedTurnImpact = .unknown
-            hasResolvedTranscriptTurn = false
-            return
-        }
-
-        hasResolvedTranscriptTurn = true
-        retainedTurnCount = selectedIndex + 1
-        let omittedTurnIDs = transcriptTurnIDs.dropFirst(selectedIndex + 1)
-        omittedTurnCount = omittedTurnIDs.count
-        omittedTurnImpact = Self.impact(of: omittedTurnIDs, ledger: ledger)
+        self.isVisible = isVisible
     }
 
     var isAvailable: Bool {
@@ -79,104 +27,36 @@ struct AgentReplyBranchPresentation: Equatable {
         return !isOperationInProgress
     }
 
-    var canPresentConfirmation: Bool {
-        isAvailable && hasResolvedTranscriptTurn
-    }
-
     var disabledHelpText: String? {
         if isOperationInProgress {
             return "Finish the pending operation before branching."
         }
         guard case let .unavailable(reason) = availability else { return nil }
+        return Self.helpText(for: reason)
+    }
+
+    static func helpText(for reason: AgentSessionBranchAvailability.Reason) -> String {
         switch reason {
         case .noCheckpoint, .turnNotCompleted, .threadMismatch, .turnNotRetained,
              .treeEvidenceUnavailable:
-            return "No native checkpoint was recorded for this turn."
+            "No native checkpoint was recorded for this turn."
         case .beforeCompaction, .unsupportedHistory:
-            return "Codex compacted this conversation after this checkpoint."
+            "Codex compacted this conversation after this checkpoint."
         case .lineageProviderMismatch:
-            return "Branching is disabled because this branch's recorded source provider does not match its current provider."
+            "Branching is disabled because this branch's recorded source provider does not match its current provider."
         case .runtimeCapabilityUnknown:
-            return "Native branching support is still being checked."
-        case .runtimeUnsupported:
-            return "Native branching is not supported by this provider runtime."
+            AgentBranchSafetySummary.runtimeCheckingText
+        case let .runtimeUnsupported(reason):
+            switch reason {
+            case .versionBelowFloor: AgentBranchSafetySummary.runtimeVersionText
+            case .flagMissing, .probeFailed, .probeTimedOut:
+                AgentBranchSafetySummary.runtimeUnverifiedText
+            }
         case .notIdle, .operationInProgress, .pendingHandoff:
-            return "Finish the pending operation before branching."
+            "Finish the pending operation before branching."
         case .providerUnsupported, .remoteSession, .mcpOriginated, .childSession, .worktreeBound:
-            return "Native branching is currently available only for local Codex sessions."
+            AgentBranchSafetySummary.providerUnavailableText
         }
-    }
-
-    var confirmationTitle: String {
-        "Branch from this reply?"
-    }
-
-    var confirmationBody: String {
-        guard hasResolvedTranscriptTurn else {
-            return "This branch confirmation is stale. Cancel and reopen it."
-        }
-        let base = "Keeps turns 1–\(retainedTurnCount). Sets aside \(omittedTurnCount) later turn(s) on this branch: \(impactDescription). Anything they changed on disk stays changed. Files, Git state, and workspace selections are not rolled back. The current path stays available in the branch menu."
-        guard sourceOwnedOracleChatCount > 0 else { return base }
-        let disclosure = if sourceOwnedOracleChatCount == 1 {
-            "1 Oracle chat stays with the original path — this branch can read its results but must start a new chat to continue."
-        } else {
-            "\(sourceOwnedOracleChatCount) Oracle chats stay with the original path — this branch can read their results but must start new chats to continue."
-        }
-        return "\(base) \(disclosure)"
-    }
-
-    var confirmationButtonTitle: String {
-        switch omittedTurnImpact {
-        case .readOnly: "Branch"
-        case .modified, .unknown: "Branch anyway"
-        }
-    }
-
-    private var impactDescription: String {
-        switch omittedTurnImpact {
-        case .readOnly:
-            return "Read-only exploration"
-        case let .modified(paths):
-            let displayedPaths = paths.prefix(8)
-            let overflowCount = paths.count - displayedPaths.count
-            let suffix = overflowCount > 0 ? ", and \(overflowCount) more" : ""
-            return "Changed files: \(displayedPaths.joined(separator: ", "))\(suffix)"
-        case .unknown:
-            return "May have changed files"
-        }
-    }
-
-    private static func impact(
-        of turnIDs: ArraySlice<UUID>,
-        ledger: CodexTurnCheckpointLedger?
-    ) -> OmittedTurnImpact {
-        guard let ledger else {
-            return turnIDs.isEmpty ? .readOnly : .unknown
-        }
-        let checkpointIndex = ledger.checkpointIndex()
-
-        var modifiedPaths: [String] = []
-        var seenPaths = Set<String>()
-        for turnID in turnIDs {
-            guard !checkpointIndex.duplicateTurnIDs.contains(turnID),
-                  let checkpoint = checkpointIndex.byTurnID[turnID],
-                  checkpoint.status == .completed,
-                  let sideEffect = checkpoint.sideEffect
-            else {
-                return .unknown
-            }
-            switch sideEffect {
-            case .readOnly:
-                continue
-            case .unknown:
-                return .unknown
-            case let .modified(paths):
-                for path in paths where seenPaths.insert(path).inserted {
-                    modifiedPaths.append(path)
-                }
-            }
-        }
-        return modifiedPaths.isEmpty ? .readOnly : .modified(paths: modifiedPaths)
     }
 }
 
@@ -188,106 +68,26 @@ struct AgentReplyBranchConfig {
 @MainActor
 struct AgentReplyBranchControl: View {
     let config: AgentReplyBranchConfig
+    @State private var isHovering = false
 
     var body: some View {
-        Button {
-            guard config.presentation.isAvailable else { return }
-            config.requestPresentation()
-        } label: {
-            Label("Branch from here…", systemImage: "arrow.triangle.branch")
-        }
-        .buttonStyle(.plain)
-        .font(.system(size: 10, weight: .medium))
-        .foregroundStyle(.secondary)
-        .disabled(!config.presentation.isAvailable)
-        .hoverTooltip(config.presentation.disabledHelpText ?? "Branch from this reply")
-    }
-}
-
-struct AgentReplyBranchConfirmation {
-    let presentation: AgentReplyBranchPresentation
-    let performBranch: @MainActor () async throws -> Void
-}
-
-@MainActor
-final class AgentReplyBranchConfirmationState: ObservableObject {
-    @Published private(set) var confirmation: AgentReplyBranchConfirmation?
-    @Published private(set) var submissionStarted = false
-    @Published private(set) var errorMessage: String?
-
-    func present(_ confirmation: AgentReplyBranchConfirmation) {
-        guard self.confirmation == nil else { return }
-        self.confirmation = confirmation
-        submissionStarted = false
-        errorMessage = nil
-    }
-
-    func dismiss() {
-        guard !submissionStarted else { return }
-        confirmation = nil
-        errorMessage = nil
-    }
-
-    func submit() async {
-        guard !submissionStarted, let confirmation else { return }
-        submissionStarted = true
-        errorMessage = nil
-        do {
-            try await confirmation.performBranch()
-            self.confirmation = nil
-            submissionStarted = false
-        } catch {
-            errorMessage = error.localizedDescription
-            submissionStarted = false
-        }
-    }
-}
-
-@MainActor
-struct AgentReplyBranchConfirmationSheet: View {
-    @ObservedObject var state: AgentReplyBranchConfirmationState
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(state.confirmation?.presentation.confirmationTitle ?? "Branch from this reply?")
-                .font(.headline)
-            Text(state.confirmation?.presentation.confirmationBody ?? "")
-                .fixedSize(horizontal: false, vertical: true)
-
-            if let errorMessage = state.errorMessage {
-                Text(errorMessage)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityLabel("Branch failed: \(errorMessage)")
+        if config.presentation.isVisible {
+            Button {
+                guard config.presentation.isAvailable else { return }
+                config.requestPresentation()
+            } label: {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(
+                        isHovering ? BubbleColors.highContrastCopyIconHover : BubbleColors.copyIconNormal
+                    )
+                    .frame(width: 16, height: 16)
             }
-
-            HStack {
-                Button("Cancel") {
-                    state.dismiss()
-                }
-                .disabled(state.submissionStarted)
-
-                Spacer()
-
-                Button {
-                    Task { await state.submit() }
-                } label: {
-                    if state.submissionStarted {
-                        HStack(spacing: 6) {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Branching…")
-                        }
-                    } else {
-                        Text(state.confirmation?.presentation.confirmationButtonTitle ?? "Branch")
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(state.submissionStarted)
-            }
+            .buttonStyle(.plain)
+            .onHover { isHovering = $0 }
+            .disabled(!config.presentation.isAvailable)
+            .hoverTooltip(config.presentation.disabledHelpText ?? "Branch from this reply…")
+            .accessibilityLabel("Create conversation branch from this reply")
         }
-        .padding(20)
-        .frame(width: 460)
-        .interactiveDismissDisabled(state.submissionStarted)
     }
 }

@@ -34,6 +34,105 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
         XCTAssertEqual(restored.codexTurnCheckpoints?.threadID, "child")
     }
 
+    func testPickerPresentationPinsSourceConsumesMatchingRequestAndCreatesFreshModel() async throws {
+        let fixture = try await makeBranchFixture(childTurns: [threadTurn("source-1")])
+        defer {
+            fixture.viewModel.test_setCurrentTabIDOverride(nil)
+            fixture.cleanup()
+        }
+        fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabID)
+
+        let inactiveSessionID = UUID()
+        let inactiveOrigin = AgentSessionBranchOrigin(
+            rootSessionID: fixture.sourceSessionID,
+            sourceSessionID: fixture.sourceSessionID,
+            sourceTurnID: fixture.sourceTurnID,
+            sourceNativeTurnRef: "source-1",
+            sourceProviderKind: AgentProviderKind.codexExec.rawValue,
+            sourceTurnOrdinal: 1,
+            createdAt: Date()
+        )
+        var inactiveSession = AgentSession(
+            id: inactiveSessionID,
+            workspaceID: fixture.workspaceID,
+            name: "Inactive branch",
+            itemCount: fixture.session.items.count,
+            agentKind: AgentProviderKind.codexExec.rawValue,
+            autoEditEnabled: true,
+            codexConversationID: "inactive-thread",
+            codexTurnCheckpoints: CodexTurnCheckpointLedger(threadID: "inactive-thread"),
+            branchOrigin: inactiveOrigin
+        )
+        inactiveSession.items = fixture.session.items.map { AgentChatItemPersist(from: $0) }
+        inactiveSession.transcript = fixture.session.transcript
+        inactiveSession.lastRunState = AgentSessionRunState.completed.rawValue
+        let workspace = WorkspaceModel(
+            id: fixture.workspaceID,
+            name: "Codex branch",
+            repoPaths: ["/tmp/repo"],
+            customStoragePath: fixture.workspaceDirectory
+        )
+        _ = try await fixture.viewModel.test_dataService.saveAgentSession(
+            inactiveSession,
+            for: workspace,
+            preparation: .alreadyCanonicalTranscript,
+            trustedCanonicalItemCount: inactiveSession.items.count
+        )
+        await fixture.viewModel.test_reconcileCodexBranchTreeMembership(for: workspace)
+
+        fixture.viewModel.requestConversationTreePresentation(
+            tabID: fixture.tabID,
+            initialTurnID: fixture.sourceTurnID
+        )
+        let first = try XCTUnwrap(fixture.viewModel.conversationTreePresentationRequest)
+        XCTAssertEqual(first.target?.activeSessionID, fixture.sourceSessionID)
+        XCTAssertEqual(first.model.phase, .loading)
+        for _ in 0 ..< 100 where first.model.phase == .loading {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(first.model.phase, .ready)
+        XCTAssertTrue(first.model.paths.contains { $0.id == inactiveSessionID && $0.turns == nil })
+
+        first.model.select(.path(inactiveSessionID))
+        for _ in 0 ..< 100 where first.model.pathLoadStates[inactiveSessionID] != .loaded {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let loadedInactive = try XCTUnwrap(first.model.paths.first { $0.id == inactiveSessionID })
+        let loadedTurn = try XCTUnwrap(loadedInactive.turns?.first)
+        XCTAssertEqual(first.model.pathLoadStates[inactiveSessionID], .loaded)
+        first.model.select(.turn(loadedTurn.id))
+        XCTAssertEqual(first.model.selectedPreview?.prompt, "first question")
+
+        fixture.viewModel.consumeConversationTreePresentationRequest(id: UUID())
+        XCTAssertTrue(fixture.viewModel.conversationTreePresentationRequest?.model === first.model)
+        fixture.viewModel.consumeConversationTreePresentationRequest(id: first.id)
+        XCTAssertNil(fixture.viewModel.conversationTreePresentationRequest)
+
+        let target = try XCTUnwrap(first.target)
+        fixture.viewModel.test_seedConversationBranchPickerUnavailable(target)
+        fixture.viewModel.requestConversationTreePresentation(
+            tabID: fixture.tabID,
+            initialTurnID: fixture.sourceTurnID
+        )
+        let second = try XCTUnwrap(fixture.viewModel.conversationTreePresentationRequest)
+        XCTAssertNotEqual(second.id, first.id)
+        XCTAssertFalse(second.model === first.model)
+        XCTAssertEqual(
+            second.model.phase,
+            .failed("Conversation-tree evidence is unavailable. The current path remains available.")
+        )
+        XCTAssertEqual(second.model.paths.map(\.id), [fixture.sourceSessionID])
+
+        _ = fixture.viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(),
+            on: fixture.session
+        )
+        let submitted = await second.model.submit()
+        XCTAssertFalse(submitted)
+        XCTAssertTrue(second.model.staleSelection)
+        XCTAssertFalse(fixture.controller.operations.contains { $0.hasPrefix("fork:") })
+    }
+
     func testBranchOperationGuardBlocksOptimisticSend() {
         let viewModel = makeViewModel()
         let tabID = UUID()
@@ -231,7 +330,7 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             _ = try await fixture.viewModel.branchFromTurn(
                 fixture.sourceTurnID,
                 tabID: fixture.tabID,
-                confirmationPin: pin
+                selectionPin: pin
             )
             XCTFail("Expected stale-confirmation rejection")
         } catch {
@@ -511,16 +610,27 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
 
     func testBranchRestoreFailureAfterRebindRollsBackToSourceAndKeepsPersistedChild() async throws {
         let fixture = try await makeBranchFixture(childTurns: [threadTurn("source-1")])
-        defer { fixture.cleanup() }
+        defer {
+            fixture.viewModel.test_setCurrentTabIDOverride(nil)
+            fixture.cleanup()
+        }
+        fixture.viewModel.test_setCurrentTabIDOverride(fixture.tabID)
         fixture.viewModel.test_branchFailureInjector = {
             $0 == "restoreAfterRebind" ? BranchInjectedFailure.restore : nil
         }
+        fixture.viewModel.requestConversationTreePresentation(
+            tabID: fixture.tabID,
+            initialTurnID: fixture.sourceTurnID
+        )
+        let picker = try XCTUnwrap(fixture.viewModel.conversationTreePresentationRequest?.model)
+        for _ in 0 ..< 100 where picker.phase == .loading {
+            try await Task.sleep(for: .milliseconds(10))
+        }
 
-        do {
-            _ = try await fixture.viewModel.branchFromTurn(fixture.sourceTurnID, tabID: fixture.tabID)
-            XCTFail("Expected post-rebind restore failure")
-        } catch {
-            XCTAssertEqual(error as? BranchInjectedFailure, .restore)
+        let submitted = await picker.submit()
+        XCTAssertFalse(submitted)
+        guard case let .childSavedNotOpened(recoveryChildID) = picker.operation else {
+            return XCTFail("Expected saved-child recovery state")
         }
 
         let workspace = WorkspaceModel(
@@ -534,11 +644,29 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             for: workspace
         )
         XCTAssertTrue(tree.requiresExactResume)
+        guard case let .available(resolvedTree) = tree else {
+            return XCTFail("Expected persisted branch tree")
+        }
+        let persistedChildID = try XCTUnwrap(
+            resolvedTree.records.first(where: { $0.id != fixture.sourceSessionID })?.id
+        )
+        XCTAssertEqual(recoveryChildID, persistedChildID)
         XCTAssertEqual(fixture.session.activeAgentSessionID, fixture.sourceSessionID)
         XCTAssertEqual(fixture.session.codexConversationID, "source")
         XCTAssertEqual(fixture.session.draftText, "preserved draft")
         XCTAssertFalse(fixture.session.isBranchOperationInProgress)
         XCTAssertFalse(fixture.controller.operations.contains("archive:child"))
+
+        let opened = await picker.openCreatedBranch()
+        XCTAssertTrue(opened)
+        XCTAssertEqual(picker.operation, .idle)
+        XCTAssertEqual(fixture.session.activeAgentSessionID, persistedChildID)
+        XCTAssertEqual(fixture.session.codexConversationID, "child")
+        XCTAssertEqual(
+            fixture.controller.operations.count { $0 == "fork:source-1" },
+            1,
+            "Recovery must open the persisted child without forking again"
+        )
     }
 
     func testBranchFileSaveFailureArchivesChildAndLeavesRootLive() async throws {
@@ -571,12 +699,16 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             $0 == "restore" ? BranchInjectedFailure.restore : nil
         }
 
+        var recoveryChildID: UUID?
         do {
             _ = try await fixture.viewModel.branchFromTurn(fixture.sourceTurnID, tabID: fixture.tabID)
             XCTFail("Expected restore failure")
+        } catch let AgentBranchOperationError.childSavedButNotOpened(sessionID) {
+            recoveryChildID = sessionID
         } catch {
-            XCTAssertEqual(error as? BranchInjectedFailure, .restore)
+            XCTFail("Expected saved-child recovery error, got \(error)")
         }
+        XCTAssertNotNil(recoveryChildID)
 
         let workspace = WorkspaceModel(
             id: fixture.workspaceID,
@@ -589,6 +721,13 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
             for: workspace
         )
         XCTAssertTrue(branchTree.requiresExactResume)
+        guard case let .available(resolvedTree) = branchTree else {
+            return XCTFail("Expected persisted branch tree")
+        }
+        let persistedChildID = try XCTUnwrap(
+            resolvedTree.records.first(where: { $0.id != fixture.sourceSessionID })?.id
+        )
+        XCTAssertEqual(recoveryChildID, persistedChildID)
         XCTAssertEqual(
             fixture.controller.operations,
             ["list:source", "fork:source-1", "list:child", "list:source", "shutdown"]
@@ -1125,10 +1264,12 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("CodexAgentModeCoordinatorBranchTests", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let tabID = UUID()
         let workspace = WorkspaceModel(
             name: "Codex branch",
             repoPaths: ["/tmp/repo"],
-            customStoragePath: directory
+            customStoragePath: directory,
+            composeTabs: [ComposeTabState(id: tabID, name: "Agent")]
         )
         let controller = BranchRecordingCodexController(childTurns: childTurns)
         let viewModel = AgentModeViewModel(
@@ -1138,7 +1279,6 @@ final class CodexAgentModeCoordinatorBranchTests: XCTestCase {
         viewModel.test_setLastKnownWorkspaceSnapshot(workspace)
         viewModel.test_oracleBranchOccupancyOverride = false
 
-        let tabID = UUID()
         let sourceSessionID = UUID()
         let session = viewModel.session(for: tabID)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sourceSessionID, on: session)

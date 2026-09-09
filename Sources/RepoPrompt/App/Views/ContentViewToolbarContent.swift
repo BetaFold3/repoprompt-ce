@@ -30,10 +30,9 @@ struct ContentViewToolbarContent: ToolbarContent {
             AgentChatTitleClusterView(
                 model: windowState.agentChatTitleCluster,
                 windowID: windowState.windowID,
-                branchMenuSnapshot: { [weak windowState] in
-                    windowState?.agentConversationBranchPickerSnapshot()
+                presentConversationTree: { [weak windowState] in
+                    windowState?.presentAgentConversationTree()
                 },
-                branchMenuActions: windowState.agentConversationBranchMenuActions(),
                 menuSnapshot: { [weak windowState] in
                     windowState?.agentChatTitleClusterMenuSnapshot()
                 },

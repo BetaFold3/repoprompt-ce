@@ -5,6 +5,10 @@ extension EnvironmentValues {
     @Entry var agentWindowIsFocused: Bool = true
 }
 
+enum AgentHandoffIcon {
+    static let systemName = "arrowshape.turn.up.right"
+}
+
 // MARK: - Message Footer Strip
 
 /// An inline footer strip with timestamp and a subtle copy button.
@@ -134,7 +138,7 @@ private struct MessageFooterStrip: View {
             Button {
                 showHandoffPopover = true
             } label: {
-                Image(systemName: "arrow.branch")
+                Image(systemName: AgentHandoffIcon.systemName)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(
                         isHoveringHandoff ? BubbleColors.highContrastCopyIconHover : BubbleColors.copyIconNormal

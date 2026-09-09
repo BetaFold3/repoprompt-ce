@@ -6,19 +6,21 @@ final class AgentChatTitleClusterModel: ObservableObject {
     struct State: Equatable {
         var title: String
         var showsConversationBranches: Bool
+        var hasActiveAgentTab: Bool
         var showsChatOptions: Bool
     }
 
     @Published private(set) var state: State
 
     init(title: String) {
-        state = State(title: title, showsConversationBranches: false, showsChatOptions: false)
+        state = State(title: title, showsConversationBranches: false, hasActiveAgentTab: false, showsChatOptions: false)
     }
 
-    func update(title: String, showsConversationBranches: Bool, showsChatOptions: Bool) {
+    func update(title: String, showsConversationBranches: Bool, hasActiveAgentTab: Bool, showsChatOptions: Bool) {
         let nextState = State(
             title: title,
             showsConversationBranches: showsConversationBranches,
+            hasActiveAgentTab: hasActiveAgentTab,
             showsChatOptions: showsChatOptions
         )
         guard state != nextState else { return }
@@ -26,31 +28,22 @@ final class AgentChatTitleClusterModel: ObservableObject {
     }
 }
 
-enum AgentConversationBranchMenuRequestGate {
+enum AgentConversationTreeRequestGate {
     static func shouldAccept(
         requestWindowID: Int?,
         currentWindowID: Int,
-        showsConversationBranches: Bool
+        hasActiveAgentTab: Bool
     ) -> Bool {
-        requestWindowID == currentWindowID && showsConversationBranches
-    }
-
-    static func shouldPresent(
-        requestID: UUID?,
-        lastPresentationRequestID: UUID?
-    ) -> Bool {
-        requestID != nil && requestID != lastPresentationRequestID
+        requestWindowID == currentWindowID && hasActiveAgentTab
     }
 }
 
 struct AgentChatTitleClusterView: View {
     @ObservedObject var model: AgentChatTitleClusterModel
     let windowID: Int
-    let branchMenuSnapshot: () -> AgentConversationBranchPickerSnapshot?
-    let branchMenuActions: AgentConversationBranchMenuActions
+    let presentConversationTree: () -> Void
     let menuSnapshot: () -> AgentChatOptionsMenuSnapshot?
     let menuActions: AgentChatOptionsMenuActions
-    @State private var conversationBranchMenuRequestID: UUID?
 
     var body: some View {
         HStack(spacing: 4) {
@@ -62,11 +55,14 @@ struct AgentChatTitleClusterView: View {
                 .accessibilityIdentifier("AgentChatTitle")
 
             if model.state.showsConversationBranches {
-                AgentConversationBranchMenuButton(
-                    presentationRequestID: conversationBranchMenuRequestID,
-                    menuSnapshot: branchMenuSnapshot,
-                    menuActions: branchMenuActions
-                )
+                Button(action: presentConversationTree) {
+                    Image(systemName: "arrow.triangle.branch")
+                }
+                .buttonStyle(.plain)
+                .frame(width: 26, height: 24)
+                .hoverTooltip("Conversation Branches")
+                .accessibilityLabel("Conversation Branches")
+                .accessibilityIdentifier("AgentConversationBranchButton")
             }
 
             if model.state.showsChatOptions {
@@ -79,110 +75,12 @@ struct AgentChatTitleClusterView: View {
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .contain)
         .onReceive(NotificationCenter.default.publisher(for: .showAgentConversationBranches)) { notification in
-            guard AgentConversationBranchMenuRequestGate.shouldAccept(
+            guard AgentConversationTreeRequestGate.shouldAccept(
                 requestWindowID: notification.userInfo?["windowID"] as? Int,
                 currentWindowID: windowID,
-                showsConversationBranches: model.state.showsConversationBranches
+                hasActiveAgentTab: model.state.hasActiveAgentTab
             ) else { return }
-            conversationBranchMenuRequestID = UUID()
-        }
-    }
-}
-
-final class AgentConversationBranchButton: NSButton {
-    init() {
-        super.init(frame: .zero)
-        image = NSImage(
-            systemSymbolName: "arrow.triangle.branch",
-            accessibilityDescription: "Conversation Branches"
-        )
-        imagePosition = .imageOnly
-        isBordered = false
-        focusRingType = .exterior
-        translatesAutoresizingMaskIntoConstraints = false
-        toolTip = "Conversation Branches"
-        setAccessibilityLabel("Conversation Branches")
-        setAccessibilityRole(.menuButton)
-        setAccessibilityIdentifier("AgentConversationBranchButton")
-        NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 26),
-            heightAnchor.constraint(equalToConstant: 24)
-        ])
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    override func mouseDown(with _: NSEvent) {
-        guard isEnabled, let action else { return }
-        NSApplication.shared.sendAction(action, to: target, from: self)
-    }
-}
-
-private struct AgentConversationBranchMenuButton: NSViewRepresentable {
-    let presentationRequestID: UUID?
-    let menuSnapshot: () -> AgentConversationBranchPickerSnapshot?
-    let menuActions: AgentConversationBranchMenuActions
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(
-            presentationRequestID: presentationRequestID,
-            menuSnapshot: menuSnapshot,
-            menuActions: menuActions
-        )
-    }
-
-    func makeNSView(context: Context) -> AgentConversationBranchButton {
-        let button = AgentConversationBranchButton()
-        button.target = context.coordinator
-        button.action = #selector(Coordinator.showMenu(_:))
-        return button
-    }
-
-    func updateNSView(_ nsView: AgentConversationBranchButton, context: Context) {
-        context.coordinator.menuSnapshot = menuSnapshot
-        context.coordinator.menuActions = menuActions
-        context.coordinator.presentMenuIfRequested(presentationRequestID, sender: nsView)
-    }
-
-    @MainActor
-    final class Coordinator: NSObject {
-        var menuSnapshot: () -> AgentConversationBranchPickerSnapshot?
-        var menuActions: AgentConversationBranchMenuActions
-        private var lastPresentationRequestID: UUID?
-
-        init(
-            presentationRequestID: UUID?,
-            menuSnapshot: @escaping () -> AgentConversationBranchPickerSnapshot?,
-            menuActions: AgentConversationBranchMenuActions
-        ) {
-            lastPresentationRequestID = presentationRequestID
-            self.menuSnapshot = menuSnapshot
-            self.menuActions = menuActions
-        }
-
-        func presentMenuIfRequested(_ requestID: UUID?, sender: NSButton) {
-            guard AgentConversationBranchMenuRequestGate.shouldPresent(
-                requestID: requestID,
-                lastPresentationRequestID: lastPresentationRequestID
-            ), let requestID
-            else { return }
-            lastPresentationRequestID = requestID
-            Task { @MainActor [weak self, weak sender] in
-                guard let self, let sender else { return }
-                showMenu(sender)
-            }
-        }
-
-        @objc func showMenu(_ sender: NSButton) {
-            guard let snapshot = menuSnapshot() else { return }
-            AgentConversationBranchMenuPresenter.popUp(
-                below: sender,
-                snapshot: snapshot,
-                actions: menuActions
-            )
+            presentConversationTree()
         }
     }
 }

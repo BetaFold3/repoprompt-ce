@@ -3,6 +3,11 @@ import XCTest
 
 @MainActor
 final class AgentHandoffUITests: XCTestCase {
+    func testHandoffUsesDistinctSendOnwardGlyph() {
+        XCTAssertEqual(AgentHandoffIcon.systemName, "arrowshape.turn.up.right")
+        XCTAssertNotEqual(AgentHandoffIcon.systemName, "arrow.triangle.branch")
+    }
+
     private var cursorCatalogSnapshot: [String: [CursorModelParameterCatalog.ParameterSpec]] = [:]
 
     override func setUp() {

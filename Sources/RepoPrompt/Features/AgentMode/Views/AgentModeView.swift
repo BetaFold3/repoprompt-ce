@@ -229,7 +229,7 @@ struct AgentModeChatDetailView: View {
     @State private var isTranscriptWindowExpanded = false
     @State private var previewLinkResolutionTask: Task<Bool, Never>?
     @StateObject private var viewportRegistry = AgentTranscriptViewportRegistry()
-    @StateObject private var replyBranchConfirmation = AgentReplyBranchConfirmationState()
+    @StateObject private var conversationTreePicker = AgentConversationTreePickerState()
 
     // MARK: - Assistant transcript search & ephemeral expansion (Workstream 5 item 1)
 
@@ -2029,17 +2029,23 @@ struct AgentModeChatDetailView: View {
         .onDisappear {
             cancelPreviewLinkResolution()
         }
+        .onReceive(agentModeVM.$conversationTreePresentationRequest.compactMap(\.self)) { request in
+            guard request.tabID == currentTabID else { return }
+            conversationTreePicker.focusOrPresent(request)
+        }
         .sheet(
             isPresented: Binding(
-                get: { replyBranchConfirmation.confirmation != nil },
-                set: { isPresented in
-                    if !isPresented {
-                        replyBranchConfirmation.dismiss()
+                get: { conversationTreePicker.request != nil },
+                set: {
+                    if !$0, let requestID = conversationTreePicker.dismiss() {
+                        agentModeVM.consumeConversationTreePresentationRequest(id: requestID)
                     }
                 }
             )
         ) {
-            AgentReplyBranchConfirmationSheet(state: replyBranchConfirmation)
+            AgentConversationTreePicker(state: conversationTreePicker) { requestID in
+                agentModeVM.consumeConversationTreePresentationRequest(id: requestID)
+            }
         }
     }
 
@@ -3490,11 +3496,6 @@ struct AgentModeChatDetailView: View {
 
     // MARK: - Reply actions
 
-    private func sourceOwnedOracleChatCount(for tabID: UUID) -> Int {
-        guard let sourceSessionID = agentModeVM.sessions[tabID]?.activeAgentSessionID else { return 0 }
-        return oracleViewModel.sessions.count { $0.agentModeSessionID == sourceSessionID }
-    }
-
     private func replyBranchConfig(
         for block: AgentTranscriptRenderBlock,
         ownerTabID: UUID?
@@ -3511,16 +3512,10 @@ struct AgentModeChatDetailView: View {
         return AgentReplyBranchConfig(
             presentation: presentation,
             requestPresentation: { [weak agentModeVM] in
-                guard let agentModeVM,
-                      let confirmation = agentModeVM.replyBranchConfirmation(
-                          turnID: block.turnID,
-                          tabID: sourceTabID,
-                          sourceOwnedOracleChatCount: sourceOwnedOracleChatCount(for: sourceTabID)
-                      )
-                else {
-                    return
-                }
-                replyBranchConfirmation.present(confirmation)
+                agentModeVM?.requestConversationTreePresentation(
+                    tabID: sourceTabID,
+                    initialTurnID: block.turnID
+                )
             }
         )
     }
