@@ -16,8 +16,9 @@ import SwiftUI
 
 @MainActor
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
-    /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
-    private var terminationInProgress = false
+    private var quitRequestPhase: AppQuitRequestPhase = .idle
+    private var presentedQuitAlert: NSAlert?
+    private weak var presentedQuitAlertParent: NSWindow?
     private let dockMenuController = DockMenuController()
 
     // New global routing/settings services (kept alive by the AppDelegate)
@@ -148,35 +149,123 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        // Prevent re-entrancy (Cmd+Q twice, menu + dock quit, etc.)
-        guard !terminationInProgress else { return .terminateLater }
-        terminationInProgress = true
+        let activeItems = WindowStatesManager.shared.allWindows.flatMap { windowState in
+            WindowCloseCoordinator.activeItems(for: windowState.makeCloseImpactSnapshot())
+        }
+        let decision = AppQuitPolicy.decide(
+            warningEnabled: GlobalSettingsStore.shared.warnBeforeQuit(),
+            suppressesConfirmation: AppLaunchConfiguration.current.suppressesNonessentialLaunchSideEffects,
+            phase: quitRequestPhase,
+            activeItems: activeItems
+        )
 
-        // 1) Signal termination FIRST to prevent observation crashes.
-        // This stops SwiftUI from trying to update views with deallocated objects
-        // during the shutdown sequence (fixes EXC_BAD_ACCESS in ObservationRegistrar).
+        switch decision {
+        case let .showConfirmation(confirmation):
+            presentQuitConfirmation(confirmation, sender: sender)
+        case .beginTermination:
+            beginTermination(sender: sender)
+        case .awaitCurrentRequest:
+            break
+        }
+        return .terminateLater
+    }
+
+    private func presentQuitConfirmation(
+        _ confirmation: AppQuitConfirmation,
+        sender: NSApplication
+    ) {
+        let alert = NSAlert()
+        alert.messageText = confirmation.title
+        alert.informativeText = confirmation.message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: confirmation.cancelButtonTitle)
+        alert.addButton(withTitle: confirmation.confirmButtonTitle)
+        presentedQuitAlert = alert
+        quitRequestPhase = .awaitingConfirmation
+
+        let completion: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            Task { @MainActor in
+                self?.handleQuitConfirmationResponse(response, alert: alert, sender: sender)
+            }
+        }
+        if let parentWindow = sender.keyWindow ?? sender.mainWindow {
+            presentedQuitAlertParent = parentWindow
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(quitConfirmationParentWillClose(_:)),
+                name: NSWindow.willCloseNotification,
+                object: parentWindow
+            )
+            alert.beginSheetModal(for: parentWindow, completionHandler: completion)
+        } else {
+            sender.activate(ignoringOtherApps: true)
+            DispatchQueue.main.async {
+                completion(alert.runModal())
+            }
+        }
+    }
+
+    @objc private func quitConfirmationParentWillClose(_ notification: Notification) {
+        guard let parentWindow = presentedQuitAlertParent,
+              notification.object as? NSWindow === parentWindow,
+              let alert = presentedQuitAlert,
+              alert.window.sheetParent === parentWindow
+        else {
+            return
+        }
+        parentWindow.endSheet(alert.window, returnCode: .cancel)
+    }
+
+    private func handleQuitConfirmationResponse(
+        _ response: NSApplication.ModalResponse,
+        alert: NSAlert,
+        sender: NSApplication
+    ) {
+        guard quitRequestPhase == .awaitingConfirmation,
+              presentedQuitAlert === alert
+        else {
+            return
+        }
+        if let parentWindow = presentedQuitAlertParent {
+            NotificationCenter.default.removeObserver(
+                self,
+                name: NSWindow.willCloseNotification,
+                object: parentWindow
+            )
+        }
+        presentedQuitAlertParent = nil
+        presentedQuitAlert = nil
+
+        if response == .alertSecondButtonReturn {
+            beginTermination(sender: sender)
+        } else {
+            quitRequestPhase = .idle
+            sender.reply(toApplicationShouldTerminate: false)
+        }
+    }
+
+    private func beginTermination(sender: NSApplication) {
+        guard quitRequestPhase != .terminating else { return }
+        quitRequestPhase = .terminating
+
+        // Signal termination only after the user has confirmed (or the warning is bypassed).
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
         MCPBackgroundModeCoordinator.shared.resetForTermination()
 
-        // 2) Persist the final restorable window session before async shutdown begins.
+        // Persist the final restorable window session before async shutdown begins.
         // Using .terminateLater lets us do async work without deadlocking.
         Task { @MainActor in
             if !AppLaunchConfiguration.current.suppressesWindowPersistence {
                 await WindowStatesManager.shared.persistWindowSessionImmediately(reason: "appShouldTerminate")
             }
 
-            // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
-            // Stop capability discovery before the shared agent/session teardown begins.
+            // Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
             await OhMyPiThinkingCapabilityResolver.shared.cancel(reason: .appTermination)
-            // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
-            // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
             sender.reply(toApplicationShouldTerminate: true)
         }
-
-        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {

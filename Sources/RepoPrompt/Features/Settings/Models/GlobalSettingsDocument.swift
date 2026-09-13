@@ -474,6 +474,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var enableKeyboardShortcuts: Bool?
         var fontScaleBodySize: Double?
         var showDatesInMessageTimestamps: Bool?
+        /// Whether normal app quit requests require explicit confirmation.
+        var warnBeforeQuit: Bool?
         /// Preferred width of the Agent Mode right utility panel, stored unscaled (at the
         /// `.normal` font preset) so the value stays stable across font-scale changes.
         var agentUtilityPanelWidth: Double?
@@ -494,6 +496,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             enableKeyboardShortcuts: Bool? = nil,
             fontScaleBodySize: Double? = nil,
             showDatesInMessageTimestamps: Bool? = nil,
+            warnBeforeQuit: Bool? = nil,
             agentUtilityPanelWidth: Double? = nil,
             wrapTranscriptDiffLines: Bool? = nil,
             transcriptCodeFontPostScriptName: String? = nil
@@ -507,6 +510,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.enableKeyboardShortcuts = enableKeyboardShortcuts
             self.fontScaleBodySize = fontScaleBodySize
             self.showDatesInMessageTimestamps = showDatesInMessageTimestamps
+            self.warnBeforeQuit = warnBeforeQuit
             self.agentUtilityPanelWidth = agentUtilityPanelWidth
             self.wrapTranscriptDiffLines = wrapTranscriptDiffLines
             self.transcriptCodeFontPostScriptName = transcriptCodeFontPostScriptName

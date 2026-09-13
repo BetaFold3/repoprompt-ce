@@ -43,6 +43,13 @@ struct AppearanceSettingsView: View {
         )
     }
 
+    private var warnBeforeQuitBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.warnBeforeQuit() },
+            set: { globalSettings.setWarnBeforeQuit($0) }
+        )
+    }
+
     private var showDatesInMessageTimestampsBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.showDatesInMessageTimestamps() },
@@ -155,6 +162,12 @@ struct AppearanceSettingsView: View {
                     description: "Configure visual behavior"
                 ) {
                     VStack(alignment: .leading, spacing: 8) {
+                        SettingToggle(
+                            title: "Warn Before Quitting",
+                            description: "Ask for confirmation whenever you quit RepoPrompt.",
+                            isOn: warnBeforeQuitBinding
+                        )
+
                         SettingToggle(
                             title: "Always Collapse File Changes",
                             description: "Reduces performance strain on very large generations.",

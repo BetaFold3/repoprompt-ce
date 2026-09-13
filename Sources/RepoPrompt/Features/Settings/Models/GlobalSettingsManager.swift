@@ -749,6 +749,16 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    func warnBeforeQuit() -> Bool {
+        scalarPreferences.ui?.warnBeforeQuit ?? true
+    }
+
+    func setWarnBeforeQuit(_ enabled: Bool, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.warnBeforeQuit = enabled
+        }
+    }
+
     func showDatesInMessageTimestamps() -> Bool {
         scalarPreferences.ui?.showDatesInMessageTimestamps ?? false
     }

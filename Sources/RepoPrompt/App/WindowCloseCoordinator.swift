@@ -214,7 +214,7 @@ final class WindowCloseCoordinator {
         presentedAlert = nil
     }
 
-    private static func activeItems(for snapshot: WindowCloseImpactSnapshot) -> [WindowCloseActivityItem] {
+    static func activeItems(for snapshot: WindowCloseImpactSnapshot) -> [WindowCloseActivityItem] {
         var items = snapshot.activeItems.filter { $0.count > 0 }
         if snapshot.mcp.activeExecutionCount > 0 {
             items.append(
