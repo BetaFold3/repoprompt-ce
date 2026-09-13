@@ -167,11 +167,13 @@ final class MCPTransportResponseDeliveryGate: @unchecked Sendable {
     private var waiters: [CheckedContinuation<Bool, Never>] = []
     private var isTerminal = false
 
-    func recordAcceptedClientFrame(_ frame: Data) {
-        let requestIDs = JSONRPCBridgeFrameInspector.inspectPermissively(
+    @discardableResult
+    func recordAcceptedClientFrame(_ frame: Data) -> [JSONRPCBridgeMessageMetadata] {
+        let messages = JSONRPCBridgeFrameInspector.inspectPermissively(
             frame,
             direction: .clientToServer
-        ).compactMap { message -> JSONRPCBridgeID? in
+        )
+        let requestIDs = messages.compactMap { message -> JSONRPCBridgeID? in
             guard message.kind == .request,
                   let id = message.id,
                   id != .null
@@ -180,13 +182,14 @@ final class MCPTransportResponseDeliveryGate: @unchecked Sendable {
             }
             return id
         }
-        guard !requestIDs.isEmpty else { return }
+        guard !requestIDs.isEmpty else { return messages }
 
         lock.lock()
         if !isTerminal {
             pendingRequestIDs.formUnion(requestIDs)
         }
         lock.unlock()
+        return messages
     }
 
     func recordDeliveredServerFrame(_ frame: Data) {
@@ -1226,8 +1229,12 @@ public actor UnixSocketMCPTransport: Transport {
             logger: log,
             onFrame: { [weak self] frame in
                 guard let self else { return }
-                responseDeliveryGate.recordAcceptedClientFrame(frame)
-                switch inboundChannel.gate.offer(frame, to: inboundChannel.continuation) {
+                let messages = responseDeliveryGate.recordAcceptedClientFrame(frame)
+                // Reuse the existing inspection so ordinary traffic does not
+                // pay for another JSON decode. Diagnostics keep the wire frame.
+                let isInitialize = messages.contains { $0.kind == .request && $0.method == "initialize" }
+                let sdkFrame = isInitialize ? MCPInitializeCompatibility.sdkCompatibleFrame(frame) : frame
+                switch inboundChannel.gate.offer(sdkFrame, to: inboundChannel.continuation) {
                 case .accepted:
                     #if DEBUG
                         if let timelineConnectionID {

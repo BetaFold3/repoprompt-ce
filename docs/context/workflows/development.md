@@ -70,6 +70,22 @@ rpce-cli-debug -w 1 -e 'tree --type roots'
 rpce-cli-debug -w 1 -c agent_manage -j '{"op":"list_agents","roles_only":true}'
 ```
 
+### Diagnose missing native Codex MCP tools
+
+If every RepoPrompt tool is missing, inspect the Codex MCP startup error before
+changing tool permissions or Oracle presets. Codex 0.154.0-alpha.6.2 advertises
+`experimental: {"codex/auth-change": {}}`; the pinned Swift MCP SDK's
+`Client.Capabilities.experimental` accepts only string values and rejects that
+initialize request before tool discovery.
+
+`MCPInitializeCompatibility` adapts only incoming initialize requests at the
+app's UNIX socket boundary, ignoring unsupported non-string experimental entries
+while retaining standard capabilities, client identity and string entries.
+Wire diagnostics retain the original frame, and the existing initialization
+approval hook still runs. Remove this adapter when the SDK supports arbitrary
+JSON experimental values. Validate this boundary with
+`make dev-test FILTER=MCPInitializeCompatibilityTests`.
+
 ### Run the transient OMP DEBUG smoke
 
 `Scripts/smoke_omp_agent_mode.sh` is the one-command OMP post-relaunch smoke. Use it only after one coordinated relaunch has installed the current DEBUG binary, with fresh explicit approval obtained immediately before that relaunch. The script itself requires an already-running current DEBUG app and never launches, stops, relaunches, switches workspaces, or resumes a session.
