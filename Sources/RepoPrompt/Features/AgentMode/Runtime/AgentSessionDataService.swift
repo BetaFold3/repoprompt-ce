@@ -243,6 +243,7 @@ actor AgentSessionDataService {
             providerSessionID = try container.decodeIfPresent(String.self, forKey: .providerSessionID)
             remoteHost = try container.decodeIfPresent(AgentSessionRemoteHostBinding.self, forKey: .remoteHost)
             autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
+            // `providerUsage` is captured as raw bytes by `AgentSessionDataCodec`, never decoded here.
             codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
             codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)
             codexModel = try container.decodeIfPresent(String.self, forKey: .codexModel)
@@ -1061,7 +1062,9 @@ actor AgentSessionDataService {
             trustedCanonicalItemCount: trustedCanonicalItemCount
         )
         let freshEncoder = JSONEncoder()
-        let data = try freshEncoder.encode(sessionToSave)
+        // Field-local codec: `providerUsage` bytes are re-inserted verbatim; any preservation
+        // failure throws here, before the atomic writer replaces the file.
+        let data = try AgentSessionDataCodec.encodeSession(sessionToSave, using: freshEncoder)
         try await diskWriter.enqueueAndWait(data: data, url: fileURL)
         await upsertMetadataRecord(metadataRecord(from: sessionToSave, fileURL: fileURL), folder: agentSessionsFolder)
         return fileURL
@@ -1085,7 +1088,8 @@ actor AgentSessionDataService {
         let fileURL = agentSessionsFolder.appendingPathComponent(agentSessionFilename(for: id))
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
         let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-        return try decoder.decode(AgentSessionLastRunStateHeader.self, from: data).lastRunState
+        return try AgentSessionDataCodec.decodeEnvelope(AgentSessionLastRunStateHeader.self, from: data, using: decoder)
+            .value.lastRunState
     }
 
     /// Load an AgentSession from disk.
@@ -1097,7 +1101,7 @@ actor AgentSessionDataService {
 
         do {
             let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-            let session = try decoder.decode(AgentSession.self, from: data)
+            let session = try AgentSessionDataCodec.decodeSession(from: data, using: decoder)
             let normalized = normalizeLoadedSession(session, fileURL: fileURL)
             var runtimeSession = normalized.runtimeSession
             var persistedSessionToRewrite = normalized.persistedSessionToRewrite
@@ -1113,7 +1117,7 @@ actor AgentSessionDataService {
                 )
             }
             if let persistedSession = persistedSessionToRewrite {
-                let encoded = try encoder.encode(persistedSession)
+                let encoded = try AgentSessionDataCodec.encodeSession(persistedSession, using: encoder)
                 try await writeDataAtomically(encoded, to: fileURL)
                 await upsertMetadataRecord(
                     metadataRecord(from: persistedSession, fileURL: fileURL),
@@ -1141,14 +1145,15 @@ actor AgentSessionDataService {
 
         do {
             let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-            let header = try decoder.decode(AgentSessionHeader.self, from: data)
+            let decodedHeader = try AgentSessionDataCodec.decodeEnvelope(AgentSessionHeader.self, from: data, using: decoder)
+            let header = decodedHeader.value
             var recoveredLastUserMessageAt = header.lastUserMessageAt
             var recoveredProjectionCounts = header.transcriptProjectionCounts
             var count = recoveredProjectionCounts?.canonicalVisibleRowCount ?? header.itemCount ?? 0
 
             if recoverMissingMetadata,
                header.lastUserMessageAt == nil || header.itemCount == nil || header.transcriptProjectionCounts == nil,
-               let fullSession = try? decoder.decode(AgentSession.self, from: data)
+               let fullSession = try? AgentSessionDataCodec.decodeSession(from: data, using: decoder)
             {
                 let normalized = normalizeLoadedSession(fullSession, fileURL: fileURL)
                 if let transcript = normalized.runtimeSession.transcript {
@@ -1173,7 +1178,7 @@ actor AgentSessionDataService {
                    let persistedSession = normalized.persistedSessionToRewrite
                 {
                     do {
-                        let encoded = try encoder.encode(persistedSession)
+                        let encoded = try AgentSessionDataCodec.encodeSession(persistedSession, using: encoder)
                         try await writeDataAtomically(encoded, to: fileURL)
                         await upsertMetadataRecord(
                             metadataRecord(from: persistedSession, fileURL: fileURL),
@@ -1205,6 +1210,7 @@ actor AgentSessionDataService {
                 providerSessionID: header.providerSessionID,
                 remoteHost: header.remoteHost,
                 autoEditEnabled: header.autoEditEnabled,
+                providerUsage: decodedHeader.providerUsage,
                 codexConversationID: header.codexConversationID,
                 codexRolloutPath: header.codexRolloutPath,
                 codexModel: header.codexModel,

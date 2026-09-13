@@ -577,6 +577,9 @@ extension AgentModeViewModel {
         var claudeConfiguredContextWindowKey: ClaudeProvisionalContextWindowResolver.Key?
         var pendingNonCodexUserInputTokenQueue: [Int] = []
         var activeNonCodexTurnTokenAccumulator: NonCodexTurnTokenAccumulator?
+        /// Owner-keyed provider accounting (plan §3.2). Installed by persisted hydration or lazily at
+        /// the first Claude execution; production runs with G1 closed (`.productionClaude`).
+        var usageAccounting: AgentUsageAccumulator?
 
         // Codex native session identifiers and metadata
         var codexConversationID: String?
@@ -626,7 +629,76 @@ extension AgentModeViewModel {
             pendingCodexComputerUseActivation != nil
         }
 
-        var claudeController: (any NativeAgentRuntimeControlling)?
+        var claudeController: (any NativeAgentRuntimeControlling)? {
+            didSet {
+                let oldIdentity = oldValue.map { ObjectIdentifier($0) }
+                let newIdentity = claudeController.map { ObjectIdentifier($0) }
+                guard oldIdentity != newIdentity else { return }
+                syncUsageAccountingExecution(hasController: newIdentity != nil)
+            }
+        }
+
+        /// Every distinct native controller is a fresh execution identity; replacement or removal
+        /// disposes the previous one so late callbacks cannot mutate a newer execution.
+        private func syncUsageAccountingExecution(hasController: Bool) {
+            guard hasController else {
+                let disposedExecutionID = usageAccounting?.activeExecutionID
+                usageAccounting?.endExecution(disposedExecutionID)
+                return
+            }
+            if let owner = activeAgentSessionID, usageAccounting?.ownerSessionID != owner {
+                usageAccounting = AgentUsageAccumulator(
+                    ownerSessionID: owner,
+                    persisted: nil,
+                    hasPriorHistory: hasSentFirstMessage,
+                    qualification: .productionClaude
+                )
+            }
+            beginUsageAccountingExecution()
+        }
+
+        /// Opens a fresh execution identity on the installed accumulator.
+        ///
+        /// Segment provenance is captured from `providerSessionID` at this moment only. A fresh
+        /// controller usually has no provider session yet (the runtime reports it later through
+        /// `.runtimeInit`), so the segment's `providerSessionID` may legitimately stay `nil`; that
+        /// value is optional provenance, never an accounting input.
+        private func beginUsageAccountingExecution() {
+            usageAccounting?.beginExecution(
+                executionID: UUID(),
+                providerSessionID: providerSessionID,
+                baseline: .unknown,
+                at: Date()
+            )
+        }
+
+        /// Installs the persisted `providerUsage` after hydration (plan §3.3).
+        ///
+        /// The on-disk payload is authoritative for a session being (re)loaded. An accumulator
+        /// installed before hydration (a controller that arrived first) knows nothing about the
+        /// persisted payload, so when it refuses the late hydration it is replaced rather than
+        /// kept: the pre-hydration state can never overwrite the persisted payload on the next
+        /// save. A controller that survived (route activation keeps it while resetting
+        /// accounting) is re-registered as a fresh execution so later dispatches stay registered.
+        func installHydratedUsageAccounting(_ persisted: AgentProviderUsagePersist?, ownerSessionID: UUID) {
+            if var accounting = usageAccounting,
+               accounting.ownerSessionID == ownerSessionID,
+               accounting.applyHydration(persisted, hasPriorHistory: hasSentFirstMessage)
+            {
+                usageAccounting = accounting
+                return
+            }
+            usageAccounting = AgentUsageAccumulator(
+                ownerSessionID: ownerSessionID,
+                persisted: persisted,
+                hasPriorHistory: hasSentFirstMessage,
+                qualification: .productionClaude
+            )
+            if claudeController != nil {
+                beginUsageAccountingExecution()
+            }
+        }
+
         var acpController: ACPAgentSessionController?
         var codexEventTask: Task<Void, Never>?
         var codexEventTaskRunID: UUID?

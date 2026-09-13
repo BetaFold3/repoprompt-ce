@@ -4785,6 +4785,9 @@ final class AgentModeViewModel: ObservableObject {
         session.runState = payload.normalizedRunState
         session.providerSessionID = agentSession.providerSessionID
         session.providerTokenUsageByTurn = agentSession.providerTokenUsageByTurn
+        // Restore preserved accounting before any live ingestion. The persisted payload is
+        // authoritative here; pre-hydration accumulator state never overwrites it on save.
+        session.installHydratedUsageAccounting(agentSession.providerUsage, ownerSessionID: agentSession.id)
         session.pendingHandoff = PendingHandoffState(
             payload: agentSession.pendingHandoffPayload,
             createdAt: agentSession.pendingHandoffCreatedAt,
@@ -5039,6 +5042,7 @@ final class AgentModeViewModel: ObservableObject {
         session.locallyAttributedStartItemID = nil
         session.remoteHost = nil
         session.providerTokenUsageByTurn.removeAll()
+        session.usageAccounting = nil
         session.claudeConfiguredContextWindow = nil
         session.claudeConfiguredContextWindowKey = nil
         session.lastUserMessageAt = nil
@@ -12249,6 +12253,9 @@ final class AgentModeViewModel: ObservableObject {
             locallyAttributedStartItemID: session.locallyAttributedStartItemID,
             autoEditEnabled: session.autoEditEnabled,
             providerTokenUsageByTurn: session.providerTokenUsageByTurn,
+            providerUsage: session.usageAccounting.flatMap {
+                $0.ownerSessionID == sessionID ? $0.persistedRepresentation : nil
+            },
             parentSessionID: session.parentSessionID,
             pendingHandoffPayload: session.pendingHandoff.payload,
             pendingHandoffCreatedAt: session.pendingHandoff.createdAt,
@@ -18388,6 +18395,8 @@ final class AgentModeViewModel: ObservableObject {
             await promptManager.closeComposeTab(destTabID)
             throw PersistentBindingMutationError.staleTransition
         }
+        // Branches never inherit source accounting; the destination starts its own identity.
+        destSession.usageAccounting = nil
 
         // 4) Clone only Oracle/chat sessions owned by the source Agent Mode session.
         //    The run ID stays nil until the destination's first explicit continuation.

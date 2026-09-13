@@ -61,6 +61,7 @@
             session.agentTask = nil
             session.providerSessionID = nil
             session.providerTokenUsageByTurn = []
+            session.usageAccounting = nil
             session.pendingNonCodexUserInputTokenQueue = []
             session.activeNonCodexTurnTokenAccumulator = nil
             session.codexConversationID = nil
@@ -387,7 +388,7 @@
                 }
                 do {
                     let data = try Data(contentsOf: fixtureURL)
-                    let session = try JSONDecoder().decode(AgentSession.self, from: data)
+                    let session = try AgentSessionDataCodec.decodeSession(from: data)
                     return AgentSession(
                         serializationVersion: session.serializationVersion,
                         workspaceID: nil,

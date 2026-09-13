@@ -276,6 +276,14 @@ struct AgentSession: Codable, Identifiable {
     /// Used to rebuild context usage after reopen/resume when tool payloads are pruned.
     var providerTokenUsageByTurn: [AgentTokenUsagePersist]
 
+    /// Field-local provider accounting (plan §3.3). `nil` means absent/unavailable and is omitted on
+    /// encode; a present member (explicit `null`, unsupported, malformed or future values included)
+    /// is preserved as raw bytes in `.opaque`. Persisted data must be read and written through
+    /// `AgentSessionDataCodec`, which captures and re-inserts those bytes; the generic `Codable`
+    /// path below only accepts the lossless subset (absent, `null`, strict typed v1) and fails
+    /// explicitly otherwise.
+    var providerUsage: AgentProviderUsagePersist?
+
     /// Codex native session identifiers (v2 thread and rollout path)
     var codexConversationID: String?
     var codexRolloutPath: String?
@@ -344,6 +352,7 @@ struct AgentSession: Codable, Identifiable {
         locallyAttributedStartItemID: UUID? = nil,
         autoEditEnabled: Bool = true,
         providerTokenUsageByTurn: [AgentTokenUsagePersist] = [],
+        providerUsage: AgentProviderUsagePersist? = nil,
         codexConversationID: String? = nil,
         codexRolloutPath: String? = nil,
         codexModel: String? = nil,
@@ -387,6 +396,7 @@ struct AgentSession: Codable, Identifiable {
         self.locallyAttributedStartItemID = locallyAttributedStartItemID
         self.autoEditEnabled = autoEditEnabled
         self.providerTokenUsageByTurn = providerTokenUsageByTurn
+        self.providerUsage = providerUsage
         self.codexConversationID = codexConversationID
         self.codexRolloutPath = codexRolloutPath
         self.codexModel = codexModel
@@ -433,6 +443,7 @@ struct AgentSession: Codable, Identifiable {
         case locallyAttributedStartItemID
         case autoEditEnabled
         case providerTokenUsageByTurn
+        case providerUsage
         case codexConversationID
         case codexRolloutPath
         case codexModel
@@ -490,6 +501,12 @@ struct AgentSession: Codable, Identifiable {
         locallyAttributedStartItemID = try container.decodeIfPresent(UUID.self, forKey: .locallyAttributedStartItemID)
         autoEditEnabled = try container.decode(Bool.self, forKey: .autoEditEnabled)
         providerTokenUsageByTurn = try container.decodeIfPresent([AgentTokenUsagePersist].self, forKey: .providerTokenUsageByTurn) ?? []
+        // Absent stays absent. `AgentSessionDataCodec` strips this member before decoding and
+        // re-attaches the captured bytes; a member reaching this generic path is limited to the
+        // lossless subset and fails explicitly outside it.
+        providerUsage = container.contains(.providerUsage)
+            ? try container.decode(AgentProviderUsagePersist.self, forKey: .providerUsage)
+            : nil
         codexConversationID = try container.decodeIfPresent(String.self, forKey: .codexConversationID)
         codexRolloutPath = try container.decodeIfPresent(String.self, forKey: .codexRolloutPath)
         codexModel = try container.decodeIfPresent(String.self, forKey: .codexModel)

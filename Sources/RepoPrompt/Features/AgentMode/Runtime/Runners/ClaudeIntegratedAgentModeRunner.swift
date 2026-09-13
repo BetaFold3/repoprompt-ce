@@ -201,6 +201,22 @@ final class ClaudeIntegratedAgentModeRunner {
                         reasoningDebug("stream reasoning run=\(runID.uuidString) attempt=\(runAttemptID.uuidString) tab=\(session.tabID.uuidString) len=\(text.count) snippet=\(reasoningDebugSnippet(text))")
                     }
                 #endif
+                // Accounting seam (plan §3.2). Transcript delivery below is independent of it. With
+                // G1 closed, production passes an unverified attribution and no turn identity, so the
+                // accumulator rejects the input and persisted accounting stays unchanged.
+                if let observation = result.usageObservation,
+                   let executionID = session.usageAccounting?.activeExecutionID
+                {
+                    session.usageAccounting?.observe(
+                        .init(
+                            observation: observation,
+                            reportedCost: AgentUsageObservationInput.exactCost(fromReported: result.cost),
+                            executionID: executionID,
+                            turnID: nil,
+                            attribution: .unverified
+                        )
+                    )
+                }
                 await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             case let .runtimeInit(status):
                 // Persist provider session ID as soon as it becomes available from
@@ -245,6 +261,10 @@ final class ClaudeIntegratedAgentModeRunner {
                     continue eventLoop
                 }
                 session.claudeExpectedTurnIDs.remove(turnID)
+                session.usageAccounting?.closeTurn(
+                    turnID,
+                    outcome: turnStatus == .completed ? .completed : .interrupted
+                )
 
                 let wasProtectedClaudeTurn = session.claudeSupersedingProtectedTurnIDs.remove(turnID) != nil
                 let hasLegacyUnscopedProtection = session.claudeSupersedingProtectedTurnIDs.isEmpty

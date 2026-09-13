@@ -317,8 +317,9 @@ actor HistorySessionScanner: HistorySessionScanning {
             let data = try Data(contentsOf: sessionFile, options: .mappedIfSafe)
 
             // Decode the session and extract the transcript.
-            // We decode as a full AgentSession to get the transcript field.
-            let session = try decoder.decode(AgentSession.self, from: data)
+            // We decode as a full AgentSession to get the transcript field; the field-local codec
+            // keeps `providerUsage` as raw bytes so unsupported nested values cannot fail the read.
+            let session = try AgentSessionDataCodec.decodeSession(from: data, using: decoder)
             let transcript = session.transcript ?? .empty
             if let signature {
                 transcriptCache[cacheKey] = TranscriptCacheEntry(signature: signature, transcript: transcript)

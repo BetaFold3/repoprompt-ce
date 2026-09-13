@@ -1303,6 +1303,10 @@ final class ClaudeAgentModeCoordinator {
                     return false
                 }
                 session.claudeExpectedTurnIDs.insert(turnID)
+                // Register provider-turn identity at actual dispatch (not composer submission).
+                if let executionID = session.usageAccounting?.activeExecutionID {
+                    session.usageAccounting?.registerTurn(turnID, executionID: executionID)
+                }
                 return true
             } catch {
                 guard sessionOwnsClaudeController(controller, for: session) else {
