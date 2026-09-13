@@ -1530,6 +1530,9 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 XCTAssertEqual(retryPolicyApplication?.outcome, "applied")
                 XCTAssertEqual(retryPolicyApplication?.runID, successorRunID)
                 XCTAssertEqual(retrySnapshot.runState, .completed)
+                // Exact accumulated output: the sidechain-identified `usage` carrier between the
+                // two main-message content chunks contributes neither its sentinel text nor a
+                // message-boundary separator (see PIDOwnedRetryRoutingTestProvider).
                 XCTAssertEqual(retrySnapshot.agentOutput, "retry-success")
                 XCTAssertEqual(retrySnapshot.runID, successorRunID)
                 XCTAssertNotEqual(retrySnapshot.runID, failedRunID)
@@ -1988,7 +1991,25 @@ private final class PIDOwnedRetryRoutingTestProvider: HeadlessAgentProvider {
             throw CancellationError()
         #endif
         return AsyncThrowingStream { continuation in
-            continuation.yield(AIStreamResult(type: "content", text: "retry-success"))
+            // Consumer regression for usage-carrier message identity: a `usage` event carrying a
+            // sidechain `contentMessageID` (and sentinel text) between two main-message content
+            // chunks must be ignored by the assistant output accumulator. The run's exact
+            // `agentOutput` therefore stays "retry-success" with no separator and no sentinel.
+            continuation.yield(AIStreamResult(type: "content", text: "retry-", contentMessageID: "msg_main"))
+            continuation.yield(
+                AIStreamResult(
+                    type: "usage",
+                    text: "USAGE-SENTINEL",
+                    promptTokens: 1,
+                    contentMessageID: "msg_sidechain",
+                    usageObservation: AgentProviderUsageObservation(
+                        source: .messageDelta,
+                        outputTokens: 1,
+                        parentToolUseID: "toolu_side"
+                    )
+                )
+            )
+            continuation.yield(AIStreamResult(type: "content", text: "success", contentMessageID: "msg_main"))
             continuation.finish()
         }
     }

@@ -126,6 +126,7 @@ The remote-by-default policy avoids breaking checkouts that do not have a siblin
 | Headless CLI argument construction | package |
 | Model catalog snapshot (string options, default raws, supported effort levels) | package |
 | Stream-result DTO (`ClaudeProviderStreamResult`, `ClaudeProviderJSONValue`) | package |
+| Usage observation companion (`ClaudeProviderUsageObservation` on `ClaudeProviderStreamResult.usageObservation`) | package; optional, trailing-default `nil`, raw optional counts plus envelope/request/parent-tool identity. Core mirror `AgentProviderUsageObservation` on `AIStreamResult`; the runtime bridge maps both directions. Transport only — no accounting; see the [usage accounting plan](../context/plans/2026-09-13-agent-usage-and-wait-efficiency-plan.md) §2.2 |
 
 The package never touches `UserDefaults`, `Keychain`, or `AgentPermissionSecureStore`. Secrets and persisted backend configs are read in core, sanitized into plugin DTOs (`ClaudeCompatibleBackendConfig`, `ClaudeCompatibleLaunchEnvironment`), and handed to the package at launch/catalog time through bridge functions and provider closures.
 

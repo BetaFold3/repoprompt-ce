@@ -15,6 +15,7 @@ typealias ClaudeCompatiblePluginAvailability = RepoPromptClaudeCompatibleProvide
 typealias ClaudeCompatiblePluginModelOption = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelOption
 typealias ClaudeCompatiblePluginModelCatalogSnapshot = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelCatalogSnapshot
 typealias ClaudeCompatiblePluginStreamResult = RepoPromptClaudeCompatibleProvider.ClaudeProviderStreamResult
+typealias ClaudeCompatiblePluginUsageObservation = RepoPromptClaudeCompatibleProvider.ClaudeProviderUsageObservation
 typealias ClaudeCompatiblePluginRuntimeVariant = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleRuntimeVariant
 typealias ClaudeCompatiblePluginProviderError = RepoPromptClaudeCompatibleProvider.ClaudeCompatibleProviderError
 typealias ClaudeCompatiblePluginPromptDeliveryMode = RepoPromptClaudeCompatibleProvider.ClaudeCompatiblePromptDeliveryMode
@@ -269,8 +270,67 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             stopReason: providerResult.stopReason,
             modelContextWindow: providerResult.modelContextWindow,
             contextUsedTokens: providerResult.contextUsedTokens,
-            contentMessageID: providerResult.contentMessageID
+            contentMessageID: providerResult.contentMessageID,
+            usageObservation: providerResult.usageObservation.map(usageObservation(from:))
         )
+    }
+
+    static func usageObservation(
+        from providerObservation: ClaudeCompatiblePluginUsageObservation
+    ) -> AgentProviderUsageObservation {
+        AgentProviderUsageObservation(
+            source: usageObservationSource(from: providerObservation.source),
+            inputTokens: providerObservation.inputTokens,
+            outputTokens: providerObservation.outputTokens,
+            cacheReadInputTokens: providerObservation.cacheReadInputTokens,
+            cacheCreationInputTokens: providerObservation.cacheCreationInputTokens,
+            model: providerObservation.model,
+            envelopeID: providerObservation.envelopeID,
+            requestID: providerObservation.requestID,
+            parentToolUseID: providerObservation.parentToolUseID,
+            resultSubtype: providerObservation.resultSubtype,
+            resultIsError: providerObservation.resultIsError
+        )
+    }
+
+    static func providerUsageObservation(
+        from observation: AgentProviderUsageObservation
+    ) -> ClaudeCompatiblePluginUsageObservation {
+        ClaudeCompatiblePluginUsageObservation(
+            source: providerUsageObservationSource(from: observation.source),
+            inputTokens: observation.inputTokens,
+            outputTokens: observation.outputTokens,
+            cacheReadInputTokens: observation.cacheReadInputTokens,
+            cacheCreationInputTokens: observation.cacheCreationInputTokens,
+            model: observation.model,
+            envelopeID: observation.envelopeID,
+            requestID: observation.requestID,
+            parentToolUseID: observation.parentToolUseID,
+            resultSubtype: observation.resultSubtype,
+            resultIsError: observation.resultIsError
+        )
+    }
+
+    private static func usageObservationSource(
+        from source: ClaudeCompatiblePluginUsageObservation.Source
+    ) -> AgentProviderUsageObservation.Source {
+        switch source {
+        case .messageStart: .messageStart
+        case .messageDelta: .messageDelta
+        case .assistant: .assistant
+        case .result: .result
+        }
+    }
+
+    private static func providerUsageObservationSource(
+        from source: AgentProviderUsageObservation.Source
+    ) -> ClaudeCompatiblePluginUsageObservation.Source {
+        switch source {
+        case .messageStart: .messageStart
+        case .messageDelta: .messageDelta
+        case .assistant: .assistant
+        case .result: .result
+        }
     }
 
     static func providerStreamResult(from streamResult: AIStreamResult) -> ClaudeCompatiblePluginStreamResult {
@@ -292,7 +352,8 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             stopReason: streamResult.stopReason,
             modelContextWindow: streamResult.modelContextWindow,
             contextUsedTokens: streamResult.contextUsedTokens,
-            contentMessageID: streamResult.contentMessageID
+            contentMessageID: streamResult.contentMessageID,
+            usageObservation: streamResult.usageObservation.map(providerUsageObservation(from:))
         )
     }
 

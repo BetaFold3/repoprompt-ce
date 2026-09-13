@@ -59,6 +59,104 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(config.backendConfig?.id.rawValue, "glmZAI")
     }
 
+    func testStreamResultBridgeRoundTripPreservesEveryFieldIncludingUsageObservation() {
+        let invocationID = UUID()
+        let sources: [(ClaudeCompatiblePluginUsageObservation.Source, AgentProviderUsageObservation.Source)] = [
+            (.messageStart, .messageStart),
+            (.messageDelta, .messageDelta),
+            (.assistant, .assistant),
+            (.result, .result)
+        ]
+        for (pluginSource, coreSource) in sources {
+            let observation = ClaudeCompatiblePluginUsageObservation(
+                source: pluginSource,
+                inputTokens: 10,
+                outputTokens: nil,
+                cacheReadInputTokens: 90,
+                cacheCreationInputTokens: 0,
+                model: "claude-opus-4-8[1m]",
+                envelopeID: "env-\(pluginSource.rawValue)",
+                requestID: "req-\(pluginSource.rawValue)",
+                parentToolUseID: "toolu_parent",
+                resultSubtype: "success",
+                resultIsError: false
+            )
+            let provider = ClaudeCompatiblePluginStreamResult(
+                type: "message_stop",
+                text: "text",
+                reasoning: "reasoning",
+                promptTokens: 7,
+                completionTokens: 3,
+                cost: 1.25,
+                toolName: "tool",
+                toolArgs: "{\"a\":1}",
+                toolOutput: "out",
+                toolInvocationID: invocationID,
+                toolResultJSON: "{\"r\":1}",
+                toolArgsJSON: "{\"a\":1}",
+                toolIsError: true,
+                providerSessionID: "session-1",
+                stopReason: "end_turn",
+                modelContextWindow: 1_000_000,
+                contextUsedTokens: 100,
+                contentMessageID: "msg-\(pluginSource.rawValue)",
+                usageObservation: observation
+            )
+
+            let core = ClaudeCompatiblePluginBridge.streamResult(from: provider)
+            XCTAssertEqual(core.type, provider.type)
+            XCTAssertEqual(core.text, provider.text)
+            XCTAssertEqual(core.reasoning, provider.reasoning)
+            XCTAssertEqual(core.promptTokens, provider.promptTokens)
+            XCTAssertEqual(core.completionTokens, provider.completionTokens)
+            XCTAssertEqual(core.cost, provider.cost)
+            XCTAssertEqual(core.toolName, provider.toolName)
+            XCTAssertEqual(core.toolArgs, provider.toolArgs)
+            XCTAssertEqual(core.toolOutput, provider.toolOutput)
+            XCTAssertEqual(core.toolInvocationID, provider.toolInvocationID)
+            XCTAssertEqual(core.toolResultJSON, provider.toolResultJSON)
+            XCTAssertEqual(core.toolArgsJSON, provider.toolArgsJSON)
+            XCTAssertEqual(core.toolIsError, provider.toolIsError)
+            XCTAssertEqual(core.providerSessionID, provider.providerSessionID)
+            XCTAssertEqual(core.stopReason, provider.stopReason)
+            XCTAssertEqual(core.modelContextWindow, provider.modelContextWindow)
+            XCTAssertEqual(core.contextUsedTokens, provider.contextUsedTokens)
+            XCTAssertEqual(core.contentMessageID, "msg-\(pluginSource.rawValue)")
+            // uuid, request_id and message.id all survive simultaneously and distinctly.
+            XCTAssertEqual(core.usageObservation?.envelopeID, "env-\(pluginSource.rawValue)")
+            XCTAssertEqual(core.usageObservation?.requestID, "req-\(pluginSource.rawValue)")
+            XCTAssertNotEqual(core.usageObservation?.requestID, core.usageObservation?.envelopeID)
+            XCTAssertNotEqual(core.usageObservation?.requestID, core.contentMessageID)
+            XCTAssertEqual(
+                core.usageObservation,
+                AgentProviderUsageObservation(
+                    source: coreSource,
+                    inputTokens: 10,
+                    outputTokens: nil,
+                    cacheReadInputTokens: 90,
+                    cacheCreationInputTokens: 0,
+                    model: "claude-opus-4-8[1m]",
+                    envelopeID: "env-\(pluginSource.rawValue)",
+                    requestID: "req-\(pluginSource.rawValue)",
+                    parentToolUseID: "toolu_parent",
+                    resultSubtype: "success",
+                    resultIsError: false
+                )
+            )
+
+            let roundTripped = ClaudeCompatiblePluginBridge.providerStreamResult(from: core)
+            XCTAssertEqual(roundTripped, provider, "reverse bridge must reproduce the provider DTO for source \(pluginSource.rawValue)")
+        }
+
+        // Absent observation stays absent in both directions; legacy fields still round-trip.
+        let bare = ClaudeCompatiblePluginStreamResult(type: "usage", text: nil, promptTokens: 0, contextUsedTokens: 0)
+        let bareCore = ClaudeCompatiblePluginBridge.streamResult(from: bare)
+        XCTAssertNil(bareCore.usageObservation)
+        XCTAssertEqual(bareCore.promptTokens, 0)
+        XCTAssertEqual(ClaudeCompatiblePluginBridge.providerStreamResult(from: bareCore), bare)
+        XCTAssertNil(AIStreamResult(type: "content", text: "x").usageObservation, "default initializer compatibility")
+    }
+
     func testRootBridgeCatalogRawValueSmokeIsNonMutating() throws {
         XCTAssertEqual(ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: .glmZAI), AgentModel.claudeSonnet.rawValue)
         XCTAssertEqual(ClaudeCompatibleProviderRuntimeBridge.noModelRawValue(for: .kimi), AgentModel.kimiCode.rawValue)

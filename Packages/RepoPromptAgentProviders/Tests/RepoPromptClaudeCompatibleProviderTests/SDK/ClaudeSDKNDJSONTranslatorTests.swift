@@ -126,6 +126,357 @@ final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
         XCTAssertEqual(translator.cliSessionID, "claude-session-2")
     }
 
+    // MARK: - Optional-preserving usage observation transport
+
+    func testUsageObservationTablePreservesRawCountsIdentityAndSourcesWithoutZeroSubstitution() throws {
+        struct Case {
+            let name: String
+            let line: [String: Any]
+            let expectedTypes: [String]
+            let expectedLegacy: (prompt: Int?, completion: Int?, context: Int?)
+            let expectedMessageID: String?
+            let expected: ClaudeProviderUsageObservation?
+        }
+        let mainStart: [String: Any] = [
+            "type": "stream_event",
+            "uuid": "env-start-main",
+            "request_id": "req-start-main",
+            "parent_tool_use_id": NSNull(),
+            "event": [
+                "type": "message_start",
+                "message": [
+                    "id": "msg_main",
+                    "model": "claude-opus-4-8",
+                    "usage": ["input_tokens": 10, "output_tokens": 0, "cache_read_input_tokens": 90, "cache_creation_input_tokens": 5]
+                ]
+            ]
+        ]
+        let cases: [Case] = [
+            Case(
+                name: "message_start preserves cache split, model, and distinct uuid/request_id/message.id",
+                line: mainStart,
+                expectedTypes: ["usage"],
+                expectedLegacy: (10, 0, 105),
+                expectedMessageID: "msg_main",
+                expected: ClaudeProviderUsageObservation(
+                    source: .messageStart,
+                    inputTokens: 10,
+                    outputTokens: 0,
+                    cacheReadInputTokens: 90,
+                    cacheCreationInputTokens: 5,
+                    model: "claude-opus-4-8",
+                    envelopeID: "env-start-main",
+                    requestID: "req-start-main"
+                )
+            ),
+            Case(
+                name: "missing counts stay nil while legacy normalizes to zero",
+                line: [
+                    "type": "stream_event",
+                    "uuid": "env-delta-missing",
+                    "request_id": "req-delta-missing",
+                    "event": ["type": "message_delta", "usage": ["output_tokens": 4]]
+                ],
+                expectedTypes: ["usage"],
+                expectedLegacy: (0, 4, nil),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(
+                    source: .messageDelta,
+                    outputTokens: 4,
+                    envelopeID: "env-delta-missing",
+                    requestID: "req-delta-missing"
+                )
+            ),
+            Case(
+                name: "explicit zero counts are observed as zero, not missing",
+                line: [
+                    "type": "assistant",
+                    "uuid": "env-zero",
+                    "request_id": "req-zero",
+                    "message": ["id": "msg_zero", "model": "claude-sonnet-4-6", "usage": ["input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0]]
+                ],
+                expectedTypes: ["usage"],
+                expectedLegacy: (0, 0, 0),
+                expectedMessageID: "msg_zero",
+                expected: ClaudeProviderUsageObservation(
+                    source: .assistant,
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheReadInputTokens: 0,
+                    cacheCreationInputTokens: 0,
+                    model: "claude-sonnet-4-6",
+                    envelopeID: "env-zero",
+                    requestID: "req-zero"
+                )
+            ),
+            Case(
+                name: "negative, fractional, bool and non-finite counts are unavailable; legacy still bridges bool true to 1",
+                line: [
+                    "type": "assistant",
+                    "message": ["usage": ["input_tokens": -7, "output_tokens": 2.5, "cache_read_input_tokens": true, "cache_creation_input_tokens": "inf"]]
+                ],
+                expectedTypes: ["usage"],
+                expectedLegacy: (0, 0, 1),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(source: .assistant)
+            ),
+            Case(
+                name: "overflowing count is unavailable rather than saturated",
+                line: [
+                    "type": "assistant",
+                    "message": ["usage": ["input_tokens": 3, "output_tokens": "99999999999999999999999"]]
+                ],
+                expectedTypes: ["usage"],
+                expectedLegacy: (3, 0, 3),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(source: .assistant, inputTokens: 3)
+            ),
+            Case(
+                name: "identified sidechain assistant carries parent tool id and its own message id",
+                line: [
+                    "type": "assistant",
+                    "uuid": "env-side",
+                    "request_id": "req-side",
+                    "parent_tool_use_id": "toolu_parent",
+                    "message": ["id": "msg_side", "model": "claude-haiku-4-5", "usage": ["input_tokens": 1, "output_tokens": 2]]
+                ],
+                expectedTypes: ["usage"],
+                expectedLegacy: (1, 2, 1),
+                expectedMessageID: "msg_side",
+                expected: ClaudeProviderUsageObservation(
+                    source: .assistant,
+                    inputTokens: 1,
+                    outputTokens: 2,
+                    model: "claude-haiku-4-5",
+                    envelopeID: "env-side",
+                    requestID: "req-side",
+                    parentToolUseID: "toolu_parent"
+                )
+            ),
+            Case(
+                name: "result attaches subtype, error evidence and envelope id; legacy context stays nil",
+                line: [
+                    "type": "result",
+                    "uuid": "env-result",
+                    "request_id": "req-result",
+                    "subtype": " Success ",
+                    "is_error": false,
+                    "session_id": "s-obs",
+                    "usage": ["input_tokens": 11, "output_tokens": 6, "cache_read_input_tokens": 40],
+                    "total_cost_usd": 0.42
+                ],
+                expectedTypes: ["message_stop"],
+                expectedLegacy: (11, 6, nil),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(
+                    source: .result,
+                    inputTokens: 11,
+                    outputTokens: 6,
+                    cacheReadInputTokens: 40,
+                    envelopeID: "env-result",
+                    requestID: "req-result",
+                    resultSubtype: "success",
+                    resultIsError: false
+                )
+            ),
+            Case(
+                name: "cost-only error result still carries evidence with nil counts",
+                line: [
+                    "type": "result",
+                    "uuid": "env-result-err",
+                    "subtype": "error_max_turns",
+                    "is_error": true,
+                    "total_cost_usd": 0.05
+                ],
+                expectedTypes: ["message_stop"],
+                expectedLegacy: (nil, nil, nil),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(
+                    source: .result,
+                    envelopeID: "env-result-err",
+                    resultSubtype: "error_max_turns",
+                    resultIsError: true
+                )
+            ),
+            Case(
+                name: "near-integer and negative-underflow strings are unavailable, never rounded; plain digit strings count",
+                line: [
+                    "type": "assistant",
+                    "message": ["usage": ["input_tokens": "1.0000000000000001", "output_tokens": "-1e-400", "cache_read_input_tokens": "1.0", "cache_creation_input_tokens": "12"]]
+                ],
+                expectedTypes: ["usage"],
+                expectedLegacy: (1, 0, 14),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(source: .assistant, cacheCreationInputTokens: 12)
+            ),
+            Case(
+                name: "ordinary numeric zero and nonzero counts are observed exactly",
+                line: [
+                    "type": "assistant",
+                    "message": ["usage": ["input_tokens": 0, "output_tokens": 42, "cache_read_input_tokens": "0", "cache_creation_input_tokens": "7"]]
+                ],
+                expectedTypes: ["usage"],
+                expectedLegacy: (0, 42, 7),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(source: .assistant, inputTokens: 0, outputTokens: 42, cacheReadInputTokens: 0, cacheCreationInputTokens: 7)
+            ),
+            Case(
+                name: "whitespace-only result subtype is not reported",
+                line: ["type": "result", "subtype": "   ", "usage": ["input_tokens": 1]],
+                expectedTypes: ["message_stop"],
+                expectedLegacy: (1, 0, nil),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(source: .result, inputTokens: 1)
+            ),
+            Case(
+                name: "usage dictionary without any usage field emits nothing",
+                line: ["type": "assistant", "message": ["usage": ["service_tier": "standard"], "content": []]],
+                expectedTypes: [],
+                expectedLegacy: (nil, nil, nil),
+                expectedMessageID: nil,
+                expected: nil
+            )
+        ]
+
+        for testCase in cases {
+            var translator = ClaudeSDKNDJSONTranslator()
+            let results = translator.parseNDJSONLine(jsonLine(testCase.line))
+            XCTAssertEqual(results.map(\.type), testCase.expectedTypes, testCase.name)
+            guard let carrier = results.first(where: { $0.type == "usage" || $0.type == "message_stop" }) else {
+                XCTAssertNil(testCase.expected, testCase.name)
+                continue
+            }
+            XCTAssertEqual(carrier.promptTokens, testCase.expectedLegacy.prompt, "\(testCase.name): legacy prompt")
+            XCTAssertEqual(carrier.completionTokens, testCase.expectedLegacy.completion, "\(testCase.name): legacy completion")
+            XCTAssertEqual(carrier.contextUsedTokens, testCase.expectedLegacy.context, "\(testCase.name): legacy context")
+            XCTAssertEqual(carrier.contentMessageID, testCase.expectedMessageID, "\(testCase.name): message.id rides on the carrier")
+            XCTAssertEqual(carrier.usageObservation, testCase.expected, testCase.name)
+            // Non-carrier results (content/tool) never gain a message id from the translator.
+            for other in results where other.type != "usage" && other.type != "message_stop" {
+                XCTAssertNil(other.contentMessageID, "\(testCase.name): legacy content identity unchanged")
+                XCTAssertNil(other.usageObservation, testCase.name)
+            }
+        }
+
+        // Raw cost stays on the existing field and is not duplicated into the observation.
+        var translator = ClaudeSDKNDJSONTranslator()
+        let costResult = try XCTUnwrap(translator.parseNDJSONLine(jsonLine(cases[6].line)).first)
+        XCTAssertEqual(costResult.cost, 0.42)
+        XCTAssertNil(costResult.contextUsedTokens)
+
+        // The DTO stream path (`parseStreamPayload`) rejects booleans and fractions the same way.
+        var payloadTranslator = ClaudeSDKNDJSONTranslator()
+        let payloadResults = payloadTranslator.parseStreamPayload([
+            "type": .string("assistant"),
+            "message": .object(["usage": .object([
+                "input_tokens": .bool(true),
+                "output_tokens": .integer(3),
+                "cache_read_input_tokens": .double(2.5),
+                "cache_creation_input_tokens": .double(4)
+            ])])
+        ])
+        let payloadCarrier = try XCTUnwrap(payloadResults.first)
+        XCTAssertEqual(payloadCarrier.type, "usage")
+        // Legacy stays untouched on this path too: `foundationObject()` yields a native Swift `Bool`,
+        // which `numberToInt` does not bridge (unlike the NDJSON path's CFBoolean NSNumber → 1),
+        // so the legacy projection normalizes the missing input to 0. The observation rejects the
+        // boolean either way.
+        XCTAssertEqual(payloadCarrier.promptTokens, 0, "legacy bool handling unchanged on the payload path")
+        XCTAssertEqual(payloadCarrier.completionTokens, 3)
+        XCTAssertEqual(
+            payloadCarrier.usageObservation,
+            ClaudeProviderUsageObservation(source: .assistant, outputTokens: 3, cacheCreationInputTokens: 4)
+        )
+    }
+
+    func testMessageDeltaObservationInheritsLaneMessageIDAndUnidentifiedSidechainStaysUnassigned() {
+        var translator = ClaudeSDKNDJSONTranslator()
+        func line(_ eventType: String, parent: Any? = nil, message: [String: Any]? = nil, usage: [String: Any]? = nil, uuid: String? = nil, requestID: String? = nil) -> Data {
+            var event: [String: Any] = ["type": eventType]
+            if let message { event["message"] = message }
+            if let usage { event["usage"] = usage }
+            var envelope: [String: Any] = ["type": "stream_event", "event": event]
+            if let parent { envelope["parent_tool_use_id"] = parent }
+            if let uuid { envelope["uuid"] = uuid }
+            if let requestID { envelope["request_id"] = requestID }
+            return jsonLine(envelope)
+        }
+        func delta(parent: Any? = nil, uuid: String? = nil, requestID: String? = nil) -> ClaudeProviderStreamResult? {
+            translator.parseNDJSONLine(line("message_delta", parent: parent, usage: ["output_tokens": 1], uuid: uuid, requestID: requestID)).first
+        }
+
+        // Main lane opens with msg_main; a main delta inherits it while its own uuid and
+        // request_id stay distinct from the inherited message id.
+        _ = translator.parseNDJSONLine(line("message_start", message: ["id": "msg_main", "usage": ["input_tokens": 5]], uuid: "u-start", requestID: "req-start"))
+        let mainDelta = delta(uuid: "u-d1", requestID: "req-d1")
+        XCTAssertEqual(mainDelta?.contentMessageID, "msg_main")
+        XCTAssertEqual(mainDelta?.usageObservation?.envelopeID, "u-d1")
+        XCTAssertEqual(mainDelta?.usageObservation?.requestID, "req-d1")
+        XCTAssertNil(mainDelta?.usageObservation?.parentToolUseID)
+
+        // A sidechain delta whose lane never opened must not borrow the main message id.
+        let unopenedSidechain = delta(parent: "toolu_unopened", uuid: "u-side", requestID: "req-side")
+        XCTAssertEqual(unopenedSidechain?.usageObservation?.parentToolUseID, "toolu_unopened")
+        XCTAssertEqual(unopenedSidechain?.usageObservation?.requestID, "req-side")
+        XCTAssertNil(unopenedSidechain?.contentMessageID)
+
+        // A sidechain delta with an unidentifiable (non-string, non-null) parent is unassigned
+        // and does not open or read the main lane.
+        let ambiguous = delta(parent: ["nested": "object"])
+        XCTAssertNil(ambiguous?.usageObservation?.parentToolUseID)
+        XCTAssertNil(ambiguous?.contentMessageID)
+        XCTAssertEqual(delta()?.contentMessageID, "msg_main", "main lane unaffected by ambiguous sidechain")
+
+        // Blank/whitespace non-null parents are unassigned: a blank-parent delta never inherits
+        // the main message, and blank-parent start/stop can neither overwrite nor close the main lane.
+        for blank in ["", "   ", "\n\t"] {
+            let blankDelta = delta(parent: blank)
+            XCTAssertNil(blankDelta?.usageObservation?.parentToolUseID, "blank parent \(blank.debugDescription)")
+            XCTAssertNil(blankDelta?.contentMessageID, "blank parent \(blank.debugDescription) must not inherit msg_main")
+            _ = translator.parseNDJSONLine(line("message_start", parent: blank, message: ["id": "msg_blank", "usage": ["input_tokens": 1]]))
+            XCTAssertEqual(delta()?.contentMessageID, "msg_main", "blank-parent start must not overwrite the main lane")
+            XCTAssertNil(delta(parent: blank)?.contentMessageID, "blank-parent start opens no lane")
+            _ = translator.parseNDJSONLine(line("message_stop", parent: blank))
+            XCTAssertEqual(delta()?.contentMessageID, "msg_main", "blank-parent stop must not close the main lane")
+        }
+        // Explicit JSON null parent keeps main-lane semantics.
+        XCTAssertEqual(delta(parent: NSNull())?.contentMessageID, "msg_main")
+        XCTAssertNil(delta(parent: NSNull())?.usageObservation?.parentToolUseID)
+
+        // An identified sidechain lane opens independently and only its own deltas inherit it.
+        _ = translator.parseNDJSONLine(line("message_start", parent: "toolu_side", message: ["id": "msg_side", "usage": ["input_tokens": 2]]))
+        XCTAssertEqual(delta(parent: "toolu_side")?.contentMessageID, "msg_side")
+        XCTAssertEqual(delta()?.contentMessageID, "msg_main")
+        XCTAssertNil(delta(parent: "toolu_other")?.contentMessageID)
+
+        // message_stop closes only its lane; a start without an id closes the lane too.
+        _ = translator.parseNDJSONLine(line("message_stop", parent: "toolu_side"))
+        XCTAssertNil(delta(parent: "toolu_side")?.contentMessageID)
+        XCTAssertEqual(delta()?.contentMessageID, "msg_main")
+        _ = translator.parseNDJSONLine(line("message_start", message: ["usage": ["input_tokens": 1]]))
+        XCTAssertNil(delta()?.contentMessageID)
+
+        // A new stream init and an explicit reset both clear open lanes.
+        _ = translator.parseNDJSONLine(line("message_start", message: ["id": "msg_next", "usage": ["input_tokens": 1]]))
+        XCTAssertEqual(delta()?.contentMessageID, "msg_next")
+        _ = translator.parseNDJSONLine(jsonLine(["type": "system", "subtype": "init", "session_id": "s-new"]))
+        XCTAssertNil(delta()?.contentMessageID)
+        _ = translator.parseNDJSONLine(line("message_start", message: ["id": "msg_reset", "usage": ["input_tokens": 1]]))
+        XCTAssertEqual(delta()?.contentMessageID, "msg_reset")
+        translator.resetMainModelTracking()
+        XCTAssertNil(delta()?.contentMessageID)
+
+        // Legacy content deltas never gain a message id from lane tracking.
+        _ = translator.parseNDJSONLine(line("message_start", message: ["id": "msg_content", "usage": ["input_tokens": 1]]))
+        let content = translator.parseNDJSONLine(jsonLine([
+            "type": "stream_event",
+            "event": ["type": "content_block_delta", "delta": ["type": "text_delta", "text": "hi"]]
+        ])).first
+        XCTAssertEqual(content?.type, "content")
+        XCTAssertNil(content?.contentMessageID)
+        XCTAssertNil(content?.usageObservation)
+    }
+
     // MARK: - Main-model attribution for modelUsage context windows
 
     func testModelUsageMainModelAttributionSelectsInitTrackedWindowOverBackgroundHaiku() {

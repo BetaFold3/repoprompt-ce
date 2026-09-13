@@ -12,6 +12,12 @@ public struct ClaudeSDKNDJSONTranslator {
     private var trackedMainModelID: String?
     private var lastMatchedMainContextWindow: Int?
     private var didLogModelUsageNoMatchFallback = false
+    // Open Anthropic message id per stream lane, keyed by `parent_tool_use_id` (main lane uses
+    // `mainLaneKey`). A `message_start` with `message.id` opens the lane; `message_stop` closes
+    // it. Only `message_delta` observations in the same lane inherit that id, so an unidentified
+    // sidechain delta is never attributed to the latest main message.
+    private var openMessageIDByLane: [String: String] = [:]
+    private static let mainLaneKey = ""
     private let enableDebugLogging: Bool
     private let treatsToolResultErrorsAsHostOwned: @Sendable (String) -> Bool
 
@@ -23,10 +29,14 @@ public struct ClaudeSDKNDJSONTranslator {
         self.treatsToolResultErrorsAsHostOwned = treatsToolResultErrorsAsHostOwned
     }
 
+    /// Resets per-stream tracking: main-model attribution state AND the open message-id lanes
+    /// used for usage-observation identity. The controller calls this for each process stream
+    /// (including shutdown/EOF reuse); lane clearing is required there, not incidental.
     public mutating func resetMainModelTracking() {
         trackedMainModelID = nil
         lastMatchedMainContextWindow = nil
         didLogModelUsageNoMatchFallback = false
+        openMessageIDByLane = [:]
     }
 
     #if DEBUG
@@ -116,6 +126,7 @@ public struct ClaudeSDKNDJSONTranslator {
                 lastMatchedMainContextWindow = nil
                 didLogModelUsageNoMatchFallback = false
             }
+            openMessageIDByLane = [:]
             return [ClaudeProviderStreamResult(type: ClaudeProviderStreamResult.lifecycleType, text: "initialized")]
         }
 
@@ -220,12 +231,20 @@ public struct ClaudeSDKNDJSONTranslator {
         }
         let usageResult: ClaudeProviderStreamResult? = {
             guard let usage = parseUsage(payload["usage"] as? [String: Any]) else { return nil }
+            let observation = makeUsageObservation(
+                source: .assistant,
+                usage: usage,
+                envelope: json,
+                model: firstString(in: payload, keys: ["model"])
+            )
             return ClaudeProviderStreamResult(
                 type: "usage",
                 text: nil,
-                promptTokens: usage.inputTokens,
-                completionTokens: usage.outputTokens,
-                contextUsedTokens: usage.contextUsedTokens
+                promptTokens: usage.legacy.inputTokens,
+                completionTokens: usage.legacy.outputTokens,
+                contextUsedTokens: usage.legacy.contextUsedTokens,
+                contentMessageID: firstString(in: payload, keys: ["id"]),
+                usageObservation: observation
             )
         }()
         guard let content = payload["content"] as? [Any] else {
@@ -407,31 +426,55 @@ public struct ClaudeSDKNDJSONTranslator {
             return []
 
         case "message_start":
-            guard let message = event["message"] as? [String: Any],
+            let message = event["message"] as? [String: Any]
+            let startMessageID = message.flatMap { firstString(in: $0, keys: ["id"]) }
+            // Open (or re-open) this lane's message identity before emitting usage so that
+            // later deltas in the same lane can reference it. A start without an id closes
+            // the lane so stale ids are not inherited.
+            if let laneKey = laneKey(for: json) {
+                openMessageIDByLane[laneKey] = startMessageID
+            }
+            guard let message,
                   let usage = parseUsage(message["usage"] as? [String: Any])
             else {
                 return []
             }
+            let observation = makeUsageObservation(
+                source: .messageStart,
+                usage: usage,
+                envelope: json,
+                model: firstString(in: message, keys: ["model"])
+            )
             return [
                 ClaudeProviderStreamResult(
                     type: "usage",
                     text: nil,
-                    promptTokens: usage.inputTokens,
-                    completionTokens: usage.outputTokens,
-                    contextUsedTokens: usage.contextUsedTokens
+                    promptTokens: usage.legacy.inputTokens,
+                    completionTokens: usage.legacy.outputTokens,
+                    contextUsedTokens: usage.legacy.contextUsedTokens,
+                    contentMessageID: startMessageID,
+                    usageObservation: observation
                 )
             ]
 
         case "message_delta":
             var results: [ClaudeProviderStreamResult] = []
             if let usage = parseUsage(event["usage"] as? [String: Any]) {
+                let observation = makeUsageObservation(
+                    source: .messageDelta,
+                    usage: usage,
+                    envelope: json,
+                    model: nil
+                )
                 results.append(
                     ClaudeProviderStreamResult(
                         type: "usage",
                         text: nil,
-                        promptTokens: usage.inputTokens,
-                        completionTokens: usage.outputTokens,
-                        contextUsedTokens: usage.contextUsedTokens
+                        promptTokens: usage.legacy.inputTokens,
+                        completionTokens: usage.legacy.outputTokens,
+                        contextUsedTokens: usage.legacy.contextUsedTokens,
+                        contentMessageID: laneKey(for: json).flatMap { openMessageIDByLane[$0] },
+                        usageObservation: observation
                     )
                 )
             }
@@ -444,6 +487,9 @@ public struct ClaudeSDKNDJSONTranslator {
             return results
 
         case "message_stop":
+            if let laneKey = laneKey(for: json) {
+                openMessageIDByLane.removeValue(forKey: laneKey)
+            }
             return [ClaudeProviderStreamResult(type: "message_stop", text: nil)]
 
         default:
@@ -489,7 +535,8 @@ public struct ClaudeSDKNDJSONTranslator {
         let resultSubtype = firstString(in: json, keys: ["subtype"])?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
-        let isError = boolValue(in: json, keys: ["is_error", "isError"]) == true
+        let rawIsError = boolValue(in: json, keys: ["is_error", "isError"])
+        let isError = rawIsError == true
         let resultSessionID = firstString(in: json, keys: ["session_id", "sessionId"])
         if let resultSessionID {
             cliSessionID = resultSessionID
@@ -518,16 +565,29 @@ public struct ClaudeSDKNDJSONTranslator {
         // Note: contextUsedTokens is intentionally nil here. Claude's result.usage is an aggregate
         // billed-turn total, not a live context snapshot. Live context snapshots come from stream
         // usage events (message_start / message_delta) and are tracked separately by the estimator.
+        // The raw observation is attached even when `usage` is absent so result subtype/error
+        // evidence and envelope identity survive alongside the raw cumulative `cost`.
+        // Observation evidence: a whitespace-only subtype is "not reported" (`nil`), while the
+        // legacy `resultSubtype` variable above keeps its existing value for error gating.
+        let resultObservation = makeUsageObservation(
+            source: .result,
+            usage: usage,
+            envelope: json,
+            model: nil,
+            resultSubtype: resultSubtype.flatMap { $0.isEmpty ? nil : $0 },
+            resultIsError: rawIsError
+        )
         results.append(
             ClaudeProviderStreamResult(
                 type: "message_stop",
                 text: nil,
-                promptTokens: usage?.inputTokens,
-                completionTokens: usage?.outputTokens,
+                promptTokens: usage?.legacy.inputTokens,
+                completionTokens: usage?.legacy.outputTokens,
                 cost: cost,
                 providerSessionID: cliSessionID,
                 stopReason: stopReason,
-                modelContextWindow: modelContextWindow
+                modelContextWindow: modelContextWindow,
+                usageObservation: resultObservation
             )
         )
         return results
@@ -1010,7 +1070,21 @@ public struct ClaudeSDKNDJSONTranslator {
         return true
     }
 
-    private func parseUsage(_ value: [String: Any]?) -> TokenUsage? {
+    /// Usage parsed once from a raw `usage` dictionary: the legacy normalized projection plus
+    /// the raw (unnormalized) counts that feed the optional-preserving observation.
+    private struct ParsedUsage {
+        let legacy: TokenUsage
+        // Observation-grade counts: non-negative exact integers only, otherwise nil.
+        // Key precedence is canonical snake_case first, camelCase only when the snake_case key is
+        // absent (conservative: a present-but-invalid canonical value stays unavailable). The
+        // legacy projection keeps its own `numberToInt(snake) ?? numberToInt(camel)` fallthrough.
+        let rawInput: Int?
+        let rawOutput: Int?
+        let rawCacheRead: Int?
+        let rawCacheCreation: Int?
+    }
+
+    private func parseUsage(_ value: [String: Any]?) -> ParsedUsage? {
         guard let value else { return nil }
 
         let input = numberToInt(value["input_tokens"]) ?? numberToInt(value["inputTokens"])
@@ -1028,11 +1102,116 @@ public struct ClaudeSDKNDJSONTranslator {
             ? saturatedNonNegativeSum(normalizedInput, max(0, cacheRead ?? 0), max(0, cacheCreation ?? 0))
             : nil
 
-        return TokenUsage(
-            inputTokens: normalizedInput,
-            outputTokens: normalizedOutput,
-            contextUsedTokens: contextUsedTokens
+        return ParsedUsage(
+            legacy: TokenUsage(
+                inputTokens: normalizedInput,
+                outputTokens: normalizedOutput,
+                contextUsedTokens: contextUsedTokens
+            ),
+            rawInput: observedCount(value["input_tokens"] ?? value["inputTokens"]),
+            rawOutput: observedCount(value["output_tokens"] ?? value["outputTokens"]),
+            rawCacheRead: observedCount(value["cache_read_input_tokens"] ?? value["cacheReadInputTokens"]),
+            rawCacheCreation: observedCount(value["cache_creation_input_tokens"] ?? value["cacheCreationInputTokens"])
         )
+    }
+
+    /// Builds the optional-preserving observation from already-parsed usage and raw envelope
+    /// identity (`uuid`, literal `request_id`, `parent_tool_use_id`). Counts that are missing or
+    /// invalid (negative, fractional, boolean, non-finite, overflowing) stay `nil`; the legacy
+    /// projection's zero-normalization never leaks in here. The Anthropic `message.id` travels on
+    /// the carrier's `contentMessageID` rather than being duplicated here.
+    private func makeUsageObservation(
+        source: ClaudeProviderUsageObservation.Source,
+        usage: ParsedUsage?,
+        envelope: [String: Any],
+        model: String?,
+        resultSubtype: String? = nil,
+        resultIsError: Bool? = nil
+    ) -> ClaudeProviderUsageObservation {
+        ClaudeProviderUsageObservation(
+            source: source,
+            inputTokens: usage?.rawInput,
+            outputTokens: usage?.rawOutput,
+            cacheReadInputTokens: usage?.rawCacheRead,
+            cacheCreationInputTokens: usage?.rawCacheCreation,
+            model: model,
+            envelopeID: firstString(in: envelope, keys: ["uuid"]),
+            requestID: firstString(in: envelope, keys: ["request_id", "requestId"]),
+            parentToolUseID: parentToolUseID(in: envelope),
+            resultSubtype: resultSubtype,
+            resultIsError: resultIsError
+        )
+    }
+
+    /// Observation-grade count parsing: exact and conservatively rejecting. Accepts only
+    /// - non-negative integral `NSNumber`/`Int` values,
+    /// - finite, non-negative (sign plus, so `-0` is rejected), integral floating values whose
+    ///   magnitude is at most 2^53 (exactly representable — no rounding guess), and
+    /// - strings made solely of ASCII digits that fit in `Int` (no sign, fraction, exponent or
+    ///   whitespace, so "1.0000000000000001" and "-1e-400" are unavailable, never rounded).
+    /// Booleans, negatives, fractions, non-finite and overflowing values are `nil`. The legacy
+    /// `numberToInt` projection is intentionally untouched.
+    private func observedCount(_ raw: Any?) -> Int? {
+        switch raw {
+        case let string as String:
+            return exactDigitCount(string)
+        case let number as NSNumber:
+            if CFGetTypeID(number) == CFBooleanGetTypeID() { return nil }
+            if CFNumberIsFloatType(number) {
+                return exactIntegralCount(number.doubleValue)
+            }
+            guard let value = Int(exactly: number), value >= 0 else { return nil }
+            return value
+        default:
+            return nil
+        }
+    }
+
+    private func exactIntegralCount(_ double: Double) -> Int? {
+        guard double.isFinite,
+              double.sign == .plus,
+              double == double.rounded(.towardZero),
+              double <= 9_007_199_254_740_992
+        else {
+            return nil
+        }
+        return Int(double)
+    }
+
+    private func exactDigitCount(_ string: String) -> Int? {
+        guard !string.isEmpty,
+              string.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") })
+        else {
+            return nil
+        }
+        return Int(string)
+    }
+
+    /// Identified `parent_tool_use_id` (non-blank string or integral, non-boolean number) or
+    /// `nil` when absent/null/unidentifiable.
+    private func parentToolUseID(in json: [String: Any]) -> String? {
+        switch json["parent_tool_use_id"] {
+        case let identifier as String:
+            let trimmed = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        case let number as NSNumber:
+            if CFGetTypeID(number) == CFBooleanGetTypeID() || CFNumberIsFloatType(number) { return nil }
+            return number.stringValue
+        default:
+            return nil
+        }
+    }
+
+    /// Lane key for message-identity tracking, classified directly from the raw envelope:
+    /// - absent or JSON `null` parent → main lane;
+    /// - identified parent → that parent's own lane;
+    /// - any other non-null parent (blank/whitespace string, bool, float, object, array) → `nil`,
+    ///   an unassigned lane that can neither read, open nor close the main lane.
+    private func laneKey(for json: [String: Any]) -> String? {
+        guard let parent = json["parent_tool_use_id"], !(parent is NSNull) else {
+            return Self.mainLaneKey
+        }
+        return parentToolUseID(in: json)
     }
 
     private func saturatedNonNegativeSum(_ values: Int...) -> Int {

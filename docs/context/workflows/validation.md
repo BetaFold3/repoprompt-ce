@@ -23,6 +23,7 @@ Run the smallest coordinated check that can fail for the behavior you changed. D
 | Packaging, MCP CLI, Agent Mode, or running-app behavior | Run the smallest build/test above, then follow the live checks in [development](development.md). |
 | Test executable inventory or optimization campaign | Follow [testing](../../testing.md); update the curated ledger surgically and never regenerate it. |
 | Release metadata, packaging, signing, or promotion | Follow [releasing](../../releasing.md) and the [release skill](../../../.agents/skills/rpce-release/SKILL.md). |
+| Agent Mode provider usage/cost accounting, worker wait policy, or `agent_run` response presentation | Follow the [usage accounting and wait efficiency plan](../plans/2026-09-13-agent-usage-and-wait-efficiency-plan.md); its §8 lists the deterministic suites and the G1–G3 runtime gates. |
 
 `make dev-format` mutates first-party Swift files. Run it for intended Swift formatting; don't run it for documentation-only work or as a speculative repository-wide cleanup.
 

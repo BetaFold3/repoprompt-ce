@@ -253,6 +253,66 @@ extension AIProviderError: LocalizedError {
     }
 }
 
+/// Core-owned, optional-preserving raw usage observation carried alongside `AIStreamResult`.
+///
+/// Mirrors the provider observation without normalization: missing counts stay `nil` (never
+/// zero), identity fields are copied from the raw envelope only, the raw cumulative cost
+/// remains on `AIStreamResult.cost`, and the provider message id remains on the carrier's
+/// `AIStreamResult.contentMessageID`. Legacy `promptTokens`/`completionTokens`/`contextUsedTokens`
+/// semantics are unchanged by this companion.
+struct AgentProviderUsageObservation: Equatable {
+    enum Source: String, Equatable {
+        case messageStart = "message_start"
+        case messageDelta = "message_delta"
+        case assistant
+        case result
+    }
+
+    let source: Source
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let cacheReadInputTokens: Int?
+    let cacheCreationInputTokens: Int?
+    /// Reported model when the envelope carried one.
+    let model: String?
+    /// Top-level provider envelope id (Claude SDK `uuid`) when present.
+    let envelopeID: String?
+    /// Literal provider `request_id` when present; distinct from `envelopeID` and `contentMessageID`.
+    let requestID: String?
+    /// Non-null parent tool use id marks a sidechain/subagent observation.
+    let parentToolUseID: String?
+    /// Result subtype evidence for `.result` observations.
+    let resultSubtype: String?
+    /// Result error evidence for `.result` observations when reported.
+    let resultIsError: Bool?
+
+    init(
+        source: Source,
+        inputTokens: Int? = nil,
+        outputTokens: Int? = nil,
+        cacheReadInputTokens: Int? = nil,
+        cacheCreationInputTokens: Int? = nil,
+        model: String? = nil,
+        envelopeID: String? = nil,
+        requestID: String? = nil,
+        parentToolUseID: String? = nil,
+        resultSubtype: String? = nil,
+        resultIsError: Bool? = nil
+    ) {
+        self.source = source
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadInputTokens = cacheReadInputTokens
+        self.cacheCreationInputTokens = cacheCreationInputTokens
+        self.model = model
+        self.envelopeID = envelopeID
+        self.requestID = requestID
+        self.parentToolUseID = parentToolUseID
+        self.resultSubtype = resultSubtype
+        self.resultIsError = resultIsError
+    }
+}
+
 /// Updated `AIStreamResult` to include optional `reasoning`, token counts, and tool metadata.
 struct AIStreamResult {
     /// Standard type strings for stream results
@@ -282,7 +342,11 @@ struct AIStreamResult {
     let contextUsedTokens: Int?
     /// Stable provider message identifier for content chunks when available.
     /// Used by lightweight aggregators to separate whole-message chunks without affecting token deltas.
+    /// On `usage`/result `message_stop` carriers it identifies the message the `usageObservation`
+    /// belongs to (`nil` when unidentified).
     let contentMessageID: String?
+    /// Raw provider usage observation for `usage` and result `message_stop` events when available.
+    let usageObservation: AgentProviderUsageObservation?
 
     init(
         type: String,
@@ -302,7 +366,8 @@ struct AIStreamResult {
         stopReason: String? = nil,
         modelContextWindow: Int? = nil,
         contextUsedTokens: Int? = nil,
-        contentMessageID: String? = nil
+        contentMessageID: String? = nil,
+        usageObservation: AgentProviderUsageObservation? = nil
     ) {
         self.type = type
         self.text = text
@@ -322,6 +387,7 @@ struct AIStreamResult {
         self.modelContextWindow = modelContextWindow
         self.contextUsedTokens = contextUsedTokens
         self.contentMessageID = contentMessageID
+        self.usageObservation = usageObservation
     }
 }
 
