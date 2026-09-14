@@ -80,6 +80,9 @@ struct AgentRuntimeSidebarView: View {
                     // Context usage
                     contextUsageSection
 
+                    // Provider usage accounting
+                    providerUsageSection
+
                     // Export context
                     exportContextSection
                 }
@@ -337,6 +340,27 @@ struct AgentRuntimeSidebarView: View {
                 .agentSidebarCard()
             }
         }
+    }
+
+    // MARK: - Provider Usage
+
+    private var providerUsageSection: some View {
+        let presentation = runtimeVM.snapshot.providerUsage.presentation
+        return VStack(alignment: .leading, spacing: 4) {
+            Text(presentation.title)
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+
+            Text(presentation.readoutText)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+        .hoverTooltip(presentation.detailText)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(presentation.title)
+        .accessibilityValue(presentation.detailText)
+        .agentSidebarCard()
     }
 
     // MARK: - Export Context

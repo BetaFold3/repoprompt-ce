@@ -20,6 +20,212 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         }
     }
 
+    struct ProviderUsageSnapshot: Equatable {
+        enum Scope: Equatable {
+            case claude
+            case codex
+            case unsupported(String)
+        }
+
+        struct Presentation: Equatable {
+            var title: String
+            var readoutText: String
+            var detailText: String
+        }
+
+        var scope: Scope
+        var trackingStartedAt: Date?
+        var cacheHitShare: AgentUsageCacheHitShare?
+        var costEstimate: AgentUsageCostEstimate?
+        /// Explains why restored read-only values cannot claim current full-session coverage.
+        var coverageDetail: String?
+        /// Accepted accounting mutations only. This lets lifecycle changes publish through the
+        /// existing equality guard without making transcript text a usage update signal.
+        var accountingRevision: UInt64?
+
+        init(
+            scope: Scope,
+            trackingStartedAt: Date? = nil,
+            cacheHitShare: AgentUsageCacheHitShare? = nil,
+            costEstimate: AgentUsageCostEstimate? = nil,
+            coverageDetail: String? = nil,
+            accountingRevision: UInt64? = nil
+        ) {
+            self.scope = scope
+            self.trackingStartedAt = trackingStartedAt
+            self.cacheHitShare = cacheHitShare
+            self.costEstimate = costEstimate
+            self.coverageDetail = coverageDetail
+            self.accountingRevision = accountingRevision
+        }
+
+        static func unavailable(for selectedAgent: AgentProviderKind?) -> Self {
+            .init(scope: scope(for: selectedAgent))
+        }
+
+        /// Projects only an owned, semantically valid accounting record. A strict lossless view of
+        /// an opaque v1 value is eligible; unsupported opaque data and foreign origins remain
+        /// unavailable. Production's unqualified gate may expose hydrated data but never live
+        /// mutations, because an unqualified accumulator is accepted only at revision zero.
+        static func projected(
+            selectedAgent: AgentProviderKind?,
+            accounting: AgentUsageAccumulator?,
+            expectedOwnerSessionID: UUID?
+        ) -> Self {
+            let resolvedScope = scope(for: selectedAgent)
+            guard resolvedScope == .claude,
+                  let expectedOwnerSessionID,
+                  let accounting,
+                  accounting.ownerSessionID == expectedOwnerSessionID,
+                  accounting.eligibility == .eligible,
+                  let record = accounting.record,
+                  record.originSessionID == expectedOwnerSessionID,
+                  record.semanticViolation == nil,
+                  accounting.qualification != .unqualified || accounting.ownedRevision == 0
+            else {
+                return .init(scope: resolvedScope)
+            }
+            var cacheHitShare = accounting.cacheHitShare
+            var costEstimate = accounting.sessionCostEstimate
+            var coverageDetail: String?
+            if accounting.qualification == .unqualified {
+                if cacheHitShare != nil {
+                    cacheHitShare?.coverage = .partial
+                }
+                if costEstimate != nil {
+                    costEstimate?.coverage = .partial
+                }
+                var details = [
+                    "These figures are restored historical accounting; current runtime tracking is unqualified, so coverage is partial."
+                ]
+                if record.turns.contains(where: { $0.outcome == .open })
+                    || record.claudeSegments.contains(where: { $0.state == .open })
+                {
+                    details.append("The restored state includes unfinished work.")
+                }
+                if accounting.activeExecutionID != nil {
+                    details.append("The current continuation is unmeasured.")
+                }
+                coverageDetail = details.joined(separator: " ")
+            }
+            return .init(
+                scope: resolvedScope,
+                trackingStartedAt: record.trackingStartedAt,
+                cacheHitShare: cacheHitShare,
+                costEstimate: costEstimate,
+                coverageDetail: coverageDetail,
+                accountingRevision: accounting.ownedRevision
+            )
+        }
+
+        var presentation: Presentation {
+            switch scope {
+            case .claude:
+                claudePresentation
+            case .codex:
+                .init(
+                    title: "Codex session usage",
+                    readoutText: "CH — · Est. —",
+                    detailText: "Cache hit (CH) share and cost are unavailable because Codex usage accounting is not available in this build."
+                )
+            case let .unsupported(providerName):
+                .init(
+                    title: "\(providerName) usage",
+                    readoutText: "CH — · Est. —",
+                    detailText: "Cache hit (CH) share and cost are unavailable for \(providerName)."
+                )
+            }
+        }
+
+        private static func scope(for selectedAgent: AgentProviderKind?) -> Scope {
+            switch selectedAgent {
+            case .claudeCode:
+                .claude
+            case .codexExec:
+                .codex
+            case let selectedAgent?:
+                .unsupported(selectedAgent.displayName)
+            case nil:
+                .unsupported("Provider")
+            }
+        }
+
+        private var claudePresentation: Presentation {
+            let cacheReadout = cacheHitShare.flatMap {
+                $0.coverage == .unavailable ? nil : Self.cachePercentage($0.ratio)
+            }
+            let costReadout = costEstimate.flatMap {
+                $0.coverage == .unavailable || $0.currency != AgentUsageAccumulator.claudeCurrency
+                    ? nil
+                    : Self.usdAmount($0.amount)
+            }
+            let cacheInline = cacheReadout.map {
+                "CH \($0)\(Self.partialSuffix(cacheHitShare?.coverage))"
+            } ?? "CH —"
+            let costInline = costReadout.map {
+                "Est. \($0)\(Self.partialSuffix(costEstimate?.coverage))"
+            } ?? "Est. —"
+
+            let cacheDetail = cacheReadout.map {
+                "Cache hit (CH) share: \($0) (\(Self.coverageText(cacheHitShare?.coverage)) coverage). It is token-weighted over validated main-loop input triples."
+            } ?? "Cache hit (CH) share: unavailable. It is token-weighted over validated main-loop input triples."
+            let trackingDetail = trackingStartedAt.map {
+                "Tracking interval starts \($0.formatted(date: .abbreviated, time: .shortened)); coverage is reported per metric."
+            } ?? "Tracking interval: unavailable; coverage is reported per metric."
+            let costDetail = costReadout.map {
+                "Provider-estimated USD cost: \($0) (\(Self.coverageText(costEstimate?.coverage)) coverage). It covers tracked Claude session activity, includes native Claude subagents, and excludes separate RepoPrompt CE worker sessions."
+            } ?? "Provider-estimated USD cost: unavailable. Its scope would cover tracked Claude session activity, include native Claude subagents, and exclude separate RepoPrompt CE worker sessions."
+
+            return .init(
+                title: "Claude session usage",
+                readoutText: "\(cacheInline) · \(costInline)",
+                detailText: [cacheDetail, trackingDetail, costDetail, coverageDetail]
+                    .compactMap(\.self)
+                    .joined(separator: " ")
+            )
+        }
+
+        private static func cachePercentage(_ ratio: Decimal) -> String {
+            if ratio > 0, ratio < Decimal(string: "0.001")! {
+                return "<0.1%"
+            }
+            return "\(formatted(ratio * 100, fractionDigits: 1))%"
+        }
+
+        private static func usdAmount(_ amount: Decimal) -> String {
+            if amount > 0, amount < Decimal(string: "0.001")! {
+                return "$\(NSDecimalNumber(decimal: amount).stringValue)"
+            }
+            return "$\(formatted(amount, fractionDigits: 3))"
+        }
+
+        private static func formatted(_ value: Decimal, fractionDigits: Int) -> String {
+            let formatter = NumberFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.numberStyle = .decimal
+            formatter.minimumFractionDigits = fractionDigits
+            formatter.maximumFractionDigits = fractionDigits
+            formatter.roundingMode = .halfUp
+            return formatter.string(from: NSDecimalNumber(decimal: value))
+                ?? NSDecimalNumber(decimal: value).stringValue
+        }
+
+        private static func partialSuffix(_ coverage: AgentProviderUsageRecord.Coverage?) -> String {
+            coverage == .partial ? " partial" : ""
+        }
+
+        private static func coverageText(_ coverage: AgentProviderUsageRecord.Coverage?) -> String {
+            switch coverage {
+            case .complete:
+                "complete"
+            case .partial:
+                "partial"
+            case .unavailable, nil:
+                "unavailable"
+            }
+        }
+    }
+
     struct ContextSnapshot: Equatable {
         var updatedAt: Date?
         var usedTokens: Int?
@@ -35,6 +241,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         var tokenStatsTotal: Int?
         var selectedAgent: AgentProviderKind?
         var selectedModelRaw: String?
+        var providerUsage: ProviderUsageSnapshot = .unavailable(for: nil)
 
         /// Canonical context window with agent-specific model metadata fallback when the provider
         /// hasn't reported one yet. With a known agent, encoded selections (`base:effort`)
@@ -154,7 +361,8 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind? = nil,
         selectedModelRaw: String? = nil,
-        sessionConfiguredContextWindow: Int? = nil
+        sessionConfiguredContextWindow: Int? = nil,
+        providerUsage: ProviderUsageSnapshot? = nil
     ) {
         activeTranscriptFirstItemID = nil
         processedItemIDs.removeAll()
@@ -257,6 +465,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
 
         next.selectedAgent = selectedAgent ?? transcriptSnapshot.selectedAgent
         next.selectedModelRaw = selectedModelRaw
+        next.providerUsage = providerUsage ?? .unavailable(for: next.selectedAgent)
 
         if snapshot != next {
             snapshot = next
@@ -270,7 +479,8 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind? = nil,
         selectedModelRaw: String? = nil,
-        sessionConfiguredContextWindow: Int? = nil
+        sessionConfiguredContextWindow: Int? = nil,
+        providerUsage: ProviderUsageSnapshot? = nil
     ) {
         resetIfTranscriptChanged(items: items)
         processNewItems(items)
@@ -330,6 +540,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
 
         next.selectedAgent = selectedAgent
         next.selectedModelRaw = selectedModelRaw
+        next.providerUsage = providerUsage ?? .unavailable(for: next.selectedAgent)
 
         if snapshot != next {
             snapshot = next

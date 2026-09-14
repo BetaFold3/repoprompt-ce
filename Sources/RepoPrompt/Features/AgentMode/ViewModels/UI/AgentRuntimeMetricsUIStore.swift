@@ -12,7 +12,8 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
         liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String,
-        sessionConfiguredContextWindow: Int? = nil
+        sessionConfiguredContextWindow: Int? = nil,
+        providerUsage: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot? = nil
     ) {
         let previousSnapshot = runtimeVM.snapshot
         runtimeVM.update(
@@ -22,7 +23,8 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
             liveSelectionSummary: liveSelectionSummary,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
-            sessionConfiguredContextWindow: sessionConfiguredContextWindow
+            sessionConfiguredContextWindow: sessionConfiguredContextWindow,
+            providerUsage: providerUsage
         )
         let didPublish = runtimeVM.snapshot != previousSnapshot
         if didPublish {
@@ -38,6 +40,7 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
                     "estimatedTranscriptTokens": runtimeVM.snapshot.estimatedTranscriptTokens.map(String.init) ?? "nil",
                     "selectionFileCount": runtimeVM.snapshot.selectionFileCount.map(String.init) ?? "nil",
                     "selectionSliceRanges": runtimeVM.snapshot.selectionSummary.map { String($0.sliceRangeCount) } ?? "nil",
+                    "usageRevision": runtimeVM.snapshot.providerUsage.accountingRevision.map(String.init) ?? "nil",
                     "updatedAtChanged": String(runtimeVM.snapshot.updatedAt != previousSnapshot.updatedAt)
                 ]
             )

@@ -5042,7 +5042,7 @@ final class AgentModeViewModel: ObservableObject {
         session.locallyAttributedStartItemID = nil
         session.remoteHost = nil
         session.providerTokenUsageByTurn.removeAll()
-        session.usageAccounting = nil
+        session.replaceUsageAccounting(nil)
         session.claudeConfiguredContextWindow = nil
         session.claudeConfiguredContextWindowKey = nil
         session.lastUserMessageAt = nil
@@ -9280,13 +9280,15 @@ final class AgentModeViewModel: ObservableObject {
             #endif
             let didChangeUsage = contextUsage != session.codexContextUsage
             let didChangeSnapshot = contextUsageSnapshot != session.contextUsageSnapshot
+            let providerUsage = sidebarProviderUsage(for: session)
+            let didChangeProviderUsage = ui.runtimeMetrics.runtimeVM.snapshot.providerUsage != providerUsage
             if didChangeSnapshot {
                 contextUsageSnapshot = session.contextUsageSnapshot
             }
             if didChangeUsage {
                 contextUsage = session.codexContextUsage
-            } else if didChangeSnapshot {
-                syncRuntimeMetricsUIState()
+            } else if didChangeSnapshot || didChangeProviderUsage {
+                syncRuntimeMetricsUIState(providerUsage: providerUsage)
             }
         }
 
@@ -9473,6 +9475,7 @@ final class AgentModeViewModel: ObservableObject {
             || runtimeSnapshot.observedReadFileCount != analyticsSnapshot.observedReadFiles.count
             || runtimeSnapshot.selectedAgent != session.selectedAgent
             || runtimeSnapshot.selectedModelRaw != session.selectedModelRaw
+            || runtimeSnapshot.providerUsage != sidebarProviderUsage(for: session)
         {
             invalidation.insert(.runtimeMetrics)
         }
@@ -18396,7 +18399,7 @@ final class AgentModeViewModel: ObservableObject {
             throw PersistentBindingMutationError.staleTransition
         }
         // Branches never inherit source accounting; the destination starts its own identity.
-        destSession.usageAccounting = nil
+        destSession.replaceUsageAccounting(nil)
 
         // 4) Clone only Oracle/chat sessions owned by the source Agent Mode session.
         //    The run ID stays nil until the destination's first explicit continuation.

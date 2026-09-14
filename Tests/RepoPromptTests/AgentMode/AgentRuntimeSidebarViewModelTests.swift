@@ -878,6 +878,380 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
     }
 
+    func testProviderUsagePresentationFormatsCompletePartialUnknownZeroAndTinyValues() {
+        typealias Usage = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+
+        let complete = Usage(
+            scope: .claude,
+            trackingStartedAt: Date(timeIntervalSince1970: 1_789_344_000),
+            cacheHitShare: .init(ratio: decimal("0.991"), coverage: .complete),
+            costEstimate: .init(amount: decimal("2.171"), currency: "USD", coverage: .complete)
+        ).presentation
+        XCTAssertEqual(complete.title, "Claude session usage")
+        XCTAssertEqual(complete.readoutText, "CH 99.1% · Est. $2.171")
+        XCTAssertTrue(complete.detailText.contains("Cache hit (CH) share"))
+        XCTAssertTrue(complete.detailText.contains("main-loop input triples"))
+        XCTAssertTrue(complete.detailText.contains("Tracking interval starts"))
+        XCTAssertTrue(complete.detailText.contains("complete coverage"))
+        XCTAssertTrue(complete.detailText.contains("includes native Claude subagents"))
+        XCTAssertTrue(complete.detailText.contains("excludes separate RepoPrompt CE worker sessions"))
+        for forbidden in ["invoice", "subscription", "grand total", "≥"] {
+            XCTAssertFalse(complete.detailText.localizedCaseInsensitiveContains(forbidden))
+        }
+
+        let partial = Usage(
+            scope: .claude,
+            cacheHitShare: .init(ratio: decimal("0.09"), coverage: .partial),
+            costEstimate: .init(amount: decimal("1.25"), currency: "USD", coverage: .partial)
+        ).presentation
+        XCTAssertEqual(partial.readoutText, "CH 9.0% partial · Est. $1.250 partial")
+        XCTAssertTrue(partial.detailText.contains("partial coverage"))
+
+        XCTAssertEqual(Usage(scope: .claude).presentation.readoutText, "CH — · Est. —")
+        XCTAssertEqual(
+            Usage(
+                scope: .claude,
+                cacheHitShare: .init(ratio: 0, coverage: .complete),
+                costEstimate: .init(amount: 0, currency: "USD", coverage: .complete)
+            ).presentation.readoutText,
+            "CH 0.0% · Est. $0.000"
+        )
+        XCTAssertEqual(
+            Usage(
+                scope: .claude,
+                cacheHitShare: .init(ratio: decimal("0.00001"), coverage: .complete),
+                costEstimate: .init(amount: decimal("0.00001"), currency: "USD", coverage: .complete)
+            ).presentation.readoutText,
+            "CH <0.1% · Est. $0.00001"
+        )
+
+        let codex = Usage.unavailable(for: .codexExec).presentation
+        XCTAssertEqual(codex.title, "Codex session usage")
+        XCTAssertEqual(codex.readoutText, "CH — · Est. —")
+        XCTAssertTrue(codex.detailText.contains("not available in this build"))
+    }
+
+    func testProviderUsageProjectionAllowsOnlyOwnedLosslessHydratedClaudeRecords() throws {
+        typealias Usage = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+        let owner = UUID()
+        let trackingStartedAt = Date(timeIntervalSince1970: 1_789_344_000)
+        let record = makeProviderUsageRecord(
+            owner: owner,
+            trackingStartedAt: trackingStartedAt,
+            cacheReadInputTokens: 90,
+            uncachedInputTokens: 10,
+            amount: decimal("2.171")
+        )
+
+        let owned = AgentUsageAccumulator(
+            ownerSessionID: owner,
+            persisted: .record(record),
+            hasPriorHistory: true,
+            qualification: .productionClaude
+        )
+        XCTAssertEqual(owned.qualification, .unqualified)
+        let ownedProjection = Usage.projected(
+            selectedAgent: .claudeCode,
+            accounting: owned,
+            expectedOwnerSessionID: owner
+        )
+        XCTAssertEqual(ownedProjection.scope, .claude)
+        XCTAssertEqual(ownedProjection.trackingStartedAt, trackingStartedAt)
+        XCTAssertEqual(ownedProjection.cacheHitShare?.ratio, decimal("0.9"))
+        XCTAssertEqual(ownedProjection.cacheHitShare?.coverage, .partial)
+        XCTAssertEqual(ownedProjection.costEstimate?.amount, decimal("2.171"))
+        XCTAssertEqual(ownedProjection.costEstimate?.coverage, .partial)
+        XCTAssertEqual(ownedProjection.accountingRevision, 0)
+        XCTAssertEqual(
+            ownedProjection.presentation.readoutText,
+            "CH 90.0% partial · Est. $2.171 partial"
+        )
+        XCTAssertTrue(ownedProjection.presentation.detailText.contains("restored historical accounting"))
+
+        let encodedRecord = try JSONEncoder().encode(record)
+        let raw = try AgentProviderUsageRawValue(validating: encodedRecord)
+        let losslessOpaque = AgentUsageAccumulator(
+            ownerSessionID: owner,
+            persisted: .opaque(raw),
+            hasPriorHistory: true,
+            qualification: .productionClaude
+        )
+        XCTAssertEqual(
+            Usage.projected(
+                selectedAgent: .claudeCode,
+                accounting: losslessOpaque,
+                expectedOwnerSessionID: owner
+            ).presentation.readoutText,
+            ownedProjection.presentation.readoutText
+        )
+        XCTAssertEqual(losslessOpaque.persistedRepresentation, .opaque(raw))
+
+        var unfinishedRecord = record
+        let unfinishedExecution = unfinishedRecord.claudeSegments[0].executionID
+        unfinishedRecord.turns.append(.init(
+            executionID: unfinishedExecution,
+            segmentIndex: 0,
+            turnID: UUID(),
+            outcome: .open,
+            coverage: .complete
+        ))
+        unfinishedRecord.claudeSegments[0].state = .open
+        let unfinished = AgentUsageAccumulator(
+            ownerSessionID: owner,
+            persisted: .record(unfinishedRecord),
+            hasPriorHistory: true,
+            qualification: .productionClaude
+        )
+        XCTAssertNil(unfinishedRecord.semanticViolation)
+        let unfinishedProjection = Usage.projected(
+            selectedAgent: .claudeCode,
+            accounting: unfinished,
+            expectedOwnerSessionID: owner
+        )
+        XCTAssertEqual(unfinishedProjection.cacheHitShare?.coverage, .partial)
+        XCTAssertEqual(unfinishedProjection.costEstimate?.coverage, .partial)
+        XCTAssertTrue(unfinishedProjection.presentation.detailText.contains("unfinished work"))
+        XCTAssertEqual(unfinished.persistedRepresentation, .record(unfinishedRecord))
+
+        var continued = losslessOpaque
+        continued.beginExecution(
+            executionID: UUID(),
+            providerSessionID: "continued-provider-session",
+            baseline: .unknown,
+            at: Date(timeIntervalSince1970: 1_789_430_400)
+        )
+        let continuedProjection = Usage.projected(
+            selectedAgent: .claudeCode,
+            accounting: continued,
+            expectedOwnerSessionID: owner
+        )
+        XCTAssertEqual(continued.qualification, .unqualified)
+        XCTAssertEqual(continued.ownedRevision, 0)
+        XCTAssertEqual(continuedProjection.cacheHitShare?.coverage, .partial)
+        XCTAssertEqual(continuedProjection.costEstimate?.coverage, .partial)
+        XCTAssertTrue(continuedProjection.presentation.detailText.contains("current continuation is unmeasured"))
+        XCTAssertEqual(continued.persistedRepresentation, .opaque(raw))
+
+        let unsupportedOpaque = AgentUsageAccumulator(
+            ownerSessionID: owner,
+            persisted: .opaque(.null),
+            hasPriorHistory: true,
+            qualification: .productionClaude
+        )
+        XCTAssertNil(
+            Usage.projected(
+                selectedAgent: .claudeCode,
+                accounting: unsupportedOpaque,
+                expectedOwnerSessionID: owner
+            ).cacheHitShare
+        )
+
+        let foreign = AgentUsageAccumulator(
+            ownerSessionID: UUID(),
+            persisted: .record(record),
+            hasPriorHistory: true,
+            qualification: .productionClaude
+        )
+        XCTAssertNil(
+            Usage.projected(
+                selectedAgent: .claudeCode,
+                accounting: foreign,
+                expectedOwnerSessionID: owner
+            ).costEstimate
+        )
+
+        let codex = Usage.projected(
+            selectedAgent: .codexExec,
+            accounting: owned,
+            expectedOwnerSessionID: owner
+        )
+        XCTAssertEqual(codex.scope, .codex)
+        XCTAssertNil(codex.cacheHitShare)
+        XCTAssertNil(codex.costEstimate)
+    }
+
+    func testScopedRuntimeRefreshPublishesUsageMutationsAndHydrationWithoutContextRegression() throws {
+        let vm = makeViewModel(testWorkspacePath: "/tmp/repoprompt-sidebar-provider-usage")
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .claudeCode
+        session.selectedModelRaw = vm.selectedModelRaw
+        vm.test_installLiveSession(session)
+        vm.test_setCurrentTabIDOverride(session.tabID)
+        let owner = try XCTUnwrap(vm.test_ensureSessionBoundToTab(session))
+        let execution = UUID()
+        session.replaceUsageAccounting(AgentUsageAccumulator(
+            ownerSessionID: owner,
+            persisted: nil,
+            hasPriorHistory: false,
+            qualification: .qualified(contractID: "test-qualified")
+        ))
+        session.usageAccounting?.beginExecution(
+            executionID: execution,
+            providerSessionID: "provider-session",
+            baseline: .verifiedZero,
+            at: Date(timeIntervalSince1970: 1_789_344_000)
+        )
+        let contextUsage = AgentContextUsage(
+            modelContextWindow: 200_000,
+            configuredContextWindow: 180_000,
+            lastTotalTokens: 1000,
+            totalTotalTokens: nil
+        )
+        session.codexContextUsage = contextUsage
+        vm.contextUsage = contextUsage
+        vm.syncRuntimeMetricsUIState()
+
+        let baselineContext = vm.ui.runtimeMetrics.runtimeVM.snapshot
+        let baselineRevision = vm.ui.runtimeMetrics.revision
+        let baselineProjectionComputations = session.test_providerUsageProjectionComputationCount
+        let firstTurn = UUID()
+        XCTAssertEqual(session.usageAccounting?.registerTurn(firstTurn, executionID: execution), .accepted)
+        let firstResult = AgentUsageObservationInput(
+            observation: .init(
+                source: .result,
+                inputTokens: 10,
+                outputTokens: 5,
+                cacheReadInputTokens: 90,
+                cacheCreationInputTokens: 0,
+                envelopeID: "result-1"
+            ),
+            reportedCost: decimal("2.171"),
+            executionID: execution,
+            turnID: firstTurn,
+            attribution: .live,
+            hasOriginalResultAuthority: true
+        )
+        XCTAssertEqual(session.usageAccounting?.observe(firstResult), .accepted)
+
+        vm.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        vm.test_flushPendingUIRefresh()
+
+        XCTAssertEqual(vm.ui.runtimeMetrics.revision, baselineRevision + 1)
+        XCTAssertEqual(
+            session.test_providerUsageProjectionComputationCount,
+            baselineProjectionComputations + 1
+        )
+        XCTAssertEqual(
+            vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
+            "CH 90.0% · Est. $2.171"
+        )
+        assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
+
+        let revisionAfterResult = vm.ui.runtimeMetrics.revision
+        XCTAssertEqual(session.usageAccounting?.observe(firstResult), .rejected(.duplicateResult))
+        vm.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        vm.test_flushPendingUIRefresh()
+        XCTAssertEqual(vm.ui.runtimeMetrics.revision, revisionAfterResult)
+        XCTAssertEqual(
+            session.test_providerUsageProjectionComputationCount,
+            baselineProjectionComputations + 1
+        )
+
+        let secondTurn = UUID()
+        XCTAssertEqual(session.usageAccounting?.registerTurn(secondTurn, executionID: execution), .accepted)
+        XCTAssertEqual(
+            session.usageAccounting?.observe(.init(
+                observation: .init(
+                    source: .messageStart,
+                    inputTokens: 900,
+                    cacheReadInputTokens: 0,
+                    cacheCreationInputTokens: 0,
+                    requestID: "request-2"
+                ),
+                executionID: execution,
+                turnID: secondTurn,
+                attribution: .live
+            )),
+            .accepted
+        )
+        XCTAssertEqual(session.usageAccounting?.closeTurn(secondTurn, outcome: .interrupted), .accepted)
+        session.usageAccounting?.endExecution(execution)
+        vm.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        vm.test_flushPendingUIRefresh()
+
+        XCTAssertEqual(vm.ui.runtimeMetrics.revision, revisionAfterResult + 1)
+        XCTAssertEqual(
+            session.test_providerUsageProjectionComputationCount,
+            baselineProjectionComputations + 2
+        )
+        XCTAssertEqual(
+            vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
+            "CH 9.0% partial · Est. $2.171 partial"
+        )
+        assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
+
+        let hydratedRecord = makeProviderUsageRecord(
+            owner: owner,
+            trackingStartedAt: Date(timeIntervalSince1970: 1_789_430_400),
+            cacheReadInputTokens: 50,
+            uncachedInputTokens: 50,
+            amount: 3
+        )
+        session.installHydratedUsageAccounting(.record(hydratedRecord), ownerSessionID: owner)
+        let revisionBeforeHydration = vm.ui.runtimeMetrics.revision
+        vm.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        vm.test_flushPendingUIRefresh()
+
+        XCTAssertEqual(vm.ui.runtimeMetrics.revision, revisionBeforeHydration + 1)
+        XCTAssertEqual(
+            session.test_providerUsageProjectionComputationCount,
+            baselineProjectionComputations + 3
+        )
+        XCTAssertEqual(
+            vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
+            "CH 50.0% partial · Est. $3.000 partial"
+        )
+        assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
+
+        let revisionAfterHydration = vm.ui.runtimeMetrics.revision
+        vm.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        vm.test_flushPendingUIRefresh()
+        XCTAssertEqual(vm.ui.runtimeMetrics.revision, revisionAfterHydration)
+        XCTAssertEqual(
+            session.test_providerUsageProjectionComputationCount,
+            baselineProjectionComputations + 3
+        )
+
+        let replacementRecord = makeProviderUsageRecord(
+            owner: owner,
+            trackingStartedAt: Date(timeIntervalSince1970: 1_789_516_800),
+            cacheReadInputTokens: 25,
+            uncachedInputTokens: 75,
+            amount: 4
+        )
+        session.installHydratedUsageAccounting(.record(replacementRecord), ownerSessionID: owner)
+        XCTAssertEqual(session.usageAccounting?.ownedRevision, 0)
+        vm.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        vm.test_flushPendingUIRefresh()
+
+        XCTAssertEqual(vm.ui.runtimeMetrics.revision, revisionAfterHydration + 1)
+        XCTAssertEqual(
+            session.test_providerUsageProjectionComputationCount,
+            baselineProjectionComputations + 4
+        )
+        XCTAssertEqual(
+            vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
+            "CH 25.0% partial · Est. $4.000 partial"
+        )
+        assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
+
+        let revisionAfterReplacement = vm.ui.runtimeMetrics.revision
+        vm.requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+        vm.test_flushPendingUIRefresh()
+        XCTAssertEqual(vm.ui.runtimeMetrics.revision, revisionAfterReplacement)
+        XCTAssertEqual(
+            session.test_providerUsageProjectionComputationCount,
+            baselineProjectionComputations + 4
+        )
+
+        vm.updateBindingsFromSession(session)
+        XCTAssertEqual(vm.ui.runtimeMetrics.revision, revisionAfterReplacement)
+        XCTAssertEqual(
+            session.test_providerUsageProjectionComputationCount,
+            baselineProjectionComputations + 4
+        )
+    }
+
     // MARK: - Known-vs-fallback context window display gating
 
     func testDisplayContextWindowTokensTruthTableGatesFactWhileEffectiveMathUnchanged() {
@@ -1005,6 +1379,73 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         vm.syncSpawnResolvedClaudeConfiguredContextWindow(400_000, launchKey: launchKey, for: session)
 
         return (vm, session, launchKey, currentKey)
+    }
+
+    private func decimal(_ text: String) -> Decimal {
+        guard let value = Decimal(string: text) else {
+            XCTFail("Expected a valid decimal fixture: \(text)")
+            return 0
+        }
+        return value
+    }
+
+    private func makeProviderUsageRecord(
+        owner: UUID,
+        trackingStartedAt: Date,
+        cacheReadInputTokens: Int64,
+        uncachedInputTokens: Int64,
+        amount: Decimal
+    ) -> AgentProviderUsageRecord {
+        let execution = UUID()
+        return AgentProviderUsageRecord(
+            originSessionID: owner,
+            trackingStartedAt: trackingStartedAt,
+            hasUnmeasuredHistory: false,
+            turns: [
+                .init(
+                    executionID: execution,
+                    segmentIndex: 0,
+                    turnID: UUID(),
+                    acceptedResultID: "hydrated-result",
+                    inputTokens: uncachedInputTokens,
+                    outputTokens: 5,
+                    cacheReadInputTokens: cacheReadInputTokens,
+                    cacheCreationInputTokens: 0,
+                    outcome: .completed,
+                    coverage: .complete
+                )
+            ],
+            claudeSegments: [
+                .init(
+                    contractID: "test-qualified",
+                    provider: AgentUsageAccumulator.claudeProviderName,
+                    providerSessionID: "provider-session",
+                    executionID: execution,
+                    resetGeneration: 0,
+                    baseline: 0,
+                    latestCumulative: amount,
+                    currency: AgentUsageAccumulator.claudeCurrency,
+                    acceptedResultID: "hydrated-result",
+                    acceptedResultOrder: 1,
+                    state: .closed,
+                    coverage: .complete
+                )
+            ]
+        )
+    }
+
+    private func assertContextOccupancyUnchanged(
+        from expected: AgentRuntimeSidebarViewModel.ContextSnapshot,
+        to actual: AgentRuntimeSidebarViewModel.ContextSnapshot,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(actual.usedTokens, expected.usedTokens, file: file, line: line)
+        XCTAssertEqual(actual.estimatedTranscriptTokens, expected.estimatedTranscriptTokens, file: file, line: line)
+        XCTAssertEqual(actual.contextWindowTokens, expected.contextWindowTokens, file: file, line: line)
+        XCTAssertEqual(actual.configuredContextWindowTokens, expected.configuredContextWindowTokens, file: file, line: line)
+        XCTAssertEqual(actual.effectiveContextWindowTokens, expected.effectiveContextWindowTokens, file: file, line: line)
+        XCTAssertEqual(actual.usageSource, expected.usageSource, file: file, line: line)
     }
 
     private func installTemporaryCustomSlotMapping() -> () -> Void {

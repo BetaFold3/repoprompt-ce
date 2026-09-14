@@ -4,12 +4,14 @@ import Foundation
 extension AgentModeViewModel {
     func syncRuntimeMetricsUIState(
         liveSelectedFileCount: Int? = nil,
-        liveSelectionSummary: AgentContextSelectionSummary? = nil
+        liveSelectionSummary: AgentContextSelectionSummary? = nil,
+        providerUsage: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot? = nil
     ) {
         #if DEBUG
             test_syncRuntimeMetricsCallCount += 1
         #endif
-        let sessionConfiguredContextWindow = sidebarConfiguredContextWindow(for: activeSession)
+        let session = activeSession
+        let sessionConfiguredContextWindow = sidebarConfiguredContextWindow(for: session)
         ui.runtimeMetrics.update(
             transcriptSnapshot: activeTranscriptAnalyticsSnapshot,
             codexUsage: contextUsage,
@@ -17,8 +19,18 @@ extension AgentModeViewModel {
             liveSelectionSummary: liveSelectionSummary,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw,
-            sessionConfiguredContextWindow: sessionConfiguredContextWindow
+            sessionConfiguredContextWindow: sessionConfiguredContextWindow,
+            providerUsage: providerUsage ?? sidebarProviderUsage(for: session)
         )
+    }
+
+    func sidebarProviderUsage(
+        for session: TabSession?
+    ) -> AgentRuntimeSidebarViewModel.ProviderUsageSnapshot {
+        guard let session else {
+            return .unavailable(for: selectedAgent)
+        }
+        return session.cachedProviderUsageProjection(selectedAgent: session.selectedAgent)
     }
 
     func sidebarConfiguredContextWindow(for session: TabSession?) -> Int? {

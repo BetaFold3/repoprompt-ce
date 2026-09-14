@@ -581,6 +581,63 @@ extension AgentModeViewModel {
         /// the first Claude execution; production runs with G1 closed (`.productionClaude`).
         var usageAccounting: AgentUsageAccumulator?
 
+        private struct ProviderUsageProjectionCacheKey: Equatable {
+            var selectedAgent: AgentProviderKind
+            var expectedOwnerSessionID: UUID?
+            var accountingOwnerSessionID: UUID?
+            var qualification: AgentUsageQualification?
+            var eligibility: AgentUsageEligibility?
+            var accountingRevision: UInt64?
+            var activeExecutionID: UUID?
+            var accountingGeneration: UInt64
+        }
+
+        private struct ProviderUsageProjectionCache {
+            var key: ProviderUsageProjectionCacheKey
+            var value: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+        }
+
+        private var providerUsageProjectionCache: ProviderUsageProjectionCache?
+        /// Explicitly distinguishes same-owner hydration/replacement values whose owned revision is zero.
+        private var usageAccountingGeneration: UInt64 = 0
+        #if DEBUG
+            private(set) var test_providerUsageProjectionComputationCount: Int = 0
+        #endif
+
+        func replaceUsageAccounting(_ accounting: AgentUsageAccumulator?) {
+            usageAccounting = accounting
+            usageAccountingGeneration &+= 1
+            providerUsageProjectionCache = nil
+        }
+
+        func cachedProviderUsageProjection(
+            selectedAgent: AgentProviderKind
+        ) -> AgentRuntimeSidebarViewModel.ProviderUsageSnapshot {
+            let key = ProviderUsageProjectionCacheKey(
+                selectedAgent: selectedAgent,
+                expectedOwnerSessionID: activeAgentSessionID,
+                accountingOwnerSessionID: usageAccounting?.ownerSessionID,
+                qualification: usageAccounting?.qualification,
+                eligibility: usageAccounting?.eligibility,
+                accountingRevision: usageAccounting?.ownedRevision,
+                activeExecutionID: usageAccounting?.activeExecutionID,
+                accountingGeneration: usageAccountingGeneration
+            )
+            if let cached = providerUsageProjectionCache, cached.key == key {
+                return cached.value
+            }
+            let value = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.projected(
+                selectedAgent: selectedAgent,
+                accounting: usageAccounting,
+                expectedOwnerSessionID: activeAgentSessionID
+            )
+            providerUsageProjectionCache = .init(key: key, value: value)
+            #if DEBUG
+                test_providerUsageProjectionComputationCount += 1
+            #endif
+            return value
+        }
+
         // Codex native session identifiers and metadata
         var codexConversationID: String?
         var codexRolloutPath: String?
@@ -647,12 +704,12 @@ extension AgentModeViewModel {
                 return
             }
             if let owner = activeAgentSessionID, usageAccounting?.ownerSessionID != owner {
-                usageAccounting = AgentUsageAccumulator(
+                replaceUsageAccounting(AgentUsageAccumulator(
                     ownerSessionID: owner,
                     persisted: nil,
                     hasPriorHistory: hasSentFirstMessage,
                     qualification: .productionClaude
-                )
+                ))
             }
             beginUsageAccountingExecution()
         }
@@ -685,15 +742,15 @@ extension AgentModeViewModel {
                accounting.ownerSessionID == ownerSessionID,
                accounting.applyHydration(persisted, hasPriorHistory: hasSentFirstMessage)
             {
-                usageAccounting = accounting
+                replaceUsageAccounting(accounting)
                 return
             }
-            usageAccounting = AgentUsageAccumulator(
+            replaceUsageAccounting(AgentUsageAccumulator(
                 ownerSessionID: ownerSessionID,
                 persisted: persisted,
                 hasPriorHistory: hasSentFirstMessage,
                 qualification: .productionClaude
-            )
+            ))
             if claudeController != nil {
                 beginUsageAccountingExecution()
             }
