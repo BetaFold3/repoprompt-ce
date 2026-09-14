@@ -1,6 +1,7 @@
 import Foundation
 import MCP
 import RepoPromptRemoteWire
+import RepoPromptShared
 
 struct RemoteToolCall: Equatable {
     let toolName: String
@@ -19,20 +20,15 @@ enum AppLinkCallTimeoutPolicy {
     static let grace: TimeInterval = 30
     static let cap: TimeInterval = 900
 
-    /// Mirrors AgentRunMCPToolService.defaultWaitTimeoutSeconds /
-    /// MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds without importing app code
-    /// into the gateway target.
-    private static let appAgentLifecycleDefaultWaitSeconds: TimeInterval = 120
-
     static func timeout(op: String, payload: [String: JSONValue]) -> TimeInterval {
         switch op {
         case "start":
-            return clamp((seconds(from: payload["timeout"]) ?? appAgentLifecycleDefaultWaitSeconds) + grace)
+            return clamp((seconds(from: payload["timeout"]) ?? MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds) + grace)
         case "poll":
             return clamp((seconds(from: payload["timeout"]) ?? 0) + grace)
         case "steer":
             guard payload["wait"]?.boolValue == true else { return fast }
-            return clamp((seconds(from: payload["timeout_seconds"]) ?? appAgentLifecycleDefaultWaitSeconds) + grace)
+            return clamp((seconds(from: payload["timeout_seconds"]) ?? MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds) + grace)
         default:
             return fast
         }

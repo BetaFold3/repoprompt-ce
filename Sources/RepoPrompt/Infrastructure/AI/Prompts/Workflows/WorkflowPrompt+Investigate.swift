@@ -74,7 +74,7 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="<k
 ```
 """))
 
-> ⚠️ **Detached agents may block on permission approvals.** Poll periodically or use `op=wait` so you can approve requests and keep them unblocked. This applies to every detached agent in this workflow.
+> ⚠️ \(sharedWaitFirstSupervisionBlock()) This applies to every detached agent in this workflow.
 
 ### Phase 2: Broad Context Gathering (via \(builderName) — REQUIRED)
 
@@ -164,17 +164,17 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=pair session_name="Inves
 
 **While the pair runs**, don't re-run its investigation. Monitor the session for permission approvals, handle user-supplied specifics (files the user pointed you at), run git on already-pinpointed code, and plan the next \(chatLabel) questions. Don't spin up parallel explore agents at your level — the pair is running its own.
 
-**When the pair returns** (wait or poll):
+**Supervise the pending pair set with `op=wait`:**
 
 \(example(variant,
 	mcp: """
 ```json
-{"tool":"agent_run","args":{"op":"wait","session_id":"<pair_session_id>","timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<pending_pair_session_id>"],"timeout":60}}
 ```
 """,
 	cli: """
 ```bash
-rpce-cli -w <window_id> -e 'agent_run op=wait session_id=<pair_uuid> timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<pending_pair_uuid>"] timeout=60'
 ```
 """))
 
@@ -329,7 +329,7 @@ Create a findings report as you investigate:
 - 🚫 **Parallel pair investigators on overlapping hypotheses** — only parallelize for genuinely disjoint paths; each pair gets its own `## Investigator Findings: <path>` sub-section
 - 🚫 Dispatching the pair without the report path — it should append findings directly
 - 🚫 Wrong tool for the job — explore agents for complex multi-step in-workspace investigation (use the pair), or broad prompts like "investigate the auth system" to explores (one specific check each)
-- 🚫 Forgetting to poll dispatched agents — they may block on permission approvals\(variant == .cli ? "\n- 🚫 **CLI:** Forgetting `-w <window_id>` — stateless invocations need explicit window targeting" : "")
+- 🚫 Failing to keep waiting on pending agents — handle every interaction, remove terminal workers, and wait again while any remain\(variant == .cli ? "\n- 🚫 **CLI:** Forgetting `-w <window_id>` — stateless invocations need explicit window targeting" : "")
 
 ---
 

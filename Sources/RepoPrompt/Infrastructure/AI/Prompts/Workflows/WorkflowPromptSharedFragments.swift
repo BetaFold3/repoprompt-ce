@@ -118,8 +118,16 @@ A role whose display name starts with `Codex CLI` (or an explicit `model_id` wit
 """
 	}
 
+	/// Shared wait-first supervision guidance. `responsePendingDetail` carries the one
+	/// shared-parallel sentence that must appear before caller-owned set guidance.
+	static func sharedWaitFirstSupervisionBlock(responsePendingDetail: String = "") -> String {
+		return """
+**Wait-first supervision.** Detach independent parallel starts, then pass every pending ID in `session_ids` to `agent_run op=wait`. Wait returns as soon as any watched session finishes or needs interaction; `timeout` is only an upper bound on how long that call may block.\(responsePendingDetail) Maintain a caller-owned outstanding-ID set; do not rebuild it solely from response `pending_session_ids`, because that list can omit a nonterminal interaction/status winner. Handle **every** returned interaction. Remove only terminal workers from the outstanding set. Retain or re-add nonterminal interaction/status winners after responding, then wait again while any outstanding IDs remain. A timeout leaves workers active; do not abandon them—wait again. Use `op=poll` only for a deliberate instantaneous inspection. Do not set `include_status_updates` merely to show activity. Transport heartbeats keep the connection alive; they do not warm provider prompt caches.
+"""
+	}
+
 	/// Parallel dispatch guidance: sibling-warning quote block, `detach:true` requirement,
-	/// `session_ids` wait semantics, poll option, and "be a pipeline, not a sequential loop" framing.
+	/// wait-first `session_ids` supervision, deliberate inspection, and pipeline framing.
 	/// - Parameters:
 	///   - variant: Tool variant — affects MCP vs CLI example syntax.
 	///   - defaultRole: `model_id` used in the concurrent-dispatch example (e.g. `"pair"`, `"engineer"`).
@@ -131,7 +139,7 @@ If dispatching independent items as fresh agents concurrently, **each agent's br
 
 **Use `detach: true`** when dispatching concurrent items — otherwise the orchestrator blocks on the first agent and can't start the second.
 
-Then pass `session_ids` (array) to `agent_run op=wait` to block until the **first** session finishes or needs input. The response tells you which session won and which are still pending.
+\(sharedWaitFirstSupervisionBlock(responsePendingDetail: " The response identifies which session needs attention and which are still pending."))
 
 \(example(variant,
 	mcp: """
@@ -143,7 +151,7 @@ Then pass `session_ids` (array) to `agent_run op=wait` to block until the **firs
 // Then wait for the first session that needs attention
 {"tool":"agent_run","args":{"op":"wait","session_ids":["<session_id_A>","<session_id_B>"],"timeout":60}}
 
-// Or poll all current snapshots without blocking
+// Deliberate instantaneous inspection only — not the supervision loop
 {"tool":"agent_run","args":{"op":"poll","session_ids":["<session_id_A>","<session_id_B>"]}}
 ```
 """,
@@ -156,12 +164,12 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=\(defaultRole) session_n
 # Then wait for the first session that needs attention
 rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60'
 
-# Or poll all current snapshots without blocking
+# Deliberate instantaneous inspection only — not the supervision loop
 rpce-cli -w <window_id> -e 'agent_run op=poll session_ids=["<uuid1>","<uuid2>"]'
 ```
 """))
 
-Handle the finished agent, then wait again on the remaining `pending_session_ids`. While waiting, summarize completed work or prepare the next brief — be a pipeline, not a sequential loop.
+While waiting, summarize completed work or prepare the next brief — be a pipeline, not a sequential loop.
 """
 	}
 

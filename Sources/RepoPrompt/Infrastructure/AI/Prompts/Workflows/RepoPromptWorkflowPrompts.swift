@@ -67,7 +67,8 @@ enum RepoPromptWorkflowPrompts {
     /// Version 61: rp-deep-plan — adds explicit halt-on-`ask_user`-timeout handling for involvement-mode checkpoints. When the user has actively picked a mode that promises a pause (Up front → Phase 1.5, Mid-flow → Phase 5) and a downstream `ask_user` returns `timed_out: true`, the workflow halts at that checkpoint instead of proceeding with assumed answers — resuming from the same prompt when the user replies. The Phase 1 involvement-mode prompt itself is exempt: a timeout there means "no signal" and falls through to Hands-off (same as `skipped: true`), so the workflow doesn't stall before any direction has been given. Adds a Core principle, a Phase 1 "Handling the answer" sub-section that distinguishes the three result shapes, halt reminders at the end of Phase 1.5 / Phase 5, and a matching anti-pattern.
     /// Version 62: rp-reminder — documents exact-chat continuation and the two-lane parallel `ask_oracle` pattern with exact model-preset selectors.
     /// Version 63: rp-reminder — teaches natural named-Oracle requests to resolve authoritative presets, pass explicit model UUIDs in one parallel batch, treat chat names as display-only, and verify returned identities before synthesis.
-    static let skillsVersion = 63
+    /// Version 64: rp-investigate / rp-deep-plan / rp-optimize / rp-orchestrate / rp-refactor — replaces poll-first worker supervision with wait-first pending-set loops, interaction handling, accurate early-wake/timeout semantics, deliberate-only polling, and cache-neutral heartbeat guidance.
+    static let skillsVersion = 64
 
     static func render(
         id: RepoPromptWorkflowID,

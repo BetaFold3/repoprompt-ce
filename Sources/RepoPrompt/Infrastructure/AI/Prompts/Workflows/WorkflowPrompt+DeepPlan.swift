@@ -171,7 +171,7 @@ rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>"] time
 ```
 """))
 
-> ⚠️ **Detached agents may block on permission approvals.** Poll periodically or use `op=wait` so you can approve and keep them unblocked.
+> ⚠️ \(sharedWaitFirstSupervisionBlock())
 
 Skip lanes that don't apply. **Don't dispatch external research just because you can** — the relevance trigger is "the plan depends on facts I can't see in this workspace."
 
@@ -356,7 +356,7 @@ For **all** modes, report:
 - 🚫 Letting Phase 7 polish make the plan *longer* than after Phase 4 — it should be tighter
 - 🚫 Dispatching external/web research when the plan only depends on in-repo facts — the trigger is real external dependency
 - 🚫 Doing broad codebase reading yourself instead of dispatching an explore agent — keep your context lean for writing
-- 🚫 Forgetting to poll dispatched agents — they may block on permission approvals
+- 🚫 Failing to keep waiting on pending agents — handle every interaction, remove terminal workers, and wait again while any remain
 - 🚫 Silently demoting an Up-front / Mid-flow user to Hands-off when their checkpoint `ask_user` times out — they asked to be involved; honor it. Halt and resume when they reply. (Phase 1's involvement-mode prompt is the one exception: a timeout there is treated as "no signal" and falls through to the Hands-off default.)\(variant == .cli ? "\n- 🚫 **CLI:** Forgetting to pass `-w <window_id>` — CLI invocations are stateless and require explicit window targeting" : "")
 
 ---

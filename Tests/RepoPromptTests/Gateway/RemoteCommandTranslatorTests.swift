@@ -729,6 +729,16 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         )
         XCTAssertEqual(
             try translator.translate(
+                RemoteClientFrame(
+                    type: "steer",
+                    sessionID: sid,
+                    payload: .object(["message": .string("next"), "wait": .bool(true)])
+                )
+            ).timeout,
+            150
+        )
+        XCTAssertEqual(
+            try translator.translate(
                 RemoteClientFrame(type: "steer", sessionID: sid, payload: .object(["message": .string("next")]))
             ).timeout,
             60

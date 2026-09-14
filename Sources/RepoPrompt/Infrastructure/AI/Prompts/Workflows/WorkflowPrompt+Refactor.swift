@@ -283,7 +283,7 @@ Only parallelize when items have **zero file overlap**. When in doubt, run seque
 - 🚫 Implementing refactorings yourself — you are the coordinator; dispatch agents to do the work
 - 🚫 Dispatching all items at once without verifying each one — refactorings compound; verify before proceeding
 - 🚫 Parallelizing items that share files — sequential is safer for dependent refactorings
-- 🚫 Forgetting to check on dispatched agents — they may block on permission approvals; poll periodically to keep them unblocked
+- 🚫 Failing to keep waiting on pending agents — handle every interaction, remove terminal workers, and wait again while any remain
 - 🚫 Assuming you understand the code structure without \(builderName)'s architectural analysis\(variant == .cli ? "\n- 🚫 **CLI:** Forgetting to pass `-w <window_id>` – CLI invocations are stateless and require explicit window targeting" : "")
 """
 	}
