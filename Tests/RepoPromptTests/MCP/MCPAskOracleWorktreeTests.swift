@@ -3962,6 +3962,176 @@ import XCTest
             }
         }
 
+        func testAgentRunResponseModeReplayPreservesWireRecoveryAndSingleMutation() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let window = fixture.contextA.window
+                let apiSettings = try XCTUnwrap(window.promptManager.apiSettingsViewModel)
+                let previousClaudeCodeConnected = apiSettings.isClaudeCodeConnected
+                var childSessionID: UUID?
+                defer {
+                    window.mcpServer.setAgentRunDispatchOverrideForTesting(nil)
+                    apiSettings.isClaudeCodeConnected = previousClaudeCodeConnected
+                }
+
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    let frozenContext = makeFrozenContext(
+                        fixture: fixture,
+                        selection: StoredSelection(codemapAutoEnabled: false),
+                        bindings: [],
+                        activeAgentSessionID: nil
+                    )
+                    _ = try await endpoint.callTool(
+                        name: "bind_context",
+                        arguments: [
+                            "op": "bind",
+                            "context_id": frozenContext.tabID.uuidString
+                        ]
+                    )
+                    await fixture.networkManager.debugSetAdditionalTools(
+                        for: endpoint.connectionID,
+                        additionalTools: [MCPWindowToolName.agentRun]
+                    )
+                    window.mcpServer.installFrozenTabContext(
+                        clientID: endpoint.connectionID.uuidString,
+                        clientName: endpoint.clientName,
+                        context: frozenContext
+                    )
+                    apiSettings.isClaudeCodeConnected = true
+
+                    let body = "PUBLIC_AGENT_RUN_RESULT\n"
+                        + String(repeating: "z", count: 2100)
+                        + "\nWIRE_RECOVERY_SENTINEL"
+                    var dispatchCount = 0
+                    window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                        _, tabID, _, _, viewModel in
+                        dispatchCount += 1
+                        let runID = UUID()
+                        let session = viewModel.session(for: tabID)
+                        session.runID = runID
+                        session.runState = .completed
+                        session.mcpFollowUpRunPending = false
+                        session.items = [.assistant(body, sequenceIndex: 0)]
+                        return .startedRun
+                    }
+
+                    let tools = await window.mcpServer.windowMCPTools
+                    let agentRun = try XCTUnwrap(
+                        tools.first { $0.name == MCPWindowToolName.agentRun }
+                    )
+                    let requestID = UUID().uuidString
+                    let baseArgs: [String: Value] = [
+                        "op": .string("start"),
+                        "message": .string("Return a terminal public-boundary result."),
+                        "model_id": .string("claudeCode:sonnet"),
+                        "detach": .bool(false),
+                        "timeout": .int(0),
+                        "request_id": .string(requestID)
+                    ]
+
+                    var tailArgs = baseArgs
+                    tailArgs["response_mode"] = .string("tail")
+                    let tailValue = try await ServerNetworkManager.withConnectionID(
+                        endpoint.connectionID
+                    ) {
+                        try await agentRun(tailArgs)
+                    }
+                    let tail = try XCTUnwrap(tailValue.objectValue)
+                    childSessionID = tail["session_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+                    let tailText = try XCTUnwrap(tail["assistant_text"]?.stringValue)
+                    XCTAssertEqual(
+                        tailText.count,
+                        OracleResponseMode.tailExcerptCharacterBudget
+                    )
+                    let tailPresentation = try XCTUnwrap(
+                        tail[AgentRunResponsePresentation.presentationKey]?.objectValue
+                    )
+                    let tailPath = try XCTUnwrap(
+                        tailPresentation["export_path"]?.stringValue
+                    )
+                    XCTAssertTrue(tailPath.hasPrefix(fixture.contextA.rootURL.path + "/"))
+                    XCTAssertFalse(tailPath.hasPrefix(fixture.contextB.rootURL.path + "/"))
+                    XCTAssertEqual(dispatchCount, 1)
+
+                    var fullArgs = baseArgs
+                    fullArgs["response_mode"] = .string("full")
+                    let fullValue = try await ServerNetworkManager.withConnectionID(
+                        endpoint.connectionID
+                    ) {
+                        try await agentRun(fullArgs)
+                    }
+                    let full = try XCTUnwrap(fullValue.objectValue)
+                    XCTAssertEqual(full["assistant_text"]?.stringValue, body)
+                    XCTAssertNil(
+                        full[AgentRunResponsePresentation.presentationKey],
+                        "Full replay must remain canonical Value presentation"
+                    )
+                    XCTAssertEqual(
+                        full["_meta"]?.objectValue?["request_id_replay"]?.boolValue,
+                        true
+                    )
+                    XCTAssertEqual(dispatchCount, 1)
+
+                    let noneResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.agentRun,
+                        arguments: [
+                            "op": "start",
+                            "message": "Return a terminal public-boundary result.",
+                            "model_id": "claudeCode:sonnet",
+                            "detach": false,
+                            "timeout": 0,
+                            "request_id": requestID,
+                            "response_mode": "none"
+                        ],
+                        timeoutSeconds: 30
+                    )
+                    let noneText = try toolResultText(noneResponse)
+                    XCTAssertTrue(noneText.contains("- Response mode: `none`"), noneText)
+                    XCTAssertTrue(noneText.contains("- Full output: `"), noneText)
+                    XCTAssertTrue(noneText.contains("- Retrieval: Read the complete assistant result"), noneText)
+                    XCTAssertFalse(noneText.contains(body), noneText)
+                    XCTAssertEqual(dispatchCount, 1)
+
+                    let nonePath = try XCTUnwrap(
+                        noneText.components(separatedBy: "- Full output: `")
+                            .dropFirst()
+                            .first?
+                            .components(separatedBy: "`")
+                            .first
+                    )
+                    XCTAssertTrue(nonePath.hasPrefix(fixture.contextA.rootURL.path + "/"))
+                    XCTAssertNotEqual(nonePath, tailPath)
+
+                    let readResponse = try await endpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: ["path": nonePath],
+                        timeoutSeconds: 30
+                    )
+                    let readText = try toolResultText(readResponse)
+                    XCTAssertTrue(readText.contains(body), readText)
+
+                    if let childSessionID {
+                        await window.agentModeViewModel.mcpDeactivateControlContext(
+                            sessionID: childSessionID,
+                            cleanupSessionStore: true
+                        )
+                    }
+                    await fixture.cleanup()
+                } catch {
+                    if let childSessionID {
+                        await window.agentModeViewModel.mcpDeactivateControlContext(
+                            sessionID: childSessionID,
+                            cleanupSessionStore: true
+                        )
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAskOracleResponseModeTailAndNoneAutoExport() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -4104,7 +4274,8 @@ import XCTest
             fixture: PersistentMCPTestFixture,
             selection: StoredSelection,
             bindings: [AgentSessionWorktreeBinding],
-            bindingState: AgentSessionWorktreeBindingState? = nil
+            bindingState: AgentSessionWorktreeBindingState? = nil,
+            activeAgentSessionID: UUID? = UUID()
         ) -> MCPServerViewModel.TabContextSnapshot {
             MCPServerViewModel.TabContextSnapshot(
                 tabID: fixture.contextA.tabID,
@@ -4115,7 +4286,7 @@ import XCTest
                 selectedMetaPromptIDs: [],
                 tabName: "Oracle Worktree",
                 runID: UUID(),
-                activeAgentSessionID: UUID(),
+                activeAgentSessionID: activeAgentSessionID,
                 worktreeBindings: bindings,
                 worktreeBindingState: bindingState,
                 explicitlyBound: false

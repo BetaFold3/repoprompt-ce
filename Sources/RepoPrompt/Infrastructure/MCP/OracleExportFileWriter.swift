@@ -1,11 +1,31 @@
 import Foundation
 import MCP
 
+struct GeneratedOracleExportCleanupReceipt: @unchecked Sendable {
+    let logicalPath: String
+    fileprivate let physicalPath: String
+    fileprivate let physicalRootPath: String
+    fileprivate let rootID: UUID
+    fileprivate let rootScope: WorkspaceLookupRootScope
+}
+
 struct GeneratedOracleExportFileWriter {
     let store: WorkspaceFileContextStore
 
     @discardableResult
     func write(path rawPath: String, content: String, destination: OracleExportDestination) async throws -> String {
+        try await writeArtifact(
+            path: rawPath,
+            content: content,
+            destination: destination
+        ).logicalPath
+    }
+
+    func writeArtifact(
+        path rawPath: String,
+        content: String,
+        destination: OracleExportDestination
+    ) async throws -> GeneratedOracleExportCleanupReceipt {
         let logicalPath = try resolvedAbsoluteExportPath(rawPath, destination: destination)
         let physicalPath = StandardizedPath.absolute(destination.lookupContext.translateInputPath(logicalPath))
         let physicalRootPath = StandardizedPath.absolute(
@@ -60,7 +80,13 @@ struct GeneratedOracleExportFileWriter {
                 expectedContent: content,
                 rootScope: destination.lookupContext.rootScope
             )
-            return logicalPath
+            return GeneratedOracleExportCleanupReceipt(
+                logicalPath: logicalPath,
+                physicalPath: physicalPath,
+                physicalRootPath: scopedRoot.standardizedFullPath,
+                rootID: scopedRoot.id,
+                rootScope: destination.lookupContext.rootScope
+            )
         } catch let error as MCPError {
             await cleanupCreatedExportIfPresent(
                 physicalPath: physicalPath,
@@ -87,6 +113,67 @@ struct GeneratedOracleExportFileWriter {
                 "Cannot create generated Oracle export at '\(logicalPath)': export creation or verification failed."
             )
         }
+    }
+
+    func remove(receipt: GeneratedOracleExportCleanupReceipt) async -> Bool {
+        guard receipt.physicalPath == receipt.physicalRootPath
+            || StandardizedPath.isDescendant(
+                receipt.physicalPath,
+                of: receipt.physicalRootPath
+            )
+        else { return false }
+
+        let fm = FileManager.default
+        if fm.fileExists(atPath: receipt.physicalPath) {
+            do {
+                try fm.removeItem(atPath: receipt.physicalPath)
+            } catch {
+                return false
+            }
+        }
+        guard !fm.fileExists(atPath: receipt.physicalPath) else { return false }
+
+        let rootStillLoaded = await store.rootRefs(scope: receipt.rootScope).contains {
+            $0.id == receipt.rootID
+                && $0.standardizedFullPath == receipt.physicalRootPath
+        }
+        if rootStillLoaded {
+            let prefix = receipt.physicalRootPath.hasSuffix("/")
+                ? receipt.physicalRootPath
+                : receipt.physicalRootPath + "/"
+            if receipt.physicalPath.hasPrefix(prefix) {
+                let relativePath = StandardizedPath.relative(
+                    String(receipt.physicalPath.dropFirst(prefix.count))
+                )
+                await store.replayObservedFileSystemDeltas(
+                    rootID: receipt.rootID,
+                    deltas: [.fileRemoved(relativePath)]
+                )
+                _ = await store.awaitAppliedIngressForExplicitRequest(
+                    userPath: receipt.physicalPath,
+                    fallbackScope: receipt.rootScope
+                )
+            }
+        }
+        return true
+    }
+
+    func remove(path rawPath: String, destination: OracleExportDestination) async {
+        guard let logicalPath = try? resolvedAbsoluteExportPath(rawPath, destination: destination) else { return }
+        let physicalPath = StandardizedPath.absolute(destination.lookupContext.translateInputPath(logicalPath))
+        let physicalRootPath = StandardizedPath.absolute(
+            destination.lookupContext.translateInputPath(destination.primaryRootPath)
+        )
+        let scopedRoots = await store.rootRefs(scope: destination.lookupContext.rootScope)
+        guard let scopedRoot = scopedRoots.first(where: { $0.standardizedFullPath == physicalRootPath }),
+              physicalPath == scopedRoot.standardizedFullPath
+              || StandardizedPath.isDescendant(physicalPath, of: scopedRoot.standardizedFullPath)
+        else { return }
+        await cleanupCreatedExportIfPresent(
+            physicalPath: physicalPath,
+            root: scopedRoot,
+            rootScope: destination.lookupContext.rootScope
+        )
     }
 
     private func resolvedAbsoluteExportPath(_ rawPath: String, destination: OracleExportDestination) throws -> String {

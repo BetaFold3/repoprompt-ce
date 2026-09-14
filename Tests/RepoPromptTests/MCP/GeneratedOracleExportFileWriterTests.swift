@@ -164,6 +164,37 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         XCTAssertFalse(tree.contains("oracle-plan-ignored.md"), tree)
     }
 
+    func testCleanupReceiptRemovesVerifiedArtifactAfterOwningRootUnloads() async throws {
+        let root = try makeTemporaryRoot(name: "OracleExportReceiptUnload")
+        let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
+        let destination = OracleExportDestination(
+            workspaceID: UUID(),
+            windowID: 1,
+            tabID: nil,
+            primaryRootPath: root.path
+        )
+        let exportPath = root.appendingPathComponent(
+            "prompt-exports/oracle-plan-receipt-unload.md"
+        ).path
+        let writer = GeneratedOracleExportFileWriter(store: store)
+
+        let receipt = try await writer.writeArtifact(
+            path: exportPath,
+            content: "receipt survives catalog unload",
+            destination: destination
+        )
+        XCTAssertEqual(receipt.logicalPath, exportPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: exportPath))
+
+        await store.unloadRoot(id: rootRecord.id)
+        let remainingRoots = await store.rootRefs(scope: .visibleWorkspace)
+        XCTAssertTrue(remainingRoots.isEmpty)
+        let removed = await writer.remove(receipt: receipt)
+        XCTAssertTrue(removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath))
+    }
+
     func testGeneratedExportWriterCleansUpSymlinkedExportPathFailure() async throws {
         let root = try makeTemporaryRoot(name: "OracleExportSymlink")
         let outside = try makeTemporaryRoot(name: "OracleExportSymlinkOutside")

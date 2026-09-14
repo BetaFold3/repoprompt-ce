@@ -11,10 +11,14 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
 
     private let runtime: MCPWindowToolRuntime
     private let dependencies: MCPWindowToolDependencies
+    private let responseExportAdapter: AgentRunResponseExportAdapter
 
     init(runtime: MCPWindowToolRuntime, dependencies: MCPWindowToolDependencies) {
         self.runtime = runtime
         self.dependencies = dependencies
+        responseExportAdapter = AgentRunResponseExportAdapter(
+            store: dependencies.promptVM.workspaceFileContextStore
+        )
     }
 
     func buildTools() -> [Tool] {
@@ -42,6 +46,8 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             - `wait`: Block until the first referenced explore run finishes or needs input. `timeout=0` behaves like poll.
             - `cancel`: Cancel a live explore child session.
 
+            `response_mode` controls terminal assistant text: `full` (default) preserves the existing response, `tail` returns up to the last 2,000 characters for the top-level snapshot, and `none` returns only exact retrieval metadata. Actionable interaction context remains full.
+
             Explore children are read-only — no edits, oracle calls, or further sub-agent spawning.
             """,
             annotations: .repoPromptLocalEphemeralState,
@@ -49,9 +55,9 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 description: """
                 Provide `op` plus operation-specific fields.
 
-                **start**: message or messages (required, mutually exclusive), detach?, timeout?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args
-                **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only)
-                **cancel**: session_id (required)
+                **start**: message or messages (required, mutually exclusive), detach?, timeout?, response_mode?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args
+                **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only), response_mode?
+                **cancel**: session_id (required), response_mode?
                 """,
                 properties: [
                     "op": .string(description: "Operation.", enum: ["start", "poll", "wait", "cancel"]),
@@ -59,6 +65,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                     "messages": .array(description: "[start] Array of exploration instruction strings. Mutually exclusive with message. Starts one fresh explore child per entry.", items: .string()),
                     "detach": .boolean(description: "[start] Return immediately instead of waiting. Default false."),
                     "timeout": .number(description: "[start, wait] Max wait seconds. 0 = poll. Default \(defaultWaitSeconds)."),
+                    "response_mode": .string(description: "How much terminal assistant text to return inline: full (default), tail, or none. Trimming exports exact text first; export failure falls back to full.", default: "full", enum: ["full", "tail", "none"]),
                     "worktree": .string(description: "[start] Existing worktree selector to bind before provider startup: @current, @main, @branch:<name>, name, branch, path, or @id:<worktree_id>. Mutually exclusive with worktree_id and worktree_create."),
                     "worktree_id": .string(description: "[start] Durable worktree ID to bind before provider startup. Mutually exclusive with worktree and worktree_create."),
                     "worktree_create": .boolean(description: "[start] Create an app-managed Git worktree, bind it to the new session, materialize its hidden root, then start the provider. Mutually exclusive with worktree/worktree_id."),
@@ -75,8 +82,12 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 ],
                 required: ["op"]
             )
-        ) { [dependencies] _, args in
-            try await dependencies.executeAgentExplore(args)
+        ) { [self] _, args in
+            try await executeWithResponsePresentation(
+                args: args,
+                toolName: MCPWindowToolName.agentExplore,
+                canonicalOperation: dependencies.executeAgentExplore
+            )
         }
     }
 
@@ -86,7 +97,8 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
         var properties: OrderedDictionary<String, JSONSchema> = [
             "op": .string(description: "Operation.", enum: ["start", "poll", "wait", "cancel", "steer", "respond"]),
             "message": .string(description: messageDescription),
-            "request_id": .string(description: "[start, steer, respond] Optional idempotency key. Duplicate calls with the same request_id and identical arguments return the recorded outcome instead of re-executing (a duplicate start returns the original session_id; a duplicate steer does not enqueue a second instruction; a duplicate respond returns the recorded resolution). Reusing a request_id with different arguments is rejected as a conflict."),
+            "request_id": .string(description: "[start, steer, respond] Optional idempotency key. Duplicate calls with the same request_id and identical substantive arguments return the recorded outcome instead of re-executing (a duplicate start returns the original session_id; a duplicate steer does not enqueue a second instruction; a duplicate respond returns the recorded resolution). response_mode may change how that canonical outcome is presented. Reusing a request_id with other different arguments is rejected as a conflict."),
+            "response_mode": .string(description: "How much terminal assistant text to return inline: full (default), tail, or none. Trimming exports exact text first; export failure falls back to full.", default: "full", enum: ["full", "tail", "none"]),
             "model_id": .string(description: "[start] Role label from agent_manage.list_agents task_labels (explore, engineer, pair, design — resolved via global role defaults), or an explicit compound model_id from agents[].models[].model_id to pin an exact target. Defaults to pair when omitted."),
             "session_id": .string(description: "[poll, wait, cancel, steer, respond] Session UUID returned by a prior start/steer response. Do not fabricate it. Not accepted by start — use steer to continue an existing session."),
             "run_id": .string(description: "[cancel] Optional exact current run UUID fence. When present, cancellation is rejected unless it matches the session's current run."),
@@ -147,6 +159,8 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
 
             **session_id lifecycle**: `start` creates a new session and returns `session_id` in the response. All subsequent operations on that run require passing the same `session_id` back. Do NOT invent session IDs — always use the value returned by `start`.
 
+            `response_mode` controls terminal assistant text: `full` (default) preserves the existing response, `tail` returns up to the last 2,000 characters for the top-level snapshot, and `none` returns only exact retrieval metadata. Actionable interaction context remains full. Multi-snapshot collection entries are reference-only in trimmed modes.
+
             **Snapshot output notes**: `poll`/`wait` first report live control snapshots, then terminal snapshots retained by the short in-memory MCP cursor, then archived snapshots from the active workspace's hydrated session index. Archived/indexed snapshots do not have a live control handle; non-terminal indexed raw states such as `running`, `idle`, or `waitingForUser` are surfaced as `completed` so clients render them as archived/non-actionable, with the original raw state preserved in `status_text`. Sessions visible only from persisted disk metadata (for example, returned by `agent_manage.list_sessions` before or outside active workspace index hydration) may still poll as `expired`; use `agent_manage.get_log` for transcript catch-up when a listed session has no poll snapshot.
 
             **Sub-agent spawning**: MCP-started `orchestrate` runs can dispatch sub-agents. Sub-agents cannot recursively start additional agent runs.
@@ -160,20 +174,66 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 description: """
                 Provide `op` plus operation-specific fields.
 
-                **start**: message (required), model_id? (defaults to pair), session_name?, workflow_id|workflow_name?, detach?, timeout?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args. Use workflow_name="orchestrate" to plan, decompose, and dispatch sub-agents.
-                **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only)
-                **cancel**: session_id (required)
-                **steer**: session_id (required, from a prior `start`/`steer` response), message (required), wait?, timeout_seconds?, workflow_id|workflow_name?
-                **respond**: session_id (required), interaction_id (required), response?, answers?, amendment?, content?, meta?
+                **start**: message (required), model_id? (defaults to pair), session_name?, workflow_id|workflow_name?, detach?, timeout?, response_mode?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args. Use workflow_name="orchestrate" to plan, decompose, and dispatch sub-agents.
+                **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only), response_mode?
+                **cancel**: session_id (required), response_mode?
+                **steer**: session_id (required, from a prior `start`/`steer` response), message (required), wait?, timeout_seconds?, workflow_id|workflow_name?, response_mode?
+                **respond**: session_id (required), interaction_id (required), response?, answers?, amendment?, content?, meta?, response_mode?
 
-                start/steer/respond also accept an optional `request_id` idempotency key; duplicates return the recorded outcome instead of re-executing.
+                All operations accept optional response_mode=full|tail|none. start/steer/respond also accept an optional `request_id` idempotency key; duplicates return the recorded canonical outcome without re-executing, then apply the requested response_mode.
                 """,
                 properties: properties,
                 required: ["op"]
             )
-        ) { [dependencies] _, args in
-            try await dependencies.executeAgentRun(args)
+        ) { [self] _, args in
+            try await executeWithResponsePresentation(
+                args: args,
+                toolName: MCPWindowToolName.agentRun,
+                canonicalOperation: dependencies.executeAgentRun
+            )
         }
+    }
+
+    private func executeWithResponsePresentation(
+        args: [String: Value],
+        toolName: String,
+        canonicalOperation: @escaping AgentRunResponsePresentation.CanonicalOperation
+    ) async throws -> Value {
+        try await AgentRunResponsePresentation.execute(
+            args: args,
+            exporter: responseExportAdapter,
+            captureDestination: { [dependencies] in
+                let metadata = await dependencies.captureRequestMetadata()
+                let targetWindow = try dependencies.requireTargetWindow()
+                let resolvedContext = try dependencies.resolveTabContextSnapshot(
+                    metadata,
+                    toolName,
+                    .allowLegacyImplicitRouting
+                )
+                guard resolvedContext.snapshot.windowID == targetWindow.windowID,
+                      let workspaceID = resolvedContext.snapshot.workspaceID,
+                      let workspace = targetWindow.workspaceManager.activeWorkspace,
+                      workspace.id == workspaceID
+                else {
+                    throw MCPError.invalidParams(
+                        "Cannot export agent result: request-bound window/workspace ownership is unavailable."
+                    )
+                }
+                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                guard lookupContext != AgentWorkspaceLookupContextResolver.failClosedLookupContext else {
+                    throw MCPError.invalidParams(
+                        "Cannot export agent result: request-bound read_file scope is unavailable."
+                    )
+                }
+                return try dependencies.makeOracleExportDestination(
+                    workspace,
+                    targetWindow.windowID,
+                    resolvedContext.snapshot.tabID,
+                    lookupContext
+                )
+            },
+            canonicalOperation: canonicalOperation
+        )
     }
 
     private func agentManageTool() -> Tool {

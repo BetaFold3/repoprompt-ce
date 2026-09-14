@@ -176,6 +176,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let askOracle = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.askOracle })
         let oracleSend = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.oracleSend })
         let oracleChatLog = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.oracleChatLog })
+        let agentExplore = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentExplore })
         let agentRun = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
         let applyEdits = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.applyEdits })
         let setStatus = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.setStatus })
@@ -208,7 +209,12 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertNotNil(oracleChatLogProperties["part"])
         XCTAssertNotNil(oracleChatLogProperties["max_total_chars"])
 
+        let agentExploreProperties = try Self.schemaProperties(for: agentExplore)
         let agentRunProperties = try Self.schemaProperties(for: agentRun)
+        for properties in [agentExploreProperties, agentRunProperties] {
+            let responseModes = properties["response_mode"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue)
+            XCTAssertEqual(responseModes, ["full", "tail", "none"])
+        }
         for field in [
             "model_id",
             "detach",
@@ -790,8 +796,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
         "17|remote_pairing|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b66a65cddc2ce05b1aa4bd372bf87806149f0059c77318f2c0c88d998953733b|schema=78d2d5faef64665bd00b69fe88ebd9776445c1b21e028dbaf03f7bbeaa6dfed2",
-        "18|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=7b3c869b0c959c1c162dfadfd4ea578b05ed0834b2e930d177a8c38f96c31a4b",
-        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d7e34e45febbe2f158be407285081ebc1aa06de44f7c08247e6716cdce930069|schema=bccc0d73bcfdeb996b558c052580e7db42abe60959e1807ad23e54291740ee23",
+        "18|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3dd91b2691b65094d6705bbd57a835d02f612b5725ce5251447ccb49a006ce6b|schema=b9ec9650bf3d775f9429b791e12e4056c06bf920a2ed040ed769df027dfe81bc",
+        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=9d0df6c967849e5478e333bb96478795057b0e129c7d7616eff97873eb27567e|schema=28a006ae721e839f1a0fcaeaabdce869424bd6c4246592fa7ab4dc76d1f507e5",
         "20|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b057e2b0203e6ec0faeac9b9342f1823d655cd7a60e51436d44d817da5516d69|schema=4cd0a819fec64efd8e0d3ad26a5242f622dd9496627b19f381bbc02ebc8fc3e5",
         "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",

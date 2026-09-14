@@ -46,7 +46,8 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         let args: [String: Value] = [
             "op": .string("start"),
             "message": .string("go"),
-            "request_id": .string("req-start-1")
+            "request_id": .string("req-start-1"),
+            "response_mode": .string("tail")
         ]
 
         do {
@@ -57,8 +58,10 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         }
         XCTAssertEqual(counter.count, 1)
 
+        var replayArgs = args
+        replayArgs["response_mode"] = .string("none")
         do {
-            _ = try await service.execute(args: args)
+            _ = try await service.execute(args: replayArgs)
             XCTFail("Duplicate start must replay the recorded outcome")
         } catch {
             XCTAssertTrue(
@@ -66,7 +69,7 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
                 "Duplicate must be answered from the registry: \(error)"
             )
         }
-        XCTAssertEqual(counter.count, 1, "Duplicate start must not execute the mutation a second time")
+        XCTAssertEqual(counter.count, 1, "Changing only response_mode must not execute the mutation a second time")
     }
 
     func testDuplicateRespondReplaysRecordedResultWhileVMFencingStaysStrict() async throws {

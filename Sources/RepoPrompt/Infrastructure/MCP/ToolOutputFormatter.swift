@@ -5553,6 +5553,7 @@ extension ToolOutputFormatter {
             lines.append("- Run ID: `\(runID)`")
         }
         lines.append(contentsOf: formattedAgentRunWorktreeLines(worktrees))
+        lines.append(contentsOf: formattedAgentResponsePresentationLines(object))
         // Multi-wait metadata
         let waitMeta = object["wait"]?.objectValue
         if let waitMeta, waitMeta["mode"]?.stringValue == "any" {
@@ -5578,6 +5579,10 @@ extension ToolOutputFormatter {
             if !pendingIDs.isEmpty {
                 lines.append("- Pending: \(pendingIDs.map { "`\($0)`" }.joined(separator: ", "))")
             }
+            lines.append(contentsOf: formattedWaitAnyNestedRecoveryLines(
+                object,
+                primarySessionID: sessionID
+            ))
         }
         if let agentName, !agentName.isEmpty {
             var agentLine = "- Agent: **\(agentName)**"
@@ -5730,6 +5735,8 @@ extension ToolOutputFormatter {
         if !interestingIDs.isEmpty {
             lines.append("- Interesting: \(interestingIDs.count)")
         }
+        lines.append(contentsOf: formattedAgentResponsePresentationLines(object))
+        let responseWideFullFallback = isResponseWideFullFallback(object)
         let snapshots = object["snapshots"]?.arrayValue ?? []
         for snap in snapshots {
             guard let snapObj = snap.objectValue else { continue }
@@ -5741,6 +5748,11 @@ extension ToolOutputFormatter {
                 line += " (\(name))"
             }
             lines.append(line)
+            lines.append(contentsOf: formattedAgentSnapshotRecoveryLines(
+                snapObj,
+                forceFullInline: responseWideFullFallback,
+                indent: "  "
+            ))
         }
         return [.text(lines.joined(separator: "\n"))]
     }
@@ -5761,6 +5773,8 @@ extension ToolOutputFormatter {
         if !terminalIDs.isEmpty {
             lines.append("- Terminal: \(terminalIDs.count)")
         }
+        lines.append(contentsOf: formattedAgentResponsePresentationLines(object))
+        let responseWideFullFallback = isResponseWideFullFallback(object)
         let snapshots = object["snapshots"]?.arrayValue ?? []
         for snap in snapshots {
             guard let snapObj = snap.objectValue else { continue }
@@ -5772,8 +5786,111 @@ extension ToolOutputFormatter {
                 line += " (\(name))"
             }
             lines.append(line)
+            lines.append(contentsOf: formattedAgentSnapshotRecoveryLines(
+                snapObj,
+                forceFullInline: responseWideFullFallback,
+                indent: "  "
+            ))
         }
         return [.text(lines.joined(separator: "\n"))]
+    }
+
+    private static func formattedWaitAnyNestedRecoveryLines(
+        _ object: [String: Value],
+        primarySessionID: String?
+    ) -> [String] {
+        let forceFullInline = isResponseWideFullFallback(object)
+        var lines: [String] = []
+        for snapshot in object["snapshots"]?.arrayValue ?? [] {
+            guard let nested = snapshot.objectValue else { continue }
+            let sessionID = nested["session_id"]?.stringValue
+            if let sessionID, sessionID == primarySessionID { continue }
+
+            let presentation = nested[AgentRunResponsePresentation.presentationKey]?.objectValue
+            let hasRetrieval = presentation?["export_path"]?.stringValue?.isEmpty == false
+            let hasRetainedFullText = shouldRenderRetainedAssistantText(
+                nested,
+                forceFullInline: forceFullInline
+            )
+            guard hasRetrieval || hasRetainedFullText else { continue }
+
+            let status = prettifiedAgentStatus(nested["status"]?.stringValue) ?? "unknown"
+            lines.append("- Additional result: `\(sessionID ?? "?")` — **\(status)**")
+            lines.append(contentsOf: formattedAgentSnapshotRecoveryLines(
+                nested,
+                forceFullInline: forceFullInline,
+                indent: "  "
+            ))
+        }
+        return lines
+    }
+
+    private static func formattedAgentSnapshotRecoveryLines(
+        _ object: [String: Value],
+        forceFullInline: Bool,
+        indent: String
+    ) -> [String] {
+        var lines = formattedAgentResponsePresentationLines(object).map { indent + $0 }
+        guard shouldRenderRetainedAssistantText(
+            object,
+            forceFullInline: forceFullInline
+        ), let assistantText = object["assistant_text"]?.stringValue,
+        !assistantText.isEmpty
+        else {
+            return lines
+        }
+
+        let isTerminal = object["status"]?.stringValue.map {
+            ["completed", "failed", "cancelled", "expired"].contains($0)
+        } ?? false
+        lines.append("\(indent)**\(isTerminal ? "Output" : "Preview")**\n\n\(assistantText)")
+        return lines
+    }
+
+    private static func shouldRenderRetainedAssistantText(
+        _ object: [String: Value],
+        forceFullInline: Bool
+    ) -> Bool {
+        if forceFullInline { return true }
+        guard let presentation = object[AgentRunResponsePresentation.presentationKey]?.objectValue,
+              presentation["response_mode"]?.stringValue == OracleResponseMode.full.rawValue
+        else {
+            return false
+        }
+        return presentation["export_warning"] != nil || presentation["safety_override"] != nil
+    }
+
+    private static func isResponseWideFullFallback(_ object: [String: Value]) -> Bool {
+        guard let presentation = object[AgentRunResponsePresentation.presentationKey]?.objectValue else {
+            return false
+        }
+        return presentation["response_mode"]?.stringValue == OracleResponseMode.full.rawValue
+            && presentation["export_warning"] != nil
+    }
+
+    private static func formattedAgentResponsePresentationLines(
+        _ object: [String: Value]
+    ) -> [String] {
+        guard let presentation = object["assistant_text_presentation"]?.objectValue else {
+            return []
+        }
+
+        var lines: [String] = []
+        if let mode = presentation["response_mode"]?.stringValue, !mode.isEmpty {
+            lines.append("- Response mode: `\(mode)`")
+        }
+        if let path = presentation["export_path"]?.stringValue, !path.isEmpty {
+            lines.append("- Full output: `\(path)`")
+        }
+        if let instruction = presentation["retrieval_instruction"]?.stringValue,
+           !instruction.isEmpty
+        {
+            lines.append("- Retrieval: \(instruction)")
+        }
+        if let warning = presentation["export_warning"]?.stringValue, !warning.isEmpty {
+            lines.append("- Export warning: \(warning)")
+        }
+        return lines
     }
 
     private static func agentListGroupingEffort(modelID: String, reasoningEffort: String?) -> String? {

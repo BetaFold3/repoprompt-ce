@@ -7,7 +7,7 @@ struct OracleExportFile: Equatable {
     let instruction: String
 }
 
-struct OracleExportDestination: Equatable {
+struct OracleExportDestination: Equatable, @unchecked Sendable {
     let workspaceID: UUID
     let windowID: Int
     let tabID: UUID?
@@ -422,7 +422,10 @@ struct AgentRunMCPToolService {
         let key = MCPRequestIdempotencyRegistry.Key(clientID: clientID, requestID: requestID)
         let fingerprint = MCPRequestIdempotencyRegistry.Fingerprint(
             operation: op,
-            payloadHashSHA256: MCPRequestIdempotencyRegistry.payloadHashHex(args: args)
+            payloadHashSHA256: MCPRequestIdempotencyRegistry.payloadHashHex(
+                args: args,
+                excluding: ["request_id", "response_mode"]
+            )
         )
         switch await idempotencyRegistry.begin(key: key, fingerprint: fingerprint) {
         case .new:
