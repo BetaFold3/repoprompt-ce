@@ -3659,6 +3659,15 @@ final class AgentModeViewModel: ObservableObject {
             persistRunStateTransitionIfNeeded(for: session)
             republishTranscriptPresentationForRunStateChangeIfNeeded(session)
         }
+        newSession.onUsageAccountingChanged = { [weak self] session, didChangeAcceptedAccounting in
+            guard let self else { return }
+            // Verdict/execution changes republish through the existing runtime-metrics coalescing;
+            // only an advanced owned revision has anything new to persist.
+            requestUIRefresh(tabID: session.tabID, scope: .runtimeMetrics)
+            guard didChangeAcceptedAccounting else { return }
+            session.isDirty = true
+            scheduleSave(for: session.tabID)
+        }
         // Initialize new session with current UI selection
         newSession.selectedAgent = selectedAgent
         newSession.selectedModelRaw = selectedModelRaw

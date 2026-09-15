@@ -222,6 +222,185 @@ struct AgentProviderUsageRecord: Codable, Equatable {
         }
     }
 
+    /// Codex disjoint owned counter interval with its frozen pricing outcome (plan §4.1). Absent
+    /// on records written before Codex accounting existed (`codexIntervals` stays `nil`, so those
+    /// bytes remain lossless). Counts are deltas of the app-server's cumulative `total`.
+    struct CodexUsageInterval: Codable, Equatable {
+        /// Compact applied pricing basis frozen at dispatch (plan §4.1): basis, source, capture
+        /// and validation dates, dispatch-time staleness, and the rates actually applied (lower
+        /// and upper differ only for an envelope). Historical amounts are never repriced from it.
+        struct AppliedPricing: Codable, Equatable {
+            var basis: String
+            var sourceKind: String
+            var capturedAtMilliseconds: Int64
+            var validatedAtMilliseconds: Int64
+            var wasStale: Bool
+            var inputRateLowerUSD: Decimal?
+            var inputRateUpperUSD: Decimal?
+            var cachedInputRateLowerUSD: Decimal?
+            var cachedInputRateUpperUSD: Decimal?
+            var cacheWriteRateLowerUSD: Decimal?
+            var cacheWriteRateUpperUSD: Decimal?
+            var outputRateLowerUSD: Decimal?
+            var outputRateUpperUSD: Decimal?
+
+            init(snapshot: OpenAIPricingSnapshot, lowerRates: OpenAIPricingRates?, upperRates: OpenAIPricingRates?) {
+                basis = snapshot.basis.rawValue
+                sourceKind = snapshot.sourceKind.rawValue
+                capturedAtMilliseconds = Int64((snapshot.capturedAt.timeIntervalSince1970 * 1000).rounded())
+                validatedAtMilliseconds = Int64((snapshot.validatedAt.timeIntervalSince1970 * 1000).rounded())
+                wasStale = snapshot.isStale
+                inputRateLowerUSD = lowerRates?.input
+                inputRateUpperUSD = upperRates?.input
+                cachedInputRateLowerUSD = lowerRates?.cachedInput
+                cachedInputRateUpperUSD = upperRates?.cachedInput
+                cacheWriteRateLowerUSD = lowerRates?.cacheWrite
+                cacheWriteRateUpperUSD = upperRates?.cacheWrite
+                outputRateLowerUSD = lowerRates?.output
+                outputRateUpperUSD = upperRates?.output
+            }
+
+            var capturedAt: Date {
+                Date(timeIntervalSince1970: TimeInterval(capturedAtMilliseconds) / 1000)
+            }
+
+            var validatedAt: Date {
+                Date(timeIntervalSince1970: TimeInterval(validatedAtMilliseconds) / 1000)
+            }
+
+            var ratePairs: [(label: String, lower: Decimal?, upper: Decimal?)] {
+                [
+                    ("inputRate", inputRateLowerUSD, inputRateUpperUSD),
+                    ("cachedInputRate", cachedInputRateLowerUSD, cachedInputRateUpperUSD),
+                    ("cacheWriteRate", cacheWriteRateLowerUSD, cacheWriteRateUpperUSD),
+                    ("outputRate", outputRateLowerUSD, outputRateUpperUSD)
+                ]
+            }
+
+            enum CodingKeys: String, CodingKey, CaseIterable {
+                case basis, sourceKind, capturedAtMilliseconds, validatedAtMilliseconds, wasStale
+                case inputRateLowerUSD, inputRateUpperUSD, cachedInputRateLowerUSD, cachedInputRateUpperUSD
+                case cacheWriteRateLowerUSD, cacheWriteRateUpperUSD, outputRateLowerUSD, outputRateUpperUSD
+            }
+
+            init(from decoder: Decoder) throws {
+                try AgentProviderUsageStrictDecoding.rejectUnknownMembers(in: decoder, known: CodingKeys.allCases)
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                basis = try container.decode(String.self, forKey: .basis)
+                sourceKind = try container.decode(String.self, forKey: .sourceKind)
+                capturedAtMilliseconds = try container.decode(Int64.self, forKey: .capturedAtMilliseconds)
+                validatedAtMilliseconds = try container.decode(Int64.self, forKey: .validatedAtMilliseconds)
+                wasStale = try container.decode(Bool.self, forKey: .wasStale)
+                inputRateLowerUSD = try container.decodeIfPresent(Decimal.self, forKey: .inputRateLowerUSD)
+                inputRateUpperUSD = try container.decodeIfPresent(Decimal.self, forKey: .inputRateUpperUSD)
+                cachedInputRateLowerUSD = try container.decodeIfPresent(Decimal.self, forKey: .cachedInputRateLowerUSD)
+                cachedInputRateUpperUSD = try container.decodeIfPresent(Decimal.self, forKey: .cachedInputRateUpperUSD)
+                cacheWriteRateLowerUSD = try container.decodeIfPresent(Decimal.self, forKey: .cacheWriteRateLowerUSD)
+                cacheWriteRateUpperUSD = try container.decodeIfPresent(Decimal.self, forKey: .cacheWriteRateUpperUSD)
+                outputRateLowerUSD = try container.decodeIfPresent(Decimal.self, forKey: .outputRateLowerUSD)
+                outputRateUpperUSD = try container.decodeIfPresent(Decimal.self, forKey: .outputRateUpperUSD)
+            }
+        }
+
+        static let attributionNotified = "notified"
+        static let attributionInferred = "inferredCurrentTurn"
+        static let attributionUnknown = "unknown"
+        static let knownAttributions: Set<String> = [attributionNotified, attributionInferred, attributionUnknown]
+
+        var executionID: UUID
+        var threadID: String?
+        var turnID: String?
+        var turnAttribution: String
+        var ordinal: Int
+        var inputTokens: Int64?
+        var cachedInputTokens: Int64?
+        var cacheWriteInputTokens: Int64?
+        var outputTokens: Int64?
+        var reasoningOutputTokens: Int64?
+        var pricingVersion: String?
+        var requestedModelID: String?
+        var resolvedModelID: String?
+        var bandKind: String?
+        var estimatedCostLowerUSD: Decimal?
+        var estimatedCostUpperUSD: Decimal?
+        /// Present only on priced intervals written by builds that record applied pricing.
+        var appliedPricing: AppliedPricing?
+        var coverage: Coverage
+        var diagnostic: String?
+
+        init(
+            executionID: UUID,
+            threadID: String? = nil,
+            turnID: String? = nil,
+            turnAttribution: String,
+            ordinal: Int,
+            inputTokens: Int64? = nil,
+            cachedInputTokens: Int64? = nil,
+            cacheWriteInputTokens: Int64? = nil,
+            outputTokens: Int64? = nil,
+            reasoningOutputTokens: Int64? = nil,
+            pricingVersion: String? = nil,
+            requestedModelID: String? = nil,
+            resolvedModelID: String? = nil,
+            bandKind: String? = nil,
+            estimatedCostLowerUSD: Decimal? = nil,
+            estimatedCostUpperUSD: Decimal? = nil,
+            appliedPricing: AppliedPricing? = nil,
+            coverage: Coverage,
+            diagnostic: String? = nil
+        ) {
+            self.executionID = executionID
+            self.threadID = threadID
+            self.turnID = turnID
+            self.turnAttribution = turnAttribution
+            self.ordinal = ordinal
+            self.inputTokens = inputTokens
+            self.cachedInputTokens = cachedInputTokens
+            self.cacheWriteInputTokens = cacheWriteInputTokens
+            self.outputTokens = outputTokens
+            self.reasoningOutputTokens = reasoningOutputTokens
+            self.pricingVersion = pricingVersion
+            self.requestedModelID = requestedModelID
+            self.resolvedModelID = resolvedModelID
+            self.bandKind = bandKind
+            self.estimatedCostLowerUSD = estimatedCostLowerUSD
+            self.estimatedCostUpperUSD = estimatedCostUpperUSD
+            self.appliedPricing = appliedPricing
+            self.coverage = coverage
+            self.diagnostic = diagnostic
+        }
+
+        enum CodingKeys: String, CodingKey, CaseIterable {
+            case executionID, threadID, turnID, turnAttribution, ordinal, inputTokens, cachedInputTokens
+            case cacheWriteInputTokens, outputTokens, reasoningOutputTokens, pricingVersion, requestedModelID
+            case resolvedModelID, bandKind, estimatedCostLowerUSD, estimatedCostUpperUSD, appliedPricing, coverage, diagnostic
+        }
+
+        init(from decoder: Decoder) throws {
+            try AgentProviderUsageStrictDecoding.rejectUnknownMembers(in: decoder, known: CodingKeys.allCases)
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            executionID = try container.decode(UUID.self, forKey: .executionID)
+            threadID = try container.decodeIfPresent(String.self, forKey: .threadID)
+            turnID = try container.decodeIfPresent(String.self, forKey: .turnID)
+            turnAttribution = try container.decode(String.self, forKey: .turnAttribution)
+            ordinal = try container.decode(Int.self, forKey: .ordinal)
+            inputTokens = try container.decodeIfPresent(Int64.self, forKey: .inputTokens)
+            cachedInputTokens = try container.decodeIfPresent(Int64.self, forKey: .cachedInputTokens)
+            cacheWriteInputTokens = try container.decodeIfPresent(Int64.self, forKey: .cacheWriteInputTokens)
+            outputTokens = try container.decodeIfPresent(Int64.self, forKey: .outputTokens)
+            reasoningOutputTokens = try container.decodeIfPresent(Int64.self, forKey: .reasoningOutputTokens)
+            pricingVersion = try container.decodeIfPresent(String.self, forKey: .pricingVersion)
+            requestedModelID = try container.decodeIfPresent(String.self, forKey: .requestedModelID)
+            resolvedModelID = try container.decodeIfPresent(String.self, forKey: .resolvedModelID)
+            bandKind = try container.decodeIfPresent(String.self, forKey: .bandKind)
+            estimatedCostLowerUSD = try container.decodeIfPresent(Decimal.self, forKey: .estimatedCostLowerUSD)
+            estimatedCostUpperUSD = try container.decodeIfPresent(Decimal.self, forKey: .estimatedCostUpperUSD)
+            appliedPricing = try container.decodeIfPresent(AppliedPricing.self, forKey: .appliedPricing)
+            coverage = try container.decode(Coverage.self, forKey: .coverage)
+            diagnostic = try container.decodeIfPresent(String.self, forKey: .diagnostic)
+        }
+    }
+
     var schemaVersion: Int
     var originSessionID: UUID
     /// Milliseconds since the Unix epoch; stored as an integer to keep persistence lossless.
@@ -229,13 +408,16 @@ struct AgentProviderUsageRecord: Codable, Equatable {
     var hasUnmeasuredHistory: Bool
     var turns: [TurnSummary]
     var claudeSegments: [ClaudeMonetarySegment]
+    /// Codex owned intervals; `nil` (absent member) until Codex accounting writes one.
+    var codexIntervals: [CodexUsageInterval]?
 
     init(
         originSessionID: UUID,
         trackingStartedAt: Date,
         hasUnmeasuredHistory: Bool,
         turns: [TurnSummary] = [],
-        claudeSegments: [ClaudeMonetarySegment] = []
+        claudeSegments: [ClaudeMonetarySegment] = [],
+        codexIntervals: [CodexUsageInterval]? = nil
     ) {
         schemaVersion = Self.supportedSchemaVersion
         self.originSessionID = originSessionID
@@ -243,6 +425,7 @@ struct AgentProviderUsageRecord: Codable, Equatable {
         self.hasUnmeasuredHistory = hasUnmeasuredHistory
         self.turns = turns
         self.claudeSegments = claudeSegments
+        self.codexIntervals = codexIntervals
     }
 
     var trackingStartedAt: Date {
@@ -251,6 +434,7 @@ struct AgentProviderUsageRecord: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case schemaVersion, originSessionID, trackingStartedAtMilliseconds, hasUnmeasuredHistory, turns, claudeSegments
+        case codexIntervals
     }
 
     init(from decoder: Decoder) throws {
@@ -262,6 +446,7 @@ struct AgentProviderUsageRecord: Codable, Equatable {
         hasUnmeasuredHistory = try container.decode(Bool.self, forKey: .hasUnmeasuredHistory)
         turns = try container.decode([TurnSummary].self, forKey: .turns)
         claudeSegments = try container.decode([ClaudeMonetarySegment].self, forKey: .claudeSegments)
+        codexIntervals = try container.decodeIfPresent([CodexUsageInterval].self, forKey: .codexIntervals)
     }
 
     // MARK: Semantic validation
@@ -329,6 +514,52 @@ struct AgentProviderUsageRecord: Codable, Equatable {
             if let count = turn.observedRequestCount, count < 0 { return "turns[\(index)] has a negative observedRequestCount" }
         }
 
+        for (index, interval) in (codexIntervals ?? []).enumerated() {
+            guard CodexUsageInterval.knownAttributions.contains(interval.turnAttribution) else {
+                return "codexIntervals[\(index)] has unknown turnAttribution '\(interval.turnAttribution)'"
+            }
+            guard interval.ordinal >= 0 else { return "codexIntervals[\(index)] has a negative ordinal" }
+            for (label, value) in [
+                ("inputTokens", interval.inputTokens),
+                ("cachedInputTokens", interval.cachedInputTokens),
+                ("cacheWriteInputTokens", interval.cacheWriteInputTokens),
+                ("outputTokens", interval.outputTokens),
+                ("reasoningOutputTokens", interval.reasoningOutputTokens)
+            ] {
+                if let value, value < 0 { return "codexIntervals[\(index)] has a negative \(label)" }
+            }
+            if let lower = interval.estimatedCostLowerUSD {
+                guard !lower.isNaN, lower >= 0 else { return "codexIntervals[\(index)] has an invalid estimatedCostLowerUSD" }
+            }
+            if let upper = interval.estimatedCostUpperUSD {
+                guard !upper.isNaN, upper >= 0 else { return "codexIntervals[\(index)] has an invalid estimatedCostUpperUSD" }
+            }
+            if (interval.estimatedCostLowerUSD == nil) != (interval.estimatedCostUpperUSD == nil) {
+                return "codexIntervals[\(index)] has only one cost bound"
+            }
+            if let lower = interval.estimatedCostLowerUSD, let upper = interval.estimatedCostUpperUSD, upper < lower {
+                return "codexIntervals[\(index)] estimatedCostUpperUSD is below its lower bound"
+            }
+            if let applied = interval.appliedPricing {
+                guard interval.estimatedCostLowerUSD != nil else { return "codexIntervals[\(index)] has applied pricing without a cost" }
+                guard !applied.basis.isEmpty, !applied.sourceKind.isEmpty else { return "codexIntervals[\(index)] has an empty pricing basis" }
+                guard applied.capturedAtMilliseconds >= 0, applied.validatedAtMilliseconds >= 0 else {
+                    return "codexIntervals[\(index)] has a negative pricing timestamp"
+                }
+                for pair in applied.ratePairs {
+                    if let lower = pair.lower {
+                        guard !lower.isNaN, lower >= 0 else { return "codexIntervals[\(index)] has an invalid \(pair.label)LowerUSD" }
+                    }
+                    if let upper = pair.upper {
+                        guard !upper.isNaN, upper >= 0 else { return "codexIntervals[\(index)] has an invalid \(pair.label)UpperUSD" }
+                    }
+                    if let lower = pair.lower, let upper = pair.upper, upper < lower {
+                        return "codexIntervals[\(index)] \(pair.label)UpperUSD is below its lower bound"
+                    }
+                }
+            }
+        }
+
         for (segmentIndex, segment) in claudeSegments.enumerated() {
             let segmentTurns = turnsBySegment[segmentIndex] ?? []
             if let acceptedResultID = segment.acceptedResultID,
@@ -355,6 +586,14 @@ struct AgentProviderUsageRecord: Codable, Equatable {
         for (index, segment) in claudeSegments.enumerated() {
             if segment.baseline?.isNaN == true { return "claudeSegments[\(index)].baseline is NaN" }
             if segment.latestCumulative?.isNaN == true { return "claudeSegments[\(index)].latestCumulative is NaN" }
+        }
+        for (index, interval) in (codexIntervals ?? []).enumerated() {
+            if interval.estimatedCostLowerUSD?.isNaN == true { return "codexIntervals[\(index)].estimatedCostLowerUSD is NaN" }
+            if interval.estimatedCostUpperUSD?.isNaN == true { return "codexIntervals[\(index)].estimatedCostUpperUSD is NaN" }
+            for pair in interval.appliedPricing?.ratePairs ?? [] {
+                if pair.lower?.isNaN == true { return "codexIntervals[\(index)].appliedPricing.\(pair.label)LowerUSD is NaN" }
+                if pair.upper?.isNaN == true { return "codexIntervals[\(index)].appliedPricing.\(pair.label)UpperUSD is NaN" }
+            }
         }
         return nil
     }

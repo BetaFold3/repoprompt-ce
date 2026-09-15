@@ -41,6 +41,11 @@ public struct ClaudeProviderUsageObservation: Sendable, Equatable {
     public let resultSubtype: String?
     /// `result.is_error` for `.result` observations when reported.
     public let resultIsError: Bool?
+    /// Literal `result_index` for `.result` observations: the provider's zero-based dispatch
+    /// ordinal within its process. Transport evidence only; ownership is decided in core.
+    public let resultIndex: Int?
+    /// Literal `queued_turn_count` for `.result` observations when reported.
+    public let queuedTurnCount: Int?
 
     public init(
         source: Source,
@@ -53,7 +58,9 @@ public struct ClaudeProviderUsageObservation: Sendable, Equatable {
         requestID: String? = nil,
         parentToolUseID: String? = nil,
         resultSubtype: String? = nil,
-        resultIsError: Bool? = nil
+        resultIsError: Bool? = nil,
+        resultIndex: Int? = nil,
+        queuedTurnCount: Int? = nil
     ) {
         self.source = source
         self.inputTokens = inputTokens
@@ -66,6 +73,8 @@ public struct ClaudeProviderUsageObservation: Sendable, Equatable {
         self.parentToolUseID = parentToolUseID
         self.resultSubtype = resultSubtype
         self.resultIsError = resultIsError
+        self.resultIndex = resultIndex
+        self.queuedTurnCount = queuedTurnCount
     }
 }
 

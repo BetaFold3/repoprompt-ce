@@ -65,6 +65,12 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.selectionTokens
     }
 
+    /// Provider usage (CH share / provider-estimated cost) is a separate readout from context
+    /// occupancy: it shares no denominator with the wheel and never feeds ratio math.
+    private var providerUsagePresentation: AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.Presentation {
+        runtimeVM.snapshot.providerUsage.presentation
+    }
+
     private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
@@ -109,6 +115,10 @@ struct AgentContextPill: View {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
         }
 
+        // Separate labelled line; the popover carries the full scope/coverage explanation.
+        let usage = providerUsagePresentation
+        lines.append("\(usage.title): \(usage.readoutText)")
+
         return lines.joined(separator: "\n")
     }
 
@@ -150,7 +160,7 @@ struct AgentContextPill: View {
         .buttonStyle(.plain)
         .hoverTooltip(contextUsageTooltip(detailedFileSummaryText: detailedFileSummaryText), .top)
         .accessibilityLabel("Agent context: \(detailedFileSummaryText)")
-        .accessibilityHint("Opens context export controls and usage details")
+        .accessibilityHint("Opens context export controls, context usage, and provider usage details")
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
             contextPopoverContent
         }
@@ -179,6 +189,9 @@ struct AgentContextPill: View {
                 )
                 Spacer()
             }
+
+            AgentProviderUsageReadout(presentation: providerUsagePresentation, showsVisibleNote: true)
+                .agentSidebarCard()
 
             AgentSelectedFilesInlineManager(
                 promptManager: promptManager,

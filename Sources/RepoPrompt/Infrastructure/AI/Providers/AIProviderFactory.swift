@@ -285,6 +285,11 @@ struct AgentProviderUsageObservation: Equatable {
     let resultSubtype: String?
     /// Result error evidence for `.result` observations when reported.
     let resultIsError: Bool?
+    /// Provider `result_index` (zero-based dispatch ordinal within the provider process) for
+    /// `.result` observations. Transport evidence only; ownership is decided by the runtime.
+    let resultIndex: Int?
+    /// Provider `queued_turn_count` for `.result` observations when reported.
+    let queuedTurnCount: Int?
 
     init(
         source: Source,
@@ -297,7 +302,9 @@ struct AgentProviderUsageObservation: Equatable {
         requestID: String? = nil,
         parentToolUseID: String? = nil,
         resultSubtype: String? = nil,
-        resultIsError: Bool? = nil
+        resultIsError: Bool? = nil,
+        resultIndex: Int? = nil,
+        queuedTurnCount: Int? = nil
     ) {
         self.source = source
         self.inputTokens = inputTokens
@@ -310,6 +317,8 @@ struct AgentProviderUsageObservation: Equatable {
         self.parentToolUseID = parentToolUseID
         self.resultSubtype = resultSubtype
         self.resultIsError = resultIsError
+        self.resultIndex = resultIndex
+        self.queuedTurnCount = queuedTurnCount
     }
 }
 

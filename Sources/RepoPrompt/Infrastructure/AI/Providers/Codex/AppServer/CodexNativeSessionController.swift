@@ -5,6 +5,23 @@ struct CodexTurnStartReceipt: Equatable {
     let provisionalSubmissionID: String
 }
 
+/// A local turn/start preflight failure proves the request never reached the app-server transport.
+/// Transport, cancellation, timeout, response-validation and server-response errors use their
+/// existing error types because none of those outcomes proves that provider work did not start.
+enum CodexTurnStartPreflightError: Error, LocalizedError, Equatable {
+    case noActiveThread
+    case invalidInput(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noActiveThread:
+            "Codex turn/start was not submitted because there is no active thread."
+        case let .invalidInput(message):
+            "Codex turn/start was not submitted: \(message)"
+        }
+    }
+}
+
 struct CodexTurnSteerReceipt: Equatable {
     let acceptedTurnID: String
 }
@@ -371,6 +388,11 @@ final class CodexNativeSessionController {
         case reasoningDelta(ReasoningDeltaPayload)
         case reasoningCompleted(ReasoningCompletionPayload)
         case tokenUsage(AgentContextUsage)
+        /// Optional-preserving raw counters companion to `tokenUsage` (plan §4.1); emitted even
+        /// when the legacy context projection is nil.
+        case usageObservation(CodexUsageObservation)
+        /// Installed `model/rerouted` notification; affected turns are priced partial, never repriced.
+        case modelRerouted(CodexModelReroute)
         case turnStarted(turnID: String?)
         case turnCompleted(turnID: String?, status: TurnStatus, failure: TurnFailure? = nil)
         case contextCompacted(turnID: String?)
@@ -583,6 +605,8 @@ final class CodexNativeSessionController {
     private var threadID: String?
     private var threadPath: String?
     private var routingCurrentTurnID: String?
+    /// Monotonic delivery ordinal of `thread/tokenUsage/updated` notifications on this controller.
+    private var usageObservationOrdinal = 0
     private var authoritativeLifecycleTurnID: String?
     private var activeTurnIDs: Set<String> = []
     private var activeTurnOrder: [String] = []
@@ -1367,8 +1391,13 @@ final class CodexNativeSessionController {
         reasoningEffort: String?,
         serviceTier: String?
     ) async throws -> CodexTurnStartReceipt {
-        guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
-        let input = try Self.turnInput(text: text, images: images)
+        guard let threadID else { throw CodexTurnStartPreflightError.noActiveThread }
+        let input: [[String: Any]]
+        do {
+            input = try Self.turnInput(text: text, images: images)
+        } catch {
+            throw CodexTurnStartPreflightError.invalidInput(error.localizedDescription)
+        }
 
         var params: [String: Any] = [
             "threadId": threadID,
@@ -2807,6 +2836,25 @@ final class CodexNativeSessionController {
             if let usage = parseTokenUsage(from: params) {
                 await emit(.tokenUsage(usage))
             }
+            if let tokenUsage = Self.tokenUsageObject(from: params) {
+                usageObservationOrdinal += 1
+                await emit(.usageObservation(CodexUsageObservationParser.observation(
+                    from: params,
+                    tokenUsage: tokenUsage,
+                    threadID: Self.notificationThreadID(from: params),
+                    notifiedTurnID: Self.notificationTurnID(from: params),
+                    routingCurrentTurnID: routingCurrentTurnID,
+                    ordinal: usageObservationOrdinal
+                )))
+            }
+        case "model/rerouted", "codex/event/model_rerouted":
+            if let reroute = CodexUsageObservationParser.reroute(
+                from: params,
+                threadID: Self.notificationThreadID(from: params),
+                turnID: Self.notificationTurnID(from: params)
+            ) {
+                await emit(.modelRerouted(reroute))
+            }
         case "error":
             if let errorNotification = Self.parseErrorNotification(from: params) {
                 if let scope = Self.turnScope(
@@ -3399,6 +3447,32 @@ final class CodexNativeSessionController {
             configuredContextWindow: Int? = nil
         ) -> AgentContextUsage? {
             parseTokenUsagePayload(from: params, configuredContextWindow: configuredContextWindow)
+        }
+
+        /// Mirrors the `thread/tokenUsage/updated` companion emission (identity extraction plus
+        /// optional-preserving counters) without a transport.
+        static func test_parseUsageObservation(
+            from params: [String: Any],
+            routingCurrentTurnID: String? = nil,
+            ordinal: Int = 1
+        ) -> CodexUsageObservation? {
+            guard let tokenUsage = tokenUsageObject(from: params) else { return nil }
+            return CodexUsageObservationParser.observation(
+                from: params,
+                tokenUsage: tokenUsage,
+                threadID: notificationThreadID(from: params),
+                notifiedTurnID: notificationTurnID(from: params),
+                routingCurrentTurnID: routingCurrentTurnID,
+                ordinal: ordinal
+            )
+        }
+
+        static func test_parseModelReroute(from params: [String: Any]) -> CodexModelReroute? {
+            CodexUsageObservationParser.reroute(
+                from: params,
+                threadID: notificationThreadID(from: params),
+                turnID: notificationTurnID(from: params)
+            )
         }
 
         static func test_parseErrorNotification(from params: [String: Any]) -> ErrorNotification? {
@@ -4678,6 +4752,10 @@ final class CodexNativeSessionController {
             "contextCompacted turnID=\(turnID ?? "nil")"
         case let .tokenUsage(usage):
             "tokenUsage modelContextWindow=\(usage.modelContextWindow.map(String.init(describing:)) ?? "nil") lastTotalTokens=\(usage.lastTotalTokens.map(String.init(describing:)) ?? "nil") totalTotalTokens=\(usage.totalTotalTokens.map(String.init(describing:)) ?? "nil")"
+        case let .usageObservation(observation):
+            "usageObservation ordinal=\(observation.ordinal) turnID=\(observation.turnID ?? "nil") attribution=\(observation.turnAttribution.rawValue) totalInput=\(observation.total?.inputTokens.map(String.init(describing:)) ?? "nil")"
+        case let .modelRerouted(reroute):
+            "modelRerouted turnID=\(reroute.turnID ?? "nil") from=\(reroute.fromModel) to=\(reroute.toModel)"
         case let .livenessActivity(activity):
             "livenessActivity kind=\(activity.kind.rawValue) method=\(activity.method) threadID=\(activity.threadID ?? "nil") turnID=\(activity.turnID ?? "nil") itemID=\(activity.itemID ?? "nil")"
         case let .errorNotification(notification):

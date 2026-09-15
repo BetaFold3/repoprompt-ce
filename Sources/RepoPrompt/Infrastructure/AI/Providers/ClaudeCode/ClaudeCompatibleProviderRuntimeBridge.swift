@@ -289,7 +289,9 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             requestID: providerObservation.requestID,
             parentToolUseID: providerObservation.parentToolUseID,
             resultSubtype: providerObservation.resultSubtype,
-            resultIsError: providerObservation.resultIsError
+            resultIsError: providerObservation.resultIsError,
+            resultIndex: providerObservation.resultIndex,
+            queuedTurnCount: providerObservation.queuedTurnCount
         )
     }
 
@@ -307,7 +309,9 @@ enum ClaudeCompatibleProviderRuntimeBridge {
             requestID: observation.requestID,
             parentToolUseID: observation.parentToolUseID,
             resultSubtype: observation.resultSubtype,
-            resultIsError: observation.resultIsError
+            resultIsError: observation.resultIsError,
+            resultIndex: observation.resultIndex,
+            queuedTurnCount: observation.queuedTurnCount
         )
     }
 

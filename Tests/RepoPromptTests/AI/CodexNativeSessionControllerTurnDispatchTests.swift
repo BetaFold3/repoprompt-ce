@@ -32,6 +32,46 @@ final class CodexNativeSessionControllerTurnDispatchTests: XCTestCase {
         XCTAssertNil(controller.test_routingCurrentTurnID)
     }
 
+    func testTurnStartPreflightFailuresDoNotReachRequestExecutor() async {
+        let recorder = TurnRequestRecorder(result: [
+            "turn": ["id": "should-not-be-used"]
+        ])
+        let controllerWithoutThread = makeController(recorder: recorder)
+
+        do {
+            _ = try await controllerWithoutThread.startUserTurn(
+                text: "hello",
+                images: [],
+                model: nil,
+                reasoningEffort: nil,
+                serviceTier: nil
+            )
+            XCTFail("Expected no-active-thread preflight failure")
+        } catch {
+            XCTAssertEqual(error as? CodexTurnStartPreflightError, .noActiveThread)
+        }
+
+        let controllerWithEmptyInput = makeController(recorder: recorder)
+        controllerWithEmptyInput.test_installThreadState(threadID: "thread-1")
+        do {
+            _ = try await controllerWithEmptyInput.startUserTurn(
+                text: "   ",
+                images: [],
+                model: nil,
+                reasoningEffort: nil,
+                serviceTier: nil
+            )
+            XCTFail("Expected invalid-input preflight failure")
+        } catch {
+            guard case let .invalidInput(message) = error as? CodexTurnStartPreflightError else {
+                return XCTFail("Expected typed invalid-input preflight failure, got \(error)")
+            }
+            XCTAssertFalse(message.isEmpty)
+        }
+
+        XCTAssertTrue(recorder.requests().isEmpty, "local preflight failures must occur before transport submission")
+    }
+
     func testTurnSteerUsesExactExpectedIDAndOmitsStartOnlySettings() async throws {
         let recorder = TurnRequestRecorder(result: [
             "turnId": "turn-1"

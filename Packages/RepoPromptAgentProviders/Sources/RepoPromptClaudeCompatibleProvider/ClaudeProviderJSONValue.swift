@@ -55,6 +55,43 @@ public enum ClaudeProviderJSONValue: Sendable, Equatable, Codable {
         switch value {
         case _ as NSNull:
             self = .null
+        case let value as NSNumber:
+            // `JSONSerialization` yields `NSNumber` for every JSON number and boolean. This case
+            // must precede the `Bool` cast: on Darwin an `NSNumber` holding 0 or 1 bridges to
+            // `Bool`, which turned wire integers such as `"cache_creation_input_tokens":0` and
+            // `"output_tokens":1` into `.bool` and downstream into missing counts. Only the
+            // CFBoolean singletons are booleans. Swift `Bool`/`Int`/`Double` inputs also arrive
+            // here via bridging: integers are classified first by the exact decimal `stringValue`
+            // (which keeps values above 2^53 exact), then by `Int(exactly:)` on the finite double
+            // (so integral doubles in scientific notation such as `1e18` stay `.integer`, as the
+            // `Double` case below always did); non-finite values still throw.
+            if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                self = .bool(value.boolValue)
+            } else if let exactInteger = Int(value.stringValue) {
+                self = .integer(exactInteger)
+            } else {
+                // `JSONSerialization` decodes long decimal literals (for example the wire cost
+                // `0.007236599999999999`) as `NSDecimalNumber`, whose `doubleValue` is computed
+                // from mantissa and exponent and is not the nearest double (it yields
+                // `…996`). Parsing its exact decimal text gives the correctly rounded double,
+                // whose shortest round-trip text equals the wire lexeme again.
+                let double: Double = if value is NSDecimalNumber, let parsed = Double(value.stringValue) {
+                    parsed
+                } else {
+                    value.doubleValue
+                }
+                guard double.isFinite else {
+                    throw JSONValueError.unsupportedValue(value.stringValue)
+                }
+                if let exactInteger = Int(exactly: double) {
+                    self = .integer(exactInteger)
+                } else {
+                    self = .double(double)
+                }
+            }
+        // The three cases below are unreachable on Darwin (every `Bool`/`Int`/`Double` boxed in
+        // `Any` matches `NSNumber` above) and are retained only as non-bridging fallbacks; their
+        // classification intentionally mirrors the `NSNumber` branch.
         case let value as Bool:
             self = .bool(value)
         case let value as Int:
@@ -67,18 +104,6 @@ public enum ClaudeProviderJSONValue: Sendable, Equatable, Codable {
                 self = .integer(exactInteger)
             } else {
                 self = .double(value)
-            }
-        case let value as NSNumber:
-            if CFGetTypeID(value) == CFBooleanGetTypeID() {
-                self = .bool(value.boolValue)
-            } else if let exactInteger = Int(value.stringValue) {
-                self = .integer(exactInteger)
-            } else {
-                let double = value.doubleValue
-                guard double.isFinite else {
-                    throw JSONValueError.unsupportedValue(value.stringValue)
-                }
-                self = .double(double)
             }
         case let value as String:
             self = .string(value)

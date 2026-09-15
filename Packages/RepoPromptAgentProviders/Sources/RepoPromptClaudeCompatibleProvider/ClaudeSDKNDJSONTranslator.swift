@@ -575,7 +575,9 @@ public struct ClaudeSDKNDJSONTranslator {
             envelope: json,
             model: nil,
             resultSubtype: resultSubtype.flatMap { $0.isEmpty ? nil : $0 },
-            resultIsError: rawIsError
+            resultIsError: rawIsError,
+            resultIndex: observedCount(json["result_index"] ?? json["resultIndex"]),
+            queuedTurnCount: observedCount(json["queued_turn_count"] ?? json["queuedTurnCount"])
         )
         results.append(
             ClaudeProviderStreamResult(
@@ -1126,7 +1128,9 @@ public struct ClaudeSDKNDJSONTranslator {
         envelope: [String: Any],
         model: String?,
         resultSubtype: String? = nil,
-        resultIsError: Bool? = nil
+        resultIsError: Bool? = nil,
+        resultIndex: Int? = nil,
+        queuedTurnCount: Int? = nil
     ) -> ClaudeProviderUsageObservation {
         ClaudeProviderUsageObservation(
             source: source,
@@ -1139,7 +1143,9 @@ public struct ClaudeSDKNDJSONTranslator {
             requestID: firstString(in: envelope, keys: ["request_id", "requestId"]),
             parentToolUseID: parentToolUseID(in: envelope),
             resultSubtype: resultSubtype,
-            resultIsError: resultIsError
+            resultIsError: resultIsError,
+            resultIndex: resultIndex,
+            queuedTurnCount: queuedTurnCount
         )
     }
 

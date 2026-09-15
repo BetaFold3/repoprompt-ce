@@ -37,6 +37,10 @@ actor ClaudeCompatibleNativeSessionAdapter: NativeAgentRuntimeControlling {
         get async { await controller.requiresReplacementAfterTerminalStartupFailure }
     }
 
+    var usageAccountingEvents: AsyncStream<NativeUsageAccountingEvent> {
+        get async { await controller.usageAccountingEvents }
+    }
+
     func ensureEventsStreamReady() async {
         await controller.ensureEventsStreamReady()
     }

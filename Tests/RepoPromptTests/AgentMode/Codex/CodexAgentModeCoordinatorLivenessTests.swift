@@ -1150,6 +1150,12 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
         let session = preparedCodexSession(in: viewModel, controller: controller)
+        // Accounting (review R2, OracleA P1#2): the identified turn is dispatched and bound, and the
+        // nil-ID completion that legitimately terminates it must close the known accounting turn.
+        enableCodexUsageAccounting(session)
+        session.registerCodexUsageDispatch(requestedModel: "gpt-5.3-codex")
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn"), session: session)
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 0)
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
             .turnCompleted(turnID: nil, status: .completed),
@@ -1161,6 +1167,14 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertNil(session.codexAuthoritativeActiveTurn)
         XCTAssertNil(session.codexAnonymousActiveTurn)
         XCTAssertNotNil(session.lastTerminalCommitRevision)
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 1, "the correlated identified turn ended without usage: unmeasured now, not at some later teardown")
+        XCTAssertEqual(session.usageAccounting?.record?.codexIntervals?.last?.turnID, "turn")
+        XCTAssertEqual(session.usageAccounting?.record?.codexIntervals?.last?.diagnostic, AgentUsageAccumulator.codexUnmeasuredTurnDiagnostic)
+        // A provably owned late report for that turn still replaces its marker.
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(codexUsageEvent(1, turn: "turn", codexTotal(1000, 100, 10)), session: session)
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 0)
+        XCTAssertEqual(session.usageAccounting?.codexIntervalCount, 1)
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.coverage, .complete)
     }
 
     func testNilStartFollowedByNilCompletionCompletesAnonymousTurn() async {
@@ -1171,6 +1185,10 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.codexAnonymousActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
         session.codexPendingTurnKind = .user
+        // Accounting (review R2): the dispatch behind an anonymous start can never be bound; its
+        // nil-ID completion marks it unmeasured once, without a second "never bound" marker later.
+        enableCodexUsageAccounting(session)
+        session.registerCodexUsageDispatch(requestedModel: "gpt-5.3-codex")
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
             .turnStarted(turnID: nil),
@@ -1180,6 +1198,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertNil(session.codexAuthoritativeActiveTurn)
         XCTAssertEqual(session.codexAnonymousActiveTurn?.turnKind, .user)
         XCTAssertNil(session.codexPendingTurnKind)
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 0)
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
             .turnCompleted(turnID: nil, status: .completed),
@@ -1190,6 +1209,11 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertNil(session.activeRunOwnership)
         XCTAssertNil(session.codexAnonymousActiveTurn)
         XCTAssertNotNil(session.lastTerminalCommitRevision)
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 1, "dispatched work ended without any establishable identity")
+        XCTAssertNil(session.usageAccounting?.record?.codexIntervals?.last?.turnID)
+        XCTAssertEqual(session.usageAccounting?.record?.codexIntervals?.last?.diagnostic, AgentUsageAccumulator.codexUnmeasuredAnonymousTurnDiagnostic)
+        session.registerCodexUsageDispatch(requestedModel: "gpt-5.3-codex")
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 1, "the anonymous dispatch was consumed by its marker")
     }
 
     func testNilCompletionWithoutObservedStartIsRejectedAndPreservesPendingTurn() async {
@@ -1201,6 +1225,10 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.codexAnonymousActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
         session.codexPendingTurnKind = .user
+        // Accounting (review R2): a completion the correlation rejects is not this session's turn,
+        // so the still-pending dispatch keeps its pricing basis for the start that follows.
+        enableCodexUsageAccounting(session)
+        session.registerCodexUsageDispatch(requestedModel: "gpt-5.3-codex")
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
             .turnCompleted(turnID: nil, status: .completed),
@@ -1213,6 +1241,180 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertNil(session.codexAuthoritativeActiveTurn)
         XCTAssertNil(session.codexAnonymousActiveTurn)
         XCTAssertNil(session.lastTerminalCommitRevision)
+        XCTAssertEqual(session.usageAccounting?.codexIntervalCount, 0, "a rejected completion leaves accounting untouched")
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "late-turn"), session: session)
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(codexUsageEvent(1, turn: "late-turn", codexTotal(1000, 100, 10)), session: session)
+        XCTAssertEqual(session.usageAccounting?.codexIntervalCount, 1)
+        XCTAssertEqual(session.usageAccounting?.record?.codexIntervals?.first?.turnID, "late-turn")
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.lower, Decimal(string: "0.0017325"), "the pending basis survived the rejected completion and priced the bound turn")
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.coverage, .complete)
+    }
+
+    /// Review R3 (OracleA P1): dispatch registration precedes the provider send, but only the
+    /// controller's typed local preflight error proves the request never reached the transport.
+    /// That exact ticket is withdrawn without manufacturing an unmeasured marker.
+    func testFailedCodexTurnStartWithdrawsItsUsageDispatchWithoutAnUnmeasuredMarker() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            startError: CodexTurnStartPreflightError.invalidInput("test fixture rejected before transport submission")
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.runState = .idle
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        enableCodexUsageAccounting(session)
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        guard case .failed = outcome else {
+            return XCTFail("Expected failed outcome, got \(outcome)")
+        }
+        XCTAssertEqual(controller.startUserTurnCountSync(), 1)
+        XCTAssertEqual(session.usageAccounting?.codexIntervalCount, 0, "a proven pre-send failure is not unmeasured work")
+
+        // The next dispatch on the same generation finds nothing pending to mark as "never bound",
+        // and is itself tracked normally (bound, awaited, marked when it ends without usage).
+        session.registerCodexUsageDispatch(requestedModel: "gpt-5.3-codex")
+        XCTAssertEqual(session.usageAccounting?.codexIntervalCount, 0)
+        let coordinator = viewModel.test_codexCoordinator
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-2"), session: session)
+        await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "turn-2", status: .interrupted), session: session)
+        let accounting = try XCTUnwrap(session.usageAccounting)
+        XCTAssertEqual(accounting.codexUnmeasuredWorkCount, 1)
+        XCTAssertEqual(accounting.record?.codexIntervals?.map(\.turnID), ["turn-2"])
+        XCTAssertNil(accounting.record?.semanticViolation)
+    }
+
+    /// Review R3 (OracleA P1): an anonymous `turn/started` is acceptance evidence even though it
+    /// cannot bind the dispatch to a turn identity. A later JSON-RPC request error must not erase
+    /// the pending usage obligation; execution teardown records it as unmeasured.
+    func testAnonymousStartBeforeRequestErrorPreservesUsageObligation() async throws {
+        let rejection = CodexAppServerClient.RequestFailure(
+            method: "turn/start",
+            code: -32000,
+            message: "server error after anonymous turn/start",
+            data: nil
+        )
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            startError: CodexAppServerClient.ClientError.requestFailed(rejection)
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.runState = .idle
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        enableCodexUsageAccounting(session)
+        controller.setStartUserTurnBeforeResult {
+            await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+                .turnStarted(turnID: nil),
+                session: session
+            )
+        }
+        defer { controller.setStartUserTurnBeforeResult(nil) }
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        guard case .failed = outcome else {
+            return XCTFail("Expected failed outcome, got \(outcome)")
+        }
+        session.endCodexUsageExecution(reason: "test-anonymous-start-before-error")
+        let accounting = try XCTUnwrap(session.usageAccounting)
+        XCTAssertEqual(accounting.codexUnmeasuredWorkCount, 1)
+        XCTAssertEqual(accounting.record?.codexIntervals?.count, 1)
+        XCTAssertNil(accounting.record?.codexIntervals?.first?.turnID)
+        XCTAssertEqual(
+            accounting.record?.codexIntervals?.first?.diagnostic,
+            AgentUsageAccumulator.codexUnmeasuredDispatchDiagnostic
+        )
+    }
+
+    /// Review R3 (OracleA P1): cancellation can race after the request write, so a missing receipt
+    /// is delivery-unknown rather than proof of rejection. Terminal teardown must retain the
+    /// potentially incurred work as one unmeasured obligation.
+    func testCancelledTurnStartWithoutReceiptPreservesUsageObligation() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            startError: CancellationError()
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.runState = .idle
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        enableCodexUsageAccounting(session)
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        XCTAssertEqual(outcome, .cancelled)
+        session.endCodexUsageExecution(reason: "test-cancelled-start")
+        let accounting = try XCTUnwrap(session.usageAccounting)
+        XCTAssertEqual(accounting.codexUnmeasuredWorkCount, 1)
+        XCTAssertEqual(accounting.record?.codexIntervals?.count, 1)
+        XCTAssertNil(accounting.record?.codexIntervals?.first?.turnID)
+        XCTAssertEqual(
+            accounting.record?.codexIntervals?.first?.diagnostic,
+            AgentUsageAccumulator.codexUnmeasuredDispatchDiagnostic
+        )
+    }
+
+    /// Review R3 (OracleA P1): the app-server client synthesizes `requestFailed` for a local
+    /// timeout, so method=turn/start without a receipt remains delivery-unknown. Execution teardown
+    /// must retain one unmeasured obligation rather than treating the error as server rejection.
+    func testTimedOutTurnStartWithoutReceiptPreservesUsageObligation() async throws {
+        let timeout = CodexAppServerClient.RequestFailure(
+            method: "turn/start",
+            code: nil,
+            message: "Request timed out after 1.0s",
+            data: nil
+        )
+        let controller = LivenessFakeCodexController(
+            snapshot: .idle,
+            activeTurnIDs: [],
+            startError: CodexAppServerClient.ClientError.requestFailed(timeout)
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.runState = .idle
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+        enableCodexUsageAccounting(session)
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        guard case .failed = outcome else {
+            return XCTFail("Expected failed outcome, got \(outcome)")
+        }
+        session.endCodexUsageExecution(reason: "test-timed-out-start")
+        let accounting = try XCTUnwrap(session.usageAccounting)
+        XCTAssertEqual(accounting.codexUnmeasuredWorkCount, 1)
+        XCTAssertEqual(accounting.record?.codexIntervals?.count, 1)
+        XCTAssertNil(accounting.record?.codexIntervals?.first?.turnID)
+        XCTAssertEqual(
+            accounting.record?.codexIntervals?.first?.diagnostic,
+            AgentUsageAccumulator.codexUnmeasuredDispatchDiagnostic
+        )
     }
 
     func testActiveCodexNativeSendUsesRealAgentRunDrainBeforeSending() async throws {
@@ -1419,6 +1621,103 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    // MARK: - Usage accounting lifecycle (plan §4.1)
+
+    /// Coordinator lifecycle: a dispatched turn that ends (interrupted) without any usage
+    /// notification is unmeasured work, a provably owned late notification still lands, and
+    /// session shutdown marks a still-open dispatched turn before the controller generation rotates.
+    func testDispatchedCodexTurnEndingWithoutUsageIsUnmeasuredAcrossInterruptLateUsageAndShutdown() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID()))
+        session.codexPricingProvider = OpenAIPricingStore.transient(
+            transport: NoNetworkPricingTransport(),
+            isNetworkPermitted: { false }
+        )
+        // The fixture pre-assigns the thread identity the fake controller reports. For accounting
+        // this generation must be the one that created the thread (verified zero baseline); a
+        // thread that already existed would be resumed and its first checkpoint only prospective.
+        let preparedThreadID = session.codexConversationID
+        session.codexConversationID = nil
+        session.beginCodexUsageExecutionIfNeeded()
+        session.codexConversationID = preparedThreadID
+        let coordinator = viewModel.test_codexCoordinator
+        func total(_ input: Int, _ cached: Int, _ output: Int) -> CodexUsageObservation.Counters {
+            .init(inputTokens: input, cachedInputTokens: cached, cacheWriteInputTokens: 0, outputTokens: output, reasoningOutputTokens: 0, totalTokens: input + output)
+        }
+        func usage(_ ordinal: Int, turn: String, _ counters: CodexUsageObservation.Counters) -> CodexNativeSessionController.Event {
+            .usageObservation(.init(threadID: "fake", turnID: turn, turnAttribution: .notified, ordinal: ordinal, last: counters, total: counters, modelContextWindow: 258_400))
+        }
+
+        session.registerCodexUsageDispatch(requestedModel: "gpt-5.3-codex")
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn"), session: session)
+        await coordinator.test_handleCodexNativeEvent(usage(1, turn: "turn", total(1000, 100, 10)), session: session)
+        let accounting = try XCTUnwrap(session.usageAccounting)
+        XCTAssertEqual(accounting.codexSessionCostEstimate?.coverage, .complete)
+        XCTAssertEqual(accounting.codexUnmeasuredWorkCount, 0)
+
+        session.registerCodexUsageDispatch(requestedModel: "gpt-5.3-codex")
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-2"), session: session)
+        await coordinator.test_handleCodexNativeEvent(.turnCompleted(turnID: "turn-2", status: .interrupted), session: session)
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 1)
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.coverage, .partial)
+        // Bundled seed rates for gpt-5.3-codex ($1.75 / $0.175 / $14.00 per million):
+        // 900 ordinary × 1.75 + 100 cached × 0.175 + 10 output × 14 = 1732.5 → $0.0017325.
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.lower, Decimal(string: "0.0017325"), "accepted amounts are retained")
+
+        await coordinator.test_handleCodexNativeEvent(usage(2, turn: "turn-2", total(2000, 200, 20)), session: session)
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 0, "a provably owned late observation replaces the marker")
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.coverage, .complete)
+        XCTAssertEqual(session.usageAccounting?.codexIntervalCount, 2)
+
+        session.registerCodexUsageDispatch(requestedModel: "gpt-5.3-codex")
+        await coordinator.test_handleCodexNativeEvent(.turnStarted(turnID: "turn-3"), session: session)
+        let generationBeforeShutdown = session.codexControllerGeneration
+        await coordinator.shutdownCodexSession(session)
+        XCTAssertNotEqual(session.codexControllerGeneration, generationBeforeShutdown)
+        XCTAssertEqual(session.usageAccounting?.codexUnmeasuredWorkCount, 1, "shutdown marks the still-open dispatched turn before the generation rotates")
+        XCTAssertEqual(session.usageAccounting?.codexSessionCostEstimate?.coverage, .partial)
+        XCTAssertNil(session.usageAccounting?.record?.semanticViolation)
+        let projection = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.projected(
+            selectedAgent: .codexExec,
+            accounting: session.usageAccounting,
+            expectedOwnerSessionID: session.activeAgentSessionID
+        )
+        XCTAssertTrue(projection.presentation.readoutText.hasSuffix(" partial"))
+        XCTAssertTrue(try XCTUnwrap(projection.coverageDetail).contains("unmeasured, not zero"))
+    }
+
+    /// Enables fixture-local Codex usage accounting without mutating the prepared run's persistent
+    /// binding, with offline pricing and a fresh-thread origin for the generation the fixture
+    /// pre-assigned its thread to (an existing thread would start prospectively).
+    private func enableCodexUsageAccounting(_ session: AgentModeViewModel.TabSession) {
+        // Install accounting directly so this focused fixture does not mutate the persistent binding
+        // after `beginRunAttempt`; doing so would intentionally stale the run ownership under test.
+        session.usageAccounting = AgentUsageAccumulator(
+            ownerSessionID: UUID(),
+            persisted: nil,
+            hasPriorHistory: false,
+            qualification: .productionClaude
+        )
+        session.codexPricingProvider = OpenAIPricingStore.transient(
+            transport: NoNetworkPricingTransport(),
+            isNetworkPermitted: { false }
+        )
+        let preparedThreadID = session.codexConversationID
+        session.codexConversationID = nil
+        session.beginCodexUsageExecutionIfNeeded()
+        session.codexConversationID = preparedThreadID
+    }
+
+    private func codexTotal(_ input: Int, _ cached: Int, _ output: Int) -> CodexUsageObservation.Counters {
+        .init(inputTokens: input, cachedInputTokens: cached, cacheWriteInputTokens: 0, outputTokens: output, reasoningOutputTokens: 0, totalTokens: input + output)
+    }
+
+    private func codexUsageEvent(_ ordinal: Int, turn: String, _ counters: CodexUsageObservation.Counters) -> CodexNativeSessionController.Event {
+        .usageObservation(.init(threadID: "fake", turnID: turn, turnAttribution: .notified, ordinal: ordinal, last: counters, total: counters, modelContextWindow: 258_400))
+    }
+
     private func makeViewModel(
         controller: LivenessFakeCodexController,
         drain: AgentModeViewModel.CodexAgentRunWaitDrain? = nil
@@ -1536,6 +1835,13 @@ private final class CodexDrainSendOrderingRecorder: @unchecked Sendable {
     }
 }
 
+/// Pricing transport that must never be reached: the lifecycle test disables network use.
+private struct NoNetworkPricingTransport: OpenAIPricingDocumentTransport {
+    func fetch(_ request: URLRequest, maximumBodyBytes: Int) async throws -> OpenAIPricingTransportResponse {
+        throw OpenAIPricingTransportError.networkNotPermitted
+    }
+}
+
 private final class LivenessFakeCodexController: CodexSessionControlling {
     private var readSnapshotCount = 0
     private var startUserTurnCount = 0
@@ -1543,6 +1849,8 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     private let snapshotStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus
     private let snapshotActiveTurnIDs: [String]
     private let onSendUserTurn: (() -> Void)?
+    private let startError: Error?
+    private var startUserTurnBeforeResult: (() async -> Void)?
     private let steerError: Error?
     private let steerDelayNanos: UInt64
     private var pendingTurnFailure: CodexNativeSessionController.TurnFailure?
@@ -1551,6 +1859,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         snapshot: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus,
         activeTurnIDs: [String] = ["turn"],
         onSendUserTurn: (() -> Void)? = nil,
+        startError: Error? = nil,
         steerError: Error? = nil,
         steerDelayNanos: UInt64 = 0,
         pendingTurnFailure: CodexNativeSessionController.TurnFailure? = nil
@@ -1558,6 +1867,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         snapshotStatus = snapshot
         snapshotActiveTurnIDs = activeTurnIDs
         self.onSendUserTurn = onSendUserTurn
+        self.startError = startError
         self.steerError = steerError
         self.steerDelayNanos = steerDelayNanos
         self.pendingTurnFailure = pendingTurnFailure
@@ -1579,6 +1889,10 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
 
     func startUserTurnCountSync() -> Int {
         startUserTurnCount
+    }
+
+    func setStartUserTurnBeforeResult(_ operation: (() async -> Void)?) {
+        startUserTurnBeforeResult = operation
     }
 
     func steerUserTurnIDsSync() -> [String] {
@@ -1637,6 +1951,12 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     ) async throws -> CodexTurnStartReceipt {
         recordSendUserTurn()
         startUserTurnCount += 1
+        if let startUserTurnBeforeResult {
+            await startUserTurnBeforeResult()
+        }
+        if let startError {
+            throw startError
+        }
         return CodexTurnStartReceipt(provisionalSubmissionID: "liveness-submission-\(startUserTurnCount)")
     }
 

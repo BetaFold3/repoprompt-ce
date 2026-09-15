@@ -30,37 +30,95 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         struct Presentation: Equatable {
             var title: String
             var readoutText: String
+            /// Full scope/coverage explanation for tooltips and accessibility.
             var detailText: String
+            /// Additional content rendered inside the context-pill popover. It keeps the compact
+            /// main line limited to latest-request CH plus accumulated session cost.
+            var expandedDetailText: String?
+            /// Short explanation hosts may render visibly next to the readout: why no figures are
+            /// shown, or why shown figures are only partial. `nil` when nothing needs explaining.
+            var noteText: String?
+
+            init(
+                title: String,
+                readoutText: String,
+                detailText: String,
+                expandedDetailText: String? = nil,
+                noteText: String? = nil
+            ) {
+                self.title = title
+                self.readoutText = readoutText
+                self.detailText = detailText
+                self.expandedDetailText = expandedDetailText
+                self.noteText = noteText
+            }
         }
 
         var scope: Scope
         var trackingStartedAt: Date?
+        /// Live-only request-level CH. Persisted turn/result aggregates never populate it.
+        var latestRequestCacheHit: AgentUsageLatestRequestCacheHit?
+        /// Token-weighted CH over the persisted session ledger.
         var cacheHitShare: AgentUsageCacheHitShare?
         var costEstimate: AgentUsageCostEstimate?
+        /// Upper bound of a Codex envelope-priced estimate; `nil` (or equal to the amount) for a point.
+        var costUpperBound: Decimal?
+        /// Pricing provenance for Codex (frozen pricing version(s) used by the priced intervals).
+        var pricingProvenance: String?
         /// Explains why restored read-only values cannot claim current full-session coverage.
         var coverageDetail: String?
+        /// Concrete per-metric coverage text used by the expanded popover.
+        var sessionCacheCoverageDetail: String?
+        var sessionCostCoverageDetail: String?
         /// Accepted accounting mutations only. This lets lifecycle changes publish through the
         /// existing equality guard without making transcript text a usage update signal.
         var accountingRevision: UInt64?
+        /// Explains why a Claude readout shows no figures (gated live accounting, missing record,
+        /// foreign ownership, or an unsupported persisted value). `nil` when figures are shown.
+        var unavailableReason: String?
+
+        /// Explains a Claude readout with no accounting owner or a lifecycle-only (`.unqualified`)
+        /// policy: nothing was measured, which is distinct from a measured zero.
+        static let claudeLiveAccountingGatedReason =
+            "No live figures: usage accounting is not counting this session's turns. Only restored session accounting can display, and it is marked partial."
+        static let claudeNoUsageRecordedReason = "No usage has been recorded for this session yet."
 
         init(
             scope: Scope,
             trackingStartedAt: Date? = nil,
+            latestRequestCacheHit: AgentUsageLatestRequestCacheHit? = nil,
             cacheHitShare: AgentUsageCacheHitShare? = nil,
             costEstimate: AgentUsageCostEstimate? = nil,
+            costUpperBound: Decimal? = nil,
+            pricingProvenance: String? = nil,
             coverageDetail: String? = nil,
-            accountingRevision: UInt64? = nil
+            sessionCacheCoverageDetail: String? = nil,
+            sessionCostCoverageDetail: String? = nil,
+            accountingRevision: UInt64? = nil,
+            unavailableReason: String? = nil
         ) {
             self.scope = scope
             self.trackingStartedAt = trackingStartedAt
+            self.latestRequestCacheHit = latestRequestCacheHit
             self.cacheHitShare = cacheHitShare
             self.costEstimate = costEstimate
+            self.costUpperBound = costUpperBound
+            self.pricingProvenance = pricingProvenance
             self.coverageDetail = coverageDetail
+            self.sessionCacheCoverageDetail = sessionCacheCoverageDetail
+            self.sessionCostCoverageDetail = sessionCostCoverageDetail
             self.accountingRevision = accountingRevision
+            self.unavailableReason = unavailableReason
         }
 
+        /// No accounting owner at all (no session, or no accumulator installed yet). Claude scope
+        /// still explains itself so an empty readout is never a silent dash.
         static func unavailable(for selectedAgent: AgentProviderKind?) -> Self {
-            .init(scope: scope(for: selectedAgent))
+            let resolvedScope = scope(for: selectedAgent)
+            return .init(
+                scope: resolvedScope,
+                unavailableReason: resolvedScope == .claude || resolvedScope == .codex ? claudeNoUsageRecordedReason : nil
+            )
         }
 
         /// Projects only an owned, semantically valid accounting record. A strict lossless view of
@@ -73,6 +131,9 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             expectedOwnerSessionID: UUID?
         ) -> Self {
             let resolvedScope = scope(for: selectedAgent)
+            if resolvedScope == .codex {
+                return projectedCodex(accounting: accounting, expectedOwnerSessionID: expectedOwnerSessionID)
+            }
             guard resolvedScope == .claude,
                   let expectedOwnerSessionID,
                   let accounting,
@@ -83,11 +144,73 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
                   record.semanticViolation == nil,
                   accounting.qualification != .unqualified || accounting.ownedRevision == 0
             else {
-                return .init(scope: resolvedScope)
+                return .init(
+                    scope: resolvedScope,
+                    unavailableReason: resolvedScope == .claude
+                        ? claudeUnavailableReason(
+                            accounting: accounting,
+                            expectedOwnerSessionID: expectedOwnerSessionID
+                        )
+                        : nil
+                )
             }
             var cacheHitShare = accounting.cacheHitShare
             var costEstimate = accounting.sessionCostEstimate
             var coverageDetail: String?
+            var details: [String] = []
+            var cacheCurrentDetails: [String] = []
+            var costCurrentDetails: [String] = []
+            // Restored `.open` turns/segments from a disposed execution are work that never closed;
+            // under every policy they make displayed coverage partial and are named explicitly.
+            if accounting.hasAbandonedHydratedLifecycleState {
+                if cacheHitShare != nil {
+                    cacheHitShare?.coverage = .partial
+                }
+                if costEstimate != nil {
+                    costEstimate?.coverage = .partial
+                }
+                let detail = "The restored state includes unfinished work."
+                details.append(detail)
+                cacheCurrentDetails.append(detail)
+                costCurrentDetails.append(detail)
+            }
+            if accounting.qualification == .executionVerified,
+               let diagnostic = accounting.executionQualificationDiagnostic
+            {
+                // Figures come only from qualified executions; an active execution that cannot
+                // charge makes any dispatched work explicitly uncounted.
+                let detail: String
+                if accounting.hasUnchargedDispatchedWork {
+                    if cacheHitShare != nil {
+                        cacheHitShare?.coverage = .partial
+                    }
+                    if costEstimate != nil {
+                        costEstimate?.coverage = .partial
+                    }
+                    detail = "The current continuation is not counted: \(diagnostic)."
+                } else if case .awaiting? = accounting.executionVerdict {
+                    detail = "The current continuation is not counting yet: \(diagnostic)."
+                } else {
+                    detail = "The current continuation cannot be counted: \(diagnostic)."
+                }
+                details.append(detail)
+                cacheCurrentDetails.append(detail)
+                costCurrentDetails.append(detail)
+            }
+            if accounting.qualification == .executionVerified, let diagnostic = accounting.monetaryScopeDiagnostic {
+                let detail = "The current continuation counts tokens only: \(diagnostic)."
+                details.append(detail)
+                costCurrentDetails.append(detail)
+            }
+            let childTurns = accounting.childActivityTurnCount
+            if childTurns > 0 {
+                details.append(
+                    "Native child (subagent) activity occurred in \(childTurns) turn\(childTurns == 1 ? "" : "s"); the cost estimate includes it, while those turns' result usage is excluded from CH because its main-loop scope cannot be proven."
+                )
+                cacheCurrentDetails.append(
+                    "Native child (subagent) activity occurred in \(childTurns) turn\(childTurns == 1 ? "" : "s"); those turns' result usage is excluded from CH because its main-loop scope cannot be proven."
+                )
+            }
             if accounting.qualification == .unqualified {
                 if cacheHitShare != nil {
                     cacheHitShare?.coverage = .partial
@@ -95,26 +218,118 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
                 if costEstimate != nil {
                     costEstimate?.coverage = .partial
                 }
-                var details = [
-                    "These figures are restored historical accounting; current runtime tracking is unqualified, so coverage is partial."
-                ]
-                if record.turns.contains(where: { $0.outcome == .open })
-                    || record.claudeSegments.contains(where: { $0.state == .open })
-                {
-                    details.append("The restored state includes unfinished work.")
-                }
+                let unqualified = "These figures are restored historical accounting; current runtime tracking is unqualified, so coverage is partial."
+                details.insert(unqualified, at: 0)
+                cacheCurrentDetails.append(unqualified)
+                costCurrentDetails.append(unqualified)
                 if accounting.activeExecutionID != nil {
-                    details.append("The current continuation is unmeasured.")
+                    let unmeasured = "The current continuation is unmeasured."
+                    details.append(unmeasured)
+                    cacheCurrentDetails.append(unmeasured)
+                    costCurrentDetails.append(unmeasured)
                 }
+            }
+            if !details.isEmpty {
                 coverageDetail = details.joined(separator: " ")
             }
             return .init(
                 scope: resolvedScope,
                 trackingStartedAt: record.trackingStartedAt,
+                latestRequestCacheHit: accounting.latestRequestCacheHit(for: .claudeAssistant),
                 cacheHitShare: cacheHitShare,
                 costEstimate: costEstimate,
                 coverageDetail: coverageDetail,
+                sessionCacheCoverageDetail: claudeSessionCacheCoverageDetail(
+                    record: record,
+                    share: cacheHitShare,
+                    currentDetail: cacheCurrentDetails.isEmpty
+                        ? nil
+                        : uniqueDetails(cacheCurrentDetails).joined(separator: " ")
+                ),
+                sessionCostCoverageDetail: claudeSessionCostCoverageDetail(
+                    record: record,
+                    estimate: costEstimate,
+                    currentDetail: costCurrentDetails.isEmpty
+                        ? nil
+                        : uniqueDetails(costCurrentDetails).joined(separator: " ")
+                ),
                 accountingRevision: accounting.ownedRevision
+            )
+        }
+
+        /// Codex scope (plan §4.1): owned counter intervals priced locally from the frozen
+        /// Standard/global list-price snapshot captured at each dispatch.
+        private static func projectedCodex(
+            accounting: AgentUsageAccumulator?,
+            expectedOwnerSessionID: UUID?
+        ) -> Self {
+            guard let expectedOwnerSessionID,
+                  let accounting,
+                  accounting.ownerSessionID == expectedOwnerSessionID,
+                  accounting.eligibility == .eligible,
+                  accounting.qualification != .unqualified
+            else {
+                return .init(
+                    scope: .codex,
+                    unavailableReason: claudeUnavailableReason(
+                        accounting: accounting,
+                        expectedOwnerSessionID: expectedOwnerSessionID
+                    )
+                )
+            }
+
+            let latest = accounting.latestRequestCacheHit(for: .codexLast)
+            guard let record = accounting.record else {
+                return .init(
+                    scope: .codex,
+                    latestRequestCacheHit: latest,
+                    sessionCacheCoverageDetail: "Unavailable: no persisted Codex session intervals have been recorded.",
+                    sessionCostCoverageDetail: "Unavailable: no persisted Codex session intervals have been recorded.",
+                    accountingRevision: accounting.ownedRevision,
+                    unavailableReason: latest == nil ? claudeNoUsageRecordedReason : nil
+                )
+            }
+            guard record.originSessionID == expectedOwnerSessionID, record.semanticViolation == nil else {
+                return .init(
+                    scope: .codex,
+                    unavailableReason: claudeUnavailableReason(
+                        accounting: accounting,
+                        expectedOwnerSessionID: expectedOwnerSessionID
+                    )
+                )
+            }
+
+            let intervals = record.codexIntervals ?? []
+            let cacheShare = accounting.codexCacheHitShare
+            let cost = accounting.codexSessionCostEstimate
+            let intervalDiagnostics = uniqueDetails(intervals.compactMap(\.diagnostic))
+            var details = intervalDiagnostics
+            if record.hasUnmeasuredHistory {
+                details.append(
+                    "Earlier Codex usage is marked unmeasured; the persisted record does not store a separate historical cause."
+                )
+            }
+            return .init(
+                scope: .codex,
+                trackingStartedAt: intervals.isEmpty ? nil : record.trackingStartedAt,
+                latestRequestCacheHit: latest,
+                cacheHitShare: cacheShare,
+                costEstimate: cost.map { .init(amount: $0.lower, currency: $0.currency, coverage: $0.coverage) },
+                costUpperBound: cost.flatMap { $0.isPoint ? nil : $0.upper },
+                pricingProvenance: accounting.codexPricingProvenance.map(codexPricingProvenanceText),
+                coverageDetail: details.isEmpty ? nil : details.joined(separator: " "),
+                sessionCacheCoverageDetail: codexSessionCacheCoverageDetail(
+                    record: record,
+                    intervals: intervals,
+                    share: cacheShare
+                ),
+                sessionCostCoverageDetail: codexSessionCostCoverageDetail(
+                    record: record,
+                    intervals: intervals,
+                    estimate: cost
+                ),
+                accountingRevision: accounting.ownedRevision,
+                unavailableReason: intervals.isEmpty && latest == nil ? claudeNoUsageRecordedReason : nil
             )
         }
 
@@ -123,18 +338,264 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             case .claude:
                 claudePresentation
             case .codex:
-                .init(
-                    title: "Codex session usage",
-                    readoutText: "CH — · Est. —",
-                    detailText: "Cache hit (CH) share and cost are unavailable because Codex usage accounting is not available in this build."
-                )
+                codexPresentation
             case let .unsupported(providerName):
                 .init(
                     title: "\(providerName) usage",
                     readoutText: "CH — · Est. —",
-                    detailText: "Cache hit (CH) share and cost are unavailable for \(providerName)."
+                    detailText: "Cache hit (CH) share and cost are unavailable for \(providerName).",
+                    noteText: "Usage accounting is unavailable for \(providerName)."
                 )
             }
+        }
+
+        /// Names the first failed projection precondition for a Claude scope. Ordering mirrors the
+        /// `projected` guard so the explanation matches the branch that actually rejected the record.
+        private static func claudeUnavailableReason(
+            accounting: AgentUsageAccumulator?,
+            expectedOwnerSessionID: UUID?
+        ) -> String {
+            guard let expectedOwnerSessionID else {
+                return "No active session owns usage accounting."
+            }
+            guard let accounting else {
+                return claudeNoUsageRecordedReason
+            }
+            guard accounting.ownerSessionID == expectedOwnerSessionID else {
+                return "Usage accounting belongs to a different session and is not shown here."
+            }
+            switch accounting.eligibility {
+            case .foreignOrigin:
+                return "The restored usage record originated in a different session; it is preserved but not counted here."
+            case .opaquePersistedValue:
+                return "The restored usage value is not supported by this build; it is preserved unchanged and not shown."
+            case .eligible:
+                break
+            }
+            guard let record = accounting.record else {
+                if accounting.qualification == .unqualified {
+                    return claudeLiveAccountingGatedReason
+                }
+                if let diagnostic = accounting.executionQualificationDiagnostic {
+                    return "No live figures: \(diagnostic). This session's turns are not counted."
+                }
+                return "No usage has been recorded for this session yet."
+            }
+            guard record.originSessionID == expectedOwnerSessionID else {
+                return "The restored usage record originated in a different session; it is preserved but not counted here."
+            }
+            guard record.semanticViolation == nil else {
+                return "The restored usage record is not semantically valid; it is preserved unchanged and not shown."
+            }
+            return "Usage accounting cannot be shown for the current session state."
+        }
+
+        private static func claudeSessionCacheCoverageDetail(
+            record: AgentProviderUsageRecord,
+            share: AgentUsageCacheHitShare?,
+            currentDetail: String?
+        ) -> String {
+            var reasons = record.turns.compactMap { turn -> String? in
+                guard turn.outcome != .open, turn.coverage != .complete else { return nil }
+                if let diagnostic = turn.diagnostic {
+                    return diagnostic.contains("monetary checkpoint rejected") ? nil : diagnostic
+                }
+                let missing = [
+                    turn.inputTokens == nil ? "input" : nil,
+                    turn.cacheReadInputTokens == nil ? "cache-read" : nil,
+                    turn.cacheCreationInputTokens == nil ? "cache-creation" : nil
+                ].compactMap(\.self)
+                return missing.isEmpty
+                    ? "A finalized Claude turn is marked incomplete; its historical cause was not recorded."
+                    : "A finalized Claude turn omitted \(missing.joined(separator: ", ")) counters."
+            }
+            if record.hasUnmeasuredHistory {
+                reasons.append(
+                    "Earlier Claude usage is marked unmeasured; the persisted record does not store a separate historical cause."
+                )
+            }
+            if let currentDetail {
+                reasons.append(currentDetail)
+            }
+            reasons = uniqueDetails(reasons)
+            guard let share else {
+                let cause = reasons.isEmpty
+                    ? "No finalized turn has a complete, nonzero input/cache-read/cache-creation denominator."
+                    : reasons.joined(separator: " ")
+                return "Unavailable: \(cause)"
+            }
+            guard share.coverage == .partial else {
+                let complete = "Complete: every finalized measured turn supplied the counters used by this metric."
+                return reasons.isEmpty ? complete : "\(complete) \(reasons.joined(separator: " "))"
+            }
+            return reasons.isEmpty
+                ? "Partial: the persisted value is marked partial, but its historical cause was not recorded."
+                : "Partial: \(reasons.joined(separator: " "))"
+        }
+
+        private static func claudeSessionCostCoverageDetail(
+            record: AgentProviderUsageRecord,
+            estimate: AgentUsageCostEstimate?,
+            currentDetail: String?
+        ) -> String {
+            var reasons: [String] = []
+            for (offset, segment) in record.claudeSegments.enumerated() {
+                let segmentNumber = offset + 1
+                if segment.baseline == nil {
+                    reasons.append("Cost segment \(segmentNumber) has no verified cumulative-cost baseline.")
+                }
+                if segment.latestCumulative == nil {
+                    reasons.append("Cost segment \(segmentNumber) has no accepted cumulative-cost checkpoint.")
+                }
+                if segment.coverage != .complete {
+                    reasons.append(
+                        "Cost segment \(segmentNumber) is recorded with \(coverageText(segment.coverage)) coverage; no separate historical reason is stored on the segment."
+                    )
+                }
+                if segment.state == .suspended {
+                    reasons.append(
+                        "Cost segment \(segmentNumber) is suspended; the persisted segment does not store its historical suspension cause."
+                    )
+                }
+            }
+            reasons.append(contentsOf: record.turns.compactMap { turn in
+                guard let diagnostic = turn.diagnostic, diagnostic.contains("monetary checkpoint rejected") else {
+                    return nil
+                }
+                return diagnostic
+            })
+            if record.hasUnmeasuredHistory {
+                reasons.append(
+                    "Earlier Claude cost is marked unmeasured; the persisted record does not store a separate historical cause."
+                )
+            }
+            if let currentDetail {
+                reasons.append(currentDetail)
+            }
+            reasons = uniqueDetails(reasons)
+            guard let estimate else {
+                return reasons.isEmpty
+                    ? "Unavailable: no segment has both a verified baseline and an accepted cumulative-cost checkpoint."
+                    : "Unavailable: \(reasons.joined(separator: " "))"
+            }
+            guard estimate.coverage == .partial else {
+                let complete = "Complete: every contributing monetary segment has complete coverage."
+                return reasons.isEmpty ? complete : "\(complete) \(reasons.joined(separator: " "))"
+            }
+            return reasons.isEmpty
+                ? "Partial: the persisted estimate is marked partial, but its historical cause was not recorded."
+                : "Partial: \(reasons.joined(separator: " "))"
+        }
+
+        private static func codexSessionCacheCoverageDetail(
+            record: AgentProviderUsageRecord,
+            intervals: [AgentProviderUsageRecord.CodexUsageInterval],
+            share: AgentUsageCacheHitShare?
+        ) -> String {
+            var reasons = intervals.compactMap { interval -> String? in
+                guard let input = interval.inputTokens,
+                      let cached = interval.cachedInputTokens,
+                      input >= 0,
+                      cached >= 0,
+                      CodexUsagePricing.hasConsistentInputSubsets(
+                          input: input,
+                          cached: cached,
+                          cacheWrite: interval.cacheWriteInputTokens
+                      )
+                else {
+                    if let diagnostic = interval.diagnostic {
+                        return diagnostic
+                    }
+                    let missing = [
+                        interval.inputTokens == nil ? "input" : nil,
+                        interval.cachedInputTokens == nil ? "cached-input" : nil
+                    ].compactMap(\.self)
+                    return missing.isEmpty
+                        ? "A Codex interval has inconsistent input/cache counters; no separate historical cause was recorded."
+                        : "A Codex interval omitted \(missing.joined(separator: ", ")) counters."
+                }
+                return nil
+            }
+            if record.hasUnmeasuredHistory {
+                reasons.append(
+                    "Earlier Codex usage is marked unmeasured; the persisted record does not store a separate historical cause."
+                )
+            }
+            reasons = uniqueDetails(reasons)
+            guard let share else {
+                return reasons.isEmpty
+                    ? "Unavailable: no owned interval has a complete, nonzero input denominator."
+                    : "Unavailable: \(reasons.joined(separator: " "))"
+            }
+            guard share.coverage == .partial else {
+                return "Complete: every owned measured interval supplied consistent input and cached-input counters."
+            }
+            return reasons.isEmpty
+                ? "Partial: the persisted value is marked partial, but its historical cause was not recorded."
+                : "Partial: \(reasons.joined(separator: " "))"
+        }
+
+        private static func codexSessionCostCoverageDetail(
+            record: AgentProviderUsageRecord,
+            intervals: [AgentProviderUsageRecord.CodexUsageInterval],
+            estimate: CodexCostEstimate?
+        ) -> String {
+            var reasons = intervals.compactMap { interval -> String? in
+                guard interval.estimatedCostLowerUSD == nil || interval.coverage != .complete else {
+                    return nil
+                }
+                if let diagnostic = interval.diagnostic {
+                    return diagnostic
+                }
+                let missing = [
+                    interval.inputTokens == nil ? "input" : nil,
+                    interval.cachedInputTokens == nil ? "cached-input" : nil,
+                    interval.outputTokens == nil ? "output" : nil
+                ].compactMap(\.self)
+                return missing.isEmpty
+                    ? "A Codex interval is not completely priced; its historical cause was not recorded."
+                    : "A Codex interval omitted \(missing.joined(separator: ", ")) counters required for complete pricing."
+            }
+            if record.hasUnmeasuredHistory {
+                reasons.append(
+                    "Earlier Codex cost is marked unmeasured; the persisted record does not store a separate historical cause."
+                )
+            }
+            reasons = uniqueDetails(reasons)
+            guard let estimate else {
+                return reasons.isEmpty
+                    ? "Unavailable: no owned interval has a priceable token delta."
+                    : "Unavailable: \(reasons.joined(separator: " "))"
+            }
+            guard estimate.coverage == .partial else {
+                return "Complete: every owned interval has a complete frozen-pricing estimate."
+            }
+            return reasons.isEmpty
+                ? "Partial: the persisted estimate is marked partial, but its historical cause was not recorded."
+                : "Partial: \(reasons.joined(separator: " "))"
+        }
+
+        private static func uniqueDetails(_ details: [String]) -> [String] {
+            var seen = Set<String>()
+            return details.filter { seen.insert($0).inserted }
+        }
+
+        /// Frozen pricing provenance for the details: version(s), capture/validation dates and
+        /// whether any priced interval used a snapshot that was already stale at dispatch.
+        private static func codexPricingProvenanceText(_ provenance: CodexPricingProvenance) -> String {
+            var parts = ["pricing version \(provenance.pricingVersions.map { String($0.prefix(12)) }.joined(separator: ", "))"]
+            if let earliest = provenance.earliestCapturedAt, let latest = provenance.latestCapturedAt {
+                let earliestText = earliest.formatted(date: .abbreviated, time: .omitted)
+                let latestText = latest.formatted(date: .abbreviated, time: .omitted)
+                parts.append(earliestText == latestText ? "price list dated \(earliestText)" : "price lists dated \(earliestText) to \(latestText)")
+            }
+            if let validated = provenance.latestValidatedAt {
+                parts.append("last validated \(validated.formatted(date: .abbreviated, time: .shortened))")
+            }
+            if provenance.staleIntervalCount > 0 {
+                parts.append("stale at dispatch for \(provenance.staleIntervalCount) interval\(provenance.staleIntervalCount == 1 ? "" : "s")")
+            }
+            return parts.joined(separator: ", ")
         }
 
         private static func scope(for selectedAgent: AgentProviderKind?) -> Scope {
@@ -151,37 +612,79 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         }
 
         private var claudePresentation: Presentation {
-            let cacheReadout = cacheHitShare.flatMap {
-                $0.coverage == .unavailable ? nil : Self.cachePercentage($0.ratio)
-            }
+            let latestReadout = latestRequestCacheHit?.share.map { Self.cachePercentage($0.ratio) }
             let costReadout = costEstimate.flatMap {
                 $0.coverage == .unavailable || $0.currency != AgentUsageAccumulator.claudeCurrency
                     ? nil
                     : Self.usdAmount($0.amount)
             }
-            let cacheInline = cacheReadout.map {
-                "CH \($0)\(Self.partialSuffix(cacheHitShare?.coverage))"
-            } ?? "CH —"
+            let latestInline = latestReadout.map { "CH \($0)" } ?? "CH —"
             let costInline = costReadout.map {
                 "Est. \($0)\(Self.partialSuffix(costEstimate?.coverage))"
             } ?? "Est. —"
 
-            let cacheDetail = cacheReadout.map {
-                "Cache hit (CH) share: \($0) (\(Self.coverageText(cacheHitShare?.coverage)) coverage). It is token-weighted over validated main-loop input triples."
-            } ?? "Cache hit (CH) share: unavailable. It is token-weighted over validated main-loop input triples."
+            let latestDetail = latestRequestCacheHit.map {
+                "Latest-request CH: \(latestReadout ?? "unavailable"). \($0.detail)"
+            } ?? "Latest-request CH: unavailable. It is live-only and is not restored from turn/result aggregates or another process."
+            let sessionCacheDetail = cacheHitShare.map {
+                "Session-average CH: \(Self.cachePercentage($0.ratio)) (\(Self.coverageText($0.coverage)) coverage). It is token-weighted over finalized result usage and is never used as the latest-request value. \(sessionCacheCoverageDetail ?? "")"
+            } ?? "Session-average CH: unavailable. \(sessionCacheCoverageDetail ?? "No finalized result has a complete nonzero input/cache counter triple.")"
             let trackingDetail = trackingStartedAt.map {
-                "Tracking interval starts \($0.formatted(date: .abbreviated, time: .shortened)); coverage is reported per metric."
-            } ?? "Tracking interval: unavailable; coverage is reported per metric."
+                "Tracking period: since \($0.formatted(date: .abbreviated, time: .shortened))."
+            } ?? "Tracking period: unavailable."
             let costDetail = costReadout.map {
-                "Provider-estimated USD cost: \($0) (\(Self.coverageText(costEstimate?.coverage)) coverage). It covers tracked Claude session activity, includes native Claude subagents, and excludes separate RepoPrompt CE worker sessions."
-            } ?? "Provider-estimated USD cost: unavailable. Its scope would cover tracked Claude session activity, include native Claude subagents, and exclude separate RepoPrompt CE worker sessions."
+                "Accumulated session cost: \($0) (\(Self.coverageText(costEstimate?.coverage)) coverage). It is Claude's cumulative process estimate, including helper-model and native Claude child usage, not billed spend; separate RepoPrompt CE worker sessions are excluded. \(sessionCostCoverageDetail ?? "")"
+            } ?? "Accumulated session cost: unavailable. \(sessionCostCoverageDetail ?? "No accepted cumulative cost checkpoint is recorded.")"
 
+            let expanded = [latestDetail, sessionCacheDetail, trackingDetail, costDetail, unavailableReason]
+                .compactMap(\.self)
+                .joined(separator: "\n\n")
             return .init(
-                title: "Claude session usage",
-                readoutText: "\(cacheInline) · \(costInline)",
-                detailText: [cacheDetail, trackingDetail, costDetail, coverageDetail]
-                    .compactMap(\.self)
-                    .joined(separator: " ")
+                title: "Claude latest request CH · session cost",
+                readoutText: "\(latestInline) · \(costInline)",
+                detailText: expanded.replacingOccurrences(of: "\n", with: " "),
+                expandedDetailText: expanded,
+                noteText: nil
+            )
+        }
+
+        private var codexPresentation: Presentation {
+            let latestReadout = latestRequestCacheHit?.share.map { Self.cachePercentage($0.ratio) }
+            let costReadout: String? = costEstimate.flatMap { estimate in
+                guard estimate.coverage != .unavailable, estimate.currency == CodexUsagePricing.currency else { return nil }
+                if let upper = costUpperBound, upper != estimate.amount {
+                    // Endpoints round outward so the displayed range never excludes a permitted value.
+                    return "\(Self.usdLowerBound(estimate.amount))–\(Self.usdUpperBound(upper))"
+                }
+                return Self.usdAmount(estimate.amount)
+            }
+            let latestInline = latestReadout.map { "CH \($0)" } ?? "CH —"
+            let costInline = costReadout.map {
+                "Est. \($0)\(Self.partialSuffix(costEstimate?.coverage))"
+            } ?? "Est. —"
+
+            let latestDetail = latestRequestCacheHit.map {
+                "Latest-request CH: \(latestReadout ?? "unavailable"). \($0.detail)"
+            } ?? "Latest-request CH: unavailable. It is live-only and is not restored from cumulative totals, another session, or another process."
+            let sessionCacheDetail = cacheHitShare.map {
+                "Session-average CH: \(Self.cachePercentage($0.ratio)) (\(Self.coverageText($0.coverage)) coverage). It is token-weighted over owned cumulative-total intervals and is never used as the latest-request value. \(sessionCacheCoverageDetail ?? "")"
+            } ?? "Session-average CH: unavailable. \(sessionCacheCoverageDetail ?? "No owned interval has complete nonzero input and cached-input counters.")"
+            let trackingDetail = trackingStartedAt.map {
+                "Tracking period: since \($0.formatted(date: .abbreviated, time: .shortened))."
+            } ?? "Tracking period: unavailable."
+            let costDetail = costReadout.map {
+                "Accumulated session cost: \($0) (\(Self.coverageText(costEstimate?.coverage)) coverage). It is an API-equivalent estimate calculated from frozen OpenAI Standard/global list prices\(pricingProvenance.map { " (\($0))" } ?? "") at each dispatch, not billed spend or a plan charge. A range bounds the stated token-price assumptions where a context band could not be attributed. \(sessionCostCoverageDetail ?? "")"
+            } ?? "Accumulated session cost: unavailable. It would be an API-equivalent estimate, not billed spend or a plan charge. \(sessionCostCoverageDetail ?? "No owned interval could be priced.")"
+
+            let expanded = [latestDetail, sessionCacheDetail, trackingDetail, costDetail, unavailableReason]
+                .compactMap(\.self)
+                .joined(separator: "\n\n")
+            return .init(
+                title: "Codex latest request CH · session cost",
+                readoutText: "\(latestInline) · \(costInline)",
+                detailText: expanded.replacingOccurrences(of: "\n", with: " "),
+                expandedDetailText: expanded,
+                noteText: nil
             )
         }
 
@@ -197,6 +700,33 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
                 return "$\(NSDecimalNumber(decimal: amount).stringValue)"
             }
             return "$\(formatted(amount, fractionDigits: 3))"
+        }
+
+        /// Lower range endpoint rounded down; a tiny positive value keeps its exact digits so it
+        /// never masquerades as zero.
+        static func usdLowerBound(_ amount: Decimal) -> String {
+            let rounded = roundedDecimal(amount, scale: 3, mode: .down)
+            if amount > 0, rounded <= 0 {
+                return "$\(NSDecimalNumber(decimal: amount).stringValue)"
+            }
+            return "$\(formatted(rounded, fractionDigits: 3))"
+        }
+
+        /// Upper range endpoint rounded up.
+        static func usdUpperBound(_ amount: Decimal) -> String {
+            "$\(formatted(roundedDecimal(amount, scale: 3, mode: .up), fractionDigits: 3))"
+        }
+
+        private static func roundedDecimal(_ value: Decimal, scale: Int16, mode: NSDecimalNumber.RoundingMode) -> Decimal {
+            let handler = NSDecimalNumberHandler(
+                roundingMode: mode,
+                scale: scale,
+                raiseOnExactness: false,
+                raiseOnOverflow: false,
+                raiseOnUnderflow: false,
+                raiseOnDivideByZero: false
+            )
+            return NSDecimalNumber(decimal: value).rounding(accordingToBehavior: handler).decimalValue
         }
 
         private static func formatted(_ value: Decimal, fractionDigits: Int) -> String {

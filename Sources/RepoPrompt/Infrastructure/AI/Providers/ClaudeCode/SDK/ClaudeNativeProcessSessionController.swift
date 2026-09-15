@@ -93,6 +93,238 @@ final actor ClaudeNativeProcessSessionController {
         case error(String)
     }
 
+    // MARK: - Usage accounting ownership (plan §3.2)
+
+    /// Immutable identity of one successfully spawned provider process. Accounting executions
+    /// are keyed by `token`; a controller instance is reusable and therefore not an execution.
+    struct ProcessLaunchIdentity: Equatable {
+        enum LaunchMode: Equatable {
+            case freshSession
+            case resumedSession(String)
+        }
+
+        let token: UUID
+        let pid: Int32
+        let launchMode: LaunchMode
+        let commandProvenance: CommandProvenance
+        let runtimeVariant: ClaudeCodeRuntimeVariant
+        /// Command actually handed to the spawner (may be a PATH wrapper or symlink).
+        let executablePath: String
+        /// `executablePath` with symlinks resolved; the value a contract must match exactly.
+        let executableRealPath: String
+        /// Effective backend of the launch environment (first-party or a compatible backend).
+        let backend: ClaudeCodeLaunchEnvironment.Backend
+        /// Backend-routing evidence derived from the final environment handed to the spawner: every
+        /// resolver override/removed key plus every backend-routing key present in the child
+        /// environment whatever its origin (inherited login shell, configured override or resolver).
+        /// Keys only — values, which may be secrets, never enter the identity. Any entry means the
+        /// launch may not be talking to the first-party backend in the qualified shape.
+        let environmentOverrideKeys: [String]
+        /// Keys of the app's own configured process overrides (`config.processEnvironmentOverrides`)
+        /// applied to this launch, regardless of classification. Diagnostic provenance only.
+        let configuredEnvironmentOverrideKeys: [String]
+        let spawnedAt: Date
+
+        init(
+            token: UUID,
+            pid: Int32,
+            launchMode: LaunchMode,
+            commandProvenance: CommandProvenance,
+            runtimeVariant: ClaudeCodeRuntimeVariant,
+            executablePath: String,
+            executableRealPath: String,
+            backend: ClaudeCodeLaunchEnvironment.Backend,
+            environmentOverrideKeys: [String],
+            configuredEnvironmentOverrideKeys: [String] = [],
+            spawnedAt: Date
+        ) {
+            self.token = token
+            self.pid = pid
+            self.launchMode = launchMode
+            self.commandProvenance = commandProvenance
+            self.runtimeVariant = runtimeVariant
+            self.executablePath = executablePath
+            self.executableRealPath = executableRealPath
+            self.backend = backend
+            self.environmentOverrideKeys = environmentOverrideKeys
+            self.configuredEnvironmentOverrideKeys = configuredEnvironmentOverrideKeys
+            self.spawnedAt = spawnedAt
+        }
+    }
+
+    /// Runtime-reported provenance for one launch: the initialize account category plus the first
+    /// `system/init` fields. Category strings only, bound to the launch token; recorded as
+    /// diagnostics and never used to gate reported figures.
+    struct RuntimeBinding: Equatable {
+        let runtimeVersion: String
+        let apiProvider: String?
+        let apiKeySource: String?
+        let model: String?
+        let permissionMode: String?
+    }
+
+    /// Launch-environment evidence bound into `ProcessLaunchIdentity` (plan §2.10). It is derived
+    /// from the exact dictionary handed to `ProcessLauncher.spawn`, never from resolver intent
+    /// alone, so a redirect that reaches the child only through the inherited login shell or a
+    /// configured override is still evidence.
+    struct LaunchEnvironmentEvidence: Equatable {
+        let environmentOverrideKeys: [String]
+        let configuredEnvironmentOverrideKeys: [String]
+    }
+
+    /// Environment keys that change which backend, account or credential a launch talks to.
+    /// Recorded on the launch identity as key names only (diagnostic provenance); they do not
+    /// gate the runtime's reported figures.
+    static let backendRoutingEnvironmentKeyPrefixes: [String] = ["ANTHROPIC_", "CLAUDE_CODE_USE_"]
+    static let backendRoutingEnvironmentKeys: Set<String> = ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"]
+
+    static func isBackendRoutingEnvironmentKey(_ key: String) -> Bool {
+        backendRoutingEnvironmentKeys.contains(key)
+            || backendRoutingEnvironmentKeyPrefixes.contains { key.hasPrefix($0) }
+    }
+
+    static func launchEnvironmentEvidence(
+        finalEnvironment: [String: String],
+        resolverOverrides: [String: String],
+        resolverRemovedKeys: Set<String>,
+        configuredOverrides: [String: String]
+    ) -> LaunchEnvironmentEvidence {
+        var routingKeys = Set(resolverOverrides.keys)
+        routingKeys.formUnion(resolverRemovedKeys)
+        routingKeys.formUnion(finalEnvironment.keys.filter(isBackendRoutingEnvironmentKey))
+        routingKeys.formUnion(configuredOverrides.keys.filter(isBackendRoutingEnvironmentKey))
+        return LaunchEnvironmentEvidence(
+            environmentOverrideKeys: routingKeys.sorted(),
+            configuredEnvironmentOverrideKeys: configuredOverrides.keys.sorted()
+        )
+    }
+
+    /// Why the controller stopped attributing results on a launch. Typed so core can map it to
+    /// an execution block reason without parsing text.
+    enum UsageAttributionBlock: Equatable {
+        case missingRuntimeVersion
+        case runtimeVersionConflict
+        case providerSessionIdentityChanged
+        case desynchronized(String)
+
+        var description: String {
+            switch self {
+            case .missingRuntimeVersion: "system/init without claude_code_version"
+            case .runtimeVersionConflict: "claude_code_version changed within one process"
+            case .providerSessionIdentityChanged: "provider session identity changed within one process"
+            case let .desynchronized(detail): detail
+            }
+        }
+    }
+
+    /// A raw `result` positively attributed to the dispatch it answers, on the current launch.
+    struct UsageResultAttribution: Equatable {
+        let launchToken: UUID
+        let turnID: UUID
+        let dispatchOrdinal: Int
+        let resultIndex: Int
+        let queuedTurnCount: Int?
+        let runtimeVersion: String
+        let providerSessionID: String
+        let observation: AgentProviderUsageObservation
+        let reportedCost: Double?
+        let turnStatus: TurnStatus
+        /// Native child (subagent) activity was observed for this turn: an `Agent`/`Task` tool use
+        /// on the main line since the previous result, or `subagent_stats.spawned > 0` on the
+        /// result. Evidence only; core decides the token-scope consequence.
+        let childActivityObserved: Bool
+
+        init(
+            launchToken: UUID,
+            turnID: UUID,
+            dispatchOrdinal: Int,
+            resultIndex: Int,
+            queuedTurnCount: Int?,
+            runtimeVersion: String,
+            providerSessionID: String,
+            observation: AgentProviderUsageObservation,
+            reportedCost: Double?,
+            turnStatus: TurnStatus,
+            childActivityObserved: Bool = false
+        ) {
+            self.launchToken = launchToken
+            self.turnID = turnID
+            self.dispatchOrdinal = dispatchOrdinal
+            self.resultIndex = resultIndex
+            self.queuedTurnCount = queuedTurnCount
+            self.runtimeVersion = runtimeVersion
+            self.providerSessionID = providerSessionID
+            self.observation = observation
+            self.reportedCost = reportedCost
+            self.turnStatus = turnStatus
+            self.childActivityObserved = childActivityObserved
+        }
+    }
+
+    /// One main-line Claude assistant API request observed while a dispatch is outstanding. The
+    /// Anthropic message ID deduplicates repeated assistant chunks; a missing observation is still
+    /// emitted so a newer request without usage clears the previous latest-request value.
+    struct UsageRequestAttribution: Equatable {
+        let launchToken: UUID
+        let turnID: UUID
+        let requestID: String?
+        let observation: AgentProviderUsageObservation?
+    }
+
+    /// Ordered accounting events delivered on a dedicated stream, independent of transcript
+    /// delivery and of any run attempt's consumer. Ownership decisions (contract, baseline,
+    /// queue policy, counter boundaries) are made by core; the controller reports evidence and
+    /// proves launch/dispatch/result correlation plus live main-line request scope.
+    enum UsageAccountingEvent: Equatable {
+        case launched(ProcessLaunchIdentity)
+        case runtimeEvidence(launchToken: UUID, runtimeVersion: String, providerSessionID: String?)
+        /// Runtime provenance observed on the first `system/init` (after `runtimeEvidence`);
+        /// repeated initializations never re-emit it. Diagnostic only.
+        case runtimeBinding(launchToken: UUID, binding: RuntimeBinding)
+        case dispatched(launchToken: UUID, turnID: UUID, ordinal: Int)
+        case counterBoundaryObserved(launchToken: UUID, kind: String)
+        /// Live-only presentation evidence. It is never retained in the resubscription replay.
+        case mainRequestUsageAttributed(UsageRequestAttribution)
+        case resultAttributed(UsageResultAttribution)
+        /// Completion-lifecycle closure of a dispatched turn, emitted on this same ordered stream
+        /// after any attribution decision for that turn so closure can never race a result.
+        case turnClosed(launchToken: UUID, turnID: UUID, status: TurnStatus)
+        case blocked(launchToken: UUID, reason: UsageAttributionBlock)
+        case launchEnded(launchToken: UUID)
+    }
+
+    /// Outcome of attributing one raw `result` payload on the current launch.
+    private enum UsageResultDisposition: Equatable {
+        /// No active launch, or the launch is already blocked: legacy completion bookkeeping only.
+        case notEvaluated
+        case attributed
+        /// Same uuid with identical accounting fields as an already attributed result. It is a
+        /// re-delivery, not a second turn boundary, so it must not advance completion bookkeeping
+        /// either; otherwise the FIFO would retire the next dispatched turn before its own result.
+        case exactDuplicate
+        case blocked
+    }
+
+    private struct UsageResultFingerprint: Equatable {
+        let resultIndex: Int?
+        let reportedCost: Double?
+        let observation: AgentProviderUsageObservation
+    }
+
+    private struct UsageLaunchState {
+        let identity: ProcessLaunchIdentity
+        var nextDispatchOrdinal = 0
+        var turnIDByDispatchOrdinal: [Int: UUID] = [:]
+        var nextResultOrdinal = 0
+        var runtimeVersion: String?
+        var providerSessionID: String?
+        var blockedReason: UsageAttributionBlock?
+        var attributedResultFingerprints: [String: UsageResultFingerprint] = [:]
+        var binding: RuntimeBinding?
+        /// A main-line `Agent`/`Task` tool use was observed since the last attributed result.
+        var childToolObservedSinceLastResult = false
+    }
+
     struct SessionRef {
         var sessionID: String?
         var configuredContextWindow: Int?
@@ -255,6 +487,52 @@ final actor ClaudeNativeProcessSessionController {
         eventsStream
     }
 
+    /// Launch-local accounting ownership state; `nil` when no process is running.
+    private var usageLaunchState: UsageLaunchState?
+    /// Identity of the process whose stdout reader is current. Stale-launch discard of stdout
+    /// bytes/EOF is keyed on this token, never on accounting state (`usageLaunchState`), so
+    /// transcript and control delivery cannot depend on the usage feature (OracleB P1#4).
+    private var activeStdoutLaunchToken: UUID?
+    /// Lives for the controller's lifetime: a reusable controller keeps one stream across
+    /// shutdown/relaunch cycles, so `shutdown()` only reports `launchEnded`. The stream is
+    /// finished explicitly in `deinit` cleanup (after a final `launchEnded` if a launch was still
+    /// active); dropping the continuation alone would not finish it.
+    private var usageEventsContinuation: AsyncStream<UsageAccountingEvent>.Continuation?
+    private var usageEventsStream: AsyncStream<UsageAccountingEvent>
+    private var usageEventsStreamHandedOut = false
+    /// Every usage event emitted for the current launch, from its `launched` up to (excluding)
+    /// its `launchEnded`; cleared when the launch ends. A later subscriber is bootstrapped with
+    /// it so evidence emitted between the previous subscriber finishing and the new subscription
+    /// (typically the next `launched`, whose identity every later dispatch and result needs) is
+    /// never lost (review R2, OracleA P1#3). Ended launches are never replayed.
+    private var currentLaunchUsageEvents: [UsageAccountingEvent] = []
+    /// The first subscriber receives the lifetime stream (with every event buffered since init).
+    /// `AsyncStream` is single-consumer and ends for good once its iterator is cancelled, so a
+    /// later subscriber (the same controller re-attached after its forwarder terminated, or a
+    /// session change) receives a fresh stream: the previous one is finished, and the fresh one
+    /// starts with the current launch's already-emitted evidence (nothing from ended launches).
+    /// Core keeps continuity for a launch it already holds (a re-delivered `launched` is ignored
+    /// there) and rejects disposed executions (OracleB P1#3, review R2).
+    var usageAccountingEvents: AsyncStream<UsageAccountingEvent> {
+        guard usageEventsStreamHandedOut else {
+            usageEventsStreamHandedOut = true
+            return usageEventsStream
+        }
+        usageEventsContinuation?.finish()
+        var continuation: AsyncStream<UsageAccountingEvent>.Continuation?
+        let stream = AsyncStream<UsageAccountingEvent> { continuation = $0 }
+        usageEventsStream = stream
+        usageEventsContinuation = continuation
+        for event in currentLaunchUsageEvents {
+            continuation?.yield(event)
+        }
+        writeRawEventLogRecord(kind: "usage.stream.resubscribed", payload: [
+            "launchToken": usageLaunchState?.identity.token.uuidString ?? NSNull(),
+            "replayedCurrentLaunchEventCount": currentLaunchUsageEvents.count
+        ] as [String: Any])
+        return stream
+    }
+
     var hasActiveSession: Bool {
         process != nil
     }
@@ -286,6 +564,10 @@ final actor ClaudeNativeProcessSessionController {
     /// waits for exit so the zombie is collected.
     private func performSynchronousDeinitCleanup() {
         closeOutputChannelsAndInput()
+        activeStdoutLaunchToken = nil
+        endUsageLaunch()
+        usageEventsContinuation?.finish()
+        usageEventsContinuation = nil
 
         if let process {
             let pid = process.pid
@@ -390,6 +672,9 @@ final actor ClaudeNativeProcessSessionController {
         let stream = Self.makeEventsStream()
         eventsStream = stream.stream
         eventsContinuation = stream.continuation
+        var usageContinuation: AsyncStream<UsageAccountingEvent>.Continuation?
+        usageEventsStream = AsyncStream { usageContinuation = $0 }
+        usageEventsContinuation = usageContinuation
     }
 
     func ensureEventsStreamReady() {
@@ -451,7 +736,6 @@ final actor ClaudeNativeProcessSessionController {
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
         guard process != nil else { return }
-
         latestFlagSettingsIntentGeneration &+= 1
         let intentGeneration = latestFlagSettingsIntentGeneration
         let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
@@ -495,12 +779,18 @@ final actor ClaudeNativeProcessSessionController {
         }
         let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID)
         try sendLine(payload)
-        return beginTurnTracking()
+        // The write succeeded: register the turn and its launch-local dispatch ordinal in this
+        // same non-suspending actor step so no result can interleave between write and ordinal.
+        let turnID = beginTurnTracking()
+        registerUsageDispatch(turnID: turnID)
+        return turnID
     }
 
     func interruptTurn(reason: String) async -> InterruptOutcome {
         guard process != nil else { return .failed }
         guard turnInFlight else { return .noTurnInFlight }
+        // An interrupted turn's original result may still carry owned usage; it is attributed with
+        // its cancelled status and finalized as interrupted by core (plan §4).
         do {
             // Wait for interrupt control-response ACK to confirm Claude received the interrupt.
             _ = try await sendControlRequest(
@@ -573,6 +863,8 @@ final actor ClaudeNativeProcessSessionController {
         // determineTurnStatus() is what consumes it, and a trailing result that misses the
         // pending-turn-ID guard never reaches that consumption point.
         turnWasInterrupted = false
+        activeStdoutLaunchToken = nil
+        endUsageLaunch()
 
         closeOutputChannelsAndInput()
 
@@ -736,6 +1028,7 @@ final actor ClaudeNativeProcessSessionController {
             launchEnvironment: environment,
             workingDirectory: workingDirectory
         )
+        let launchToken = UUID()
         let spawned = try ProcessLauncher.spawn(
             command: resolvedCommand,
             arguments: arguments,
@@ -771,8 +1064,9 @@ final actor ClaudeNativeProcessSessionController {
         latestRuntimeInitMcpServerStatuses = [:]
         lastEmittedRuntimeInitStatus = nil
         process = spawned
+        activeStdoutLaunchToken = launchToken
         do {
-            try startStdoutReader(handle: spawned.stdout)
+            try startStdoutReader(handle: spawned.stdout, launchToken: launchToken)
             try startStderrReader(handle: spawned.stderr)
         } catch {
             spawned.stdout.readabilityHandler = nil
@@ -786,6 +1080,27 @@ final actor ClaudeNativeProcessSessionController {
             )
             throw ControllerError.initializationFailed("Failed to start Claude process readers: \(error.localizedDescription)")
         }
+        let resumedSessionID = existingSessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Evidence comes from `environment`, the exact dictionary the child was spawned with.
+        let environmentEvidence = Self.launchEnvironmentEvidence(
+            finalEnvironment: environment,
+            resolverOverrides: launchEnvironment.environmentOverrides,
+            resolverRemovedKeys: launchEnvironment.removedEnvironmentKeys,
+            configuredOverrides: config.processEnvironmentOverrides
+        )
+        beginUsageLaunch(ProcessLaunchIdentity(
+            token: launchToken,
+            pid: spawned.pid,
+            launchMode: (resumedSessionID?.isEmpty == false) ? .resumedSession(resumedSessionID!) : .freshSession,
+            commandProvenance: resolvedLaunchCommand.provenance,
+            runtimeVariant: config.runtimeVariant,
+            executablePath: resolvedCommand,
+            executableRealPath: URL(fileURLWithPath: resolvedCommand).resolvingSymlinksInPath().path,
+            backend: launchEnvironment.backend,
+            environmentOverrideKeys: environmentEvidence.environmentOverrideKeys,
+            configuredEnvironmentOverrideKeys: environmentEvidence.configuredEnvironmentOverrideKeys,
+            spawnedAt: Date()
+        ))
         await registerExpectedAgentPIDIfNeeded(spawned.pid)
     }
 
@@ -1005,12 +1320,17 @@ final actor ClaudeNativeProcessSessionController {
         }
         writeRawEventLogRecord(kind: "protocol.outbound.raw", payload: lineRecordPayload(from: lineData))
         do {
+            // A missing stdin handle is a failed write, never a silent success: dispatch
+            // registration below this call must only follow bytes actually delivered.
+            guard let stdin = process.stdin else {
+                throw ControllerError.inputWriteFailed("Claude stdin is not available")
+            }
             // Combine JSON body and newline into a single write to ensure atomic
             // delivery to the CLI's stdin pipe. Two separate writes could theoretically
             // be split if the pipe reader consumes data between them.
             var frame = lineData
             frame.append(0x0A)
-            try process.stdin?.write(contentsOf: frame)
+            try stdin.write(contentsOf: frame)
         } catch {
             // Stdin is broken — the process is dead or dying. Schedule teardown so the
             // child process doesn't linger (mirrors Codex's terminateTransport behavior).
@@ -1024,7 +1344,7 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    private func startStdoutReader(handle: FileHandle) throws {
+    private func startStdoutReader(handle: FileHandle, launchToken: UUID) throws {
         try ReadSourceFDPreflight.validateOpenFD(handle.fileDescriptor, label: "Claude stdout")
         let channel = FileHandleChunkChannel()
         stdoutChunkChannel = channel
@@ -1037,14 +1357,17 @@ final actor ClaudeNativeProcessSessionController {
                 channel.yield(data)
             }
         }
+        // The consumer carries the launch token of the process whose stdout it reads, so a
+        // straggler chunk or EOF from an already-replaced process is discarded before framing
+        // and can neither reach the current translator nor accounting.
         stdoutConsumerTask = Task { [weak self] in
             for await chunk in channel.stream {
                 guard let self else { break }
-                await handleStdoutChunk(chunk)
+                await handleStdoutChunk(chunk, launchToken: launchToken)
             }
             // Stream ended (EOF or finish() called)
             guard let self else { return }
-            await handleStdoutEOF()
+            await handleStdoutEOF(launchToken: launchToken)
         }
     }
 
@@ -1080,7 +1403,14 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    private func handleStdoutChunk(_ data: Data) async {
+    private func handleStdoutChunk(_ data: Data, launchToken: UUID) async {
+        guard isCurrentStdoutLaunch(launchToken) else {
+            writeRawEventLogRecord(kind: "protocol.inbound.staleLaunchDiscarded", payload: [
+                "launchToken": launchToken.uuidString,
+                "byteCount": data.count
+            ] as [String: Any])
+            return
+        }
         var lines: [Data] = []
         stdoutFramer.feed(data, onDiagnostic: { [self] diagnostic in
             switch diagnostic {
@@ -1449,6 +1779,22 @@ final actor ClaudeNativeProcessSessionController {
                 "mcpServerStatuses": mcpStatuses
             ] as [String: Any])
             publishRuntimeInitIfChanged()
+            noteUsageRuntimeEvidence(
+                version: payload["claude_code_version"] as? String,
+                providerSessionID: Self.firstSessionIdentifier(in: payload)
+            )
+            noteUsageRuntimeBinding(payload)
+        } else if (payload["type"] as? String) == "system",
+                  let subtype = (payload["subtype"] as? String)?.lowercased(),
+                  subtype.contains("compact")
+        {
+            noteUsageCounterBoundary(kind: subtype)
+        } else if let boundary = Self.usageCompactionStatusBoundary(in: payload) {
+            // Installed 2.1.268 reports compaction through `system/status` (`compacting`,
+            // `compact_result`/`compact_error`), not only `compact_boundary`.
+            noteUsageCounterBoundary(kind: boundary)
+        } else if Self.usageChildToolInvocation(in: payload) != nil {
+            noteUsageChildToolObserved()
         }
 
         guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []) else {
@@ -1488,6 +1834,9 @@ final actor ClaudeNativeProcessSessionController {
         // arrive per turn.
         let payloadType = (payload["type"] as? String) ?? ""
         let isResultPayload = payloadType == "result"
+        if payloadType == "assistant" {
+            emitMainRequestUsageIfOwned(payload: payload, streamResults: streamResults)
+        }
 
         for result in streamResults {
             #if DEBUG
@@ -1528,6 +1877,19 @@ final actor ClaudeNativeProcessSessionController {
             writeRawEventLogRecord(kind: "translator.streamResult", payload: logPayload)
             emit(.stream(result))
             if isResultPayload, result.type == "message_stop" {
+                // Accounting ownership is decided against launch-local dispatch ordinals, not the
+                // completion FIFO below, so deferred `idle` completion never skews attribution.
+                let disposition = evaluateUsageResultAttribution(result: result, payload: payload)
+                if disposition == .exactDuplicate {
+                    // A re-delivered result is not a second turn boundary. Consuming the FIFO
+                    // here would retire the next dispatched turn (transcript and accounting)
+                    // before its own authoritative result arrives.
+                    writeRawEventLogRecord(kind: "turn.duplicateResultIgnored", payload: [
+                        "resultIndex": result.usageObservation?.resultIndex ?? NSNull(),
+                        "pendingTurnIDCount": pendingTurnIDBuffer.count - pendingTurnIDHead
+                    ] as [String: Any])
+                    continue
+                }
                 guard hasPendingTurnIDs else {
                     noteMissingPendingTurnID(context: "result message_stop")
                     continue
@@ -1543,7 +1905,7 @@ final actor ClaudeNativeProcessSessionController {
                 } else {
                     // Legacy mode: complete immediately on result/message_stop.
                     let completedTurnID = dequeueTurnID()
-                    emit(.turnCompleted(turnID: completedTurnID, status: status))
+                    emitTurnCompleted(turnID: completedTurnID, status: status)
                 }
             }
         }
@@ -1562,7 +1924,7 @@ final actor ClaudeNativeProcessSessionController {
             return
         }
         let turnID = dequeueTurnID()
-        emit(.turnCompleted(turnID: turnID, status: status))
+        emitTurnCompleted(turnID: turnID, status: status)
         // If more deferred completions remain, schedule a new fallback.
         scheduleAuthoritativeIdleFallbackIfNeeded()
     }
@@ -1604,7 +1966,7 @@ final actor ClaudeNativeProcessSessionController {
             "turnID": turnID.uuidString,
             "status": String(describing: status)
         ] as [String: Any])
-        emit(.turnCompleted(turnID: turnID, status: status))
+        emitTurnCompleted(turnID: turnID, status: status)
         scheduleAuthoritativeIdleFallbackIfNeeded()
     }
 
@@ -1619,7 +1981,7 @@ final actor ClaudeNativeProcessSessionController {
         for status in pendingAuthoritativeTurnStatuses {
             guard hasPendingTurnIDs else { break }
             let turnID = dequeueTurnID()
-            emit(.turnCompleted(turnID: turnID, status: status))
+            emitTurnCompleted(turnID: turnID, status: status)
         }
         pendingAuthoritativeTurnStatuses.removeAll()
     }
@@ -1794,7 +2156,11 @@ final actor ClaudeNativeProcessSessionController {
         return nil
     }
 
-    private func determineTurnStatus(from payload: [String: Any], stopReasonHint: String? = nil) -> TurnStatus {
+    private func determineTurnStatus(
+        from payload: [String: Any],
+        stopReasonHint: String? = nil,
+        consumeInterruptMarker: Bool = true
+    ) -> TurnStatus {
         let subtype = ((payload["subtype"] as? String) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -1805,7 +2171,9 @@ final actor ClaudeNativeProcessSessionController {
         // If we recently sent an interrupt control request for this turn,
         // any error_during_execution result is an abort side effect, not a real failure.
         if turnWasInterrupted {
-            turnWasInterrupted = false
+            if consumeInterruptMarker {
+                turnWasInterrupted = false
+            }
             return .cancelled
         }
 
@@ -1935,6 +2303,92 @@ final actor ClaudeNativeProcessSessionController {
         @discardableResult
         func test_beginTurnTracking() -> UUID {
             beginTurnTracking()
+        }
+
+        /// Installs a synthetic process launch (no subprocess) so attribution can be exercised
+        /// through the production `handleStreamPayload` path.
+        @discardableResult
+        func test_beginSyntheticUsageLaunch(
+            launchMode: ProcessLaunchIdentity.LaunchMode = .freshSession,
+            commandProvenance: CommandProvenance = .automaticResolved,
+            pid: Int32 = 0,
+            executableRealPath: String = "/synthetic/claude",
+            backend: ClaudeCodeLaunchEnvironment.Backend = .defaultClaude,
+            environmentOverrideKeys: [String] = [],
+            configuredEnvironmentOverrideKeys: [String] = []
+        ) -> ProcessLaunchIdentity {
+            let identity = ProcessLaunchIdentity(
+                token: UUID(),
+                pid: pid,
+                launchMode: launchMode,
+                commandProvenance: commandProvenance,
+                runtimeVariant: config.runtimeVariant,
+                executablePath: executableRealPath,
+                executableRealPath: executableRealPath,
+                backend: backend,
+                environmentOverrideKeys: environmentOverrideKeys,
+                configuredEnvironmentOverrideKeys: configuredEnvironmentOverrideKeys,
+                spawnedAt: Date()
+            )
+            // A synthetic launch stands in for a spawn: the stdout reader generation is that launch.
+            activeStdoutLaunchToken = identity.token
+            beginUsageLaunch(identity)
+            return identity
+        }
+
+        /// Seeds the initialize control response (account category evidence) for binding tests.
+        func test_setInitializeResponse(_ response: [String: Any]) {
+            initializeResponseSnapshot = Self.parseInitializeResponseSnapshot(from: response)
+        }
+
+        /// Runs the production environment composition (`effectiveLaunchEnvironment`, which applies
+        /// this controller's configured overrides, the resolver overrides/removals and child
+        /// sanitization) and derives launch-identity evidence from that final dictionary exactly
+        /// as `startProcessIfNeeded` does before `ProcessLauncher.spawn`.
+        func test_launchEnvironmentEvidence(
+            base: [String: String],
+            resolverOverrides: [String: String] = [:],
+            resolverRemovedKeys: Set<String> = []
+        ) -> LaunchEnvironmentEvidence {
+            let finalEnvironment = effectiveLaunchEnvironment(
+                base: base,
+                resolverOverrides: resolverOverrides,
+                resolverRemovedKeys: resolverRemovedKeys
+            )
+            return Self.launchEnvironmentEvidence(
+                finalEnvironment: finalEnvironment,
+                resolverOverrides: resolverOverrides,
+                resolverRemovedKeys: resolverRemovedKeys,
+                configuredOverrides: config.processEnvironmentOverrides
+            )
+        }
+
+        /// Mirrors a successful user-message write: turn tracking plus dispatch registration.
+        @discardableResult
+        func test_registerSyntheticDispatch() -> UUID {
+            let turnID = beginTurnTracking()
+            registerUsageDispatch(turnID: turnID)
+            return turnID
+        }
+
+        func test_endSyntheticUsageLaunch() {
+            endUsageLaunch()
+        }
+
+        /// Attaches an already-spawned harmless child (for example `/bin/cat`) as the controller's
+        /// process so `sendUserMessage` performs its production stdin write against a real pipe.
+        /// Readers are not started; `shutdown()` terminates the child normally.
+        func test_attachSpawnedProcess(_ spawned: SpawnedProcess) {
+            process = spawned
+            isShuttingDown = false
+        }
+
+        func test_currentUsageLaunchToken() -> UUID? {
+            usageLaunchState?.identity.token
+        }
+
+        func test_handleStdoutChunk(_ data: Data, launchToken: UUID) async {
+            await handleStdoutChunk(data, launchToken: launchToken)
         }
 
         func test_storePendingPermissionRequest(id: String, request: [String: Any]) {
@@ -2114,8 +2568,16 @@ final actor ClaudeNativeProcessSessionController {
         }
     }
 
-    private func handleStdoutEOF() async {
+    private func handleStdoutEOF(launchToken: UUID) async {
         guard !isShuttingDown else { return }
+        // An EOF from an already-replaced process must not tear down the current launch.
+        guard isCurrentStdoutLaunch(launchToken) else {
+            writeRawEventLogRecord(kind: "process.stdoutEOF.staleLaunchIgnored", payload: [
+                "launchToken": launchToken.uuidString
+            ])
+            return
+        }
+        activeStdoutLaunchToken = nil
         writeRawEventLogRecord(kind: "process.stdoutEOF")
         var remainingLines: [Data] = []
         stdoutFramer.flush { line in
@@ -2133,10 +2595,366 @@ final actor ClaudeNativeProcessSessionController {
         if !staleIDs.isEmpty {
             emit(.error("Claude process exited unexpectedly."))
             for id in staleIDs {
-                emit(.turnCompleted(turnID: id, status: .failed))
+                emitTurnCompleted(turnID: id, status: .failed)
             }
         }
+        endUsageLaunch()
         finishEventsStreamIfNeeded()
+    }
+
+    /// Every completion-lifecycle exit emits the transcript event and, when a launch is active,
+    /// the ordered accounting closure on the usage stream (after any attribution for the turn).
+    private func emitTurnCompleted(turnID: UUID, status: TurnStatus) {
+        emit(.turnCompleted(turnID: turnID, status: status))
+        if let state = usageLaunchState {
+            emitUsage(.turnClosed(launchToken: state.identity.token, turnID: turnID, status: status))
+        }
+    }
+
+    // MARK: - Usage accounting ownership helpers
+
+    /// Process/reader generation check for stdout bytes and EOF; independent of accounting state.
+    private func isCurrentStdoutLaunch(_ token: UUID) -> Bool {
+        activeStdoutLaunchToken == token
+    }
+
+    private func emitUsage(_ event: UsageAccountingEvent) {
+        switch event {
+        case .launched:
+            currentLaunchUsageEvents = [event]
+        case .launchEnded:
+            currentLaunchUsageEvents.removeAll()
+        default:
+            currentLaunchUsageEvents.append(event)
+        }
+        usageEventsContinuation?.yield(event)
+    }
+
+    /// Latest-request evidence is intentionally not added to currentLaunchUsageEvents. Replaying
+    /// it to a replacement subscriber could make a prior request look current after restore.
+    private func emitTransientUsage(_ event: UsageAccountingEvent) {
+        usageEventsContinuation?.yield(event)
+    }
+
+    private func beginUsageLaunch(_ identity: ProcessLaunchIdentity) {
+        var state = UsageLaunchState(identity: identity)
+        if case let .resumedSession(sessionID) = identity.launchMode {
+            state.providerSessionID = sessionID
+        }
+        usageLaunchState = state
+        writeRawEventLogRecord(kind: "usage.launch.began", payload: [
+            "launchToken": identity.token.uuidString,
+            "pid": Int(identity.pid),
+            "launchMode": Self.launchModeDescription(identity.launchMode),
+            "commandProvenance": identity.commandProvenance.rawValue,
+            "runtimeVariant": identity.runtimeVariant.rawValue,
+            "environmentOverrideKeys": identity.environmentOverrideKeys,
+            "configuredEnvironmentOverrideKeys": identity.configuredEnvironmentOverrideKeys
+        ] as [String: Any])
+        emitUsage(.launched(identity))
+    }
+
+    private func endUsageLaunch() {
+        guard let state = usageLaunchState else { return }
+        usageLaunchState = nil
+        writeRawEventLogRecord(kind: "usage.launch.ended", payload: [
+            "launchToken": state.identity.token.uuidString,
+            "dispatchCount": state.nextDispatchOrdinal,
+            "attributedResultCount": state.nextResultOrdinal,
+            "blockedReason": state.blockedReason?.description ?? NSNull()
+        ] as [String: Any])
+        emitUsage(.launchEnded(launchToken: state.identity.token))
+    }
+
+    private static func launchModeDescription(_ mode: ProcessLaunchIdentity.LaunchMode) -> String {
+        switch mode {
+        case .freshSession: "freshSession"
+        case .resumedSession: "resumedSession"
+        }
+    }
+
+    private func registerUsageDispatch(turnID: UUID) {
+        guard var state = usageLaunchState else { return }
+        let ordinal = state.nextDispatchOrdinal
+        state.nextDispatchOrdinal += 1
+        state.turnIDByDispatchOrdinal[ordinal] = turnID
+        usageLaunchState = state
+        writeRawEventLogRecord(kind: "usage.dispatch.registered", payload: [
+            "launchToken": state.identity.token.uuidString,
+            "turnID": turnID.uuidString,
+            "ordinal": ordinal
+        ] as [String: Any])
+        emitUsage(.dispatched(launchToken: state.identity.token, turnID: turnID, ordinal: ordinal))
+    }
+
+    /// Terminal for the launch: no later result on this process can be attributed.
+    private func blockUsageAttribution(_ reason: UsageAttributionBlock) {
+        guard var state = usageLaunchState, state.blockedReason == nil else { return }
+        state.blockedReason = reason
+        state.turnIDByDispatchOrdinal.removeAll()
+        usageLaunchState = state
+        writeRawEventLogRecord(kind: "usage.attribution.blocked", payload: [
+            "launchToken": state.identity.token.uuidString,
+            "reason": reason.description
+        ] as [String: Any])
+        emitUsage(.blocked(launchToken: state.identity.token, reason: reason))
+    }
+
+    private func blockUsageAttribution(reason: String) {
+        blockUsageAttribution(.desynchronized(reason))
+    }
+
+    private func noteUsageRuntimeEvidence(version: String?, providerSessionID: String?) {
+        guard var state = usageLaunchState, state.blockedReason == nil else { return }
+        let trimmedVersion = version?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmedVersion.isEmpty else {
+            blockUsageAttribution(.missingRuntimeVersion)
+            return
+        }
+        if let known = state.runtimeVersion {
+            guard known == trimmedVersion else {
+                blockUsageAttribution(.runtimeVersionConflict)
+                return
+            }
+        }
+        let trimmedSession = providerSessionID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let known = state.providerSessionID {
+            guard trimmedSession.isEmpty || known == trimmedSession else {
+                blockUsageAttribution(.providerSessionIdentityChanged)
+                return
+            }
+        } else if !trimmedSession.isEmpty {
+            state.providerSessionID = trimmedSession
+        }
+        let isFirstEvidence = state.runtimeVersion == nil
+        state.runtimeVersion = trimmedVersion
+        usageLaunchState = state
+        if isFirstEvidence {
+            writeRawEventLogRecord(kind: "usage.runtime.evidence", payload: [
+                "launchToken": state.identity.token.uuidString,
+                "claudeCodeVersion": trimmedVersion,
+                "hasProviderSessionID": !trimmedSession.isEmpty
+            ] as [String: Any])
+            emitUsage(.runtimeEvidence(
+                launchToken: state.identity.token,
+                runtimeVersion: trimmedVersion,
+                providerSessionID: state.providerSessionID
+            ))
+        }
+    }
+
+    /// Emits only a current-launch, main-line assistant request while the dispatch that owns the
+    /// next result is still outstanding. Sidechain assistant messages and session mismatches are
+    /// ignored; they can never replace the main readout. A missing usage object is still evidence
+    /// that a newer main request occurred, so it clears the earlier value downstream.
+    private func emitMainRequestUsageIfOwned(
+        payload: [String: Any],
+        streamResults: [AIStreamResult]
+    ) {
+        guard let state = usageLaunchState,
+              state.blockedReason == nil,
+              payload["parent_tool_use_id"] == nil || payload["parent_tool_use_id"] is NSNull,
+              let providerSessionID = state.providerSessionID,
+              Self.firstSessionIdentifier(in: payload)?
+              .trimmingCharacters(in: .whitespacesAndNewlines) == providerSessionID,
+              let turnID = state.turnIDByDispatchOrdinal[state.nextResultOrdinal]
+        else { return }
+
+        let message = payload["message"] as? [String: Any]
+        let trimmedRequestID = (message?["id"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestID = trimmedRequestID.flatMap { $0.isEmpty ? nil : $0 }
+        let observation = streamResults
+            .compactMap(\.usageObservation)
+            .first(where: { $0.source == .assistant && $0.parentToolUseID == nil })
+
+        emitTransientUsage(.mainRequestUsageAttributed(.init(
+            launchToken: state.identity.token,
+            turnID: turnID,
+            requestID: requestID,
+            observation: observation
+        )))
+    }
+
+    // MARK: Runtime provenance and child-activity evidence
+
+    /// Records the first `system/init` provenance for the launch (diagnostic only). Repeated
+    /// initializations never reset baseline, index or totals and never re-emit it; a changed model
+    /// or key source is not a reason to stop counting the runtime's reported figures.
+    private func noteUsageRuntimeBinding(_ payload: [String: Any]) {
+        guard var state = usageLaunchState, state.blockedReason == nil, let version = state.runtimeVersion else { return }
+        let observed = RuntimeBinding(
+            runtimeVersion: version,
+            apiProvider: initializeResponseSnapshot?.account?.apiProvider,
+            apiKeySource: payload["apiKeySource"] as? String,
+            model: payload["model"] as? String,
+            permissionMode: payload["permissionMode"] as? String
+        )
+        guard state.binding == nil else { return }
+        state.binding = observed
+        usageLaunchState = state
+        writeRawEventLogRecord(kind: "usage.runtime.binding", payload: [
+            "launchToken": state.identity.token.uuidString,
+            "apiProvider": observed.apiProvider ?? NSNull(),
+            "apiKeySource": observed.apiKeySource ?? NSNull(),
+            "model": observed.model ?? NSNull(),
+            "permissionMode": observed.permissionMode ?? NSNull()
+        ] as [String: Any])
+        emitUsage(.runtimeBinding(launchToken: state.identity.token, binding: observed))
+    }
+
+    /// `system/status` compaction activity on installed 2.1.268 (`status: compacting`,
+    /// `compact_result`/`compact_error`/`compact_metadata`).
+    static func usageCompactionStatusBoundary(in payload: [String: Any]) -> String? {
+        guard (payload["type"] as? String) == "system", (payload["subtype"] as? String) == "status" else { return nil }
+        if (payload["status"] as? String)?.lowercased().contains("compact") == true { return "status:compacting" }
+        for key in ["compact_result", "compact_error", "compact_metadata"] where payload[key] != nil {
+            return "status:\(key)"
+        }
+        return nil
+    }
+
+    /// Name of a native child tool invoked in a main-line assistant message (`Agent` or its alias
+    /// `Task`). Sidechain messages (non-null `parent_tool_use_id`) are not main-line evidence.
+    static func usageChildToolInvocation(in payload: [String: Any]) -> String? {
+        guard (payload["type"] as? String) == "assistant",
+              payload["parent_tool_use_id"] == nil || payload["parent_tool_use_id"] is NSNull,
+              let message = payload["message"] as? [String: Any],
+              let content = message["content"] as? [[String: Any]]
+        else { return nil }
+        for block in content where (block["type"] as? String) == "tool_use" {
+            if let name = block["name"] as? String, name == "Agent" || name == "Task" {
+                return name
+            }
+        }
+        return nil
+    }
+
+    private func noteUsageChildToolObserved() {
+        guard var state = usageLaunchState, state.blockedReason == nil, !state.childToolObservedSinceLastResult else { return }
+        state.childToolObservedSinceLastResult = true
+        usageLaunchState = state
+        writeRawEventLogRecord(kind: "usage.childTool.observed", payload: [
+            "launchToken": state.identity.token.uuidString
+        ] as [String: Any])
+    }
+
+    /// Whether a result reports spawned native children (`subagent_stats.spawned > 0`). The field
+    /// is present with zeros on every 2.1.268 result, so presence alone is never child evidence.
+    static func usageResultReportsSpawnedChildren(in payload: [String: Any]) -> Bool {
+        guard let stats = payload["subagent_stats"] as? [String: Any],
+              let spawned = stats["spawned"] as? NSNumber,
+              CFGetTypeID(spawned) != CFBooleanGetTypeID()
+        else { return false }
+        return spawned.doubleValue > 0
+    }
+
+    private func noteUsageCounterBoundary(kind: String) {
+        guard let state = usageLaunchState, state.blockedReason == nil else { return }
+        writeRawEventLogRecord(kind: "usage.counterBoundary.observed", payload: [
+            "launchToken": state.identity.token.uuidString,
+            "kind": kind
+        ] as [String: Any])
+        emitUsage(.counterBoundaryObserved(launchToken: state.identity.token, kind: kind))
+    }
+
+    /// Attributes a raw `result` to exactly the dispatch it answers. Every failure is fail-closed:
+    /// an exact duplicate is a no-op (no ordinal advance, and the caller must not treat it as a
+    /// turn boundary), a reused uuid with different fields, a reused/skipped/reordered index, a
+    /// missing dispatch, missing version or session evidence all block the remaining launch.
+    /// Indices are never skipped to resynchronize.
+    @discardableResult
+    private func evaluateUsageResultAttribution(result: AIStreamResult, payload: [String: Any]) -> UsageResultDisposition {
+        guard var state = usageLaunchState, state.blockedReason == nil else { return .notEvaluated }
+        guard let observation = result.usageObservation else {
+            blockUsageAttribution(reason: "result carried no usage observation")
+            return .blocked
+        }
+        guard let resultID = observation.envelopeID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !resultID.isEmpty
+        else {
+            blockUsageAttribution(reason: "result without uuid")
+            return .blocked
+        }
+        // Bind the cumulative cost from the originally decoded payload: the translator input is a
+        // JSONSerialization re-serialisation of this dictionary (17-significant-digit doubles) and
+        // the parser turns such literals into decimal numbers, so `result.cost` can carry ±1e-18
+        // noise (0.008242 → 0.008242000000000001) while the decoded value is the exact nearest double.
+        // The plugin codec already parses long decimal literals to the correctly rounded double
+        // (`ClaudeProviderJSONValue(any:)`), so this is the nearest double of the wire lexeme.
+        let cumulativeCost = (payload["total_cost_usd"] as? NSNumber).map(\.doubleValue) ?? result.cost
+        let fingerprint = UsageResultFingerprint(
+            resultIndex: observation.resultIndex,
+            reportedCost: cumulativeCost,
+            observation: observation
+        )
+        if let seen = state.attributedResultFingerprints[resultID] {
+            if seen == fingerprint {
+                writeRawEventLogRecord(kind: "usage.result.duplicateIgnored", payload: [
+                    "launchToken": state.identity.token.uuidString,
+                    "resultIndex": observation.resultIndex ?? NSNull()
+                ] as [String: Any])
+                return .exactDuplicate
+            }
+            blockUsageAttribution(reason: "result uuid reused with conflicting accounting fields")
+            return .blocked
+        }
+        guard let runtimeVersion = state.runtimeVersion else {
+            blockUsageAttribution(reason: "result before runtime version evidence")
+            return .blocked
+        }
+        let resultSessionID = Self.firstSessionIdentifier(in: payload)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard let providerSessionID = state.providerSessionID, !resultSessionID.isEmpty,
+              resultSessionID == providerSessionID
+        else {
+            blockUsageAttribution(reason: "result provider session identity mismatch")
+            return .blocked
+        }
+        guard let resultIndex = observation.resultIndex else {
+            blockUsageAttribution(reason: "result_index missing or invalid")
+            return .blocked
+        }
+        guard resultIndex == state.nextResultOrdinal else {
+            blockUsageAttribution(reason: "result_index \(resultIndex) but next expected ordinal is \(state.nextResultOrdinal)")
+            return .blocked
+        }
+        guard let turnID = state.turnIDByDispatchOrdinal[resultIndex] else {
+            blockUsageAttribution(reason: "no dispatched turn for result_index \(resultIndex)")
+            return .blocked
+        }
+        // Outcome, local commands, child scope and cumulative-cost monotonicity are not ownership
+        // questions: the result is attributed with its status and child evidence, and core decides
+        // finalization, token-scope coverage and checkpoint acceptance (plan §4).
+        let status = determineTurnStatus(from: payload, stopReasonHint: result.stopReason, consumeInterruptMarker: false)
+        let childActivityObserved = state.childToolObservedSinceLastResult || Self.usageResultReportsSpawnedChildren(in: payload)
+        state.turnIDByDispatchOrdinal.removeValue(forKey: resultIndex)
+        state.nextResultOrdinal += 1
+        state.attributedResultFingerprints[resultID] = fingerprint
+        state.childToolObservedSinceLastResult = false
+        usageLaunchState = state
+        writeRawEventLogRecord(kind: "usage.result.attributed", payload: [
+            "launchToken": state.identity.token.uuidString,
+            "turnID": turnID.uuidString,
+            "resultIndex": resultIndex,
+            "queuedTurnCount": observation.queuedTurnCount ?? NSNull(),
+            "status": String(describing: status),
+            "childActivityObserved": childActivityObserved
+        ] as [String: Any])
+        emitUsage(.resultAttributed(UsageResultAttribution(
+            launchToken: state.identity.token,
+            turnID: turnID,
+            dispatchOrdinal: resultIndex,
+            resultIndex: resultIndex,
+            queuedTurnCount: observation.queuedTurnCount,
+            runtimeVersion: runtimeVersion,
+            providerSessionID: providerSessionID,
+            observation: observation,
+            reportedCost: cumulativeCost,
+            turnStatus: status,
+            childActivityObserved: childActivityObserved
+        )))
+        return .attributed
     }
 
     private func failPendingControlRequests(with error: Error) {
@@ -2424,7 +3242,7 @@ final actor ClaudeNativeProcessSessionController {
         let staleIDs = drainAllTurnIDs()
         if !staleIDs.isEmpty {
             for id in staleIDs {
-                emit(.turnCompleted(turnID: id, status: .failed))
+                emitTurnCompleted(turnID: id, status: .failed)
             }
         }
         await shutdown()

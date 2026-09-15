@@ -577,9 +577,29 @@ extension AgentModeViewModel {
         var claudeConfiguredContextWindowKey: ClaudeProvisionalContextWindowResolver.Key?
         var pendingNonCodexUserInputTokenQueue: [Int] = []
         var activeNonCodexTurnTokenAccumulator: NonCodexTurnTokenAccumulator?
-        /// Owner-keyed provider accounting (plan §3.2). Installed by persisted hydration or lazily at
-        /// the first Claude execution; production runs with G1 closed (`.productionClaude`).
+        /// Owner-keyed provider accounting (plan §3.2). Installed by persisted hydration or lazily when
+        /// a native controller is installed; production verifies each execution (`.productionClaude`).
+        /// Executions are keyed by actual process launch (`.launched` usage event), never by
+        /// controller installation.
         var usageAccounting: AgentUsageAccumulator?
+        /// Identity of the native process currently owning accounting for this session.
+        private(set) var activeNativeLaunch: NativeProcessLaunchIdentity?
+        private var activeNativeRuntimeVersion: String?
+        /// Session-owned forwarder from the controller's usage-evidence stream into the accumulator.
+        /// Survives run-attempt consumer exits so late (for example cancellation) results still land.
+        private var usageAccountingForwardingTask: Task<Void, Never>?
+        private var usageAccountingForwardingControllerID: ObjectIdentifier?
+        /// Distinguishes forwarders of the same controller instance across detach/reattach cycles,
+        /// so a superseded forwarder can never dispose the launch a newer one is draining.
+        private var usageAccountingForwardingGeneration: UInt64 = 0
+        /// Invoked after an ingested usage event changed the execution verdict, transient
+        /// latest-request presentation, or accepted accounting; the flag is `true` only when
+        /// `ownedRevision` advanced (something to persist).
+        var onUsageAccountingChanged: ((TabSession, _ didChangeAcceptedAccounting: Bool) -> Void)?
+        #if DEBUG
+            /// Events ingested through the session-owned seam (forwarder or direct), for test draining.
+            private(set) var test_ingestedNativeUsageEventCount = 0
+        #endif
 
         private struct ProviderUsageProjectionCacheKey: Equatable {
             var selectedAgent: AgentProviderKind
@@ -588,7 +608,10 @@ extension AgentModeViewModel {
             var qualification: AgentUsageQualification?
             var eligibility: AgentUsageEligibility?
             var accountingRevision: UInt64?
+            var presentationRevision: UInt64?
             var activeExecutionID: UUID?
+            var executionVerdict: AgentUsageExecutionVerdict?
+            var hasUnchargedDispatchedWork: Bool?
             var accountingGeneration: UInt64
         }
 
@@ -620,7 +643,10 @@ extension AgentModeViewModel {
                 qualification: usageAccounting?.qualification,
                 eligibility: usageAccounting?.eligibility,
                 accountingRevision: usageAccounting?.ownedRevision,
+                presentationRevision: usageAccounting?.presentationRevision,
                 activeExecutionID: usageAccounting?.activeExecutionID,
+                executionVerdict: usageAccounting?.executionVerdict,
+                hasUnchargedDispatchedWork: usageAccounting?.hasUnchargedDispatchedWork,
                 accountingGeneration: usageAccountingGeneration
             )
             if let cached = providerUsageProjectionCache, cached.key == key {
@@ -691,18 +717,54 @@ extension AgentModeViewModel {
                 let oldIdentity = oldValue.map { ObjectIdentifier($0) }
                 let newIdentity = claudeController.map { ObjectIdentifier($0) }
                 guard oldIdentity != newIdentity else { return }
-                syncUsageAccountingExecution(hasController: newIdentity != nil)
+                syncUsageAccountingForwarding(to: claudeController)
             }
         }
 
-        /// Every distinct native controller is a fresh execution identity; replacement or removal
-        /// disposes the previous one so late callbacks cannot mutate a newer execution.
-        private func syncUsageAccountingExecution(hasController: Bool) {
-            guard hasController else {
-                let disposedExecutionID = usageAccounting?.activeExecutionID
-                usageAccounting?.endExecution(disposedExecutionID)
+        /// Controller installation only guarantees an owner-keyed accumulator and a session-owned
+        /// forwarder for that controller's usage-evidence stream. Execution identity is created by
+        /// the controller's `.launched` event (an actual process spawn) and disposed by
+        /// `.launchEnded`. Replacing a controller disposes any execution immediately because the
+        /// old forwarder is cancelled; removing it keeps the forwarder draining until the old
+        /// process reports its end, so a cancellation result can still be attributed while a
+        /// disposed execution keeps rejecting late input.
+        private func syncUsageAccountingForwarding(to controller: (any NativeAgentRuntimeControlling)?) {
+            guard let controller else {
+                // Detached without a live launch (never launched, or startup failed): nothing can
+                // arrive that this session may charge, so the forwarder ends now.
+                if activeNativeLaunch == nil {
+                    let previous = usageAccountingStateSnapshot
+                    let disposedExecutionID = usageAccounting?.activeExecutionID
+                    usageAccounting?.endExecution(disposedExecutionID)
+                    cancelUsageAccountingForwarding()
+                    notifyUsageAccountingChangedIfNeeded(previousState: previous)
+                }
+                // Otherwise the forwarder keeps draining until `.launchEnded` (or the stream ends),
+                // then terminates itself because the controller is no longer attached.
                 return
             }
+            if usageAccountingForwardingControllerID == ObjectIdentifier(controller),
+               let task = usageAccountingForwardingTask, !task.isCancelled
+            {
+                // The same controller instance is re-attached while its forwarder still drains a live
+                // launch. The evidence stream is single-consumer: cancelling this forwarder would end
+                // it for good, so the forwarder, launch and execution are kept (OracleB P1#3).
+                ensureUsageAccountingOwner()
+                return
+            }
+            cancelUsageAccountingForwarding()
+            let previous = usageAccountingStateSnapshot
+            if let disposedExecutionID = usageAccounting?.activeExecutionID {
+                usageAccounting?.endExecution(disposedExecutionID)
+            }
+            activeNativeLaunch = nil
+            activeNativeRuntimeVersion = nil
+            ensureUsageAccountingOwner()
+            notifyUsageAccountingChangedIfNeeded(previousState: previous)
+            startUsageAccountingForwarding(from: controller)
+        }
+
+        private func ensureUsageAccountingOwner() {
             if let owner = activeAgentSessionID, usageAccounting?.ownerSessionID != owner {
                 replaceUsageAccounting(AgentUsageAccumulator(
                     ownerSessionID: owner,
@@ -711,22 +773,232 @@ extension AgentModeViewModel {
                     qualification: .productionClaude
                 ))
             }
-            beginUsageAccountingExecution()
         }
 
-        /// Opens a fresh execution identity on the installed accumulator.
-        ///
-        /// Segment provenance is captured from `providerSessionID` at this moment only. A fresh
-        /// controller usually has no provider session yet (the runtime reports it later through
-        /// `.runtimeInit`), so the segment's `providerSessionID` may legitimately stay `nil`; that
-        /// value is optional provenance, never an accounting input.
-        private func beginUsageAccountingExecution() {
-            usageAccounting?.beginExecution(
-                executionID: UUID(),
-                providerSessionID: providerSessionID,
-                baseline: .unknown,
+        /// Cancelling the consuming task finishes that controller's `usageAccountingEvents` stream
+        /// for good (later iterators get `nil` immediately), so this is only ever invoked where the
+        /// controller is dropped or replaced — never on a session that keeps its attached
+        /// controller and continues running turns (`cancelEphemeralRuntimeState` must not call it).
+        private func cancelUsageAccountingForwarding() {
+            usageAccountingForwardingTask?.cancel()
+            usageAccountingForwardingTask = nil
+            usageAccountingForwardingControllerID = nil
+        }
+
+        /// Explicit forwarder lifecycle: it holds only the controller's stream (never the
+        /// controller), ingests until the stream ends, and terminates early once its controller is
+        /// detached and the launch it was draining has ended. A stream that ends while a launch is
+        /// still active (controller deallocated without `shutdown`) disposes that launch.
+        private func startUsageAccountingForwarding(from controller: any NativeAgentRuntimeControlling) {
+            let controllerID = ObjectIdentifier(controller)
+            usageAccountingForwardingControllerID = controllerID
+            usageAccountingForwardingGeneration &+= 1
+            let generation = usageAccountingForwardingGeneration
+            usageAccountingForwardingTask = Task { @MainActor [weak self, weak controller] in
+                guard let stream = await controller?.usageAccountingEvents else { return }
+                for await event in stream {
+                    guard let self, !Task.isCancelled, usageAccountingForwardingGeneration == generation else { return }
+                    ingestNativeUsageAccountingEvent(event)
+                    if claudeController == nil, activeNativeLaunch == nil {
+                        break
+                    }
+                }
+                guard let self, !Task.isCancelled, usageAccountingForwardingGeneration == generation else { return }
+                if let launch = activeNativeLaunch {
+                    ingestNativeUsageAccountingEvent(.launchEnded(launchToken: launch.token))
+                }
+                usageAccountingForwardingTask = nil
+                usageAccountingForwardingControllerID = nil
+            }
+        }
+
+        #if DEBUG
+            var test_isUsageAccountingForwardingActive: Bool {
+                usageAccountingForwardingTask.map { !$0.isCancelled } ?? false
+            }
+        #endif
+
+        private struct UsageAccountingStateSnapshot: Equatable {
+            var revision: UInt64?
+            var presentationRevision: UInt64?
+            var verdict: AgentUsageExecutionVerdict?
+            var executionID: UUID?
+        }
+
+        private var usageAccountingStateSnapshot: UsageAccountingStateSnapshot? {
+            guard let usageAccounting else { return nil }
+            return .init(
+                revision: usageAccounting.ownedRevision,
+                presentationRevision: usageAccounting.presentationRevision,
+                verdict: usageAccounting.executionVerdict,
+                executionID: usageAccounting.activeExecutionID
+            )
+        }
+
+        private func notifyUsageAccountingChangedIfNeeded(previousState: UsageAccountingStateSnapshot?) {
+            let current = usageAccountingStateSnapshot
+            guard current != previousState else { return }
+            onUsageAccountingChanged?(self, current?.revision != previousState?.revision)
+        }
+
+        /// Session-owned accounting ingestion (plan §3.2). Every event carries the launch token of
+        /// the process that produced it; the accumulator rejects anything for a disposed execution.
+        /// Ownership policy (contract allowlist, queue bound, counter boundaries) is applied here, in
+        /// core, from `ClaudeNativeUsageContract`; the controller only proves correlation.
+        func ingestNativeUsageAccountingEvent(_ event: NativeUsageAccountingEvent) {
+            let previous = usageAccountingStateSnapshot
+            defer {
+                #if DEBUG
+                    test_ingestedNativeUsageEventCount += 1
+                #endif
+                notifyUsageAccountingChangedIfNeeded(previousState: previous)
+            }
+            switch event {
+            case let .launched(launch):
+                if activeNativeLaunch?.token == launch.token {
+                    // Re-delivered launch evidence (a controller resubscription replays the
+                    // current launch's evidence to its new subscriber). This session already
+                    // holds that launch: registering it again would end and reopen its execution
+                    // at a fresh baseline, so continuity is kept and nothing is re-registered.
+                    // If the accounting owner changed under the launch, the launch stays
+                    // disposed for the new owner rather than gaining a zero baseline (review R2).
+                    return
+                }
+                ensureUsageAccountingOwner()
+                activeNativeLaunch = launch
+                activeNativeRuntimeVersion = nil
+                let launchProviderSessionID: String? = if case let .resumedSession(sessionID) = launch.launchMode {
+                    sessionID
+                } else {
+                    providerSessionID
+                }
+                usageAccounting?.beginAwaitingExecution(
+                    executionID: launch.token,
+                    providerSessionID: launchProviderSessionID,
+                    at: Date()
+                )
+            case let .runtimeEvidence(launchToken, runtimeVersion, _):
+                guard let launch = activeNativeLaunch, launch.token == launchToken else { return }
+                activeNativeRuntimeVersion = runtimeVersion
+                usageAccounting?.resolveExecutionQualification(
+                    executionID: launchToken,
+                    verdict: ClaudeNativeUsageContract.verdict(for: launch, runtimeVersion: runtimeVersion),
+                    at: Date()
+                )
+            case .runtimeBinding:
+                // Provenance diagnostics only (account category, model, key source); the reported
+                // figures are not gated on them.
+                break
+            case let .dispatched(launchToken, turnID, _):
+                usageAccounting?.registerTurn(turnID, executionID: launchToken)
+            case let .counterBoundaryObserved(launchToken, kind):
+                guard activeNativeLaunch?.token == launchToken else { return }
+                if let reason = ClaudeNativeUsageContract.counterBoundaryBlock(
+                    contractID: usageAccounting?.executionVerdict?.contractID,
+                    kind: kind
+                ) {
+                    usageAccounting?.resolveExecutionQualification(
+                        executionID: launchToken,
+                        verdict: .blocked(reason),
+                        at: Date()
+                    )
+                }
+            case let .mainRequestUsageAttributed(attribution):
+                guard activeNativeLaunch?.token == attribution.launchToken else { return }
+                usageAccounting?.observeLatestClaudeRequest(
+                    observation: attribution.observation,
+                    requestID: attribution.requestID,
+                    executionID: attribution.launchToken,
+                    turnID: attribution.turnID
+                )
+            case let .resultAttributed(attribution):
+                guard activeNativeLaunch?.token == attribution.launchToken else { return }
+                if let contractID = usageAccounting?.executionVerdict?.contractID,
+                   let reason = ClaudeNativeUsageContract.queuePolicyBlock(
+                       contractID: contractID,
+                       queuedTurnCount: attribution.queuedTurnCount
+                   )
+                {
+                    usageAccounting?.resolveExecutionQualification(
+                        executionID: attribution.launchToken,
+                        verdict: .blocked(reason),
+                        at: Date()
+                    )
+                    return
+                }
+                usageAccounting?.observe(
+                    .init(
+                        observation: attribution.observation,
+                        reportedCost: AgentUsageObservationInput.exactCost(fromReported: attribution.reportedCost),
+                        executionID: attribution.launchToken,
+                        turnID: attribution.turnID,
+                        attribution: .live,
+                        hasOriginalResultAuthority: true,
+                        terminalOutcome: attribution.turnStatus == .completed ? .completed : .interrupted,
+                        childActivityObserved: attribution.childActivityObserved
+                    )
+                )
+            case let .turnClosed(launchToken, turnID, status):
+                guard activeNativeLaunch?.token == launchToken else { return }
+                usageAccounting?.closeTurn(turnID, outcome: status == .completed ? .completed : .interrupted)
+            case let .blocked(launchToken, reason):
+                let blockReason: AgentUsageExecutionBlockReason = switch reason {
+                case .runtimeVersionConflict: .runtimeVersionConflict
+                case .missingRuntimeVersion: .unsupportedRuntime(reason.description)
+                case .providerSessionIdentityChanged, .desynchronized: .attributionDesynchronized(reason.description)
+                }
+                usageAccounting?.resolveExecutionQualification(
+                    executionID: launchToken,
+                    verdict: .blocked(blockReason),
+                    at: Date()
+                )
+            case let .launchEnded(launchToken):
+                if activeNativeLaunch?.token == launchToken {
+                    activeNativeLaunch = nil
+                    activeNativeRuntimeVersion = nil
+                }
+                usageAccounting?.endExecution(launchToken)
+            }
+        }
+
+        /// Re-registers the live launch on a replaced accumulator. The verdict the previous
+        /// accumulator had already resolved for this same process is carried over: a blocked
+        /// execution stays blocked, and a qualified one continues the persisted segment for its
+        /// execution (the accumulator never reopens a zero baseline for a process it already has
+        /// a checkpoint for — OracleA P0#3 / OracleB P1#1). Without a previous verdict the launch
+        /// is resolved from its runtime evidence as usual. Still-open persisted turns of that
+        /// execution are re-registered by the accumulator; dispatches that were never persisted
+        /// are not reconstructed and their results stay rejected as unregistered.
+        private func reattachActiveNativeLaunchToUsageAccounting(previousVerdict: AgentUsageExecutionVerdict?) {
+            guard let launch = activeNativeLaunch else { return }
+            let launchProviderSessionID: String? = if case let .resumedSession(sessionID) = launch.launchMode {
+                sessionID
+            } else {
+                providerSessionID
+            }
+            usageAccounting?.beginAwaitingExecution(
+                executionID: launch.token,
+                providerSessionID: launchProviderSessionID,
                 at: Date()
             )
+            switch previousVerdict {
+            case let .blocked(reason)?:
+                usageAccounting?.resolveExecutionQualification(executionID: launch.token, verdict: .blocked(reason), at: Date())
+            case let .qualified(contractID, baseline)?:
+                usageAccounting?.resolveExecutionQualification(
+                    executionID: launch.token,
+                    verdict: .qualified(contractID: contractID, baseline: baseline),
+                    at: Date()
+                )
+            case .awaiting?, nil:
+                if let version = activeNativeRuntimeVersion {
+                    usageAccounting?.resolveExecutionQualification(
+                        executionID: launch.token,
+                        verdict: ClaudeNativeUsageContract.verdict(for: launch, runtimeVersion: version),
+                        at: Date()
+                    )
+                }
+            }
         }
 
         /// Installs the persisted `providerUsage` after hydration (plan §3.3).
@@ -735,9 +1007,11 @@ extension AgentModeViewModel {
         /// installed before hydration (a controller that arrived first) knows nothing about the
         /// persisted payload, so when it refuses the late hydration it is replaced rather than
         /// kept: the pre-hydration state can never overwrite the persisted payload on the next
-        /// save. A controller that survived (route activation keeps it while resetting
-        /// accounting) is re-registered as a fresh execution so later dispatches stay registered.
+        /// save. A live launch that survived (route activation keeps the controller while resetting
+        /// accounting) is re-registered so later dispatches stay registered.
         func installHydratedUsageAccounting(_ persisted: AgentProviderUsagePersist?, ownerSessionID: UUID) {
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
             if var accounting = usageAccounting,
                accounting.ownerSessionID == ownerSessionID,
                accounting.applyHydration(persisted, hasPriorHistory: hasSentFirstMessage)
@@ -745,15 +1019,132 @@ extension AgentModeViewModel {
                 replaceUsageAccounting(accounting)
                 return
             }
+            var previousVerdict: AgentUsageExecutionVerdict?
+            if let launch = activeNativeLaunch, usageAccounting?.activeExecutionID == launch.token {
+                previousVerdict = usageAccounting?.executionVerdict
+            }
             replaceUsageAccounting(AgentUsageAccumulator(
                 ownerSessionID: ownerSessionID,
                 persisted: persisted,
                 hasPriorHistory: hasSentFirstMessage,
                 qualification: .productionClaude
             ))
-            if claudeController != nil {
-                beginUsageAccountingExecution()
-            }
+            reattachActiveNativeLaunchToUsageAccounting(previousVerdict: previousVerdict)
+        }
+
+        // MARK: Codex usage accounting (plan §4.1)
+
+        /// Pricing seam held by Codex dispatch; tests inject a transient store. Never waits.
+        var codexPricingProvider: any OpenAIPricingProviding = OpenAIPricingStore.shared
+
+        /// Registers the current controller generation as the Codex accounting execution. A thread
+        /// that this generation will create fresh has a verified zero baseline; a resumed thread
+        /// inherits unknown usage (prospective baseline). Idempotent for the same generation.
+        func beginCodexUsageExecutionIfNeeded() {
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            ensureUsageAccountingOwner()
+            usageAccounting?.beginCodexExecution(
+                executionID: codexControllerGeneration,
+                threadOrigin: codexConversationID == nil ? .fresh : .resumed
+            )
+        }
+
+        /// Registers the turn about to be dispatched (pricing snapshot frozen when available; the
+        /// dispatch is tracked either way) and lets the store schedule at most one bounded
+        /// background refresh (never awaited). Registration precedes the provider send because
+        /// `turn/started` can be observed before the send returns. The typed receipt or lifecycle
+        /// start records acceptance independently of turn identity; only a proven rejection of an
+        /// unaccepted exact ticket withdraws it, while delivery-unknown work stays covered.
+        @discardableResult
+        func registerCodexUsageDispatch(requestedModel: String?) -> CodexDispatchTicket? {
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            ensureUsageAccountingOwner()
+            usageAccounting?.beginCodexExecution(
+                executionID: codexControllerGeneration,
+                threadOrigin: codexConversationID == nil ? .fresh : .resumed
+            )
+            codexPricingProvider.noteCodexDispatch()
+            return usageAccounting?.registerCodexDispatch(
+                executionID: codexControllerGeneration,
+                requestedModelID: requestedModel ?? codexModel,
+                pricing: codexPricingProvider.currentSnapshot()
+            )
+        }
+
+        /// Records provider acceptance from the typed start receipt. Exact-ticket matching
+        /// prevents a delayed receipt from accepting a successor dispatch.
+        func acceptCodexUsageDispatch(_ ticket: CodexDispatchTicket?) {
+            guard let ticket else { return }
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            usageAccounting?.acceptCodexDispatch(ticket)
+        }
+
+        /// Records provider acceptance from `turn/started` before its optional identity is
+        /// inspected. This keeps anonymous starts covered by later completion or teardown.
+        func acceptCurrentCodexUsageDispatch() {
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            usageAccounting?.acceptCurrentCodexDispatch(executionID: codexControllerGeneration)
+        }
+
+        /// The caller proved that the exact unaccepted dispatch was not submitted or was
+        /// definitively rejected: withdraw it without an unmeasured marker. Accepted, bound, stale
+        /// and cross-execution tickets are no-ops. Delivery-unknown errors must not call this method.
+        func withdrawCodexUsageDispatch(_ ticket: CodexDispatchTicket?) {
+            guard let ticket else { return }
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            usageAccounting?.withdrawCodexDispatch(ticket)
+        }
+
+        func bindCodexUsageTurn(_ turnID: String?) {
+            guard let turnID = turnID?.trimmingCharacters(in: .whitespacesAndNewlines), !turnID.isEmpty else { return }
+            usageAccounting?.bindCodexTurn(executionID: codexControllerGeneration, turnID: turnID)
+        }
+
+        func ingestCodexUsageObservation(_ observation: CodexUsageObservation) {
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            usageAccounting?.observeCodexUsage(observation, executionID: codexControllerGeneration, at: Date())
+        }
+
+        func noteCodexModelReroute(_ reroute: CodexModelReroute) {
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            usageAccounting?.noteCodexReroute(executionID: codexControllerGeneration, reroute: reroute)
+        }
+
+        /// The provider reported a turn terminal. Dispatched work that never produced a usage
+        /// observation is recorded as unmeasured rather than silently counted as zero. Callers
+        /// pass the provider's turn identity or, for a nil-ID completion, the identity the
+        /// coordinator's completion correlation established; without either, use
+        /// `closeUnidentifiedCodexUsageTurn`.
+        func closeCodexUsageTurn(_ turnID: String?) {
+            guard let turnID = turnID?.trimmingCharacters(in: .whitespacesAndNewlines), !turnID.isEmpty else { return }
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            usageAccounting?.closeCodexTurn(executionID: codexControllerGeneration, turnID: turnID)
+        }
+
+        /// A turn completion arrived without a turn identity and could not be correlated to a
+        /// known turn: outstanding dispatched work on this generation is recorded as unmeasured
+        /// (a provably owned late observation still upserts a bound turn's marker).
+        func closeUnidentifiedCodexUsageTurn() {
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            usageAccounting?.closeUnidentifiedCodexTurn(executionID: codexControllerGeneration)
+        }
+
+        /// The current controller generation is ending (cancel, failure, shutdown, replacement).
+        /// Must run before `codexController` is reassigned, which rotates the generation.
+        func endCodexUsageExecution(reason: String) {
+            let previous = usageAccountingStateSnapshot
+            defer { notifyUsageAccountingChangedIfNeeded(previousState: previous) }
+            _ = reason
+            usageAccounting?.endCodexExecution(executionID: codexControllerGeneration)
         }
 
         var acpController: ACPAgentSessionController?
@@ -843,6 +1234,8 @@ extension AgentModeViewModel {
 
         deinit {
             applyEditsApprovalSubscriptionTask?.cancel()
+            // Session disposal terminates the forwarder; a disposed session cannot own accounting.
+            usageAccountingForwardingTask?.cancel()
         }
 
         /// Cancels all ephemeral runtime tasks and clears transient state on this
@@ -877,6 +1270,11 @@ extension AgentModeViewModel {
             applyEditsApprovalSubscriptionTask?.cancel()
             applyEditsApprovalSubscriptionTask = nil
             applyEditsApprovalSubscriptionID = nil
+            // The usage-accounting forwarder is deliberately not touched here: this method keeps
+            // `claudeController` attached, and cancelling the forwarder would finish that
+            // controller's evidence stream irreversibly (every later launch/dispatch/result would be
+            // dropped silently). Teardown paths end it by dropping the controller (coordinator
+            // shutdown → detach → `claudeController = nil`), by stream end, or by session `deinit`.
         }
 
         @discardableResult

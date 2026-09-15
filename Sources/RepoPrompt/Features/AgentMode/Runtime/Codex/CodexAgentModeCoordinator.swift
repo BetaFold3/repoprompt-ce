@@ -207,6 +207,37 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    private enum CodexTurnStartFailureDisposition {
+        case provenNotSubmitted
+        case deliveryUnknown
+    }
+
+    /// Only the controller's local preflight error proves `turn/start` never reached its transport.
+    /// `requestFailed` is not definitive: the client uses it for both JSON-RPC error envelopes and
+    /// locally synthesized timeouts, and neither proves that provider work did not start.
+    private nonisolated static func codexTurnStartFailureDisposition(
+        _ error: Error
+    ) -> CodexTurnStartFailureDisposition {
+        if error is CodexTurnStartPreflightError {
+            return .provenNotSubmitted
+        }
+        return .deliveryUnknown
+    }
+
+    private func settleCodexUsageDispatchAfterStartFailure(
+        _ ticket: CodexDispatchTicket?,
+        error: Error,
+        session: AgentModeViewModel.TabSession
+    ) {
+        guard let ticket else { return }
+        switch Self.codexTurnStartFailureDisposition(error) {
+        case .provenNotSubmitted:
+            session.withdrawCodexUsageDispatch(ticket)
+        case .deliveryUnknown:
+            logCodex("[AgentModeVM][CodexUsage] retaining dispatch ticket after delivery-unknown turn/start failure")
+        }
+    }
+
     func isCodexCompactionInFlight(session: AgentModeViewModel.TabSession) -> Bool {
         session.codexPendingTurnKind == .compact
             || session.codexAuthoritativeActiveTurn?.turnKind == .compact
@@ -2408,6 +2439,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             return
         }
+        let usageDispatchTicket = session.registerCodexUsageDispatch(requestedModel: head.model)
         do {
             _ = try await controller.startUserTurn(
                 text: head.providerText,
@@ -2416,6 +2448,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 reasoningEffort: head.reasoningEffort,
                 serviceTier: head.serviceTier
             )
+            session.acceptCodexUsageDispatch(usageDispatchTicket)
             guard var inFlight = session.codexFallbackDispatchInFlight,
                   inFlight.id == head.id,
                   session.codexController.map(ObjectIdentifier.init) == head.originControllerInstanceID
@@ -2440,6 +2473,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 )
             }
         } catch {
+            settleCodexUsageDispatchAfterStartFailure(
+                usageDispatchTicket,
+                error: error,
+                session: session
+            )
             await failCodexFallbackDispatch(
                 session: session,
                 entry: head,
@@ -2872,6 +2910,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             cancelCodexTransportClosedFallback(for: session.tabID)
             stopBashLivenessTask(for: session.tabID)
             stopCodexStallWatchdog(for: session.tabID)
+            session.endCodexUsageExecution(reason: "agent-switched")
             if let controller = session.codexController {
                 Task { await controller.shutdown() }
             }
@@ -3639,10 +3678,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return true
         }
 
+        guard replayTurn.expectedTurnID == nil else {
+            return false
+        }
+        let usageDispatchTicket = session.registerCodexUsageDispatch(requestedModel: replayTurn.model)
         do {
-            guard replayTurn.expectedTurnID == nil else {
-                return false
-            }
             _ = try await controller.startUserTurn(
                 text: replayTurn.text,
                 images: replayTurn.images,
@@ -3650,6 +3690,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 reasoningEffort: replayTurn.reasoningEffort,
                 serviceTier: replayTurn.serviceTier
             )
+            session.acceptCodexUsageDispatch(usageDispatchTicket)
             await applySuccessfulCodexNativeSend(
                 for: session,
                 runID: runID,
@@ -3659,6 +3700,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
             return true
         } catch {
+            settleCodexUsageDispatchAfterStartFailure(
+                usageDispatchTicket,
+                error: error,
+                session: session
+            )
             _ = markCodexReconnectNeeded(for: session, source: "managed-auth-recovery-replay-failed")
             await finalizeCodexRun(
                 session,
@@ -3742,6 +3788,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session: session,
             reason: "Codex queued follow-up was cancelled because the controller was replaced."
         )
+        session.endCodexUsageExecution(reason: "controller-replaced")
         session.codexController = nil
         session.codexControllerPermissionProfile = nil
         session.codexControllerSessionProfile = nil
@@ -3995,6 +4042,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session.codexControllerFeatureState = desiredFeatureState
             }
             guard let controller = session.codexController else { return nil }
+            session.beginCodexUsageExecutionIfNeeded()
             controller.ensureEventsStreamReady()
             if session.codexEventTask == nil || session.codexEventTaskRunID != runID {
                 session.codexEventTask?.cancel()
@@ -4555,12 +4603,16 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
 
+        // Only `turn/start` dispatches register accounting work; `turn/steer` joins the already
+        // dispatched turn and never produces a second `turn/started`, so it registers nothing.
+        var usageDispatchTicket: CodexDispatchTicket?
         do {
             setRunningStatus("Sending message…", source: .transport, session: session, urgent: true)
             switch dispatchPlan {
             case .start:
                 beginTrackedCodexUserTurn(session)
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.startUserTurn")
+                usageDispatchTicket = session.registerCodexUsageDispatch(requestedModel: selection.model)
                 _ = try await controller.startUserTurn(
                     text: text,
                     images: attachments,
@@ -4568,6 +4620,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
                 )
+                session.acceptCodexUsageDispatch(usageDispatchTicket)
             case let .steer(identity):
                 logCodex("[AgentModeVM] sendCodexNativeMessage: calling controller.steerUserTurn expectedTurnID=\(identity.turnID)")
                 do {
@@ -4697,6 +4750,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
             return .sent
         } catch let steerError as CodexTurnSteerError {
+            session.withdrawCodexUsageDispatch(usageDispatchTicket)
             session.codexPendingTurnKind = nil
             guard session.runID == sendRunID,
                   let activeController = session.codexController,
@@ -4728,6 +4782,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 controller: controller
             )
         } catch {
+            // Only a proven local preflight failure can clear an unaccepted exact ticket.
+            // JSON-RPC request failures, cancellation, lost receipts and other uncertain outcomes
+            // remain covered until a lifecycle completion or execution teardown proves their state.
+            settleCodexUsageDispatchAfterStartFailure(
+                usageDispatchTicket,
+                error: error,
+                session: session
+            )
             session.codexPendingTurnKind = nil
             guard session.runID == sendRunID,
                   let activeController = session.codexController,
@@ -6087,6 +6149,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             sealAssistantBoundary(session)
             reconcileReasoningCompletion(payload, session: session)
             return
+        case let .usageObservation(observation):
+            // Accounting eligibility is independent of the active-run context guard (plan §4.1):
+            // ownership is the controller generation, so provably owned late usage still lands.
+            session.ingestCodexUsageObservation(observation)
+        case let .modelRerouted(reroute):
+            session.noteCodexModelReroute(reroute)
         case let .tokenUsage(usage):
             guard session.runState.isActive else { return }
             viewModel?.applyCodexNativeContextUsage(usage, session: session)
@@ -6385,6 +6453,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
             enqueueCommandExecutionRunningUpdate(runningUpdate, session: session)
         case let .turnStarted(turnID):
+            // Acceptance is lifecycle evidence independent of the optional turn identity.
+            // Record it first so a nil-ID start still protects the pending exact dispatch ticket.
+            session.acceptCurrentCodexUsageDispatch()
+            session.bindCodexUsageTurn(turnID)
             await completePendingCodexTerminalSettleIfPresent(
                 session: session,
                 trigger: "turn-started"
@@ -6407,10 +6479,30 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         case let .turnCompleted(turnID, status, failure):
-            guard let completion = correlatedCodexTurnKindForCompletion(
+            // Accounting closure is independent of run-state correlation (plan §4.1): a bound turn
+            // that ends without any usage observation is unmeasured work, never measured zero. A
+            // nil-ID completion legitimately terminates the identified turn the correlation
+            // validates, so that known accounting turn is closed; a nil-ID completion correlated
+            // only to an anonymous turn (its `turn/started` carried no identity) ends dispatched
+            // work whose identity can never be established, so outstanding work is marked
+            // unmeasured now instead of at some later execution teardown. A completion the
+            // correlation rejects is not this session's turn and leaves accounting untouched;
+            // its outstanding work is still marked at its own closure or execution end
+            // (review R2, OracleA P1#2).
+            let completion = correlatedCodexTurnKindForCompletion(
                 turnID: turnID,
                 session: session
-            ) else {
+            )
+            if let turnID {
+                session.closeCodexUsageTurn(turnID)
+            } else if let completion {
+                if let identifiedTurnID = completion.authoritativeIdentity?.turnID {
+                    session.closeCodexUsageTurn(identifiedTurnID)
+                } else {
+                    session.closeUnidentifiedCodexUsageTurn()
+                }
+            }
+            guard let completion else {
                 return
             }
             let failureMessage = status == .failed
@@ -8062,6 +8154,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             case .reasoningDelta: "reasoningDelta"
             case .reasoningCompleted: "reasoningCompleted"
             case .tokenUsage: "tokenUsage"
+            case .usageObservation: "usageObservation"
+            case .modelRerouted: "modelRerouted"
             case .approvalRequest: "approvalRequest"
             case .permissionsRequest: "permissionsRequest"
             case .requestUserInput: "requestUserInput"
@@ -8095,6 +8189,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             "reasoningCompleted summary=\(payload.summary.count) content=\(payload.content.count) turnID=\(payload.scope.turnID) itemID=\(payload.scope.itemID)"
         case let .tokenUsage(usage):
             "tokenUsage modelContextWindow=\(usage.modelContextWindow.map(String.init(describing:)) ?? "nil") lastTotalTokens=\(usage.lastTotalTokens.map(String.init(describing:)) ?? "nil") totalTotalTokens=\(usage.totalTotalTokens.map(String.init(describing:)) ?? "nil")"
+        case let .usageObservation(observation):
+            "usageObservation ordinal=\(observation.ordinal) turnID=\(observation.turnID ?? "nil") attribution=\(observation.turnAttribution.rawValue)"
+        case let .modelRerouted(reroute):
+            "modelRerouted turnID=\(reroute.turnID ?? "nil") from=\(reroute.fromModel) to=\(reroute.toModel)"
         case let .approvalRequest(request):
             "approvalRequest kind=\(request.kind)"
         case .permissionsRequest:
@@ -8624,6 +8722,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         clearCodexPendingInteractions(in: session)
         cancelCodexTransportClosedFallback(for: session.tabID)
         stopBashLivenessTask(for: session.tabID)
+        session.endCodexUsageExecution(reason: "controller-reset")
         if let controller = session.codexController {
             Task { await controller.shutdown() }
         }
@@ -8708,6 +8807,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         cancelCodexTransportClosedFallback(for: session.tabID)
         stopCodexStallWatchdog(for: session.tabID)
         stopBashLivenessTask(for: session.tabID)
+        session.endCodexUsageExecution(reason: "user-cancel-detached")
         session.codexController = nil
         session.codexControllerPermissionProfile = nil
         session.codexControllerSessionProfile = nil
@@ -8789,6 +8889,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         resetTrackedCodexTurns(session)
         session.pendingCodexComputerUseActivation = nil
+        session.endCodexUsageExecution(reason: "session-shutdown")
         if let controller = session.codexController {
             await controller.shutdown()
         }

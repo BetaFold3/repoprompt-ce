@@ -79,7 +79,9 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
                 requestID: "req-\(pluginSource.rawValue)",
                 parentToolUseID: "toolu_parent",
                 resultSubtype: "success",
-                resultIsError: false
+                resultIsError: false,
+                resultIndex: 0,
+                queuedTurnCount: 0
             )
             let provider = ClaudeCompatiblePluginStreamResult(
                 type: "message_stop",
@@ -140,9 +142,14 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
                     requestID: "req-\(pluginSource.rawValue)",
                     parentToolUseID: "toolu_parent",
                     resultSubtype: "success",
-                    resultIsError: false
+                    resultIsError: false,
+                    resultIndex: 0,
+                    queuedTurnCount: 0
                 )
             )
+            // Zero-valued ownership evidence survives as zero, never as missing.
+            XCTAssertEqual(core.usageObservation?.resultIndex, 0)
+            XCTAssertEqual(core.usageObservation?.queuedTurnCount, 0)
 
             let roundTripped = ClaudeCompatiblePluginBridge.providerStreamResult(from: core)
             XCTAssertEqual(roundTripped, provider, "reverse bridge must reproduce the provider DTO for source \(pluginSource.rawValue)")

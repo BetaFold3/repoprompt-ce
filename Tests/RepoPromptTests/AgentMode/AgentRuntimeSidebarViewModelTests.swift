@@ -880,38 +880,59 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
 
     func testProviderUsagePresentationFormatsCompletePartialUnknownZeroAndTinyValues() {
         typealias Usage = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+        let execution = UUID()
+
+        func latest(_ ratio: Decimal) -> AgentUsageLatestRequestCacheHit {
+            .init(
+                source: .claudeAssistant,
+                executionID: execution,
+                turnID: UUID().uuidString,
+                requestID: UUID().uuidString,
+                share: .init(ratio: ratio, coverage: .complete),
+                detail: "Complete: request counters are present."
+            )
+        }
 
         let complete = Usage(
             scope: .claude,
             trackingStartedAt: Date(timeIntervalSince1970: 1_789_344_000),
-            cacheHitShare: .init(ratio: decimal("0.991"), coverage: .complete),
-            costEstimate: .init(amount: decimal("2.171"), currency: "USD", coverage: .complete)
+            latestRequestCacheHit: latest(decimal("0.991")),
+            cacheHitShare: .init(ratio: decimal("0.5"), coverage: .complete),
+            costEstimate: .init(amount: decimal("2.171"), currency: "USD", coverage: .complete),
+            sessionCacheCoverageDetail: "Complete: every finalized turn supplied cache counters.",
+            sessionCostCoverageDetail: "Complete: every contributing cost segment is measured."
         ).presentation
-        XCTAssertEqual(complete.title, "Claude session usage")
+        XCTAssertEqual(complete.title, "Claude latest request CH · session cost")
         XCTAssertEqual(complete.readoutText, "CH 99.1% · Est. $2.171")
-        XCTAssertTrue(complete.detailText.contains("Cache hit (CH) share"))
-        XCTAssertTrue(complete.detailText.contains("main-loop input triples"))
-        XCTAssertTrue(complete.detailText.contains("Tracking interval starts"))
+        XCTAssertTrue(complete.detailText.contains("Latest-request CH: 99.1%"))
+        XCTAssertTrue(complete.detailText.contains("Session-average CH: 50.0%"))
+        XCTAssertTrue(complete.detailText.contains("Tracking period: since"))
         XCTAssertTrue(complete.detailText.contains("complete coverage"))
-        XCTAssertTrue(complete.detailText.contains("includes native Claude subagents"))
-        XCTAssertTrue(complete.detailText.contains("excludes separate RepoPrompt CE worker sessions"))
+        XCTAssertTrue(complete.detailText.contains("including helper-model and native Claude child usage"))
+        XCTAssertTrue(complete.detailText.contains("separate RepoPrompt CE worker sessions are excluded"))
+        XCTAssertNotNil(complete.expandedDetailText)
         for forbidden in ["invoice", "subscription", "grand total", "≥"] {
             XCTAssertFalse(complete.detailText.localizedCaseInsensitiveContains(forbidden))
         }
 
         let partial = Usage(
             scope: .claude,
-            cacheHitShare: .init(ratio: decimal("0.09"), coverage: .partial),
-            costEstimate: .init(amount: decimal("1.25"), currency: "USD", coverage: .partial)
+            latestRequestCacheHit: latest(decimal("0.09")),
+            cacheHitShare: .init(ratio: decimal("0.75"), coverage: .partial),
+            costEstimate: .init(amount: decimal("1.25"), currency: "USD", coverage: .partial),
+            sessionCacheCoverageDetail: "Partial: one finalized turn omitted cache-read counters.",
+            sessionCostCoverageDetail: "Partial: cost segment 2 has no accepted checkpoint."
         ).presentation
-        XCTAssertEqual(partial.readoutText, "CH 9.0% partial · Est. $1.250 partial")
-        XCTAssertTrue(partial.detailText.contains("partial coverage"))
+        XCTAssertEqual(partial.readoutText, "CH 9.0% · Est. $1.250 partial")
+        XCTAssertTrue(partial.detailText.contains("Session-average CH: 75.0% (partial coverage)"))
+        XCTAssertTrue(partial.detailText.contains("cost segment 2 has no accepted checkpoint"))
 
         XCTAssertEqual(Usage(scope: .claude).presentation.readoutText, "CH — · Est. —")
         XCTAssertEqual(
             Usage(
                 scope: .claude,
-                cacheHitShare: .init(ratio: 0, coverage: .complete),
+                latestRequestCacheHit: latest(0),
+                cacheHitShare: .init(ratio: decimal("0.5"), coverage: .complete),
                 costEstimate: .init(amount: 0, currency: "USD", coverage: .complete)
             ).presentation.readoutText,
             "CH 0.0% · Est. $0.000"
@@ -919,16 +940,18 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(
             Usage(
                 scope: .claude,
-                cacheHitShare: .init(ratio: decimal("0.00001"), coverage: .complete),
+                latestRequestCacheHit: latest(decimal("0.00001")),
+                cacheHitShare: .init(ratio: decimal("0.5"), coverage: .complete),
                 costEstimate: .init(amount: decimal("0.00001"), currency: "USD", coverage: .complete)
             ).presentation.readoutText,
             "CH <0.1% · Est. $0.00001"
         )
 
         let codex = Usage.unavailable(for: .codexExec).presentation
-        XCTAssertEqual(codex.title, "Codex session usage")
+        XCTAssertEqual(codex.title, "Codex latest request CH · session cost")
         XCTAssertEqual(codex.readoutText, "CH — · Est. —")
-        XCTAssertTrue(codex.detailText.contains("not available in this build"))
+        XCTAssertTrue(codex.detailText.contains("No usage has been recorded"))
+        XCTAssertTrue(codex.detailText.contains("not billed spend"))
     }
 
     func testProviderUsageProjectionAllowsOnlyOwnedLosslessHydratedClaudeRecords() throws {
@@ -949,7 +972,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             hasPriorHistory: true,
             qualification: .productionClaude
         )
-        XCTAssertEqual(owned.qualification, .unqualified)
+        XCTAssertEqual(owned.qualification, .executionVerified)
         let ownedProjection = Usage.projected(
             selectedAgent: .claudeCode,
             accounting: owned,
@@ -958,15 +981,19 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(ownedProjection.scope, .claude)
         XCTAssertEqual(ownedProjection.trackingStartedAt, trackingStartedAt)
         XCTAssertEqual(ownedProjection.cacheHitShare?.ratio, decimal("0.9"))
-        XCTAssertEqual(ownedProjection.cacheHitShare?.coverage, .partial)
+        XCTAssertEqual(ownedProjection.cacheHitShare?.coverage, .complete)
         XCTAssertEqual(ownedProjection.costEstimate?.amount, decimal("2.171"))
-        XCTAssertEqual(ownedProjection.costEstimate?.coverage, .partial)
+        XCTAssertEqual(ownedProjection.costEstimate?.coverage, .complete)
         XCTAssertEqual(ownedProjection.accountingRevision, 0)
+        XCTAssertNil(ownedProjection.latestRequestCacheHit, "restored result aggregates never claim a latest request")
         XCTAssertEqual(
             ownedProjection.presentation.readoutText,
-            "CH 90.0% partial · Est. $2.171 partial"
+            "CH — · Est. $2.171"
         )
-        XCTAssertTrue(ownedProjection.presentation.detailText.contains("restored historical accounting"))
+        XCTAssertTrue(ownedProjection.presentation.detailText.contains("Session-average CH: 90.0%"))
+        XCTAssertTrue(ownedProjection.presentation.detailText.contains("not restored from turn/result aggregates"))
+        XCTAssertNil(ownedProjection.coverageDetail)
+        XCTAssertFalse(ownedProjection.presentation.detailText.contains("restored historical accounting"))
 
         let encodedRecord = try JSONEncoder().encode(record)
         let raw = try AgentProviderUsageRawValue(validating: encodedRecord)
@@ -1025,11 +1052,14 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             accounting: continued,
             expectedOwnerSessionID: owner
         )
-        XCTAssertEqual(continued.qualification, .unqualified)
+        XCTAssertEqual(continued.qualification, .executionVerified)
         XCTAssertEqual(continued.ownedRevision, 0)
-        XCTAssertEqual(continuedProjection.cacheHitShare?.coverage, .partial)
-        XCTAssertEqual(continuedProjection.costEstimate?.coverage, .partial)
-        XCTAssertTrue(continuedProjection.presentation.detailText.contains("current continuation is unmeasured"))
+        XCTAssertEqual(continued.executionVerdict, .awaiting)
+        // Nothing was dispatched on the awaiting execution, so restored coverage stays complete
+        // while the detail explains that the continuation is not counting yet.
+        XCTAssertEqual(continuedProjection.cacheHitShare?.coverage, .complete)
+        XCTAssertEqual(continuedProjection.costEstimate?.coverage, .complete)
+        XCTAssertTrue(continuedProjection.presentation.detailText.contains("not counting yet: the runtime has not reported its version yet"))
         XCTAssertEqual(continued.persistedRepresentation, .opaque(raw))
 
         let unsupportedOpaque = AgentUsageAccumulator(
@@ -1066,8 +1096,132 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             expectedOwnerSessionID: owner
         )
         XCTAssertEqual(codex.scope, .codex)
+        XCTAssertNil(codex.trackingStartedAt, "a Claude-only record must not lend its tracking start to Codex")
         XCTAssertNil(codex.cacheHitShare)
         XCTAssertNil(codex.costEstimate)
+    }
+
+    func testProviderUsageUnavailableExplanationsDistinguishGatedOwnershipAndUnsupportedStates() throws {
+        typealias Usage = AgentRuntimeSidebarViewModel.ProviderUsageSnapshot
+        let owner = UUID()
+        let noUsage = Usage.claudeNoUsageRecordedReason
+        let dash = "CH — · Est. —"
+
+        // No owner at all (no session / no accumulator): explicit explanation, never a silent dash.
+        let noOwner = Usage.unavailable(for: .claudeCode)
+        XCTAssertEqual(noOwner.unavailableReason, noUsage)
+        XCTAssertEqual(noOwner.presentation.readoutText, dash)
+        XCTAssertTrue(noOwner.presentation.detailText.contains("No usage has been recorded"))
+        XCTAssertTrue(noOwner.presentation.detailText.hasSuffix(noUsage))
+        XCTAssertNil(noOwner.presentation.noteText)
+        XCTAssertTrue(noOwner.presentation.expandedDetailText?.contains(noUsage) == true)
+        XCTAssertEqual(
+            Usage.projected(selectedAgent: .claudeCode, accounting: nil, expectedOwnerSessionID: owner)
+                .unavailableReason,
+            noUsage
+        )
+
+        // Live production continuation with no restored record and no runtime evidence yet: the
+        // readout must say why rather than imply measured zero.
+        var live = AgentUsageAccumulator(
+            ownerSessionID: owner,
+            persisted: nil,
+            hasPriorHistory: false,
+            qualification: .productionClaude
+        )
+        live.beginExecution(executionID: UUID(), providerSessionID: nil, baseline: .unknown, at: Date())
+        XCTAssertNil(live.record)
+        let awaiting = "No live figures: the runtime has not reported its version yet. This session's turns are not counted."
+        let liveProjection = Usage.projected(selectedAgent: .claudeCode, accounting: live, expectedOwnerSessionID: owner)
+        XCTAssertEqual(liveProjection.unavailableReason, awaiting)
+        XCTAssertEqual(liveProjection.presentation.readoutText, dash)
+        XCTAssertNil(liveProjection.presentation.noteText)
+        XCTAssertTrue(liveProjection.presentation.expandedDetailText?.contains(awaiting) == true)
+        // A lifecycle-only policy names itself too.
+        var inert = AgentUsageAccumulator(ownerSessionID: owner, persisted: nil, hasPriorHistory: false, qualification: .unqualified)
+        inert.beginExecution(executionID: UUID(), providerSessionID: nil, baseline: .unknown, at: Date())
+        XCTAssertEqual(
+            Usage.projected(selectedAgent: .claudeCode, accounting: inert, expectedOwnerSessionID: owner).unavailableReason,
+            Usage.claudeLiveAccountingGatedReason
+        )
+        for forbidden in ["invoice", "subscription", "grand total", "≥", "$0"] {
+            XCTAssertFalse(liveProjection.presentation.detailText.localizedCaseInsensitiveContains(forbidden), forbidden)
+        }
+
+        // Ownership and unsupported-value failures name their own cause, not the gate.
+        let record = makeProviderUsageRecord(
+            owner: owner,
+            trackingStartedAt: Date(timeIntervalSince1970: 1_789_344_000),
+            cacheReadInputTokens: 90,
+            uncachedInputTokens: 10,
+            amount: decimal("2.171")
+        )
+        let foreign = AgentUsageAccumulator(
+            ownerSessionID: UUID(),
+            persisted: .record(record),
+            hasPriorHistory: true,
+            qualification: .productionClaude
+        )
+        let foreignReason = try XCTUnwrap(
+            Usage.projected(selectedAgent: .claudeCode, accounting: foreign, expectedOwnerSessionID: foreign.ownerSessionID)
+                .unavailableReason
+        )
+        XCTAssertTrue(foreignReason.contains("different session"))
+        XCTAssertFalse(foreignReason.contains("not yet qualified"))
+
+        let mismatchedOwner = try XCTUnwrap(
+            Usage.projected(selectedAgent: .claudeCode, accounting: foreign, expectedOwnerSessionID: owner)
+                .unavailableReason
+        )
+        XCTAssertTrue(mismatchedOwner.contains("belongs to a different session"))
+
+        let unsupported = AgentUsageAccumulator(
+            ownerSessionID: owner,
+            persisted: .opaque(.null),
+            hasPriorHistory: true,
+            qualification: .productionClaude
+        )
+        let unsupportedReason = try XCTUnwrap(
+            Usage.projected(selectedAgent: .claudeCode, accounting: unsupported, expectedOwnerSessionID: owner)
+                .unavailableReason
+        )
+        XCTAssertTrue(unsupportedReason.contains("not supported by this build"))
+        XCTAssertTrue(unsupportedReason.contains("preserved unchanged"))
+
+        // Displayed restored figures with complete coverage carry neither a reason nor a note.
+        let owned = AgentUsageAccumulator(
+            ownerSessionID: owner,
+            persisted: .record(record),
+            hasPriorHistory: true,
+            qualification: .productionClaude
+        )
+        let ownedProjection = Usage.projected(selectedAgent: .claudeCode, accounting: owned, expectedOwnerSessionID: owner)
+        XCTAssertNil(ownedProjection.unavailableReason)
+        XCTAssertEqual(ownedProjection.presentation.readoutText, "CH — · Est. $2.171")
+        XCTAssertFalse(ownedProjection.presentation.detailText.contains("No live figures"))
+        XCTAssertNil(ownedProjection.coverageDetail)
+        XCTAssertNil(ownedProjection.presentation.noteText)
+        XCTAssertNil(
+            Usage(
+                scope: .claude,
+                cacheHitShare: .init(ratio: decimal("0.991"), coverage: .complete),
+                costEstimate: .init(amount: decimal("2.171"), currency: "USD", coverage: .complete)
+            ).presentation.noteText
+        )
+
+        // Codex explains an empty readout; unsupported scopes keep their own wording and never
+        // receive a Claude reason.
+        XCTAssertEqual(Usage.unavailable(for: .codexExec).unavailableReason, noUsage)
+        XCTAssertNil(Usage.unavailable(for: .cursor).unavailableReason)
+        XCTAssertEqual(
+            Usage.projected(selectedAgent: .codexExec, accounting: owned, expectedOwnerSessionID: owner).unavailableReason,
+            noUsage,
+            "a Claude-only record has no Codex intervals to show"
+        )
+        XCTAssertFalse(Usage.unavailable(for: .cursor).presentation.detailText.contains("G1"))
+        XCTAssertNil(Usage.unavailable(for: .codexExec).presentation.noteText)
+        XCTAssertTrue(Usage.unavailable(for: .codexExec).presentation.expandedDetailText?.contains(noUsage) == true)
+        XCTAssertEqual(Usage.unavailable(for: .cursor).presentation.noteText, "Usage accounting is unavailable for \(AgentProviderKind.cursor.displayName).")
     }
 
     func testScopedRuntimeRefreshPublishesUsageMutationsAndHydrationWithoutContextRegression() throws {
@@ -1106,6 +1260,30 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         let baselineProjectionComputations = session.test_providerUsageProjectionComputationCount
         let firstTurn = UUID()
         XCTAssertEqual(session.usageAccounting?.registerTurn(firstTurn, executionID: execution), .accepted)
+        XCTAssertEqual(
+            session.usageAccounting?.observeLatestClaudeRequest(
+                observation: .init(
+                    source: .assistant,
+                    inputTokens: 10,
+                    outputTokens: 5,
+                    cacheReadInputTokens: 90,
+                    cacheCreationInputTokens: 0,
+                    requestID: "request-1"
+                ),
+                requestID: "request-1",
+                executionID: execution,
+                turnID: firstTurn
+            ),
+            .accepted
+        )
+        XCTAssertNil(
+            AgentRuntimeSidebarViewModel.ProviderUsageSnapshot.projected(
+                selectedAgent: .codexExec,
+                accounting: session.usageAccounting,
+                expectedOwnerSessionID: owner
+            ).latestRequestCacheHit,
+            "switching provider scope cannot expose Claude's request value as Codex"
+        )
         let firstResult = AgentUsageObservationInput(
             observation: .init(
                 source: .result,
@@ -1134,6 +1312,10 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
             "CH 90.0% · Est. $2.171"
+        )
+        XCTAssertTrue(
+            vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.expandedDetailText?
+                .contains("Session-average CH: 90.0%") == true
         )
         assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
 
@@ -1176,7 +1358,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
         XCTAssertEqual(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
-            "CH 9.0% partial · Est. $2.171 partial"
+            "CH — · Est. $2.171 partial"
         )
         assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
 
@@ -1197,9 +1379,10 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             session.test_providerUsageProjectionComputationCount,
             baselineProjectionComputations + 3
         )
+        // A hydrated complete record with no live execution is complete under the production policy.
         XCTAssertEqual(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
-            "CH 50.0% partial · Est. $3.000 partial"
+            "CH — · Est. $3.000"
         )
         assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
 
@@ -1231,7 +1414,7 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
         XCTAssertEqual(
             vm.ui.runtimeMetrics.runtimeVM.snapshot.providerUsage.presentation.readoutText,
-            "CH 25.0% partial · Est. $4.000 partial"
+            "CH — · Est. $4.000"
         )
         assertContextOccupancyUnchanged(from: baselineContext, to: vm.ui.runtimeMetrics.runtimeVM.snapshot)
 

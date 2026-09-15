@@ -12,6 +12,10 @@ protocol NativeAgentRuntimeControlling: Actor {
     var hasTurnInFlight: Bool { get async }
     var events: AsyncStream<NativeAgentRuntimeEvent> { get async }
     var requiresReplacementAfterTerminalStartupFailure: Bool { get async }
+    /// Dedicated, ordered usage-accounting evidence stream (launch, dispatch, attributed results,
+    /// blockage, launch end). Independent of transcript delivery and of run-attempt consumers.
+    /// Runtimes without accounting evidence return an already-finished stream.
+    var usageAccountingEvents: AsyncStream<NativeUsageAccountingEvent> { get async }
 
     func ensureEventsStreamReady() async
     func resetEventsStreamForNewRun() async
@@ -35,6 +39,10 @@ extension NativeAgentRuntimeControlling {
     var requiresReplacementAfterTerminalStartupFailure: Bool {
         false
     }
+
+    var usageAccountingEvents: AsyncStream<NativeUsageAccountingEvent> {
+        AsyncStream { $0.finish() }
+    }
 }
 
 // MARK: - Current Claude-compatible native runtime aliases
@@ -53,5 +61,8 @@ typealias NativeAgentRuntimeRuntimeInitStatus = ClaudeNativeProcessSessionContro
 typealias NativeAgentRuntimeInterruptOutcome = ClaudeNativeProcessSessionController.InterruptOutcome
 typealias NativeAgentRuntimeControllerError = ClaudeNativeProcessSessionController.ControllerError
 typealias NativeAgentRuntimeEffortLevel = ClaudeCodeEffortLevel
+typealias NativeUsageAccountingEvent = ClaudeNativeProcessSessionController.UsageAccountingEvent
+typealias NativeProcessLaunchIdentity = ClaudeNativeProcessSessionController.ProcessLaunchIdentity
+typealias NativeUsageResultAttribution = ClaudeNativeProcessSessionController.UsageResultAttribution
 
 extension ClaudeNativeProcessSessionController: NativeAgentRuntimeControlling {}

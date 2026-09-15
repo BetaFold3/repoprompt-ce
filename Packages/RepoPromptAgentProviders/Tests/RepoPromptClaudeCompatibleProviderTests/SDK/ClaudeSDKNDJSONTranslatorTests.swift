@@ -329,6 +329,67 @@ final class ClaudeSDKNDJSONTranslatorTests: XCTestCase {
                 expected: ClaudeProviderUsageObservation(source: .result, inputTokens: 1)
             ),
             Case(
+                name: "result_index and queued_turn_count zero are observed as zero, not missing",
+                line: [
+                    "type": "result", "subtype": "success", "uuid": "env-r0", "session_id": "s-1",
+                    "result_index": 0, "queued_turn_count": 0, "num_turns": 1,
+                    "usage": ["input_tokens": 4, "output_tokens": 1, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0]
+                ],
+                expectedTypes: ["message_stop"],
+                expectedLegacy: (4, 1, nil),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(
+                    source: .result,
+                    inputTokens: 4,
+                    outputTokens: 1,
+                    cacheReadInputTokens: 100,
+                    cacheCreationInputTokens: 0,
+                    envelopeID: "env-r0",
+                    resultSubtype: "success",
+                    resultIndex: 0,
+                    queuedTurnCount: 0
+                )
+            ),
+            Case(
+                name: "boolean, negative, fractional or missing result ownership fields stay missing",
+                line: [
+                    "type": "result", "subtype": "success", "uuid": "env-r-bad",
+                    "result_index": true, "queued_turn_count": -1,
+                    "usage": ["input_tokens": 2]
+                ],
+                expectedTypes: ["message_stop"],
+                expectedLegacy: (2, 0, nil),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(
+                    source: .result,
+                    inputTokens: 2,
+                    envelopeID: "env-r-bad",
+                    resultSubtype: "success"
+                )
+            ),
+            Case(
+                name: "result_index 3 with fractional queue count keeps the index and drops the queue",
+                line: [
+                    "type": "result", "subtype": "error_during_execution", "uuid": "env-r3", "is_error": true,
+                    "result_index": 3, "queued_turn_count": 0.5,
+                    "usage": ["input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0]
+                ],
+                expectedTypes: ["message_stop"],
+                expectedLegacy: (0, 0, nil),
+                expectedMessageID: nil,
+                expected: ClaudeProviderUsageObservation(
+                    source: .result,
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheReadInputTokens: 0,
+                    cacheCreationInputTokens: 0,
+                    envelopeID: "env-r3",
+                    resultSubtype: "error_during_execution",
+                    resultIsError: true,
+                    resultIndex: 3
+                )
+            ),
+            Case(
                 name: "usage dictionary without any usage field emits nothing",
                 line: ["type": "assistant", "message": ["usage": ["service_tier": "standard"], "content": []]],
                 expectedTypes: [],

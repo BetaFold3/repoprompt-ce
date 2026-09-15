@@ -505,7 +505,7 @@ final class CodexCLIProvider: AIProvider {
                     case .toolCall, .toolResult, .commandExecutionRunning:
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server emitted tool events while interactive chat tools are disabled.")
 
-                    case .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system:
+                    case .reasoningCompleted, .tokenUsage, .usageObservation, .modelRerouted, .turnStarted(turnID: _), .system:
                         continue
                     }
                 }
@@ -662,7 +662,7 @@ final class CodexCLIProvider: AIProvider {
                     case .toolCall, .toolResult, .commandExecutionRunning:
                         throw AIProviderError.invalidConfiguration(detail: "Codex app-server emitted tool events while interactive chat tools are disabled.")
 
-                    case .reasoningDelta, .reasoningCompleted, .tokenUsage, .turnStarted(turnID: _), .system:
+                    case .reasoningDelta, .reasoningCompleted, .tokenUsage, .usageObservation, .modelRerouted, .turnStarted(turnID: _), .system:
                         continue
                     }
                 }
