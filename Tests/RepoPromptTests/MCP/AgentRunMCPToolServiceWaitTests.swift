@@ -3136,6 +3136,218 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         XCTAssertNil(session.lastInteractionResolution)
     }
 
+    // MARK: - Plan §6.3 frozen wait policy
+
+    private final class WaitPolicyResolutionRecorder {
+        var family: AgentMCPWaitPolicy.ParentFamily
+        private(set) var count = 0
+
+        init(family: AgentMCPWaitPolicy.ParentFamily) {
+            self.family = family
+        }
+
+        func resolve(_ metadata: MCPServerViewModel.RequestMetadata) -> AgentMCPWaitPolicy.RequestContext {
+            count += 1
+            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: family)
+        }
+    }
+
+    func testOmittedSingleWaitFreezesParentFamilyOnceAndReportsAutomaticPolicy() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        var service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: recorder)
+        let resolutions = WaitPolicyResolutionRecorder(family: .codex)
+        service.resolveWaitPolicyContext = { resolutions.resolve($0) }
+        await liveSnapshots.set(makeSnapshot(sessionID: fixture.sessionID, status: .completed, latestAssistantPreview: "done"))
+
+        let value = try await service.execute(args: [
+            "op": .string("wait"),
+            "session_id": .string(fixture.sessionID.uuidString)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
+        XCTAssertEqual(
+            object["wait_policy"],
+            .object([
+                "mode": .string("automatic"),
+                "timeout_seconds": .int(600),
+                "parent_family": .string("codex")
+            ])
+        )
+        XCTAssertEqual(resolutions.count, 1, "The parent family is frozen exactly once at the outer entry")
+        let completions = await recorder.completions()
+        XCTAssertTrue(completions.isEmpty, "An actionable snapshot returns immediately without parking")
+    }
+
+    func testPollOpReportsPollPolicyWithoutResolvingParentFamily() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        var service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: WaitScopeRecorder())
+        let resolutions = WaitPolicyResolutionRecorder(family: .codex)
+        service.resolveWaitPolicyContext = { resolutions.resolve($0) }
+
+        let value = try await service.execute(args: [
+            "op": .string("poll"),
+            "session_id": .string(fixture.sessionID.uuidString)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue)
+        XCTAssertEqual(object["wait_policy"], .object(["mode": .string("poll"), "timeout_seconds": .int(0)]))
+        XCTAssertEqual(resolutions.count, 0, "A poll never needs the parent family")
+    }
+
+    func testSingleElementMultiWaitUsesTheGeneralFrozenPathWithoutRecapture() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        var service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: WaitScopeRecorder())
+        let resolutions = WaitPolicyResolutionRecorder(family: .claude)
+        service.resolveWaitPolicyContext = { metadata in
+            let context = resolutions.resolve(metadata)
+            // Simulate the parent changing after the freeze: a recapture would observe Codex.
+            resolutions.family = .codex
+            return context
+        }
+        await liveSnapshots.set(makeSnapshot(sessionID: fixture.sessionID, status: .completed, latestAssistantPreview: "done"))
+
+        let value = try await service.execute(args: [
+            "op": .string("wait"),
+            "session_ids": .array([.string(fixture.sessionID.uuidString)])
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["session_id"]?.stringValue, fixture.sessionID.uuidString)
+        XCTAssertNil(object["wait"]?.objectValue?["mode"], "A one-element multi-wait keeps the single-session shape")
+        XCTAssertEqual(
+            object["wait_policy"],
+            .object([
+                "mode": .string("automatic"),
+                "timeout_seconds": .int(180),
+                "parent_family": .string("claude")
+            ])
+        )
+        XCTAssertEqual(resolutions.count, 1, "No opportunistic recapture of provider identity for one-element waits")
+    }
+
+    func testMultiWaitPollEmitsRootPolicyOnceAndNeverOnNestedSnapshots() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let first = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: first.registration) } }
+        let second = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: second.registration) } }
+        var service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: WaitScopeRecorder())
+        let resolutions = WaitPolicyResolutionRecorder(family: .codex)
+        service.resolveWaitPolicyContext = { resolutions.resolve($0) }
+
+        let value = try await service.execute(args: [
+            "op": .string("wait"),
+            "session_ids": .array([.string(first.sessionID.uuidString), .string(second.sessionID.uuidString)]),
+            "timeout": .int(0)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["wait"]?.objectValue?["mode"]?.stringValue, "any")
+        XCTAssertEqual(object["wait"]?.objectValue?["result"]?.stringValue, "timed_out")
+        XCTAssertEqual(object["wait_policy"], .object(["mode": .string("poll"), "timeout_seconds": .int(0)]))
+        let snapshots = try XCTUnwrap(object["snapshots"]?.arrayValue)
+        XCTAssertEqual(snapshots.count, 2)
+        for snapshot in snapshots {
+            XCTAssertNil(snapshot.objectValue?["wait_policy"], "The tuple is emitted once at the root")
+        }
+        XCTAssertEqual(resolutions.count, 1)
+    }
+
+    func testExplicitWaitAcceptsFourHourMaximumAndRejectsAboveWithoutClamping() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        var service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: WaitScopeRecorder())
+        service.resolveWaitPolicyContext = { WaitPolicyResolutionRecorder(family: .codex).resolve($0) }
+        await liveSnapshots.set(makeSnapshot(sessionID: fixture.sessionID, status: .completed, latestAssistantPreview: "done"))
+
+        let accepted = try await service.execute(args: [
+            "op": .string("wait"),
+            "session_id": .string(fixture.sessionID.uuidString),
+            "timeout": .int(14400)
+        ])
+        XCTAssertEqual(
+            accepted.objectValue?["wait_policy"],
+            .object(["mode": .string("explicit"), "timeout_seconds": .int(14400)]),
+            "Explicit selections never carry a parent family"
+        )
+
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.sessionID.uuidString),
+                "timeout": .int(14401)
+            ])
+            XCTFail("14401 must be rejected rather than clamped")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("14400"), String(describing: error))
+        }
+    }
+
+    func testDelegatedFrozenWaitUsesSuppliedContextAndSelectionWithoutRecapture() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(in: viewModel, liveSnapshots: liveSnapshots)
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        var service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: WaitScopeRecorder())
+        service.resolveWaitPolicyContext = { metadata in
+            XCTFail("Delegated frozen waits must not re-resolve the parent family")
+            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .claude)
+        }
+        await liveSnapshots.set(makeSnapshot(sessionID: fixture.sessionID, status: .completed, latestAssistantPreview: "done"))
+
+        let frozenContext = AgentMCPWaitPolicy.RequestContext(
+            metadata: MCPServerViewModel.RequestMetadata(
+                connectionID: nil,
+                clientName: "agent-run-wait-tests",
+                windowID: window.windowID
+            ),
+            parentFamily: .codex
+        )
+        let value = try await service.executeFrozenWait(
+            sessionIDs: [fixture.sessionID],
+            context: frozenContext,
+            selection: .automatic(parentFamily: .codex)
+        )
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["session_id"]?.stringValue, fixture.sessionID.uuidString)
+        XCTAssertEqual(
+            object["wait_policy"],
+            .object([
+                "mode": .string("automatic"),
+                "timeout_seconds": .int(600),
+                "parent_family": .string("codex")
+            ])
+        )
+    }
+
     private func makeWindow() -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

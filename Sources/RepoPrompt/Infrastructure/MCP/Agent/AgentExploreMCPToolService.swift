@@ -16,6 +16,12 @@ struct AgentExploreMCPToolService {
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
     var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> UUID? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
+    /// Plan §6.3: frozen parent-family resolver shared with the delegated `agent_run` control
+    /// service. Resolved once at the Explore outer entry, before child creation or delegation.
+    var resolveWaitPolicyContext: (_ metadata: RequestMetadata) async -> AgentMCPWaitPolicy.RequestContext = {
+        AgentMCPWaitPolicy.RequestContext(metadata: $0, parentFamily: .unresolved)
+    }
+
     let startRun: StartRun
     var vcsService: VCSService = .shared
     var gitTargetResolver: GitRepoTargetResolver = .init()
@@ -28,8 +34,11 @@ struct AgentExploreMCPToolService {
         )
     }
 
-    static func resolvedStartTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try AgentRunMCPToolService.resolvedStartTimeoutSeconds(value)
+    static func resolvedStartWaitSelection(
+        _ value: Value?,
+        parentFamily: AgentMCPWaitPolicy.ParentFamily
+    ) throws -> AgentMCPWaitPolicy.Selection {
+        try AgentRunMCPToolService.resolvedStartWaitSelection(value, parentFamily: parentFamily)
     }
 
     func execute(args: [String: Value]) async throws -> Value {
@@ -57,9 +66,13 @@ struct AgentExploreMCPToolService {
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
         try validateBatchWorktreeRequest(worktreeStartRequest, messageCount: messages.count)
         let detach = AgentMCPToolHelpers.parseBool(args["detach"]) ?? false
-        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(args["timeout"])
 
         let metadata = await captureRequestMetadata()
+        // Plan §6.3/§6.4: freeze the parent family and validate the wait selection before any
+        // explore child is created or the request is rebound. The frozen values flow through the
+        // internal start-to-wait delegation; omission is never rewritten to an explicit number.
+        let waitContext = await resolveWaitPolicyContext(metadata)
+        let waitSelection = try Self.resolvedStartWaitSelection(args["timeout"], parentFamily: waitContext.parentFamily)
         let context = try await resolveStartContext(metadata: metadata)
         let started = try await startExploreRuns(
             messages: messages,
@@ -69,30 +82,35 @@ struct AgentExploreMCPToolService {
 
         guard startMessages.isBatch, started.count > 1 else {
             let run = started[0]
-            if detach || run.outcome.snapshot.status != .running || timeoutSeconds <= 0 {
-                return decoratedStartValue(snapshot: run.outcome.snapshot, delivery: run.outcome.delivery)
+            let startedValue = decoratedStartValue(snapshot: run.outcome.snapshot, delivery: run.outcome.delivery)
+            if detach {
+                return startedValue
             }
-            return try await agentRunControlService.execute(args: [
-                "op": .string("wait"),
-                "session_id": .string(run.outcome.snapshot.sessionID.uuidString),
-                "timeout": .double(timeoutSeconds)
-            ])
+            if run.outcome.snapshot.status != .running || waitSelection.timeoutSeconds <= 0 {
+                return AgentMCPWaitPolicy.attaching(waitSelection, to: startedValue)
+            }
+            return try await agentRunControlService.executeFrozenWait(
+                sessionIDs: [run.outcome.snapshot.sessionID],
+                context: waitContext,
+                selection: waitSelection
+            )
         }
 
         let sessionIDs = started.map(\.outcome.snapshot.sessionID)
-        if !detach, timeoutSeconds > 0 {
-            return try await agentRunControlService.execute(args: [
-                "op": .string("wait"),
-                "session_ids": .array(sessionIDs.map { .string($0.uuidString) }),
-                "timeout": .double(timeoutSeconds)
-            ])
+        if !detach, waitSelection.timeoutSeconds > 0 {
+            return try await agentRunControlService.executeFrozenWait(
+                sessionIDs: sessionIDs,
+                context: waitContext,
+                selection: waitSelection
+            )
         }
 
-        return await batchStartValue(
+        let batchValue = await batchStartValue(
             sessionIDs: sessionIDs,
             result: detach ? "detached" : "poll",
             agentModeVM: context.agentModeVM
         )
+        return detach ? batchValue : AgentMCPWaitPolicy.attaching(waitSelection, to: batchValue)
     }
 
     private func executeControl(args: [String: Value], op: String) async throws -> Value {
@@ -105,17 +123,37 @@ struct AgentExploreMCPToolService {
         try validateAllowedKeys(args, op: op, allowed: allowed)
 
         let metadata = await captureRequestMetadata()
+        // Plan §6.3: an Explore wait is an outer lifecycle entry; freeze the parent family and
+        // validate the selection here, then hand both to the delegated control service.
+        let frozenWait: (context: AgentMCPWaitPolicy.RequestContext, selection: AgentMCPWaitPolicy.Selection)?
+        if op == "wait" {
+            let waitContext = await resolveWaitPolicyContext(metadata)
+            let waitSelection = try AgentRunMCPToolService.resolvedWaitSelection(
+                args["timeout"],
+                parentFamily: waitContext.parentFamily
+            )
+            frozenWait = (waitContext, waitSelection)
+        } else {
+            frozenWait = nil
+        }
         let targetWindow = try requireTargetWindow()
         let agentModeVM = targetWindow.agentModeViewModel
         let caller = try await resolveExploreCaller(metadata: metadata, agentModeVM: agentModeVM)
         let sessionIDs = try await resolveReferencedSessionIDs(args: args, op: op, targetWindow: targetWindow, agentModeVM: agentModeVM)
         try validateExploreChildSessions(sessionIDs: sessionIDs, callerSessionID: caller.sourceSessionID, agentModeVM: agentModeVM)
 
+        if let frozenWait {
+            return try await agentRunControlService.executeFrozenWait(
+                sessionIDs: sessionIDs,
+                context: frozenWait.context,
+                selection: frozenWait.selection
+            )
+        }
         return try await agentRunControlService.execute(args: args)
     }
 
     private var agentRunControlService: AgentRunMCPToolService {
-        AgentRunMCPToolService(
+        var service = AgentRunMCPToolService(
             toolName: toolName,
             captureRequestMetadata: captureRequestMetadata,
             requireTargetWindow: requireTargetWindow,
@@ -128,6 +166,8 @@ struct AgentExploreMCPToolService {
             endAgentRunWait: endAgentRunWait,
             startRun: startRun
         )
+        service.resolveWaitPolicyContext = resolveWaitPolicyContext
+        return service
     }
 
     private enum StartMessages {

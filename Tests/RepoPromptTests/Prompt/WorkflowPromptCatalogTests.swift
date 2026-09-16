@@ -1,4 +1,6 @@
+import Foundation
 @testable import RepoPromptApp
+import RepoPromptShared
 import XCTest
 
 final class WorkflowPromptCatalogTests: XCTestCase {
@@ -46,14 +48,14 @@ final class WorkflowPromptCatalogTests: XCTestCase {
     }
 
     func testRenderedManagedPromptFrontmatterCompatibility() {
-        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 64)
+        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 65)
 
         for descriptor in WorkflowPromptCatalog.installDescriptors {
             let rendered = RepoPromptWorkflowPrompts.render(id: descriptor.id, variant: .mcp)
             XCTAssertTrue(rendered.hasPrefix("---\n"), descriptor.name)
             XCTAssertTrue(rendered.contains("name: \"\(descriptor.name)\""), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_managed: true"), descriptor.name)
-            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 64"), descriptor.name)
+            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 65"), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_variant: mcp"), descriptor.name)
             XCTAssertFalse(RepoPromptWorkflowPrompts.stripYAMLFrontmatter(rendered).hasPrefix("---"), descriptor.name)
         }
@@ -111,8 +113,8 @@ final class WorkflowPromptCatalogTests: XCTestCase {
 
                 XCTAssertTrue(rendered.contains("Detach independent parallel starts"), label)
                 XCTAssertTrue(rendered.contains("pass every pending ID in `session_ids` to `agent_run op=wait`"), label)
-                XCTAssertTrue(rendered.contains("Wait returns as soon as any watched session finishes or needs interaction"), label)
-                XCTAssertTrue(rendered.contains("`timeout` is only an upper bound on how long that call may block"), label)
+                XCTAssertTrue(rendered.contains("Wait returns as soon as any watched session finishes, needs interaction"), label)
+                XCTAssertTrue(rendered.contains("upper bounds rather than mandatory sleeps"), label)
                 XCTAssertTrue(rendered.contains("Maintain a caller-owned outstanding-ID set"), label)
                 XCTAssertTrue(rendered.contains("do not rebuild it solely from response `pending_session_ids`"), label)
                 XCTAssertTrue(rendered.contains("nonterminal interaction/status winner"), label)
@@ -120,12 +122,82 @@ final class WorkflowPromptCatalogTests: XCTestCase {
                 XCTAssertTrue(rendered.contains("Remove only terminal workers from the outstanding set"), label)
                 XCTAssertTrue(rendered.contains("Retain or re-add nonterminal interaction/status winners after responding"), label)
                 XCTAssertTrue(rendered.contains("wait again while any outstanding IDs remain"), label)
-                XCTAssertTrue(rendered.contains("A timeout leaves workers active; do not abandon them—wait again"), label)
+                XCTAssertTrue(rendered.contains("A timeout returns the current state while the worker remains active; do not abandon it—wait again"), label)
                 XCTAssertTrue(rendered.contains("Use `op=poll` only for a deliberate instantaneous inspection"), label)
                 XCTAssertTrue(rendered.contains("Do not set `include_status_updates` merely to show activity"), label)
-                XCTAssertTrue(rendered.contains("Transport heartbeats keep the connection alive; they do not warm provider prompt caches"), label)
+                XCTAssertTrue(rendered.contains("A wait or transport heartbeat does not itself send a provider-model request"), label)
+                XCTAssertTrue(rendered.contains("does not warm a prompt cache"), label)
                 XCTAssertFalse(rendered.lowercased().contains("poll periodically"), label)
                 XCTAssertFalse(rendered.contains("Forgetting to poll"), label)
+            }
+        }
+
+        let claudeAutomaticWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds)
+        let codexAutomaticWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds)
+        let otherAutomaticWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds)
+        let unresolvedAutomaticWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds)
+        let fallbackWaitSummary = if otherAutomaticWaitSeconds == unresolvedAutomaticWaitSeconds {
+            "other or unresolved parents \(otherAutomaticWaitSeconds) seconds"
+        } else {
+            "other parents \(otherAutomaticWaitSeconds) seconds and unresolved parents \(unresolvedAutomaticWaitSeconds) seconds"
+        }
+        let automaticWaitProviderSummary = "Claude \(claudeAutomaticWaitSeconds) seconds, Codex \(codexAutomaticWaitSeconds) seconds, and \(fallbackWaitSummary)"
+
+        let maximumExplicitWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds)
+        let explicitWaitRangeFormatter = NumberFormatter()
+        explicitWaitRangeFormatter.locale = Locale(identifier: "en_US_POSIX")
+        explicitWaitRangeFormatter.numberStyle = .decimal
+        explicitWaitRangeFormatter.usesGroupingSeparator = true
+        explicitWaitRangeFormatter.groupingSeparator = ","
+        explicitWaitRangeFormatter.groupingSize = 3
+        let formattedMaximumExplicitWaitSeconds = explicitWaitRangeFormatter.string(
+            from: NSNumber(value: maximumExplicitWaitSeconds)
+        ) ?? String(maximumExplicitWaitSeconds)
+        let explicitWaitRange = "0...\(formattedMaximumExplicitWaitSeconds)"
+
+        let automaticWaitWorkflowIDs = waitFirstWorkflowIDs + [.reminder]
+        for workflowID in automaticWaitWorkflowIDs {
+            for renderedVariant in waitFirstVariants {
+                let rendered = RepoPromptWorkflowPrompts.render(
+                    id: workflowID,
+                    variant: renderedVariant.variant
+                )
+                let label = "\(workflowID.commandName) [\(renderedVariant.name)]"
+
+                XCTAssertTrue(rendered.contains("For routine supervision, omit `timeout` / `timeout_seconds`"), label)
+                XCTAssertTrue(rendered.contains("omission selects the automatic wait from the effective parent provider"), label)
+                XCTAssertTrue(
+                    rendered.contains("effective parent provider: \(automaticWaitProviderSummary)."),
+                    label
+                )
+                XCTAssertTrue(rendered.contains("upper bounds rather than mandatory sleeps"), label)
+                XCTAssertTrue(rendered.contains("A timeout returns the current state while the worker remains active"), label)
+                XCTAssertTrue(rendered.contains("does not itself send a provider-model request"), label)
+                XCTAssertTrue(rendered.contains("does not warm a prompt cache"), label)
+                XCTAssertTrue(rendered.contains("The next parent-model continuation may refresh a cache"), label)
+                XCTAssertTrue(rendered.contains("depending on the actual provider product and account path"), label)
+                XCTAssertTrue(rendered.contains("Longer explicit waits trade fewer supervisory model calls"), label)
+                XCTAssertTrue(rendered.contains("greater chance of cache expiry on short-retention paths"), label)
+                XCTAssertTrue(rendered.contains("Use an explicit override only for"), label)
+                XCTAssertTrue(rendered.contains("known caller constraint"), label)
+                XCTAssertTrue(rendered.contains("not merely because a worker may run for a long time"), label)
+                XCTAssertTrue(
+                    rendered.contains("accepted explicit range is `\(explicitWaitRange)` seconds; zero means poll"),
+                    label
+                )
+                XCTAssertFalse(rendered.lowercased().contains("cache-safe"), label)
+                XCTAssertFalse(rendered.lowercased().contains("codex ttl"), label)
+
+                for line in rendered.split(separator: "\n") {
+                    if line.contains("agent_run op=") {
+                        XCTAssertFalse(line.contains("timeout="), "\(label): \(line)")
+                        XCTAssertFalse(line.contains("timeout_seconds="), "\(label): \(line)")
+                    }
+                    if line.contains("{\"tool\":\"agent_run\"") {
+                        XCTAssertFalse(line.contains("\"timeout\":"), "\(label): \(line)")
+                        XCTAssertFalse(line.contains("\"timeout_seconds\":"), "\(label): \(line)")
+                    }
+                }
             }
         }
     }

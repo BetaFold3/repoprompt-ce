@@ -18,17 +18,28 @@ struct RemoteToolCall: Equatable {
 enum AppLinkCallTimeoutPolicy {
     static let fast: TimeInterval = 60
     static let grace: TimeInterval = 30
+    /// App-link response cap only; expiry does not cancel an already accepted lifecycle worker.
     static let cap: TimeInterval = 900
 
     static func timeout(op: String, payload: [String: JSONValue]) -> TimeInterval {
         switch op {
         case "start":
-            return clamp((seconds(from: payload["timeout"]) ?? MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds) + grace)
+            guard let requestedSeconds = seconds(from: payload["timeout"]) else {
+                // The gateway cannot determine whether an omitted-timeout start detaches.
+                return clamp(MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds)
+            }
+            return clamp(requestedSeconds + grace)
         case "poll":
             return clamp((seconds(from: payload["timeout"]) ?? 0) + grace)
         case "steer":
-            guard payload["wait"]?.boolValue == true else { return fast }
-            return clamp((seconds(from: payload["timeout_seconds"]) ?? MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds) + grace)
+            let wait = semanticBool(payload["wait"])
+            guard wait != false else { return fast }
+            let hasWaitIntent = wait == true || payload["timeout_seconds"] != nil
+            guard hasWaitIntent else { return fast }
+            guard let requestedSeconds = seconds(from: payload["timeout_seconds"]) else {
+                return clamp(MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds)
+            }
+            return clamp(requestedSeconds + grace)
         default:
             return fast
         }
@@ -47,6 +58,29 @@ enum AppLinkCallTimeoutPolicy {
             return seconds
         default:
             return nil
+        }
+    }
+
+    /// Matches the app lifecycle service's accepted boolean representations.
+    private static func semanticBool(_ value: JSONValue?) -> Bool? {
+        switch value {
+        case let .bool(value):
+            value
+        case let .string(value):
+            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes":
+                true
+            case "false", "0", "no":
+                false
+            default:
+                nil
+            }
+        case let .int(value):
+            value != 0
+        case let .double(value):
+            value != 0
+        default:
+            nil
         }
     }
 }

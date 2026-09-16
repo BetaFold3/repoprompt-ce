@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 extension RepoPromptWorkflowPrompts {
 	// MARK: - Example Generators
@@ -118,11 +119,40 @@ A role whose display name starts with `Codex CLI` (or an explicit `model_id` wit
 """
 	}
 
+	static var lifecycleAutomaticWaitProviderSummary: String {
+		let claudeSeconds = Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds)
+		let codexSeconds = Int(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds)
+		let otherSeconds = Int(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds)
+		let unresolvedSeconds = Int(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds)
+		let fallbackSummary: String
+		if otherSeconds == unresolvedSeconds {
+			fallbackSummary = "other or unresolved parents \(otherSeconds) seconds"
+		} else {
+			fallbackSummary = "other parents \(otherSeconds) seconds and unresolved parents \(unresolvedSeconds) seconds"
+		}
+		return "Claude \(claudeSeconds) seconds, Codex \(codexSeconds) seconds, and \(fallbackSummary)"
+	}
+
+	static var lifecycleExplicitWaitRange: String {
+		let maximumExplicitSeconds = Int(MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds)
+		let formatter = NumberFormatter()
+		formatter.locale = Locale(identifier: "en_US_POSIX")
+		formatter.numberStyle = .decimal
+		formatter.usesGroupingSeparator = true
+		formatter.groupingSeparator = ","
+		formatter.groupingSize = 3
+		let formattedMaximum = formatter.string(from: NSNumber(value: maximumExplicitSeconds))
+			?? String(maximumExplicitSeconds)
+		return "0...\(formattedMaximum)"
+	}
+
 	/// Shared wait-first supervision guidance. `responsePendingDetail` carries the one
 	/// shared-parallel sentence that must appear before caller-owned set guidance.
 	static func sharedWaitFirstSupervisionBlock(responsePendingDetail: String = "") -> String {
 		return """
-**Wait-first supervision.** Detach independent parallel starts, then pass every pending ID in `session_ids` to `agent_run op=wait`. Wait returns as soon as any watched session finishes or needs interaction; `timeout` is only an upper bound on how long that call may block.\(responsePendingDetail) Maintain a caller-owned outstanding-ID set; do not rebuild it solely from response `pending_session_ids`, because that list can omit a nonterminal interaction/status winner. Handle **every** returned interaction. Remove only terminal workers from the outstanding set. Retain or re-add nonterminal interaction/status winners after responding, then wait again while any outstanding IDs remain. A timeout leaves workers active; do not abandon them—wait again. Use `op=poll` only for a deliberate instantaneous inspection. Do not set `include_status_updates` merely to show activity. Transport heartbeats keep the connection alive; they do not warm provider prompt caches.
+**Wait-first supervision.** Detach independent parallel starts, then pass every pending ID in `session_ids` to `agent_run op=wait`. For routine supervision, omit `timeout` / `timeout_seconds`; omission selects the automatic wait from the effective parent provider: \(lifecycleAutomaticWaitProviderSummary). Wait returns as soon as any watched session finishes, needs interaction, is cancelled, or reaches another actionable state, so those values and any explicit timeout are upper bounds rather than mandatory sleeps.\(responsePendingDetail) Maintain a caller-owned outstanding-ID set; do not rebuild it solely from response `pending_session_ids`, because that list can omit a nonterminal interaction/status winner. Handle **every** returned interaction. Remove only terminal workers from the outstanding set. Retain or re-add nonterminal interaction/status winners after responding, then wait again while any outstanding IDs remain. A timeout returns the current state while the worker remains active; do not abandon it—wait again. Use `op=poll` only for a deliberate instantaneous inspection. Do not set `include_status_updates` merely to show activity.
+
+A wait or transport heartbeat does not itself send a provider-model request and therefore does not warm a prompt cache. The next parent-model continuation may refresh a cache, depending on the actual provider product and account path. Longer explicit waits trade fewer supervisory model calls against a greater chance of cache expiry on short-retention paths. Use an explicit override only for a deliberate responsiveness/control trade-off or a known caller constraint, not merely because a worker may run for a long time. The accepted explicit range is `\(lifecycleExplicitWaitRange)` seconds; zero means poll.
 """
 	}
 
@@ -149,7 +179,7 @@ If dispatching independent items as fresh agents concurrently, **each agent's br
 {"tool":"agent_run","args":{"op":"start","model_id":"\(defaultRole)","session_name":"2/N: <goal B>","message":"<brief B>","detach":true}}
 
 // Then wait for the first session that needs attention
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<session_id_A>","<session_id_B>"],"timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<session_id_A>","<session_id_B>"]}}
 
 // Deliberate instantaneous inspection only — not the supervision loop
 {"tool":"agent_run","args":{"op":"poll","session_ids":["<session_id_A>","<session_id_B>"]}}
@@ -162,7 +192,7 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=\(defaultRole) session_n
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=\(defaultRole) session_name="2/N: <goal B>" message="<brief B>" detach=true'
 
 # Then wait for the first session that needs attention
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"]'
 
 # Deliberate instantaneous inspection only — not the supervision loop
 rpce-cli -w <window_id> -e 'agent_run op=poll session_ids=["<uuid1>","<uuid2>"]'

@@ -27,6 +27,60 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
         XCTAssertFalse(presentation.subtitle?.contains("reasoning provider_super") == true, presentation.subtitle ?? "")
     }
 
+    func testLifecycleWaitSubtitlesAreDerivedFromCallArguments() throws {
+        let sessionID = "11111111-1111-1111-1111-111111111111"
+
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "start"])
+            ),
+            "start • wait auto"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID])
+            ),
+            "wait • wait auto"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID, "timeout": 600])
+            ),
+            "wait • wait ≤10m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID, "timeout": 0])
+            ),
+            "wait • poll"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID, "timeout": -5])
+            ),
+            "wait • poll"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "start", "detach": true, "timeout": 600])
+            ),
+            "start • detach"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_explore",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID])
+            ),
+            "wait • \(sessionID) • wait auto"
+        )
+    }
+
     func testReasoningEffortFallsBackToArgsWhenResultAgentObjectOmitsIt() throws {
         let args = try runArgs([
             "op": "start",
@@ -58,6 +112,11 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
             "agent": agent,
             "assistant_text": "Done"
         ]
+    }
+
+    private func jsonString(_ object: [String: Any]) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return try XCTUnwrap(String(data: data, encoding: .utf8))
     }
 
     private func runArgs(_ object: [String: Any]) throws -> ToolArgsDTOs.AgentRunArgs {

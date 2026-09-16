@@ -60,6 +60,43 @@ final class AgentRunResponsePresentationTests: XCTestCase {
         XCTAssertEqual(captureCount, 0)
     }
 
+    /// Plan §6.3: presentation trims assistant text only; the canonical root `wait_policy`
+    /// tuple survives full, tail and none unchanged.
+    func testTrimmedModesPreserveRootWaitPolicyTuple() async throws {
+        let destination = makeDestination(root: FileManager.default.temporaryDirectory)
+        let policy: Value = .object([
+            "mode": .string("automatic"),
+            "timeout_seconds": .int(600),
+            "parent_family": .string("codex")
+        ])
+        let canonical = snapshot(
+            sessionID: UUID(),
+            status: .completed,
+            text: "complete response",
+            extras: ["wait_policy": policy]
+        )
+
+        for mode in ["full", "tail", "none"] {
+            let presented = try await AgentRunResponsePresentation.execute(
+                args: ["op": .string("wait"), "response_mode": .string(mode)],
+                exporter: immediateExporter(),
+                captureDestination: { destination },
+                canonicalOperation: { _ in canonical }
+            )
+            XCTAssertEqual(presented.objectValue?["wait_policy"], policy, mode)
+            if mode == "full" {
+                XCTAssertEqual(presented, canonical)
+            } else {
+                XCTAssertNotEqual(presented, canonical, "\(mode) must trim the terminal assistant text")
+                XCTAssertEqual(
+                    presented.objectValue?[AgentRunResponsePresentation.presentationKey]?
+                        .objectValue?["response_mode"]?.stringValue,
+                    mode
+                )
+            }
+        }
+    }
+
     func testRequestBoundDestinationIsCapturedBeforeCanonicalAwait() async throws {
         let rootA = FileManager.default.temporaryDirectory.appendingPathComponent("captured-a")
         let rootB = FileManager.default.temporaryDirectory.appendingPathComponent("ambient-b")

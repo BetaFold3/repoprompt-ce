@@ -68,7 +68,8 @@ enum RepoPromptWorkflowPrompts {
     /// Version 62: rp-reminder — documents exact-chat continuation and the two-lane parallel `ask_oracle` pattern with exact model-preset selectors.
     /// Version 63: rp-reminder — teaches natural named-Oracle requests to resolve authoritative presets, pass explicit model UUIDs in one parallel batch, treat chat names as display-only, and verify returned identities before synthesis.
     /// Version 64: rp-investigate / rp-deep-plan / rp-optimize / rp-orchestrate / rp-refactor — replaces poll-first worker supervision with wait-first pending-set loops, interaction handling, accurate early-wake/timeout semantics, deliberate-only polling, and cache-neutral heartbeat guidance.
-    static let skillsVersion = 64
+    /// Version 65: managed orchestration workflows and rp-reminder — recommends automatic parent-provider lifecycle waits for routine supervision, documents explicit wait trade-offs, and removes routine numeric wait examples.
+    static let skillsVersion = 65
 
     static func render(
         id: RepoPromptWorkflowID,

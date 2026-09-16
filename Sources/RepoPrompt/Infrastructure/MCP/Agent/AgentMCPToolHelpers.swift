@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptShared
 
 // MARK: - Shared MCP Tool Helpers
 
@@ -8,7 +9,9 @@ import MCP
 /// Shared utility functions used by `AgentRunMCPToolService` and `AgentManageMCPToolService`.
 /// Extracted to eliminate duplication across the two tool services and the snapshot model.
 enum AgentMCPToolHelpers {
-    static let maximumTimeoutSeconds: TimeInterval = 86400
+    /// Inclusive explicit lifecycle timeout ceiling, derived from the shared policy so schema
+    /// text, parsing and transport tests cannot drift (plan §6.1).
+    static let maximumTimeoutSeconds: TimeInterval = MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds
 
     // MARK: - String parsing
 

@@ -66,7 +66,9 @@ Dispatch a sub-agent when a side investigation or delegated chunk of work would 
 
 **Key `agent_manage` ops:** `list_agents` (discover roles + compound model_ids), `list_sessions`, `get_log`, `cleanup_sessions` (delete finished MCP-started sessions).
 
-**Fan-out pattern:** call `agent_run op=start` with `detach:true` for each probe, then `agent_run op=wait session_ids=[…]` to block on the batch. Always follow a `detach` with a `wait` — don't leave probes unattended.
+**Fan-out pattern:** call `agent_run op=start` with `detach:true` for each probe, then `agent_run op=wait session_ids=[…]` to block on the batch. Always follow a `detach` with a `wait` — don't leave probes unattended. For routine supervision, omit `timeout` / `timeout_seconds`; omission selects the automatic wait from the effective parent provider: \(lifecycleAutomaticWaitProviderSummary). Actionable state wakes the wait early, so automatic and explicit values are upper bounds rather than mandatory sleeps. A timeout returns the current state while the worker remains active.
+
+A wait or transport heartbeat does not itself send a provider-model request and therefore does not warm a prompt cache. The next parent-model continuation may refresh a cache depending on the actual provider product and account path. Longer explicit waits trade fewer supervisory model calls against a greater chance of cache expiry on short-retention paths. Use an explicit override only for deliberate responsiveness/control or a known caller constraint, not merely because a worker may run for a long time. The accepted explicit range is `\(lifecycleExplicitWaitRange)` seconds; zero means poll.
 
 **Export handoff:** when `context_builder` or `ask_oracle` returns `oracle_export_path`, include that path inside the child agent's next `message` so it reads the export with `read_file`.
 
@@ -91,7 +93,7 @@ Dispatch a sub-agent when a side investigation or delegated chunk of work would 
 
 // Delegate · Fan-out · Steer · Cleanup
 {"tool":"agent_run","args":{"op":"start","model_id":"explore","session_name":"Probe: X","message":"<question>","detach":true}}
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<uuid1>","<uuid2>"],"timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<uuid1>","<uuid2>"]}}
 {"tool":"agent_run","args":{"op":"steer","session_id":"<uuid>","message":"now do Y","wait":true}}
 {"tool":"agent_manage","args":{"op":"cleanup_sessions","session_ids":["<uuid>"]}}
 ```
@@ -111,7 +113,7 @@ rpce-cli -w <window_id> -e 'chat "..." --mode plan'
 
 # Delegate · Fan-out · Steer · Cleanup
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="Probe: X" message="<question>" detach=true'
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"] timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<uuid1>","<uuid2>"]'
 rpce-cli -w <window_id> -e 'agent_run op=steer session_id="<uuid>" message="now do Y" wait=true'
 rpce-cli -w <window_id> -e 'agent_manage op=cleanup_sessions session_ids=["<uuid>"]'
 ```

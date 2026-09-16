@@ -30,6 +30,105 @@ import XCTest
             XCTAssertEqual(timeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds)
         }
 
+        func testOmittedWaitingAgentOperationsUseOwnedResponseEnvelope() async {
+            let session = makeUnconnectedSession()
+            let sessionID = UUID().uuidString
+            let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
+            XCTAssertEqual(expected, 630)
+            let cases: [(toolName: String, arguments: [String: Value])] = [
+                ("agent_run", ["op": .string("start")]),
+                ("agent_explore", ["op": .string("start")]),
+                ("agent_run", ["op": .string("start"), "timeout": .null]),
+                ("agent_explore", ["op": .string("start"), "timeout": .null]),
+                ("agent_run", ["op": .string("wait"), "session_id": .string(sessionID)]),
+                ("agent_explore", ["op": .string("wait"), "session_id": .string(sessionID)]),
+                (
+                    "agent_run",
+                    ["op": .string("wait"), "session_id": .string(sessionID), "timeout": .null]
+                ),
+                (
+                    "agent_explore",
+                    ["op": .string("wait"), "session_id": .string(sessionID), "timeout": .null]
+                ),
+                (
+                    "agent_run",
+                    ["op": .string("steer"), "session_id": .string(sessionID), "wait": .bool(true)]
+                ),
+                (
+                    "agent_run",
+                    ["op": .string("steer"), "session_id": .string(sessionID), "timeout_seconds": .null]
+                ),
+                (
+                    "agent_run",
+                    [
+                        "op": .string("steer"),
+                        "session_id": .string(sessionID),
+                        "wait": .bool(true),
+                        "timeout_seconds": .null
+                    ]
+                )
+            ]
+
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                )
+                XCTAssertEqual(
+                    timeout,
+                    expected,
+                    "\(testCase.toolName) \(testCase.arguments)"
+                )
+            }
+        }
+
+        func testOmittedNonWaitingAgentOperationsRetainOrdinaryDeadline() async {
+            let session = makeUnconnectedSession()
+            let sessionID = UUID().uuidString
+            let cases: [(toolName: String, arguments: [String: Value])] = [
+                ("agent_run", ["op": .string("start"), "detach": .bool(true)]),
+                (
+                    "agent_run",
+                    ["op": .string("start"), "detach": .bool(true), "timeout": .null]
+                ),
+                ("agent_explore", ["op": .string("start"), "detach": .string("yes")]),
+                (
+                    "agent_run",
+                    ["op": .string("steer"), "session_id": .string(sessionID)]
+                ),
+                (
+                    "agent_run",
+                    [
+                        "op": .string("steer"),
+                        "session_id": .string(sessionID),
+                        "wait": .string("no"),
+                        "timeout_seconds": .int(600)
+                    ]
+                ),
+                (
+                    "agent_run",
+                    [
+                        "op": .string("steer"),
+                        "session_id": .string(sessionID),
+                        "wait": .bool(false),
+                        "timeout_seconds": .null
+                    ]
+                )
+            ]
+
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                )
+                XCTAssertEqual(
+                    timeout,
+                    MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds,
+                    "\(testCase.toolName) \(testCase.arguments)"
+                )
+            }
+        }
+
         func testAgentRun600SecondWaitUsesRequestedWaitPlusDeliveryMargin() async {
             let session = makeUnconnectedSession()
 
@@ -47,6 +146,58 @@ import XCTest
                 600 + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
             )
             XCTAssertNotEqual(timeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds)
+        }
+
+        func testMaximumExplicitAgentWaitUsesRequestedWaitPlusDeliveryMargin() async {
+            let session = makeUnconnectedSession()
+            let maximum = MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds
+            let sessionID = UUID().uuidString
+            let cases: [(toolName: String, arguments: [String: Value])] = [
+                (
+                    "agent_run",
+                    ["op": .string("wait"), "session_id": .string(sessionID), "timeout": .double(maximum)]
+                ),
+                (
+                    "agent_explore",
+                    ["op": .string("wait"), "session_id": .string(sessionID), "timeout": .double(maximum)]
+                ),
+                (
+                    "agent_run",
+                    [
+                        "op": .string("steer"),
+                        "session_id": .string(sessionID),
+                        "timeout_seconds": .double(maximum)
+                    ]
+                )
+            ]
+
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                )
+                XCTAssertEqual(
+                    timeout,
+                    maximum + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds,
+                    "\(testCase.toolName) \(testCase.arguments)"
+                )
+                XCTAssertEqual(timeout, 14430)
+            }
+        }
+
+        func testSmallExplicitAgentWaitRetainsOrdinaryDeadlineFloor() async {
+            let session = makeUnconnectedSession()
+
+            let timeout = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: [
+                    "op": .string("wait"),
+                    "session_id": .string(UUID().uuidString),
+                    "timeout": .int(1)
+                ]
+            )
+
+            XCTAssertEqual(timeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds)
         }
 
         func testAnotherControlToolWaitUsesRequestedWaitPlusDeliveryMargin() async {
@@ -75,6 +226,28 @@ import XCTest
             await session.setDefaultToolCallTimeout(.none)
             let explicitNone = await session.test_resolvedToolCallTimeout(
                 toolName: "read_file"
+            )
+            XCTAssertNil(explicitNone)
+        }
+
+        func testCustomDefaultTimeoutPolicyOverridesOwnedAgentWait() async {
+            let session = makeUnconnectedSession()
+            let arguments: [String: Value] = [
+                "op": .string("wait"),
+                "session_id": .string(UUID().uuidString)
+            ]
+
+            await session.setDefaultToolCallTimeout(.seconds(450))
+            let explicitDeadline = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: arguments
+            )
+            XCTAssertEqual(explicitDeadline, 450)
+
+            await session.setDefaultToolCallTimeout(.none)
+            let explicitNone = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: arguments
             )
             XCTAssertNil(explicitNone)
         }
@@ -110,17 +283,33 @@ import XCTest
 
         func testZeroSemanticWaitLeavesClientDeadlineUnbounded() async {
             let session = makeUnconnectedSession()
+            let sessionID = UUID().uuidString
+            let cases: [(toolName: String, arguments: [String: Value])] = [
+                (
+                    "agent_run",
+                    ["op": .string("wait"), "session_id": .string(sessionID), "timeout": .int(0)]
+                ),
+                (
+                    "agent_explore",
+                    ["op": .string("wait"), "session_id": .string(sessionID), "timeout": .int(0)]
+                ),
+                (
+                    "agent_run",
+                    [
+                        "op": .string("steer"),
+                        "session_id": .string(sessionID),
+                        "timeout_seconds": .int(0)
+                    ]
+                )
+            ]
 
-            let timeout = await session.test_resolvedToolCallTimeout(
-                toolName: "agent_run",
-                arguments: [
-                    "op": .string("wait"),
-                    "session_id": .string(UUID().uuidString),
-                    "timeout": .int(0)
-                ]
-            )
-
-            XCTAssertNil(timeout)
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: testCase.toolName,
+                    arguments: testCase.arguments
+                )
+                XCTAssertNil(timeout, "\(testCase.toolName) \(testCase.arguments)")
+            }
         }
 
         private func makeUnconnectedSession() -> InteractiveMCPClientSession {

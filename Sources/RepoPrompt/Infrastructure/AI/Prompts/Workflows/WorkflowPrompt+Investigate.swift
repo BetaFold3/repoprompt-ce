@@ -169,12 +169,12 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=pair session_name="Inves
 \(example(variant,
 	mcp: """
 ```json
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<pending_pair_session_id>"],"timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<pending_pair_session_id>"]}}
 ```
 """,
 	cli: """
 ```bash
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<pending_pair_uuid>"] timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<pending_pair_uuid>"]'
 ```
 """))
 

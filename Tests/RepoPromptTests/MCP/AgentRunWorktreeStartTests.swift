@@ -3335,6 +3335,166 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         }
     }
 
+    /// Plan §6.3: `agent_explore.start` freezes the parent family before any child is created and
+    /// reports the canonical `wait_policy` only when the call selected a wait.
+    func testAgentExploreStartFreezesParentFamilyBeforeChildCreationAndReportsPolicyOnlyWhenWaiting() async throws {
+        let root = try makeTemporaryDirectory(named: "explore-wait-policy")
+        let window = try await makeWindow(root: root)
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let parentID = UUID()
+        let source = window.agentModeViewModel.session(for: sourceTabID)
+        source.testInstallPersistentSessionBinding(sessionID: parentID)
+        source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
+        let recorder = ExploreStartRecorder()
+        var service = makeAgentExploreStartService(window: window, sourceTabID: sourceTabID, recorder: recorder)
+        var childrenStartedAtResolution: [Int] = []
+        service.resolveWaitPolicyContext = { metadata in
+            childrenStartedAtResolution.append(recorder.observations.count)
+            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .codex)
+        }
+
+        let detached = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("detached probe"),
+            "detach": .bool(true)
+        ])
+        XCTAssertEqual(recorder.observations.count, 1)
+        XCTAssertNil(detached.objectValue?["wait_policy"], "Detached starts have no wait policy to report")
+        XCTAssertEqual(childrenStartedAtResolution, [0], "Frozen before the first child was created")
+
+        let polled = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("polled probe"),
+            "timeout": .int(0)
+        ])
+        XCTAssertEqual(recorder.observations.count, 2)
+        XCTAssertEqual(childrenStartedAtResolution, [0, 1], "Frozen before the second child was created")
+        let polledObject = try XCTUnwrap(polled.objectValue)
+        XCTAssertEqual(polledObject["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue)
+        XCTAssertEqual(polledObject["wait_policy"], .object(["mode": .string("poll"), "timeout_seconds": .int(0)]))
+
+        let batch = try await service.execute(args: [
+            "op": .string("start"),
+            "messages": .array([.string("batch one"), .string("batch two")]),
+            "timeout": .int(0)
+        ])
+        XCTAssertEqual(recorder.observations.count, 4)
+        XCTAssertEqual(childrenStartedAtResolution, [0, 1, 2])
+        let batchObject = try XCTUnwrap(batch.objectValue)
+        XCTAssertEqual(batchObject["start"]?.objectValue?["result"]?.stringValue, "poll")
+        XCTAssertEqual(batchObject["wait_policy"], .object(["mode": .string("poll"), "timeout_seconds": .int(0)]))
+        for snapshot in try XCTUnwrap(batchObject["snapshots"]?.arrayValue) {
+            XCTAssertNil(snapshot.objectValue?["wait_policy"], "The tuple is emitted once at the root")
+        }
+
+        let detachedBatch = try await service.execute(args: [
+            "op": .string("start"),
+            "messages": .array([.string("detached one"), .string("detached two")]),
+            "detach": .bool(true)
+        ])
+        XCTAssertEqual(recorder.observations.count, 6)
+        XCTAssertEqual(detachedBatch.objectValue?["start"]?.objectValue?["result"]?.stringValue, "detached")
+        XCTAssertNil(detachedBatch.objectValue?["wait_policy"])
+    }
+
+    /// Plan §6.3: `agent_explore.wait` is an outer lifecycle entry. It freezes the parent family
+    /// once, keeps Explore's own child validation and argument contract, and delegates the frozen
+    /// selection without recapturing provider identity.
+    func testAgentExploreWaitFreezesParentFamilyOnceAndPreservesChildValidation() async throws {
+        let root = try makeTemporaryDirectory(named: "explore-wait-frozen-policy")
+        let window = try await makeWindow(root: root)
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let parentID = UUID()
+        let source = window.agentModeViewModel.session(for: sourceTabID)
+        source.testInstallPersistentSessionBinding(sessionID: parentID)
+        source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
+        let recorder = ExploreStartRecorder(activatesControlContext: true)
+        var service = makeAgentExploreStartService(window: window, sourceTabID: sourceTabID, recorder: recorder)
+        var resolutionCount = 0
+        service.resolveWaitPolicyContext = { metadata in
+            resolutionCount += 1
+            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .codex)
+        }
+
+        _ = try await service.execute(args: [
+            "op": .string("start"),
+            "message": .string("child probe"),
+            "detach": .bool(true)
+        ])
+        let child = try XCTUnwrap(recorder.observations.first)
+        XCTAssertEqual(resolutionCount, 1)
+        defer {
+            Task { await window.agentModeViewModel.mcpDeactivateControlContext(sessionID: child.sessionID, cleanupSessionStore: true) }
+        }
+
+        // The child finishes, so an omitted-timeout wait returns immediately with the frozen family.
+        // Clear the start-pending running mask so the terminal state is projected, not masked.
+        let childSession = window.agentModeViewModel.session(for: child.tabID)
+        childSession.runState = .completed
+        window.agentModeViewModel.setMCPFollowUpRunPending(sessionID: child.sessionID, false)
+        window.agentModeViewModel.publishMCPStateChange(for: childSession)
+
+        let waited = try await service.execute(args: [
+            "op": .string("wait"),
+            "session_id": .string(child.sessionID.uuidString)
+        ])
+        let waitedObject = try XCTUnwrap(waited.objectValue)
+        XCTAssertEqual(waitedObject["session_id"]?.stringValue, child.sessionID.uuidString)
+        XCTAssertEqual(waitedObject["status"]?.stringValue, AgentRunMCPSnapshot.Status.completed.rawValue)
+        XCTAssertEqual(
+            waitedObject["wait_policy"],
+            .object([
+                "mode": .string("automatic"),
+                "timeout_seconds": .int(600),
+                "parent_family": .string("codex")
+            ])
+        )
+        XCTAssertEqual(resolutionCount, 2, "Explore wait freezes exactly once; delegation does not recapture")
+
+        // Duplicate references collapse to the single-session shape through the same frozen path.
+        let deduplicated = try await service.execute(args: [
+            "op": .string("wait"),
+            "session_ids": .array([.string(child.sessionID.uuidString), .string(child.sessionID.uuidString)]),
+            "timeout": .int(0)
+        ])
+        let deduplicatedObject = try XCTUnwrap(deduplicated.objectValue)
+        XCTAssertEqual(deduplicatedObject["session_id"]?.stringValue, child.sessionID.uuidString)
+        XCTAssertNil(deduplicatedObject["wait"]?.objectValue?["mode"])
+        XCTAssertEqual(deduplicatedObject["wait_policy"], .object(["mode": .string("poll"), "timeout_seconds": .int(0)]))
+        XCTAssertEqual(resolutionCount, 3)
+
+        // Explore-level child validation and the argument contract are unchanged by delegation.
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("wait"),
+                "session_id": .string(UUID().uuidString)
+            ])
+            XCTFail("Unknown sessions must be rejected by Explore child validation")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("explore child"), error.localizedDescription)
+        }
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("wait"),
+                "session_id": .string(child.sessionID.uuidString),
+                "include_status_updates": .bool(true)
+            ])
+            XCTFail("agent_explore wait never accepted include_status_updates")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("include_status_updates"), error.localizedDescription)
+        }
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("wait"),
+                "session_id": .string(child.sessionID.uuidString),
+                "timeout": .int(14401)
+            ])
+            XCTFail("Explore wait validates the explicit range before delegation")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("14400"), error.localizedDescription)
+        }
+    }
+
     func testAgentExplorePreservesRestrictedStartAndControlFields() async throws {
         let root = try makeTemporaryDirectory(named: "explore-restricted-fields")
         let window = try await makeWindow(root: root)

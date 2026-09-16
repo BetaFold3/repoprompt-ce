@@ -29,9 +29,17 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
         ]
     }
 
+    private static var lifecycleWaitSemantics: String {
+        let claudeSeconds = Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds)
+        let codexSeconds = Int(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds)
+        let otherSeconds = Int(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds)
+        let unresolvedSeconds = Int(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds)
+        let maximumExplicitSeconds = Int(MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds)
+        return "Omit the timeout for automatic selection from the effective parent provider: Claude \(claudeSeconds) seconds, Codex \(codexSeconds) seconds, other \(otherSeconds) seconds, and unresolved \(unresolvedSeconds) seconds. Completion, interaction, cancellation, or other actionable state returns early; the selected timeout is only a wait-phase upper bound. A timeout returns the current state while the accepted worker remains active for later wait or poll. Explicit values must be in the inclusive range 0...\(maximumExplicitSeconds) seconds; zero means poll."
+    }
+
     private func agentExploreTool() -> Tool {
-        let defaultWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds)
-        return runtime.tool(
+        runtime.tool(
             name: MCPWindowToolName.agentExplore,
             freshnessPolicy: .none,
             description: """
@@ -45,6 +53,8 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             - `poll`: Return current snapshot immediately for `session_id` or `session_ids`.
             - `wait`: Block until the first referenced explore run finishes or needs input. `timeout=0` behaves like poll.
             - `cancel`: Cancel a live explore child session.
+
+            \(Self.lifecycleWaitSemantics)
 
             `response_mode` controls terminal assistant text: `full` (default) preserves the existing response, `tail` returns up to the last 2,000 characters for the top-level snapshot, and `none` returns only exact retrieval metadata. Actionable interaction context remains full.
 
@@ -64,7 +74,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                     "message": .string(description: "[start] Exploration instruction text for one fresh explore child. Mutually exclusive with messages."),
                     "messages": .array(description: "[start] Array of exploration instruction strings. Mutually exclusive with message. Starts one fresh explore child per entry.", items: .string()),
                     "detach": .boolean(description: "[start] Return immediately instead of waiting. Default false."),
-                    "timeout": .number(description: "[start, wait] Max wait seconds. 0 = poll. Default \(defaultWaitSeconds)."),
+                    "timeout": .number(description: "[start, wait] \(Self.lifecycleWaitSemantics)"),
                     "response_mode": .string(description: "How much terminal assistant text to return inline: full (default), tail, or none. Trimming exports exact text first; export failure falls back to full.", default: "full", enum: ["full", "tail", "none"]),
                     "worktree": .string(description: "[start] Existing worktree selector to bind before provider startup: @current, @main, @branch:<name>, name, branch, path, or @id:<worktree_id>. Mutually exclusive with worktree_id and worktree_create."),
                     "worktree_id": .string(description: "[start] Durable worktree ID to bind before provider startup. Mutually exclusive with worktree and worktree_create."),
@@ -92,7 +102,6 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
     }
 
     private func agentRunTool() -> Tool {
-        let defaultWaitSeconds = Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds)
         let messageDescription = "[start, steer] Instruction text. Required for start and steer. If sharing an exported plan, include the path/instruction directly in this text."
         var properties: OrderedDictionary<String, JSONSchema> = [
             "op": .string(description: "Operation.", enum: ["start", "poll", "wait", "cancel", "steer", "respond"]),
@@ -108,7 +117,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             "workflow_id": .string(description: "[start, steer, respond] Workflow ID. Mutually exclusive with workflow_name."),
             "workflow_name": .string(description: "[start, steer, respond] Workflow name. Mutually exclusive with workflow_id."),
             "detach": .boolean(description: "[start] Return immediately instead of waiting. Default false."),
-            "timeout": .number(description: "[start, wait] Max wait seconds. 0 = poll. Default \(defaultWaitSeconds)."),
+            "timeout": .number(description: "[start, wait] \(Self.lifecycleWaitSemantics)"),
             "worktree": .string(description: "[start] Existing worktree selector to bind before provider startup: @current, @main, @branch:<name>, name, branch, path, or @id:<worktree_id>. Mutually exclusive with worktree_id and worktree_create."),
             "worktree_id": .string(description: "[start] Durable worktree ID to bind before provider startup. Mutually exclusive with worktree and worktree_create."),
             "worktree_create": .boolean(description: "[start] Create an app-managed Git worktree, bind it to the new session, materialize its hidden root, then start the provider. Mutually exclusive with worktree/worktree_id."),
@@ -121,7 +130,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             "worktree_color": .string(description: "[start] Optional visual color to persist for the bound worktree as #RRGGBB."),
             "allow_external_worktree_path": .boolean(description: "[start + worktree_create] Allow explicit worktree_path outside RepoPrompt's app-managed worktree container."),
             "wait": .boolean(description: "[steer] Wait for an interesting/terminal state after steering. Implied when timeout_seconds is provided."),
-            "timeout_seconds": .number(description: "[steer] Max wait seconds when wait=true. 0 = immediate post-steer snapshot. Default \(defaultWaitSeconds)."),
+            "timeout_seconds": .number(description: "[steer] When wait=true, \(Self.lifecycleWaitSemantics) Zero returns the immediate post-steer snapshot."),
             "interaction_id": .string(description: "[respond] Pending interaction UUID from the snapshot. Returned as a top-level field in poll/wait responses when the run is waiting_for_input."),
             "response": .string(description: "[respond] Text answer or decision token (accept, decline, cancel, skip, etc). For MCP elicitation use accept, decline, or cancel; a non-action string is sent as content.response."),
             "answers": .object(description: "[respond] Structured answers keyed by question ID."),
@@ -150,12 +159,14 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
 
             **Operations**: start | poll | wait | cancel | steer | respond
 
-            - `start`: Launch an agent run in a **new** session/tab. Do NOT pass `session_id` — use `steer` to continue an existing session. Omit `model_id` to use the `pair` role, or pass `model_id` with a role label (resolved via the global role-default mapping in `agent_manage.list_agents` `task_labels`) or an explicit compound `model_id` from `agents[].models[].model_id`. When started from an Agent Mode run, the new child session inherits the source session's worktree bindings by default; pass `inherit_worktree=false` to keep parent session threading but skip worktree inheritance. Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. Returns a `session_id` — save it for all follow-up calls. Waits up to `timeout` seconds (default \(defaultWaitSeconds)). Pass `detach: true` to return immediately.
+            - `start`: Launch an agent run in a **new** session/tab. Do NOT pass `session_id` — use `steer` to continue an existing session. Omit `model_id` to use the `pair` role, or pass `model_id` with a role label (resolved via the global role-default mapping in `agent_manage.list_agents` `task_labels`) or an explicit compound `model_id` from `agents[].models[].model_id`. When started from an Agent Mode run, the new child session inherits the source session's worktree bindings by default; pass `inherit_worktree=false` to keep parent session threading but skip worktree inheritance. Optional start-only worktree args can bind the new session to an existing worktree (`worktree`/`worktree_id`) or create an app-managed worktree (`worktree_create=true`) before provider startup; explicit worktree args take precedence, suppress parent inheritance, and bind only the requested worktree. Returns a `session_id` — save it for all follow-up calls. When waiting, omit `timeout` to use the automatic policy below. Pass `detach: true` to return immediately.
             - `poll`: Return current snapshot immediately. Accepts `session_id` (single) or `session_ids` (array — returns all current snapshots).
-            - `wait`: Block until the run finishes or needs input. Default \(defaultWaitSeconds)s. `timeout: 0` = poll. Accepts `session_id` (single) or `session_ids` (array — returns when first session reaches interesting state). Returns `interaction_id` when input is pending.
+            - `wait`: Block until the run finishes or needs input. Omit `timeout` for automatic selection. `timeout: 0` = poll. Accepts `session_id` (single) or `session_ids` (array — returns when first session reaches interesting state). Returns `interaction_id` when input is pending.
             - `cancel`: Stop an active agent run. Only valid when the run is `running` or `waiting_for_input`. Requires `session_id`.
             - `steer`: Continue an existing agent session by sending a follow-up instruction to the `session_id` returned by `start`. If the run is still active, the instruction is steered into that run; if the last run already finished or the MCP wait/control handle expired, RepoPrompt reactivates the existing Agent session and starts the next run in the same session when it still exists. Pass `wait: true` (or `timeout_seconds`) to block until the steered run finishes or needs input. Do NOT use `steer` when status is `waiting_for_input` — use `respond` instead.
             - `respond`: Resolve a pending interaction (question, approval, MCP elicitation, etc). Requires `session_id` and `interaction_id` from the snapshot. The `interaction_id` is returned as a top-level field in poll/wait responses when input is pending. For MCP elicitation, use `response` (`accept`, `decline`, or `cancel`) plus optional object `content` and `meta`.
+
+            \(Self.lifecycleWaitSemantics)
 
             **session_id lifecycle**: `start` creates a new session and returns `session_id` in the response. All subsequent operations on that run require passing the same `session_id` back. Do NOT invent session IDs — always use the value returned by `start`.
 

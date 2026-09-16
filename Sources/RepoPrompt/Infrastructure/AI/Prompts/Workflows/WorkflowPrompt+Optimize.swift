@@ -117,7 +117,7 @@ Use `detach:true` so they run concurrently:
 // (Target & call graph, Prior perf work, Scope), each with detach:true.
 
 // Then wait on all of them at once
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<id1>","<id2>","<id3>","<id4>","<id5>"],"timeout":180}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<id1>","<id2>","<id3>","<id4>","<id5>"]}}
 ```
 """,
 	cli: """
@@ -126,7 +126,7 @@ Use `detach:true` so they run concurrently:
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="Bottleneck candidates: <area>" message="Scout for performance bottlenecks around <translated target>. Look at the target AND surrounding context: callers, data dependencies, adjacent operations, shared infrastructure. Hunt for tight loops with per-iteration allocations, redundant computation, locking, expensive transformations, sync I/O on hot paths, O(n²), unbatched updates. Report 2–3 ranked candidates with file:line and one-sentence rationale per candidate. No fixes yet." detach=true'
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="Conventions: AGENTS.md" message="Read AGENTS.md. Report how to run unit tests, benchmarks, debug harness, sanctioned measurement commands. Quote exact commands." detach=true'
 # Repeat the same shape for the remaining 3 explores in the table above (Target & call graph, Prior perf work, Scope), each with detach=true.
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>","<id3>","<id4>","<id5>"] timeout=180'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>","<id3>","<id4>","<id5>"]'
 ```
 """))
 
@@ -387,7 +387,7 @@ You (the agent) own triage, prompt translation, scoreboard reads, sub-agent veri
 **Cheat sheet for the four operations you'll repeat:**
 ```
 agent_run op=start  model_id=<explore|pair>  detach=true       # dispatch
-agent_run op=wait   session_ids=["..."]      timeout=N         # block
+agent_run op=wait   session_ids=["..."]                        # block; automatic wait
 agent_run op=steer  session_id="..."         wait=true         # correct
 \(builderName)  response_type=plan  export_response=true              # plan
 ```

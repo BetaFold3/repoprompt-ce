@@ -52,7 +52,55 @@ public enum MCPTimeoutPolicy {
     /// and transport delivery before the CLI cancels the request.
     public static let cliSemanticWaitResponseMarginSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
 
-    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = 120
+    /// Provider family of the **parent** model invocation that called an agent lifecycle tool
+    /// (`agent_run` / `agent_explore` start, wait, multi-wait, steer-with-wait). The app freezes the
+    /// family once at the outer lifecycle entry from the authenticated run binding; it is never
+    /// inferred from the worker model, the MCP client name, a role label, or a transport protocol.
+    public enum AgentLifecycleParentFamily: String, CaseIterable, Sendable, Codable {
+        case claude
+        case codex
+        case other
+        case unresolved
+    }
+
+    /// Automatic (omitted-timeout) lifecycle wait when the effective parent is Claude Code.
+    public static let agentLifecycleClaudeAutomaticWaitSeconds: TimeInterval = 180
+    /// Automatic lifecycle wait when the effective parent is Codex. This is a CE operational
+    /// heuristic, not a Codex CLI/app-server prompt-cache TTL contract.
+    public static let agentLifecycleCodexAutomaticWaitSeconds: TimeInterval = 600
+    /// Automatic lifecycle wait for every other named provider.
+    public static let agentLifecycleOtherAutomaticWaitSeconds: TimeInterval = 180
+    /// Automatic lifecycle wait when no authoritative live parent can be resolved
+    /// (missing, ambiguous, stale, fallback, external or remote binding).
+    public static let agentLifecycleUnresolvedAutomaticWaitSeconds: TimeInterval = 180
+    /// Largest value the automatic family table can select.
+    public static let agentLifecycleMaximumAutomaticWaitSeconds: TimeInterval = 600
+    /// Owned-host response envelope for operations that actually perform an automatic wait:
+    /// the maximum automatic wait plus the response encoding/delivery margin (600 + 30).
+    public static let agentLifecycleAutomaticWaitResponseEnvelopeSeconds: TimeInterval =
+        agentLifecycleMaximumAutomaticWaitSeconds + cliSemanticWaitResponseMarginSeconds
+    /// Inclusive upper bound for an explicit lifecycle timeout: exactly four hours. Larger values
+    /// are rejected, never clamped.
+    public static let agentLifecycleMaximumExplicitTimeoutSeconds: TimeInterval = 14400
+
+    /// Resolves the automatic lifecycle wait for a frozen parent family.
+    public static func agentLifecycleAutomaticWaitSeconds(for family: AgentLifecycleParentFamily) -> TimeInterval {
+        switch family {
+        case .claude:
+            agentLifecycleClaudeAutomaticWaitSeconds
+        case .codex:
+            agentLifecycleCodexAutomaticWaitSeconds
+        case .other:
+            agentLifecycleOtherAutomaticWaitSeconds
+        case .unresolved:
+            agentLifecycleUnresolvedAutomaticWaitSeconds
+        }
+    }
+
+    /// Compatibility alias for the unresolved-parent automatic wait. Provider-aware production
+    /// code must resolve the parent family and call `agentLifecycleAutomaticWaitSeconds(for:)`
+    /// instead of treating this value as a universal default.
+    public static let agentLifecycleDefaultWaitSeconds: TimeInterval = agentLifecycleUnresolvedAutomaticWaitSeconds
     public static let askUserDefaultTimeoutSeconds: TimeInterval = 300
     public static let nextUserInstructionDefaultWaitSeconds: TimeInterval = 600
     public static let applyEditsApprovalTimeoutSeconds: TimeInterval = 300

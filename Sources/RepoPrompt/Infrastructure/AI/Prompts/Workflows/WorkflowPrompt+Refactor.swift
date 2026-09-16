@@ -93,12 +93,12 @@ Collect results before proceeding:
 \(example(variant,
 	mcp: """
 ```json
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<id_1>","<id_2>"],"timeout":60}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<id_1>","<id_2>"]}}
 ```
 """,
 	cli: """
 ```bash
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id_1>","<id_2>"] timeout=60'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id_1>","<id_2>"]'
 ```
 """))
 

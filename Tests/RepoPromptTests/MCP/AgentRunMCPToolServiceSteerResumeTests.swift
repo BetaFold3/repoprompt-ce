@@ -216,6 +216,138 @@ final class AgentRunMCPToolServiceSteerResumeTests: XCTestCase {
         XCTAssertFalse(hasActiveRegistration)
     }
 
+    // MARK: - Plan §6.4 steer wait selection ordering
+
+    func testSteerRejectsExplicitTimeoutAboveMaximumBeforeAnyMutationOrReactivation() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.origin = .user
+        session.runState = .completed
+
+        var service = makeService(window: window)
+        service.testDispatchSteerInstruction = { _, _, _, _ in
+            XCTFail("An invalid explicit timeout must fail before the steering mutation")
+            return .startedRun
+        }
+
+        do {
+            _ = try await service.execute(args: [
+                "op": .string("steer"),
+                "session_id": .string(sessionID.uuidString),
+                "message": .string("never dispatched"),
+                "timeout_seconds": .int(14401)
+            ])
+            XCTFail("Expected timeout validation failure")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("14400"), String(describing: error))
+        }
+
+        XCTAssertNil(session.mcpControlContext, "Validation must run before control-context reactivation")
+        XCTAssertFalse(session.mcpFollowUpRunPending)
+        XCTAssertFalse(session.isMCPOriginated)
+        let hasActiveRegistration = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)
+        XCTAssertFalse(hasActiveRegistration)
+    }
+
+    func testSteerWithWaitFalseIgnoresSuppliedTimeoutWithoutParsingAndReportsNoPolicy() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.origin = .user
+        session.runState = .completed
+
+        var service = makeService(window: window)
+        var resolutionCount = 0
+        service.resolveWaitPolicyContext = { metadata in
+            resolutionCount += 1
+            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .codex)
+        }
+        var dispatchCount = 0
+        service.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
+            dispatchCount += 1
+            let controlledSession = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: dispatchedSessionID))
+            await agentModeVM.prepareMCPWaitTrackingForRunStart(session: controlledSession)
+            controlledSession.runState = .running
+            agentModeVM.publishMCPStateChange(for: controlledSession)
+            return .startedRun
+        }
+
+        // 99,999 would fail validation if parsed; wait=false must keep ignoring it with the warning.
+        let value = try await service.execute(args: [
+            "op": .string("steer"),
+            "session_id": .string(sessionID.uuidString),
+            "message": .string("fire and forget"),
+            "wait": .bool(false),
+            "timeout_seconds": .int(99999)
+        ])
+
+        XCTAssertEqual(dispatchCount, 1)
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue)
+        XCTAssertTrue(
+            object["warning"]?.stringValue?.contains("Ignoring timeout_seconds because wait=false") == true,
+            "warning: \(String(describing: object["warning"]))"
+        )
+        XCTAssertNil(object["wait_policy"], "A deliberately non-waiting steer has no wait policy to report")
+        XCTAssertEqual(resolutionCount, 0, "No wait selection means no parent-family resolution")
+
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
+    func testSteerWithExplicitZeroFreezesFamilyBeforeDispatchAndReportsPollPolicy() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.origin = .user
+        session.runState = .completed
+
+        var service = makeService(window: window)
+        var resolvedBeforeDispatch = false
+        var resolutionCount = 0
+        service.resolveWaitPolicyContext = { metadata in
+            resolutionCount += 1
+            resolvedBeforeDispatch = true
+            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .codex)
+        }
+        service.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
+            XCTAssertTrue(resolvedBeforeDispatch, "The parent family must be frozen before the steering mutation")
+            let controlledSession = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: dispatchedSessionID))
+            await agentModeVM.prepareMCPWaitTrackingForRunStart(session: controlledSession)
+            controlledSession.runState = .running
+            agentModeVM.publishMCPStateChange(for: controlledSession)
+            return .startedRun
+        }
+
+        let value = try await service.execute(args: [
+            "op": .string("steer"),
+            "session_id": .string(sessionID.uuidString),
+            "message": .string("steer then poll"),
+            "wait": .bool(true),
+            "timeout_seconds": .int(0)
+        ])
+
+        let object = try XCTUnwrap(value.objectValue)
+        XCTAssertEqual(object["status"]?.stringValue, AgentRunMCPSnapshot.Status.running.rawValue)
+        XCTAssertNil(object["warning"])
+        XCTAssertEqual(object["wait_policy"], .object(["mode": .string("poll"), "timeout_seconds": .int(0)]))
+        XCTAssertEqual(resolutionCount, 1)
+
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
     private func makeWindow() async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

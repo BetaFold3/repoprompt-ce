@@ -277,9 +277,9 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertTrue(responseModeDescription.contains("auto-export"))
     }
 
-    func testLifecycleSchemasAdvertiseConfigurableDefaultsWithoutMaximumClamp() async throws {
+    func testLifecycleSchemasAdvertiseProviderAutomaticWaitsAndExplicitRange() async throws {
         do {
-            let caseLabel = "testAgentLifecycleSchemasAdvertiseTwoMinuteDefaultsWithoutMaximumClamp"
+            let caseLabel = "testAgentLifecycleSchemasAdvertiseProviderAutomaticWaitsAndExplicitRange"
             let window = Self.makeWindowWithoutAutoStart()
             let tools = await window.mcpServer.windowMCPTools
             let agentExplore = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentExplore }, caseLabel)
@@ -293,10 +293,32 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             let runTimeout = try XCTUnwrap(runProperties["timeout"]?.objectValue?["description"]?.stringValue, caseLabel)
             let steerTimeout = try XCTUnwrap(runProperties["timeout_seconds"]?.objectValue?["description"]?.stringValue, caseLabel)
 
-            let defaultText = "Default \(Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds))."
-            for description in [exploreTimeout, runTimeout, steerTimeout] {
-                XCTAssertTrue(description.contains(defaultText), caseLabel + ": " + description)
-                XCTAssertFalse(description.lowercased().contains("maximum"), caseLabel + ": " + description)
+            let claudeText = "Claude \(Int(MCPTimeoutPolicy.agentLifecycleClaudeAutomaticWaitSeconds)) seconds"
+            let codexText = "Codex \(Int(MCPTimeoutPolicy.agentLifecycleCodexAutomaticWaitSeconds)) seconds"
+            let otherText = "other \(Int(MCPTimeoutPolicy.agentLifecycleOtherAutomaticWaitSeconds)) seconds"
+            let unresolvedText = "unresolved \(Int(MCPTimeoutPolicy.agentLifecycleUnresolvedAutomaticWaitSeconds)) seconds"
+            let rangeText = "range 0...\(Int(MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds)) seconds"
+            for description in [
+                exploreTimeout,
+                runTimeout,
+                steerTimeout,
+                agentExplore.description,
+                agentRun.description
+            ] {
+                XCTAssertTrue(description.contains("Omit the timeout for automatic selection from the effective parent provider"), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains(claudeText), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains(codexText), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains(otherText), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains(unresolvedText), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains("actionable state returns early"), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains("wait-phase upper bound"), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains("worker remains active"), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains(rangeText), caseLabel + ": " + description)
+                XCTAssertTrue(description.contains("zero means poll"), caseLabel + ": " + description)
+                XCTAssertFalse(description.contains("Default 180"), caseLabel + ": " + description)
+                XCTAssertFalse(description.contains("Default 600"), caseLabel + ": " + description)
+                XCTAssertFalse(description.lowercased().contains("cache-safe"), caseLabel + ": " + description)
+                XCTAssertFalse(description.lowercased().contains("codex ttl"), caseLabel + ": " + description)
             }
         }
 
@@ -796,8 +818,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
         "17|remote_pairing|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b66a65cddc2ce05b1aa4bd372bf87806149f0059c77318f2c0c88d998953733b|schema=78d2d5faef64665bd00b69fe88ebd9776445c1b21e028dbaf03f7bbeaa6dfed2",
-        "18|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3dd91b2691b65094d6705bbd57a835d02f612b5725ce5251447ccb49a006ce6b|schema=b9ec9650bf3d775f9429b791e12e4056c06bf920a2ed040ed769df027dfe81bc",
-        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=9d0df6c967849e5478e333bb96478795057b0e129c7d7616eff97873eb27567e|schema=28a006ae721e839f1a0fcaeaabdce869424bd6c4246592fa7ab4dc76d1f507e5",
+        "18|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=5e70eaa6fadbd541d9692c1ca946c8377c15f50bb5fb137a35c78a20d959470f|schema=4cdae85b26c8cabfd9e9473a32e6b41d36da3db1fe40959919d4369ff4f50549",
+        "19|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=0c27ddd17cd1662bcb78a5fe871f99c608b3d513901c22c99fa4ccb59cbe744a|schema=85269d27565923683fd042e26938001ed9caf60e162a52967478fa80a3a0e32d",
         "20|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b057e2b0203e6ec0faeac9b9342f1823d655cd7a60e51436d44d817da5516d69|schema=4cd0a819fec64efd8e0d3ad26a5242f622dd9496627b19f381bbc02ebc8fc3e5",
         "21|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
         "22|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",

@@ -1,6 +1,8 @@
+import Foundation
 import MCP
 @testable import RepoPromptGateway
 import RepoPromptRemoteWire
+import RepoPromptShared
 import XCTest
 
 final class RemoteCommandTranslatorTests: XCTestCase {
@@ -693,7 +695,7 @@ final class RemoteCommandTranslatorTests: XCTestCase {
         }
     }
 
-    func testTranslatedToolCallsCarryAppLinkTimeoutPolicy() throws {
+    func testFastAndPollToolCallsRetainAppLinkTimeoutPolicy() throws {
         let sid = "11111111-1111-1111-1111-111111111111"
         let translator = RemoteCommandTranslator()
 
@@ -717,29 +719,114 @@ final class RemoteCommandTranslatorTests: XCTestCase {
             try translator.translate(RemoteClientFrame(type: "poll", sessionID: sid, payload: .object([:]))).timeout,
             60
         )
+    }
+
+    func testOmittedStartAndWaitingSteerUseOwnedResponseEnvelope() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let translator = RemoteCommandTranslator()
+        let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
+        XCTAssertEqual(expected, 630)
+        let frames = [
+            RemoteClientFrame(type: "start", payload: .object(["message": .string("go")])),
+            RemoteClientFrame(
+                type: "start",
+                payload: .object(["message": .string("go"), "detach": .bool(true)])
+            ),
+            RemoteClientFrame(
+                type: "steer",
+                sessionID: sid,
+                payload: .object(["message": .string("next"), "wait": .bool(true)])
+            )
+        ]
+
+        for frame in frames {
+            XCTAssertEqual(try translator.translate(frame).timeout, expected, frame.type)
+        }
+    }
+
+    func testSteerTimeoutPresenceInfersWaitUnlessWaitIsFalse() throws {
+        let sid = "11111111-1111-1111-1111-111111111111"
+        let translator = RemoteCommandTranslator()
+
+        let inferredWait = try translator.translate(RemoteClientFrame(
+            type: "steer",
+            sessionID: sid,
+            payload: .object(["message": .string("next"), "timeout_seconds": .int(300)])
+        ))
+        XCTAssertEqual(inferredWait.timeout, 330)
+        XCTAssertNil(inferredWait.arguments["wait"])
+        XCTAssertEqual(inferredWait.arguments["timeout_seconds"], .int(300))
+
+        let explicitNonWait = try translator.translate(RemoteClientFrame(
+            type: "steer",
+            sessionID: sid,
+            payload: .object([
+                "message": .string("next"),
+                "wait": .bool(false),
+                "timeout_seconds": .int(300)
+            ])
+        ))
+        XCTAssertEqual(explicitNonWait.timeout, 60)
+        XCTAssertEqual(explicitNonWait.arguments["wait"], .bool(false))
+        XCTAssertEqual(explicitNonWait.arguments["timeout_seconds"], .int(300))
+
+        let falseWaitValues: [JSONValue] = [
+            .string(" FALSE "),
+            .string("0"),
+            .string("no"),
+            .int(0),
+            .double(0)
+        ]
+        for wait in falseWaitValues {
+            let call = try translator.translate(RemoteClientFrame(
+                type: "steer",
+                sessionID: sid,
+                payload: .object([
+                    "message": .string("next"),
+                    "wait": wait,
+                    "timeout_seconds": .int(300)
+                ])
+            ))
+            XCTAssertEqual(call.timeout, 60, "\(wait)")
+        }
+
+        let trueWaitValues: [JSONValue] = [
+            .string(" TRUE "),
+            .string("1"),
+            .string("yes"),
+            .int(2),
+            .double(-1)
+        ]
+        for wait in trueWaitValues {
+            let call = try translator.translate(RemoteClientFrame(
+                type: "steer",
+                sessionID: sid,
+                payload: .object(["message": .string("next"), "wait": wait])
+            ))
+            XCTAssertEqual(
+                call.timeout,
+                MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds,
+                "\(wait)"
+            )
+        }
+
+        let omittedWait = try translator.translate(RemoteClientFrame(
+            type: "steer",
+            sessionID: sid,
+            payload: .object(["message": .string("next")])
+        ))
+        XCTAssertEqual(omittedWait.timeout, 60)
+    }
+
+    func testExplicitAppLinkTimeoutsRetainFloorGraceAndCap() throws {
+        let translator = RemoteCommandTranslator()
+
+        XCTAssertEqual(AppLinkCallTimeoutPolicy.fast, 60)
+        XCTAssertEqual(AppLinkCallTimeoutPolicy.grace, 30)
+        XCTAssertEqual(AppLinkCallTimeoutPolicy.cap, 900)
         XCTAssertEqual(
             try translator.translate(
-                RemoteClientFrame(
-                    type: "steer",
-                    sessionID: sid,
-                    payload: .object(["message": .string("next"), "wait": .bool(true), "timeout_seconds": .int(300)])
-                )
-            ).timeout,
-            330
-        )
-        XCTAssertEqual(
-            try translator.translate(
-                RemoteClientFrame(
-                    type: "steer",
-                    sessionID: sid,
-                    payload: .object(["message": .string("next"), "wait": .bool(true)])
-                )
-            ).timeout,
-            150
-        )
-        XCTAssertEqual(
-            try translator.translate(
-                RemoteClientFrame(type: "steer", sessionID: sid, payload: .object(["message": .string("next")]))
+                RemoteClientFrame(type: "start", payload: .object(["message": .string("go"), "timeout": .int(0)]))
             ).timeout,
             60
         )
@@ -750,14 +837,44 @@ final class RemoteCommandTranslatorTests: XCTestCase {
             90
         )
         XCTAssertEqual(
-            try translator.translate(RemoteClientFrame(type: "start", payload: .object(["message": .string("go")]))).timeout,
-            150
-        )
-        XCTAssertEqual(
             try translator.translate(
-                RemoteClientFrame(type: "start", payload: .object(["message": .string("go"), "timeout": .int(10000)]))
+                RemoteClientFrame(type: "start", payload: .object(["message": .string("go"), "timeout": .int(870)]))
             ).timeout,
             900
         )
+        XCTAssertEqual(
+            try translator.translate(RemoteClientFrame(
+                type: "start",
+                payload: .object([
+                    "message": .string("go"),
+                    "timeout": .double(MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds)
+                ])
+            )).timeout,
+            900
+        )
+    }
+
+    func testTimeoutAbove870CapsTransportWithoutTranslatingWorkerCancellation() throws {
+        let requestedTimeout: TimeInterval = 871
+        let call = try RemoteCommandTranslator().translate(RemoteClientFrame(
+            type: "start",
+            payload: .object(["message": .string("go"), "timeout": .double(requestedTimeout)])
+        ))
+
+        XCTAssertEqual(call.timeout, 900)
+        XCTAssertEqual(
+            call.timeout,
+            AppLinkCallTimeoutPolicy.cap,
+            "The gateway transport cap remains independent of the accepted worker wait."
+        )
+        XCTAssertLessThan(
+            try XCTUnwrap(call.timeout),
+            requestedTimeout + AppLinkCallTimeoutPolicy.grace,
+            "Above 870 seconds the gateway can expire before the semantic wait plus response grace."
+        )
+        XCTAssertEqual(call.toolName, "agent_run")
+        XCTAssertEqual(call.arguments["op"], .string("start"))
+        XCTAssertEqual(call.arguments["timeout"], .double(requestedTimeout))
+        XCTAssertNotEqual(call.arguments["op"], .string("cancel"), "Transport expiry does not cancel the worker.")
     }
 }

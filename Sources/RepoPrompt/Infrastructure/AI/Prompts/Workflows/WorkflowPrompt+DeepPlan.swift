@@ -160,14 +160,14 @@ Each explore gets ONE narrow question. Spawn with `detach: true`, then wait on t
 	"detach":true
 }}
 
-{"tool":"agent_run","args":{"op":"wait","session_ids":["<id1>","<id2>"],"timeout":120}}
+{"tool":"agent_run","args":{"op":"wait","session_ids":["<id1>","<id2>"]}}
 ```
 """,
 	cli: """
 ```bash
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="Seams: <area>" message="How does <subsystem> connect to <adjacent area>? Key types, extension points, file:line refs." detach=true'
 rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="External: <topic>" message="Look up <library/API/RFC>. Report current behavior, version notes, and 2–3 links." detach=true'
-rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>"] timeout=120'
+rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>"]'
 ```
 """))
 

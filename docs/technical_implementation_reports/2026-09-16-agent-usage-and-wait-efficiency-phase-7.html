@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phase 7 Agent Usage and Wait Efficiency — Technical Report</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --page: #f5f7fb;
+  --panel: #ffffff;
+  --ink: #172033;
+  --muted: #5f687a;
+  --line: #d8deea;
+  --accent: #1463a5;
+  --accent-soft: #eaf3fc;
+  --good: #196c3a;
+  --warn: #9a5a00;
+  --warn-soft: #fff6e6;
+  --code: #eef2f7;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #10141c;
+    --panel: #171d28;
+    --ink: #eef3fb;
+    --muted: #aeb9ca;
+    --line: #354055;
+    --accent: #73c8ff;
+    --accent-soft: #132c42;
+    --good: #8ce8ad;
+    --warn: #ffc25e;
+    --warn-soft: #3a2b0e;
+    --code: #222b3a;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font: 16px/1.58 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+main { width: min(1060px, calc(100% - 32px)); margin: 32px auto 72px; }
+header, section {
+  margin: 18px 0;
+  padding: 25px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+h1, h2, h3 { line-height: 1.22; }
+h1 { margin: 0 0 10px; font-size: clamp(1.9rem, 4vw, 2.8rem); }
+h2 { margin: 0 0 14px; font-size: 1.45rem; }
+h3 { margin: 24px 0 8px; font-size: 1.08rem; }
+p, li { max-width: 82ch; }
+.lede { margin: 0; color: var(--muted); font-size: 1.08rem; }
+.badge {
+  display: inline-block;
+  margin: 12px 6px 0 0;
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: .88rem;
+}
+.callout {
+  margin: 14px 0;
+  padding: 12px 15px;
+  border-left: 4px solid var(--accent);
+  background: var(--accent-soft);
+}
+.warn { border-left-color: var(--warn); background: var(--warn-soft); }
+.good { color: var(--good); font-weight: 700; }
+code {
+  padding: .12em .32em;
+  border-radius: 5px;
+  background: var(--code);
+  font: .9em ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+}
+pre {
+  overflow: auto;
+  margin: 10px 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--code);
+}
+pre code { padding: 0; background: transparent; overflow-wrap: normal; }
+table { width: 100%; border-collapse: collapse; font-size: .94rem; }
+th, td {
+  padding: 10px 8px;
+  vertical-align: top;
+  text-align: left;
+  border-bottom: 1px solid var(--line);
+}
+th { color: var(--muted); }
+ol.steps > li { margin: 17px 0; }
+.small { color: var(--muted); font-size: .91rem; }
+.kicker { color: var(--accent); font-weight: 700; letter-spacing: .04em; text-transform: uppercase; font-size: .78rem; }
+</style>
+</head>
+<body>
+<main>
+<header>
+<p class="kicker">Technical implementation report</p>
+<h1>Phase 7: agent lifecycle wait efficiency</h1>
+<p class="lede">This report explains the provider-aware automatic wait change for RepoPrompt CE Agent Mode.</p>
+<span class="badge">Report date: 2026-09-16</span>
+<span class="badge">Implementation staged</span>
+<span class="badge">No commit created</span>
+<span class="badge">No external assets</span>
+</header>
+
+<section>
+<h2>Outcome</h2>
+<p>Phase 7 replaces one universal two-minute lifecycle wait with a small provider-family policy.</p>
+<p>When a caller omits a timeout, a Claude parent gets 180 seconds.</p>
+<p>A Codex parent gets 600 seconds.</p>
+<p>Every other or unresolved parent gets 180 seconds.</p>
+<p>A lifecycle call starts a worker, waits for a worker, or continues a worker.</p>
+<p>MCP is the local protocol that lets an agent call RepoPrompt tools.</p>
+<p>The policy uses the authenticated parent run.</p>
+<p>It does not guess from the worker model, client name, role label, or transport.</p>
+<p>Early completion, cancellation, and user-input states still return immediately.</p>
+<p>The selected time is an upper limit for waiting.</p>
+<p>It is not a required sleep.</p>
+<p>It is also not a promise about a provider cache lifetime.</p>
+<p class="good">The staged implementation has focused test, lint, format-check, and product-build evidence from the implementation session.</p>
+</section>
+
+<section>
+<h2>Evidence and limits</h2>
+<ul>
+<li><strong>Current code evidence.</strong> This report reads the 33 staged Phase 7 files in the live checkout.</li>
+<li><strong>Current test-path evidence.</strong> The commands and test class names below come from the live <code>Makefile</code> and current test files.</li>
+<li><strong>Session evidence.</strong> The supplied handoff records the user instructions, the review process, and the original validation results.</li>
+<li><strong>Plan evidence.</strong> <code>docs/context/plans/2026-09-13-agent-usage-and-wait-efficiency-plan.md:278-287</code> and <code>:513-595</code> record the active Phase 7 contract.</li>
+<li><strong>Limit.</strong> No source test was rerun while this report was written.</li>
+<li><strong>Limit.</strong> This report adds documentation only. It does not change runtime code.</li>
+<li><strong>Limit.</strong> The report does not assess the checkout's unrelated untracked files.</li>
+</ul>
+<p>The Phase 7 source diff contained 33 staged files and <code>+2370/-248</code> lines before this report was added.</p>
+</section>
+
+<section>
+<h2>What changed and why</h2>
+<table>
+<thead><tr><th>Area</th><th>Live files</th><th>Change</th><th>Why</th></tr></thead>
+<tbody>
+<tr>
+<td>One shared policy</td>
+<td><code>Packages/RepoPromptCore/Sources/RepoPromptShared/MCP/MCPTimeoutPolicy.swift:52-106</code></td>
+<td>Adds the parent-family enum, the 180/600/180 automatic values, a 630-second response envelope, and a 14,400-second explicit maximum.</td>
+<td>One source of numbers prevents the app, CLI, and gateway from drifting.</td>
+</tr>
+<tr>
+<td>Parent identity</td>
+<td><code>Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentMCPWaitPolicy.swift:1-142</code><br><code>Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift:2385-2424</code></td>
+<td>Resolves the parent only from one exact, active, authenticated run binding. It freezes that result before a lifecycle mutation or Explore delegation.</td>
+<td>A remote, fallback, stale, missing, or ambiguous caller must not inherit another session's provider family.</td>
+</tr>
+<tr>
+<td>Agent lifecycle service</td>
+<td><code>Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentRunMCPToolService.swift</code><br><code>Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentExploreMCPToolService.swift</code><br><code>Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentMCPToolHelpers.swift</code></td>
+<td>Uses the frozen selection for start, wait, multi-wait, steer-with-wait, and Explore. It accepts JSON <code>null</code> as an omitted timeout. It rejects values above four hours.</td>
+<td>The same meaning now applies to every lifecycle path. Invalid values fail before a worker starts or receives a steer.</td>
+</tr>
+<tr>
+<td>Observable result</td>
+<td><code>Sources/RepoPrompt/Infrastructure/MCP/Agent/AgentMCPWaitPolicy.swift:32-72</code><br><code>Tests/RepoPromptTests/MCP/AgentRunResponsePresentationTests.swift</code><br><code>Tests/RepoPromptTests/MCP/MCPRequestIdempotencyAgentRunServiceTests.swift</code></td>
+<td>Adds one root <code>wait_policy</code> object to wait-related results. It survives idempotent replay and all response-display modes.</td>
+<td>A caller can see whether RepoPrompt used automatic, explicit, or poll behavior.</td>
+</tr>
+<tr>
+<td>CLI deadline</td>
+<td><code>Packages/RepoPromptCore/Sources/RepoPromptMCPCore/Interactive/InteractiveMCPClientSession.swift:974-1056</code><br><code>Packages/RepoPromptCore/Sources/RepoPromptMCPCore/CommandRunner/MCPCommandRunner.swift:679-700</code></td>
+<td>Gives owned automatic lifecycle waits a 630-second client envelope. It keeps an explicit wait at the requested value plus 30 seconds. It updates command help.</td>
+<td>A Codex automatic wait must not be cut off by the ordinary 300-second tool deadline.</td>
+</tr>
+<tr>
+<td>Remote gateway</td>
+<td><code>Sources/RepoPromptGateway/Wire/RemoteCommandTranslator.swift:18-89</code><br><code>Tests/RepoPromptTests/Gateway/RemoteCommandTranslatorTests.swift</code></td>
+<td>Uses the same omitted-timeout meaning and permissive boolean parsing. It retains its 900-second remote transport cap.</td>
+<td>The gateway is a remote-device route. Its cap is an intentional transport boundary. It does not cancel an accepted worker.</td>
+</tr>
+<tr>
+<td>Tool schema and cards</td>
+<td><code>Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPAgentControlToolProvider.swift:29-190</code><br><code>Sources/RepoPrompt/Features/AgentMode/Views/ToolCards/ToolCardRouter.swift:633-642</code></td>
+<td>Describes automatic selection and the explicit range. The tool card says <code>wait auto</code> when no timeout was supplied.</td>
+<td>The API description and visible card now match the runtime behavior.</td>
+</tr>
+<tr>
+<td>Workflow guidance</td>
+<td><code>Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPromptSharedFragments.swift:122-155</code><br><code>Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/WorkflowPrompt+*.swift</code></td>
+<td>Updates the managed workflows to prefer wait-first supervision and routine timeout omission.</td>
+<td>Polling less often reduces avoidable supervisor work. The guidance states that a wait alone does not warm a provider cache.</td>
+</tr>
+<tr>
+<td>Tests and records</td>
+<td><code>Packages/RepoPromptCore/Tests/RepoPromptCoreTests/MCP/Control/InteractiveMCPClientSessionCancellationTests.swift</code><br><code>Tests/RepoPromptTests/MCP/Control/AgentLifecycleExecutionContractTests.swift</code><br><code>Tests/RepoPromptTests/MCP/AgentRunMCPToolServiceWaitTests.swift</code><br><code>Scripts/Fixtures/test-suite-contract-ledger.tsv</code><br><code>docs/context/plans/2026-09-13-agent-usage-and-wait-efficiency-plan.md</code></td>
+<td>Adds focused coverage and records the completed Phase 7 contract and validation evidence.</td>
+<td>The policy has direct tests at the shared, service, CLI, gateway, UI, and prompt boundaries.</td>
+</tr>
+</tbody>
+</table>
+</section>
+
+<section>
+<h2>What to expect</h2>
+<h3>Automatic calls</h3>
+<p>Omit <code>timeout</code> for <code>start</code> or <code>wait</code>.</p>
+<p>Omit <code>timeout_seconds</code> for a steering call that waits.</p>
+<p>RepoPrompt returns a root object like this for an active automatic wait:</p>
+<pre><code>{
+  "wait_policy": {
+    "mode": "automatic",
+    "timeout_seconds": 600,
+    "parent_family": "codex"
+  }
+}</code></pre>
+<p>A Claude parent uses <code>180</code> and <code>"claude"</code>.</p>
+<p>An unknown parent uses <code>180</code> and <code>"unresolved"</code>.</p>
+<p>Only automatic mode includes <code>parent_family</code>.</p>
+
+<h3>Explicit and poll calls</h3>
+<p><code>timeout: 45</code> produces <code>mode: "explicit"</code> and a 45-second value.</p>
+<p><code>timeout: 0</code> produces <code>mode: "poll"</code>.</p>
+<p>Poll returns the current snapshot without waiting.</p>
+<p><code>timeout: null</code> means the same thing as omitting the field.</p>
+<p>Values from 0 through 14,400 seconds are valid.</p>
+<p>A value above 14,400 returns a validation error.</p>
+<p>RepoPrompt does not silently reduce an oversized value.</p>
+
+<h3>Detached and remote calls</h3>
+<p>A detached start does not wait.</p>
+<p>It therefore has no <code>wait_policy</code> object.</p>
+<p>The remote gateway uses a conservative 630-second envelope for an omitted start because it cannot know whether that start will detach.</p>
+<p>The gateway still caps its own response at 900 seconds.</p>
+<p>A response timeout at that remote boundary does not stop an already accepted worker.</p>
+
+<h3>Provider meaning</h3>
+<p>Only <code>.claudeCode</code> maps to the Claude row.</p>
+<p>Only <code>.codexExec</code> maps to the Codex row.</p>
+<p>Claude-compatible vendors do not automatically get the Claude value.</p>
+<p>They use the other row unless future code deliberately changes the table.</p>
+<p>A standalone, remote, legacy-routed, or ambiguous caller correctly resolves as unresolved.</p>
+</section>
+
+<section>
+<h2>Major decisions and session turns</h2>
+<table>
+<thead><tr><th>Turn or decision</th><th>Reasoning</th><th>Evidence</th></tr></thead>
+<tbody>
+<tr>
+<td>Use a fixed family mapping instead of the earlier universal 120-second value or adaptive cache arithmetic.</td>
+<td>The user asked for a small mapping that maintainers can review and change directly. The active plan treats the values as operational defaults, not provider cache guarantees.</td>
+<td>Current plan, <code>:278-287</code> and <code>:513-536</code>.</td>
+</tr>
+<tr>
+<td>Keep the mapping small: Claude 180, Codex 600, other/unresolved 180.</td>
+<td>The table is easy to find and test. A future provider-policy change needs one deliberate constants-table update.</td>
+<td><code>MCPTimeoutPolicy.swift:52-106</code> and <code>AgentLifecycleExecutionContractTests.swift:1-110</code>.</td>
+</tr>
+<tr>
+<td>Freeze only authenticated direct parent identity.</td>
+<td>The parent may be different from the worker. A fallback lookup could associate the request with the wrong provider. The safe fallback is unresolved.</td>
+<td><code>AgentMCPWaitPolicy.swift:85-137</code> and <code>MCPServerViewModel.swift:2385-2424</code>.</td>
+</tr>
+<tr>
+<td>Preserve an old public default symbol as a compatibility alias.</td>
+<td>Existing source can still compile. New lifecycle paths use the family resolver instead of treating that alias as a universal default.</td>
+<td><code>MCPTimeoutPolicy.swift:101-106</code>.</td>
+</tr>
+<tr>
+<td>Use one small response object without a policy version field.</td>
+<td>The current consumer needs the mode, chosen seconds, and automatic parent family. A version would create a public contract without a current use or migration rule.</td>
+<td>Current plan, <code>:776-785</code>; <code>AgentMCPWaitPolicy.Selection.canonicalValue</code>.</td>
+</tr>
+<tr>
+<td>Keep a four-hour server maximum but retain the gateway's 900-second cap.</td>
+<td>The server can accept a longer explicit lifecycle wait. The remote gateway has a separate transport limit. The limit is visible rather than hidden as a server-side clamp.</td>
+<td>Current plan, <code>:752-775</code>; <code>RemoteCommandTranslator.swift:18-89</code>.</td>
+</tr>
+<tr>
+<td>Guide agents to wait first instead of polling first.</td>
+<td>A wait wakes early for actionable state. The guidance also avoids the incorrect claim that a transport wait itself warms a model cache.</td>
+<td><code>WorkflowPromptSharedFragments.swift:149-155</code>.</td>
+</tr>
+<tr>
+<td>Use scoped workers for scouting and implementation. Reserve code review for OracleA and OracleB.</td>
+<td>The user required workers to gather or verify evidence but not review code. The user required fresh Oracle review lanes after remediation.</td>
+<td>Supplied session handoff and user request.</td>
+</tr>
+<tr>
+<td>Fix OracleA's initial P1 about JSON-null deadlines.</td>
+<td>JSON <code>null</code> is omission. It must receive the automatic 630-second owned CLI envelope, not the ordinary 300-second deadline.</td>
+<td>Supplied session handoff; <code>InteractiveMCPClientSession.swift:974-1056</code>; <code>InteractiveMCPClientSessionCancellationTests.swift:1-100</code>.</td>
+</tr>
+<tr>
+<td>Fix OracleB's initial P1 about fallback provenance.</td>
+<td>Manager or legacy fallback must not borrow another session's family. The resolver now requires the exact direct connection-to-run binding.</td>
+<td>Supplied session handoff; <code>MCPServerViewModel.swift:2385-2424</code>.</td>
+</tr>
+<tr>
+<td>Run fresh re-reviews rather than continue an old review chat.</td>
+<td>The user required a new review lane for each remediation round. Both fresh lanes closed their initial P1 finding and approved the remediated state.</td>
+<td>Supplied session handoff; current plan, <code>:810</code>.</td>
+</tr>
+<tr>
+<td>Stage implementation files but do not commit.</td>
+<td>The user expressly requested staging and no commit.</td>
+<td>Supplied session handoff; live repository status before this report showed 33 staged Phase 7 files.</td>
+</tr>
+</tbody>
+</table>
+</section>
+
+<section>
+<h2>How to test it now</h2>
+<p>Run these commands from the repository root.</p>
+<p>Use the coordinated <code>make dev-*</code> commands.</p>
+<p>If the conductor reports <code>global-wait</code>, wait for its ticket.</p>
+<p>Do not start a direct Swift or Xcode command as a substitute.</p>
+
+<h3>1. Check the local setup</h3>
+<pre><code>make doctor</code></pre>
+<p>Fix only setup problems that this command reports.</p>
+
+<h3>2. Run the smallest core test</h3>
+<pre><code>make dev-core-test FILTER=InteractiveMCPClientSessionCancellationTests</code></pre>
+<p>This checks automatic CLI envelopes, JSON <code>null</code>, explicit values, and poll behavior.</p>
+
+<h3>3. Run the policy contract test</h3>
+<pre><code>make dev-test FILTER=AgentLifecycleExecutionContractTests</code></pre>
+<p>This checks every current provider kind, the frozen parent family, the 180/600/180 table, the four-hour maximum, and the result metadata.</p>
+
+<h3>4. Run the lifecycle service tests</h3>
+<pre><code>make dev-test FILTER=AgentRunMCPToolServiceWaitTests
+make dev-test FILTER=AgentRunMCPToolServiceSteerResumeTests
+make dev-test FILTER=AgentRunWorktreeStartTests</code></pre>
+<p>These cover wait, steer-with-wait, multi-wait, and start paths.</p>
+
+<h3>5. Run the transport and presentation tests</h3>
+<pre><code>make dev-test FILTER=RemoteCommandTranslatorTests
+make dev-test FILTER=AgentRunResponsePresentationTests
+make dev-test FILTER=MCPRequestIdempotencyAgentRunServiceTests</code></pre>
+<p>These check gateway deadline selection, <code>wait_policy</code> through response trimming, and replay behavior.</p>
+
+<h3>6. Run the user-facing contract tests</h3>
+<pre><code>make dev-test FILTER=AgentControlToolCardPresentationTests
+make dev-test FILTER=ToolCatalogSnapshotTests
+make dev-test FILTER=WorkflowPromptCatalogTests</code></pre>
+<p>These check tool-card text, tool schema text, and the managed workflow prompts.</p>
+
+<h3>7. Check style and build each affected product</h3>
+<pre><code>make dev-format-check
+make dev-lint
+make dev-swift-build PRODUCT=RepoPrompt
+make dev-swift-build PRODUCT=repoprompt-mcp
+make dev-swift-build PRODUCT=repoprompt-gateway</code></pre>
+<p>Each command should exit with status zero.</p>
+<p>A filtered test command must report that it ran tests.</p>
+<p>A zero-test command is not a pass.</p>
+
+<h3>8. Optional broader test</h3>
+<pre><code>make dev-test-parallel</code></pre>
+<p>This is the full root test lane.</p>
+<p>It is broader than the focused Phase 7 checks.</p>
+
+<h3>9. Optional manual behavior check</h3>
+<p>Use an active MCP-bound Agent Mode parent for this check.</p>
+<p>A standalone or remote caller is expected to produce the unresolved 180-second policy.</p>
+<p>Do not launch or relaunch a visible app through an agent without explicit approval.</p>
+<p>If you deliberately launch the debug app yourself, use <code>rpce-cli-debug</code>, not the production CLI.</p>
+<ol class="steps">
+<li>Select Claude as the active parent. Start or wait for a child without a timeout. Expect <code>mode: "automatic"</code>, <code>timeout_seconds: 180</code>, and <code>parent_family: "claude"</code>.</li>
+<li>Select Codex as the active parent. Repeat the call. Expect <code>timeout_seconds: 600</code> and <code>parent_family: "codex"</code>.</li>
+<li>Use <code>timeout: null</code>. Expect the same automatic result as an omitted timeout.</li>
+<li>Use <code>timeout: 0</code>. Expect <code>mode: "poll"</code> and no <code>parent_family</code>.</li>
+<li>Use <code>timeout: 45</code>. Expect <code>mode: "explicit"</code>, <code>timeout_seconds: 45</code>, and no <code>parent_family</code>.</li>
+<li>Use <code>timeout: 14401</code>. Expect an error before a new worker starts or an existing worker receives a steer.</li>
+<li>Start several detached workers. Then call one multi-wait without a timeout. Expect one root <code>wait_policy</code> object, not one object per worker.</li>
+</ol>
+<p>Example argument shapes:</p>
+<pre><code>{"op":"wait","session_id":"&lt;id&gt;"}
+{"op":"wait","session_id":"&lt;id&gt;","timeout":null}
+{"op":"wait","session_id":"&lt;id&gt;","timeout":0}
+{"op":"wait","session_id":"&lt;id&gt;","timeout":45}</code></pre>
+</section>
+
+<section>
+<h2>Validation recorded for the implementation</h2>
+<table>
+<thead><tr><th>Check</th><th>Recorded result</th><th>Source</th></tr></thead>
+<tbody>
+<tr><td>Focused core tests</td><td>15 tests passed. The same 15 passed again after remediation.</td><td>Current plan, <code>:810</code>.</td></tr>
+<tr><td>Focused root tests</td><td>194 tests passed before review. 95 affected tests passed again after remediation.</td><td>Current plan, <code>:810</code>.</td></tr>
+<tr><td>Style</td><td><code>make dev-format-check</code> and <code>make dev-lint</code> passed.</td><td>Current plan, <code>:810</code>.</td></tr>
+<tr><td>Product builds</td><td><code>RepoPrompt</code>, <code>repoprompt-mcp</code>, and <code>repoprompt-gateway</code> builds passed.</td><td>Current plan, <code>:810</code>.</td></tr>
+<tr><td>Review</td><td>Fresh OracleA and OracleB re-reviews approved. Both initial P1 findings were explicitly closed. No P0 or P1 remained open.</td><td>Supplied session handoff and current plan, <code>:810</code>.</td></tr>
+<tr><td>Context structure</td><td><code>Scripts/test-check-agent-context</code> passed 23 of 23 tests during the session.</td><td>Current plan, <code>:800-810</code>.</td></tr>
+</tbody>
+</table>
+
+<div class="callout warn">
+<strong>Known limits.</strong>
+<p>The implementation session did not run an unfiltered full-root test, a live app or provider probe, or the optional G3 matched-pair cache/cost evaluation.</p>
+<p>The exact-ID ledger command completed its target inventories but stayed non-green because the checkout already had 296 missing and three stale identities.</p>
+<p><code>Scripts/check-agent-context</code> had three existing September 3/5 document errors.</p>
+<p><code>make guardrails</code> had 12 existing tracked-document allowlist entries.</p>
+<p>These known project-wide results do not prove a new Phase 7 failure. They also do not become green because of this report.</p>
+</div>
+</section>
+
+<section>
+<h2>Action items</h2>
+<h3>For you now</h3>
+<ul>
+<li>No code action is required to use the staged policy.</li>
+<li>Run the focused commands above if you want current-machine evidence.</li>
+<li>Run the optional full-root lane if you need broader local confidence before a commit.</li>
+<li>Request a visible app launch or relaunch explicitly if you want an agent to perform the manual check.</li>
+<li>Before any commit, review the staged diff and run <code>.agents/skills/rpce-contribution-check/scripts/preflight.sh commit</code>.</li>
+<li>Do not treat the Codex 600-second value as a documented Codex cache lifetime.</li>
+</ul>
+
+<h3>For a later maintenance change</h3>
+<ul>
+<li>Consider OracleB's non-blocking P2 notes only when this area changes again.</li>
+<li>Those notes cover a now-redundant resolver call, the conservative gateway envelope for omitted detached starts, and duplicated boolean or guidance helpers.</li>
+<li>Do not fold those observations into an unrelated change.</li>
+<li>A paid provider/cache experiment needs explicit approval before it runs.</li>
+</ul>
+</section>
+
+<section>
+<h2>Change inventory</h2>
+<table>
+<thead><tr><th>Git state at report creation</th><th>Files</th><th>Role</th><th>Purpose</th></tr></thead>
+<tbody>
+<tr><td>Modified, staged</td><td>3 Core source files and 1 Core test file under <code>Packages/RepoPromptCore/</code></td><td>Shared policy and CLI client behavior</td><td>Defines values and aligns owned CLI deadlines.</td></tr>
+<tr><td>Added or modified, staged</td><td>7 app MCP files under <code>Sources/RepoPrompt/Infrastructure/MCP/</code></td><td>App lifecycle implementation</td><td>Resolves parent provenance, selects waits, exposes metadata, and documents schema semantics.</td></tr>
+<tr><td>Modified, staged</td><td><code>Sources/RepoPromptGateway/Wire/RemoteCommandTranslator.swift</code></td><td>Gateway transport code</td><td>Aligns remote deadline and boolean behavior.</td></tr>
+<tr><td>Modified, staged</td><td><code>ToolCardRouter.swift</code> and 8 managed workflow prompt files</td><td>UI and guidance</td><td>Shows automatic waits honestly and directs agents to wait first.</td></tr>
+<tr><td>Modified, staged</td><td>11 root test files and <code>Scripts/Fixtures/test-suite-contract-ledger.tsv</code></td><td>Tests and test inventory</td><td>Protects the new contract across its affected boundaries.</td></tr>
+<tr><td>Modified, staged</td><td><code>docs/context/plans/2026-09-13-agent-usage-and-wait-efficiency-plan.md</code></td><td>Owning reference document</td><td>Records the Phase 7 contract, decisions, reviews, and validation.</td></tr>
+<tr><td>Added, staged</td><td><code>docs/technical_implementation_reports/2026-09-16-agent-usage-and-wait-efficiency-phase-7.html</code></td><td>Documentation</td><td>Explains the implementation and current testing path for a reader outside the session.</td></tr>
+</tbody>
+</table>
+<p class="small">The staged implementation contained 33 files before this report. No commit was created. The report deliberately does not group unrelated untracked files into the Phase 7 change.</p>
+</section>
+
+<section>
+<h2>Maintainer notes</h2>
+<p>The active plan remains the durable owner for this policy.</p>
+<p>Use that plan when changing provider-family waits, result metadata, or the CLI and gateway timeout boundary.</p>
+<p>Keep automatic selection based on the parent run.</p>
+<p>Keep the fallback unresolved when provenance is not exact.</p>
+<p>Keep response metadata small and free of account, cache-age, or provider-secret data.</p>
+<p>Generated from live repository files and supplied AI-agent session evidence on 2026-09-16.</p>
+</section>
+</main>
+</body>
+</html>

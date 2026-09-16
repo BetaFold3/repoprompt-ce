@@ -974,6 +974,9 @@ actor InteractiveMCPClientSession {
                     semanticWaitSeconds + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
                 )
             }
+            if Self.usesOwnedAutomaticAgentWait(toolName: toolName, arguments: arguments) {
+                return MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
+            }
             return MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
         case let .seconds(seconds):
             return seconds.isFinite && seconds > 0 ? seconds : nil
@@ -989,14 +992,11 @@ actor InteractiveMCPClientSession {
         let timeoutKey: String
         switch toolName {
         case "agent_run", "agent_explore":
-            let operation = arguments["op"]?.stringValue?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            switch operation {
+            switch normalizedAgentOperation(arguments) {
             case "start", "wait":
                 timeoutKey = "timeout"
             case "steer" where toolName == "agent_run":
-                guard arguments["wait"]?.boolValue != false else { return nil }
+                guard semanticBool(arguments["wait"]) != false else { return nil }
                 timeoutKey = "timeout_seconds"
             default:
                 return nil
@@ -1020,6 +1020,65 @@ actor InteractiveMCPClientSession {
         }
         guard let seconds, seconds.isFinite, seconds >= 0 else { return nil }
         return seconds
+    }
+
+    private static func usesOwnedAutomaticAgentWait(
+        toolName: String,
+        arguments: [String: Value]
+    ) -> Bool {
+        guard toolName == "agent_run" || toolName == "agent_explore" else {
+            return false
+        }
+
+        switch normalizedAgentOperation(arguments) {
+        case "start":
+            return semanticBool(arguments["detach"]) != true && isOmittedSemanticTimeout(arguments["timeout"])
+        case "wait":
+            return isOmittedSemanticTimeout(arguments["timeout"])
+        case "steer" where toolName == "agent_run":
+            let wait = semanticBool(arguments["wait"])
+            guard wait != false else { return false }
+            let hasWaitIntent = wait == true || arguments["timeout_seconds"] != nil
+            return hasWaitIntent && isOmittedSemanticTimeout(arguments["timeout_seconds"])
+        default:
+            return false
+        }
+    }
+
+    private static func isOmittedSemanticTimeout(_ value: Value?) -> Bool {
+        guard let value else { return true }
+        if case .null = value { return true }
+        return false
+    }
+
+    private static func normalizedAgentOperation(_ arguments: [String: Value]) -> String? {
+        arguments["op"]?.stringValue?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    /// Matches the lifecycle services' permissive boolean parsing so detached starts
+    /// and explicitly non-waiting steering never acquire an owned wait deadline.
+    private static func semanticBool(_ value: Value?) -> Bool? {
+        switch value {
+        case let .bool(value):
+            value
+        case let .string(value):
+            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "1", "yes":
+                true
+            case "false", "0", "no":
+                false
+            default:
+                nil
+            }
+        case let .int(value):
+            value != 0
+        case let .double(value):
+            value != 0
+        default:
+            nil
+        }
     }
 
     #if DEBUG

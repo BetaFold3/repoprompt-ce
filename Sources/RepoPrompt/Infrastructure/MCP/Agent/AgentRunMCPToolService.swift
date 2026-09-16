@@ -200,6 +200,9 @@ struct AgentRunMCPToolService {
         _ targetWindow: WindowState
     ) async throws -> ResolvedAgentRunOracleReviewLaunchSource
 
+    /// Compatibility alias for the unresolved-parent automatic wait, retained for existing test and
+    /// downstream source compatibility only. No lifecycle path reads it: start, wait, multi-wait and
+    /// steer-with-wait resolve the frozen parent family through `AgentMCPWaitPolicy`.
     static let defaultWaitTimeoutSeconds = MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
     static let defaultStartTaskLabelKind: AgentModelCatalog.TaskLabelKind = .pair
     nonisolated static let statusUpdateSliceSeconds: TimeInterval = 2
@@ -264,20 +267,27 @@ struct AgentRunMCPToolService {
         return statusUpdateSliceSeconds
     }
 
-    static func resolvedStartTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try resolvedLifecycleWaitTimeoutSeconds(value)
+    /// Plan §6.1/§6.4: omission is automatic for the frozen parent family, explicit `0` is a poll,
+    /// and explicit values above the shared maximum are rejected without clamping.
+    static func resolvedStartWaitSelection(
+        _ value: Value?,
+        parentFamily: AgentMCPWaitPolicy.ParentFamily
+    ) throws -> AgentMCPWaitPolicy.Selection {
+        try AgentMCPWaitPolicy.selection(rawTimeout: value, parentFamily: parentFamily)
     }
 
-    static func resolvedWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try resolvedLifecycleWaitTimeoutSeconds(value)
+    static func resolvedWaitSelection(
+        _ value: Value?,
+        parentFamily: AgentMCPWaitPolicy.ParentFamily
+    ) throws -> AgentMCPWaitPolicy.Selection {
+        try AgentMCPWaitPolicy.selection(rawTimeout: value, parentFamily: parentFamily)
     }
 
-    static func resolvedSteerTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try resolvedLifecycleWaitTimeoutSeconds(value)
-    }
-
-    private static func resolvedLifecycleWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
-        try AgentMCPToolHelpers.parseTimeoutSeconds(value) ?? defaultWaitTimeoutSeconds
+    static func resolvedSteerWaitSelection(
+        _ value: Value?,
+        parentFamily: AgentMCPWaitPolicy.ParentFamily
+    ) throws -> AgentMCPWaitPolicy.Selection {
+        try AgentMCPWaitPolicy.selection(rawTimeout: value, parentFamily: parentFamily)
     }
 
     private nonisolated static func agentRunExpiredSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {
@@ -314,6 +324,13 @@ struct AgentRunMCPToolService {
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping HeartbeatOperation) async throws -> Value
     var beginAgentRunWait: (_ metadata: RequestMetadata, _ sessionIDs: Set<UUID>, _ timeoutSeconds: TimeInterval?) async -> UUID? = { _, _, _ in nil }
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
+    /// Plan §6.3: freezes the effective parent family for one lifecycle call from the authenticated
+    /// run binding. The default treats the parent as unresolved; the server view model injects the
+    /// authoritative resolver. Invoked once at the outer entry, before any mutation or delegation.
+    var resolveWaitPolicyContext: (_ metadata: RequestMetadata) async -> AgentMCPWaitPolicy.RequestContext = {
+        AgentMCPWaitPolicy.RequestContext(metadata: $0, parentFamily: .unresolved)
+    }
+
     let startRun: StartRun
     var currentSnapshotProvider: (@Sendable (_ sessionID: UUID, _ agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot?)?
     #if DEBUG
@@ -668,7 +685,13 @@ struct AgentRunMCPToolService {
             throw MCPError.invalidParams("agent_run.start always creates a new session. Use agent_run op=steer with session_id to continue an existing session.")
         }
         let detach = parseBool(args["detach"]) ?? false
-        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(args["timeout"])
+        // Plan §6.3/§6.4: freeze the effective parent family and validate the wait selection before
+        // any session target is created, bound or dispatched. An invalid explicit timeout therefore
+        // never dispatches a mutation. Detached starts still validate the supplied value but report
+        // no wait policy.
+        let waitContext = await resolveWaitPolicyContext(metadata)
+        let waitSelection = try Self.resolvedStartWaitSelection(args["timeout"], parentFamily: waitContext.parentFamily)
+        let timeoutSeconds = waitSelection.timeoutSeconds
         #if DEBUG
             if ompQualificationLease != nil {
                 let budget = Self.ompQualificationAuthorizationDeadlineNanoseconds(
@@ -1467,15 +1490,17 @@ struct AgentRunMCPToolService {
                     session.ompQualificationStartContext = nil
                 }
             #endif
-            return decoratedRunValue(snapshot: effectiveSnapshot, workflow: workflow, delivery: outcome.delivery)
+            let startedValue = decoratedRunValue(snapshot: effectiveSnapshot, workflow: workflow, delivery: outcome.delivery)
+            // Detached starts have no wait policy to report; every other start selected one.
+            return detach ? startedValue : AgentMCPWaitPolicy.attaching(waitSelection, to: startedValue)
         }
         let waitedValue: Value
         do {
             waitedValue = try await waitForInterestingState(
                 sessionID: effectiveSnapshot.sessionID,
                 agentModeVM: agentModeVM,
-                metadata: metadata,
-                timeoutSeconds: timeoutSeconds,
+                metadata: waitContext.metadata,
+                timeoutSeconds: waitSelection.timeoutSeconds,
                 stage: "starting",
                 message: "Waiting for the started run to finish or request input...",
                 workflow: workflow,
@@ -1502,7 +1527,7 @@ struct AgentRunMCPToolService {
                 session.ompQualificationStartContext = nil
             }
         #endif
-        return waitedValue
+        return AgentMCPWaitPolicy.attaching(waitSelection, to: waitedValue)
     }
 
     private func executeWait(args: [String: Value], forcePoll: Bool = false) async throws -> Value {
@@ -1516,21 +1541,23 @@ struct AgentRunMCPToolService {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionID = try await resolveControlSessionID(args, targetWindow: targetWindow, agentModeVM: agentModeVM)
-        let timeoutSeconds = try forcePoll ? 0 : Self.resolvedWaitTimeoutSeconds(args["timeout"])
         let includeStatusUpdates = forcePoll ? false : (parseBool(args["include_status_updates"]) ?? false)
         let metadata = await captureRequestMetadata()
-        let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
-        if initialSnapshot.isActionableForMCPWait || timeoutSeconds <= 0 {
-            return decoratedRunValue(snapshot: initialSnapshot)
+        let waitContext: AgentMCPWaitPolicy.RequestContext
+        let waitSelection: AgentMCPWaitPolicy.Selection
+        if forcePoll {
+            // `op=poll` never waits, so it does not need the parent family.
+            waitContext = AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: .unresolved)
+            waitSelection = .poll
+        } else {
+            waitContext = await resolveWaitPolicyContext(metadata)
+            waitSelection = try Self.resolvedWaitSelection(args["timeout"], parentFamily: waitContext.parentFamily)
         }
-        return try await waitForInterestingState(
+        return try await performSingleWait(
             sessionID: sessionID,
             agentModeVM: agentModeVM,
-            metadata: metadata,
-            timeoutSeconds: timeoutSeconds,
-            stage: "waiting",
-            message: "Waiting for the agent run to finish or request input...",
-            liveSnapshot: initialSnapshot,
+            context: waitContext,
+            selection: waitSelection,
             includeStatusUpdates: includeStatusUpdates
         )
     }
@@ -1540,37 +1567,118 @@ struct AgentRunMCPToolService {
         let targetWindow = try requireTargetWindow()
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
-
-        // Single-element waits should preserve the existing single-session response shape.
-        if sessionIDs.count == 1 {
-            var singleArgs = args
-            singleArgs.removeValue(forKey: "session_ids")
-            singleArgs["session_id"] = .string(sessionIDs[0].uuidString)
-            return try await executeWait(args: singleArgs)
-        }
-
-        let timeoutSeconds = try Self.resolvedWaitTimeoutSeconds(args["timeout"])
         let includeStatusUpdates = parseBool(args["include_status_updates"]) ?? false
         let metadata = await captureRequestMetadata()
+        let waitContext = await resolveWaitPolicyContext(metadata)
+        let waitSelection = try Self.resolvedWaitSelection(args["timeout"], parentFamily: waitContext.parentFamily)
+        return try await performWait(
+            sessionIDs: sessionIDs,
+            agentModeVM: agentModeVM,
+            context: waitContext,
+            selection: waitSelection,
+            includeStatusUpdates: includeStatusUpdates
+        )
+    }
+
+    /// Delegated wait entry for callers that already froze the request context and wait
+    /// selection at their own outer lifecycle entry (Explore start-to-wait and Explore wait).
+    /// The frozen values are used as-is; nothing is recaptured or recomputed here.
+    func executeFrozenWait(
+        sessionIDs: [UUID],
+        context: AgentMCPWaitPolicy.RequestContext,
+        selection: AgentMCPWaitPolicy.Selection,
+        includeStatusUpdates: Bool = false
+    ) async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        let agentModeVM = resolvedAgentModeViewModel(targetWindow)
+        return try await performWait(
+            sessionIDs: sessionIDs,
+            agentModeVM: agentModeVM,
+            context: context,
+            selection: selection,
+            includeStatusUpdates: includeStatusUpdates
+        )
+    }
+
+    private func performWait(
+        sessionIDs: [UUID],
+        agentModeVM: AgentModeViewModel,
+        context: AgentMCPWaitPolicy.RequestContext,
+        selection: AgentMCPWaitPolicy.Selection,
+        includeStatusUpdates: Bool
+    ) async throws -> Value {
+        // Single-element waits preserve the single-session response shape while taking the same
+        // frozen context/selection as a general multi-wait (no recapture of provider identity).
+        if sessionIDs.count == 1 {
+            return try await performSingleWait(
+                sessionID: sessionIDs[0],
+                agentModeVM: agentModeVM,
+                context: context,
+                selection: selection,
+                includeStatusUpdates: includeStatusUpdates
+            )
+        }
+        return try await performMultiWait(
+            sessionIDs: sessionIDs,
+            agentModeVM: agentModeVM,
+            context: context,
+            selection: selection,
+            includeStatusUpdates: includeStatusUpdates
+        )
+    }
+
+    private func performSingleWait(
+        sessionID: UUID,
+        agentModeVM: AgentModeViewModel,
+        context: AgentMCPWaitPolicy.RequestContext,
+        selection: AgentMCPWaitPolicy.Selection,
+        includeStatusUpdates: Bool
+    ) async throws -> Value {
+        let initialSnapshot = await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM)
+        if initialSnapshot.isActionableForMCPWait || selection.timeoutSeconds <= 0 {
+            return AgentMCPWaitPolicy.attaching(selection, to: decoratedRunValue(snapshot: initialSnapshot))
+        }
+        let value = try await waitForInterestingState(
+            sessionID: sessionID,
+            agentModeVM: agentModeVM,
+            metadata: context.metadata,
+            timeoutSeconds: selection.timeoutSeconds,
+            stage: "waiting",
+            message: "Waiting for the agent run to finish or request input...",
+            liveSnapshot: initialSnapshot,
+            includeStatusUpdates: includeStatusUpdates
+        )
+        return AgentMCPWaitPolicy.attaching(selection, to: value)
+    }
+
+    private func performMultiWait(
+        sessionIDs: [UUID],
+        agentModeVM: AgentModeViewModel,
+        context: AgentMCPWaitPolicy.RequestContext,
+        selection: AgentMCPWaitPolicy.Selection,
+        includeStatusUpdates: Bool
+    ) async throws -> Value {
+        let metadata = context.metadata
+        let timeoutSeconds = selection.timeoutSeconds
         let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
 
         if let ready = initialSnapshots.first(where: { isInterestingSnapshot($0) }) {
-            return decoratedMultiWaitValue(
+            return AgentMCPWaitPolicy.attaching(selection, to: decoratedMultiWaitValue(
                 snapshot: ready,
                 sessionIDs: sessionIDs,
                 result: ready.status == .expired ? "expired" : "snapshot_ready",
                 pendingSessionIDs: pendingSessionIDs(from: initialSnapshots)
-            )
+            ))
         }
 
         if timeoutSeconds <= 0 {
-            return decoratedMultiWaitValue(
+            return AgentMCPWaitPolicy.attaching(selection, to: decoratedMultiWaitValue(
                 snapshot: initialSnapshots[0],
                 sessionIDs: sessionIDs,
                 result: "timed_out",
                 snapshots: initialSnapshots,
                 pendingSessionIDs: pendingSessionIDs(from: initialSnapshots)
-            )
+            ))
         }
 
         let waitScopeToken = await beginAgentRunWait(metadata, Set(sessionIDs), timeoutSeconds)
@@ -1593,7 +1701,7 @@ struct AgentRunMCPToolService {
             if let waitScopeToken {
                 await endAgentRunWait(waitScopeToken, completion)
             }
-            return value
+            return AgentMCPWaitPolicy.attaching(selection, to: value)
         } catch is CancellationError {
             if let value = await waitAnyCancellationValueIfActionable(
                 sessionIDs: sessionIDs,
@@ -1604,7 +1712,7 @@ struct AgentRunMCPToolService {
                 if let waitScopeToken {
                     await endAgentRunWait(waitScopeToken, completion)
                 }
-                return value
+                return AgentMCPWaitPolicy.attaching(selection, to: value)
             }
             let completion = AgentRunWaitScopeCompletion(reason: .cancelled, result: "cancelled", winnerSessionID: nil, pendingSessionIDs: Set(sessionIDs), errorDescription: nil)
             if let waitScopeToken {
@@ -1635,7 +1743,7 @@ struct AgentRunMCPToolService {
         let agentModeVM = resolvedAgentModeViewModel(targetWindow)
         let sessionIDs = try await resolveControlSessionIDs(references, targetWindow: targetWindow, agentModeVM: agentModeVM)
         let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
-        return decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots)
+        return AgentMCPWaitPolicy.attaching(.poll, to: decoratedMultiPollValue(sessionIDs: sessionIDs, snapshots: snapshots))
     }
 
     #if DEBUG
@@ -1721,6 +1829,38 @@ struct AgentRunMCPToolService {
         let text = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let metadata = await captureRequestMetadata()
+
+        // Plan §6.3/§6.4: resolve the frozen parent family and validate the active wait selection
+        // before the steering mutation or any control-context reactivation, so an invalid explicit
+        // timeout never dispatches. `wait=false` keeps ignoring a supplied timeout_seconds with the
+        // existing warning and does not parse it.
+        let shouldWait: Bool = {
+            if let explicit = parseBool(args["wait"]) { return explicit }
+            if args["timeout_seconds"] != nil { return true }
+            return false
+        }()
+        let rawSteerTimeoutSeconds = args["timeout_seconds"]
+        let ignoredTimeoutWarning: String?
+        let steerWaitContext: AgentMCPWaitPolicy.RequestContext?
+        let steerWaitSelection: AgentMCPWaitPolicy.Selection?
+        if shouldWait {
+            ignoredTimeoutWarning = nil
+            let waitContext = await resolveWaitPolicyContext(metadata)
+            steerWaitContext = waitContext
+            steerWaitSelection = try Self.resolvedSteerWaitSelection(
+                rawSteerTimeoutSeconds,
+                parentFamily: waitContext.parentFamily
+            )
+        } else if rawSteerTimeoutSeconds != nil {
+            ignoredTimeoutWarning = "Ignoring timeout_seconds because wait=false; the steering instruction was accepted without waiting."
+            steerWaitContext = nil
+            steerWaitSelection = nil
+        } else {
+            ignoredTimeoutWarning = nil
+            steerWaitContext = nil
+            steerWaitSelection = nil
+        }
+
         let resolution = try await ensureSteerControlContext(
             sessionID: sessionID,
             targetWindow: targetWindow,
@@ -1778,50 +1918,36 @@ struct AgentRunMCPToolService {
         }
         await Task.yield()
 
-        // Steer-and-wait: optionally block until the agent reaches an interesting state
-        let shouldWait: Bool = {
-            if let explicit = parseBool(args["wait"]) { return explicit }
-            if args["timeout_seconds"] != nil { return true }
-            return false
-        }()
-        let rawSteerTimeoutSeconds = args["timeout_seconds"]
-        let ignoredTimeoutWarning: String?
-        let steerTimeoutSeconds: TimeInterval?
-        if shouldWait {
-            ignoredTimeoutWarning = nil
-            steerTimeoutSeconds = try Self.resolvedSteerTimeoutSeconds(rawSteerTimeoutSeconds)
-        } else if rawSteerTimeoutSeconds != nil {
-            ignoredTimeoutWarning = "Ignoring timeout_seconds because wait=false; the steering instruction was accepted without waiting."
-            steerTimeoutSeconds = nil
-        } else {
-            ignoredTimeoutWarning = nil
-            steerTimeoutSeconds = nil
-        }
+        // Steer-and-wait: optionally block until the agent reaches an interesting state using the
+        // selection frozen before the mutation.
         let shouldBlockForSteeredOutput = delivery.isActiveRunDispatch
             ? snapshot.interaction == nil
             : (!snapshot.status.isTerminal && snapshot.interaction == nil)
-        if shouldWait, shouldBlockForSteeredOutput {
-            let timeout = steerTimeoutSeconds ?? Self.defaultWaitTimeoutSeconds
-            if timeout > 0 {
-                return try await waitForInterestingState(
-                    sessionID: sessionID,
-                    agentModeVM: agentModeVM,
-                    metadata: metadata,
-                    timeoutSeconds: timeout,
-                    stage: "steering",
-                    message: "Waiting for the steered run to finish or request input...",
-                    workflow: workflow,
-                    initialDelivery: delivery,
-                    liveSnapshot: snapshot.status == .running ? snapshot : nil
-                )
-            }
+        if let steerWaitContext, let steerWaitSelection,
+           shouldBlockForSteeredOutput, steerWaitSelection.timeoutSeconds > 0
+        {
+            let waited = try await waitForInterestingState(
+                sessionID: sessionID,
+                agentModeVM: agentModeVM,
+                metadata: steerWaitContext.metadata,
+                timeoutSeconds: steerWaitSelection.timeoutSeconds,
+                stage: "steering",
+                message: "Waiting for the steered run to finish or request input...",
+                workflow: workflow,
+                initialDelivery: delivery,
+                liveSnapshot: snapshot.status == .running ? snapshot : nil
+            )
+            return AgentMCPWaitPolicy.attaching(steerWaitSelection, to: waited)
         }
-        return decoratedRunValue(
+        let steeredValue = decoratedRunValue(
             snapshot: snapshot,
             workflow: workflow,
             delivery: delivery,
             warning: ignoredTimeoutWarning
         )
+        // Non-waiting steers have no wait policy to report.
+        guard let steerWaitSelection else { return steeredValue }
+        return AgentMCPWaitPolicy.attaching(steerWaitSelection, to: steeredValue)
     }
 
     private func clearFollowUpPendingAfterSteerFailure(

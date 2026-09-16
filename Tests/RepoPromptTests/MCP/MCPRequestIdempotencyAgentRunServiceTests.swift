@@ -189,6 +189,103 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         XCTAssertEqual(entryCount, 0, "request_id is opt-in; without it no idempotency entry is recorded")
     }
 
+    /// Plan §6.3: the canonical root `wait_policy` tuple is recorded before idempotency storage
+    /// and replayed verbatim — a duplicate never re-executes or recomputes the parent family.
+    func testDuplicateSteerReplaysStoredWaitPolicyWithoutRecomputingParentFamily() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+
+        let registry = MCPRequestIdempotencyRegistry()
+        var service = makeService(window: window)
+        service.idempotencyRegistry = registry
+        let dispatchCounter = CallCounter()
+        let resolutionCounter = CallCounter()
+        var currentFamily: AgentMCPWaitPolicy.ParentFamily = .codex
+        service.resolveWaitPolicyContext = { metadata in
+            resolutionCounter.increment()
+            return AgentMCPWaitPolicy.RequestContext(metadata: metadata, parentFamily: currentFamily)
+        }
+        service.testDispatchSteerInstruction = { dispatchedSessionID, _, _, agentModeVM in
+            dispatchCounter.increment()
+            let controlledSession = try XCTUnwrap(agentModeVM.mcpControlledSession(sessionID: dispatchedSessionID))
+            await agentModeVM.prepareMCPWaitTrackingForRunStart(session: controlledSession)
+            controlledSession.runState = .running
+            agentModeVM.publishMCPStateChange(for: controlledSession)
+            return .startedRun
+        }
+        // The steered run finishes immediately, so the automatic selection returns without parking.
+        service.currentSnapshotProvider = { snapshotSessionID, _ in
+            Self.completedSnapshot(sessionID: snapshotSessionID)
+        }
+
+        let args: [String: Value] = [
+            "op": .string("steer"),
+            "session_id": .string(sessionID.uuidString),
+            "message": .string("steer with automatic wait"),
+            "wait": .bool(true),
+            "request_id": .string("req-steer-policy-1"),
+            "response_mode": .string("full")
+        ]
+        let first = try await service.execute(args: args)
+        let expectedPolicy: Value = .object([
+            "mode": .string("automatic"),
+            "timeout_seconds": .int(600),
+            "parent_family": .string("codex")
+        ])
+        XCTAssertEqual(first.objectValue?["wait_policy"], expectedPolicy)
+        XCTAssertEqual(dispatchCounter.count, 1)
+        XCTAssertEqual(resolutionCounter.count, 1)
+
+        // The apparent parent changes; a replay must still present the stored tuple.
+        currentFamily = .claude
+        var replayArgs = args
+        replayArgs["response_mode"] = .string("none")
+        let replay = try await service.execute(args: replayArgs)
+        XCTAssertEqual(replay.objectValue?["wait_policy"], expectedPolicy)
+        XCTAssertEqual(replay.objectValue?["_meta"]?.objectValue?["request_id_replay"], .bool(true))
+        XCTAssertEqual(dispatchCounter.count, 1, "Duplicate must not re-execute the steer")
+        XCTAssertEqual(resolutionCounter.count, 1, "Duplicate must not recompute the parent family")
+
+        session.runState = .idle
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
+    /// `currentSnapshotProvider` is a `@Sendable` nonisolated closure, so the fixture builder
+    /// must be callable off the main actor.
+    private nonisolated static func completedSnapshot(sessionID: UUID) -> AgentRunMCPSnapshot {
+        AgentRunMCPSnapshot(
+            sessionID: sessionID,
+            runID: nil,
+            tabID: nil,
+            sessionName: "Steered Agent",
+            agentRaw: AgentProviderKind.codexExec.rawValue,
+            agentDisplayName: AgentProviderKind.codexExec.displayName,
+            modelRaw: "codex",
+            reasoningEffortRaw: nil,
+            status: .completed,
+            statusText: "completed",
+            latestAssistantPreview: "steered result",
+            interaction: nil,
+            transcriptItemCount: 1,
+            updatedAt: Date(),
+            parentSessionID: nil,
+            failureReason: nil,
+            worktreeBindings: [],
+            activeWorktreeMerges: [],
+            lastInteractionResolution: nil
+        )
+    }
+
     private func makeWindow() async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

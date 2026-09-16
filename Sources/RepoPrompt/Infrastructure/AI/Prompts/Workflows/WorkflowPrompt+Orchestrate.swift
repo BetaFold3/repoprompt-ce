@@ -286,7 +286,7 @@ When questions arise during coordination, reason through them yourself. If you'r
 | Start a fresh agent | `agent_run op=start model_id=<role> session_name="..." message="..." detach=true/false` |
 | Steer an existing agent | `agent_run op=steer session_id="..." message="..." wait=true` |
 | Wait for an agent | `agent_run op=wait session_id="..."` |
-| Wait for first of multiple agents | `agent_run op=wait session_ids=["...", "..."] timeout=60` |
+| Wait for first of multiple agents | `agent_run op=wait session_ids=["...", "..."]` |
 | Deliberate instantaneous inspection of one agent | `agent_run op=poll session_id="..."` |
 | Deliberate instantaneous inspection of multiple agents | `agent_run op=poll session_ids=["...", "..."]` |
 \(cleanupQuickReferenceRow)| Read plan/context | `read_file`, `get_file_tree`, `file_search` |
