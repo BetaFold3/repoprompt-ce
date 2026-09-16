@@ -92,6 +92,10 @@ struct ContextBuilderCardContext {
     }
 }
 
+struct AgentControlToolCardContext {
+    let authoritativeLocalParentFamily: AgentMCPWaitPolicy.ParentFamily?
+}
+
 enum ToolCardRouter {
     static let knownResultTools: Set<String> = [
         "bash",
@@ -128,13 +132,20 @@ enum ToolCardRouter {
         for item: AgentChatItem,
         oracleOpenContext: AgentOracleOpenContext? = nil,
         contextBuilder: ContextBuilderCardContext? = nil,
+        agentControlContext: AgentControlToolCardContext? = nil,
         showRunScopedToolCancel: Bool = false,
         cancelActiveToolsAction: (() -> Void)? = nil
     ) -> AnyView {
         let normalized = normalizedToolCardName(item.toolName)
         let key = normalized?.lowercased()
         let presentation = callPresentation(for: item)
-        let subtitle = presentation?.subtitle ?? callSubtitle(for: key, argsJSON: item.toolArgsJSON)
+        let subtitle = presentation?.subtitle ?? callSubtitle(
+            for: key,
+            argsJSON: item.toolArgsJSON,
+            resultJSON: item.toolResultJSON,
+            toolIsError: item.toolIsError,
+            agentControlContext: agentControlContext
+        )
         return AnyView(
             ToolCallCard(
                 item: item,
@@ -242,9 +253,24 @@ enum ToolCardRouter {
         return ToolCallPresentation(title: webPresentation.title, subtitle: webPresentation.subtitle)
     }
 
-    static func callSubtitle(for toolName: String?, argsJSON: String?) -> String? {
+    static func callSubtitle(
+        for toolName: String?,
+        argsJSON: String?,
+        resultJSON: String? = nil,
+        toolIsError: Bool? = nil,
+        agentControlContext: AgentControlToolCardContext? = nil
+    ) -> String? {
         let normalized = normalizedToolCardName(toolName)?.lowercased() ?? toolName?.lowercased()
-        return ToolCardSubtitleBuilder.subtitle(for: normalized, argsJSON: argsJSON)
+        // Some provider paths complete a call with only toolIsError populated. Represent that
+        // status-only completion as an empty structured result so lifecycle labels cannot fall
+        // back to live parent context after the call has settled.
+        let presentationResultJSON = resultJSON ?? (toolIsError != nil ? "{}" : nil)
+        return ToolCardSubtitleBuilder.subtitle(
+            for: normalized,
+            argsJSON: argsJSON,
+            resultJSON: presentationResultJSON,
+            agentControlContext: agentControlContext
+        )
     }
 
     static func isWorktreeMergeOp(_ argsJSON: String?) -> Bool {
@@ -268,8 +294,70 @@ enum ToolCardRouter {
     }
 }
 
+enum AgentControlWaitLabelBuilder {
+    static func callLabel(
+        detach: Bool?,
+        timeout: Double?,
+        context: AgentControlToolCardContext?
+    ) -> String {
+        if detach == true {
+            return "detach"
+        }
+        if let timeout {
+            return timeout <= 0 ? "poll" : "wait ≤\(formatSeconds(timeout))"
+        }
+        if let family = context?.authoritativeLocalParentFamily {
+            let seconds = MCPTimeoutPolicy.agentLifecycleAutomaticWaitSeconds(for: family)
+            return "wait ≤\(formatSeconds(seconds))"
+        }
+        return "wait auto"
+    }
+
+    static func lifecycleLabel(
+        resultJSON: String?,
+        showBeforeCompletion: Bool,
+        detach: Bool?,
+        timeout: Double?,
+        context: AgentControlToolCardContext?
+    ) -> String? {
+        if detach == true {
+            return "detach"
+        }
+        if let resultJSON {
+            guard let resultObject = ToolJSON.structuredResultObject(from: resultJSON) else { return nil }
+            return resultLabel(from: resultObject)
+        }
+        guard showBeforeCompletion else { return nil }
+        return callLabel(detach: detach, timeout: timeout, context: context)
+    }
+
+    static func resultLabel(from resultObject: [String: Any]) -> String? {
+        guard let metadata = AgentMCPWaitPolicy.canonicalMetadata(from: resultObject) else { return nil }
+        switch metadata.mode {
+        case .automatic, .explicit:
+            return "wait ≤\(formatSeconds(metadata.timeoutSeconds))"
+        case .poll:
+            return "poll"
+        }
+    }
+
+    private static func formatSeconds(_ seconds: Double) -> String {
+        let rounded = Int(seconds.rounded())
+        if rounded % 60 == 0, rounded >= 60 {
+            let minutes = rounded / 60
+            return minutes == 1 ? "1m" : "\(minutes)m"
+        }
+        return "\(rounded)s"
+    }
+}
+
 private enum ToolCardSubtitleBuilder {
-    static func subtitle(for toolName: String?, argsJSON: String?) -> String? {
+    static func subtitle(
+        for toolName: String?,
+        argsJSON: String?,
+        resultJSON: String?,
+        agentControlContext: AgentControlToolCardContext?
+    ) -> String? {
         switch toolName {
         case "read":
             if let args = ToolJSON.decodeArgs(ToolArgsDTOs.NativeReadArgs.self, from: argsJSON),
@@ -470,12 +558,29 @@ private enum ToolCardSubtitleBuilder {
                     if let count = args.messages?.count, count > 1 {
                         parts.append("\(count) probes")
                     }
-                    parts.append(agentControlWaitLabel(detach: args.detach, timeout: args.timeout))
+                    if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                        resultJSON: resultJSON,
+                        showBeforeCompletion: true,
+                        detach: args.detach,
+                        timeout: args.timeout,
+                        context: agentControlContext
+                    ) {
+                        parts.append(waitLabel)
+                    }
                     return parts.joined(separator: " • ")
                 case "cancel":
                     var parts = [op]
                     if let sessionID = args.sessionID, !sessionID.isEmpty {
                         parts.append(sessionID)
+                    }
+                    if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                        resultJSON: resultJSON,
+                        showBeforeCompletion: false,
+                        detach: false,
+                        timeout: nil,
+                        context: agentControlContext
+                    ) {
+                        parts.append(waitLabel)
                     }
                     return parts.joined(separator: " • ")
                 case "poll", "wait":
@@ -485,8 +590,14 @@ private enum ToolCardSubtitleBuilder {
                     } else if let sessionIDs = args.sessionIDs, !sessionIDs.isEmpty {
                         parts.append("\(sessionIDs.count) sessions")
                     }
-                    if op == "wait" {
-                        parts.append(agentControlWaitLabel(detach: false, timeout: args.timeout))
+                    if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                        resultJSON: resultJSON,
+                        showBeforeCompletion: op == "wait",
+                        detach: false,
+                        timeout: args.timeout,
+                        context: agentControlContext
+                    ) {
+                        parts.append(waitLabel)
                     }
                     return parts.joined(separator: " • ")
                 default:
@@ -514,15 +625,29 @@ private enum ToolCardSubtitleBuilder {
                     if let model = args.model, !model.isEmpty {
                         parts.append(model)
                     }
-                    parts.append(agentControlWaitLabel(detach: args.detach, timeout: args.timeout))
+                    if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                        resultJSON: resultJSON,
+                        showBeforeCompletion: true,
+                        detach: args.detach,
+                        timeout: args.timeout,
+                        context: agentControlContext
+                    ) {
+                        parts.append(waitLabel)
+                    }
                     return parts.joined(separator: " • ")
                 case "poll", "wait", "cancel":
                     var parts = [op]
                     if let sessionID = args.sessionID, !sessionID.isEmpty {
                         parts.append(sessionID)
                     }
-                    if op == "wait" {
-                        parts.append(agentControlWaitLabel(detach: false, timeout: args.timeout))
+                    if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                        resultJSON: resultJSON,
+                        showBeforeCompletion: op == "wait",
+                        detach: false,
+                        timeout: args.timeout,
+                        context: agentControlContext
+                    ) {
+                        parts.append(waitLabel)
                     }
                     return parts.joined(separator: " • ")
                 case "steer":
@@ -533,8 +658,14 @@ private enum ToolCardSubtitleBuilder {
                     if let workflowLabel {
                         parts.append(workflowLabel)
                     }
-                    if args.wait == true || args.timeoutSeconds != nil {
-                        parts.append(agentControlWaitLabel(detach: false, timeout: args.timeoutSeconds ?? args.timeout))
+                    if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                        resultJSON: resultJSON,
+                        showBeforeCompletion: args.wait == true || args.timeoutSeconds != nil,
+                        detach: false,
+                        timeout: args.timeoutSeconds ?? args.timeout,
+                        context: agentControlContext
+                    ) {
+                        parts.append(waitLabel)
                     }
                     return parts.joined(separator: " • ")
                 case "respond":
@@ -544,6 +675,15 @@ private enum ToolCardSubtitleBuilder {
                     }
                     if let workflowLabel {
                         parts.append(workflowLabel)
+                    }
+                    if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                        resultJSON: resultJSON,
+                        showBeforeCompletion: false,
+                        detach: false,
+                        timeout: nil,
+                        context: agentControlContext
+                    ) {
+                        parts.append(waitLabel)
                     }
                     return parts.joined(separator: " • ")
                 default:
@@ -627,25 +767,6 @@ private enum ToolCardSubtitleBuilder {
         default:
             raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "auto tree"
         }
-    }
-
-    private static func agentControlWaitLabel(detach: Bool?, timeout: Double?) -> String {
-        if detach == true {
-            return "detach"
-        }
-        guard let timeout else {
-            return "wait auto"
-        }
-        return timeout <= 0 ? "poll" : "wait ≤\(formatSeconds(timeout))"
-    }
-
-    private static func formatSeconds(_ seconds: Double) -> String {
-        let rounded = Int(seconds.rounded())
-        if rounded % 60 == 0, rounded >= 60 {
-            let minutes = rounded / 60
-            return minutes == 1 ? "1m" : "\(minutes)m"
-        }
-        return "\(rounded)s"
     }
 
     private static func shortenPath(_ path: String) -> String {

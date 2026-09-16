@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 import MCP
 import RepoPromptShared
@@ -72,7 +73,76 @@ enum AgentMCPWaitPolicy {
         }
     }
 
+    /// Validated canonical metadata decoded from a lifecycle result. This accepts only the
+    /// Phase 7 root tuple and deliberately drops any additional nested payload.
+    struct CanonicalMetadata: Equatable {
+        let mode: Mode
+        let timeoutSeconds: TimeInterval
+        let parentFamily: ParentFamily?
+
+        var jsonObject: [String: Any] {
+            var object: [String: Any] = [
+                "mode": mode.rawValue,
+                "timeout_seconds": Self.timeoutJSONValue(timeoutSeconds)
+            ]
+            if mode == .automatic, let parentFamily {
+                object["parent_family"] = parentFamily.rawValue
+            }
+            return object
+        }
+
+        private static func timeoutJSONValue(_ seconds: TimeInterval) -> Any {
+            if seconds.rounded(.down) == seconds, seconds <= TimeInterval(Int.max) {
+                return Int(seconds)
+            }
+            return seconds
+        }
+    }
+
     static let waitPolicyKey = "wait_policy"
+
+    /// Validates the canonical root tuple before UI or persistence consumes it. Stored timeout
+    /// values remain authoritative; validation checks only the canonical mode-specific shape.
+    static func canonicalMetadata(from rootObject: [String: Any]) -> CanonicalMetadata? {
+        guard let object = rootObject[waitPolicyKey] as? [String: Any],
+              let rawMode = object["mode"] as? String,
+              let mode = Mode(rawValue: rawMode),
+              let timeoutSeconds = numericTimeout(object["timeout_seconds"]),
+              timeoutSeconds >= 0,
+              timeoutSeconds <= MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds
+        else { return nil }
+
+        switch mode {
+        case .automatic:
+            guard timeoutSeconds > 0,
+                  let rawFamily = object["parent_family"] as? String,
+                  let parentFamily = ParentFamily(rawValue: rawFamily)
+            else { return nil }
+            return CanonicalMetadata(mode: mode, timeoutSeconds: timeoutSeconds, parentFamily: parentFamily)
+        case .explicit:
+            guard timeoutSeconds > 0, object["parent_family"] == nil else { return nil }
+            return CanonicalMetadata(mode: mode, timeoutSeconds: timeoutSeconds, parentFamily: nil)
+        case .poll:
+            guard timeoutSeconds == 0, object["parent_family"] == nil else { return nil }
+            return CanonicalMetadata(mode: mode, timeoutSeconds: timeoutSeconds, parentFamily: nil)
+        }
+    }
+
+    private static func numericTimeout(_ value: Any?) -> TimeInterval? {
+        guard let value else { return nil }
+        if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            let seconds = number.doubleValue
+            return seconds.isFinite ? seconds : nil
+        }
+        if let seconds = value as? Double, seconds.isFinite {
+            return seconds
+        }
+        if let seconds = value as? Int {
+            return TimeInterval(seconds)
+        }
+        return nil
+    }
 
     /// Exhaustive current-enum mapping. Only `.claudeCode` belongs to the Claude row and only
     /// `.codexExec` to the Codex row; Claude-compatible vendors do not inherit the Claude default

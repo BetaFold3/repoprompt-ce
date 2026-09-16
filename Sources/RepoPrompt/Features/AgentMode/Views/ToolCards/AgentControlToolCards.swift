@@ -42,6 +42,7 @@ struct AgentRunCardPresentation: Equatable {
     let interactionKind: String?
     let interactionPrompt: String?
     let deliveryRaw: String?
+    let waitLabel: String?
     let op: String
 
     init?(resultObject: [String: Any], args: ToolArgsDTOs.AgentRunArgs? = nil, opOverride: String? = nil) {
@@ -67,6 +68,7 @@ struct AgentRunCardPresentation: Equatable {
         interactionKind = (interactionObject?["kind"] as? String)?.nonEmpty
         interactionPrompt = (interactionObject?["prompt"] as? String)?.nonEmpty
         deliveryRaw = (metaObject?["delivery"] as? String)?.nonEmpty
+        waitLabel = AgentControlWaitLabelBuilder.resultLabel(from: resultObject)
         op = opOverride?.lowercased() ?? args?.op?.lowercased() ?? "start"
     }
 
@@ -100,7 +102,7 @@ struct AgentRunCardPresentation: Equatable {
     }
 
     var subtitle: String? {
-        let parts = [statusLabel, interactionLabel, workflowLabel, sessionNameOrID, agentName, model]
+        let parts = [statusLabel, waitLabel, interactionLabel, workflowLabel, sessionNameOrID, agentName, model]
             .compactMap(\.self)
         if !parts.isEmpty {
             return parts.joined(separator: " • ")
@@ -296,6 +298,7 @@ private struct AgentExploreBatchStartPresentation {
     let startedCount: Int
     let runningCount: Int
     let visualStatus: ToolCardStatus
+    let waitLabel: String?
 
     init?(resultObject: [String: Any]) {
         guard let start = resultObject["start"] as? [String: Any],
@@ -318,10 +321,13 @@ private struct AgentExploreBatchStartPresentation {
         } else {
             visualStatus = .neutral
         }
+        waitLabel = AgentControlWaitLabelBuilder.resultLabel(from: resultObject)
     }
 
     var subtitle: String {
-        "Started \(startedCount) explores • \(runningCount) running"
+        ["Started \(startedCount) explores", "\(runningCount) running", waitLabel]
+            .compactMap(\.self)
+            .joined(separator: " • ")
     }
 }
 

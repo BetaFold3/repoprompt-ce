@@ -2956,6 +2956,15 @@ struct AgentModeChatDetailView: View {
         let cancelAction = showCancel ? cancelActiveToolsAction : nil
         let ownerTabID = transcriptSnapshot.presentation.tabID ?? transcriptSnapshot.currentTabID ?? currentTabID
         let isRemoteSession = ownerTabID.flatMap { agentModeVM.sessions[$0]?.remoteHost } != nil
+        let authoritativeOwnerSession = transcriptSnapshot.presentation.tabID.flatMap { agentModeVM.sessions[$0] }
+        let authoritativeLocalParentFamily: AgentMCPWaitPolicy.ParentFamily? = {
+            guard showCancel,
+                  let authoritativeOwnerSession,
+                  authoritativeOwnerSession.remoteHost == nil,
+                  authoritativeOwnerSession.runState.isActive
+            else { return nil }
+            return AgentMCPWaitPolicy.parentFamily(for: authoritativeOwnerSession.selectedAgent)
+        }()
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
         let runLocallyInsteadAction: (() -> Void)? = if let ownerTabID,
                                                         agentModeVM.shouldOfferRunLocallyInstead(
@@ -3002,6 +3011,11 @@ struct AgentModeChatDetailView: View {
                 cancelActiveToolsAction: cancelAction,
                 isRemoteSession: isRemoteSession
             ),
+            agentControlToolCardContext: showCancel
+                ? AgentControlToolCardContext(
+                    authoritativeLocalParentFamily: authoritativeLocalParentFamily
+                )
+                : nil,
             promptManager: promptManager,
             handoffConfig: handoffConfig(for: item.id),
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),

@@ -384,14 +384,21 @@ enum AgentToolResultPersistencePolicy {
             }
             return resultJSON
         }()
+        let boundedFallback = exceedsPersistedToolSummaryBudget(fallbackWithMetadata)
+            ? minimalResultJSON(statusWord: statusWord, normalizedToolName: normalizedToolName)
+            : fallbackWithMetadata
+        let lifecycleWaitPolicySummary = lifecycleWaitPolicyFallbackJSON(
+            normalizedToolName: normalizedToolName,
+            sanitizedResultJSON: sanitized?.resultJSON,
+            fallbackJSON: boundedFallback,
+            statusWord: statusWord,
+            context: context
+        )
         let resultJSON = promptExportStructuredMetadata
             ?? cursorACPStructuredSummary
             ?? allowedStructuredSummary
-            ?? (
-                exceedsPersistedToolSummaryBudget(fallbackWithMetadata)
-                    ? minimalResultJSON(statusWord: statusWord, normalizedToolName: normalizedToolName)
-                    : fallbackWithMetadata
-            )
+            ?? lifecycleWaitPolicySummary
+            ?? boundedFallback
         return AgentPersistedToolResultSummary(
             resultJSON: resultJSON,
             statusWord: statusWord,
@@ -401,6 +408,42 @@ enum AgentToolResultPersistencePolicy {
             exitCode: exitCode,
             summaryText: summaryText,
             summaryOnly: promptExportStructuredMetadata == nil
+        )
+    }
+
+    private static func lifecycleWaitPolicyFallbackJSON(
+        normalizedToolName: String?,
+        sanitizedResultJSON: String?,
+        fallbackJSON: String,
+        statusWord: String,
+        context: AgentToolResultProcessingContext?
+    ) -> String? {
+        guard normalizedToolName == "agent_run" || normalizedToolName == "agent_explore",
+              let sanitizedObject = jsonObject(from: sanitizedResultJSON, context: context),
+              let waitPolicy = AgentMCPWaitPolicy.canonicalMetadata(from: sanitizedObject)
+        else {
+            return nil
+        }
+
+        func mergingPolicy(into baseJSON: String) -> String? {
+            guard var object = jsonObject(from: baseJSON, context: context) else { return nil }
+            object[AgentMCPWaitPolicy.waitPolicyKey] = waitPolicy.jsonObject
+            guard let json = jsonString(from: object),
+                  !exceedsPersistedToolSummaryBudget(json)
+            else {
+                return nil
+            }
+            return json
+        }
+
+        if let merged = mergingPolicy(into: fallbackJSON) {
+            return merged
+        }
+        return mergingPolicy(
+            into: minimalResultJSON(
+                statusWord: statusWord,
+                normalizedToolName: normalizedToolName
+            )
         )
     }
 
@@ -1997,6 +2040,9 @@ enum AgentToolResultPersistencePolicy {
             }
             if let workflowName = smallStringValue(rawObject, keys: ["workflow_name"]) {
                 object["workflow_name"] = workflowName
+            }
+            if let waitPolicy = AgentMCPWaitPolicy.canonicalMetadata(from: rawObject) {
+                object[AgentMCPWaitPolicy.waitPolicyKey] = waitPolicy.jsonObject
             }
             if let session = rawObject["session"] as? [String: Any] {
                 var sessionObject: [String: Any] = [:]

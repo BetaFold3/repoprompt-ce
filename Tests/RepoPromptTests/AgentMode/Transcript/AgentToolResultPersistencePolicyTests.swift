@@ -361,6 +361,149 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
     }
 
+    func testAgentLifecycleWaitPolicyPersistsCanonicalMetadataOnly() throws {
+        let lifecycleRows: [(toolName: String, policy: [String: Any], expected: [String: Any])] = [
+            (
+                "agent_run",
+                [
+                    "mode": "automatic",
+                    "timeout_seconds": 420,
+                    "parent_family": "codex",
+                    "arbitrary": ["secret": "drop-me"]
+                ],
+                ["mode": "automatic", "timeout_seconds": 420, "parent_family": "codex"]
+            ),
+            (
+                "agent_explore",
+                ["mode": "explicit", "timeout_seconds": 90, "arbitrary": true],
+                ["mode": "explicit", "timeout_seconds": 90]
+            ),
+            (
+                "agent_run",
+                ["mode": "poll", "timeout_seconds": 0, "arbitrary": ["drop": true]],
+                ["mode": "poll", "timeout_seconds": 0]
+            )
+        ]
+        for row in lifecycleRows {
+            let lifecycleRaw = jsonString([
+                "status": "completed",
+                "wait_policy": row.policy
+            ])
+            try XCTAssertNotNil(
+                AgentMCPWaitPolicy.canonicalMetadata(from: decodedObject(lifecycleRaw)),
+                row.toolName
+            )
+            let lifecycleSummary = try XCTUnwrap(
+                persistedSummary(toolName: row.toolName, rawResultJSON: lifecycleRaw)
+            )
+            let lifecycleObject = try decodedObject(lifecycleSummary.resultJSON)
+            let persistedPolicy = try XCTUnwrap(
+                lifecycleObject["wait_policy"] as? [String: Any],
+                "\(row.toolName): \(lifecycleSummary.resultJSON)"
+            )
+            XCTAssertEqual(persistedPolicy as NSDictionary, row.expected as NSDictionary, row.toolName)
+            XCTAssertNil(persistedPolicy["arbitrary"], row.toolName)
+        }
+
+        let malformedPolicies: [[String: Any]] = [
+            [
+                "mode": "automatic",
+                "timeout_seconds": 180,
+                "parent_family": "legacy-unknown"
+            ],
+            [
+                "mode": "automatic",
+                "timeout_seconds": true,
+                "parent_family": "codex"
+            ],
+            [
+                "mode": "automatic",
+                "timeout_seconds": -1,
+                "parent_family": "codex"
+            ],
+            [
+                "mode": "automatic",
+                "timeout_seconds": 14401,
+                "parent_family": "codex"
+            ]
+        ]
+        for policy in malformedPolicies {
+            let malformedLifecycleRaw = jsonString([
+                "status": "completed",
+                "wait_policy": policy
+            ])
+            let malformedObject = try decodedObject(malformedLifecycleRaw)
+            XCTAssertNil(AgentMCPWaitPolicy.canonicalMetadata(from: malformedObject))
+            let malformedLifecycleSummary = try XCTUnwrap(
+                persistedSummary(toolName: "agent_run", rawResultJSON: malformedLifecycleRaw)
+            )
+            XCTAssertNil(try decodedObject(malformedLifecycleSummary.resultJSON)["wait_policy"])
+        }
+
+        XCTAssertNil(AgentMCPWaitPolicy.canonicalMetadata(from: [
+            "wait_policy": [
+                "mode": "automatic",
+                "timeout_seconds": Double.infinity,
+                "parent_family": "codex"
+            ]
+        ]))
+
+        let bulkyText = String(repeating: "bulky lifecycle field ", count: 400)
+        let oversizedLifecycleRaw = jsonString([
+            "status": "completed",
+            "wait_policy": [
+                "mode": "automatic",
+                "timeout_seconds": 420,
+                "parent_family": "codex"
+            ],
+            "assistant_text": bulkyText,
+            "note": bulkyText,
+            "reason": bulkyText,
+            "status_text": bulkyText,
+            "workflow_name": bulkyText,
+            "session": ["id": "session-1", "name": bulkyText],
+            "agent": ["id": "codex", "name": bulkyText, "model": bulkyText],
+            "interaction": ["id": "interaction-1", "kind": "question", "prompt": bulkyText],
+            "_meta": ["delivery": bulkyText]
+        ])
+        XCTAssertGreaterThan(
+            oversizedLifecycleRaw.utf8.count,
+            AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes
+        )
+
+        let oversizedLifecycleSummary = try XCTUnwrap(
+            persistedSummary(toolName: "agent_run", rawResultJSON: oversizedLifecycleRaw)
+        )
+        let oversizedLifecycleObject = try decodedObject(oversizedLifecycleSummary.resultJSON)
+        XCTAssertEqual(oversizedLifecycleObject["status"] as? String, "completed")
+        XCTAssertEqual(oversizedLifecycleObject["summary_only"] as? Bool, true)
+        XCTAssertEqual(
+            oversizedLifecycleObject["wait_policy"] as? NSDictionary,
+            [
+                "mode": "automatic",
+                "timeout_seconds": 420,
+                "parent_family": "codex"
+            ] as NSDictionary
+        )
+        for omittedKey in [
+            "assistant_text",
+            "note",
+            "reason",
+            "status_text",
+            "workflow_name",
+            "session",
+            "agent",
+            "interaction",
+            "_meta"
+        ] {
+            XCTAssertNil(oversizedLifecycleObject[omittedKey], omittedKey)
+        }
+        XCTAssertLessThanOrEqual(
+            oversizedLifecycleSummary.resultJSON.utf8.count,
+            AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes
+        )
+    }
+
     func testCursorACPStructuredSummaryKeepsChatIDForAllowedOracleTools() throws {
         for toolName in ["ask_oracle", "oracle_send"] {
             let events = CursorACPEventNormalizer.normalize([

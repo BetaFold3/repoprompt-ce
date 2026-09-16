@@ -27,8 +27,12 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
         XCTAssertFalse(presentation.subtitle?.contains("reasoning provider_super") == true, presentation.subtitle ?? "")
     }
 
-    func testLifecycleWaitSubtitlesAreDerivedFromCallArguments() throws {
+    func testLifecycleCallSubtitlesUsePreCompletionContextAndCanonicalCompletionPolicy() throws {
         let sessionID = "11111111-1111-1111-1111-111111111111"
+        let codexContext = AgentControlToolCardContext(authoritativeLocalParentFamily: .codex)
+        let claudeContext = AgentControlToolCardContext(authoritativeLocalParentFamily: .claude)
+        let otherContext = AgentControlToolCardContext(authoritativeLocalParentFamily: .other)
+        let unresolvedContext = AgentControlToolCardContext(authoritativeLocalParentFamily: nil)
 
         try XCTAssertEqual(
             ToolCardRouter.callSubtitle(
@@ -36,6 +40,38 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
                 argsJSON: jsonString(["op": "start"])
             ),
             "start • wait auto"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "start", "model": "requested-worker-model"]),
+                agentControlContext: codexContext
+            ),
+            "start • requested-worker-model • wait ≤10m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID]),
+                agentControlContext: claudeContext
+            ),
+            "wait • wait ≤3m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_explore",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID]),
+                agentControlContext: otherContext
+            ),
+            "wait • \(sessionID) • wait ≤3m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID]),
+                agentControlContext: unresolvedContext
+            ),
+            "wait • wait auto"
         )
         try XCTAssertEqual(
             ToolCardRouter.callSubtitle(
@@ -79,6 +115,109 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
             ),
             "wait • \(sessionID) • wait auto"
         )
+
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString([
+                    "op": "start",
+                    "model": "requested-worker-model",
+                    "timeout": 600
+                ]),
+                resultJSON: jsonString([
+                    "status": "completed",
+                    "wait_policy": [
+                        "mode": "automatic",
+                        "timeout_seconds": 300,
+                        "parent_family": "claude"
+                    ]
+                ]),
+                agentControlContext: codexContext
+            ),
+            "start • requested-worker-model • wait ≤5m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString([
+                    "op": "start",
+                    "model": "requested-worker-model"
+                ]),
+                resultJSON: jsonString(["status": "completed"]),
+                agentControlContext: codexContext
+            ),
+            "start • requested-worker-model"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_explore",
+                argsJSON: jsonString(["op": "wait", "session_id": sessionID]),
+                resultJSON: jsonString([
+                    "status": "completed",
+                    "wait_policy": [
+                        "mode": "automatic",
+                        "timeout_seconds": 180,
+                        "parent_family": "legacy-unknown"
+                    ]
+                ]),
+                agentControlContext: codexContext
+            ),
+            "wait • \(sessionID)"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "agent_run",
+                argsJSON: jsonString(["op": "start", "detach": true, "timeout": 600]),
+                resultJSON: jsonString(["status": "running"]),
+                agentControlContext: codexContext
+            ),
+            "start • detach"
+        )
+        for isError in [false, true] {
+            try XCTAssertEqual(
+                ToolCardRouter.callSubtitle(
+                    for: "agent_run",
+                    argsJSON: jsonString([
+                        "op": "start",
+                        "model": "requested-worker-model"
+                    ]),
+                    toolIsError: isError,
+                    agentControlContext: codexContext
+                ),
+                "start • requested-worker-model",
+                "toolIsError=\(isError)"
+            )
+        }
+    }
+
+    func testLifecycleResultSubtitlesUseCanonicalWaitPolicy() {
+        var automaticResult = resultObject(reasoningEffort: nil)
+        automaticResult["wait_policy"] = [
+            "mode": "automatic",
+            "timeout_seconds": 420,
+            "parent_family": "codex"
+        ]
+        XCTAssertEqual(
+            AgentRunCardPresentation(resultObject: automaticResult)?.waitLabel,
+            "wait ≤7m"
+        )
+
+        var explicitResult = resultObject(reasoningEffort: nil)
+        explicitResult["wait_policy"] = ["mode": "explicit", "timeout_seconds": 90]
+        XCTAssertEqual(AgentRunCardPresentation(resultObject: explicitResult)?.waitLabel, "wait ≤90s")
+
+        var pollResult = resultObject(reasoningEffort: nil)
+        pollResult["wait_policy"] = ["mode": "poll", "timeout_seconds": 0]
+        XCTAssertEqual(AgentRunCardPresentation(resultObject: pollResult)?.waitLabel, "poll")
+        XCTAssertNil(AgentRunCardPresentation(resultObject: resultObject(reasoningEffort: nil))?.waitLabel)
+
+        var malformedResult = resultObject(reasoningEffort: nil)
+        malformedResult["wait_policy"] = [
+            "mode": "automatic",
+            "timeout_seconds": 180,
+            "parent_family": "legacy-unknown"
+        ]
+        XCTAssertNil(AgentRunCardPresentation(resultObject: malformedResult)?.waitLabel)
     }
 
     func testReasoningEffortFallsBackToArgsWhenResultAgentObjectOmitsIt() throws {

@@ -175,6 +175,7 @@ struct AgentMessageBubble: View {
     let currentTabID: UUID?
     let suppressAskUserTranscriptUI: Bool
     let contextBuilderContext: ContextBuilderCardContext?
+    let agentControlToolCardContext: AgentControlToolCardContext?
     let promptManager: PromptViewModel?
     var handoffConfig: AgentHandoffConfig?
     let rawToolResultPayload: String?
@@ -207,6 +208,7 @@ struct AgentMessageBubble: View {
         currentTabID: UUID? = nil,
         suppressAskUserTranscriptUI: Bool = false,
         contextBuilderContext: ContextBuilderCardContext? = nil,
+        agentControlToolCardContext: AgentControlToolCardContext? = nil,
         promptManager: PromptViewModel? = nil,
         handoffConfig: AgentHandoffConfig? = nil,
         rawToolResultPayload: String? = nil,
@@ -225,6 +227,7 @@ struct AgentMessageBubble: View {
         self.currentTabID = currentTabID
         self.suppressAskUserTranscriptUI = suppressAskUserTranscriptUI
         self.contextBuilderContext = contextBuilderContext
+        self.agentControlToolCardContext = agentControlToolCardContext
         self.promptManager = promptManager
         self.handoffConfig = handoffConfig
         self.rawToolResultPayload = rawToolResultPayload
@@ -287,6 +290,7 @@ struct AgentMessageBubble: View {
                         tabID: currentTabID
                     ),
                     contextBuilder: contextBuilderContext,
+                    agentControlContext: agentControlToolCardContext,
                     showRunScopedToolCancel: showRunScopedToolCancel,
                     cancelActiveToolsAction: cancelActiveToolsAction
                 )
