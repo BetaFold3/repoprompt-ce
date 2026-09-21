@@ -10,6 +10,31 @@ extension OracleViewModel {
         case explicitSlices = "explicit_slices"
     }
 
+    struct OracleMCPSendReplyContext {
+        let mode: String
+        let tabID: UUID?
+        let agentModeSessionID: UUID?
+        let agentModeRunID: UUID?
+        let model: AIModel
+        let modelRawID: String
+        let modelDisplayName: String
+        let modelSelection: String
+        let modelSource: String
+        let modelPresetID: UUID?
+        let modelPresetName: String?
+        let outputReserveTokens: Int?
+    }
+
+    /// Accepted send plus immutable reply inputs. A successful ticket owns exactly one
+    /// reference-counted pin on `chatID`; its recipient must call `unpinSession(chatID)`
+    /// exactly once after transferring or completing observation of the query.
+    struct OracleMCPSendTicket {
+        let chatID: UUID
+        let queryID: UUID
+        let createdFreshChat: Bool
+        let replyContext: OracleMCPSendReplyContext
+    }
+
     private static let iso8601Formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -1047,20 +1072,36 @@ extension OracleViewModel {
     ///   session-having caller must not adopt them even when the run matches.
     /// - Unowned legacy chats match unowned callers always, and owned callers only where
     ///   `allowUnownedLegacy` permits adoption.
+    static func oracleOwnerMatches(
+        ownerSessionID: UUID?,
+        ownerRunID: UUID?,
+        callerSessionID: UUID?,
+        callerRunID: UUID?,
+        allowUnownedLegacy: Bool
+    ) -> Bool {
+        if let ownerSessionID {
+            return callerSessionID == ownerSessionID
+        }
+        if let ownerRunID {
+            return callerSessionID == nil && callerRunID == ownerRunID
+        }
+        guard callerSessionID != nil || callerRunID != nil else { return true }
+        return allowUnownedLegacy
+    }
+
     private static func sessionMatchesOracleOwner(
         _ session: ChatSession,
         agentModeSessionID: UUID?,
         agentModeRunID: UUID?,
         allowUnownedLegacy: Bool
     ) -> Bool {
-        if let ownerSessionID = session.agentModeSessionID {
-            return agentModeSessionID == ownerSessionID
-        }
-        if let ownerRunID = session.agentModeRunID {
-            return agentModeSessionID == nil && agentModeRunID == ownerRunID
-        }
-        guard agentModeSessionID != nil || agentModeRunID != nil else { return true }
-        return allowUnownedLegacy
+        oracleOwnerMatches(
+            ownerSessionID: session.agentModeSessionID,
+            ownerRunID: session.agentModeRunID,
+            callerSessionID: agentModeSessionID,
+            callerRunID: agentModeRunID,
+            allowUnownedLegacy: allowUnownedLegacy
+        )
     }
 
     static func sessionMatchesOracleOwnerForExplicitContinuation(
@@ -1649,15 +1690,33 @@ extension OracleViewModel {
         )
     }
 
-    /// Full implementation of the shared oracle send backend.
+    /// Synchronous-behavior wrapper for the shared Oracle send backend.
     @MainActor
     func tool_chatSend(
         args: [String: Value],
         promptVM: PromptViewModel,
         tabContext: OracleSendTabContext? = nil
-    ) async throws
-        -> [String: Value]
-    {
+    ) async throws -> [String: Value] {
+        let ticket = try await tool_chatSendStart(
+            args: args,
+            promptVM: promptVM,
+            tabContext: tabContext
+        )
+        defer { unpinSession(ticket.chatID) }
+        try await waitUntilMessageFinalised(ticket.queryID)
+        return try tool_chatSendReply(for: ticket)
+    }
+
+    /// Accepts and starts an Oracle send without waiting for its reply.
+    ///
+    /// Success transfers one `chatID` pin to the returned ticket. Rejections release their
+    /// temporary pin internally; a successful recipient owns exactly one matching unpin.
+    @MainActor
+    func tool_chatSendStart(
+        args: [String: Value],
+        promptVM: PromptViewModel,
+        tabContext: OracleSendTabContext? = nil
+    ) async throws -> OracleMCPSendTicket {
         // ────────── 1. Validate & extract parameters ──────────
         let removedArgs = ["selected_paths", "git_scope", "git_base"].filter { args[$0] != nil }
         if !removedArgs.isEmpty {
@@ -2030,13 +2089,32 @@ extension OracleViewModel {
             createdFreshChat = atomic.1
             sendStart = atomic.2
         }
-        defer { unpinSession(chatID) }
-
-        let queryId: UUID
+        let ticket: OracleMCPSendTicket
         switch sendStart {
         case let .started(startedQueryID):
-            queryId = startedQueryID
+            // Step B binds its operation at this first synchronous point after the
+            // reservation, before any continuation activation or ownership awaits.
+            ticket = OracleMCPSendTicket(
+                chatID: chatID,
+                queryID: startedQueryID,
+                createdFreshChat: createdFreshChat,
+                replyContext: OracleMCPSendReplyContext(
+                    mode: mode,
+                    tabID: tabID,
+                    agentModeSessionID: tabContext?.agentModeSessionID,
+                    agentModeRunID: tabContext?.agentModeRunID,
+                    model: selectedModel,
+                    modelRawID: selectedModel.rawValue,
+                    modelDisplayName: selectedModel.displayName,
+                    modelSelection: modelSelection.selectionKind.rawValue,
+                    modelSource: modelSelection.modelSource,
+                    modelPresetID: modelSelection.modelPresetID,
+                    modelPresetName: modelSelection.modelPresetName,
+                    outputReserveTokens: outputReserveTokens
+                )
+            )
         case .rejectedSessionBusy:
+            unpinSession(chatID)
             throw ChatToolError.oracleSessionBusy(
                 "This chat is still streaming. Pass new_chat:true or a different chat_id, or wait. In Agent Mode, use oracle_chat_log with the explicit chat_id to inspect the lane."
             )
@@ -2062,13 +2140,18 @@ extension OracleViewModel {
                 }
                 await deleteSession(rejectedSession)
             }
+            unpinSession(chatID)
             throw ChatToolError.oracleConcurrencyLimit(
                 "2 Oracle streams are already running in this tab. Wait for one to finish, then retry. In Agent Mode, use oracle_chat_log with each explicit chat_id to inspect the active lanes."
             )
         case let .failed(reason):
+            unpinSession(chatID)
             throw ChatToolError.invalidParams(reason)
         }
 
+        // From accepted ticket creation through return, this segment must remain
+        // nonthrowing: the caller does not own the ticket's pin until the return completes.
+        // If a future change introduces a throw here, it must release the pin internally.
         // Continuation activation, ownership, and naming are committed only after
         // overflow validation and the atomic reservation both succeed.
         if !createdFreshChat,
@@ -2110,58 +2193,67 @@ extension OracleViewModel {
             clearMCPSessionUIState(for: chatID)
         }
 
-        try await waitUntilMessageFinalised(queryId)
+        return ticket
+    }
 
-        // ────────── 6. Build typed reply ──────────
+    /// Builds the wire reply for a completed Oracle send ticket.
+    @MainActor
+    func tool_chatSendReply(for ticket: OracleMCPSendTicket) throws -> [String: Value] {
+        let context = ticket.replyContext
         let errors: [String] = []
-        let aiMsg = getChatMessage(withId: queryId).flatMap { $0.isUser ? nil : $0 }
+        let aiMsg = getChatMessage(withId: ticket.queryID).flatMap { $0.isUser ? nil : $0 }
 
         let replyObj = ChatSendReply(
-            chatId: chatID,
-            shortId: sessions.first(where: { $0.id == chatID })?.shortID ?? "",
-            mode: mode,
+            chatId: ticket.chatID,
+            shortId: sessions.first(where: { $0.id == ticket.chatID })?.shortID ?? "",
+            mode: context.mode,
             response: aiMsg?.content,
             errors: errors.isEmpty ? nil : errors
         )
 
-        // Serialise to MCP Value → dictionary
         guard case var .object(dict) = replyObj.toMCPValue() else {
             throw ChatToolError.internalError("failed to encode reply")
         }
-        if let tabID {
+        if let tabID = context.tabID {
             dict["context_id"] = .string(tabID.uuidString)
         }
-        if let agentModeSessionID = tabContext?.agentModeSessionID {
+        if let agentModeSessionID = context.agentModeSessionID {
             dict["agent_session_id"] = .string(agentModeSessionID.uuidString)
         }
-        if let agentModeRunID = tabContext?.agentModeRunID {
+        if let agentModeRunID = context.agentModeRunID {
             dict["agent_run_id"] = .string(agentModeRunID.uuidString)
         }
-        if modelSelection.modelSource == "preset" {
-            // Internal UI-only fields are captured by Agent Mode tool cards and are never
-            // formatted into MCP output or retained in agent-facing transcript summaries.
-            dict["ui_model_id"] = .string(selectedModel.rawValue)
-            dict["ui_model_name"] = .string(selectedModel.displayName)
-        } else {
-            dict["model_id"] = .string(selectedModel.rawValue)
-            dict["model_name"] = .string(selectedModel.displayName)
-        }
-        dict["model_selection"] = .string(modelSelection.selectionKind.rawValue)
-        dict["model_source"] = .string(modelSelection.modelSource)
-        if let modelPresetID = modelSelection.modelPresetID {
-            dict["model_preset_id"] = .string(modelPresetID.uuidString)
-        }
-        if let modelPresetName = modelSelection.modelPresetName {
-            dict["model_preset_name"] = .string(modelPresetName)
-        }
+        dict.merge(modelIdentityFields(context), uniquingKeysWith: { _, new in new })
         if let usage = buildOracleUsageEcho(
-            assistantMessageID: queryId,
-            model: selectedModel,
-            outputReserveTokens: outputReserveTokens
+            assistantMessageID: ticket.queryID,
+            model: context.model,
+            outputReserveTokens: context.outputReserveTokens
         ) {
             dict["usage"] = .object(usage)
         }
         return dict
+    }
+
+    func modelIdentityFields(_ context: OracleMCPSendReplyContext) -> [String: Value] {
+        var fields: [String: Value] = [:]
+        if context.modelSource == "preset" {
+            // Internal UI-only fields are captured by Agent Mode tool cards and are never
+            // formatted into MCP output or retained in agent-facing transcript summaries.
+            fields["ui_model_id"] = .string(context.modelRawID)
+            fields["ui_model_name"] = .string(context.modelDisplayName)
+        } else {
+            fields["model_id"] = .string(context.modelRawID)
+            fields["model_name"] = .string(context.modelDisplayName)
+        }
+        fields["model_selection"] = .string(context.modelSelection)
+        fields["model_source"] = .string(context.modelSource)
+        if let modelPresetID = context.modelPresetID {
+            fields["model_preset_id"] = .string(modelPresetID.uuidString)
+        }
+        if let modelPresetName = context.modelPresetName {
+            fields["model_preset_name"] = .string(modelPresetName)
+        }
+        return fields
     }
 
     /// Neutral usage echo for ask_oracle / oracle_send results.

@@ -637,6 +637,24 @@ final class AgentOraclePillRoutingTests: XCTestCase {
     }
 
     @MainActor
+    private final class OracleLifecycleRecorder {
+        private(set) var kinds: [OracleMessageLifecycleActivityEvent.Kind] = []
+
+        func record(_ event: OracleMessageLifecycleActivityEvent) {
+            kinds.append(event.kind)
+        }
+    }
+
+    @MainActor
+    private final class RejectedSessionPinRecorder {
+        private(set) var rows: [(sessionID: UUID, pinCountBeforeCleanup: Int)] = []
+
+        func record(sessionID: UUID, pinCountBeforeCleanup: Int) {
+            rows.append((sessionID, pinCountBeforeCleanup))
+        }
+    }
+
+    @MainActor
     private final class FirstSessionSaveGate {
         private let gate = OneShotAsyncGate()
         private(set) var entryCount = 0
@@ -714,9 +732,490 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             continuations[model.rawValue]?.finish()
         }
 
+        func fail(model: AIModel, error: Error) {
+            continuations[model.rawValue]?.finish(throwing: error)
+        }
+
         func finishAll() {
             continuations.values.forEach { $0.finish() }
         }
+    }
+
+    func testOracleSendWrapperMatchesStartWaitReplyOutcome() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let settings = GlobalSettingsStore.shared
+        let presetsManager = ModelPresetsManager.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousPlanningModelRaw = settings.planningModelRaw()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let harness = ParallelOracleTransportHarness()
+
+        defer {
+            harness.finishAll()
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            settings.setPlanningModelRaw(previousPlanningModelRaw, commit: false)
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            fixture.cleanup()
+        }
+
+        let model = AIModel.customProviderUser(name: "wrapper-parity")
+        let preset = ModelPreset(
+            name: "Wrapper_Parity",
+            model: model,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [preset]
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, selectedModel in
+            harness.makeStream(message: message, for: selectedModel)
+        }
+
+        let agentSessionID = UUID()
+        let agentRunID = UUID()
+        let packaging = OracleViewModel.OracleSendPackagingContext(
+            sourceTabID: fixture.tabID,
+            sourceWorkspaceID: fixture.workspace.id,
+            sourceSelectionRevision: 0,
+            sourceAgentSessionID: agentSessionID,
+            sourceAgentRunID: agentRunID,
+            promptText: "",
+            selection: StoredSelection(selectedPaths: [], codemapAutoEnabled: false),
+            lookupContext: nil,
+            reviewGitContext: .automaticOnly(),
+            provenance: .direct
+        )
+        let tabContext = OracleViewModel.OracleSendTabContext(
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspace.id,
+            origin: .askOracle,
+            agentModeSessionID: agentSessionID,
+            agentModeRunID: agentRunID,
+            packaging: packaging
+        )
+
+        let wrapperTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Parity turn"),
+                    "mode": .string("chat"),
+                    "model": .string(preset.id.uuidString),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 1)
+        let wrapperSession = try XCTUnwrap(
+            oracle.sessions.first {
+                oracle.streamingSessions.contains($0.id) && $0.lastSendModelID == model.rawValue
+            }
+        )
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(wrapperSession.id), 1)
+        let tokenInfo = ChatTokenInfo(promptTokens: 321, completionTokens: 12, cost: 0.01)
+        harness.finish(model: model, text: "Identical reply", tokens: tokenInfo)
+        let wrapperReply = try await wrapperTask.value
+        let chatID = try XCTUnwrap(wrapperReply["chat_id"]?.stringValue)
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(wrapperSession.id), 0)
+        XCTAssertEqual(wrapperReply["response"]?.stringValue, "Identical reply")
+        XCTAssertEqual(wrapperReply["mode"]?.stringValue, "chat")
+        XCTAssertEqual(wrapperReply["context_id"]?.stringValue, fixture.tabID.uuidString)
+        XCTAssertEqual(wrapperReply["agent_session_id"]?.stringValue, agentSessionID.uuidString)
+        XCTAssertEqual(wrapperReply["agent_run_id"]?.stringValue, agentRunID.uuidString)
+        XCTAssertEqual(wrapperReply["ui_model_id"]?.stringValue, model.rawValue)
+        XCTAssertEqual(wrapperReply["ui_model_name"]?.stringValue, model.displayName)
+        XCTAssertNil(wrapperReply["model_id"])
+        XCTAssertNil(wrapperReply["model_name"])
+        XCTAssertEqual(wrapperReply["model_selection"]?.stringValue, "explicit")
+        XCTAssertEqual(wrapperReply["model_source"]?.stringValue, "preset")
+        XCTAssertEqual(wrapperReply["model_preset_id"]?.stringValue, preset.id.uuidString)
+        XCTAssertEqual(wrapperReply["model_preset_name"]?.stringValue, preset.name)
+        let wrapperUsage = try XCTUnwrap(wrapperReply["usage"]?.objectValue)
+        XCTAssertEqual(wrapperUsage["input_tokens"]?.intValue, 321)
+        XCTAssertEqual(wrapperUsage["source"]?.stringValue, "provider_reported")
+
+        let ticket = try await oracle.tool_chatSendStart(
+            args: [
+                "message": .string("Parity turn"),
+                "mode": .string("chat"),
+                "model": .string(preset.id.uuidString),
+                "chat_id": .string(chatID)
+            ],
+            promptVM: promptViewModel,
+            tabContext: tabContext
+        )
+        var ownsTicketPin = true
+        defer {
+            if ownsTicketPin {
+                oracle.unpinSession(ticket.chatID)
+            }
+        }
+
+        XCTAssertEqual(
+            oracle.sessions.first(where: { $0.id == ticket.chatID })?.shortID,
+            chatID
+        )
+        XCTAssertTrue(oracle.isOracleQueryActive(ticket.queryID, in: ticket.chatID))
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(ticket.chatID), 1)
+        try await harness.waitUntilOpen(count: 2)
+        harness.finish(model: model, text: "Identical reply", tokens: tokenInfo)
+        try await oracle.waitUntilMessageFinalised(ticket.queryID)
+        XCTAssertFalse(oracle.isOracleQueryActive(ticket.queryID, in: ticket.chatID))
+
+        let splitReply = try oracle.tool_chatSendReply(for: ticket)
+        XCTAssertEqual(splitReply, wrapperReply)
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(ticket.chatID), 1)
+        oracle.unpinSession(ticket.chatID)
+        ownsTicketPin = false
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(ticket.chatID), 0)
+
+        settings.setMCPShowModelPresets(false, commit: false)
+        settings.setPlanningModelRaw(model.rawValue, commit: false)
+        let nonPresetTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Planning-model identity"),
+                    "mode": .string("chat"),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel,
+                tabContext: tabContext
+            )
+        }
+        try await harness.waitUntilOpen(count: 3)
+        harness.finish(model: model, text: "Planning reply", tokens: tokenInfo)
+        let nonPresetReply = try await nonPresetTask.value
+        XCTAssertEqual(nonPresetReply["response"]?.stringValue, "Planning reply")
+        XCTAssertEqual(nonPresetReply["context_id"]?.stringValue, fixture.tabID.uuidString)
+        XCTAssertEqual(nonPresetReply["agent_session_id"]?.stringValue, agentSessionID.uuidString)
+        XCTAssertEqual(nonPresetReply["agent_run_id"]?.stringValue, agentRunID.uuidString)
+        XCTAssertEqual(nonPresetReply["model_id"]?.stringValue, model.rawValue)
+        XCTAssertEqual(nonPresetReply["model_name"]?.stringValue, model.displayName)
+        XCTAssertNil(nonPresetReply["ui_model_id"])
+        XCTAssertNil(nonPresetReply["ui_model_name"])
+        XCTAssertEqual(nonPresetReply["model_selection"]?.stringValue, "automatic")
+        XCTAssertEqual(nonPresetReply["model_source"]?.stringValue, "planning_model")
+        XCTAssertNil(nonPresetReply["model_preset_id"])
+        XCTAssertNil(nonPresetReply["model_preset_name"])
+    }
+
+    func testOracleSendTerminalHookReportsFailureAndCancellation() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let settings = GlobalSettingsStore.shared
+        let presetsManager = ModelPresetsManager.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let harness = ParallelOracleTransportHarness()
+        var pinnedSessionIDs: [UUID] = []
+
+        defer {
+            oracle.setOracleMCPStreamTerminalObserver(nil)
+            harness.finishAll()
+            for sessionID in pinnedSessionIDs {
+                oracle.unpinSession(sessionID)
+            }
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            fixture.cleanup()
+        }
+
+        let model = AIModel.customProviderUser(name: "terminal-hook")
+        let preset = ModelPreset(
+            name: "Terminal_Hook",
+            model: model,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [preset]
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, selectedModel in
+            harness.makeStream(message: message, for: selectedModel)
+        }
+
+        var sessionIDByQueryID: [UUID: UUID] = [:]
+        var terminalEvents: [(
+            queryID: UUID,
+            reason: OracleViewModel.OracleMCPStreamTerminalReason,
+            wasActive: Bool
+        )] = []
+        oracle.setOracleMCPStreamTerminalObserver { queryID, reason in
+            let wasActive = sessionIDByQueryID[queryID]
+                .map { oracle.isOracleQueryActive(queryID, in: $0) } ?? false
+            terminalEvents.append((queryID, reason, wasActive))
+        }
+
+        let failedTicket = try await oracle.tool_chatSendStart(
+            args: [
+                "message": .string("Fail this turn"),
+                "model": .string(preset.id.uuidString),
+                "new_chat": .bool(true)
+            ],
+            promptVM: promptViewModel
+        )
+        pinnedSessionIDs.append(failedTicket.chatID)
+        sessionIDByQueryID[failedTicket.queryID] = failedTicket.chatID
+        XCTAssertTrue(oracle.isOracleQueryActive(failedTicket.queryID, in: failedTicket.chatID))
+        try await harness.waitUntilOpen(count: 1)
+        harness.fail(model: model, error: URLError(.badServerResponse))
+        try await oracle.waitUntilMessageFinalised(failedTicket.queryID)
+        XCTAssertFalse(oracle.isOracleQueryActive(failedTicket.queryID, in: failedTicket.chatID))
+        let failureEvents = terminalEvents.filter { $0.queryID == failedTicket.queryID }
+        XCTAssertEqual(failureEvents.count, 1)
+        XCTAssertEqual(failureEvents.first?.reason, .failed)
+        XCTAssertEqual(failureEvents.first?.wasActive, true)
+
+        let cancelledTicket = try await oracle.tool_chatSendStart(
+            args: [
+                "message": .string("Cancel this turn"),
+                "model": .string(preset.id.uuidString),
+                "new_chat": .bool(true)
+            ],
+            promptVM: promptViewModel
+        )
+        pinnedSessionIDs.append(cancelledTicket.chatID)
+        sessionIDByQueryID[cancelledTicket.queryID] = cancelledTicket.chatID
+        XCTAssertTrue(oracle.isOracleQueryActive(cancelledTicket.queryID, in: cancelledTicket.chatID))
+        try await harness.waitUntilOpen(count: 2)
+        await oracle.cancelAIResponse(in: cancelledTicket.chatID, skipPartialParseAndSave: true)
+        XCTAssertFalse(oracle.isOracleQueryActive(cancelledTicket.queryID, in: cancelledTicket.chatID))
+        let cancellationEvents = terminalEvents.filter { $0.queryID == cancelledTicket.queryID }
+        XCTAssertTrue(cancellationEvents.contains(where: { $0.reason == .cancelled && $0.wasActive }))
+        XCTAssertFalse(cancellationEvents.contains(where: { $0.reason == .failed }))
+    }
+
+    func testOracleSendWrapperCancellationReleasesPinWithoutStoppingQuery() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let settings = GlobalSettingsStore.shared
+        let presetsManager = ModelPresetsManager.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let harness = ParallelOracleTransportHarness()
+
+        defer {
+            harness.finishAll()
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            fixture.cleanup()
+        }
+
+        let model = AIModel.customProviderUser(name: "wrapper-cancellation")
+        let preset = ModelPreset(
+            name: "Wrapper_Cancellation",
+            model: model,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [preset]
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, selectedModel in
+            harness.makeStream(message: message, for: selectedModel)
+        }
+
+        let wrapperTask = Task { @MainActor in
+            try await oracle.tool_chatSend(
+                args: [
+                    "message": .string("Keep running after observer cancellation"),
+                    "model": .string(preset.id.uuidString),
+                    "new_chat": .bool(true)
+                ],
+                promptVM: promptViewModel
+            )
+        }
+        try await harness.waitUntilOpen(count: 1)
+        let liveSession = try XCTUnwrap(
+            oracle.sessions.first {
+                oracle.streamingSessions.contains($0.id) && $0.lastSendModelID == model.rawValue
+            }
+        )
+        let queryID = try XCTUnwrap(oracle.activeQueryId(for: liveSession.id))
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(liveSession.id), 1)
+
+        wrapperTask.cancel()
+        do {
+            _ = try await wrapperTask.value
+            XCTFail("Expected the wrapper observer to be cancelled")
+        } catch is CancellationError {
+            // Expected: cancelling the observer must not cancel the accepted Oracle query.
+        }
+
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(liveSession.id), 0)
+        XCTAssertTrue(oracle.isOracleQueryActive(queryID, in: liveSession.id))
+        harness.finish(model: model, text: "Query outlived its observer")
+        try await oracle.waitUntilMessageFinalised(queryID)
+        XCTAssertFalse(oracle.isOracleQueryActive(queryID, in: liveSession.id))
+        XCTAssertEqual(
+            oracle.messagesSnapshot(for: liveSession.id).first(where: { $0.id == queryID })?.content,
+            "Query outlived its observer"
+        )
+    }
+
+    func testOracleTerminalHookSuppressesLateErrorAndCancelAfterCompletionWins() async throws {
+        let fixture = try await makeFixture()
+        let oracle = fixture.oracleViewModel
+        let promptViewModel = fixture.composition.promptManager
+        let apiSettings = try XCTUnwrap(promptViewModel.apiSettingsViewModel)
+        let settings = GlobalSettingsStore.shared
+        let presetsManager = ModelPresetsManager.shared
+        let previousPresets = presetsManager.presets
+        let previousShowPresets = settings.mcpShowModelPresets()
+        let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+        let previousCustomProviderValidity = apiSettings.isCustomProviderValid
+        let harness = ParallelOracleTransportHarness()
+        let errorFinalizationGate = OneShotAsyncGate()
+        let cancelFinalizationGate = OneShotAsyncGate()
+        var pinnedSessionIDs: [UUID] = []
+
+        defer {
+            errorFinalizationGate.release()
+            cancelFinalizationGate.release()
+            oracle.setOracleMCPStreamTerminalObserver(nil)
+            oracle.setOracleFinalizationBeforeOwnershipCommitObserverForTesting(nil)
+            harness.finishAll()
+            for sessionID in pinnedSessionIDs {
+                oracle.unpinSession(sessionID)
+            }
+            oracle.setOraclePostPackagingTransportOverrideForTesting(nil)
+            presetsManager.presets = previousPresets
+            settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+            settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
+            apiSettings.isCustomProviderValid = previousCustomProviderValidity
+            fixture.cleanup()
+        }
+
+        let errorModel = AIModel.customProviderUser(name: "late-error-after-completion")
+        let cancelModel = AIModel.customProviderUser(name: "late-cancel-after-completion")
+        let errorPreset = ModelPreset(
+            name: "Late_Error_After_Completion",
+            model: errorModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        let cancelPreset = ModelPreset(
+            name: "Late_Cancel_After_Completion",
+            model: cancelModel,
+            supportedModes: SupportedModes(chat: true, plan: true, review: true)
+        )
+        presetsManager.presets = [errorPreset, cancelPreset]
+        settings.setMCPShowModelPresets(true, commit: false)
+        settings.setMCPTemporarilyDisablePresets(false, commit: false)
+        apiSettings.isCustomProviderValid = true
+        oracle.setOraclePostPackagingTransportOverrideForTesting { message, selectedModel in
+            harness.makeStream(message: message, for: selectedModel)
+        }
+        oracle.setOracleFinalizationBeforeOwnershipCommitObserverForTesting { queryID, _ in
+            if errorFinalizationGate.targetQueryID == queryID {
+                await errorFinalizationGate.suspendUntilReleased()
+            } else if cancelFinalizationGate.targetQueryID == queryID {
+                await cancelFinalizationGate.suspendUntilReleased()
+            }
+        }
+        var terminalEvents: [(UUID, OracleViewModel.OracleMCPStreamTerminalReason)] = []
+        oracle.setOracleMCPStreamTerminalObserver { queryID, reason in
+            terminalEvents.append((queryID, reason))
+        }
+
+        let errorTicket = try await oracle.tool_chatSendStart(
+            args: [
+                "message": .string("Complete before a late error"),
+                "model": .string(errorPreset.id.uuidString),
+                "new_chat": .bool(true)
+            ],
+            promptVM: promptViewModel
+        )
+        pinnedSessionIDs.append(errorTicket.chatID)
+        errorFinalizationGate.targetQueryID = errorTicket.queryID
+        let lifecycleRecorder = OracleLifecycleRecorder()
+        let lifecycleObserverID = oracle.addMessageLifecycleActivityObserver(
+            for: errorTicket.queryID,
+            observer: { lifecycleRecorder.record($0) }
+        )
+        try await harness.waitUntilOpen(count: 1)
+        harness.yield(model: errorModel, text: "Completed despite late error", isFinal: true)
+        try await AsyncTestWait.waitUntil("Error-race finalizer reached ownership gate") {
+            await MainActor.run { errorFinalizationGate.entered }
+        }
+        harness.fail(model: errorModel, error: URLError(.badServerResponse))
+        try await AsyncTestWait.waitUntil("Late stream error reached its handler") {
+            await MainActor.run { lifecycleRecorder.kinds.contains(.streamFailed) }
+        }
+        XCTAssertFalse(terminalEvents.contains(where: { $0.0 == errorTicket.queryID }))
+        errorFinalizationGate.release()
+        try await AsyncTestWait.waitUntil("Error-race response finalized") {
+            await MainActor.run {
+                oracle.messagesSnapshot(for: errorTicket.chatID)
+                    .first(where: { $0.id == errorTicket.queryID })?.isFinalized == true
+            }
+        }
+        oracle.removeMessageLifecycleActivityObserver(
+            for: errorTicket.queryID,
+            observerID: lifecycleObserverID
+        )
+        let completedAfterError = try XCTUnwrap(
+            oracle.messagesSnapshot(for: errorTicket.chatID)
+                .first(where: { $0.id == errorTicket.queryID })
+        )
+        XCTAssertEqual(completedAfterError.content, "Completed despite late error")
+        XCTAssertTrue(completedAfterError.isFinalized)
+        XCTAssertFalse(terminalEvents.contains(where: { $0.0 == errorTicket.queryID }))
+
+        let cancelTicket = try await oracle.tool_chatSendStart(
+            args: [
+                "message": .string("Complete before a late cancel"),
+                "model": .string(cancelPreset.id.uuidString),
+                "new_chat": .bool(true)
+            ],
+            promptVM: promptViewModel
+        )
+        pinnedSessionIDs.append(cancelTicket.chatID)
+        cancelFinalizationGate.targetQueryID = cancelTicket.queryID
+        try await harness.waitUntilOpen(count: 2)
+        harness.yield(model: cancelModel, text: "Completed despite late cancel", isFinal: true)
+        try await AsyncTestWait.waitUntil("Cancel-race finalizer reached ownership gate") {
+            await MainActor.run { cancelFinalizationGate.entered }
+        }
+        await oracle.cancelAIResponse(in: cancelTicket.chatID, skipPartialParseAndSave: true)
+        XCTAssertFalse(terminalEvents.contains(where: { $0.0 == cancelTicket.queryID }))
+        cancelFinalizationGate.release()
+        try await AsyncTestWait.waitUntil("Cancel-race response finalized") {
+            await MainActor.run {
+                oracle.messagesSnapshot(for: cancelTicket.chatID)
+                    .first(where: { $0.id == cancelTicket.queryID })?.isFinalized == true
+            }
+        }
+        let completedAfterCancel = try XCTUnwrap(
+            oracle.messagesSnapshot(for: cancelTicket.chatID)
+                .first(where: { $0.id == cancelTicket.queryID })
+        )
+        XCTAssertEqual(completedAfterCancel.content, "Completed despite late cancel")
+        XCTAssertTrue(completedAfterCancel.isFinalized)
+        XCTAssertFalse(terminalEvents.contains(where: { $0.0 == cancelTicket.queryID }))
     }
 
     func testParallelOracleSendsUseExactPresetsStayIndependentAndEnforceOverlapPolicies() async throws {
@@ -824,6 +1323,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 oracle.streamingSessions.contains($0.id) && $0.lastSendModelID == fableModel.rawValue
             }
         )
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(firstSession.id), 1)
         do {
             _ = try await oracle.tool_chatSend(
                 args: [
@@ -840,6 +1340,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             XCTAssertEqual((error as? ChatToolError)?.code, .oracleSessionBusy)
             XCTAssertTrue(error.localizedDescription.contains("oracle_session_busy"), error.localizedDescription)
             XCTAssertTrue(oracle.streamingSessions.contains(firstSession.id))
+            XCTAssertEqual(oracle.oracleSessionPinCountForTesting(firstSession.id), 1)
         }
 
         let secondTask = Task { @MainActor in
@@ -867,6 +1368,9 @@ final class AgentOraclePillRoutingTests: XCTestCase {
             Set(streamingSessions.compactMap(\.lastSendModelID)),
             [fableModel.rawValue, solModel.rawValue]
         )
+        XCTAssertTrue(streamingSessions.allSatisfy {
+            oracle.oracleSessionPinCountForTesting($0.id) == 1
+        })
         let liveList = try await oracle.tool_chatList(args: [
             "scope": .string("tab"),
             "context_id": .string(fixture.tabID.uuidString),
@@ -954,6 +1458,14 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         )
 
         let activeSessionBeforeRejectedThird = oracle.workspaceManager.activeChatSessionID(forTabID: fixture.tabID)
+        let rejectedPinRecorder = RejectedSessionPinRecorder()
+        oracle.setOracleRejectedNewSessionCleanupObserverForTesting { rejectedSessionID, tabID in
+            XCTAssertEqual(tabID, fixture.tabID)
+            rejectedPinRecorder.record(
+                sessionID: rejectedSessionID,
+                pinCountBeforeCleanup: oracle.oracleSessionPinCountForTesting(rejectedSessionID)
+            )
+        }
 
         do {
             _ = try await oracle.tool_chatSend(
@@ -982,10 +1494,17 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 "A rejected third lane must restore the exact previously active Oracle chat"
             )
         }
+        let firstRejectedRow = try XCTUnwrap(rejectedPinRecorder.rows.first)
+        XCTAssertEqual(firstRejectedRow.pinCountBeforeCleanup, 1)
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(firstRejectedRow.sessionID), 0)
 
         oracle.setOracleRejectedNewSessionCleanupObserverForTesting { rejectedSessionID, tabID in
             XCTAssertNotEqual(rejectedSessionID, uiSessionID)
             XCTAssertEqual(tabID, fixture.tabID)
+            rejectedPinRecorder.record(
+                sessionID: rejectedSessionID,
+                pinCountBeforeCleanup: oracle.oracleSessionPinCountForTesting(rejectedSessionID)
+            )
             oracle.workspaceManager.setActiveChatSessionID(uiSessionID, forTabID: fixture.tabID)
         }
         do {
@@ -1013,6 +1532,10 @@ final class AgentOraclePillRoutingTests: XCTestCase {
                 "The interleaved rejected lane must still be deleted"
             )
         }
+        let secondRejectedRow = try XCTUnwrap(rejectedPinRecorder.rows.last)
+        XCTAssertEqual(rejectedPinRecorder.rows.count, 2)
+        XCTAssertEqual(secondRejectedRow.pinCountBeforeCleanup, 1)
+        XCTAssertEqual(oracle.oracleSessionPinCountForTesting(secondRejectedRow.sessionID), 0)
         oracle.setOracleRejectedNewSessionCleanupObserverForTesting(nil)
 
         harness.finish(model: uiModel, text: "UI response")

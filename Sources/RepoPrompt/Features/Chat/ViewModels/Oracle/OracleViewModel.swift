@@ -362,6 +362,20 @@ class OracleViewModel: ObservableObject {
         case mcp
     }
 
+    enum OracleMCPStreamTerminalReason: Equatable {
+        case cancelled
+        case failed
+    }
+
+    /// Notification seam for abnormal Oracle stream outcomes from every send origin.
+    /// One observer slot is supported (the latest setter wins). A query may emit more than
+    /// once, and duplicate emissions may disagree when providers report cancellation as
+    /// another error. Step B's future store, not this hook, owns first-writer-wins stamping.
+    typealias OracleMCPStreamTerminalObserver = @MainActor (
+        _ queryID: UUID,
+        _ reason: OracleMCPStreamTerminalReason
+    ) -> Void
+
     enum SendStart: Equatable {
         case started(queryID: UUID)
         case rejectedSessionBusy
@@ -378,6 +392,7 @@ class OracleViewModel: ObservableObject {
 
     /// Per-session stream state
     private var runStateBySession: [UUID: SessionRunState] = [:]
+    private var oracleMCPStreamTerminalObserver: OracleMCPStreamTerminalObserver?
 
     /// Per-message routing
     private var sessionIDByMessageId: [UUID: UUID] = [:]
@@ -822,6 +837,34 @@ class OracleViewModel: ObservableObject {
     }
 
     @MainActor
+    func isOracleQueryActive(_ queryID: UUID, in sessionID: UUID) -> Bool {
+        runStateBySession[sessionID]?.activeQueryId == queryID
+    }
+
+    @MainActor
+    func setOracleMCPStreamTerminalObserver(_ observer: OracleMCPStreamTerminalObserver?) {
+        oracleMCPStreamTerminalObserver = observer
+    }
+
+    @MainActor
+    private func emitOracleMCPStreamTerminal(
+        queryID: UUID,
+        reason: OracleMCPStreamTerminalReason
+    ) {
+        oracleMCPStreamTerminalObserver?(queryID, reason)
+    }
+
+    /// Existing completion evidence outranks a later abnormal notification. This reads only
+    /// the established provider-stop, finalization-claim, and finalized-message authorities;
+    /// it does not introduce another stream state machine.
+    @MainActor
+    private func oracleCompletionAlreadyWon(queryID: UUID, sessionID: UUID) -> Bool {
+        providerStopSeen.contains(queryID)
+            || finalizingAIResponses.contains(queryID)
+            || messageStore[sessionID]?.first(where: { $0.id == queryID })?.isFinalized == true
+    }
+
+    @MainActor
     private func recomputeWorkspaceBusyAndFontFreeze() {
         let anyStreaming = !streamingSessions.isEmpty
         workspaceManager.isChatBusy = anyStreaming
@@ -1186,6 +1229,10 @@ class OracleViewModel: ObservableObject {
 
         func isSessionTombstonedForTesting(_ sessionID: UUID) -> Bool {
             deletedSessionIDs.contains(sessionID)
+        }
+
+        func oracleSessionPinCountForTesting(_ sessionID: UUID) -> Int {
+            pinnedSessionRefCounts[sessionID] ?? 0
         }
     #endif
 
@@ -3750,8 +3797,12 @@ class OracleViewModel: ObservableObject {
         clearStreamActivityTracking(for: aiResponseId)
         streamIDsByQueryId.removeValue(forKey: aiResponseId)
 
+        let terminalReason: OracleMCPStreamTerminalReason = error is CancellationError ? .cancelled : .failed
         let stillOwnsSession = runStateBySession[sessionID]?.activeQueryId == aiResponseId
         guard stillOwnsSession else {
+            if !oracleCompletionAlreadyWon(queryID: aiResponseId, sessionID: sessionID) {
+                emitOracleMCPStreamTerminal(queryID: aiResponseId, reason: terminalReason)
+            }
             emitMessageLifecycleActivity(
                 error is CancellationError ? .streamCancelled : .streamFailed,
                 for: aiResponseId
@@ -3761,6 +3812,9 @@ class OracleViewModel: ObservableObject {
         }
 
         if error is CancellationError {
+            if !oracleCompletionAlreadyWon(queryID: aiResponseId, sessionID: sessionID) {
+                emitOracleMCPStreamTerminal(queryID: aiResponseId, reason: .cancelled)
+            }
             emitMessageLifecycleActivity(.streamCancelled, for: aiResponseId)
             print("AI response was cancelled.")
             guard let index = messageStore[sessionID]?.firstIndex(where: { $0.id == aiResponseId }) else {
@@ -3797,6 +3851,7 @@ class OracleViewModel: ObservableObject {
 
         emitMessageLifecycleActivity(.streamFailed, for: aiResponseId)
         guard claimAIResponseFinalization(aiResponseId, sessionID: sessionID) else { return }
+        emitOracleMCPStreamTerminal(queryID: aiResponseId, reason: .failed)
         defer { finalizingAIResponses.remove(aiResponseId) }
 
         // Pass token count to error message handler for non-cancellation errors
@@ -3991,6 +4046,11 @@ class OracleViewModel: ObservableObject {
         let streamId = runStateBySession[sessionID]?.activeStreamId ?? (qid.flatMap { streamIDsByQueryId[$0] })
         if let streamId {
             await aiQueriesService.cancelStream(id: streamId)
+        }
+        if let qid,
+           !oracleCompletionAlreadyWon(queryID: qid, sessionID: sessionID)
+        {
+            emitOracleMCPStreamTerminal(queryID: qid, reason: .cancelled)
         }
         if let qid {
             streamIDsByQueryId.removeValue(forKey: qid)

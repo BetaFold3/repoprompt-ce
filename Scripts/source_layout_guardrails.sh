@@ -375,6 +375,7 @@ allowed_tracked_docs=(
   "docs/context/plans/completed/2026-09-17-claude-auto-permissions-plan.md"
   "docs/context/plans/completed/quick-model-picker-and-handoff-hud.md"
   "docs/context/plans/2026-09-13-agent-usage-and-wait-efficiency-plan.md"
+  "docs/context/plans/2026-09-21-oracle-resumable-wait-plan.md"
   "docs/context/plans/omp-provider-integration.md"
   "docs/context/plans/pi-provider-integration.md"
   "docs/context/quick-model-picker-and-handoff-hud.md"
