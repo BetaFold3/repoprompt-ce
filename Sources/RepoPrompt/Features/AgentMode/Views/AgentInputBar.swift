@@ -1703,15 +1703,25 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var permissionChipIconName: String {
-        permissionBinding?.iconName ?? "shield"
+        permissionBinding?.sessionStatus?.iconName
+            ?? permissionBinding?.iconName
+            ?? "shield"
     }
 
     private var permissionChipDisplayName: String {
-        permissionBinding?.displayName ?? "Default"
+        permissionBinding?.sessionStatus?.title
+            ?? permissionBinding?.displayName
+            ?? "Default"
     }
 
     private var permissionChipIsWarning: Bool {
-        permissionBinding?.isWarning ?? false
+        permissionBinding?.sessionStatus?.isWarning
+            ?? permissionBinding?.isWarning
+            ?? false
+    }
+
+    private var permissionOptionsTitle: String {
+        permissionBinding?.providerID == .claude ? "Configured Preference" : "Sandbox Level"
     }
 
     @ViewBuilder
@@ -1759,6 +1769,57 @@ struct AgentComposerView: View, Equatable {
         }
     }
 
+    @ViewBuilder
+    private var permissionSessionStatusBlock: some View {
+        if let permissionBinding,
+           let status = permissionBinding.sessionStatus
+        {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Image(systemName: status.iconName)
+                    Text(status.title)
+                        .fontWeight(.semibold)
+                }
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                .foregroundStyle(status.isWarning ? Color.orange : Color.secondary)
+
+                Text(status.detail)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let configured = permissionBinding.configuredMode {
+                    permissionStatusRow(label: "Configured", mode: configured)
+                }
+                permissionStatusRow(label: "Requested", mode: status.requestedMode)
+                if let resolved = status.resolvedLaunchMode {
+                    permissionStatusRow(label: "Launch request", mode: resolved)
+                }
+                if let acknowledged = status.acknowledgedMode {
+                    permissionStatusRow(label: "Acknowledged request", mode: acknowledged)
+                }
+            }
+            .padding(8)
+            .background((status.isWarning ? Color.orange : Color.secondary).opacity(0.08))
+            .cornerRadius(6)
+        }
+    }
+
+    private func permissionStatusRow(
+        label: String,
+        mode: AgentPermissionModePresentationBinding
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text("\(label):")
+                .foregroundStyle(.tertiary)
+            Text(mode.displayName)
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+    }
+
     private var approvalPopoverContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Permissions")
@@ -1766,9 +1827,10 @@ struct AgentComposerView: View, Equatable {
                 .padding(.bottom, 2)
 
             managedPermissionInfoBlock
+            permissionSessionStatusBlock
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Sandbox Level")
+                Text(permissionOptionsTitle)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                     .foregroundStyle(.secondary)
 
@@ -1971,7 +2033,7 @@ struct AgentComposerView: View, Equatable {
                 }
 
                 Section {
-                    Toggle("RepoPrompt Only", isOn: Binding(
+                    Toggle("Suppress Third-Party MCP Servers", isOn: Binding(
                         get: { claudeTools.mcpStrictModeEnabled },
                         set: { newValue in
                             actions.applyClaudeToolSettingMutation(.mcpStrictMode(enabled: newValue))
@@ -1982,7 +2044,7 @@ struct AgentComposerView: View, Equatable {
                 } footer: {
                     Text(
                         claudeTools.mcpStrictModeEnabled
-                            ? "Only RepoPrompt MCP is active. Other MCP servers are ignored."
+                            ? "Third-party MCP servers from your Claude config are ignored for this launch. This is not end-to-end tool containment."
                             : "Other MCP servers from your Claude config will also be loaded."
                     )
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 10))

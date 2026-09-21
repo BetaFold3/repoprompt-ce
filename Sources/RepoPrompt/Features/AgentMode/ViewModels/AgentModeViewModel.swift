@@ -8765,6 +8765,7 @@ final class AgentModeViewModel: ObservableObject {
 
     @discardableResult
     func updatePermissionBindingState(from session: TabSession, syncUI: Bool = true) -> Bool {
+        guard session.tabID == currentTabID else { return false }
         let externallyManagedReason = permissionControlsExternallyManagedReason(for: session)
         let usesSubagentPolicy = usesSubagentPermissionPolicy(session)
         let nextState = ActivePermissionChromeState(
@@ -8783,7 +8784,10 @@ final class AgentModeViewModel: ObservableObject {
             selectedModelRaw: session.selectedModelRaw,
             permissionProfile: session.permissionProfile,
             isSubagent: usesSubagentPolicy,
-            externallyManagedReason: externallyManagedReason
+            externallyManagedReason: externallyManagedReason,
+            claudePermissionSessionState: session.selectedAgent.usesClaudeTooling
+                ? session.claudePermissionSessionState
+                : nil
         )
         if activeProviderControlsBinding != nextControlsBinding {
             activeProviderControlsBinding = nextControlsBinding

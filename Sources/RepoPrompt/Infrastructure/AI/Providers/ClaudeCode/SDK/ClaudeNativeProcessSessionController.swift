@@ -328,6 +328,8 @@ final actor ClaudeNativeProcessSessionController {
     struct SessionRef {
         var sessionID: String?
         var configuredContextWindow: Int?
+        var initializationGeneration: UInt64 = 0
+        var initializedDuringCall: Bool = false
     }
 
     /// Outcome of an interrupt control request, used by the coordinator to decide
@@ -341,6 +343,33 @@ final actor ClaudeNativeProcessSessionController {
         case timedOut
         /// The interrupt request failed (e.g. process not running or write error).
         case failed
+    }
+
+    struct PermissionStageError: Error, LocalizedError {
+        let requestedMode: String
+        let underlyingError: Error
+
+        var errorDescription: String? {
+            "Claude rejected permission mode '\(requestedMode)' during initialization: \(underlyingError.localizedDescription)"
+        }
+    }
+
+    struct AutoPermissionLiveMutationError: Error, LocalizedError, Equatable {
+        enum Reason: Equatable {
+            case initializationIncomplete
+            case turnInFlight
+        }
+
+        let reason: Reason
+
+        var errorDescription: String? {
+            switch reason {
+            case .initializationIncomplete:
+                "Claude Auto settings cannot change before initialization completes."
+            case .turnInFlight:
+                "Claude Auto settings cannot change while a turn is active."
+            }
+        }
     }
 
     enum ControllerError: Error, LocalizedError {
@@ -423,6 +452,7 @@ final actor ClaudeNativeProcessSessionController {
     private var flagSettingsRequestGeneration: UInt64 = 0
     private var hasCompletedInitialFlagSettings = false
     private var isInitialized = false
+    private var initializationGeneration: UInt64 = 0
     private var isShuttingDown = false
     private var nextControlRequestID = 1
     private var pendingControlRequests: [String: CheckedContinuation<[String: Any], Error>] = [:]
@@ -701,8 +731,14 @@ final actor ClaudeNativeProcessSessionController {
         effortLevel: ClaudeCodeEffortLevel? = nil,
         systemPromptOverride: String? = nil
     ) async throws -> SessionRef {
+        let initializationGenerationAtEntry = initializationGeneration
         if process != nil, isInitialized {
-            return SessionRef(sessionID: sessionID, configuredContextWindow: configuredContextWindow)
+            return SessionRef(
+                sessionID: sessionID,
+                configuredContextWindow: configuredContextWindow,
+                initializationGeneration: initializationGeneration,
+                initializedDuringCall: initializationGeneration != initializationGenerationAtEntry
+            )
         }
 
         ensureEventsStreamReady()
@@ -721,7 +757,12 @@ final actor ClaudeNativeProcessSessionController {
             try await prepareRuntimeIfNeeded()
             try await startProcessIfNeeded(existingSessionID: existingSessionID, model: model, effortLevel: effortLevel)
             try await initializeIfNeeded(systemPromptOverride: systemPromptOverride)
-            return SessionRef(sessionID: sessionID, configuredContextWindow: configuredContextWindow)
+            return SessionRef(
+                sessionID: sessionID,
+                configuredContextWindow: configuredContextWindow,
+                initializationGeneration: initializationGeneration,
+                initializedDuringCall: initializationGeneration != initializationGenerationAtEntry
+            )
         } catch {
             if process != nil || configURL != nil {
                 await shutdown()
@@ -731,15 +772,44 @@ final actor ClaudeNativeProcessSessionController {
     }
 
     func currentSessionRef() async -> SessionRef {
-        SessionRef(sessionID: sessionID, configuredContextWindow: configuredContextWindow)
+        SessionRef(
+            sessionID: sessionID,
+            configuredContextWindow: configuredContextWindow,
+            initializationGeneration: initializationGeneration,
+            initializedDuringCall: false
+        )
     }
 
     func applyModelAndEffort(model: String?, effortLevel: ClaudeCodeEffortLevel?) async throws {
         guard process != nil else { return }
+        let autoPermissionRequested = isAutoPermissionRequested
+        if autoPermissionRequested {
+            guard isInitialized else {
+                throw AutoPermissionLiveMutationError(reason: .initializationIncomplete)
+            }
+            guard !turnInFlight else {
+                throw AutoPermissionLiveMutationError(reason: .turnInFlight)
+            }
+        }
+
         latestFlagSettingsIntentGeneration &+= 1
         let intentGeneration = latestFlagSettingsIntentGeneration
         let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
         guard intentGeneration == latestFlagSettingsIntentGeneration else { return }
+        guard process != nil else {
+            if autoPermissionRequested {
+                throw ControllerError.processNotRunning
+            }
+            return
+        }
+        if autoPermissionRequested {
+            guard isInitialized else {
+                throw AutoPermissionLiveMutationError(reason: .initializationIncomplete)
+            }
+            guard !turnInFlight else {
+                throw AutoPermissionLiveMutationError(reason: .turnInFlight)
+            }
+        }
         if liveFlagSettingsRequiresProcessRestart(for: resolved.launchEnvironment) {
             writeRawEventLogRecord(kind: "session.flagSettingsDeferred", payload: [
                 "reason": "launch_environment_changed",
@@ -749,9 +819,15 @@ final actor ClaudeNativeProcessSessionController {
         }
         let previousBaseModel = activeFlagSettingsBaseModel
         let nextBaseModel = Self.flagSettingsBaseModel(from: resolved.request)
+        if autoPermissionRequested, previousBaseModel != nextBaseModel {
+            writeRawEventLogRecord(kind: "session.flagSettingsDeferred", payload: [
+                "reason": "auto_base_model_changed",
+                "model": model ?? NSNull()
+            ] as [String: Any])
+            throw ControllerError.liveModelSwitchRequiresRestart
+        }
         storeFlagSettingsRequest(resolved.request)
 
-        guard process != nil else { return }
         guard isInitialized || hasCompletedInitialFlagSettings else {
             writeRawEventLogRecord(kind: "session.flagSettingsPending", payload: [
                 "settings": resolved.request?["settings"] ?? NSNull()
@@ -776,6 +852,11 @@ final actor ClaudeNativeProcessSessionController {
     func sendUserMessage(_ text: String) async throws -> UUID {
         guard process != nil else {
             throw ControllerError.processNotRunning
+        }
+        guard isInitialized else {
+            throw ControllerError.initializationFailed(
+                "Cannot send a user message before initialization completes."
+            )
         }
         let payload = try ClaudeSDKProtocolCodec.encodeUserMessage(text: text, sessionID: sessionID)
         try sendLine(payload)
@@ -1128,9 +1209,14 @@ final actor ClaudeNativeProcessSessionController {
         writeRawEventLogRecord(kind: "session.initialized", payload: initializeResult)
         try await applyInitialFlagSettingsIfNeeded()
         try await applyInitialPermissionModeIfNeeded()
-        isInitialized = true
+        completeInitialization()
 
         publishRuntimeInitIfChanged()
+    }
+
+    private func completeInitialization() {
+        initializationGeneration &+= 1
+        isInitialized = true
     }
 
     private func resolveLaunchFlagSettings(
@@ -1148,6 +1234,9 @@ final actor ClaudeNativeProcessSessionController {
             variant: config.runtimeVariant,
             requestedModel: requestedModel
         )
+        try validateResolvedAutoPermissionMode(
+            launchEnvironment: launchEnvironment
+        )
         let requestEffortLevel = Self.shouldSuppressEffortSettings(for: launchEnvironment)
             ? nil
             : effectiveEffortLevel
@@ -1156,6 +1245,44 @@ final actor ClaudeNativeProcessSessionController {
             effortLevel: requestEffortLevel
         )
         return (launchEnvironment, request)
+    }
+
+    private var isAutoPermissionRequested: Bool {
+        config.permissionMode
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare(ClaudeAgentToolPreferences.PermissionLevel.auto.permissionMode) == .orderedSame
+    }
+
+    private func validateResolvedAutoPermissionMode(
+        launchEnvironment: ClaudeCodeLaunchEnvironment
+    ) throws {
+        guard isAutoPermissionRequested else { return }
+        switch launchEnvironment.backend {
+        case .defaultClaude:
+            break
+        case let .compatible(backendID):
+            let agentKind: AgentProviderKind = switch backendID {
+            case .glmZAI:
+                .claudeCodeGLM
+            case .kimi:
+                .kimiCode
+            case .custom:
+                .customClaudeCompatible
+            }
+            throw ClaudeAgentToolPreferences.AutoPermissionModeBlockedError(
+                candidacy: .compatibleBackend(agentKind)
+            )
+        }
+
+        let candidacy = ClaudeAgentToolPreferences.autoPermissionCandidacy(
+            agentKind: .claudeCode,
+            selectedModelRaw: launchEnvironment.effectiveModel
+        )
+        guard candidacy == .eligible else {
+            throw ClaudeAgentToolPreferences.AutoPermissionModeBlockedError(
+                candidacy: candidacy
+            )
+        }
     }
 
     private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {
@@ -1192,11 +1319,20 @@ final actor ClaudeNativeProcessSessionController {
 
     private func applyInitialPermissionModeIfNeeded() async throws {
         guard let request = Self.buildSetPermissionModeRequest(permissionMode: config.permissionMode) else { return }
-        let permissionModeResult = try await sendControlRequest(request: request)
-        writeRawEventLogRecord(kind: "session.permissionModeInitialized", payload: [
-            "requestedMode": request["mode"] ?? NSNull(),
-            "response": permissionModeResult
-        ] as [String: Any])
+        do {
+            let permissionModeResult = try await sendControlRequest(request: request)
+            writeRawEventLogRecord(kind: "session.permissionModeInitialized", payload: [
+                "requestedMode": request["mode"] ?? NSNull(),
+                "response": permissionModeResult
+            ] as [String: Any])
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw PermissionStageError(
+                requestedMode: config.permissionMode,
+                underlyingError: error
+            )
+        }
     }
 
     private static func buildInitializeRequest(systemPromptOverride: String?) -> [String: Any] {
@@ -2378,8 +2514,16 @@ final actor ClaudeNativeProcessSessionController {
         /// Attaches an already-spawned harmless child (for example `/bin/cat`) as the controller's
         /// process so `sendUserMessage` performs its production stdin write against a real pipe.
         /// Readers are not started; `shutdown()` terminates the child normally.
-        func test_attachSpawnedProcess(_ spawned: SpawnedProcess) {
+        func test_attachSpawnedProcess(
+            _ spawned: SpawnedProcess,
+            initialized: Bool = true
+        ) {
             process = spawned
+            if initialized {
+                completeInitialization()
+            } else {
+                isInitialized = false
+            }
             isShuttingDown = false
         }
 

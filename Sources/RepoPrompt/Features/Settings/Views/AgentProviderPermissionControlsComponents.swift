@@ -70,6 +70,28 @@ struct AgentProviderPermissionLevelSection: View {
                         .foregroundColor(binding.isWarning ? .orange : .secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+            } else if binding.providerID == .claude,
+                      let configured = binding.configuredMode
+            {
+                Menu {
+                    ForEach(binding.options) { option in
+                        Button {
+                            onSelectPermissionLevel(option.id)
+                        } label: {
+                            Label(option.title, systemImage: option.iconName)
+                        }
+                        .disabled(!option.isEnabled)
+                    }
+                } label: {
+                    Label(configured.displayName, systemImage: "questionmark.shield")
+                }
+                .disabled(binding.externallyManagedReason != nil)
+                .frame(idealWidth: 320, maxWidth: 420, alignment: .leading)
+
+                Text("Stored raw permission mode. Choose a supported level to replace it.")
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("No permission options available for this provider.")
                     .font(.footnote)
@@ -78,10 +100,16 @@ struct AgentProviderPermissionLevelSection: View {
         }
     }
 
-    /// Falls back to the first option when no option is flagged `isSelected`. Returns
-    /// `nil` only when the binding has no options at all, keeping the UI crash-free.
+    /// Claude preserves unknown configured raw modes instead of presenting them as the
+    /// first known option. Other providers retain their existing crash-free fallback.
     private func selectedPermissionOption(in binding: AgentPermissionChromeBinding) -> AgentPermissionOptionBinding? {
-        binding.options.first(where: { $0.isSelected }) ?? binding.options.first
+        if binding.providerID == .claude,
+           binding.configuredMode != nil,
+           !binding.options.contains(where: \.isSelected)
+        {
+            return nil
+        }
+        return binding.options.first(where: { $0.isSelected }) ?? binding.options.first
     }
 
     private func permissionLevelLabel(for providerID: AgentProviderBindingID) -> String {

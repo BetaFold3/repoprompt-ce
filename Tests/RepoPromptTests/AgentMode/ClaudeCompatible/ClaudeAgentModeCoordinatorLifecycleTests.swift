@@ -4,6 +4,747 @@ import XCTest
 
 @MainActor
 extension AgentModeRunServiceLifecycleTests {
+    func testAutoLaunchSettingsEqualityTracksBaseAndBackendButNotEffort() {
+        let opusKey = ClaudeAgentModeCoordinator.AutoPermissionValidationKey(
+            agentKind: .claudeCode,
+            runtimeVariant: .standard,
+            baseModel: "claude-opus-5"
+        )
+        let sonnetKey = ClaudeAgentModeCoordinator.AutoPermissionValidationKey(
+            agentKind: .claudeCode,
+            runtimeVariant: .standard,
+            baseModel: "claude-sonnet-5"
+        )
+        let compatibleKey = ClaudeAgentModeCoordinator.AutoPermissionValidationKey(
+            agentKind: .claudeCodeGLM,
+            runtimeVariant: .glm,
+            baseModel: "claude-opus-5"
+        )
+        let base = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .standard,
+            workspacePath: "/workspace",
+            permissionMode: "auto",
+            allowNativeBashTool: false,
+            mcpStrictMode: true,
+            sessionProfile: .standard,
+            toolSearchEnabled: nil,
+            autoPermissionValidationKey: opusKey
+        )
+        let sameEffortFreeIdentity = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .standard,
+            workspacePath: "/workspace",
+            permissionMode: "auto",
+            allowNativeBashTool: false,
+            mcpStrictMode: true,
+            sessionProfile: .standard,
+            toolSearchEnabled: nil,
+            autoPermissionValidationKey: opusKey
+        )
+        let changedModel = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .standard,
+            workspacePath: "/workspace",
+            permissionMode: "auto",
+            allowNativeBashTool: false,
+            mcpStrictMode: true,
+            sessionProfile: .standard,
+            toolSearchEnabled: nil,
+            autoPermissionValidationKey: sonnetKey
+        )
+        let changedBackend = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .glm,
+            workspacePath: "/workspace",
+            permissionMode: "auto",
+            allowNativeBashTool: false,
+            mcpStrictMode: true,
+            sessionProfile: .standard,
+            toolSearchEnabled: nil,
+            autoPermissionValidationKey: compatibleKey
+        )
+
+        XCTAssertEqual(base, sameEffortFreeIdentity)
+        XCTAssertNotEqual(base, changedModel)
+        XCTAssertNotEqual(base, changedBackend)
+    }
+
+    func testActiveAutoTurnDefersLiveSettingsApplication() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "auto-active",
+            hasTurnInFlight: true
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let session = makeRunningClaudeSession(controller: controller)
+        session.selectedModelRaw = "opus"
+        session.permissionProfile = .providerOverride(.claude(.auto))
+        harness.host.test_installLiveSession(session)
+        harness.host.test_setCurrentTabIDOverride(session.tabID)
+        defer { harness.host.test_setCurrentTabIDOverride(nil) }
+        guard let runID = session.runID else {
+            return XCTFail("Expected running Claude session identity")
+        }
+
+        let launchSettings = ClaudeAgentModeCoordinator.ControllerLaunchSettings(
+            runtimeVariant: .standard,
+            workspacePath: URL(
+                fileURLWithPath: FileManager.default.currentDirectoryPath
+            ).standardizedFileURL.path,
+            permissionMode: "auto",
+            allowNativeBashTool: false,
+            mcpStrictMode: true,
+            sessionProfile: .standard,
+            toolSearchEnabled: nil,
+            autoPermissionValidationKey: .init(
+                agentKind: .claudeCode,
+                runtimeVariant: .standard,
+                baseModel: "opus"
+            )
+        )
+        session.claudePermissionSessionState = .acknowledged(
+            ClaudePermissionAcknowledgement(
+                ownership: ClaudePermissionControllerOwnership(
+                    controllerIdentifier: ObjectIdentifier(controller as AnyObject),
+                    runID: runID,
+                    runAttemptID: session.activeRunAttemptID
+                ),
+                launchSettings: launchSettings,
+                requestedMode: "auto",
+                acknowledgedEffort: .high
+            )
+        )
+        harness.host.updatePermissionBindingState(from: session, syncUI: false)
+        let acknowledgedBinding = harness.host.activeProviderControlsBinding
+        XCTAssertEqual(acknowledgedBinding?.permission.sessionStatus?.phase, .acknowledged)
+        harness.host.claudeCoordinator.test_setControllerLaunchSettings(
+            launchSettings,
+            for: session
+        )
+
+        await harness.host.claudeCoordinator.applyCurrentClaudeModelAndEffortIfPossible(
+            for: session,
+            reason: "test_active_auto"
+        )
+
+        XCTAssertFalse(recorder.contains("auto-active:apply"))
+        guard case .pendingNextTurn = session.claudePermissionSessionState else {
+            return XCTFail("Expected pending next-turn evidence")
+        }
+        let pendingBinding = harness.host.activeProviderControlsBinding
+        XCTAssertEqual(pendingBinding?.permission.sessionStatus?.phase, .pendingNextTurn)
+        XCTAssertNotEqual(acknowledgedBinding, pendingBinding)
+    }
+
+    func testCancelledDispatchCannotResumeAgainstSuccessorController() async {
+        let recorder = LifecycleRecorder()
+        let cancelledStartGate = LifecycleAsyncGate()
+        let cancelledController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "cancelled-dispatch",
+            startGate: cancelledStartGate
+        )
+        let successorController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "successor-dispatch"
+        )
+        var factoryInvocationCount = 0
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeControllerFactory: { _, _, _, _ in
+                factoryInvocationCount += 1
+                return factoryInvocationCount == 1 ? cancelledController : successorController
+            }
+        )
+        let session = makeRunningClaudeSession(controller: cancelledController)
+        session.claudeController = nil
+        harness.host.test_installLiveSession(session)
+
+        let cancelledDispatch = Task {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "cancelled",
+                attachments: []
+            )
+        }
+        await cancelledStartGate.waitUntilArrived()
+
+        _ = harness.host.claudeCoordinator.prepareClaudeCancelSync(session)
+        if let cancelledAttemptID = session.activeRunAttemptID {
+            _ = session.endRunAttempt(
+                ifCurrentAttemptID: cancelledAttemptID,
+                source: "test_cancelled_dispatch"
+            )
+        }
+        session.runState = .running
+        session.beginRunAttempt(source: "test_successor_dispatch")
+
+        let successorDispatch = Task {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "successor",
+                attachments: []
+            )
+        }
+        let successorSent = await successorDispatch.value
+
+        XCTAssertTrue(successorSent)
+        XCTAssertFalse(recorder.contains("cancelled-dispatch:send"))
+        XCTAssertEqual(
+            recorder.events.count { $0 == "successor-dispatch:send" },
+            1
+        )
+        XCTAssertEqual(session.claudeExpectedTurnIDs.count, 1)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
+
+        await cancelledStartGate.release()
+        let cancelledSent = await cancelledDispatch.value
+
+        XCTAssertFalse(cancelledSent)
+        XCTAssertEqual(
+            recorder.events.count { $0 == "successor-dispatch:send" },
+            1
+        )
+        XCTAssertEqual(session.claudeExpectedTurnIDs.count, 1)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
+    }
+
+    func testSupersededStartupReturnCannotEvictSuccessorAutoEffortEvidence() async {
+        let recorder = LifecycleRecorder()
+        let supersededStartGate = LifecycleAsyncGate()
+        let supersededController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "superseded-auto-startup",
+            startGate: supersededStartGate
+        )
+        let successorController = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "successor-auto-startup",
+            failApplyCount: 1
+        )
+        var factoryInvocationCount = 0
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeControllerFactory: { _, _, _, _ in
+                factoryInvocationCount += 1
+                return factoryInvocationCount == 1 ? supersededController : successorController
+            }
+        )
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(
+            forModelRaw: model,
+            agentKind: .claudeCode
+        )
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(
+                previousEffort,
+                forModelRaw: model,
+                agentKind: .claudeCode
+            )
+        }
+
+        let session = makeRunningClaudeSession(controller: supersededController)
+        session.claudeController = nil
+        session.selectedModelRaw = model
+        session.permissionProfile = .providerOverride(.claude(.auto))
+        harness.host.test_installLiveSession(session)
+
+        let supersededDispatch = Task {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "superseded",
+                attachments: []
+            )
+        }
+        await supersededStartGate.waitUntilArrived()
+
+        _ = harness.host.claudeCoordinator.prepareClaudeCancelSync(session)
+        if let supersededAttemptID = session.activeRunAttemptID {
+            _ = session.endRunAttempt(
+                ifCurrentAttemptID: supersededAttemptID,
+                source: "test_superseded_auto_startup"
+            )
+        }
+        session.runState = .running
+        session.beginRunAttempt(source: "test_successor_auto_startup")
+
+        let firstSuccessorSent = await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "successor first",
+            attachments: []
+        )
+
+        XCTAssertTrue(firstSuccessorSent)
+        let appliedEffortsAfterFirstSuccessorSend = await successorController.recordedAppliedEffortLevels()
+        XCTAssertTrue(appliedEffortsAfterFirstSuccessorSend.isEmpty)
+
+        await supersededStartGate.release()
+        let supersededSent = await supersededDispatch.value
+        XCTAssertFalse(supersededSent)
+
+        let secondSuccessorSent = await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "successor second",
+            attachments: []
+        )
+
+        XCTAssertTrue(secondSuccessorSent)
+        XCTAssertEqual(
+            recorder.events.count { $0 == "successor-auto-startup:send" },
+            2
+        )
+        let successorAppliedEfforts = await successorController.recordedAppliedEffortLevels()
+        XCTAssertTrue(successorAppliedEfforts.isEmpty)
+        XCTAssertFalse(recorder.contains("superseded-auto-startup:send"))
+        let supersededAppliedEfforts = await supersededController.recordedAppliedEffortLevels()
+        XCTAssertTrue(supersededAppliedEfforts.isEmpty)
+        guard case let .acknowledged(acknowledgement) = session.claudePermissionSessionState else {
+            return XCTFail("Expected successor Auto effort acknowledgement")
+        }
+        XCTAssertEqual(
+            acknowledgement.ownership.controllerIdentifier,
+            ObjectIdentifier(successorController as AnyObject)
+        )
+        XCTAssertEqual(acknowledgement.acknowledgedEffort, .high)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
+    }
+
+    func testRetainedAutoControllerAppliesDeferredEffortBeforeNextSend() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "retained-auto-effort"
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(
+            forModelRaw: model,
+            agentKind: .claudeCode
+        )
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(
+                previousEffort,
+                forModelRaw: model,
+                agentKind: .claudeCode
+            )
+        }
+
+        let session = await makeInitializedAutoSession(
+            harness: harness,
+            controller: controller,
+            model: model
+        )
+        await controller.setTurnInFlight(true)
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+        await harness.host.claudeCoordinator.applyCurrentClaudeModelAndEffortIfPossible(
+            for: session,
+            reason: "test_active_high_to_low"
+        )
+
+        guard case let .pendingNextTurn(active, _, _) = session.claudePermissionSessionState else {
+            return XCTFail("Expected deferred Low effort evidence")
+        }
+        XCTAssertEqual(active?.acknowledgedEffort, .high)
+
+        await controller.setTurnInFlight(false)
+        let sent = await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "apply low",
+            attachments: []
+        )
+
+        XCTAssertTrue(sent)
+        let appliedEfforts = await controller.recordedAppliedEffortLevels()
+        XCTAssertEqual(appliedEfforts, [.low])
+        assertOrderedEvents([
+            "retained-auto-effort:apply",
+            "retained-auto-effort:send"
+        ], in: recorder)
+        guard case let .acknowledged(acknowledgement) = session.claudePermissionSessionState else {
+            return XCTFail("Expected acknowledged Low effort evidence")
+        }
+        XCTAssertEqual(acknowledgement.acknowledgedEffort, .low)
+    }
+
+    func testFailedAutoEffortApplicationRemainsPendingAndRetriesBeforeSend() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "retry-auto-effort",
+            failApplyCount: 1
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(
+            forModelRaw: model,
+            agentKind: .claudeCode
+        )
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(
+                previousEffort,
+                forModelRaw: model,
+                agentKind: .claudeCode
+            )
+        }
+
+        let session = await makeInitializedAutoSession(
+            harness: harness,
+            controller: controller,
+            model: model
+        )
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+
+        let firstSent = await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "first",
+            attachments: []
+        )
+
+        XCTAssertFalse(firstSent)
+        XCTAssertFalse(recorder.contains("retry-auto-effort:send"))
+        guard case let .pendingNextTurn(active, _, _) = session.claudePermissionSessionState else {
+            return XCTFail("Expected failed Low effort to remain pending")
+        }
+        XCTAssertEqual(active?.acknowledgedEffort, .high)
+
+        let secondSent = await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "second",
+            attachments: []
+        )
+
+        XCTAssertTrue(secondSent)
+        let appliedEfforts = await controller.recordedAppliedEffortLevels()
+        XCTAssertEqual(appliedEfforts, [.low, .low])
+        XCTAssertEqual(
+            recorder.events.count { $0 == "retry-auto-effort:send" },
+            1
+        )
+        assertOrderedEvents([
+            "retry-auto-effort:apply",
+            "retry-auto-effort:apply",
+            "retry-auto-effort:send"
+        ], in: recorder)
+        guard case let .acknowledged(acknowledgement) = session.claudePermissionSessionState else {
+            return XCTFail("Expected retried Low effort acknowledgement")
+        }
+        XCTAssertEqual(acknowledgement.acknowledgedEffort, .low)
+    }
+
+    func testAutoEffortRevalidatesAfterEventsPreparationBeforeSend() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "final-auto-effort"
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(
+            forModelRaw: model,
+            agentKind: .claudeCode
+        )
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(
+                previousEffort,
+                forModelRaw: model,
+                agentKind: .claudeCode
+            )
+        }
+
+        let session = await makeInitializedAutoSession(
+            harness: harness,
+            controller: controller,
+            model: model
+        )
+        let eventsReadyGate = LifecycleAsyncGate()
+        await controller.setEventsStreamReadyGate(eventsReadyGate)
+
+        let sendTask = Task {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "latest effort",
+                attachments: []
+            )
+        }
+        await eventsReadyGate.waitUntilArrived()
+
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+        await harness.host.claudeCoordinator.applyCurrentClaudeModelAndEffortIfPossible(
+            for: session,
+            reason: "test_effort_change_during_events_prepare"
+        )
+        await eventsReadyGate.release()
+
+        let sent = await sendTask.value
+        XCTAssertTrue(sent)
+        let appliedEfforts = await controller.recordedAppliedEffortLevels()
+        XCTAssertEqual(appliedEfforts, [.low])
+        assertOrderedEvents([
+            "final-auto-effort:events-ready",
+            "final-auto-effort:apply",
+            "final-auto-effort:send"
+        ], in: recorder)
+    }
+
+    func testSameControllerAutoRestartReinitializesCapturedEffortThenAppliesLatestBeforeSend() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "same-controller-auto-restart"
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(
+            forModelRaw: model,
+            agentKind: .claudeCode
+        )
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(
+                previousEffort,
+                forModelRaw: model,
+                agentKind: .claudeCode
+            )
+        }
+
+        let session = await makeInitializedAutoSession(
+            harness: harness,
+            controller: controller,
+            model: model
+        )
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+        await controller.setHasActiveSession(false)
+        let restartGate = LifecycleAsyncGate()
+        await controller.setStartGate(restartGate)
+
+        let sendTask = Task {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "same controller restart",
+                attachments: []
+            )
+        }
+        await restartGate.waitUntilArrived()
+
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        await harness.host.claudeCoordinator.applyCurrentClaudeModelAndEffortIfPossible(
+            for: session,
+            reason: "test_same_controller_restart_latest_effort"
+        )
+        await restartGate.release()
+
+        let sent = await sendTask.value
+        XCTAssertTrue(sent)
+        let startEfforts = await controller.recordedStartEffortLevels()
+        XCTAssertEqual(startEfforts, [.high, .low])
+        let appliedEfforts = await controller.recordedAppliedEffortLevels()
+        XCTAssertEqual(appliedEfforts, [.high])
+        assertOrderedEvents([
+            "same-controller-auto-restart:start:low",
+            "same-controller-auto-restart:apply:high",
+            "same-controller-auto-restart:send"
+        ], in: recorder)
+        guard case let .acknowledged(acknowledgement) = session.claudePermissionSessionState else {
+            return XCTFail("Expected latest High effort acknowledgement after restart")
+        }
+        XCTAssertEqual(acknowledgement.acknowledgedEffort, .high)
+    }
+
+    func testAutoReinitializationEvidenceFollowsStartupReturnNotPreSampledActiveSession() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "startup-return-auto-evidence"
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(
+            forModelRaw: model,
+            agentKind: .claudeCode
+        )
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(
+                previousEffort,
+                forModelRaw: model,
+                agentKind: .claudeCode
+            )
+        }
+
+        let session = await makeInitializedAutoSession(
+            harness: harness,
+            controller: controller,
+            model: model
+        )
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+        await controller.forceInitializationOnNextStartCall()
+        let restartGate = LifecycleAsyncGate()
+        await controller.setStartGate(restartGate)
+        let reportsActiveBeforeStart = await controller.hasActiveSession
+        XCTAssertTrue(reportsActiveBeforeStart)
+
+        let sendTask = Task {
+            await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+                session: session,
+                text: "startup-return evidence",
+                attachments: []
+            )
+        }
+        await restartGate.waitUntilArrived()
+
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        await harness.host.claudeCoordinator.applyCurrentClaudeModelAndEffortIfPossible(
+            for: session,
+            reason: "test_startup_return_auto_evidence"
+        )
+        await restartGate.release()
+
+        let sent = await sendTask.value
+        XCTAssertTrue(sent)
+        let startEfforts = await controller.recordedStartEffortLevels()
+        let appliedEfforts = await controller.recordedAppliedEffortLevels()
+        XCTAssertEqual(startEfforts, [.high, .low])
+        XCTAssertEqual(appliedEfforts, [.high])
+        assertOrderedEvents([
+            "startup-return-auto-evidence:start:low",
+            "startup-return-auto-evidence:apply:high",
+            "startup-return-auto-evidence:send"
+        ], in: recorder)
+        guard case let .acknowledged(acknowledgement) = session.claudePermissionSessionState else {
+            return XCTFail("Expected latest High effort acknowledgement after reported initialization")
+        }
+        XCTAssertEqual(acknowledgement.acknowledgedEffort, .high)
+    }
+
+    func testAutoReuseAfterUnobservedReinitializationDropsStaleEffortEvidenceBeforeSend() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "unobserved-auto-reinitialization"
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(
+            forModelRaw: model,
+            agentKind: .claudeCode
+        )
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(
+                previousEffort,
+                forModelRaw: model,
+                agentKind: .claudeCode
+            )
+        }
+
+        let session = await makeInitializedAutoSession(
+            harness: harness,
+            controller: controller,
+            model: model
+        )
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+        await controller.advanceInitializationGenerationUnobserved(effortLevel: .low)
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+
+        let firstSent = await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "revalidate after unobserved initialization",
+            attachments: []
+        )
+        let secondSent = await harness.host.claudeCoordinator.sendClaudeNativeMessage(
+            session: session,
+            text: "reuse acknowledged generation",
+            attachments: []
+        )
+
+        XCTAssertTrue(firstSent)
+        XCTAssertTrue(secondSent)
+        let appliedEfforts = await controller.recordedAppliedEffortLevels()
+        XCTAssertEqual(appliedEfforts, [.high])
+        XCTAssertEqual(
+            recorder.events.count { $0 == "unobserved-auto-reinitialization:send" },
+            2
+        )
+        assertOrderedEvents([
+            "unobserved-auto-reinitialization:unobserved-initialization:low",
+            "unobserved-auto-reinitialization:apply:high",
+            "unobserved-auto-reinitialization:send"
+        ], in: recorder)
+        guard case let .acknowledged(acknowledgement) = session.claudePermissionSessionState else {
+            return XCTFail("Expected High effort acknowledgement for the advanced generation")
+        }
+        XCTAssertEqual(acknowledgement.acknowledgedEffort, .high)
+    }
+
+    func testAutoInitializationCompletionPreservesPendingEffortIntent() async {
+        let recorder = LifecycleRecorder()
+        let initializationGate = LifecycleAsyncGate()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "gated-auto-initialization",
+            hasActiveSession: false,
+            startGate: initializationGate
+        )
+        let harness = makeHarness(recorder: recorder, claudeController: controller)
+        let effortService = harness.host.providerBindingService
+        let model = "opus"
+        let previousEffort = effortService.claudeEffortLevel(
+            forModelRaw: model,
+            agentKind: .claudeCode
+        )
+        effortService.setClaudeEffortLevel(.high, forModelRaw: model, agentKind: .claudeCode)
+        defer {
+            effortService.setClaudeEffortLevel(
+                previousEffort,
+                forModelRaw: model,
+                agentKind: .claudeCode
+            )
+        }
+
+        let session = makeRunningClaudeSession(controller: controller)
+        session.claudeController = nil
+        session.selectedModelRaw = model
+        session.permissionProfile = .providerOverride(.claude(.auto))
+        harness.host.test_installLiveSession(session)
+
+        let initializationTask = Task {
+            await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+        }
+        await initializationGate.waitUntilArrived()
+
+        effortService.setClaudeEffortLevel(.low, forModelRaw: model, agentKind: .claudeCode)
+        await harness.host.claudeCoordinator.applyCurrentClaudeModelAndEffortIfPossible(
+            for: session,
+            reason: "test_initialization_pending_effort"
+        )
+        await initializationGate.release()
+        await initializationTask.value
+
+        let startEfforts = await controller.recordedStartEffortLevels()
+        XCTAssertEqual(startEfforts, [.high])
+        let appliedEfforts = await controller.recordedAppliedEffortLevels()
+        XCTAssertTrue(appliedEfforts.isEmpty)
+        guard case let .pendingNextTurn(active, requestedMode, _) =
+            session.claudePermissionSessionState
+        else {
+            return XCTFail("Expected pending Low intent after High initialization")
+        }
+        XCTAssertEqual(active?.acknowledgedEffort, .high)
+        XCTAssertEqual(requestedMode, "auto")
+    }
+
     func testQueuedClaudeSteeringRecreatesControllerBeforeSendWhenPermissionsTighten() async {
         let recorder = LifecycleRecorder()
         let oldController = LifecycleFakeNativeController(
@@ -385,26 +1126,25 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
     }
 
-    func testSupersedingEnsureShutsDownTrackedPrivateFallbackBeforeStartupReturns() async {
+    func testCancelInvalidatesTrackedPrivateFallbackBeforeStartupReturns() async {
         let recorder = LifecycleRecorder()
         let privateStartupGate = LifecycleAsyncGate()
         let privateShutdownGate = LifecycleAsyncGate()
         let retiredController = LifecycleFakeNativeController(
             recorder: recorder,
-            label: "retired-before-private-supersession",
+            label: "retired-before-private-cancel",
             failResumeStart: true
         )
         let privateReplacement = LifecycleFakeNativeController(
             recorder: recorder,
-            label: "private-superseded-before-startup-return",
+            label: "private-cancelled-before-startup-return",
             startGate: privateStartupGate,
-            shutdownGate: privateShutdownGate,
-            sessionID: "private-superseded-provider-session"
+            shutdownGate: privateShutdownGate
         )
         let successorController = LifecycleFakeNativeController(
             recorder: recorder,
-            label: "successor-after-private-supersession",
-            sessionID: "successor-after-private-supersession-session"
+            label: "successor-after-private-cancel",
+            sessionID: "successor-after-private-cancel-session"
         )
         var factoryInvocationCount = 0
         let harness = makeHarness(
@@ -415,7 +1155,7 @@ extension AgentModeRunServiceLifecycleTests {
             }
         )
         let session = makeRunningClaudeSession(controller: retiredController)
-        session.providerSessionID = "provider-session-before-private-supersession"
+        session.providerSessionID = "provider-session-before-private-cancel"
         let runtime = resolvedClaudeLaunchPolicy(
             profile: session.permissionProfile,
             harness: harness
@@ -436,37 +1176,37 @@ extension AgentModeRunServiceLifecycleTests {
             harness.host.claudeCoordinator.test_hasTrackedPrivateFallbackController(for: session)
         )
 
-        await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+        _ = harness.host.claudeCoordinator.prepareClaudeCancelSync(session)
         await privateShutdownGate.waitUntilArrived()
 
-        guard let installedController = session.claudeController else {
-            return XCTFail("Expected the successor controller before private startup returned")
-        }
-        XCTAssertEqual(
-            ObjectIdentifier(installedController as AnyObject),
-            ObjectIdentifier(successorController as AnyObject)
-        )
-        XCTAssertEqual(
-            session.providerSessionID,
-            "successor-after-private-supersession-session"
-        )
+        XCTAssertNil(session.claudeController)
         XCTAssertFalse(
             harness.host.claudeCoordinator.test_hasTrackedPrivateFallbackController(for: session)
         )
         XCTAssertFalse(harness.host.claudeCoordinator.test_hasFallbackReplacementClaim(for: session))
-        XCTAssertTrue(recorder.contains("private-superseded-before-startup-return:shutdown"))
 
         await privateShutdownGate.release()
         await privateStartupGate.release()
         await firstEnsureTask.value
 
+        session.runState = .running
+        await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+
+        guard let installedController = session.claudeController else {
+            return XCTFail("Expected a successor after cancelled preparation completed")
+        }
+        XCTAssertEqual(
+            ObjectIdentifier(installedController as AnyObject),
+            ObjectIdentifier(successorController as AnyObject)
+        )
+        XCTAssertEqual(factoryInvocationCount, 2)
         XCTAssertEqual(
             recorder.events.count {
-                $0 == "private-superseded-before-startup-return:shutdown"
+                $0 == "private-cancelled-before-startup-return:shutdown"
             },
             1
         )
-        XCTAssertFalse(recorder.contains("successor-after-private-supersession:shutdown"))
+        XCTAssertFalse(recorder.contains("successor-after-private-cancel:shutdown"))
         XCTAssertEqual(session.runState, .running)
         XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
     }
@@ -538,7 +1278,7 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
     }
 
-    func testConcurrentEnsureSupersedesPrivateFallbackStartupWithoutConcurrentControllerStart() async {
+    func testConcurrentEnsureJoinsPrivateFallbackPreparation() async {
         let recorder = LifecycleRecorder()
         let freshStartupGate = LifecycleAsyncGate()
         let retiredController = LifecycleFakeNativeController(
@@ -552,17 +1292,16 @@ extension AgentModeRunServiceLifecycleTests {
             startGate: freshStartupGate,
             sessionID: "private-provider-session"
         )
-        let successorController = LifecycleFakeNativeController(
+        let unexpectedSuccessor = LifecycleFakeNativeController(
             recorder: recorder,
-            label: "successor-replacement",
-            sessionID: "successor-provider-session"
+            label: "unexpected-successor"
         )
         var factoryInvocationCount = 0
         let harness = makeHarness(
             recorder: recorder,
             claudeControllerFactory: { _, _, _, _ in
                 factoryInvocationCount += 1
-                return factoryInvocationCount == 1 ? privateReplacement : successorController
+                return factoryInvocationCount == 1 ? privateReplacement : unexpectedSuccessor
             }
         )
         let session = makeRunningClaudeSession(controller: retiredController)
@@ -590,42 +1329,34 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertNil(harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session))
         XCTAssertTrue(harness.host.claudeCoordinator.test_hasFallbackReplacementClaim(for: session))
 
-        await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
-
-        guard let installedBeforePrivateStartupReturns = session.claudeController else {
-            return XCTFail("Expected the concurrent ensure to install its successor controller")
+        let joiningEnsureTask = Task {
+            await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
         }
-        XCTAssertEqual(
-            ObjectIdentifier(installedBeforePrivateStartupReturns as AnyObject),
-            ObjectIdentifier(successorController as AnyObject)
-        )
-        XCTAssertEqual(session.providerSessionID, "successor-provider-session")
-        XCTAssertNil(session.pendingHandoff.payload)
-        XCTAssertFalse(harness.host.claudeCoordinator.test_hasFallbackReplacementClaim(for: session))
+        await Task.yield()
+
+        XCTAssertEqual(factoryInvocationCount, 1)
+        let maximumConcurrentStarts = await privateReplacement.maximumConcurrentStartInvocationCount()
+        XCTAssertEqual(maximumConcurrentStarts, 1)
 
         await freshStartupGate.release()
         await firstEnsureTask.value
+        await joiningEnsureTask.value
 
         guard let installedController = session.claudeController else {
-            return XCTFail("Expected the successor controller to remain installed")
+            return XCTFail("Expected the joined preparation controller to be installed")
         }
         XCTAssertEqual(
             ObjectIdentifier(installedController as AnyObject),
-            ObjectIdentifier(successorController as AnyObject)
+            ObjectIdentifier(privateReplacement as AnyObject)
         )
-        XCTAssertEqual(factoryInvocationCount, 2)
-        XCTAssertEqual(session.providerSessionID, "successor-provider-session")
-        XCTAssertNil(session.pendingHandoff.payload)
+        XCTAssertEqual(factoryInvocationCount, 1)
+        XCTAssertEqual(session.providerSessionID, "private-provider-session")
+        XCTAssertNotNil(session.pendingHandoff.payload)
+        XCTAssertFalse(harness.host.claudeCoordinator.test_hasFallbackReplacementClaim(for: session))
         let privateStartSessionIDs = await privateReplacement.recordedStartExistingSessionIDs()
-        let successorStartSessionIDs = await successorController.recordedStartExistingSessionIDs()
-        let privateMaximumConcurrentStarts = await privateReplacement.maximumConcurrentStartInvocationCount()
-        let successorMaximumConcurrentStarts = await successorController.maximumConcurrentStartInvocationCount()
         XCTAssertEqual(privateStartSessionIDs, [nil])
-        XCTAssertEqual(successorStartSessionIDs, ["provider-session-to-resume"])
-        XCTAssertEqual(privateMaximumConcurrentStarts, 1)
-        XCTAssertEqual(successorMaximumConcurrentStarts, 1)
-        XCTAssertTrue(recorder.contains("private-replacement:shutdown"))
-        XCTAssertFalse(recorder.contains("successor-replacement:shutdown"))
+        XCTAssertFalse(recorder.contains("private-replacement:shutdown"))
+        XCTAssertFalse(recorder.contains("unexpected-successor:start"))
         XCTAssertEqual(session.runState, .running)
         XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
     }
@@ -1226,6 +1957,34 @@ extension AgentModeRunServiceLifecycleTests {
         XCTAssertTrue(recorder.contains("claude:shutdown"))
     }
 
+    private func makeInitializedAutoSession(
+        harness: LifecycleHarness,
+        controller: LifecycleFakeNativeController,
+        model: String
+    ) async -> AgentModeViewModel.TabSession {
+        let session = makeRunningClaudeSession(controller: controller)
+        session.claudeController = nil
+        session.selectedModelRaw = model
+        session.permissionProfile = .providerOverride(.claude(.auto))
+        harness.host.test_installLiveSession(session)
+
+        await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+        guard let installedController = session.claudeController else {
+            XCTFail("Expected initialized Auto controller")
+            return session
+        }
+        XCTAssertEqual(
+            ObjectIdentifier(installedController as AnyObject),
+            ObjectIdentifier(controller as AnyObject)
+        )
+        guard case let .acknowledged(acknowledgement) = session.claudePermissionSessionState else {
+            XCTFail("Expected initialized Auto permission acknowledgement")
+            return session
+        }
+        XCTAssertEqual(acknowledgement.acknowledgedEffort, .high)
+        return session
+    }
+
     private func resolvedClaudeLaunchPolicy(
         profile: AgentProviderPermissionProfile,
         harness: LifecycleHarness
@@ -1309,21 +2068,27 @@ actor LifecycleAsyncGate {
 actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     private let recorder: LifecycleRecorder
     private let label: String
-    private let turnInFlight: Bool
+    private var activeSession: Bool
+    private var turnInFlight: Bool
     private let failSend: Bool
+    private var remainingApplyFailures: Int
     private let failStart: Bool
     private let failResumeStart: Bool
     private let replacementAfterTerminalStartupFailure: Bool
-    private let startGate: LifecycleAsyncGate?
+    private var startGate: LifecycleAsyncGate?
     private let currentSessionRefGate: LifecycleAsyncGate?
-    private let eventsStreamReadyGate: LifecycleAsyncGate?
+    private var eventsStreamReadyGate: LifecycleAsyncGate?
+    private var forceInitializationOnNextStart = false
+    private var initializationGeneration: UInt64 = 0
     private let sendUserMessageGate: LifecycleAsyncGate?
     private let shutdownGate: LifecycleAsyncGate?
     private let emittedAssistantTextOnSend: String?
-    private let sessionRef: NativeAgentRuntimeSessionRef
+    private let sessionID: String
     private let stream: AsyncStream<NativeAgentRuntimeEvent>
     private let streamContinuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation
     private var startExistingSessionIDs: [String?] = []
+    private var startEffortLevels: [NativeAgentRuntimeEffortLevel?] = []
+    private var appliedEffortLevels: [NativeAgentRuntimeEffortLevel?] = []
     private var activeStartInvocationCount = 0
     private var maxConcurrentStartInvocationCount = 0
     private var pendingTurnCompletionID: UUID?
@@ -1332,8 +2097,10 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     init(
         recorder: LifecycleRecorder,
         label: String = "claude",
+        hasActiveSession: Bool = true,
         hasTurnInFlight: Bool = false,
         failSend: Bool = false,
+        failApplyCount: Int = 0,
         failStart: Bool = false,
         failResumeStart: Bool = false,
         requiresReplacementAfterTerminalStartupFailure: Bool = false,
@@ -1347,8 +2114,10 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     ) {
         self.recorder = recorder
         self.label = label
+        activeSession = hasActiveSession
         turnInFlight = hasTurnInFlight
         self.failSend = failSend
+        remainingApplyFailures = failApplyCount
         self.failStart = failStart
         self.failResumeStart = failResumeStart
         replacementAfterTerminalStartupFailure = requiresReplacementAfterTerminalStartupFailure
@@ -1358,7 +2127,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         self.sendUserMessageGate = sendUserMessageGate
         self.shutdownGate = shutdownGate
         self.emittedAssistantTextOnSend = emittedAssistantTextOnSend
-        sessionRef = NativeAgentRuntimeSessionRef(sessionID: sessionID)
+        self.sessionID = sessionID
         var capturedContinuation: AsyncStream<NativeAgentRuntimeEvent>.Continuation?
         stream = AsyncStream { continuation in
             capturedContinuation = continuation
@@ -1370,7 +2139,7 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
     }
 
     var hasActiveSession: Bool {
-        true
+        activeSession
     }
 
     var hasTurnInFlight: Bool {
@@ -1401,13 +2170,20 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         systemPromptOverride: String?
     ) async throws -> NativeAgentRuntimeSessionRef {
         recorder.record("\(label):start")
+        recorder.record("\(label):start:\(effortLevel?.rawValue ?? "nil")")
         startExistingSessionIDs.append(existingSessionID)
+        startEffortLevels.append(effortLevel)
         activeStartInvocationCount += 1
         maxConcurrentStartInvocationCount = max(
             maxConcurrentStartInvocationCount,
             activeStartInvocationCount
         )
         defer { activeStartInvocationCount -= 1 }
+        let generationAtEntry = initializationGeneration
+        let shouldInitialize = initializationGeneration == 0
+            || !activeSession
+            || forceInitializationOnNextStart
+        forceInitializationOnNextStart = false
         if let startGate {
             await startGate.arriveAndWait()
         }
@@ -1417,7 +2193,15 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
         if failStart {
             throw AIProviderError.invalidConfiguration(detail: "Expected configured startup failure")
         }
-        return sessionRef
+        if shouldInitialize {
+            initializationGeneration &+= 1
+        }
+        activeSession = true
+        return NativeAgentRuntimeSessionRef(
+            sessionID: sessionID,
+            initializationGeneration: initializationGeneration,
+            initializedDuringCall: initializationGeneration != generationAtEntry
+        )
     }
 
     func recordedStartExistingSessionIDs() -> [String?] {
@@ -1440,10 +2224,58 @@ actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
             recorder.record("\(label):current-ref")
             await currentSessionRefGate.arriveAndWait()
         }
-        return sessionRef
+        return NativeAgentRuntimeSessionRef(
+            sessionID: sessionID,
+            initializationGeneration: initializationGeneration,
+            initializedDuringCall: false
+        )
     }
 
-    func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws {}
+    func applyModelAndEffort(model: String?, effortLevel: NativeAgentRuntimeEffortLevel?) async throws {
+        recorder.record("\(label):apply")
+        recorder.record("\(label):apply:\(effortLevel?.rawValue ?? "nil")")
+        appliedEffortLevels.append(effortLevel)
+        if remainingApplyFailures > 0 {
+            remainingApplyFailures -= 1
+            throw AIProviderError.invalidConfiguration(detail: "Expected effort application failure")
+        }
+    }
+
+    func setHasActiveSession(_ value: Bool) {
+        activeSession = value
+    }
+
+    func setTurnInFlight(_ value: Bool) {
+        turnInFlight = value
+    }
+
+    func setStartGate(_ gate: LifecycleAsyncGate?) {
+        startGate = gate
+    }
+
+    func forceInitializationOnNextStartCall() {
+        forceInitializationOnNextStart = true
+    }
+
+    func advanceInitializationGenerationUnobserved(
+        effortLevel: NativeAgentRuntimeEffortLevel
+    ) {
+        recorder.record("\(label):unobserved-initialization:\(effortLevel.rawValue)")
+        initializationGeneration &+= 1
+        activeSession = true
+    }
+
+    func setEventsStreamReadyGate(_ gate: LifecycleAsyncGate?) {
+        eventsStreamReadyGate = gate
+    }
+
+    func recordedStartEffortLevels() -> [NativeAgentRuntimeEffortLevel?] {
+        startEffortLevels
+    }
+
+    func recordedAppliedEffortLevels() -> [NativeAgentRuntimeEffortLevel?] {
+        appliedEffortLevels
+    }
 
     func sendUserMessage(_ text: String) async throws -> UUID {
         recorder.record("\(label):send")

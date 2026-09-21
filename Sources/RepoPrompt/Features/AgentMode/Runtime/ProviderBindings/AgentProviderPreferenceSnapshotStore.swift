@@ -4,6 +4,49 @@ import Foundation
 final class AgentProviderPreferenceSnapshotStore {
     typealias CodexMCPServerEntriesProvider = () -> [MCPIntegrationHelper.CodexServerEntry]
 
+    private static let credentialKeyPattern =
+        #"[A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|authorization)"#
+    private static let credentialHeadPattern =
+        #"(?is)(?<![A-Za-z0-9_])["']?(\#(credentialKeyPattern))["']?\s*[:=]\s*"#
+    /// Escape-aware quoted value. A value truncated at end-of-input redacts through `\z`,
+    /// including a dangling final backslash that has no character left to escape.
+    private static let credentialQuotedValuePattern =
+        #"(?:"(?:\\.|[^"\\])*(?:"|\\?\z)|'(?:\\.|[^'\\])*(?:'|\\?\z))"#
+    private static let credentialNextAssignmentPattern =
+        #"[,;|\&]?(?<![A-Za-z0-9_-])["']?\#(credentialKeyPattern)["']?\s*[:=]"#
+    private static let credentialFreeTextRunPattern =
+        #"\S(?:(?!\#(credentialNextAssignmentPattern))\S)*"#
+    /// Internal redaction placeholder written by earlier passes. It uses private-use
+    /// delimiters so a later pass can recognize its own output without trusting literal
+    /// `[redacted]` text that arrived in the raw diagnostic; the caller must derive one
+    /// that is absent from the raw input via `credentialRedactionPlaceholder(absentFrom:)`.
+    private static let credentialRedactionPlaceholderBase = "\u{E000}rpce-redacted"
+    private static let credentialRedactionPlaceholderTerminator = "\u{E001}"
+    private static let credentialRedactionMarker = "[redacted]"
+
+    private static func credentialRedactionPlaceholder(absentFrom rawValue: String) -> String {
+        var candidate = credentialRedactionPlaceholderBase + credentialRedactionPlaceholderTerminator
+        var suffix = 0
+        while rawValue.contains(candidate) {
+            suffix += 1
+            candidate = "\(credentialRedactionPlaceholderBase)-\(suffix)\(credentialRedactionPlaceholderTerminator)"
+        }
+        return candidate
+    }
+
+    /// Ordered passes: quoted assignments, then authorization-scheme values, then free-text
+    /// assignments. The free-text pass skips only values that begin with the exact,
+    /// case-sensitive generated placeholder so it never re-consumes context after an earlier pass's redaction.
+    private static func credentialRedactionPatterns(placeholder: String) -> [String] {
+        let escapedPlaceholder = NSRegularExpression.escapedPattern(for: placeholder)
+        let placeholderSkipPattern = "(?!(?-i:\(escapedPlaceholder)))"
+        return [
+            #"\#(credentialHeadPattern)\#(credentialQuotedValuePattern)"#,
+            #"\#(credentialHeadPattern)(?:bearer|basic|token)\s+(?:\#(credentialQuotedValuePattern)|\#(credentialFreeTextRunPattern))"#,
+            #"\#(credentialHeadPattern)\#(placeholderSkipPattern)\#(credentialFreeTextRunPattern)"#
+        ]
+    }
+
     let defaults: UserDefaults
     let securePermissions: AgentPermissionSecureStore?
 
@@ -35,7 +78,8 @@ final class AgentProviderPreferenceSnapshotStore {
             selectedModelRaw: nil,
             permissionProfile: .userConfigured,
             isSubagent: false,
-            externallyManagedReason: nil
+            externallyManagedReason: nil,
+            claudePermissionSessionState: nil
         )
     }
 
@@ -48,13 +92,16 @@ final class AgentProviderPreferenceSnapshotStore {
         selectedModelRaw: String? = nil,
         permissionProfile: AgentProviderPermissionProfile,
         isSubagent _: Bool,
-        externallyManagedReason: String?
+        externallyManagedReason: String?,
+        claudePermissionSessionState: ClaudePermissionSessionState? = nil
     ) -> AgentProviderControlsBinding {
         let providerID = selectedAgent.providerBindingID
         let permission = permissionChromeBinding(
-            for: providerID,
+            for: selectedAgent,
+            selectedModelRaw: selectedModelRaw,
             profile: permissionProfile,
-            externallyManagedReason: externallyManagedReason
+            externallyManagedReason: externallyManagedReason,
+            claudePermissionSessionState: claudePermissionSessionState
         )
         return AgentProviderControlsBinding(
             revision: revision(for: providerID),
@@ -269,10 +316,13 @@ final class AgentProviderPreferenceSnapshotStore {
     }
 
     private func permissionChromeBinding(
-        for providerID: AgentProviderBindingID,
+        for selectedAgent: AgentProviderKind,
+        selectedModelRaw: String?,
         profile: AgentProviderPermissionProfile,
-        externallyManagedReason: String?
+        externallyManagedReason: String?,
+        claudePermissionSessionState: ClaudePermissionSessionState?
     ) -> AgentPermissionChromeBinding {
+        let providerID = selectedAgent.providerBindingID
         switch providerID {
         case .codex:
             let effective = effectiveCodexPermissionLevel(profile: profile)
@@ -295,12 +345,32 @@ final class AgentProviderPreferenceSnapshotStore {
                 }
             )
         case .claude:
-            let effective = effectiveClaudePermissionLevel(profile: profile)
+            let configured = claudePermissionModePresentation(
+                ClaudeAgentToolPreferences.permissionMode(
+                    defaults: defaults,
+                    secureStore: securePermissions
+                )
+            )
+            let requested = claudePermissionModePresentation(
+                runtimePermission(for: selectedAgent, profile: profile).claudePermissionMode
+                    ?? ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
+            )
+            let configuredLevel = exactClaudePermissionLevel(for: configured.rawValue)
+            let sessionStatus = claudePermissionSessionState.map {
+                claudePermissionSessionStatusBinding(
+                    state: $0,
+                    selectedAgent: selectedAgent,
+                    selectedModelRaw: selectedModelRaw,
+                    requestedMode: requested
+                )
+            }
+            let chromeMode = sessionStatus == nil ? configured : requested
+            let chromeLevel = exactClaudePermissionLevel(for: chromeMode.rawValue)
             return AgentPermissionChromeBinding(
                 providerID: providerID,
-                displayName: effective.displayName,
-                iconName: effective.iconName,
-                isWarning: effective.isWarning,
+                displayName: chromeMode.displayName,
+                iconName: chromeLevel?.iconName ?? "questionmark.shield",
+                isWarning: chromeLevel?.isWarning ?? false,
                 externallyManagedReason: externallyManagedReason,
                 options: ClaudeAgentToolPreferences.PermissionLevel.allCases.map { level in
                     AgentPermissionOptionBinding(
@@ -309,10 +379,12 @@ final class AgentProviderPreferenceSnapshotStore {
                         iconName: level.iconName,
                         detailText: level.detailText,
                         isWarning: level.isWarning,
-                        isSelected: level == effective,
+                        isSelected: level == configuredLevel,
                         isEnabled: externallyManagedReason == nil
                     )
-                }
+                },
+                configuredMode: configured,
+                sessionStatus: sessionStatus
             )
         case .openCode:
             let effective = effectiveOpenCodePermissionLevel(profile: profile)
@@ -373,6 +445,196 @@ final class AgentProviderPreferenceSnapshotStore {
                 )]
             )
         }
+    }
+
+    private func claudePermissionSessionStatusBinding(
+        state: ClaudePermissionSessionState,
+        selectedAgent: AgentProviderKind,
+        selectedModelRaw: String?,
+        requestedMode: AgentPermissionModePresentationBinding
+    ) -> AgentPermissionSessionStatusBinding {
+        let resolution = ClaudeAgentToolPreferences.resolvePermissionMode(
+            requestedMode: requestedMode.rawValue,
+            agentKind: selectedAgent,
+            selectedModelRaw: selectedModelRaw
+        )
+        let desiredLaunchMode = resolution.launchMode.map(claudePermissionModePresentation)
+
+        switch state {
+        case .notStarted:
+            return AgentPermissionSessionStatusBinding(
+                phase: .selectedNotStarted,
+                title: "\(requestedMode.displayName) selected",
+                detail: "Not started — Claude Code has not acknowledged this request.",
+                iconName: claudePermissionIconName(for: requestedMode.rawValue),
+                isWarning: claudePermissionIsWarning(requestedMode.rawValue),
+                requestedMode: requestedMode,
+                resolvedLaunchMode: desiredLaunchMode,
+                acknowledgedMode: nil
+            )
+        case .blocked:
+            switch resolution.reason {
+            case let .blockedAuto(currentCandidacy):
+                return AgentPermissionSessionStatusBinding(
+                    phase: .blocked,
+                    title: "Auto blocked",
+                    detail: sanitizedClaudePermissionPresentationMessage(
+                        currentCandidacy.blockingMessage ?? "Claude Auto is unavailable for this selection."
+                    ),
+                    iconName: "exclamationmark.shield.fill",
+                    isWarning: true,
+                    requestedMode: requestedMode,
+                    resolvedLaunchMode: nil,
+                    acknowledgedMode: nil
+                )
+            case .eligibleAuto, .nonAutoPassThrough:
+                return AgentPermissionSessionStatusBinding(
+                    phase: .selectedNotStarted,
+                    title: "\(requestedMode.displayName) selected",
+                    detail: "Not started — Claude Code has not acknowledged this request.",
+                    iconName: claudePermissionIconName(for: requestedMode.rawValue),
+                    isWarning: claudePermissionIsWarning(requestedMode.rawValue),
+                    requestedMode: requestedMode,
+                    resolvedLaunchMode: desiredLaunchMode,
+                    acknowledgedMode: nil
+                )
+            }
+        case let .initializing(_, launchSettings, capturedRequestedMode):
+            let capturedRequest = claudePermissionModePresentation(capturedRequestedMode)
+            let launchMode = launchSettings.permissionMode.map(claudePermissionModePresentation)
+            return AgentPermissionSessionStatusBinding(
+                phase: .initializing,
+                title: "\((launchMode ?? capturedRequest).displayName) initializing",
+                detail: "Launch request pending — Claude Code has not acknowledged it yet.",
+                iconName: "clock.badge.questionmark",
+                isWarning: claudePermissionIsWarning((launchMode ?? capturedRequest).rawValue),
+                requestedMode: requestedMode,
+                resolvedLaunchMode: launchMode,
+                acknowledgedMode: nil
+            )
+        case let .acknowledged(acknowledgement):
+            let launchMode = acknowledgement.launchSettings.permissionMode
+                .map(claudePermissionModePresentation)
+                ?? claudePermissionModePresentation(acknowledgement.requestedMode)
+            return AgentPermissionSessionStatusBinding(
+                phase: .acknowledged,
+                title: "\(launchMode.displayName) acknowledged",
+                detail: "Claude Code accepted this request for the current controller attempt; this does not confirm that it remains continuously effective.",
+                iconName: "checkmark.shield",
+                isWarning: claudePermissionIsWarning(launchMode.rawValue),
+                requestedMode: requestedMode,
+                resolvedLaunchMode: launchMode,
+                acknowledgedMode: launchMode
+            )
+        case let .failed(_, capturedRequestedMode, message):
+            let failedMode = claudePermissionModePresentation(capturedRequestedMode)
+            let reason = sanitizedClaudePermissionPresentationMessage(message)
+            return AgentPermissionSessionStatusBinding(
+                phase: .failed,
+                title: "\(failedMode.displayName) request failed",
+                detail: "\(reason) Review the model and permission selection, then retry.",
+                iconName: "exclamationmark.shield.fill",
+                isWarning: true,
+                requestedMode: requestedMode,
+                resolvedLaunchMode: desiredLaunchMode,
+                acknowledgedMode: nil
+            )
+        case let .pendingNextTurn(active, _, reason):
+            let acknowledgedMode = active.map {
+                $0.launchSettings.permissionMode
+                    .map(claudePermissionModePresentation)
+                    ?? claudePermissionModePresentation($0.requestedMode)
+            }
+            let title = acknowledgedMode.map { "\($0.displayName) acknowledged · Change pending" }
+                ?? "Permission change pending"
+            var detail = normalizedClaudePendingReason(reason)
+            if let acknowledgedMode {
+                detail += " The active controller acknowledgement applies only to its captured \(acknowledgedMode.displayName) request."
+            }
+            return AgentPermissionSessionStatusBinding(
+                phase: .pendingNextTurn,
+                title: title,
+                detail: detail,
+                iconName: "clock.arrow.circlepath",
+                isWarning: acknowledgedMode.map { claudePermissionIsWarning($0.rawValue) } ?? false,
+                requestedMode: requestedMode,
+                resolvedLaunchMode: desiredLaunchMode,
+                acknowledgedMode: acknowledgedMode
+            )
+        }
+    }
+
+    private func claudePermissionModePresentation(
+        _ rawValue: String
+    ) -> AgentPermissionModePresentationBinding {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = trimmed.isEmpty
+            ? ClaudeAgentToolPreferences.PermissionLevel.requireApproval.permissionMode
+            : trimmed
+        return AgentPermissionModePresentationBinding(
+            rawValue: normalized,
+            displayName: exactClaudePermissionLevel(for: normalized)?.displayName ?? normalized
+        )
+    }
+
+    private func exactClaudePermissionLevel(
+        for rawValue: String
+    ) -> ClaudeAgentToolPreferences.PermissionLevel? {
+        ClaudeAgentToolPreferences.PermissionLevel.allCases.first {
+            $0.permissionMode.caseInsensitiveCompare(rawValue) == .orderedSame
+        }
+    }
+
+    private func claudePermissionIconName(for rawValue: String) -> String {
+        exactClaudePermissionLevel(for: rawValue)?.iconName ?? "questionmark.shield"
+    }
+
+    private func claudePermissionIsWarning(_ rawValue: String) -> Bool {
+        exactClaudePermissionLevel(for: rawValue)?.isWarning ?? false
+    }
+
+    private func normalizedClaudePendingReason(_ rawValue: String) -> String {
+        let sanitized = sanitizedClaudePermissionPresentationMessage(rawValue)
+        let lowercased = sanitized.lowercased()
+        guard lowercased.contains("effort"),
+              !lowercased.contains("before the next turn")
+        else {
+            return sanitized
+        }
+        let prefix = "Effort change pending —"
+        if sanitized.hasPrefix(prefix) {
+            let suffix = sanitized.dropFirst(prefix.count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return suffix.isEmpty
+                ? "Effort change pending — applies before the next turn."
+                : "Effort change pending — applies before the next turn. \(suffix)"
+        }
+        return "\(sanitized) Applies before the next turn."
+    }
+
+    private func sanitizedClaudePermissionPresentationMessage(_ rawValue: String) -> String {
+        var value = rawValue
+        let placeholder = Self.credentialRedactionPlaceholder(absentFrom: rawValue)
+        for pattern in Self.credentialRedactionPatterns(placeholder: placeholder) {
+            value = value.replacingOccurrences(
+                of: pattern,
+                with: "$1=\(placeholder)",
+                options: .regularExpression
+            )
+        }
+        value = value.replacingOccurrences(of: placeholder, with: Self.credentialRedactionMarker)
+        value = value.replacingOccurrences(of: NSHomeDirectory(), with: "~")
+        value = value
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        if value.isEmpty {
+            value = "Claude Code did not accept the permission request."
+        }
+        if value.count > 240 {
+            value = String(value.prefix(239)) + "…"
+        }
+        return value
     }
 
     /// Builds the Codex tool snapshot with Safe Managed overrides applied when the profile

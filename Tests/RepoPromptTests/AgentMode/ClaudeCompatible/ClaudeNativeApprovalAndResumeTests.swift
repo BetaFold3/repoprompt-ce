@@ -100,6 +100,157 @@ final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
         XCTAssertFalse(sameEnvironmentRequiresRestart)
     }
 
+    func testResolvedCompatibleBackendBlocksNativeAutoBeforeLaunch() async throws {
+        let resolver = RecordingLaunchEnvironmentResolver()
+        let controller = try ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .agentMode(
+                commandName: "/usr/bin/false",
+                modelString: "opus",
+                runtimeVariant: .standard,
+                permissionMode: "auto"
+            ),
+            environmentResolver: resolver
+        )
+
+        do {
+            _ = try await controller.test_resolveApplyFlagSettingsRequest(
+                model: "opus",
+                effortLevel: .high
+            )
+            XCTFail("Expected resolved compatible backend to block Auto")
+        } catch let error as ClaudeAgentToolPreferences.AutoPermissionModeBlockedError {
+            XCTAssertEqual(error.candidacy, .compatibleBackend(.claudeCodeGLM))
+        }
+    }
+
+    func testSendBeforeInitializationWritesNothingAndTracksNoTurn() async throws {
+        let child = try ProcessLauncher.spawn(
+            command: "/bin/cat",
+            arguments: [],
+            environment: ["PATH": "/usr/bin:/bin"],
+            workingDirectory: "/tmp"
+        )
+        let controller = try ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .discovery(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .standard
+            )
+        )
+        await controller.test_attachSpawnedProcess(child, initialized: false)
+
+        do {
+            _ = try await controller.sendUserMessage("must not be written")
+            XCTFail("Expected send-before-initialization to fail")
+        } catch let error as ClaudeNativeProcessSessionController.ControllerError {
+            guard case .initializationFailed = error else {
+                return XCTFail("Unexpected controller error: \(error)")
+            }
+        }
+
+        let hasTurnInFlight = await controller.hasTurnInFlight
+        XCTAssertFalse(hasTurnInFlight)
+        await controller.shutdown()
+    }
+
+    func testNativeSessionRefReportsStableGenerationOnReuseAndZeroForUninitializedAttach() async throws {
+        let uninitializedChild = try ProcessLauncher.spawn(
+            command: "/bin/cat",
+            arguments: [],
+            environment: ["PATH": "/usr/bin:/bin"],
+            workingDirectory: "/tmp"
+        )
+        let uninitializedController = try ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .discovery(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .standard
+            )
+        )
+        await uninitializedController.test_attachSpawnedProcess(
+            uninitializedChild,
+            initialized: false
+        )
+
+        let uninitializedRef = await uninitializedController.currentSessionRef()
+        XCTAssertEqual(uninitializedRef.initializationGeneration, 0)
+        XCTAssertFalse(uninitializedRef.initializedDuringCall)
+        await uninitializedController.shutdown()
+
+        let initializedChild = try ProcessLauncher.spawn(
+            command: "/bin/cat",
+            arguments: [],
+            environment: ["PATH": "/usr/bin:/bin"],
+            workingDirectory: "/tmp"
+        )
+        let initializedController = try ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .discovery(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .standard
+            )
+        )
+        await initializedController.test_attachSpawnedProcess(
+            initializedChild,
+            initialized: true
+        )
+
+        let attachedRef = await initializedController.currentSessionRef()
+        let reusedRef = try await initializedController.startOrResume(
+            existingSessionID: nil,
+            model: nil
+        )
+        XCTAssertEqual(attachedRef.initializationGeneration, 1)
+        XCTAssertFalse(attachedRef.initializedDuringCall)
+        XCTAssertEqual(reusedRef.initializationGeneration, attachedRef.initializationGeneration)
+        XCTAssertFalse(reusedRef.initializedDuringCall)
+        await initializedController.shutdown()
+    }
+
+    @MainActor
+    func testPermissionStageAndLocalAutoFailuresDoNotRetryFreshResume() {
+        let underlying = ClaudeNativeProcessSessionController.ControllerError.invalidControlResponse(
+            "Auto rejected"
+        )
+        let permissionFailure = ClaudeNativeProcessSessionController.PermissionStageError(
+            requestedMode: "auto",
+            underlyingError: underlying
+        )
+        XCTAssertFalse(
+            ClaudeAgentModeCoordinator.test_shouldRetryFreshStartWithoutResume(
+                after: permissionFailure,
+                existingSessionID: "existing-session"
+            )
+        )
+        XCTAssertFalse(
+            ClaudeAgentModeCoordinator.test_shouldRetryFreshStartWithoutResume(
+                after: ClaudeAgentToolPreferences.AutoPermissionModeBlockedError(
+                    candidacy: .unsupportedModel("haiku")
+                ),
+                existingSessionID: "existing-session"
+            )
+        )
+        XCTAssertTrue(
+            ClaudeAgentModeCoordinator.test_shouldRetryFreshStartWithoutResume(
+                after: underlying,
+                existingSessionID: "existing-session"
+            )
+        )
+    }
+
     func testRepoPromptPermissionAutoApprovalAndAllowPayloadPreserveToolUseID() throws {
         let repoPromptPayload: [String: Any] = [
             "tool_name": "mcp__RepoPromptCE__read_file",

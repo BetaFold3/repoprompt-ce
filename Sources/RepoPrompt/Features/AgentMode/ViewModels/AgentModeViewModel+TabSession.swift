@@ -712,6 +712,9 @@ extension AgentModeViewModel {
             pendingCodexComputerUseActivation != nil
         }
 
+        /// Coordinator-owned, non-persisted Claude permission request evidence.
+        var claudePermissionSessionState: ClaudePermissionSessionState = .notStarted
+
         var claudeController: (any NativeAgentRuntimeControlling)? {
             didSet {
                 let oldIdentity = oldValue.map { ObjectIdentifier($0) }

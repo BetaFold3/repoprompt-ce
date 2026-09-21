@@ -11,9 +11,9 @@ import Foundation
 /// Summary DTO consumed by Agent Permissions settings surfaces to render a capability
 /// row for each CLI provider.
 ///
-/// These summaries describe effective capabilities for the supplied permission profile.
-/// They intentionally stop short of claiming MCP tool ACLs or role-based tool
-/// enforcement — those are separate MCP policy concerns.
+/// These summaries describe configuration for the supplied permission profile.
+/// They carry no live-session acknowledgement and intentionally stop short of claiming
+/// MCP tool ACLs, containment, or role-based enforcement.
 struct AgentPermissionCapabilitySummary: Identifiable, Equatable {
     let providerID: AgentProviderBindingID
     let providerName: String
@@ -104,8 +104,12 @@ struct AgentPermissionCapabilitySummaryBuilder {
             let warnings: [String]
             switch profile {
             case .userConfigured:
-                let level = ClaudeAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
-                permissionMode = level.displayName
+                let rawMode = ClaudeAgentToolPreferences.permissionMode(
+                    defaults: defaults,
+                    secureStore: securePermissions
+                )
+                let level = exactClaudePermissionLevel(for: rawMode)
+                permissionMode = level?.displayName ?? rawMode
                 bash = ClaudeAgentToolPreferences.bashToolEnabled(defaults: defaults, secureStore: securePermissions)
                 strict = ClaudeAgentToolPreferences.mcpStrictModeEnabled(defaults: defaults, secureStore: securePermissions)
                 warnings = level == .fullAccess
@@ -129,15 +133,15 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 providerID: providerID,
                 providerName: providerID.displayName,
                 isAvailable: isAvailable,
-                fileMutation: "Permission mode: \(permissionMode)",
-                shell: bash ? "Bash enabled" : "Bash disabled",
+                fileMutation: "Configured permission mode: \(permissionMode) (no live session state)",
+                shell: bash ? "Configured Bash: enabled" : "Configured Bash: disabled",
                 externalMCP: strict
-                    ? "Third-party MCP: RepoPrompt only"
-                    : "Third-party MCP: all servers",
+                    ? "Configured MCP servers: third-party servers suppressed"
+                    : "Configured MCP servers: third-party servers enabled",
                 search: ClaudeAgentToolPreferences.toolSearchEnabled(defaults: defaults)
                     ? "Tool search allowed"
                     : "Tool search disabled",
-                approvalModeDescription: "Permission mode: \(permissionMode)",
+                approvalModeDescription: "Configured permission mode: \(permissionMode); no live session acknowledgement",
                 warnings: warnings
             )
         case .openCode:
@@ -226,6 +230,14 @@ struct AgentPermissionCapabilitySummaryBuilder {
             level
         case .providerOverride:
             .defaultPermission
+        }
+    }
+
+    private func exactClaudePermissionLevel(
+        for rawValue: String
+    ) -> ClaudeAgentToolPreferences.PermissionLevel? {
+        ClaudeAgentToolPreferences.PermissionLevel.allCases.first {
+            $0.permissionMode.caseInsensitiveCompare(rawValue) == .orderedSame
         }
     }
 

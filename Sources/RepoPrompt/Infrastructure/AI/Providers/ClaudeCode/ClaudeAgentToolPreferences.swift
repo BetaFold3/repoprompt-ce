@@ -116,69 +116,140 @@ struct ClaudeAgentToolPreferences {
         }
     }
 
-    enum UnsupportedAutoPermissionFallback: Equatable {
-        case autoApproveEdits
-        case fullAccess
+    enum AutoPermissionCandidacy: Equatable {
+        case eligible
+        case unsupportedModel(String)
+        case unknownModel(String?)
+        case compatibleBackend(AgentProviderKind)
+
+        var blockingMessage: String? {
+            switch self {
+            case .eligible:
+                nil
+            case let .unsupportedModel(model):
+                "Claude Auto is unavailable for model '\(model)'. Select an eligible Claude model or choose another permission mode."
+            case let .unknownModel(model):
+                if let model {
+                    "Claude Auto cannot validate model '\(model)'. Select an eligible Claude model or choose another permission mode."
+                } else {
+                    "Claude Auto requires an explicit eligible Claude model. Select a model or choose another permission mode."
+                }
+            case let .compatibleBackend(agentKind):
+                "Claude Auto is available only with official Claude Code, not the '\(agentKind.rawValue)' compatible backend."
+            }
+        }
+    }
+
+    enum PermissionModeResolutionReason: Equatable {
+        case nonAutoPassThrough
+        case eligibleAuto
+        case blockedAuto(AutoPermissionCandidacy)
     }
 
     struct PermissionModeResolution: Equatable {
         let requestedMode: String
-        let effectiveMode: String
-        let autoWasReplaced: Bool
-        let replacementLevel: PermissionLevel?
+        let launchMode: String?
+        let reason: PermissionModeResolutionReason
+
+        var blockingMessage: String? {
+            guard case let .blockedAuto(candidacy) = reason else { return nil }
+            return candidacy.blockingMessage
+        }
     }
 
-    /// Claude Code Auto permission mode is supported only for **official Claude Code**
-    /// (not GLM, Kimi, or Custom Claude-compatible backends) and only for the app's
-    /// Opus Latest aliases. Pinned Opus IDs are intentionally treated as unsupported
-    /// until Claude exposes compatibility for those model identifiers.
+    struct AutoPermissionModeBlockedError: Error, LocalizedError, Equatable {
+        let candidacy: AutoPermissionCandidacy
+
+        var errorDescription: String? {
+            candidacy.blockingMessage ?? "Claude Auto is unavailable for the resolved launch."
+        }
+    }
+
+    /// Pure local candidacy authority. This only decides whether RepoPrompt may
+    /// request Auto; Claude Code remains the acceptance authority.
+    static func autoPermissionCandidacy(
+        agentKind: AgentProviderKind,
+        selectedModelRaw: String?
+    ) -> AutoPermissionCandidacy {
+        guard agentKind == .claudeCode else {
+            return .compatibleBackend(agentKind)
+        }
+        guard let baseModel = ClaudeModelSpecifier(raw: selectedModelRaw).baseModel else {
+            return .unknownModel(nil)
+        }
+
+        let aliases = [
+            AgentModel.claudeOpus.rawValue,
+            AgentModel.claudeOpus1m.rawValue,
+            AgentModel.claudeSonnet.rawValue
+        ]
+        if aliases.contains(where: { baseModel.caseInsensitiveCompare($0) == .orderedSame }) {
+            return .eligible
+        }
+
+        let eligibleLegacyIDs: Set = [
+            "claude-opus-4-6",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6"
+        ]
+        if eligibleLegacyIDs.contains(baseModel) {
+            return .eligible
+        }
+
+        // Full family IDs deliberately remain case-sensitive. The shared family
+        // catalog owns the strict major/minor/date grammar.
+        if ClaudeModelFamilyCatalog.family(for: baseModel) != nil {
+            return .eligible
+        }
+
+        if baseModel.caseInsensitiveCompare(AgentModel.claudeHaiku.rawValue) == .orderedSame
+            || baseModel.hasPrefix("claude-")
+        {
+            return .unsupportedModel(baseModel)
+        }
+        return .unknownModel(baseModel)
+    }
+
     static func supportsAutoPermissionMode(
         agentKind: AgentProviderKind,
         selectedModelRaw: String?
     ) -> Bool {
-        guard agentKind == .claudeCode else { return false }
-        guard let baseModel = ClaudeModelSpecifier(raw: selectedModelRaw).baseModel else { return false }
-        return baseModel.caseInsensitiveCompare(AgentModel.claudeOpus.rawValue) == .orderedSame
-            || baseModel.caseInsensitiveCompare(AgentModel.claudeOpus1m.rawValue) == .orderedSame
+        autoPermissionCandidacy(
+            agentKind: agentKind,
+            selectedModelRaw: selectedModelRaw
+        ) == .eligible
     }
 
     static func resolvePermissionMode(
         requestedMode: String,
         agentKind: AgentProviderKind,
-        selectedModelRaw: String?,
-        unsupportedAutoFallback: UnsupportedAutoPermissionFallback
+        selectedModelRaw: String?
     ) -> PermissionModeResolution {
         let trimmedMode = requestedMode.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalizedMode = trimmedMode.isEmpty ? PermissionLevel.requireApproval.permissionMode : trimmedMode
         guard normalizedMode.caseInsensitiveCompare(PermissionLevel.auto.permissionMode) == .orderedSame else {
             return PermissionModeResolution(
                 requestedMode: normalizedMode,
-                effectiveMode: normalizedMode,
-                autoWasReplaced: false,
-                replacementLevel: nil
+                launchMode: normalizedMode,
+                reason: .nonAutoPassThrough
             )
         }
 
-        guard !supportsAutoPermissionMode(agentKind: agentKind, selectedModelRaw: selectedModelRaw) else {
+        let candidacy = autoPermissionCandidacy(
+            agentKind: agentKind,
+            selectedModelRaw: selectedModelRaw
+        )
+        guard candidacy == .eligible else {
             return PermissionModeResolution(
                 requestedMode: normalizedMode,
-                effectiveMode: PermissionLevel.auto.permissionMode,
-                autoWasReplaced: false,
-                replacementLevel: nil
+                launchMode: nil,
+                reason: .blockedAuto(candidacy)
             )
-        }
-
-        let replacementLevel: PermissionLevel = switch unsupportedAutoFallback {
-        case .autoApproveEdits:
-            .autoApproveEdits
-        case .fullAccess:
-            .fullAccess
         }
         return PermissionModeResolution(
             requestedMode: normalizedMode,
-            effectiveMode: replacementLevel.permissionMode,
-            autoWasReplaced: true,
-            replacementLevel: replacementLevel
+            launchMode: PermissionLevel.auto.permissionMode,
+            reason: .eligibleAuto
         )
     }
 

@@ -172,6 +172,33 @@ struct AgentPermissionOptionBinding: Identifiable, Equatable {
     let isEnabled: Bool
 }
 
+struct AgentPermissionModePresentationBinding: Equatable {
+    let rawValue: String
+    let displayName: String
+}
+
+enum AgentPermissionSessionPhaseBinding: Equatable {
+    case selectedNotStarted
+    case blocked
+    case initializing
+    case acknowledged
+    case failed
+    case pendingNextTurn
+}
+
+/// Presentation-only projection of provider runtime evidence. These values describe
+/// requests and acknowledgements; they are not an independently evaluated permission policy.
+struct AgentPermissionSessionStatusBinding: Equatable {
+    let phase: AgentPermissionSessionPhaseBinding
+    let title: String
+    let detail: String
+    let iconName: String
+    let isWarning: Bool
+    let requestedMode: AgentPermissionModePresentationBinding
+    let resolvedLaunchMode: AgentPermissionModePresentationBinding?
+    let acknowledgedMode: AgentPermissionModePresentationBinding?
+}
+
 struct AgentPermissionChromeBinding: Equatable {
     let providerID: AgentProviderBindingID
     let displayName: String
@@ -179,6 +206,28 @@ struct AgentPermissionChromeBinding: Equatable {
     let isWarning: Bool
     let externallyManagedReason: String?
     let options: [AgentPermissionOptionBinding]
+    let configuredMode: AgentPermissionModePresentationBinding?
+    let sessionStatus: AgentPermissionSessionStatusBinding?
+
+    init(
+        providerID: AgentProviderBindingID,
+        displayName: String,
+        iconName: String,
+        isWarning: Bool,
+        externallyManagedReason: String?,
+        options: [AgentPermissionOptionBinding],
+        configuredMode: AgentPermissionModePresentationBinding? = nil,
+        sessionStatus: AgentPermissionSessionStatusBinding? = nil
+    ) {
+        self.providerID = providerID
+        self.displayName = displayName
+        self.iconName = iconName
+        self.isWarning = isWarning
+        self.externallyManagedReason = externallyManagedReason
+        self.options = options
+        self.configuredMode = configuredMode
+        self.sessionStatus = sessionStatus
+    }
 }
 
 struct AgentProviderRuntimePermissionBinding: Equatable {
