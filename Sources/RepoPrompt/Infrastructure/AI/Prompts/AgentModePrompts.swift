@@ -164,8 +164,9 @@ enum AgentModePrompts {
         - `workspace_context` - Get workspace snapshot (prompt + selection + tokens)
         - `prompt` - Get or modify the shared prompt
         - `ask_oracle` - Consult a second AI for planning or review
-        - `oracle_chat_log` - Recover Oracle context after compaction
+        - `oracle_chat_log` - Recover conversation text after `ask_oracle op:"wait"` without IDs has collected owned undelivered operations
         \(Fragments.namedOracleConsultationGuidance)
+        \(Fragments.oracleResumableWaitGuidance)
 
         *Read-only Sub-agent Probes:*
         - `agent_explore` - Launch/control short read-only explore child agents (`start`, `poll`, `wait`, `cancel` only; pass `messages` to start several probes in one call)
@@ -234,7 +235,8 @@ enum AgentModePrompts {
 
         Answer quick questions directly. For substantive work, put the useful conclusion first. When a durable artifact is requested or clearly useful, create or update it in the active workspace with `apply_edits`, follow existing naming conventions, and report the final path. Ask in normal conversation when scope or destination is materially ambiguous.
 
-        Oracle consultation is optional. Use `oracle_utils` to resolve named presets exactly. For independent opinions, start separate `ask_oracle` chats with `new_chat:true`, explicit presets, and parallel calls when possible; continue each lane by its `chat_id`, which keeps that lane on its own preset. Default to zero critique rounds. Use one anonymized cross-critique only for material disagreement or a meaningful blind spot, and a second only for one explicit unresolved issue. Judge the evidence and user's criteria yourself; model identity and votes are not authority. Use `oracle_chat_log` only to recover a lane after compaction or interruption.
+        Oracle consultation is optional. Use `oracle_utils` to resolve named presets exactly. For independent opinions, start separate `ask_oracle` chats with `new_chat:true`, explicit presets, and parallel calls when possible; continue each lane by its `chat_id`, which keeps that lane on its own preset. Default to zero critique rounds. Use one anonymized cross-critique only for material disagreement or a meaningful blind spot, and a second only for one explicit unresolved issue. Judge the evidence and user's criteria yourself; model identity and votes are not authority.
+        \(Fragments.oracleResumableWaitGuidance)
 
         Do not perform coding, build, Git, shell, worktree, computer-use, or agent-delegation tasks. Explain when a request belongs in a standard Agent Mode session.
         """
@@ -258,6 +260,17 @@ enum AgentModePrompts {
         - For independent opinions, issue all `ask_oracle` calls together in the same tool-call batch. Give every lane `new_chat:true` and its own explicit `model`; `chat_name` is optional display text only and never selects a model. Refer to lanes by preset alias only, and never relay one lane's metadata to another.
         - Continue each lane with its own returned `chat_id`. The lane stays on its own preset, so `model` can be omitted on continuation; passing a different `model` switches that lane deliberately. Each result reports how the model was chosen through `model_selection` (`explicit`, `inherited`, or `automatic`).
         - Before comparing or synthesizing answers, verify every result's returned `model_preset_id` and `model_preset_name` match the requested preset. If identity is missing, mismatched, or any lane fails, report that failure and do not synthesize the answers.
+        """
+
+        static let oracleResumableWaitGuidance = """
+
+        **Resumable Oracle waits**
+        - Routinely omit `timeout_seconds` on single sends and `op:"wait"`. Pending is normal: a timeout or steering wake leaves the same Oracle query running.
+        - Never resend a pending question. Resume with `op:"wait"` and its `operation_id`. After steering, respond to the user first, then resume waiting.
+        - After compaction, first call `op:"wait"` without `operation_ids` to collect all owned undelivered operations in the current tab. Use `oracle_chat_log` with a known `chat_id` only for conversation recovery; never reconstruct a lost operation by resending.
+        - A wait or transport heartbeat issues no provider-model request and does not warm a prompt cache. Do not claim that it preserves cache state or infer a provider cache TTL.
+        - Use `op:"cancel"` only when the user asks or the question is known to be wrong. An unkeyed repeat is a new consultation; `request_id` protects an identical live send but is not persisted across app relaunch.
+        - Step B `consultations` batches remain blocking, are not steerable, reject `timeout_seconds` and `request_id`, and expose no wait/cancel handles. For a long two-lane duel, start two single sends with `timeout_seconds:0` and then wait once on both operation IDs.
         """
 
         // MARK: - Export delegation guidance

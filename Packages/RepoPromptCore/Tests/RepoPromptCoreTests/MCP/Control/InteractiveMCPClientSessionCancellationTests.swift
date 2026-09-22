@@ -6,18 +6,116 @@ import XCTest
 
 #if DEBUG
     final class InteractiveMCPClientSessionCancellationTests: XCTestCase {
-        func testContextBuilderAndAskOracleDefaultsHaveNoClientDeadline() async {
+        func testContextBuilderDefaultHasNoClientDeadline() async {
             let session = makeUnconnectedSession()
 
-            let contextBuilderTimeout = await session.test_resolvedToolCallTimeout(
+            let timeout = await session.test_resolvedToolCallTimeout(
                 toolName: "context_builder"
             )
-            let askOracleTimeout = await session.test_resolvedToolCallTimeout(
-                toolName: "ask_oracle"
+
+            XCTAssertNil(timeout)
+        }
+
+        func testAskOracleAutomaticSingleSendAndWaitUseOwnedResponseEnvelope() async {
+            let session = makeUnconnectedSession()
+            let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
+            XCTAssertEqual(expected, 630)
+            let cases: [[String: Value]] = [
+                [:],
+                ["op": .string("send")],
+                ["op": .string("send"), "timeout_seconds": .null],
+                ["op": .string("wait")],
+                ["op": .string("wait"), "timeout_seconds": .null]
+            ]
+
+            for arguments in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: "ask_oracle",
+                    arguments: arguments
+                )
+                XCTAssertEqual(timeout, expected, "\(arguments)")
+            }
+        }
+
+        func testAskOracleExplicitWaitUsesOrdinaryFloorAndDeliveryMargin() async {
+            let session = makeUnconnectedSession()
+            let maximum = MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds
+            let cases: [(arguments: [String: Value], expected: TimeInterval)] = [
+                (
+                    ["message": .string("brief"), "timeout_seconds": .int(1)],
+                    MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+                ),
+                (
+                    ["op": .string("wait"), "timeout_seconds": .double(600)],
+                    600 + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+                ),
+                (
+                    ["op": .string("wait"), "timeout_seconds": .double(maximum)],
+                    maximum + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+                )
+            ]
+
+            for testCase in cases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: "ask_oracle",
+                    arguments: testCase.arguments
+                )
+                XCTAssertEqual(timeout, testCase.expected, "\(testCase.arguments)")
+            }
+        }
+
+        func testAskOraclePollAndCancelUseOrdinaryDeadlineWhileBatchRemainsUnbounded() async {
+            let session = makeUnconnectedSession()
+            let ordinary = MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+            let ordinaryCases: [[String: Value]] = [
+                ["timeout_seconds": .int(0)],
+                ["op": .string("wait"), "timeout_seconds": .int(0)],
+                ["op": .string("cancel"), "operation_ids": .array([])],
+                ["op": .string("unsupported")],
+                ["op": .string("wait"), "timeout_seconds": .double(.infinity)],
+                [
+                    "op": .string("wait"),
+                    "timeout_seconds": .double(
+                        MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds + 1
+                    )
+                ]
+            ]
+
+            for arguments in ordinaryCases {
+                let timeout = await session.test_resolvedToolCallTimeout(
+                    toolName: "ask_oracle",
+                    arguments: arguments
+                )
+                XCTAssertEqual(timeout, ordinary, "\(arguments)")
+            }
+
+            let batchTimeout = await session.test_resolvedToolCallTimeout(
+                toolName: "ask_oracle",
+                arguments: [
+                    "consultations": .array([]),
+                    "timeout_seconds": .int(1)
+                ]
+            )
+            XCTAssertNil(batchTimeout)
+        }
+
+        func testExplicitCLITimeoutPolicyOverridesAskOracleClassification() async {
+            let session = makeUnconnectedSession()
+            let arguments: [String: Value] = ["op": .string("wait")]
+
+            let explicitDeadline = await session.test_resolvedToolCallTimeout(
+                .seconds(450),
+                toolName: "ask_oracle",
+                arguments: arguments
+            )
+            let explicitNone = await session.test_resolvedToolCallTimeout(
+                .none,
+                toolName: "ask_oracle",
+                arguments: arguments
             )
 
-            XCTAssertNil(contextBuilderTimeout)
-            XCTAssertNil(askOracleTimeout)
+            XCTAssertEqual(explicitDeadline, 450)
+            XCTAssertNil(explicitNone)
         }
 
         func testOrdinaryToolRetains300SecondClientDeadline() async {

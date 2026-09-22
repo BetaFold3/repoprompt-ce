@@ -44,8 +44,9 @@ public enum MCPTimeoutPolicy {
     /// Default CLI-side deadline for ordinary tool responses.
     public static let cliDefaultToolCallTimeoutSeconds: TimeInterval = 300
     /// Long-running tools whose provider/run cancellation contract is authoritative.
+    /// `ask_oracle` is classified from its arguments by the owned CLI because
+    /// single sends and waits are bounded while Step B batches remain blocking.
     public static let cliDefaultUnboundedToolNames: Set<String> = [
-        "ask_oracle",
         "context_builder"
     ]
     /// Extra time after a caller-requested server-side wait for response encoding
@@ -53,9 +54,10 @@ public enum MCPTimeoutPolicy {
     public static let cliSemanticWaitResponseMarginSeconds: TimeInterval = .init(responseSendDeadlineSeconds)
 
     /// Provider family of the **parent** model invocation that called an agent lifecycle tool
-    /// (`agent_run` / `agent_explore` start, wait, multi-wait, steer-with-wait). The app freezes the
-    /// family once at the outer lifecycle entry from the authenticated run binding; it is never
-    /// inferred from the worker model, the MCP client name, a role label, or a transport protocol.
+    /// (`agent_run` / `agent_explore` start, wait, multi-wait, steer-with-wait) or a bounded
+    /// `ask_oracle` send/wait. The app freezes the family once at the outer entry from the
+    /// authenticated run binding; it is never inferred from the worker/Oracle model, the MCP
+    /// client name, a role label, or a transport protocol.
     public enum AgentLifecycleParentFamily: String, CaseIterable, Sendable, Codable {
         case claude
         case codex

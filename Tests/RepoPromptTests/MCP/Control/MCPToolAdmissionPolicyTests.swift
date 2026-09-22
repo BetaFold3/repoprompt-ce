@@ -56,6 +56,20 @@ final class MCPToolAdmissionPolicyTests: XCTestCase {
         XCTAssertEqual(ServerNetworkManager.admissionClass(forCanonicalToolName: alias), .exclusive)
     }
 
+    func testOwnedCLIAskOracleStillRequiresExplicitCapabilityGrant() {
+        // Evidence for the unresolved access-control decision: the parser routes the owned CLI
+        // to ask_oracle, but normal MCP connections do not receive this gated capability.
+        XCTAssertTrue(MCPPolicyGatedTools.names.contains(MCPWindowToolName.askOracle))
+        XCTAssertTrue(ServerNetworkManager.isAllowedByPositiveToolCeiling(
+            canonicalToolName: MCPWindowToolName.askOracle,
+            allowedToolsOverride: nil
+        ))
+        XCTAssertEqual(
+            ServerNetworkManager.admissionClass(forCanonicalToolName: MCPWindowToolName.askOracle),
+            .control
+        )
+    }
+
     func testGateBCapacitiesRecordConservativeWI3BaselineChoices() {
         XCTAssertEqual(MCPToolAdmissionPolicy.exclusiveConnectionLimit, 1)
         XCTAssertEqual(MCPToolAdmissionPolicy.controlConnectionLimit, 8)

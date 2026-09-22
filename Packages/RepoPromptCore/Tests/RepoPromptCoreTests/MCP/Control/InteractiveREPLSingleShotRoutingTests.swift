@@ -17,6 +17,42 @@ import XCTest
             XCTAssertEqual(args["paths"]?.value as? [String], ["Sources/App.swift"])
         }
 
+        func testAskOracleAndOracleSendCommandsPreserveTheirCanonicalToolNames() throws {
+            let askOracle = try MCPCommandParser.parseCommand(
+                "ask_oracle op=wait",
+                ctx: CommandParseContext(currentDirectory: "/workspace")
+            )
+            guard case let .aliasCall(askOracleToolName, _) = askOracle else {
+                return XCTFail("Expected ask_oracle alias call")
+            }
+            XCTAssertEqual(askOracleToolName, "ask_oracle")
+
+            let oracleSend = try MCPCommandParser.parseCommand(
+                #"oracle_send {"message":"question"}"#,
+                ctx: CommandParseContext(currentDirectory: "/workspace")
+            )
+            guard case let .call(oracleSendToolName, _) = oracleSend else {
+                return XCTFail("Expected oracle_send raw call")
+            }
+            XCTAssertEqual(oracleSendToolName, "oracle_send")
+        }
+
+        func testAskOracleWaitParsesShellStrippedOperationIDArray() throws {
+            let operationID = "11111111-1111-1111-1111-111111111111"
+            let command = try MCPCommandParser.parseCommand(
+                "ask_oracle op=wait operation_ids=[11111111-1111-1111-1111-111111111111]",
+                ctx: CommandParseContext(currentDirectory: "/workspace")
+            )
+            guard case let .aliasCall(toolName, args) = command else {
+                return XCTFail("Expected ask_oracle alias call")
+            }
+            XCTAssertEqual(toolName, "ask_oracle")
+            let values = try XCTUnwrap(
+                args["operation_ids"]?.value as? [UncheckedSendableValue]
+            )
+            XCTAssertEqual(values.compactMap { $0.value as? String }, [operationID])
+        }
+
         func testSingleShotCallWithInitialWindowInjectsHiddenWindowWithoutBinding() async throws {
             let fixture = try await makeFixture()
             addTeardownBlock { await fixture.cleanup() }

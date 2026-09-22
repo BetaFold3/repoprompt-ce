@@ -5,6 +5,92 @@ import XCTest
 
 @MainActor
 final class AgentRunWaitDrainIntegrationTests: XCTestCase {
+    func testRealDrainHandlesOracleOnlyResumableWait() async throws {
+        try await AgentRunWaitDrainTestHarness.withHarness { harness in
+            let executionID = try await harness.beginOracleResumableWait()
+            harness.endOracleExecutionOnWake(executionID)
+
+            XCTAssertTrue(harness.server.test_oracleWaitScopeExists(executionID: executionID))
+            let drained = await harness.drain(source: "test-oracle-only-drain")
+
+            XCTAssertTrue(drained)
+            XCTAssertFalse(harness.server.test_oracleWaitScopeExists(executionID: executionID))
+            XCTAssertFalse(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
+        }
+    }
+
+    func testProductionDrainTracksRegistrationBeforeInvocationResolutionAndExcludesBatch() async throws {
+        try await AgentRunWaitDrainTestHarness.withHarness { harness in
+            let registered = await harness.server.test_beginResolvedToolExecution(
+                metadata: harness.metadata,
+                resolvedContext: nil,
+                toolName: MCPWindowToolName.askOracle,
+                toolArgs: ["op": .string("wait")]
+            )
+            let execution = try XCTUnwrap(registered)
+            XCTAssertTrue(harness.server.test_oracleWaitScopeExists(executionID: execution.executionID))
+
+            let drainTask = Task { @MainActor in
+                await harness.drain(source: "test-registration-time-oracle-drain")
+            }
+            try await AsyncTestWait.waitUntil("registration-time steer becomes sticky") {
+                await MainActor.run {
+                    harness.server.oracleWaitScopeSteeringRequested(executionID: execution.executionID)
+                }
+            }
+            XCTAssertTrue(
+                harness.server.test_oracleWaitScopeExists(executionID: execution.executionID),
+                "drain must not report completion before invocation resolution and execution cleanup"
+            )
+
+            _ = await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+                await harness.server.resolveOracleWaitInvocation()
+            }
+            harness.endOracleExecutionOnWake(execution.executionID)
+
+            let drainedBeforeResolutionCompleted = await drainTask.value
+            XCTAssertTrue(drainedBeforeResolutionCompleted)
+            XCTAssertFalse(harness.server.test_oracleWaitScopeExists(executionID: execution.executionID))
+            XCTAssertFalse(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
+
+            let batch = await harness.server.test_beginResolvedToolExecution(
+                metadata: harness.metadata,
+                resolvedContext: nil,
+                toolName: MCPWindowToolName.askOracle,
+                toolArgs: ["consultations": .array([.object(["message": .string("blocking")])])]
+            )
+            let batchExecution = try XCTUnwrap(batch)
+            XCTAssertFalse(
+                harness.server.test_oracleWaitScopeExists(executionID: batchExecution.executionID),
+                "blocking Step B batches must stay outside the resumable steering drain"
+            )
+            let batchExcludedFromDrain = await harness.drain(source: "test-blocking-batch-exclusion")
+            XCTAssertTrue(batchExcludedFromDrain)
+            XCTAssertTrue(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
+            harness.server.test_endToolExecution(executionID: batchExecution.executionID)
+        }
+    }
+
+    func testRealDrainHandlesMixedChildAndOracleWaits() async throws {
+        try await AgentRunWaitDrainTestHarness.withHarness { harness in
+            let childWait = harness.startWait()
+            try await harness.waitUntilBlocked()
+            let executionID = try await harness.beginOracleResumableWait()
+            harness.endOracleExecutionOnWake(executionID)
+
+            let drained = await harness.drain(source: "test-mixed-child-oracle-drain")
+            XCTAssertTrue(drained)
+            let childValue = try await childWait.value
+            XCTAssertEqual(
+                childValue.objectValue?["wait"]?.objectValue?["result"]?.stringValue,
+                "interrupted_by_steering"
+            )
+            XCTAssertFalse(harness.server.hasActiveChildAgentRunWaits(runID: harness.parentRunID))
+            XCTAssertFalse(harness.server.test_oracleWaitScopeExists(executionID: executionID))
+            XCTAssertFalse(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
+        }
+    }
+
     func testRealParentWaitScopeDrainInterruptsOnceAndAllowsCleanRewait() async throws {
         try await AgentRunWaitDrainTestHarness.withHarness { harness in
             let firstWait = harness.startWait()
@@ -84,6 +170,14 @@ final class AgentRunWaitDrainTestHarness {
     private let liveSnapshots: AgentRunWaitDrainLiveSnapshots
     private var waitTasks: [Task<Value, Error>] = []
     private var didCleanup = false
+
+    var metadata: MCPServerViewModel.RequestMetadata {
+        MCPServerViewModel.RequestMetadata(
+            connectionID: connectionID,
+            clientName: "agent-run-wait-drain-tests",
+            windowID: window.windowID
+        )
+    }
 
     private init(
         window: WindowState,
@@ -190,6 +284,27 @@ final class AgentRunWaitDrainTestHarness {
             service: service,
             liveSnapshots: liveSnapshots
         )
+    }
+
+    func beginOracleResumableWait() async throws -> UUID {
+        let registered = await server.test_beginResolvedToolExecution(
+            metadata: metadata,
+            resolvedContext: nil,
+            toolName: MCPWindowToolName.askOracle
+        )
+        let execution = try XCTUnwrap(registered)
+        _ = await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
+            await server.resolveOracleWaitInvocation()
+        }
+        return execution.executionID
+    }
+
+    func endOracleExecutionOnWake(_ executionID: UUID) {
+        server.subscribeOracleWaitScope(executionID: executionID) { [server] in
+            Task { @MainActor in
+                server.test_endToolExecution(executionID: executionID)
+            }
+        }
     }
 
     func startWait(timeoutSeconds: TimeInterval = 2) -> Task<Value, Error> {

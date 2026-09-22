@@ -3,14 +3,20 @@ import Foundation
 import MCP
 import RepoPromptShared
 
-// SEARCH-HELPER: MCP, agent_run, agent_explore, wait policy, parent family, timeout, wait_policy
+// SEARCH-HELPER: MCP, agent_run, agent_explore, ask_oracle, wait policy, parent family, timeout, wait_policy
 
-/// Invocation-local wait policy for `agent_run` / `agent_explore` lifecycle calls (plan §6.3).
+/// Invocation-local wait policy for `agent_run` / `agent_explore` lifecycle calls (plan §6.3)
+/// and, unchanged, for bounded `ask_oracle` sends and `op:"wait"` (Oracle resumable wait plan
+/// §3.1/§3.6): the same family table, the same `selection(rawTimeout:parentFamily:)` rules and
+/// the same canonical root `wait_policy` tuple attached once per response via `attaching(_:to:)`.
 ///
 /// The effective-parent classification is frozen once at the outer lifecycle entry from the
 /// authenticated run binding and then carried unchanged through child creation, run rebinding,
-/// steering and Explore delegation. The policy values never retain a live session and never infer
-/// the family from the worker model, the MCP client name, a role label or a transport protocol.
+/// steering and Explore delegation. For `ask_oracle` it is frozen per invocation: a later
+/// `op:"wait"` on the same operation is a new observation and may legitimately carry a
+/// different family after a run rotation. The policy values never retain a live session and
+/// never infer the family from the worker model, the MCP client name, a role label or a
+/// transport protocol.
 enum AgentMCPWaitPolicy {
     typealias ParentFamily = MCPTimeoutPolicy.AgentLifecycleParentFamily
 
@@ -194,7 +200,8 @@ enum AgentMCPWaitPolicy {
     /// Resolves the wait selection for a raw `timeout` / `timeout_seconds` argument.
     /// Omission is automatic (never rewritten to an explicit number); explicit `0` is a poll;
     /// explicit values from 1 through the shared maximum are accepted and larger values throw
-    /// without clamping.
+    /// without clamping. `ask_oracle` validates the raw value before any model selection or
+    /// packaging and reuses this resolution unchanged.
     static func selection(rawTimeout: Value?, parentFamily: ParentFamily) throws -> Selection {
         guard let seconds = try AgentMCPToolHelpers.parseTimeoutSeconds(rawTimeout) else {
             return .automatic(parentFamily: parentFamily)

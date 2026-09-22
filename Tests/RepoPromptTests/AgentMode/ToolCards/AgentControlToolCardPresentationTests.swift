@@ -190,6 +190,84 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
         }
     }
 
+    func testAskOracleSubtitlesUseParentFamilyAndCanonicalResultWaitLabels() throws {
+        let operationID = "11111111-1111-1111-1111-111111111111"
+        let codexContext = AgentControlToolCardContext(authoritativeLocalParentFamily: .codex)
+        let claudeContext = AgentControlToolCardContext(authoritativeLocalParentFamily: .claude)
+
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString(["message": "question", "mode": "plan"]),
+                agentControlContext: codexContext
+            ),
+            "plan • wait ≤10m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString(["op": "wait", "operation_ids": [operationID]]),
+                agentControlContext: claudeContext
+            ),
+            "wait • \(operationID) • wait ≤3m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString([
+                    "op": "wait",
+                    "operation_ids": [operationID, "22222222-2222-2222-2222-222222222222"],
+                    "timeout_seconds": 0
+                ])
+            ),
+            "wait • 2 operations • poll"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString(["op": "cancel", "operation_ids": [operationID]]),
+                agentControlContext: codexContext
+            ),
+            "cancel • \(operationID)"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString([
+                    "message": "question",
+                    "mode": "review",
+                    "timeout_seconds": 600
+                ]),
+                resultJSON: jsonString([
+                    "status": "completed",
+                    "wait_policy": [
+                        "mode": "automatic",
+                        "timeout_seconds": 180,
+                        "parent_family": "claude"
+                    ]
+                ]),
+                agentControlContext: codexContext
+            ),
+            "review • wait ≤3m"
+        )
+        try XCTAssertEqual(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString(["message": "question", "mode": "review"]),
+                resultJSON: jsonString(["status": "completed"]),
+                agentControlContext: codexContext
+            ),
+            "review"
+        )
+        try XCTAssertNil(
+            ToolCardRouter.callSubtitle(
+                for: "ask_oracle",
+                argsJSON: jsonString(["consultations": [["message": "one"], ["message": "two"]]]),
+                agentControlContext: codexContext
+            )
+        )
+    }
+
     func testLifecycleResultSubtitlesUseCanonicalWaitPolicy() {
         var automaticResult = resultObject(reasoningEffort: nil)
         automaticResult["wait_policy"] = [

@@ -270,6 +270,8 @@ When questions arise during coordination, reason through them yourself. If you'r
 
 \(sharedParallelDispatchBlock(variant: variant, defaultRole: "pair"))
 
+\(sharedOracleResumableWaitGuidance(variant: variant))
+
 \(sharedSessionCleanupSection(variant: variant, heading: "### Housekeeping", includeSessionCleanupGuidance: includeSessionCleanupGuidance, includeStrayPlanExportCleanup: true))
 ---
 

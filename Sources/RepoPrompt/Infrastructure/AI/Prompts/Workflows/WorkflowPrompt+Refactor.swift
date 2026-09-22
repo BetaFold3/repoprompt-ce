@@ -263,6 +263,8 @@ Refactorings that touch **completely independent modules** can run concurrently.
 
 \(sharedParallelDispatchBlock(variant: variant, defaultRole: "engineer"))
 
+\(sharedOracleResumableWaitGuidance(variant: variant))
+
 Only parallelize when items have **zero file overlap**. When in doubt, run sequentially — refactoring conflicts are painful to untangle.
 
 \(sharedSessionCleanupSection(variant: variant, heading: "### Housekeeping", includeSessionCleanupGuidance: includeSessionCleanupGuidance))

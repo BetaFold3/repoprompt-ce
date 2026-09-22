@@ -26,6 +26,10 @@ final class KnowledgeAgentPromptTests: XCTestCase {
         XCTAssertFalse(prompt.contains("model_preset_id"))
         XCTAssertTrue(prompt.contains("Default to zero critique rounds"))
         XCTAssertTrue(prompt.contains("Judge the evidence"))
+        XCTAssertTrue(prompt.contains("Never resend a pending question"))
+        XCTAssertTrue(prompt.contains("without `operation_ids`"))
+        XCTAssertTrue(prompt.contains("does not warm a prompt cache"))
+        XCTAssertTrue(prompt.contains("`consultations` batches remain blocking"))
     }
 
     func testKnowledgePromptKeepsProviderMediaClaimsTruthful() {

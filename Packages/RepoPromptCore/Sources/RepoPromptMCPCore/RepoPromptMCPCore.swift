@@ -2880,7 +2880,7 @@ func printUsage() {
           builder "how does auth work?" --response-type question
           After builder, use chat to continue: chat "explain more" --chat-id <returned-id>
 
-        ask_oracle (chat, plan, review) - Send/continue an oracle conversation
+        oracle_send (chat, plan, review) - Blocking Oracle conversation
           Aliases: chat "msg" continues current chat (--new to start fresh)
                    plan "msg"   → new_chat=true mode=plan
                    review "msg" → new_chat=true mode=review (includes git diff)
@@ -2888,7 +2888,19 @@ func printUsage() {
           chat "Explain auth" --new                    Start new chat
           plan "Design user system"                    New chat in plan mode
           review "What changed?"                       Review git diff of selected files
+
+        ask_oracle - Agent Mode bounded/resumable Oracle consultation
           ask_oracle message="Review plan" mode=plan new_chat=true
+          ask_oracle message="Start now" timeout_seconds=0
+                                                       Start and return pending immediately
+          ask_oracle op=wait operation_ids=["<id>"]    Resume without resending
+          ask_oracle op=wait                           Recover all owned undelivered operations
+          ask_oracle op=cancel operation_ids=["<id>"]  Cancel only on user request/wrong question
+          Routine sends/waits should omit timeout_seconds. A timeout or steering wake returns
+          pending while Oracle keeps running; never resend. Respond to steering first, then wait.
+          Waits and transport heartbeats do not issue a model request or warm a prompt cache.
+          consultations batches remain blocking and reject timeout_seconds/request_id. For a long
+          two-lane duel, start two single sends with timeout_seconds=0, then wait on both handles.
 
         read_file (read, cat) - Read file contents
           read src/main.swift                          Read entire file

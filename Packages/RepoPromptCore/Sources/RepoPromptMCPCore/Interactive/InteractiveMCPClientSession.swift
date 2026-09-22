@@ -961,6 +961,9 @@ actor InteractiveMCPClientSession {
         }
         switch effectivePolicy {
         case .default:
+            if toolName == "ask_oracle" {
+                return Self.resolvedAskOracleDefaultTimeout(arguments: arguments)
+            }
             if MCPTimeoutPolicy.cliDefaultUnboundedToolNames.contains(toolName) {
                 return nil
             }
@@ -982,6 +985,59 @@ actor InteractiveMCPClientSession {
             return seconds.isFinite && seconds > 0 ? seconds : nil
         case .none:
             return nil
+        }
+    }
+
+    /// Step B `ask_oracle` keeps request-owned batches blocking while giving every
+    /// single send and wait an owned client response envelope. Invalid/control combinations
+    /// retain the ordinary deadline so the server can reject them promptly.
+    private static func resolvedAskOracleDefaultTimeout(
+        arguments: [String: Value]
+    ) -> TimeInterval? {
+        if arguments["consultations"] != nil {
+            return nil
+        }
+
+        let operation: String
+        if let rawOperation = arguments["op"] {
+            if case .null = rawOperation {
+                operation = "send"
+            } else {
+                guard let value = rawOperation.stringValue?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased(),
+                    !value.isEmpty
+                else {
+                    return MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+                }
+                operation = value
+            }
+        } else {
+            operation = "send"
+        }
+
+        switch operation {
+        case "send", "wait":
+            guard let timeoutValue = arguments["timeout_seconds"] else {
+                return MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
+            }
+            if case .null = timeoutValue {
+                return MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
+            }
+            guard let timeoutSeconds = semanticTimeoutSeconds(timeoutValue),
+                  timeoutSeconds > 0,
+                  timeoutSeconds <= MCPTimeoutPolicy.agentLifecycleMaximumExplicitTimeoutSeconds
+            else {
+                return MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+            }
+            return max(
+                MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds,
+                timeoutSeconds + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+            )
+        case "cancel":
+            return MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
+        default:
+            return MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
         }
     }
 
@@ -1007,7 +1063,16 @@ actor InteractiveMCPClientSession {
             return nil
         }
 
-        guard let value = arguments[timeoutKey] else { return nil }
+        guard let value = arguments[timeoutKey],
+              let seconds = semanticTimeoutSeconds(value),
+              seconds >= 0
+        else {
+            return nil
+        }
+        return seconds
+    }
+
+    private static func semanticTimeoutSeconds(_ value: Value) -> TimeInterval? {
         let seconds: TimeInterval? = switch value {
         case let .int(value):
             TimeInterval(value)
@@ -1018,7 +1083,7 @@ actor InteractiveMCPClientSession {
         default:
             nil
         }
-        guard let seconds, seconds.isFinite, seconds >= 0 else { return nil }
+        guard let seconds, seconds.isFinite else { return nil }
         return seconds
     }
 

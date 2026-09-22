@@ -176,6 +176,7 @@ struct AgentMessageBubble: View {
     let suppressAskUserTranscriptUI: Bool
     let contextBuilderContext: ContextBuilderCardContext?
     let agentControlToolCardContext: AgentControlToolCardContext?
+    let agentOracleToolCardContext: AgentOracleToolCardContext?
     let promptManager: PromptViewModel?
     var handoffConfig: AgentHandoffConfig?
     let rawToolResultPayload: String?
@@ -209,6 +210,7 @@ struct AgentMessageBubble: View {
         suppressAskUserTranscriptUI: Bool = false,
         contextBuilderContext: ContextBuilderCardContext? = nil,
         agentControlToolCardContext: AgentControlToolCardContext? = nil,
+        agentOracleToolCardContext: AgentOracleToolCardContext? = nil,
         promptManager: PromptViewModel? = nil,
         handoffConfig: AgentHandoffConfig? = nil,
         rawToolResultPayload: String? = nil,
@@ -228,6 +230,7 @@ struct AgentMessageBubble: View {
         self.suppressAskUserTranscriptUI = suppressAskUserTranscriptUI
         self.contextBuilderContext = contextBuilderContext
         self.agentControlToolCardContext = agentControlToolCardContext
+        self.agentOracleToolCardContext = agentOracleToolCardContext
         self.promptManager = promptManager
         self.handoffConfig = handoffConfig
         self.rawToolResultPayload = rawToolResultPayload
@@ -312,6 +315,7 @@ struct AgentMessageBubble: View {
                         workspaceID: currentWorkspaceID,
                         tabID: currentTabID
                     ),
+                    oracleToolCardContext: agentOracleToolCardContext,
                     contextBuilder: contextBuilderContext,
                     promptManager: promptManager
                 )

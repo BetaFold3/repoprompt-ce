@@ -76,6 +76,8 @@ rpce-cli -w <window_id> -e 'agent_run op=start model_id=explore session_name="<k
 
 > ⚠️ \(sharedWaitFirstSupervisionBlock()) This applies to every detached agent in this workflow.
 
+\(sharedOracleResumableWaitGuidance(variant: variant))
+
 ### Phase 2: Broad Context Gathering (via \(builderName) — REQUIRED)
 
 \(builderName) discovers workspace files you'd miss manually. Pass detailed instructions + the report path so prior research informs its selection:

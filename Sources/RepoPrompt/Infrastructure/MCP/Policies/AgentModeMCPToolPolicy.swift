@@ -18,7 +18,11 @@ enum AgentModeMCPToolPolicy {
     static let knowledgeAllowedTools = KnowledgeSessionPolicy.allowedMCPToolNames
 
     static let knowledgeAskOracleDescription = """
-    Consult an Oracle model using the current repository evidence. Resolve exact selectable preset names or UUIDs with oracle_utils op=models. For independent opinions, issue calls together in one tool-call batch, each with new_chat:true and an explicit model. Continue each lane with its returned chat_id and new_chat:false; the lane keeps its own model preset, so model can be omitted, and the call fails rather than switching models if that preset is no longer usable. No packet, hash, manifest, or verification-gate ritual is required.
+    Consult an Oracle model using the current repository evidence. Resolve exact selectable preset names or UUIDs with oracle_utils op=models. For independent opinions, use separate single sends with new_chat:true and an explicit model; for a long duel, give each timeout_seconds:0 and then call op:wait once with both operation IDs. Continue completed lanes with their returned chat_id and new_chat:false; the lane keeps its own model preset, so model can be omitted, and the call fails rather than switching models if that preset is no longer usable.
+
+    Routine sends and waits should omit timeout_seconds. Pending is normal: a timeout or steering wake leaves the Oracle running. Never resend a pending question; resume it with op:wait and its operation_id. After steering, respond to the user first, then resume waiting. After compaction, call op:wait without operation_ids to collect owned undelivered results; use oracle_chat_log with a known chat_id only for conversation recovery. A wait or transport heartbeat does not issue a provider-model request and does not warm a prompt cache. Use op:cancel only when the user asks or the question is known to be wrong. An unkeyed repeat is a new consultation; request_id protects an identical live send but is not persisted across app relaunch.
+
+    consultations batches remain blocking until all lanes finish, are not steerable, reject timeout_seconds and request_id, and cannot be resumed or cancelled by operation handle. No packet, hash, manifest, or verification-gate ritual is required.
     """
 
     /// Tools granted to legacy/generic agent mode runs (from MCPPolicyGatedTools).

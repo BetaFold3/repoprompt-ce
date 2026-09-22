@@ -1025,6 +1025,69 @@ enum ToolResultDTOs {
             }
         }
 
+        private struct ErrorPayload: Codable {
+            let code: String?
+            let message: String?
+        }
+
+        struct Pending: Codable, Equatable {
+            let reason: String?
+            let streamState: String?
+            let elapsedSeconds: Double?
+
+            private enum CodingKeys: String, CodingKey {
+                case reason
+                case streamState = "stream_state"
+                case elapsedSeconds = "elapsed_seconds"
+            }
+        }
+
+        struct WaitPolicy: Codable, Equatable {
+            let mode: String
+            let timeoutSeconds: Double
+            let parentFamily: String?
+
+            private enum CodingKeys: String, CodingKey {
+                case mode
+                case timeoutSeconds = "timeout_seconds"
+                case parentFamily = "parent_family"
+            }
+        }
+
+        struct WaitSummary: Codable, Equatable {
+            let result: String?
+            let pendingOperationIDs: [String]?
+
+            private enum CodingKeys: String, CodingKey {
+                case result
+                case pendingOperationIDs = "pending_operation_ids"
+            }
+        }
+
+        struct Resume: Codable, Equatable {
+            let op: String?
+            let operationIDs: [String]?
+
+            private enum CodingKeys: String, CodingKey {
+                case op
+                case operationIDs = "operation_ids"
+            }
+        }
+
+        let ok: Bool?
+        let status: String?
+        let operationID: String?
+        let queryID: String?
+        let pending: Pending?
+        let waitPolicy: WaitPolicy?
+        let results: [ChatSendDTO]?
+        let wait: WaitSummary?
+        let resume: Resume?
+        let cancel: String?
+        let code: String?
+        let error: String?
+        let note: String?
+        let partialResponse: String?
         let chatID: String?
         let mode: String?
         let response: String?
@@ -1043,6 +1106,20 @@ enum ToolResultDTOs {
         let usage: Usage?
 
         private enum CodingKeys: String, CodingKey {
+            case ok
+            case status
+            case operationID = "operation_id"
+            case queryID = "query_id"
+            case pending
+            case waitPolicy = "wait_policy"
+            case results
+            case wait
+            case resume
+            case cancel
+            case code
+            case error
+            case note
+            case partialResponse = "partial_response"
             case chatID = "chat_id"
             case mode
             case response
@@ -1066,6 +1143,20 @@ enum ToolResultDTOs {
             response: String?,
             diffs: [Diff]?,
             errors: [String]?,
+            ok: Bool? = nil,
+            status: String? = nil,
+            operationID: String? = nil,
+            queryID: String? = nil,
+            pending: Pending? = nil,
+            waitPolicy: WaitPolicy? = nil,
+            results: [ChatSendDTO]? = nil,
+            wait: WaitSummary? = nil,
+            resume: Resume? = nil,
+            cancel: String? = nil,
+            code: String? = nil,
+            error: String? = nil,
+            note: String? = nil,
+            partialResponse: String? = nil,
             modelID: String? = nil,
             modelName: String? = nil,
             uiModelID: String? = nil,
@@ -1076,6 +1167,20 @@ enum ToolResultDTOs {
             modelPresetName: String? = nil,
             usage: Usage? = nil
         ) {
+            self.ok = ok
+            self.status = status
+            self.operationID = operationID
+            self.queryID = queryID
+            self.pending = pending
+            self.waitPolicy = waitPolicy
+            self.results = results
+            self.wait = wait
+            self.resume = resume
+            self.cancel = cancel
+            self.code = code
+            self.error = error
+            self.note = note
+            self.partialResponse = partialResponse
             self.chatID = chatID
             self.mode = mode
             self.response = response
@@ -1094,6 +1199,29 @@ enum ToolResultDTOs {
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
+            ok = try container.decodeIfPresent(Bool.self, forKey: .ok)
+            status = try container.decodeIfPresent(String.self, forKey: .status)
+            operationID = try container.decodeIfPresent(String.self, forKey: .operationID)
+            queryID = try container.decodeIfPresent(String.self, forKey: .queryID)
+            pending = try container.decodeIfPresent(Pending.self, forKey: .pending)
+            waitPolicy = try container.decodeIfPresent(WaitPolicy.self, forKey: .waitPolicy)
+            results = try container.decodeIfPresent([ChatSendDTO].self, forKey: .results)
+            wait = try container.decodeIfPresent(WaitSummary.self, forKey: .wait)
+            resume = try container.decodeIfPresent(Resume.self, forKey: .resume)
+            cancel = try container.decodeIfPresent(String.self, forKey: .cancel)
+            let topLevelCode = try container.decodeIfPresent(String.self, forKey: .code)
+            if let stringError = try? container.decode(String.self, forKey: .error) {
+                code = topLevelCode
+                error = stringError
+            } else if let payload = try? container.decode(ErrorPayload.self, forKey: .error) {
+                code = topLevelCode ?? payload.code
+                error = payload.message ?? payload.code
+            } else {
+                code = topLevelCode
+                error = nil
+            }
+            note = try container.decodeIfPresent(String.self, forKey: .note)
+            partialResponse = try container.decodeIfPresent(String.self, forKey: .partialResponse)
             chatID = try container.decodeIfPresent(String.self, forKey: .chatID)
             mode = try container.decodeIfPresent(String.self, forKey: .mode)
             response = try container.decodeIfPresent(String.self, forKey: .response)
@@ -1116,6 +1244,20 @@ enum ToolResultDTOs {
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(ok, forKey: .ok)
+            try container.encodeIfPresent(status, forKey: .status)
+            try container.encodeIfPresent(operationID, forKey: .operationID)
+            try container.encodeIfPresent(queryID, forKey: .queryID)
+            try container.encodeIfPresent(pending, forKey: .pending)
+            try container.encodeIfPresent(waitPolicy, forKey: .waitPolicy)
+            try container.encodeIfPresent(results, forKey: .results)
+            try container.encodeIfPresent(wait, forKey: .wait)
+            try container.encodeIfPresent(resume, forKey: .resume)
+            try container.encodeIfPresent(cancel, forKey: .cancel)
+            try container.encodeIfPresent(code, forKey: .code)
+            try container.encodeIfPresent(error, forKey: .error)
+            try container.encodeIfPresent(note, forKey: .note)
+            try container.encodeIfPresent(partialResponse, forKey: .partialResponse)
             try container.encodeIfPresent(chatID, forKey: .chatID)
             try container.encodeIfPresent(mode, forKey: .mode)
             try container.encodeIfPresent(response, forKey: .response)

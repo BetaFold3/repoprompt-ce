@@ -1711,11 +1711,17 @@ extension OracleViewModel {
     ///
     /// Success transfers one `chatID` pin to the returned ticket. Rejections release their
     /// temporary pin internally; a successful recipient owns exactly one matching unpin.
+    ///
+    /// When `operationID` names a reserved `mcpOperationStore` receipt, the accepted send is
+    /// bound to it at the first synchronous point after `.started` (before any post-start
+    /// activation/ownership await) and the ticket's pin transfers to the operation, whose
+    /// completion observer releases it. The caller must then not unpin.
     @MainActor
     func tool_chatSendStart(
         args: [String: Value],
         promptVM: PromptViewModel,
-        tabContext: OracleSendTabContext? = nil
+        tabContext: OracleSendTabContext? = nil,
+        operationID: UUID? = nil
     ) async throws -> OracleMCPSendTicket {
         // ────────── 1. Validate & extract parameters ──────────
         let removedArgs = ["selected_paths", "git_scope", "git_base"].filter { args[$0] != nil }
@@ -2113,10 +2119,32 @@ extension OracleViewModel {
                     outputReserveTokens: outputReserveTokens
                 )
             )
+            if let operationID {
+                mcpOperationStore.bind(
+                    operationID,
+                    ticket: ticket,
+                    chatShortID: sessions.first(where: { $0.id == chatID })?.shortID
+                )
+                #if DEBUG
+                    await oraclePostBindObserverForTesting?(operationID, startedQueryID)
+                #endif
+            }
         case .rejectedSessionBusy:
             unpinSession(chatID)
+            let ownerVisibleOperationIDs: [UUID]
+            if let tabID {
+                let caller = OracleMCPOperationStore.OwnerScope(
+                    tabID: tabID,
+                    agentSessionID: tabContext?.agentModeSessionID,
+                    runID: tabContext?.agentModeRunID
+                )
+                ownerVisibleOperationIDs = mcpOperationStore.runningOperationIDs(owner: caller)
+                    .filter { $0 != operationID && mcpOperationStore.snapshot($0)?.chatID == chatID }
+            } else {
+                ownerVisibleOperationIDs = []
+            }
             throw ChatToolError.oracleSessionBusy(
-                "This chat is still streaming. Pass new_chat:true or a different chat_id, or wait. In Agent Mode, use oracle_chat_log with the explicit chat_id to inspect the lane."
+                "This chat is still streaming. Pass new_chat:true or a different chat_id, or wait. In Agent Mode, use oracle_chat_log with the explicit chat_id to inspect the lane.\(Self.runningOperationsRemedy(ownerVisibleOperationIDs))"
             )
         case .rejectedTabConcurrencyLimit:
             // A freshly created target that never reserved must not linger as an orphan
@@ -2141,8 +2169,20 @@ extension OracleViewModel {
                 await deleteSession(rejectedSession)
             }
             unpinSession(chatID)
+            let ownerVisibleOperationIDs: [UUID]
+            if let tabID {
+                let caller = OracleMCPOperationStore.OwnerScope(
+                    tabID: tabID,
+                    agentSessionID: tabContext?.agentModeSessionID,
+                    runID: tabContext?.agentModeRunID
+                )
+                ownerVisibleOperationIDs = mcpOperationStore.runningOperationIDs(owner: caller)
+                    .filter { $0 != operationID }
+            } else {
+                ownerVisibleOperationIDs = []
+            }
             throw ChatToolError.oracleConcurrencyLimit(
-                "2 Oracle streams are already running in this tab. Wait for one to finish, then retry. In Agent Mode, use oracle_chat_log with each explicit chat_id to inspect the active lanes."
+                "2 Oracle streams are already running in this tab. Wait for one to finish, then retry. In Agent Mode, use oracle_chat_log with each explicit chat_id to inspect the active lanes.\(Self.runningOperationsRemedy(ownerVisibleOperationIDs))"
             )
         case let .failed(reason):
             unpinSession(chatID)
@@ -2194,6 +2234,14 @@ extension OracleViewModel {
         }
 
         return ticket
+    }
+
+    /// Names the caller's running `ask_oracle` operations and the wait/cancel remedy in busy
+    /// and cap rejections (plan §3.6). Empty when no bounded operation is running.
+    static func runningOperationsRemedy(_ operationIDs: [UUID]) -> String {
+        guard !operationIDs.isEmpty else { return "" }
+        let ids = operationIDs.map(\.uuidString).joined(separator: ", ")
+        return " Running ask_oracle operation_ids: \(ids). Collect them with ask_oracle op:\"wait\" (operation_ids) or stop one with op:\"cancel\"; do not resend the question."
     }
 
     /// Builds the wire reply for a completed Oracle send ticket.

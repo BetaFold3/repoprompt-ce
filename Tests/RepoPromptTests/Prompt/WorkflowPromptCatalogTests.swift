@@ -48,14 +48,14 @@ final class WorkflowPromptCatalogTests: XCTestCase {
     }
 
     func testRenderedManagedPromptFrontmatterCompatibility() {
-        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 65)
+        XCTAssertEqual(RepoPromptWorkflowPrompts.skillsVersion, 66)
 
         for descriptor in WorkflowPromptCatalog.installDescriptors {
             let rendered = RepoPromptWorkflowPrompts.render(id: descriptor.id, variant: .mcp)
             XCTAssertTrue(rendered.hasPrefix("---\n"), descriptor.name)
             XCTAssertTrue(rendered.contains("name: \"\(descriptor.name)\""), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_managed: true"), descriptor.name)
-            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 65"), descriptor.name)
+            XCTAssertTrue(rendered.contains("repoprompt_skills_version: 66"), descriptor.name)
             XCTAssertTrue(rendered.contains("repoprompt_variant: mcp"), descriptor.name)
             XCTAssertFalse(RepoPromptWorkflowPrompts.stripYAMLFrontmatter(rendered).hasPrefix("---"), descriptor.name)
         }
@@ -82,6 +82,66 @@ final class WorkflowPromptCatalogTests: XCTestCase {
         }
         XCTAssertTrue(reminder.contains("re-packages the current workspace selection"))
         XCTAssertTrue(reminder.contains("fresh chat with a concise summary"))
+    }
+
+    func testResumableOracleGuidanceCoversAgentWorkflowsReminderAndRolePrompts() {
+        let workflowIDs: [RepoPromptWorkflowID] = [
+            .investigate,
+            .deepPlan,
+            .optimize,
+            .orchestrate,
+            .refactor
+        ]
+        var prompts: [(label: String, text: String)] = workflowIDs.map {
+            (
+                "\($0.commandName) [agent]",
+                RepoPromptWorkflowPrompts.render(id: $0, variant: .agent)
+            )
+        }
+        prompts.append(
+            (
+                "rp-reminder [mcp]",
+                RepoPromptWorkflowPrompts.render(id: .reminder, variant: .mcp)
+            )
+        )
+        prompts.append(
+            (
+                "rp-reminder [agent]",
+                RepoPromptWorkflowPrompts.render(id: .reminder, variant: .agent)
+            )
+        )
+        prompts.append(("standard agent", SystemPromptService.agentModePrompt()))
+        prompts.append(("engineer agent", SystemPromptService.agentModePrompt(taskLabelKind: .engineer)))
+        prompts.append(
+            (
+                "knowledge agent",
+                SystemPromptService.agentModePrompt(
+                    agentKind: .claudeCode,
+                    sessionProfile: .knowledge
+                )
+            )
+        )
+
+        for prompt in prompts {
+            XCTAssertTrue(prompt.text.contains("Never resend a pending question"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("`op:\"wait\"`"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("without `operation_ids`"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("respond to the user first"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("does not warm a prompt cache"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("`op:\"cancel\"`"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("not persisted across app relaunch"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("`consultations` batches remain blocking"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("`timeout_seconds:0`"), prompt.label)
+            XCTAssertTrue(prompt.text.contains("provider cache TTL"), prompt.label)
+            XCTAssertFalse(prompt.text.lowercased().contains("cache-safe"), prompt.label)
+        }
+
+        for workflowID in workflowIDs {
+            for variant in [WorkflowPromptVariant.mcp, .cli] {
+                let rendered = RepoPromptWorkflowPrompts.render(id: workflowID, variant: variant)
+                XCTAssertFalse(rendered.contains("**Resumable Oracle waits.**"), workflowID.commandName)
+            }
+        }
     }
 
     func testAgentWorkflowTemplatesRenderFromProviderNeutralCatalog() {

@@ -273,7 +273,7 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
                 for: "ask_oracle",
                 argsJSON: jsonString(["message": "review", "mode": "review", "model": "GPT_5_6_Sol_xhigh"])
             ),
-            "review • GPT_5_6_Sol_xhigh"
+            "review • GPT_5_6_Sol_xhigh • wait auto"
         )
         let resolvedDTO = try XCTUnwrap(ToolJSON.decode(
             ToolResultDTOs.ChatSendDTO.self,
@@ -561,6 +561,279 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertNil(AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: "null"))
         XCTAssertNil(AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: "42"))
         XCTAssertNil(AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: "[]"))
+    }
+
+    func testOracleOperationPresentationDistinguishesFrozenStatesAndMultiHandleEnvelopes() throws {
+        XCTAssertEqual(OracleToolCardState.pending.visualStatus, .warning)
+        XCTAssertEqual(OracleToolCardState.cancelling.visualStatus, .warning)
+        XCTAssertEqual(OracleToolCardState.completed.visualStatus, .success)
+        XCTAssertEqual(OracleToolCardState.cancelled.visualStatus, .warning)
+        XCTAssertEqual(OracleToolCardState.failed.visualStatus, .failure)
+
+        let pendingRaw = jsonString([
+            "status": "pending",
+            "operation_id": "11111111-1111-1111-1111-111111111111",
+            "chat_id": "pending-chat",
+            "mode": "plan",
+            "pending": [
+                "reason": "timed_out",
+                "stream_state": "streaming",
+                "elapsed_seconds": 181
+            ],
+            "wait_policy": [
+                "mode": "automatic",
+                "timeout_seconds": 180,
+                "parent_family": "claude"
+            ]
+        ])
+        let pendingDTO = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: pendingRaw))
+        let pendingPresentation = OracleToolCardPresentation(
+            dto: pendingDTO,
+            resultObject: ToolJSON.structuredResultObject(from: pendingRaw)
+        )
+
+        XCTAssertEqual(pendingDTO.status, "pending")
+        XCTAssertEqual(pendingDTO.operationID, "11111111-1111-1111-1111-111111111111")
+        XCTAssertEqual(pendingDTO.pending?.reason, "timed_out")
+        XCTAssertEqual(pendingDTO.pending?.streamState, "streaming")
+        XCTAssertEqual(pendingDTO.pending?.elapsedSeconds, 181)
+        XCTAssertEqual(pendingDTO.waitPolicy?.mode, "automatic")
+        XCTAssertEqual(pendingDTO.waitPolicy?.timeoutSeconds, 180)
+        XCTAssertEqual(pendingDTO.waitPolicy?.parentFamily, "claude")
+        XCTAssertEqual(pendingPresentation.state, .pending)
+        XCTAssertEqual(pendingPresentation.waitLabel, "wait ≤3m")
+        XCTAssertTrue(pendingPresentation.subtitle.contains("Last reported pending"), pendingPresentation.subtitle)
+        XCTAssertFalse(pendingPresentation.subtitle.lowercased().contains("running"), pendingPresentation.subtitle)
+        XCTAssertEqual(pendingPresentation.singleChatID, "pending-chat")
+
+        let cancellingRaw = jsonString([
+            "status": "pending",
+            "operation_id": "11111111-1111-1111-1111-111111111111",
+            "pending": [
+                "reason": "timed_out",
+                "stream_state": "cancelling",
+                "elapsed_seconds": 182
+            ]
+        ])
+        let cancellingDTO = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: cancellingRaw))
+        XCTAssertEqual(
+            OracleToolCardPresentation(
+                dto: cancellingDTO,
+                resultObject: ToolJSON.structuredResultObject(from: cancellingRaw)
+            ).state,
+            .cancelling
+        )
+
+        let terminalCancelEchoRaw = jsonString([
+            "ok": false,
+            "status": "cancelled",
+            "operation_id": "55555555-5555-5555-5555-555555555555",
+            "cancel": "requested",
+            "error": [
+                "code": "oracle_cancelled",
+                "message": "The Oracle consultation was cancelled."
+            ]
+        ])
+        let terminalCancelEchoDTO = try XCTUnwrap(
+            ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: terminalCancelEchoRaw)
+        )
+        XCTAssertEqual(terminalCancelEchoDTO.code, "oracle_cancelled")
+        XCTAssertEqual(terminalCancelEchoDTO.error, "The Oracle consultation was cancelled.")
+        XCTAssertEqual(
+            OracleToolCardPresentation(
+                dto: terminalCancelEchoDTO,
+                resultObject: ToolJSON.structuredResultObject(from: terminalCancelEchoRaw)
+            ).state,
+            .cancelled,
+            "terminal status outranks an echoed cancel request"
+        )
+
+        let completedCancelEchoRaw = jsonString([
+            "status": "completed",
+            "operation_id": "66666666-6666-6666-6666-666666666666",
+            "cancel": "requested",
+            "response": "completion won"
+        ])
+        let completedCancelEchoDTO = try XCTUnwrap(
+            ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: completedCancelEchoRaw)
+        )
+        XCTAssertEqual(
+            OracleToolCardPresentation(
+                dto: completedCancelEchoDTO,
+                resultObject: ToolJSON.structuredResultObject(from: completedCancelEchoRaw)
+            ).state,
+            .completed
+        )
+
+        let envelopeRaw = jsonString([
+            "results": [
+                [
+                    "status": "completed",
+                    "operation_id": "11111111-1111-1111-1111-111111111111",
+                    "chat_id": "completed-chat",
+                    "response": "done"
+                ],
+                [
+                    "status": "pending",
+                    "operation_id": "22222222-2222-2222-2222-222222222222",
+                    "chat_id": "pending-chat",
+                    "pending": [
+                        "reason": "polled",
+                        "stream_state": "streaming",
+                        "elapsed_seconds": 0
+                    ]
+                ],
+                [
+                    "ok": false,
+                    "status": "cancelled",
+                    "operation_id": "33333333-3333-3333-3333-333333333333",
+                    "chat_id": "cancelled-chat",
+                    "error": [
+                        "code": "oracle_cancelled",
+                        "message": "The Oracle consultation was cancelled."
+                    ]
+                ],
+                [
+                    "ok": false,
+                    "status": "failed",
+                    "operation_id": "44444444-4444-4444-4444-444444444444",
+                    "error": [
+                        "code": "oracle_stream_failed",
+                        "message": "The Oracle consultation failed."
+                    ]
+                ]
+            ],
+            "wait": [
+                "result": "polled",
+                "pending_operation_ids": ["22222222-2222-2222-2222-222222222222"]
+            ],
+            "resume": [
+                "op": "wait",
+                "operation_ids": ["22222222-2222-2222-2222-222222222222"]
+            ],
+            "wait_policy": [
+                "mode": "poll",
+                "timeout_seconds": 0
+            ]
+        ])
+        let envelopeDTO = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: envelopeRaw))
+        let envelopePresentation = OracleToolCardPresentation(
+            dto: envelopeDTO,
+            resultObject: ToolJSON.structuredResultObject(from: envelopeRaw)
+        )
+
+        XCTAssertEqual(envelopeDTO.results?.count, 4)
+        XCTAssertEqual(envelopeDTO.results?[2].code, "oracle_cancelled")
+        XCTAssertEqual(envelopeDTO.results?[3].code, "oracle_stream_failed")
+        XCTAssertEqual(envelopeDTO.wait?.result, "polled")
+        XCTAssertEqual(
+            envelopeDTO.wait?.pendingOperationIDs,
+            ["22222222-2222-2222-2222-222222222222"]
+        )
+        XCTAssertEqual(envelopeDTO.resume?.op, "wait")
+        XCTAssertEqual(
+            envelopePresentation.lanes.map(\.state),
+            [.completed, .pending, .cancelled, .failed]
+        )
+        XCTAssertEqual(envelopePresentation.state, .failed)
+        XCTAssertEqual(envelopePresentation.waitLabel, "poll")
+        XCTAssertTrue(envelopePresentation.subtitle.contains("1 failed"), envelopePresentation.subtitle)
+        XCTAssertTrue(envelopePresentation.subtitle.contains("1 last reported pending"), envelopePresentation.subtitle)
+        XCTAssertEqual(
+            envelopePresentation.uniqueChatIDs,
+            ["completed-chat", "pending-chat", "cancelled-chat"]
+        )
+        XCTAssertNil(envelopePresentation.singleChatID)
+    }
+
+    @MainActor
+    func testOracleLivePresentationUsesStorePhaseDeliveryAndElapsedSummary() {
+        let operationID = UUID()
+        let chatID = UUID()
+        let createdAt = Date(timeIntervalSinceReferenceDate: 1000)
+        let running = OracleMCPOperationStore.Summary(
+            operationID: operationID,
+            phase: .running,
+            delivery: .undelivered,
+            createdAt: createdAt,
+            terminalAt: nil,
+            deliveredAt: nil,
+            chatID: chatID,
+            chatShortID: "short-chat",
+            chatName: "Deep review",
+            queryID: UUID(),
+            mode: "review",
+            modelPresetName: "Oracle",
+            terminalReason: nil
+        )
+        let runningPresentation = OracleToolCardLivePresentation(
+            summary: running,
+            now: createdAt.addingTimeInterval(12 * 60 + 4)
+        )
+        XCTAssertEqual(runningPresentation.text, "Oracle running · 12m • Deep review")
+        XCTAssertEqual(runningPresentation.chatID, "short-chat")
+
+        let ready = OracleMCPOperationStore.Summary(
+            operationID: operationID,
+            phase: .ready,
+            delivery: .undelivered,
+            createdAt: createdAt,
+            terminalAt: createdAt.addingTimeInterval(30),
+            deliveredAt: nil,
+            chatID: chatID,
+            chatShortID: nil,
+            chatName: nil,
+            queryID: UUID(),
+            mode: "review",
+            modelPresetName: "Oracle",
+            terminalReason: nil
+        )
+        let readyPresentation = OracleToolCardLivePresentation(summary: ready)
+        XCTAssertEqual(readyPresentation.text, "Oracle finished — not yet collected")
+        XCTAssertEqual(readyPresentation.chatID, chatID.uuidString)
+
+        let collected = OracleMCPOperationStore.Summary(
+            operationID: operationID,
+            phase: .ready,
+            delivery: .delivered,
+            createdAt: createdAt,
+            terminalAt: createdAt.addingTimeInterval(30),
+            deliveredAt: createdAt.addingTimeInterval(31),
+            chatID: chatID,
+            chatShortID: "short-chat",
+            chatName: "Deep review",
+            queryID: UUID(),
+            mode: "review",
+            modelPresetName: "Oracle",
+            terminalReason: nil
+        )
+        XCTAssertEqual(
+            OracleToolCardLivePresentation(summary: collected).text,
+            "Collected • Deep review"
+        )
+
+        let cancelling = OracleMCPOperationStore.Summary(
+            operationID: operationID,
+            phase: .cancelling,
+            delivery: .undelivered,
+            createdAt: createdAt,
+            terminalAt: nil,
+            deliveredAt: nil,
+            chatID: chatID,
+            chatShortID: "short-chat",
+            chatName: nil,
+            queryID: UUID(),
+            mode: "review",
+            modelPresetName: "Oracle",
+            terminalReason: nil
+        )
+        XCTAssertEqual(
+            OracleToolCardLivePresentation(
+                summary: cancelling,
+                now: createdAt.addingTimeInterval(61)
+            ).text,
+            "Oracle cancelling · 1m"
+        )
     }
 
     func testContextBuilderRoutingRejectsMismatchedOrUnknownResponseBranch() throws {

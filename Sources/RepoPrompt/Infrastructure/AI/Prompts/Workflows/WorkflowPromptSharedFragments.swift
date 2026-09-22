@@ -146,6 +146,23 @@ A role whose display name starts with `Codex CLI` (or an explicit `model_id` wit
 		return "0...\(formattedMaximum)"
 	}
 
+	/// Guidance for surfaces that expose the bounded/resumable `ask_oracle` contract.
+	/// The five workflow owners use only their Agent variant; rp-reminder also exposes
+	/// `ask_oracle` in its MCP variant. Synchronous `oracle_send` / CLI `chat` receive nothing.
+	static func sharedOracleResumableWaitGuidance(
+		variant: WorkflowPromptVariant,
+		includeMCPVariant: Bool = false
+	) -> String {
+		guard variant == .agent || (includeMCPVariant && variant == .mcp) else { return "" }
+		return """
+**Resumable Oracle waits.** For routine single `ask_oracle` sends and `op:"wait"` calls, omit `timeout_seconds`; omission selects the automatic wait for the effective parent provider. Pending is a normal result: a timeout or steering wake leaves the same Oracle query running. Never resend a pending question. Resume with `op:"wait"` and the returned `operation_id`; after compaction, call `op:"wait"` without `operation_ids` to collect all owned undelivered operations in the current tab. If steering woke the call, respond to the user first, then resume waiting.
+
+A wait or transport heartbeat does not itself send a provider-model request and therefore does not warm a prompt cache. Do not claim that a wait preserves cache state or infer any provider cache TTL. Use `op:"cancel"` only when the user asks or the question is known to be wrong. An unkeyed repeat is a new consultation; `request_id` protects an identical live send from duplicate spend but is not persisted across app relaunch.
+
+Step B `consultations` batches remain blocking until every lane finishes, are not steerable, reject `timeout_seconds` and `request_id`, and cannot be resumed or cancelled by operation handle. For a long two-lane duel, start two independent single sends with `new_chat:true`, distinct exact model presets, and `timeout_seconds:0`, then make one `op:"wait"` call with both operation IDs.
+"""
+	}
+
 	/// Shared wait-first supervision guidance. `responsePendingDetail` carries the one
 	/// shared-parallel sentence that must appear before caller-owned set guidance.
 	static func sharedWaitFirstSupervisionBlock(responsePendingDetail: String = "") -> String {

@@ -411,6 +411,9 @@ final class MCPServerViewModel: ObservableObject {
 
     #if DEBUG
         private var oracleChatSendOverrideForTesting: MCPOracleToolService.SendChat?
+        private var oracleCancelOverrideForTesting:
+            (@MainActor (_ chatID: UUID, _ queryID: UUID) async -> OracleViewModel.CancelAIResponseOutcome)?
+        private var beforeAskOraclePreparationForTesting: (@MainActor @Sendable () async -> Void)?
         private var oracleExportOverrideForTesting:
             MCPOracleToolService.ExportOracleResponse?
         var requestMetadataOverrideForTesting: RequestMetadata?
@@ -426,8 +429,22 @@ final class MCPServerViewModel: ObservableObject {
             ToolResultDTOs.SelectionReply
         ) -> Void)?
 
+        /// Stubs the synchronous batch transport and the bounded single-send start
+        /// boundary. Single-send tests still traverse reservation, startup, store, and delivery.
         func setOracleChatSendOverrideForTesting(_ override: MCPOracleToolService.SendChat?) {
             oracleChatSendOverrideForTesting = override
+        }
+
+        func setOracleCancelOverrideForTesting(
+            _ override: (@MainActor (_ chatID: UUID, _ queryID: UUID) async -> OracleViewModel.CancelAIResponseOutcome)?
+        ) {
+            oracleCancelOverrideForTesting = override
+        }
+
+        func setBeforeAskOraclePreparationForTesting(
+            _ handler: (@MainActor @Sendable () async -> Void)?
+        ) {
+            beforeAskOraclePreparationForTesting = handler
         }
 
         func setOracleExportOverrideForTesting(
@@ -478,6 +495,12 @@ final class MCPServerViewModel: ObservableObject {
                 override,
                 source: source
             )
+        }
+
+        func setOraclePostBindObserverForTesting(
+            _ observer: OracleViewModel.OraclePostBindObserver?
+        ) {
+            oracleVM.setOraclePostBindObserverForTesting(observer)
         }
 
         func setContextBuilderFollowUpOverrideForTesting(
@@ -626,6 +649,82 @@ final class MCPServerViewModel: ObservableObject {
                     }
                 #endif
                 return try await exportOracleResponse(request)
+            },
+            startOracleSend: { [self] args, promptVM, tabContext, operationID in
+                #if DEBUG
+                    if let override = oracleChatSendOverrideForTesting {
+                        let result = try await override(args, promptVM, tabContext)
+                        let chatID = UUID()
+                        let queryID = UUID()
+                        let model = AIModel.customProviderUser(name: "oracle-test-start")
+                        let ticket = OracleViewModel.OracleMCPSendTicket(
+                            chatID: chatID,
+                            queryID: queryID,
+                            createdFreshChat: args["new_chat"]?.boolValue ?? false,
+                            replyContext: OracleViewModel.OracleMCPSendReplyContext(
+                                mode: args["mode"]?.stringValue ?? "chat",
+                                tabID: tabContext?.tabID,
+                                agentModeSessionID: tabContext?.agentModeSessionID,
+                                agentModeRunID: tabContext?.agentModeRunID,
+                                model: model,
+                                modelRawID: model.rawValue,
+                                modelDisplayName: model.displayName,
+                                modelSelection: "automatic",
+                                modelSource: "planning_model",
+                                modelPresetID: nil,
+                                modelPresetName: nil,
+                                outputReserveTokens: args["max_output_tokens"]?.intValue
+                            )
+                        )
+                        oracleVM.mcpOperationStore.test_bindCompleted(
+                            operationID,
+                            ticket: ticket,
+                            chatShortID: result["chat_id"]?.stringValue,
+                            result: result
+                        )
+                        return ticket
+                    }
+                #endif
+                return try await oracleVM.tool_chatSendStart(
+                    args: args,
+                    promptVM: promptVM,
+                    tabContext: tabContext,
+                    operationID: operationID
+                )
+            },
+            operationStore: oracleVM.mcpOperationStore,
+            resolveWaitInvocation: { [self] in await resolveOracleWaitInvocation() },
+            waitScopeHooks: MCPOracleToolService.OracleWaitScopeHooks(
+                isSteeringRequested: { [self] executionID in
+                    oracleWaitScopeSteeringRequested(executionID: executionID)
+                },
+                subscribe: { [self] executionID, onWake in
+                    subscribeOracleWaitScope(executionID: executionID, onWake: onWake)
+                },
+                unsubscribe: { [self] executionID in
+                    unsubscribeOracleWaitScope(executionID: executionID)
+                }
+            ),
+            cancelOracleQuery: { [self] chatID, queryID in
+                #if DEBUG
+                    if let override = oracleCancelOverrideForTesting {
+                        return await override(chatID, queryID)
+                    }
+                #endif
+                return await oracleVM.cancelAIResponse(in: chatID, expectedQueryID: queryID)
+            },
+            noteOracleResultIdentity: { [self] result, tabID in
+                guard let targetWindow = try? requireTargetWindow() else { return }
+                targetWindow.agentModeViewModel.captureOracleUIToolResultIdentity(
+                    toolName: MCPWindowToolName.askOracle,
+                    result: result,
+                    tabID: tabID
+                )
+            },
+            beforeAskOraclePreparation: { [self] in
+                #if DEBUG
+                    await beforeAskOraclePreparationForTesting?()
+                #endif
             }
         )
     }
@@ -1116,7 +1215,11 @@ final class MCPServerViewModel: ObservableObject {
         guard let self else {
             throw MCPError.internalError("Window deallocated while executing \(name)")
         }
-        return try await runTool(name, freshnessPolicy: freshnessPolicy) { [weak self] in
+        return try await runTool(
+            name,
+            freshnessPolicy: freshnessPolicy,
+            isResumableOracleInvocation: Self.isResumableOracleInvocation(toolName: name, args: args)
+        ) { [weak self] in
             guard let self else {
                 throw MCPError.internalError("Window deallocated during \(name)")
             }
@@ -1869,6 +1972,29 @@ final class MCPServerViewModel: ObservableObject {
     private var childAgentRunWaitCountsByParentRunID: [UUID: [UUID: Int]] = [:]
     private let agentRunWaitScopeStaleGraceSeconds: TimeInterval = 60
 
+    /// Invocation-local wake scope for one bounded `ask_oracle` call (Oracle resumable wait
+    /// plan §3.3). Created in the same synchronous MainActor sequence that registers the
+    /// execution — before the start gate opens — with the already-resolved `indexedRunID`, and
+    /// removed in the same cleanup that unregisters the execution. It owns how *this call*
+    /// stops waiting (sticky steering flag plus a wake for an already-parked observer); it
+    /// never owns or cancels the Oracle query. A steer that arrives during preparation is
+    /// captured by the sticky flag and honored at the first park attempt.
+    @MainActor
+    private struct OracleMCPWaitScope {
+        let executionID: UUID
+        let runID: UUID
+        let connectionID: UUID?
+        var steeringRequested = false
+        var onWake: (@MainActor () -> Void)?
+    }
+
+    @MainActor
+    private var oracleWaitScopesByExecutionID: [UUID: OracleMCPWaitScope] = [:]
+
+    /// Execution identity of the tool body currently running under `runTool`. Lets a bounded
+    /// `ask_oracle` find its own wake scope without threading tokens through the service.
+    @TaskLocal static var currentToolExecutionID: UUID?
+
     /// Cumulative count of tool executions that have ended (success/error/cancel) per run.
     /// Used by the Claude steering interrupt safety gate to verify that the provider stream
     /// has acknowledged all locally-completed tool results before sending an interrupt.
@@ -1984,6 +2110,7 @@ final class MCPServerViewModel: ObservableObject {
         runID: UUID?,
         connectionID: UUID?,
         toolName: String,
+        isResumableOracleInvocation: Bool = false,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         cancel: @escaping () -> Void
     ) {
@@ -2000,6 +2127,14 @@ final class MCPServerViewModel: ObservableObject {
         if let runID {
             activeToolExecutionIDsByRunID[runID, default: []].insert(executionID)
             steeringDebugLog("[AgentRunSteeringWake] MCP tool register runID=\(runID) executionID=\(executionID) tool=\(toolName) active=\(debugActiveTools(for: runID))")
+            if isResumableOracleInvocation {
+                oracleWaitScopesByExecutionID[executionID] = OracleMCPWaitScope(
+                    executionID: executionID,
+                    runID: runID,
+                    connectionID: connectionID
+                )
+                steeringDebugLog("[AgentRunSteeringWake] ask_oracle wait scope begin runID=\(runID) executionID=\(executionID)")
+            }
         }
         if let connectionID {
             activeToolExecutionIDsByConnectionID[connectionID, default: []].insert(executionID)
@@ -2015,6 +2150,9 @@ final class MCPServerViewModel: ObservableObject {
         guard let execution = activeToolExecutionsByID.removeValue(forKey: executionID) else {
             steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister ignored missing executionID=\(executionID)")
             return
+        }
+        if oracleWaitScopesByExecutionID.removeValue(forKey: executionID) != nil {
+            steeringDebugLog("[AgentRunSteeringWake] ask_oracle wait scope end executionID=\(executionID)")
         }
 
         EditFlowPerf.lifecycleEvent(
@@ -2264,12 +2402,90 @@ final class MCPServerViewModel: ObservableObject {
             .joined(separator: ",")
     }
 
+    // MARK: - ask_oracle wait scopes (steering wake)
+
+    /// Marks and wakes every bounded `ask_oracle` wait owned by `runID`. The flag is sticky so
+    /// a call still in preparation returns pending at its first park attempt.
+    @MainActor
+    private func wakeOracleWaitScopes(ownedBy runID: UUID, source: String) {
+        var wakes: [@MainActor () -> Void] = []
+        for (executionID, scope) in oracleWaitScopesByExecutionID
+            where scope.runID == runID
+        {
+            var updated = scope
+            // Registration precedes argument dispatch, so retain an early steer even before a
+            // single/wait invocation has marked itself resumable. Batch never subscribes or
+            // observes this bit and therefore remains synchronous.
+            updated.steeringRequested = true
+            if let onWake = updated.onWake {
+                wakes.append(onWake)
+                updated.onWake = nil
+            }
+            oracleWaitScopesByExecutionID[executionID] = updated
+        }
+        guard !wakes.isEmpty || hasActiveOracleResumableWaits(runID: runID) else { return }
+        steeringDebugLog("[AgentRunSteeringWake] ask_oracle wait scopes woken source=\(source) runID=\(runID) parked=\(wakes.count)")
+        for wake in wakes {
+            wake()
+        }
+    }
+
+    @MainActor
+    private func hasActiveOracleResumableWaits(runID: UUID) -> Bool {
+        oracleWaitScopesByExecutionID.values.contains { $0.runID == runID }
+    }
+
+    @MainActor
+    func oracleWaitScopeSteeringRequested(executionID: UUID) -> Bool {
+        oracleWaitScopesByExecutionID[executionID]?.steeringRequested ?? false
+    }
+
+    /// Registers the parked observer's wake. Fires immediately when steering was already
+    /// requested so the sticky flag can never be missed between the double-check and the park.
+    @MainActor
+    func subscribeOracleWaitScope(executionID: UUID, onWake: @escaping @MainActor () -> Void) {
+        guard var scope = oracleWaitScopesByExecutionID[executionID] else { return }
+        if scope.steeringRequested {
+            onWake()
+            return
+        }
+        scope.onWake = onWake
+        oracleWaitScopesByExecutionID[executionID] = scope
+    }
+
+    @MainActor
+    func unsubscribeOracleWaitScope(executionID: UUID) {
+        guard var scope = oracleWaitScopesByExecutionID[executionID] else { return }
+        scope.onWake = nil
+        oracleWaitScopesByExecutionID[executionID] = scope
+    }
+
+    /// One frozen `ask_oracle` wait invocation: the same `resolveAgentLifecycleWaitPolicyContext`
+    /// read `agent_run` uses, the run this execution occupies in `activeToolExecutionIDsByRunID`,
+    /// and the wake scope created at registration (nil → 180 s bound, no wake).
+    @MainActor
+    func resolveOracleWaitInvocation() async -> MCPOracleToolService.OracleWaitInvocation {
+        let metadata = await captureRequestMetadata()
+        let context = await resolveAgentLifecycleWaitPolicyContext(metadata: metadata)
+        let executionID = Self.currentToolExecutionID
+        let scope = executionID.flatMap { oracleWaitScopesByExecutionID[$0] }
+        let callerRunID = executionID.flatMap { activeToolExecutionsByID[$0]?.runID }
+        return MCPOracleToolService.OracleWaitInvocation(
+            context: context,
+            callerRunID: callerRunID,
+            wakeScopeExecutionID: scope?.executionID
+        )
+    }
+
     @MainActor
     func wakeAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async {
+        // Bounded ask_oracle waits owned by this run wake first, before the child agent_run
+        // guard below, so an Oracle-only wait still returns its pending result promptly.
+        wakeOracleWaitScopes(ownedBy: runID, source: source)
         let sessionIDs = Set(childAgentRunWaitCountsByParentRunID[runID]?.keys.map(\.self) ?? [])
         guard !sessionIDs.isEmpty else {
             steeringDebugLog("[AgentRunSteeringWake] parent wake found no child agent_run waiters source=\(source) parentRunID=\(runID) active=\(debugActiveTools(for: runID))")
@@ -2298,7 +2514,9 @@ final class MCPServerViewModel: ObservableObject {
         timeoutSeconds: TimeInterval,
         publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async -> Bool {
-        guard hasActiveChildAgentRunWaits(runID: runID) else {
+        guard hasActiveChildAgentRunWaits(runID: runID)
+            || hasActiveOracleResumableWaits(runID: runID)
+        else {
             steeringDebugLog("[AgentRunSteeringWake] parent drain fast-idle source=\(source) parentRunID=\(runID)")
             return true
         }
@@ -2311,12 +2529,15 @@ final class MCPServerViewModel: ObservableObject {
                 publicationForSessionID: publicationForSessionID
             )
 
-            guard hasActiveChildAgentRunWaits(runID: runID) else {
+            guard hasActiveChildAgentRunWaits(runID: runID)
+                || hasActiveOracleResumableWaits(runID: runID)
+            else {
                 steeringDebugLog("[AgentRunSteeringWake] parent drain completed source=\(source) parentRunID=\(runID)")
                 return true
             }
             guard timeoutSeconds > 0, Date() < deadline else {
-                steeringDebugLog("[AgentRunSteeringWake] parent drain timed out source=\(source) parentRunID=\(runID) timeout=\(timeoutSeconds) remaining=\(debugChildAgentRunWaits(for: runID))")
+                let oracleCount = oracleWaitScopesByExecutionID.values.count { $0.runID == runID }
+                steeringDebugLog("[AgentRunSteeringWake] parent drain timed out source=\(source) parentRunID=\(runID) timeout=\(timeoutSeconds) remaining=\(debugChildAgentRunWaits(for: runID)) oracleWaits=\(oracleCount)")
                 return false
             }
 
@@ -2425,6 +2646,7 @@ final class MCPServerViewModel: ObservableObject {
             metadata: RequestMetadata,
             resolvedContext: ResolvedTabContextSnapshot?,
             toolName: String = "test_tool",
+            toolArgs: [String: Value] = [:],
             cancel: @escaping () -> Void = {}
         ) async -> (executionID: UUID, runID: UUID?)? {
             guard let connectionID = metadata.connectionID else {
@@ -2444,6 +2666,10 @@ final class MCPServerViewModel: ObservableObject {
                 runID: indexedRunID,
                 connectionID: connectionID,
                 toolName: toolName,
+                isResumableOracleInvocation: Self.isResumableOracleInvocation(
+                    toolName: toolName,
+                    args: toolArgs
+                ),
                 cancel: cancel
             )
             return (executionID, indexedRunID)
@@ -2487,6 +2713,21 @@ final class MCPServerViewModel: ObservableObject {
         func test_agentRunWaitScopeCount(parentRunID: UUID) -> Int {
             purgeStaleAgentRunWaitScopes(source: "test-count")
             return agentRunWaitScopesByToken.values.count { $0.parentRunID == parentRunID }
+        }
+
+        @MainActor
+        func test_oracleWaitScopeExists(executionID: UUID) -> Bool {
+            oracleWaitScopesByExecutionID[executionID] != nil
+        }
+
+        @MainActor
+        func test_oracleWaitScopeCount(runID: UUID) -> Int {
+            oracleWaitScopesByExecutionID.values.count { $0.runID == runID }
+        }
+
+        @MainActor
+        func test_oracleWaitScopeHasParkedObserver(executionID: UUID) -> Bool {
+            oracleWaitScopesByExecutionID[executionID]?.onWake != nil
         }
 
         @MainActor
@@ -3009,6 +3250,25 @@ final class MCPServerViewModel: ObservableObject {
         return purpose != .agentModeRun
     }
 
+    private static func isResumableOracleInvocation(
+        toolName: String,
+        args: [String: Value]
+    ) -> Bool {
+        guard toolName == MCPWindowToolName.askOracle else { return false }
+        let op = (args["op"]?.stringValue ?? "send")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        switch op {
+        case "", "send":
+            // Step B batches remain synchronous and must never join the steering drain.
+            return args["consultations"] == nil
+        case "wait":
+            return true
+        default:
+            return false
+        }
+    }
+
     private func shouldRegisterRunToolExecution(toolName: String) -> Bool {
         // The per-run idle waiter should observe tools executed *by* the active run.
         // External control-plane calls (agent_run/agent_manage) may intentionally
@@ -3036,6 +3296,7 @@ final class MCPServerViewModel: ObservableObject {
     private func runTool<T>(
         _ name: String,
         freshnessPolicy: MCPToolFreshnessPolicy,
+        isResumableOracleInvocation: Bool,
         body: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         #if DEBUG || EDIT_FLOW_PERF
@@ -3175,7 +3436,9 @@ final class MCPServerViewModel: ObservableObject {
                         EditFlowPerf.Stage.MCPToolCall.providerExecution,
                         EditFlowPerf.Dimensions(toolName: name)
                     ) {
-                        try await body()
+                        try await Self.$currentToolExecutionID.withValue(toolToken) {
+                            try await body()
+                        }
                     }
                     EditFlowPerf.lifecycleEvent(
                         EditFlowPerf.Lifecycle.MCPRunTool.providerEnded,
@@ -3214,6 +3477,7 @@ final class MCPServerViewModel: ObservableObject {
                 runID: indexedRunID,
                 connectionID: capturedConnectionID,
                 toolName: name,
+                isResumableOracleInvocation: isResumableOracleInvocation,
                 lifecycleCorrelation: lifecycleCorrelation,
                 cancel: { task.cancel() }
             )

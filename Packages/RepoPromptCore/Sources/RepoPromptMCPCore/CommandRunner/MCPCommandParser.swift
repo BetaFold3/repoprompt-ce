@@ -436,7 +436,7 @@ enum MCPCommandParser {
         "manage_worktree",
         // Raw MCP tool names (apply_edits and file_actions require JSON format via 'call')
         "manage_selection", "workspace_context", "read_file", "file_search",
-        "get_file_tree", "get_code_structure", "apply_edits", "oracle_send",
+        "get_file_tree", "get_code_structure", "apply_edits", "ask_oracle", "oracle_send",
         "oracle_utils", "manage_workspaces", "bind_context", "file_actions", "context_builder", "git",
         "manage_worktree", "app_settings", "agent_run", "agent_manage"
     ]
@@ -816,15 +816,15 @@ enum MCPCommandParser {
                   !instructionsValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             else {
                 throw CommandParseError.missingArgument(
-                    """
-                    instructions (required)
-
-                    Usage:
-                      builder "your task description"
-                      builder --task "your task description"
-
-                    Optional: --type plan|question|clarify, --export
-                    """
+                    [
+                        "instructions (required)",
+                        "",
+                        "Usage:",
+                        "  builder \"your task description\"",
+                        "  builder --task \"your task description\"",
+                        "",
+                        "Optional: --type plan|question|clarify, --export"
+                    ].joined(separator: "\n")
                 )
             }
 
@@ -1760,9 +1760,9 @@ enum MCPCommandParser {
         case "ask_oracle", "oracle_send":
             let parsed = parseRawToolArgs(input, toolName: first)
             if parsed.isJSON {
-                return .call(toolName: "oracle_send", jsonPayload: parsed.jsonPayload)
+                return .call(toolName: first, jsonPayload: parsed.jsonPayload)
             }
-            return .aliasCall(toolName: "oracle_send", args: parsed.args)
+            return .aliasCall(toolName: first, args: parsed.args)
 
         case "oracle_utils":
             let parsed = parseRawToolArgs(input, toolName: first)
@@ -1828,15 +1828,15 @@ enum MCPCommandParser {
 
             guard hasInstructions else {
                 throw CommandParseError.missingArgument(
-                    """
-                    instructions (required)
-
-                    Usage:
-                      context_builder task="your task description"
-                      context_builder instructions="..." response_type=plan
-
-                    Optional: response_type=plan|question|clarify, export_response=true
-                    """
+                    [
+                        "instructions (required)",
+                        "",
+                        "Usage:",
+                        "  context_builder task=\"your task description\"",
+                        "  context_builder instructions=\"...\" response_type=plan",
+                        "",
+                        "Optional: response_type=plan|question|clarify, export_response=true"
+                    ].joined(separator: "\n")
                 )
             }
 
@@ -2175,13 +2175,15 @@ enum MCPCommandParser {
     /// Handles: JSON arrays/objects, booleans, integers, and strings.
     private static func parseValue(_ value: String, key: String? = nil) -> UncheckedSendableValue {
         // Try to parse as JSON array or object
-        if (value.hasPrefix("[") && value.hasSuffix("]")) ||
-            (value.hasPrefix("{") && value.hasSuffix("}"))
+        if value.hasPrefix("[") && value.hasSuffix("]") ||
+            value.hasPrefix("{") && value.hasSuffix("}")
         {
             if let jsonValue = parseJSONValue(value) {
                 return jsonValue
             }
-            if key == "session_ids", let relaxedArray = parseRelaxedStringArray(value) {
+            if key == "session_ids" || key == "operation_ids",
+               let relaxedArray = parseRelaxedStringArray(value)
+            {
                 return relaxedArray
             }
             // Fall through to string if JSON parsing fails
@@ -2204,7 +2206,8 @@ enum MCPCommandParser {
     }
 
     /// Parses shell-style arrays whose inner JSON string quotes were stripped by splitShellWords.
-    /// This is intentionally narrow: it supports `session_ids=[uuid1,uuid2]` after quote removal.
+    /// This is intentionally narrow: it supports the known string-array control keys
+    /// `session_ids` and `operation_ids` after shell quote removal.
     private static func parseRelaxedStringArray(_ value: String) -> UncheckedSendableValue? {
         guard value.hasPrefix("["), value.hasSuffix("]") else { return nil }
         let inner = value.dropFirst().dropLast().trimmingCharacters(in: .whitespacesAndNewlines)

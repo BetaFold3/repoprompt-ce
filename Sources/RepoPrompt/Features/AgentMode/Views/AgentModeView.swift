@@ -2966,6 +2966,15 @@ struct AgentModeChatDetailView: View {
             return AgentMCPWaitPolicy.parentFamily(for: authoritativeOwnerSession.selectedAgent)
         }()
         let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
+        let oracleToolCardContext: AgentOracleToolCardContext? = {
+            guard !isRemoteSession,
+                  item.kind == .toolResult,
+                  normalizedToolCardName(item.toolName)?.lowercased() == "ask_oracle"
+            else {
+                return nil
+            }
+            return AgentOracleToolCardContext(operationStore: oracleViewModel.mcpOperationStore)
+        }()
         let runLocallyInsteadAction: (() -> Void)? = if let ownerTabID,
                                                         agentModeVM.shouldOfferRunLocallyInstead(
                                                             tabID: ownerTabID,
@@ -3016,6 +3025,7 @@ struct AgentModeChatDetailView: View {
                     authoritativeLocalParentFamily: authoritativeLocalParentFamily
                 )
                 : nil,
+            agentOracleToolCardContext: oracleToolCardContext,
             promptManager: promptManager,
             handoffConfig: handoffConfig(for: item.id),
             rawToolResultPayload: agentModeVM.rawToolResultPayloadForRendering(tabID: ownerTabID, itemID: item.id),

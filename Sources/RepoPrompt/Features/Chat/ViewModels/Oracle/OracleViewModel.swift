@@ -846,12 +846,76 @@ class OracleViewModel: ObservableObject {
         oracleMCPStreamTerminalObserver = observer
     }
 
+    /// Emission site for abnormal terminal outcomes. The operation store mints its durable
+    /// first-writer-wins stamp here, in the same synchronous segment that precedes the hub
+    /// `fulfil` on every caller path (plan §3.8), before the replaceable observer runs.
     @MainActor
     private func emitOracleMCPStreamTerminal(
         queryID: UUID,
-        reason: OracleMCPStreamTerminalReason
+        reason: OracleMCPStreamTerminalReason,
+        detail: String? = nil
     ) {
+        mcpOperationStore.noteStreamTerminal(
+            queryID: queryID,
+            reason: reason == .cancelled ? .cancelled : .failed,
+            detail: detail
+        )
         oracleMCPStreamTerminalObserver?(queryID, reason)
+    }
+
+    /// Oracle-owned receipts and delivery state for bounded `ask_oracle` operations
+    /// (plan §3.3). UI-only sends never instantiate the optional backing store.
+    @MainActor
+    private var mcpOperationStoreStorage: OracleMCPOperationStore?
+
+    @MainActor
+    var mcpOperationStore: OracleMCPOperationStore {
+        if let store = mcpOperationStoreStorage {
+            return store
+        }
+        let store = OracleMCPOperationStore(
+            dependencies: OracleMCPOperationStore.Dependencies(
+                waitUntilMessageFinalised: { [weak self] queryID in
+                    guard let self else { return }
+                    try await waitUntilMessageFinalised(queryID)
+                },
+                messageState: { [weak self] queryID in
+                    self?.mcpMessageFinalizationState(for: queryID) ?? .missing
+                },
+                captureReply: { [weak self] ticket in
+                    guard let self else {
+                        throw ChatToolError.internalError("Oracle view model is gone")
+                    }
+                    return try tool_chatSendReply(for: ticket)
+                },
+                unpinSession: { [weak self] chatID in
+                    self?.unpinSession(chatID)
+                },
+                chatName: { [weak self] chatID in
+                    self?.sessions.first(where: { $0.id == chatID })?.name
+                }
+            )
+        )
+        mcpOperationStoreStorage = store
+        return store
+    }
+
+    /// Message-side completion authority read by the operation store's observer.
+    @MainActor
+    func mcpMessageFinalizationState(for queryID: UUID) -> OracleMCPOperationStore.MessageState {
+        guard let sessionID = sessionIDByMessageId[queryID],
+              let message = messageStore[sessionID]?.first(where: { $0.id == queryID })
+        else {
+            return .missing
+        }
+        return message.isFinalized ? .finalized : .notFinalized
+    }
+
+    /// Live MCP-origin stream occupancy for a tab (the two-stream cap authority). Pending
+    /// operations still count because their streams are still running.
+    @MainActor
+    func mcpActiveOracleStreamCount(forTabID tabID: UUID?) -> Int {
+        activeMCPOracleStreamCount(forTabID: tabID)
     }
 
     /// Existing completion evidence outranks a later abnormal notification. This reads only
@@ -1145,6 +1209,10 @@ class OracleViewModel: ObservableObject {
         typealias OraclePreflightPreparedObserver = @MainActor @Sendable (
             _ conversationSessionID: UUID
         ) async -> Void
+        typealias OraclePostBindObserver = @MainActor @Sendable (
+            _ operationID: UUID,
+            _ queryID: UUID
+        ) async -> Void
 
         var oracleReviewPackagingTraceObserverForTesting:
             OracleReviewPackagingTraceContext.Observer?
@@ -1165,6 +1233,7 @@ class OracleViewModel: ObservableObject {
             OracleCloneWillPersistObserver?
         var oraclePreflightPreparedObserverForTesting:
             OraclePreflightPreparedObserver?
+        var oraclePostBindObserverForTesting: OraclePostBindObserver?
 
         func setOracleReviewPackagingTraceObserverForTesting(
             _ observer: OracleReviewPackagingTraceContext.Observer?
@@ -1222,6 +1291,12 @@ class OracleViewModel: ObservableObject {
             oraclePreflightPreparedObserverForTesting = observer
         }
 
+        func setOraclePostBindObserverForTesting(
+            _ observer: OraclePostBindObserver?
+        ) {
+            oraclePostBindObserverForTesting = observer
+        }
+
         func waitForSessionSavesForTesting(_ sessionID: UUID) async {
             guard let tail = sessionSaveTails[sessionID] else { return }
             _ = try? await tail.value
@@ -1233,6 +1308,10 @@ class OracleViewModel: ObservableObject {
 
         func oracleSessionPinCountForTesting(_ sessionID: UUID) -> Int {
             pinnedSessionRefCounts[sessionID] ?? 0
+        }
+
+        var test_hasMCPOperationStore: Bool {
+            mcpOperationStoreStorage != nil
         }
     #endif
 
@@ -1341,6 +1420,15 @@ class OracleViewModel: ObservableObject {
     }
 
     deinit {
+        // Never assert executor isolation or touch the computed getter from deinit: final
+        // release may occur off-main, and the getter would instantiate an otherwise-unused
+        // store. Transfer only an existing store to an actor-isolated cleanup task.
+        if let operationStore = mcpOperationStoreStorage {
+            Task { @MainActor in
+                operationStore.teardown()
+            }
+        }
+
         // Cancel all watchdog tasks
         for (_, task) in finalizationWatchdogs {
             task.cancel()
@@ -1637,7 +1725,14 @@ class OracleViewModel: ObservableObject {
             return
         }
 
-        // Stream likely stuck. Cancel upstream and finalize with current content.
+        // Stream likely stuck. Stamp failure synchronously before the first suspension;
+        // forced partial finalization must never be projected as successful completion.
+        emitOracleMCPStreamTerminal(
+            queryID: queryId,
+            reason: .failed,
+            detail: "watchdog_forced_finalization"
+        )
+
         // Targeted cancel for this specific stream
         if let streamId = streamIDsByQueryId[queryId] {
             await aiQueriesService.cancelStream(id: streamId)
@@ -1653,6 +1748,15 @@ class OracleViewModel: ObservableObject {
             await self.finalizeAIResponse(aiResponseId: queryId, sessionID: sessionID, partialBuffer: content)
         }
     }
+
+    #if DEBUG
+        @MainActor
+        func test_fireFinalizationWatchdogNow(for queryID: UUID) async {
+            hasSeenNonReasoningText.insert(queryID)
+            lastAnyStreamActivityAt[queryID] = Date().addingTimeInterval(-(finalizationSilenceGrace + 1))
+            await finalizationWatchdogFired(for: queryID)
+        }
+    #endif
 
     // MARK: - Message Finalisation
 
@@ -4039,17 +4143,41 @@ class OracleViewModel: ObservableObject {
         }
     }
 
+    enum CancelAIResponseOutcome: Equatable {
+        /// The session's active query matched (or no expectation was given) and a stop was issued.
+        case stopIssued(queryID: UUID)
+        /// The session had no active query; nothing was stopped.
+        case noActiveQuery
+        /// `expectedQueryID` did not match the session's active query. Nothing was stopped and
+        /// no hub waiter was fulfilled for any ID (plan §3.8 query-match rule).
+        case queryNotActive(activeQueryID: UUID?)
+    }
+
+    /// Stops the session's current chat stream. The optional `expectedQueryID` guard sits
+    /// exactly where the active query is read, in the same synchronous MainActor segment that
+    /// initiates the stop: the captured stream ID is what gets cancelled, so a query that
+    /// rotates during the `cancelStream` await is never affected.
     @MainActor
-    func cancelAIResponse(in sessionID: UUID, skipPartialParseAndSave: Bool = false) async {
+    @discardableResult
+    func cancelAIResponse(
+        in sessionID: UUID,
+        skipPartialParseAndSave: Bool = false,
+        expectedQueryID: UUID? = nil
+    ) async -> CancelAIResponseOutcome {
         // Targeted cancel for the current chat stream only (not headless/context-builder streams)
         let qid = runStateBySession[sessionID]?.activeQueryId
+        if let expectedQueryID, qid != expectedQueryID {
+            return .queryNotActive(activeQueryID: qid)
+        }
+        let outcome: CancelAIResponseOutcome = qid.map { .stopIssued(queryID: $0) } ?? .noActiveQuery
         let streamId = runStateBySession[sessionID]?.activeStreamId ?? (qid.flatMap { streamIDsByQueryId[$0] })
         if let streamId {
             await aiQueriesService.cancelStream(id: streamId)
         }
-        if let qid,
-           !oracleCompletionAlreadyWon(queryID: qid, sessionID: sessionID)
-        {
+        let completionAlreadyWon = qid.map {
+            oracleCompletionAlreadyWon(queryID: $0, sessionID: sessionID)
+        } ?? false
+        if let qid, !completionAlreadyWon {
             emitOracleMCPStreamTerminal(queryID: qid, reason: .cancelled)
         }
         if let qid {
@@ -4073,14 +4201,19 @@ class OracleViewModel: ObservableObject {
             clearStreamActivityTracking(for: qid)
         }
 
-        guard let queryId = qid else { return }
+        guard let queryId = qid else { return outcome }
         guard !skipPartialParseAndSave else {
-            Task { await finalisationHub.fulfil(queryId) }
-            return
+            // If successful finalization already claimed the message, its owner must publish
+            // completion. Waking the operation observer here can classify a still-unfinalized
+            // message as failed before that winner commits.
+            if !completionAlreadyWon {
+                Task { await finalisationHub.fulfil(queryId) }
+            }
+            return outcome
         }
         guard let idx = messageStore[sessionID]?.firstIndex(where: { $0.id == queryId && !$0.isUser }) else {
             Task { await finalisationHub.fulfil(queryId) }
-            return
+            return outcome
         }
 
         let finalContent = messageStore[sessionID]?[idx].content.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -4093,7 +4226,7 @@ class OracleViewModel: ObservableObject {
             purgeMessageCaches(for: queryId)
             autosaveChatHistory(for: sessionID)
             Task { await finalisationHub.fulfil(queryId) }
-            return
+            return outcome
         }
 
         await processAIResponse(finalContent, forQueryId: queryId, sessionID: sessionID)
@@ -4109,6 +4242,7 @@ class OracleViewModel: ObservableObject {
 
         // Notify any waiters that this message is finalised (cancelled)
         Task { await finalisationHub.fulfil(queryId) }
+        return outcome
     }
 
     @MainActor

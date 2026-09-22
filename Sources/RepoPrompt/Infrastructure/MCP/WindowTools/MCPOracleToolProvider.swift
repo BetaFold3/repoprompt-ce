@@ -62,13 +62,17 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
 
             Use this to start or continue an oracle conversation in `chat`, `plan`, or `review` mode for the current agent tab.
 
+            `op` defaults to `send`. Single sends and `op:"wait"` are bounded observations: routinely omit `timeout_seconds` to use the parent-family automatic wait, or pass `0` to poll. A timeout or steering wake returns `status:"pending"` with an `operation_id` while the same Oracle query keeps running. Pending is normal: never resend the question. Resume with `op:"wait"` and the returned handle; after compaction, omit `operation_ids` to collect every owned undelivered operation in the current tab. After a steering wake, respond to the user first, then resume waiting. A wait or transport heartbeat does not issue a provider-model request and does not warm a prompt cache.
+
+            `op:"wait"` accepts only `operation_ids` and `timeout_seconds`; `op:"cancel"` accepts only required operation IDs and does not wait. Both controls reject all send arguments. Cancel only when the user asks or the question is known to be wrong. An unkeyed repeated send is a new consultation; a caller-supplied UUID `request_id` protects an identical live send from duplicate spend but is not persisted across app relaunch.
+
             Every Oracle send re-packages the full chat history. `selection_mode` controls continuation context: `current` (default) re-packages the current workspace selection exactly as before; `none` sends no workspace selection and suppresses review-mode frozen/automatic diffs for this turn; `explicit_slices` packages only the supplied `slices` for this turn. Explicit slices never mutate the shared workspace selection. Prune selection, use `selection_mode:none`, or continue a long lane in a fresh chat with a concise summary.
 
             Before a provider starts, the exact immutable packaged request is checked against a known model context window with output reserve and tokenizer margin. `max_output_tokens` customizes only that reserve. Unknown context windows skip the overflow check. Result usage echoes `context_window` and `pct` only for exact windows, never provider fallbacks, and reports the applied `output_reserve_tokens`.
 
             `response_mode` controls how much reply text returns inline: `full` (default) returns the complete response; `tail` returns the last ~2000 characters as `excerpt` plus stats; `none` returns stats only. Whenever the reply is trimmed (`tail` or `none`), the full response is auto-exported and the result includes `export_path`, `line_count`, and `char_count` so the full text remains retrievable. Ask Oracle replies to end with a final `## Recommendations` section so `tail` remains semantically useful.
 
-            To run two independent consultations concurrently, either issue two calls with `new_chat:true` and distinct exact model presets, or use one `consultations` array (mutually exclusive with the single-send parameter set). Batch consultations fan out internally against the 2-streams-per-tab cap (queueing excess items rather than rejecting), allocate each chat via the atomic choose-and-reserve path, preserve input order in `results`, and support per-item `response_mode`. Optional `require_distinct:true` rejects the whole batch before any lane starts when two items resolve to the same preset. Continue each lane with its returned `chat_id`. Reusing a streaming chat returns `oracle_session_busy`; a third simultaneous MCP Oracle stream in the tab (outside the batch queue) returns `oracle_concurrency_limit` for that item. Under parallel use, always pass an explicit `chat_id` to `oracle_chat_log`.
+            Step B `consultations` batches require an idle Oracle tab at admission and fan out internally against the 2-streams-per-tab cap (queueing excess items rather than rejecting), preserve input order in `results`, and support per-item `response_mode`. They remain blocking until every lane finishes, are not steerable, and do not create operation handles addressable by wait or cancel; `timeout_seconds` and `request_id` are rejected rather than ignored. Optional `require_distinct:true` rejects the whole batch before any lane starts when two items resolve to the same preset. For a long two-lane duel, prefer two independent single sends with `new_chat:true`, distinct exact model presets, and `timeout_seconds:0`, then one `op:"wait"` call with both operation IDs. Continue completed lanes with their returned `chat_id`. Reusing a streaming chat returns `oracle_session_busy`; a third simultaneous MCP Oracle stream in the tab (outside the batch queue) returns `oracle_concurrency_limit` for that item. Under parallel use, always pass an explicit `chat_id` to `oracle_chat_log`.
 
             A `chat_id` continuation stays on the model preset that chat last used, so `model` can be omitted and the lane will not drift. Passing a different `model` with `chat_id` deliberately switches that lane from then on. If the chat's preset was deleted, disabled, or no longer supports the requested `mode`, the call fails instead of silently substituting another model. A manual send into the chat from the app resets its preset binding. Each result reports how the model was chosen through `model_selection` (`explicit`, `inherited`, or `automatic`).
 
@@ -76,11 +80,26 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
 
             Pass `export_response: true` to write the response to a shareable file and get back shareable `oracle_export_path` / `oracle_export_instruction` values. To hand the export to a child agent, include `oracle_export_path` inside the `message` (or `messages`) you send on your next delegation call; your system prompt names the specific delegation tool available to you.
 
-            Use `oracle_chat_log` after compaction to recover recent oracle messages.
+            After compaction, first call `op:"wait"` without `operation_ids` to recover owned undelivered results. Use `oracle_chat_log` with a known `chat_id` only to recover conversation text when no operation can be collected; never reconstruct a lost operation by resending.
             """,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
                 properties: [
+                    "op": .string(
+                        description: "Operation: send (default), wait, or cancel. wait observes existing operations without resending; cancel never waits.",
+                        default: "send",
+                        enum: ["send", "wait", "cancel"]
+                    ),
+                    "timeout_seconds": .number(
+                        description: "Single send or wait observation bound in seconds, 0...14400. Omit for the parent-family automatic wait; zero polls. A timeout returns pending and never stops the Oracle. Rejected with consultations and cancel."
+                    ),
+                    "request_id": .string(
+                        description: "Optional caller-generated UUID for duplicate-spend protection on a single send. Identical live retries observe the same operation; conflicting intent is rejected. Not persisted across app relaunch. Rejected with consultations, wait, and cancel."
+                    ),
+                    "operation_ids": .array(
+                        description: "Operation UUIDs for wait or cancel (1...16, distinct). Optional for wait: omission collects all owned undelivered operations in the current tab, including after compaction. Required for cancel. Rejected on send.",
+                        items: .string(description: "Oracle operation UUID")
+                    ),
                     "message": .string(
                         description: "Your message to send (single-send mode). Mutually exclusive with `consultations`.",
                         minLength: 1
@@ -140,7 +159,7 @@ final class MCPOracleToolProvider: MCPWindowToolProviding {
                         description: "When true, export the response to a file and return `oracle_export_path` plus `oracle_export_instruction`. Include `oracle_export_path` inside the `message` you send on your next delegation call; the specific delegation tool is named by your system prompt."
                     ),
                     "consultations": .array(
-                        description: "Batch of independent new-chat Oracle consultations. Mutually exclusive with single-send parameters (message/mode/chat_id/new_chat/model/chat_name/export_response/selection_mode/slices/max_output_tokens/response_mode). Fans out with at most 2 concurrent streams per tab, queuing the rest. Returns ordered `results`.",
+                        description: "Blocking Step B batch of independent new-chat Oracle consultations. Requires an idle Oracle tab at admission. Valid only for send (op omitted or send); mutually exclusive with the single-send parameter set, operation_ids, timeout_seconds, and request_id. Fans out with at most 2 concurrent streams per tab, queues excess lanes, and returns ordered `results` only after every lane finishes. Batch lanes are not steerable or addressable by wait/cancel.",
                         items: .object(
                             properties: [
                                 "message": .string(

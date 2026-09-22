@@ -173,6 +173,8 @@ rpce-cli -w <window_id> -e 'agent_run op=wait session_ids=["<id1>","<id2>"]'
 
 > ⚠️ \(sharedWaitFirstSupervisionBlock())
 
+\(sharedOracleResumableWaitGuidance(variant: variant))
+
 Skip lanes that don't apply. **Don't dispatch external research just because you can** — the relevance trigger is "the plan depends on facts I can't see in this workspace."
 
 ---

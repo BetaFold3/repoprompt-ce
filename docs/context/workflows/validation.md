@@ -24,6 +24,7 @@ Run the smallest coordinated check that can fail for the behavior you changed. D
 | Test executable inventory or optimization campaign | Follow [testing](../../testing.md); update the curated ledger surgically and never regenerate it. |
 | Release metadata, packaging, signing, or promotion | Follow [releasing](../../releasing.md) and the [release skill](../../../.agents/skills/rpce-release/SKILL.md). |
 | Agent Mode provider usage/cost accounting, worker wait policy, or `agent_run` response presentation | Follow the [usage accounting and wait efficiency plan](../plans/2026-09-13-agent-usage-and-wait-efficiency-plan.md); its §8 lists the deterministic suites and the G1–G3 runtime gates. |
+| `ask_oracle` resumable waits, operation ownership/cancellation, steering wake, or pending cards | Follow the [Oracle resumable wait plan](../plans/2026-09-21-oracle-resumable-wait-plan.md) §5: focused `OracleMCPOperationStoreTests`, `MCPAskOracleLifecycleTests`, `AgentOraclePillRoutingTests`, `OracleMessageFinalisationHubTests`, and Oracle card coverage; run `make dev-core-test` plus `make dev-swift-build PRODUCT=repoprompt-mcp` for the owned-client deadlines. Claude Code and Codex live steering checks are a separate release gate, not established by deterministic tests. |
 
 `make dev-format` mutates first-party Swift files. Run it for intended Swift formatting; don't run it for documentation-only work or as a speculative repository-wide cleanup.
 

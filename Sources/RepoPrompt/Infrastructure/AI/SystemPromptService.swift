@@ -761,7 +761,7 @@ class SystemPromptService {
 
         Work directly when the task is small, the code is already located, or the steps share tight state.
 
-        Consult `ask_oracle` with mode:"plan" for consequential ambiguity, architecture choices, or high-risk approach decisions; keep new_chat:false while continuing the same planning workstream. Independent review is different: use `ask_oracle` with mode:"review" in a fresh chat (review independence outweighs the continuity default), or a fresh-context verifier agent. Give the reviewer the request, acceptance criteria, the diff or files, and your validation evidence — not your conclusions.\(AgentModePrompts.Fragments.namedOracleConsultationGuidance)
+        Consult `ask_oracle` with mode:"plan" for consequential ambiguity, architecture choices, or high-risk approach decisions; keep new_chat:false while continuing the same planning workstream. Independent review is different: use `ask_oracle` with mode:"review" in a fresh chat (review independence outweighs the continuity default), or a fresh-context verifier agent. Give the reviewer the request, acceptance criteria, the diff or files, and your validation evidence — not your conclusions.\(AgentModePrompts.Fragments.namedOracleConsultationGuidance)\(AgentModePrompts.Fragments.oracleResumableWaitGuidance)
 
         Review triggers on risk, not file count: security, privacy, or auth boundaries; destructive migrations; concurrency or distributed state; public API or compatibility surfaces; architecture-wide behavior; or changes that are hard to validate directly. One review: apply in-scope findings, rerun affected validation, and don't loop again unless new risk appears or the user asks.
 
@@ -961,8 +961,9 @@ class SystemPromptService {
         - `prompt` - Get or modify the shared prompt; export context
         - `workspace_context` - Get a combined workspace snapshot (prompt + selection + tokens)
         - `ask_oracle` - Consult a second AI for planning, review, or questions. File reads are tracked so the Oracle knows what you see. Prefer one long-running chat (`new_chat:false`).
-        - `oracle_chat_log` - Read recent Oracle conversation messages to recover context after compaction
+        - `oracle_chat_log` - Recover conversation text after `ask_oracle op:"wait"` without IDs has collected owned undelivered operations
         \(AgentModePrompts.Fragments.namedOracleConsultationGuidance)
+        \(AgentModePrompts.Fragments.oracleResumableWaitGuidance)
 
         \(agentDelegationSection)
 
@@ -986,7 +987,7 @@ class SystemPromptService {
         	- Use `ask_user` to clarify requirements
            - Or consult `ask_oracle` with `mode:"plan"` to think through the approach
 
-        3.5 **After compaction**: Call `oracle_chat_log` with `limit:1` to read the Oracle's most recent message, then continue with `ask_oracle` (`new_chat:false`) to pick up where you left off.
+        3.5 **After compaction**: First call `ask_oracle` with `op:"wait"` and omit `operation_ids` to collect every owned undelivered Oracle result in the current tab. Never resend a pending question. If no operation can be collected, use `oracle_chat_log` with the known `chat_id` to recover conversation text before any deliberate continuation.
 
         4. **After completing a task**:
         \(afterCompletingTask)

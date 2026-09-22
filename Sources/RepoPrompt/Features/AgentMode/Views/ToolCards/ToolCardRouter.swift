@@ -96,6 +96,10 @@ struct AgentControlToolCardContext {
     let authoritativeLocalParentFamily: AgentMCPWaitPolicy.ParentFamily?
 }
 
+struct AgentOracleToolCardContext {
+    let operationStore: OracleMCPOperationStore
+}
+
 enum ToolCardRouter {
     static let knownResultTools: Set<String> = [
         "bash",
@@ -162,6 +166,7 @@ enum ToolCardRouter {
         for item: AgentChatItem,
         isMostRecentEditBubble: Bool = true,
         oracleOpenContext: AgentOracleOpenContext? = nil,
+        oracleToolCardContext: AgentOracleToolCardContext? = nil,
         contextBuilder: ContextBuilderCardContext? = nil,
         promptManager: PromptViewModel? = nil
     ) -> AnyView {
@@ -199,11 +204,19 @@ enum ToolCardRouter {
         case "prompt":
             return AnyView(PromptResultCard(item: item, promptManager: promptManager))
         case "ask_oracle", "oracle_send":
-            return AnyView(ChatSendResultCard(item: item, oracleOpenContext: oracleOpenContext))
+            return AnyView(ChatSendResultCard(
+                item: item,
+                oracleOpenContext: oracleOpenContext,
+                oracleToolCardContext: oracleToolCardContext
+            ))
         case "oracle_chat_log":
             return AnyView(ChatsResultCard(item: item))
         case "chat_send":
-            return AnyView(ChatSendResultCard(item: item, oracleOpenContext: oracleOpenContext))
+            return AnyView(ChatSendResultCard(
+                item: item,
+                oracleOpenContext: oracleOpenContext,
+                oracleToolCardContext: nil
+            ))
         case "chats":
             return AnyView(ChatsResultCard(item: item))
         case "list_models":
@@ -475,17 +488,11 @@ private enum ToolCardSubtitleBuilder {
                 if let path = args.path, !path.isEmpty { return shortenPath(path) }
             }
         case "ask_oracle":
-            if let args = ToolJSON.decodeArgs(ToolArgsDTOs.AskOracleArgs.self, from: argsJSON) {
-                let mode = args.mode?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let model = args.model?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let labels = [mode, model].compactMap(\.self).filter { !$0.isEmpty }
-                if !labels.isEmpty {
-                    return labels.joined(separator: " • ")
-                }
-                if let message = args.message, !message.isEmpty {
-                    return "\"\(message)\""
-                }
-            }
+            return oracleCallSubtitle(
+                argsJSON: argsJSON,
+                resultJSON: resultJSON,
+                agentControlContext: agentControlContext
+            )
         case "oracle_chat_log":
             if let chatID = stringArgument(from: argsJSON, keys: ["chat_id"]), !chatID.isEmpty {
                 return chatID
@@ -853,6 +860,87 @@ private enum ToolCardSubtitleBuilder {
             return nil
         }
         return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+
+    private static func oracleCallSubtitle(
+        argsJSON: String?,
+        resultJSON: String?,
+        agentControlContext: AgentControlToolCardContext?
+    ) -> String? {
+        guard let args = ToolRawJSON.object(from: argsJSON) else { return nil }
+        let op = ToolRawJSON.string(args, key: "op")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? "send"
+        let operationIDs = (args["operation_ids"] as? [String])?
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        let timeout = oracleTimeoutSeconds(from: args)
+
+        switch op {
+        case "wait":
+            var parts = ["wait"]
+            if !operationIDs.isEmpty {
+                parts.append(operationIDs.count == 1 ? operationIDs[0] : "\(operationIDs.count) operations")
+            }
+            if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                resultJSON: resultJSON,
+                showBeforeCompletion: true,
+                detach: false,
+                timeout: timeout,
+                context: agentControlContext
+            ) {
+                parts.append(waitLabel)
+            }
+            return parts.joined(separator: " • ")
+        case "cancel":
+            var parts = ["cancel"]
+            if !operationIDs.isEmpty {
+                parts.append(operationIDs.count == 1 ? operationIDs[0] : "\(operationIDs.count) operations")
+            }
+            return parts.joined(separator: " • ")
+        default:
+            var parts: [String] = []
+            if let mode = nonEmptyOracleArgument(ToolRawJSON.string(args, key: "mode")) {
+                parts.append(mode)
+            }
+            if let model = nonEmptyOracleArgument(ToolRawJSON.string(args, key: "model")) {
+                parts.append(model)
+            }
+            if parts.isEmpty,
+               let message = nonEmptyOracleArgument(ToolRawJSON.string(args, key: "message"))
+            {
+                parts.append("\"\(message)\"")
+            }
+            if args["consultations"] == nil,
+               let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                   resultJSON: resultJSON,
+                   showBeforeCompletion: true,
+                   detach: false,
+                   timeout: timeout,
+                   context: agentControlContext
+               )
+            {
+                parts.append(waitLabel)
+            }
+            return parts.isEmpty ? nil : parts.joined(separator: " • ")
+        }
+    }
+
+    private static func oracleTimeoutSeconds(from args: [String: Any]) -> Double? {
+        if let number = args["timeout_seconds"] as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = args["timeout_seconds"] as? String {
+            return Double(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private static func nonEmptyOracleArgument(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 
     private static func unquotedString(_ raw: String) -> String? {
