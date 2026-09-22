@@ -911,15 +911,13 @@ private enum ToolCardSubtitleBuilder {
             {
                 parts.append("\"\(message)\"")
             }
-            if args["consultations"] == nil,
-               let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
-                   resultJSON: resultJSON,
-                   showBeforeCompletion: true,
-                   detach: false,
-                   timeout: timeout,
-                   context: agentControlContext
-               )
-            {
+            if let waitLabel = AgentControlWaitLabelBuilder.lifecycleLabel(
+                resultJSON: resultJSON,
+                showBeforeCompletion: true,
+                detach: false,
+                timeout: timeout,
+                context: agentControlContext
+            ) {
                 parts.append(waitLabel)
             }
             return parts.isEmpty ? nil : parts.joined(separator: " • ")

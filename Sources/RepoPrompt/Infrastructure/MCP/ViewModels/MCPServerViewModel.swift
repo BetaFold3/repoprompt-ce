@@ -429,8 +429,8 @@ final class MCPServerViewModel: ObservableObject {
             ToolResultDTOs.SelectionReply
         ) -> Void)?
 
-        /// Stubs the synchronous batch transport and the bounded single-send start
-        /// boundary. Single-send tests still traverse reservation, startup, store, and delivery.
+        /// Stubs the bounded send transport after request preparation.
+        /// Lifecycle tests still traverse reservation, startup, store, and delivery.
         func setOracleChatSendOverrideForTesting(_ override: MCPOracleToolService.SendChat?) {
             oracleChatSendOverrideForTesting = override
         }
@@ -469,6 +469,10 @@ final class MCPServerViewModel: ObservableObject {
 
         func executeAskOracleForTesting(args: [String: Value]) async throws -> Value {
             try await oracleToolService.executeAskOracle(args: args)
+        }
+
+        func executeOracleSendForTesting(args: [String: Value]) async throws -> Value {
+            try await oracleToolService.executeOracleSend(args: args)
         }
 
         func executeOracleChatLogForTesting(args: [String: Value]) async throws -> Value {
@@ -525,7 +529,12 @@ final class MCPServerViewModel: ObservableObject {
     #endif
 
     private var oracleToolService: MCPOracleToolService {
-        MCPOracleToolService(
+        let capturedOracleVM = oracleVM
+        #if DEBUG
+            let capturedChatSendOverride = oracleChatSendOverrideForTesting
+            let capturedPreparationHook = beforeAskOraclePreparationForTesting
+        #endif
+        return MCPOracleToolService(
             askOracleToolName: MCPWindowToolName.askOracle,
             oracleSendToolName: MCPWindowToolName.oracleSend,
             oracleChatLogToolName: MCPWindowToolName.oracleChatLog,
@@ -650,9 +659,12 @@ final class MCPServerViewModel: ObservableObject {
                 #endif
                 return try await exportOracleResponse(request)
             },
-            startOracleSend: { [self] args, promptVM, tabContext, operationID in
+            startOracleSend: { [weak capturedOracleVM] args, promptVM, tabContext, operationID in
+                guard let capturedOracleVM else {
+                    throw MCPError.internalError("Oracle view model deallocated before queued ask_oracle startup")
+                }
                 #if DEBUG
-                    if let override = oracleChatSendOverrideForTesting {
+                    if let override = capturedChatSendOverride {
                         let result = try await override(args, promptVM, tabContext)
                         let chatID = UUID()
                         let queryID = UUID()
@@ -676,7 +688,7 @@ final class MCPServerViewModel: ObservableObject {
                                 outputReserveTokens: args["max_output_tokens"]?.intValue
                             )
                         )
-                        oracleVM.mcpOperationStore.test_bindCompleted(
+                        capturedOracleVM.mcpOperationStore.test_bindCompleted(
                             operationID,
                             ticket: ticket,
                             chatShortID: result["chat_id"]?.stringValue,
@@ -685,7 +697,7 @@ final class MCPServerViewModel: ObservableObject {
                         return ticket
                     }
                 #endif
-                return try await oracleVM.tool_chatSendStart(
+                return try await capturedOracleVM.tool_chatSendStart(
                     args: args,
                     promptVM: promptVM,
                     tabContext: tabContext,
@@ -721,9 +733,9 @@ final class MCPServerViewModel: ObservableObject {
                     tabID: tabID
                 )
             },
-            beforeAskOraclePreparation: { [self] in
+            beforeAskOraclePreparation: {
                 #if DEBUG
-                    await beforeAskOraclePreparationForTesting?()
+                    await capturedPreparationHook?()
                 #endif
             }
         )
@@ -2413,9 +2425,9 @@ final class MCPServerViewModel: ObservableObject {
             where scope.runID == runID
         {
             var updated = scope
-            // Registration precedes argument dispatch, so retain an early steer even before a
-            // single/wait invocation has marked itself resumable. Batch never subscribes or
-            // observes this bit and therefore remains synchronous.
+            // Registration precedes argument dispatch, so retain an early steer before a
+            // bounded single, batch, or wait invocation reaches its resumable park. Each later
+            // wait observes this sticky bit and returns without losing the wake.
             updated.steeringRequested = true
             if let onWake = updated.onWake {
                 wakes.append(onWake)
@@ -3260,8 +3272,7 @@ final class MCPServerViewModel: ObservableObject {
             .lowercased()
         switch op {
         case "", "send":
-            // Step B batches remain synchronous and must never join the steering drain.
-            return args["consultations"] == nil
+            return true
         case "wait":
             return true
         default:

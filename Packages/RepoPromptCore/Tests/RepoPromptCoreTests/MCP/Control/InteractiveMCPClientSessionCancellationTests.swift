@@ -16,7 +16,7 @@ import XCTest
             XCTAssertNil(timeout)
         }
 
-        func testAskOracleAutomaticSingleSendAndWaitUseOwnedResponseEnvelope() async {
+        func testAskOracleAutomaticSendsAndWaitUseOwnedResponseEnvelope() async {
             let session = makeUnconnectedSession()
             let expected = MCPTimeoutPolicy.agentLifecycleAutomaticWaitResponseEnvelopeSeconds
             XCTAssertEqual(expected, 630)
@@ -24,6 +24,8 @@ import XCTest
                 [:],
                 ["op": .string("send")],
                 ["op": .string("send"), "timeout_seconds": .null],
+                ["consultations": .array([])],
+                ["consultations": .array([]), "timeout_seconds": .null],
                 ["op": .string("wait")],
                 ["op": .string("wait"), "timeout_seconds": .null]
             ]
@@ -64,7 +66,7 @@ import XCTest
             }
         }
 
-        func testAskOraclePollAndCancelUseOrdinaryDeadlineWhileBatchRemainsUnbounded() async {
+        func testAskOraclePollCancelAndBatchUseBoundedDeadlines() async {
             let session = makeUnconnectedSession()
             let ordinary = MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
             let ordinaryCases: [[String: Value]] = [
@@ -96,7 +98,7 @@ import XCTest
                     "timeout_seconds": .int(1)
                 ]
             )
-            XCTAssertNil(batchTimeout)
+            XCTAssertEqual(batchTimeout, ordinary)
         }
 
         func testExplicitCLITimeoutPolicyOverridesAskOracleClassification() async {

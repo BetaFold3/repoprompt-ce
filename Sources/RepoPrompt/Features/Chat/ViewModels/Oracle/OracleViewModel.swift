@@ -383,7 +383,7 @@ class OracleViewModel: ObservableObject {
         case failed(reason: String)
     }
 
-    private static let maxConcurrentMCPOracleStreamsPerTab = 2
+    static let maxConcurrentMCPOracleStreamsPerTab = 2
 
     @Published var messages: [AIChatMessage] = []
     @Published private(set) var streamingSessions: Set<UUID> = []
@@ -893,6 +893,9 @@ class OracleViewModel: ObservableObject {
                 },
                 chatName: { [weak self] chatID in
                     self?.sessions.first(where: { $0.id == chatID })?.name
+                },
+                activeStreamCount: { [weak self] tabID in
+                    self?.activeMCPOracleStreamCount(forTabID: tabID) ?? 0
                 }
             )
         )
@@ -1123,6 +1126,8 @@ class OracleViewModel: ObservableObject {
         if let queryID, runStateBySession[sessionID]?.activeQueryId != queryID {
             return false
         }
+        let releasedMCPStream = runStateBySession[sessionID]?.origin == .mcp
+        let releasedTabID = sessions.first(where: { $0.id == sessionID })?.composeTabID
         runStateBySession[sessionID]?.activeQueryId = nil
         runStateBySession[sessionID]?.activeStreamId = nil
         runStateBySession[sessionID]?.origin = nil
@@ -1132,6 +1137,9 @@ class OracleViewModel: ObservableObject {
             currentQueryId = nil
         }
         recomputeWorkspaceBusyAndFontFreeze()
+        if releasedMCPStream, let releasedTabID {
+            mcpOperationStoreStorage?.noteActualStreamCapacityChanged(tabID: releasedTabID)
+        }
         return true
     }
 
@@ -1209,6 +1217,7 @@ class OracleViewModel: ObservableObject {
         typealias OraclePreflightPreparedObserver = @MainActor @Sendable (
             _ conversationSessionID: UUID
         ) async -> Void
+        typealias OracleRequestPreparedObserver = @MainActor @Sendable () async -> Void
         typealias OraclePostBindObserver = @MainActor @Sendable (
             _ operationID: UUID,
             _ queryID: UUID
@@ -1233,6 +1242,7 @@ class OracleViewModel: ObservableObject {
             OracleCloneWillPersistObserver?
         var oraclePreflightPreparedObserverForTesting:
             OraclePreflightPreparedObserver?
+        var oracleRequestPreparedObserverForTesting: OracleRequestPreparedObserver?
         var oraclePostBindObserverForTesting: OraclePostBindObserver?
 
         func setOracleReviewPackagingTraceObserverForTesting(
@@ -1289,6 +1299,12 @@ class OracleViewModel: ObservableObject {
             _ observer: OraclePreflightPreparedObserver?
         ) {
             oraclePreflightPreparedObserverForTesting = observer
+        }
+
+        func setOracleRequestPreparedObserverForTesting(
+            _ observer: OracleRequestPreparedObserver?
+        ) {
+            oracleRequestPreparedObserverForTesting = observer
         }
 
         func setOraclePostBindObserverForTesting(

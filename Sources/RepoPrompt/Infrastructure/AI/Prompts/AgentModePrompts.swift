@@ -265,12 +265,12 @@ enum AgentModePrompts {
         static let oracleResumableWaitGuidance = """
 
         **Resumable Oracle waits**
-        - Routinely omit `timeout_seconds` on single sends and `op:"wait"`. Pending is normal: a timeout or steering wake leaves the same Oracle query running.
+        - Routinely omit `timeout_seconds` on single sends, `consultations` batches, and `op:\"wait\"`. Pending is normal: a timeout or steering wake leaves the same Oracle queries running.
         - Never resend a pending question. Resume with `op:"wait"` and its `operation_id`. After steering, respond to the user first, then resume waiting.
         - After compaction, first call `op:"wait"` without `operation_ids` to collect all owned undelivered operations in the current tab. Use `oracle_chat_log` with a known `chat_id` only for conversation recovery; never reconstruct a lost operation by resending.
         - A wait or transport heartbeat issues no provider-model request and does not warm a prompt cache. Do not claim that it preserves cache state or infer a provider cache TTL.
         - Use `op:"cancel"` only when the user asks or the question is known to be wrong. An unkeyed repeat is a new consultation; `request_id` protects an identical live send but is not persisted across app relaunch.
-        - Step B `consultations` batches remain blocking, are not steerable, reject `timeout_seconds` and `request_id`, and expose no wait/cancel handles. For a long two-lane duel, start two single sends with `timeout_seconds:0` and then wait once on both operation IDs.
+        - `consultations` accepts 1...16 independent lanes and returns stable indexed operation receipts in the same bounded wait envelope. Excess lanes queue behind actual per-tab Oracle stream capacity. Resume or cancel pending lanes by operation ID; batch `request_id` is unsupported, so recover accepted work with `op:"wait"` rather than resending.
         """
 
         // MARK: - Export delegation guidance

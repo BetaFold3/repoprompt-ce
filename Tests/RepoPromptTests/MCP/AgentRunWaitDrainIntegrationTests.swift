@@ -19,7 +19,7 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
         }
     }
 
-    func testProductionDrainTracksRegistrationBeforeInvocationResolutionAndExcludesBatch() async throws {
+    func testProductionDrainTracksRegistrationBeforeInvocationResolutionAndIncludesBatch() async throws {
         try await AgentRunWaitDrainTestHarness.withHarness { harness in
             let registered = await harness.server.test_beginResolvedToolExecution(
                 metadata: harness.metadata,
@@ -53,21 +53,41 @@ final class AgentRunWaitDrainIntegrationTests: XCTestCase {
             XCTAssertFalse(harness.server.test_oracleWaitScopeExists(executionID: execution.executionID))
             XCTAssertFalse(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
 
+            // Registration classification runs before argument dispatch; this synthetic lane is
+            // intentionally never parsed, so it does not need the public batch model field.
             let batch = await harness.server.test_beginResolvedToolExecution(
                 metadata: harness.metadata,
                 resolvedContext: nil,
                 toolName: MCPWindowToolName.askOracle,
-                toolArgs: ["consultations": .array([.object(["message": .string("blocking")])])]
+                toolArgs: ["consultations": .array([.object(["message": .string("bounded")])])]
             )
             let batchExecution = try XCTUnwrap(batch)
-            XCTAssertFalse(
+            XCTAssertTrue(
                 harness.server.test_oracleWaitScopeExists(executionID: batchExecution.executionID),
-                "blocking Step B batches must stay outside the resumable steering drain"
+                "bounded batch sends join the resumable steering drain"
             )
-            let batchExcludedFromDrain = await harness.drain(source: "test-blocking-batch-exclusion")
-            XCTAssertTrue(batchExcludedFromDrain)
-            XCTAssertTrue(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
-            harness.server.test_endToolExecution(executionID: batchExecution.executionID)
+            let batchDrainTask = Task { @MainActor in
+                await harness.drain(source: "test-bounded-batch-inclusion")
+            }
+            try await AsyncTestWait.waitUntil("batch steering wake becomes sticky") {
+                await MainActor.run {
+                    harness.server.oracleWaitScopeSteeringRequested(
+                        executionID: batchExecution.executionID
+                    )
+                }
+            }
+            _ = await MCPServerViewModel.$currentToolExecutionID.withValue(
+                batchExecution.executionID
+            ) {
+                await harness.server.resolveOracleWaitInvocation()
+            }
+            harness.endOracleExecutionOnWake(batchExecution.executionID)
+            let batchDrained = await batchDrainTask.value
+            XCTAssertTrue(batchDrained)
+            XCTAssertFalse(
+                harness.server.test_oracleWaitScopeExists(executionID: batchExecution.executionID)
+            )
+            XCTAssertFalse(harness.server.hasActiveToolExecutions(runID: harness.parentRunID))
         }
     }
 

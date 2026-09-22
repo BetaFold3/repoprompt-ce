@@ -2896,11 +2896,11 @@ func printUsage() {
           ask_oracle op=wait operation_ids=["<id>"]    Resume without resending
           ask_oracle op=wait                           Recover all owned undelivered operations
           ask_oracle op=cancel operation_ids=["<id>"]  Cancel only on user request/wrong question
-          Routine sends/waits should omit timeout_seconds. A timeout or steering wake returns
-          pending while Oracle keeps running; never resend. Respond to steering first, then wait.
-          Waits and transport heartbeats do not issue a model request or warm a prompt cache.
-          consultations batches remain blocking and reject timeout_seconds/request_id. For a long
-          two-lane duel, start two single sends with timeout_seconds=0, then wait on both handles.
+          Routine sends, consultations batches, and waits should omit timeout_seconds. A timeout
+          or steering wake returns pending while Oracle keeps running; never resend. Respond to
+          steering first, then wait. Waits and transport heartbeats do not issue a model request
+          or warm a prompt cache. consultations accepts 1...16 indexed, resumable lanes that queue
+          behind actual Oracle capacity; batch request_id is unsupported. Resume with op=wait.
 
         read_file (read, cat) - Read file contents
           read src/main.swift                          Read entire file

@@ -259,12 +259,13 @@ final class AgentControlToolCardPresentationTests: XCTestCase {
             ),
             "review"
         )
-        try XCTAssertNil(
+        try XCTAssertEqual(
             ToolCardRouter.callSubtitle(
                 for: "ask_oracle",
                 argsJSON: jsonString(["consultations": [["message": "one"], ["message": "two"]]]),
                 agentControlContext: codexContext
-            )
+            ),
+            "wait ≤10m"
         )
     }
 

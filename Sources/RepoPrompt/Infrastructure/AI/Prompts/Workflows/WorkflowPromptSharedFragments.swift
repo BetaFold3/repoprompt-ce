@@ -155,11 +155,11 @@ A role whose display name starts with `Codex CLI` (or an explicit `model_id` wit
 	) -> String {
 		guard variant == .agent || (includeMCPVariant && variant == .mcp) else { return "" }
 		return """
-**Resumable Oracle waits.** For routine single `ask_oracle` sends and `op:"wait"` calls, omit `timeout_seconds`; omission selects the automatic wait for the effective parent provider. Pending is a normal result: a timeout or steering wake leaves the same Oracle query running. Never resend a pending question. Resume with `op:"wait"` and the returned `operation_id`; after compaction, call `op:"wait"` without `operation_ids` to collect all owned undelivered operations in the current tab. If steering woke the call, respond to the user first, then resume waiting.
+**Resumable Oracle waits.** For routine single `ask_oracle` sends, `consultations` batches, and `op:"wait"` calls, omit `timeout_seconds`; omission selects the automatic wait for the effective parent provider. Pending is a normal result: a timeout or steering wake leaves the same Oracle queries running. Never resend a pending question. Resume with `op:"wait"` and the returned operation IDs; after compaction, call `op:"wait"` without `operation_ids` to collect all owned undelivered operations in the current tab, including more than 16. If steering woke the call, respond to the user first, then resume waiting.
 
 A wait or transport heartbeat does not itself send a provider-model request and therefore does not warm a prompt cache. Do not claim that a wait preserves cache state or infer any provider cache TTL. Use `op:"cancel"` only when the user asks or the question is known to be wrong. An unkeyed repeat is a new consultation; `request_id` protects an identical live send from duplicate spend but is not persisted across app relaunch.
 
-Step B `consultations` batches remain blocking until every lane finishes, are not steerable, reject `timeout_seconds` and `request_id`, and cannot be resumed or cancelled by operation handle. For a long two-lane duel, start two independent single sends with `new_chat:true`, distinct exact model presets, and `timeout_seconds:0`, then make one `op:"wait"` call with both operation IDs.
+`consultations` accepts 1...16 independent lanes and returns stable indexed operation receipts in the same bounded wait envelope. Excess lanes queue behind actual per-tab Oracle capacity. Resume or cancel pending lanes by operation ID; batch `request_id` is unsupported, so recover accepted work with `op:"wait"` rather than resending.
 """
 	}
 

@@ -197,9 +197,6 @@ struct MCPOracleToolService {
 
     // MARK: - ask_oracle (agent-mode only)
 
-    /// Matches `OracleViewModel.maxConcurrentMCPOracleStreamsPerTab`.
-    private static let batchMaxConcurrentStreams = 2
-
     /// `op:"wait"` / `op:"cancel"` accept at most this many handles per call (plan §3.2).
     static let operationIDsPerCallLimit = 16
     /// Byte ceiling for a pending single-send result, asserted by `MCPAskOracleLifecycleTests`.
@@ -216,7 +213,7 @@ struct MCPOracleToolService {
     ]
 
     private static let batchAskOracleArgs: Set<String> = [
-        "consultations", "require_distinct", "op"
+        "consultations", "require_distinct", "op", "timeout_seconds", "request_id"
     ]
 
     private static let waitAskOracleArgs: Set<String> = [
@@ -626,11 +623,17 @@ struct MCPOracleToolService {
             "operation_id": .string(operationID.uuidString),
             "mode": .string(snapshot.finalization.mode)
         ]
-        if let chatShortID = snapshot.chatShortID {
-            stub["chat_id"] = .string(chatShortID)
-        }
-        if let queryID = snapshot.queryID {
-            stub["query_id"] = .string(queryID.uuidString)
+        if let batchIndex = snapshot.batchIndex {
+            stub["index"] = .int(batchIndex)
+            stub["chat_id"] = snapshot.chatShortID.map(Value.string) ?? .null
+            stub["query_id"] = snapshot.queryID.map { .string($0.uuidString) } ?? .null
+        } else {
+            if let chatShortID = snapshot.chatShortID {
+                stub["chat_id"] = .string(chatShortID)
+            }
+            if let queryID = snapshot.queryID {
+                stub["query_id"] = .string(queryID.uuidString)
+            }
         }
         if let context = operationStore.replyContext(operationID) {
             let identity = oracleVM.modelIdentityFields(context)
@@ -640,9 +643,16 @@ struct MCPOracleToolService {
                 stub["model_name"] = modelName
             }
         }
+        let streamState = switch snapshot.phase {
+        case .queued: "queued"
+        case .starting: "starting"
+        case .running: "streaming"
+        case .cancelling: "cancelling"
+        case .ready, .failed, .cancelled: "terminal"
+        }
         stub["pending"] = .object([
             "reason": .string(reason),
-            "stream_state": .string(snapshot.phase == .cancelling ? "cancelling" : "streaming"),
+            "stream_state": .string(streamState),
             "elapsed_seconds": .int(operationStore.elapsedSeconds(for: operationID) ?? 0)
         ])
         if includeResume {
@@ -656,10 +666,11 @@ struct MCPOracleToolService {
     }
 
     private static func resumeValue(_ operationIDs: [UUID]) -> Value {
-        .object([
-            "op": .string("wait"),
-            "operation_ids": .array(operationIDs.map { .string($0.uuidString) })
-        ])
+        var resume: [String: Value] = ["op": .string("wait")]
+        if operationIDs.count <= Self.operationIDsPerCallLimit {
+            resume["operation_ids"] = .array(operationIDs.map { .string($0.uuidString) })
+        }
+        return .object(resume)
     }
 
     private static func unknownLane(_ operationID: UUID) -> Value {
@@ -674,8 +685,8 @@ struct MCPOracleToolService {
         ])
     }
 
-    private static func deliveryFailureLane(_ operationID: UUID, error: Error) -> Value {
-        .object([
+    private func deliveryFailureLane(_ operationID: UUID, error: Error) -> Value {
+        var lane: [String: Value] = [
             "operation_id": .string(operationID.uuidString),
             "status": .string("delivery_failed"),
             "ok": .bool(false),
@@ -685,7 +696,11 @@ struct MCPOracleToolService {
                     "Completed operation \(operationID.uuidString) could not be delivered: \(error.localizedDescription). Retry this operation_id with ask_oracle op:\"wait\"."
                 )
             ])
-        ])
+        ]
+        if let batchIndex = operationStore.snapshot(operationID)?.batchIndex {
+            lane["index"] = .int(batchIndex)
+        }
+        return .object(lane)
     }
 
     private static func expiredLane(_ tombstone: OracleMCPOperationStore.Tombstone) -> Value {
@@ -698,6 +713,9 @@ struct MCPOracleToolService {
                 "message": .string("operation_id \(tombstone.operationID.uuidString) was evicted after delivery or retention expiry. Read the chat with oracle_chat_log; do not resend.")
             ])
         ]
+        if let batchIndex = tombstone.batchIndex {
+            lane["index"] = .int(batchIndex)
+        }
         if let chatShortID = tombstone.chatShortID {
             lane["chat_id"] = .string(chatShortID)
         }
@@ -718,6 +736,9 @@ struct MCPOracleToolService {
             "delivered": .bool(snapshot.delivery == .delivered),
             "mode": .string(snapshot.finalization.mode)
         ]
+        if let batchIndex = snapshot.batchIndex {
+            lane["index"] = .int(batchIndex)
+        }
         if let chatShortID = snapshot.chatShortID {
             lane["chat_id"] = .string(chatShortID)
         }
@@ -775,8 +796,27 @@ struct MCPOracleToolService {
             parentFamily: invocation.context.parentFamily
         )
         operationStore.purge()
-
         let targetIDs = requestedIDs ?? operationStore.undeliveredOperationIDs(owner: caller)
+        return try await observeAskOracleOperations(
+            targetIDs: targetIDs,
+            caller: caller,
+            selection: selection,
+            timeoutSeconds: selection.mode == .poll ? 0 : selection.timeoutSeconds,
+            connectionID: connectionID,
+            invocation: invocation,
+            op: "wait"
+        )
+    }
+
+    private func observeAskOracleOperations(
+        targetIDs: [UUID],
+        caller: OracleMCPOperationStore.OwnerScope,
+        selection: AgentMCPWaitPolicy.Selection,
+        timeoutSeconds: TimeInterval,
+        connectionID: UUID,
+        invocation: OracleWaitInvocation,
+        op: String
+    ) async throws -> Value {
         var lanesByID: [UUID: Value] = [:]
         var observable: [UUID] = []
         var hasLaneErrors = false
@@ -808,7 +848,7 @@ struct MCPOracleToolService {
             ) {
                 let capturedOutcome = await operationStore.awaitSettlement(
                     of: capturedObservable,
-                    timeoutSeconds: selection.mode == .poll ? 0 : selection.timeoutSeconds,
+                    timeoutSeconds: timeoutSeconds,
                     externalWake: wake
                 )
                 await outcomeCapture.store(capturedOutcome)
@@ -839,7 +879,7 @@ struct MCPOracleToolService {
                 } catch {
                     retryableIDs.append(id)
                     hasLaneErrors = true
-                    lanesByID[id] = Self.deliveryFailureLane(id, error: error)
+                    lanesByID[id] = deliveryFailureLane(id, error: error)
                 }
             case .found:
                 pendingIDs.append(id)
@@ -888,7 +928,7 @@ struct MCPOracleToolService {
             envelope["_meta"] = .object(["wake_reason": .string(Self.steeringWakeReason)])
         }
         recordWaitDiagnostics(
-            op: "wait",
+            op: op,
             selection: selection,
             outcome: waitResult,
             parkedMS: parkedMS,
@@ -931,11 +971,24 @@ struct MCPOracleToolService {
                 lanes.append(Self.unknownLane(operationID))
             case let .expired(tombstone):
                 lanes.append(Self.expiredLane(tombstone))
-            case let .found(snapshot):
+            case let .found(authorizedSnapshot):
+                // A prior lane's transport stop may have suspended; re-read this authorized
+                // lane before deciding whether or how to mutate it.
+                let snapshot = operationStore.snapshot(operationID) ?? authorizedSnapshot
                 let cancelValue: String
                 switch snapshot.phase {
+                case .queued:
+                    cancelValue = operationStore.cancelUnboundBatch(operationID)
+                        ? "requested"
+                        : "already_terminal"
                 case .starting:
-                    cancelValue = "not_cancellable_yet"
+                    if snapshot.batchIndex != nil {
+                        cancelValue = operationStore.cancelUnboundBatch(operationID)
+                            ? "requested"
+                            : "already_terminal"
+                    } else {
+                        cancelValue = "not_cancellable_yet"
+                    }
                 case .running:
                     guard operationStore.beginCancelRequest(operationID) else {
                         cancelValue = operationStore.snapshot(operationID)?.phase.isTerminal == true
@@ -967,7 +1020,7 @@ struct MCPOracleToolService {
                 lane["cancel"] = .string(cancelValue)
                 lanes.append(.object(lane))
                 cancelOutcomes[cancelValue, default: 0] += 1
-                if operationStore.snapshot(operationID)?.phase.isTerminal == false {
+                if operationStore.snapshot(operationID)?.delivery != .delivered {
                     resumeIDs.append(operationID)
                 }
             }
@@ -1061,37 +1114,33 @@ struct MCPOracleToolService {
             .joined()
     }
 
-    // MARK: Batch (Step B: synchronous, request-owned; plan §3.7)
+    // MARK: Batch (bounded, resumable; Step C)
 
     private func executeAskOracleBatch(args: [String: Value]) async throws -> Value {
-        // Wait controls are rejected on batch, not ignored: the batch blocks until every lane
-        // finishes and is not steerable in this release.
-        let rejectedWaitControls = ["timeout_seconds", "request_id"].filter { args[$0] != nil }
-        if !rejectedWaitControls.isEmpty {
-            throw MCPError.invalidParams(
-                "ask_oracle consultations do not accept \(rejectedWaitControls.joined(separator: ", ")): a batch blocks until all lanes finish and cannot be resumed or deduplicated. For a long duel use two single sends with timeout_seconds:0, then one op:\"wait\" with both operation_ids."
-            )
-        }
         let unsupported = args.keys
             .filter { !$0.hasPrefix("_") && !Self.batchAskOracleArgs.contains($0) }
             .sorted()
         if !unsupported.isEmpty {
             throw MCPError.invalidParams(
-                "ask_oracle consultations is mutually exclusive with single-send parameters. Unsupported args with consultations: \(unsupported.joined(separator: ", ")). Allowed batch args: consultations, require_distinct."
+                "ask_oracle consultations is mutually exclusive with the single-send parameter set and accepts only consultations, require_distinct, op, and timeout_seconds. Unsupported args: \(unsupported.joined(separator: ", ")). Batch request_id is unsupported."
             )
         }
-
-        guard let connectionID = ServerNetworkManager.currentConnectionID else {
-            throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
+        if args["request_id"] != nil {
+            throw MCPError.invalidParams(
+                "request_id is unsupported for consultations batches; recover accepted lanes with op:\"wait\" rather than resending."
+            )
         }
+        let rawTimeout = args["timeout_seconds"]
+        _ = try Self.parseAskOracleTimeout(rawTimeout)
 
         guard let consultationsValue = args["consultations"],
-              let consultationItems = consultationsValue.arrayValue
+              let consultationItems = consultationsValue.arrayValue,
+              !consultationItems.isEmpty,
+              consultationItems.count <= OracleMCPOperationStore.maxBatchLaneCount
         else {
-            throw MCPError.invalidParams("consultations must be a non-empty array")
-        }
-        guard !consultationItems.isEmpty else {
-            throw MCPError.invalidParams("consultations must be a non-empty array")
+            throw MCPError.invalidParams(
+                "consultations must contain between 1 and \(OracleMCPOperationStore.maxBatchLaneCount) lanes"
+            )
         }
 
         let requireDistinct: Bool
@@ -1112,22 +1161,31 @@ struct MCPOracleToolService {
             }
             try parsedItems.append(parseConsultationItem(object, index: index))
         }
-
-        // Fail closed before any lane spends money or creates chats.
         if requireDistinct {
             try validateDistinctConsultationPresets(parsedItems)
         }
 
-        // Step B admission: the request-local window of 2 is only correct on an idle tab.
-        // Residual race (a competing single starting between here and the first lane start)
-        // reproduces today's lane-failure behavior and is documented in the plan.
-        let caller = try await resolveCallerScope(args: args, connectionID: connectionID)
-        operationStore.purge()
-        if oracleVM.mcpActiveOracleStreamCount(forTabID: caller.tabID) > 0 {
-            throw ChatToolError.oracleBatchRequiresIdleTab(
-                runningOperationIDs: operationStore.runningOperationIDs(owner: caller).map(\.uuidString)
-            )
+        guard let connectionID = ServerNetworkManager.currentConnectionID else {
+            throw MCPError.invalidParams("ask_oracle requires an active MCP connection")
         }
+
+        let clock = ContinuousClock()
+        let observationStart = clock.now
+        let invocation = await resolveWaitInvocation()
+        let selection = try AgentMCPWaitPolicy.selection(
+            rawTimeout: rawTimeout,
+            parentFamily: invocation.context.parentFamily
+        )
+        let source = try await captureBatchSource(
+            args: args,
+            connectionID: connectionID,
+            needsReview: parsedItems.contains { $0.mode == "review" }
+        )
+        let caller = OracleMCPOperationStore.OwnerScope(
+            tabID: source.directTabContext.tabID,
+            agentSessionID: source.owner.agentSessionID,
+            runID: source.owner.runID
+        )
 
         await sendStageProgress(
             connectionID,
@@ -1136,50 +1194,54 @@ struct MCPOracleToolService {
             "Starting \(parsedItems.count) Oracle consultations..."
         )
 
-        let capturedItems = parsedItems
-        let maxConcurrent = Self.batchMaxConcurrentStreams
-        let envelope = try await withHeartbeat(
-            connectionID,
-            askOracleToolName,
-            "waiting",
-            "Waiting for Oracle consultations..."
-        ) {
-            let collected = try await withThrowingTaskGroup(of: (Int, Value).self) { group in
-                var nextIndex = 0
-                var inFlight = 0
-                var collected = Array(repeating: Value.null, count: capturedItems.count)
-
-                func startNextIfPossible() {
-                    while inFlight < maxConcurrent, nextIndex < capturedItems.count {
-                        let index = nextIndex
-                        let item = capturedItems[index]
-                        nextIndex += 1
-                        inFlight += 1
-                        group.addTask { @MainActor in
-                            let value = await executeConsultationItem(
-                                item,
-                                index: index,
-                                connectionID: connectionID
-                            )
-                            return (index, value)
-                        }
+        let starter = startOracleSend
+        let preparationHook = beforeAskOraclePreparation
+        let promptVM = promptVM
+        let activeRunProvider = source.activeRunProvider
+        let submissions = parsedItems.map { item in
+            let itemArgs = consultationArgs(item)
+            let laneSource = source.laneSource(for: item.mode)
+            let tabContext = laneSource.context
+            let finalization = makeBatchFinalizationRequest(
+                item: item,
+                tabContext: tabContext,
+                source: source
+            )
+            return OracleMCPOperationStore.BatchSubmission(
+                finalization: finalization,
+                activeRunProvider: activeRunProvider,
+                startup: { operationID in
+                    if let startupError = laneSource.startupError {
+                        return startupError
+                    }
+                    await preparationHook()
+                    do {
+                        _ = try await starter(itemArgs, promptVM, tabContext, operationID)
+                        return nil
+                    } catch {
+                        return (error as? ChatToolError)
+                            ?? ChatToolError.invalidParams(error.localizedDescription)
                     }
                 }
-
-                startNextIfPossible()
-                while inFlight > 0 {
-                    let (index, value) = try await group.next()!
-                    collected[index] = value
-                    inFlight -= 1
-                    startNextIfPossible()
-                }
-                return collected
-            }
-            return ["results": .array(collected)]
+            )
         }
+        let operationIDs = try operationStore.admitBatch(owner: caller, submissions: submissions)
+        let remaining = Self.remainingTimeout(
+            selection: selection,
+            elapsed: observationStart.duration(to: clock.now)
+        )
+        let result = try await observeAskOracleOperations(
+            targetIDs: operationIDs,
+            caller: caller,
+            selection: selection,
+            timeoutSeconds: remaining,
+            connectionID: connectionID,
+            invocation: invocation,
+            op: "send"
+        )
 
         await sendStageProgress(connectionID, askOracleToolName, "complete", "Oracle consultations complete")
-        return Self.agentFacingOracleResult(.object(envelope))
+        return result
     }
 
     private struct AskOracleConsultationItem {
@@ -1213,8 +1275,8 @@ struct MCPOracleToolService {
                 "consultations[\(index)].model is required (exact preset UUID or name)"
             )
         }
-        let model = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !model.isEmpty else {
+        let modelSelector = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !modelSelector.isEmpty else {
             throw MCPError.invalidParams("consultations[\(index)].model cannot be empty")
         }
 
@@ -1254,7 +1316,11 @@ struct MCPOracleToolService {
             )
         }
         let responseMode = try OracleResponseMode.parse(object["response_mode"]?.stringValue)
-        try validateNewChatModelSelection(newChat: true, model: model, mode: modeRaw)
+        let model = try resolveBatchModelSelector(
+            modelSelector,
+            mode: modeRaw,
+            index: index
+        )
 
         return AskOracleConsultationItem(
             message: message,
@@ -1285,11 +1351,149 @@ struct MCPOracleToolService {
         }
     }
 
-    private func executeConsultationItem(
-        _ item: AskOracleConsultationItem,
-        index: Int,
-        connectionID: UUID
-    ) async -> Value {
+    private struct CapturedBatchSource {
+        let owner: AgentOracleOwner
+        let directTabContext: OracleViewModel.OracleSendTabContext
+        let reviewTabContext: OracleViewModel.OracleSendTabContext?
+        let reviewError: ChatToolError?
+        let workspace: WorkspaceModel?
+        let windowID: Int
+        let activeRunProvider: @MainActor () -> UUID?
+
+        func laneSource(for mode: String) -> (
+            context: OracleViewModel.OracleSendTabContext,
+            startupError: ChatToolError?
+        ) {
+            guard mode == "review" else { return (directTabContext, nil) }
+            return (reviewTabContext ?? directTabContext, reviewError)
+        }
+    }
+
+    private func captureBatchSource(
+        args: [String: Value],
+        connectionID: UUID,
+        needsReview: Bool
+    ) async throws -> CapturedBatchSource {
+        let targetWindow = try requireTargetWindow()
+        let tabID = try await resolveTabIDForAgentMode(args, connectionID)
+        let requestContext = try? await requireCurrentTabContext(askOracleToolName)
+        let virtualContext = (requestContext?.tabID == tabID) ? requestContext : nil
+        let owner = await resolveAgentOracleOwner(
+            tabID: tabID,
+            targetWindow: targetWindow,
+            tabContext: virtualContext
+        )
+        guard owner.agentSessionID != nil || owner.runID != nil else {
+            throw MCPError.invalidParams(
+                "consultations batches require an authenticated active Agent Mode session or run"
+            )
+        }
+
+        let directTabContext: OracleViewModel.OracleSendTabContext
+        if let virtualContext {
+            directTabContext = try await oracleSendTabContext(
+                from: virtualContext,
+                owner: owner,
+                origin: .askOracle,
+                mode: "chat"
+            )
+        } else {
+            guard let tabSnapshot = targetWindow.workspaceManager.composeTabSnapshot(for: tabID) else {
+                throw MCPError.internalError("Unable to resolve compose tab context for ask_oracle")
+            }
+            let lookupContext = try await oraclePackagingLookupContext(owner: owner)
+            let workspace = targetWindow.workspaceManager.activeWorkspace
+            let workspaceID = workspace?.id
+            let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+                workspaceID: workspaceID,
+                tabID: tabID,
+                sessionID: owner.agentSessionID,
+                bindings: owner.worktreeBindingState.bindings ?? [],
+                base: "HEAD"
+            )
+            let packaging = OracleViewModel.OracleSendPackagingContext(
+                sourceTabID: tabID,
+                sourceWorkspaceID: workspaceID,
+                sourceSelectionRevision: workspaceID.map {
+                    targetWindow.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: $0,
+                        tabID: tabID
+                    )
+                } ?? 0,
+                sourceAgentSessionID: owner.agentSessionID,
+                sourceAgentRunID: owner.runID,
+                promptText: tabSnapshot.promptText,
+                selection: tabSnapshot.selection,
+                lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext,
+                provenance: .direct
+            )
+            directTabContext = OracleViewModel.OracleSendTabContext(
+                tabID: tabID,
+                workspaceID: workspaceID,
+                origin: .askOracle,
+                agentModeSessionID: owner.agentSessionID,
+                agentModeRunID: owner.runID,
+                packaging: packaging
+            )
+        }
+
+        var reviewTabContext: OracleViewModel.OracleSendTabContext?
+        var reviewError: ChatToolError?
+        if needsReview {
+            do {
+                let packaging = try await reviewPackaging(
+                    mode: "review",
+                    conversationTabID: tabID,
+                    conversationWorkspaceID: directTabContext.workspaceID,
+                    owner: owner,
+                    direct: directTabContext.packaging
+                )
+                reviewTabContext = OracleViewModel.OracleSendTabContext(
+                    tabID: tabID,
+                    workspaceID: directTabContext.workspaceID,
+                    origin: .askOracle,
+                    agentModeSessionID: owner.agentSessionID,
+                    agentModeRunID: owner.runID,
+                    packaging: packaging
+                )
+            } catch {
+                reviewError = (error as? ChatToolError)
+                    ?? ChatToolError.invalidParams(error.localizedDescription)
+            }
+        }
+
+        let sourceWorkspace = directTabContext.workspaceID.flatMap {
+            targetWindow.workspaceManager.workspace(withID: $0)
+        }
+        if directTabContext.workspaceID != nil, sourceWorkspace == nil {
+            throw MCPError.internalError(
+                "Unable to resolve the frozen source workspace for ask_oracle batch"
+            )
+        }
+
+        let agentModeViewModel = targetWindow.agentModeViewModel
+        let ownerSessionID = owner.agentSessionID
+        let ownerRunID = owner.runID
+        let activeRunProvider: @MainActor () -> UUID? = { [weak agentModeViewModel] in
+            agentModeViewModel?.mcpOracleActiveRunID(
+                tabID: tabID,
+                ownerSessionID: ownerSessionID,
+                ownerRunID: ownerRunID
+            )
+        }
+        return CapturedBatchSource(
+            owner: owner,
+            directTabContext: directTabContext,
+            reviewTabContext: reviewTabContext,
+            reviewError: reviewError,
+            workspace: sourceWorkspace,
+            windowID: targetWindow.windowID,
+            activeRunProvider: activeRunProvider
+        )
+    }
+
+    private func consultationArgs(_ item: AskOracleConsultationItem) -> [String: Value] {
         var itemArgs: [String: Value] = [
             "message": .string(item.message),
             "mode": .string(item.mode),
@@ -1300,37 +1504,31 @@ struct MCPOracleToolService {
         if let chatName = item.chatName {
             itemArgs["chat_name"] = .string(chatName)
         }
+        return itemArgs
+    }
 
-        do {
-            let prepared = try await prepareAskOracleSend(args: itemArgs, connectionID: connectionID)
-            var result = try await sendChat(prepared.chatArgs, promptVM, prepared.tabContext)
-            let request = try await makeFinalizationRequest(
-                args: itemArgs,
-                connectionID: connectionID,
-                responseMode: item.responseMode,
-                exportResponse: false,
-                lookupContext: prepared.tabContext.packaging.lookupContext,
-                tabID: prepared.tabID
+    private func makeBatchFinalizationRequest(
+        item: AskOracleConsultationItem,
+        tabContext: OracleViewModel.OracleSendTabContext,
+        source: CapturedBatchSource
+    ) -> OracleMCPOperationStore.FinalizationRequest {
+        let exportDestination: OracleExportDestination? = if item.responseMode == .full {
+            nil
+        } else {
+            try? MCPServerViewModel.makeOracleExportDestination(
+                workspace: source.workspace,
+                windowID: source.windowID,
+                tabID: tabContext.tabID,
+                lookupContext: tabContext.packaging.lookupContext ?? .visibleWorkspace
             )
-            try await finalizeAskOracleResult(&result, request: request)
-            result["ok"] = .bool(true)
-            result["index"] = .int(index)
-            return .object(result)
-        } catch let error as ChatToolError {
-            var payload = error.toMCPValue().objectValue ?? [:]
-            payload["ok"] = .bool(false)
-            payload["index"] = .int(index)
-            return .object(payload)
-        } catch {
-            return .object([
-                "ok": .bool(false),
-                "index": .int(index),
-                "error": .object([
-                    "code": .string(ChatToolErrorCode.invalidParams.rawValue),
-                    "message": .string(error.localizedDescription)
-                ])
-            ])
         }
+        return OracleMCPOperationStore.FinalizationRequest(
+            mode: item.mode,
+            message: item.message,
+            responseMode: item.responseMode,
+            exportResponse: false,
+            exportDestination: exportDestination
+        )
     }
 
     /// Freezes presentation at send (plan §3.5): mode, message, `response_mode`,
@@ -1876,6 +2074,53 @@ struct MCPOracleToolService {
         throw MCPError.invalidParams(
             "new_chat:true requires an explicit model when multiple model presets support '\(mode)' mode: \(choices). Retry with model set to one exact preset name or UUID from oracle_utils op=models. chat_name only labels the Oracle session and never selects a model."
         )
+    }
+
+    private func resolveBatchModelSelector(
+        _ selector: String,
+        mode: String,
+        index: Int
+    ) throws -> String {
+        try validateNewChatModelSelection(newChat: true, model: selector, mode: mode)
+
+        let configuredPresets = ModelPresetsManager.shared.allPresets()
+        let settings = GlobalSettingsStore.shared
+        let usageState = MCPModelPresetUsageState(
+            showModelPresets: settings.mcpShowModelPresets(),
+            temporarilyDisabled: settings.mcpTemporarilyDisablePresets(),
+            configuredPresetCount: configuredPresets.count
+        )
+        if usageState.allowsConfiguredPresets, !configuredPresets.isEmpty {
+            guard let preset = Self.exactModelPresetMatch(selector, in: configuredPresets) else {
+                throw MCPError.invalidParams(
+                    "consultations[\(index)].model must exactly match one configured preset UUID or unambiguous name from oracle_utils op=models"
+                )
+            }
+            guard configuredPresets.filteredForMode(mode).contains(where: { $0.id == preset.id }) else {
+                throw MCPError.invalidParams(
+                    "consultations[\(index)].model preset '\(preset.name)' does not support '\(mode)' mode"
+                )
+            }
+            return preset.id.uuidString
+        }
+
+        let planningResolution = promptVM.mcpOraclePlanningModelResolution()
+        guard case let .configured(planningModel) = planningResolution else {
+            let message = PromptViewModel.mcpOraclePlanningModelErrorMessage(
+                for: planningResolution,
+                availabilityGuidance: { model in oracleModelAvailabilityGuidance(for: model) }
+            ) ?? "MCP Oracle model is not configured."
+            throw MCPError.invalidParams(message)
+        }
+        let normalized = selector.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.caseInsensitiveCompare("current_chat_model") == .orderedSame
+            || normalized.caseInsensitiveCompare(planningModel.displayName) == .orderedSame
+        else {
+            throw MCPError.invalidParams(
+                "consultations[\(index)].model must be 'current_chat_model' or '\(planningModel.displayName)' while model presets are unavailable"
+            )
+        }
+        return "current_chat_model"
     }
 
     private static func exactModelPresetMatch(

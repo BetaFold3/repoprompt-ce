@@ -29,7 +29,9 @@ final class KnowledgeAgentPromptTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Never resend a pending question"))
         XCTAssertTrue(prompt.contains("without `operation_ids`"))
         XCTAssertTrue(prompt.contains("does not warm a prompt cache"))
-        XCTAssertTrue(prompt.contains("`consultations` batches remain blocking"))
+        XCTAssertTrue(prompt.contains("`consultations` accepts 1...16 independent lanes"))
+        XCTAssertTrue(prompt.contains("stable indexed operation receipts"))
+        XCTAssertTrue(prompt.contains("Resume or cancel pending lanes"))
     }
 
     func testKnowledgePromptKeepsProviderMediaClaimsTruthful() {

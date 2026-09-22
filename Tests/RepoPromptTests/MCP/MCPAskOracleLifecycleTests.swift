@@ -5,8 +5,8 @@ import XCTest
 
 /// Oracle resumable wait plan §5 `MCPAskOracleLifecycleTests`: bounded single send, pending
 /// stub shape and byte ceiling, `wait_policy` per mode, `op:"wait"` envelopes, `op:"cancel"`
-/// phases and the query-match rule, `request_id` dedup, Step B batch admission, and the
-/// steering wake through the real `MCPServerViewModel` execution registry.
+/// phases and the query-match rule, `request_id` dedup, Step C bounded batch scheduling,
+/// late-reservation safety, and steering wake through the real `MCPServerViewModel` registry.
 ///
 /// The Oracle stream engine is real; only the provider transport is stubbed after packaging.
 @MainActor
@@ -221,6 +221,37 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             return try XCTUnwrap(value.objectValue)
         }
 
+        @discardableResult
+        func activateAgentRunForBatch(
+            sessionID: UUID? = nil,
+            activeRunID: UUID? = nil
+        ) throws -> UUID {
+            let sessionID = sessionID ?? runID
+            let activeRunID = activeRunID ?? runID
+            let session = window.agentModeViewModel.session(for: tabID)
+            guard window.agentModeViewModel.test_installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session,
+                updateWorkspaceMetadata: true
+            ) != nil else {
+                throw LifecycleTestError.runMappingFailed
+            }
+            session.runID = activeRunID
+            session.runState = .running
+            window.agentModeViewModel.setAgentRunActive(tabID, isActive: true)
+            return sessionID
+        }
+
+        func legacySend(message: String) async throws -> [String: Value] {
+            let value = try await window.mcpServer.executeOracleSendForTesting(args: [
+                "message": .string(message),
+                "mode": .string("chat"),
+                "model": .string(preset.id.uuidString),
+                "new_chat": .bool(true)
+            ])
+            return try XCTUnwrap(value.objectValue)
+        }
+
         func chatUUID(shortID: String) throws -> UUID {
             try XCTUnwrap(window.oracleViewModel.resolveSession(id: shortID)?.id)
         }
@@ -248,10 +279,21 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             window.mcpServer.setOracleChatSendOverrideForTesting(nil)
             window.mcpServer.setBeforeAskOraclePreparationForTesting(nil)
             window.mcpServer.setOraclePostBindObserverForTesting(nil)
+            window.oracleViewModel.setOracleRequestPreparedObserverForTesting(nil)
             window.oracleViewModel.setOraclePostPackagingTransportOverrideForTesting(nil)
             window.oracleViewModel.mcpOperationStore.teardown()
             await window.oracleViewModel.cancelAllActiveSessionStreams()
+            if let session = window.agentModeViewModel.session(for: tabID, createIfNeeded: false),
+               let sessionID = session.activeAgentSessionID,
+               session.mcpControlContext != nil
+            {
+                await window.agentModeViewModel.mcpDeactivateControlContext(
+                    sessionID: sessionID,
+                    cleanupSessionStore: true
+                )
+            }
             window.oracleViewModel.sessions = []
+            window.agentModeViewModel.setAgentRunActive(tabID, isActive: false)
             window.mcpServer.cleanupRunIDMapping(runID: runID, connectionID: connectionID)
             let settings = GlobalSettingsStore.shared
             ModelPresetsManager.shared.presets = previousPresets
@@ -302,6 +344,25 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
 
     private func encodedByteCount(_ object: [String: Value]) throws -> Int {
         try JSONEncoder().encode(Value.object(object)).count
+    }
+
+    private func batchConsultations(
+        fixture: Fixture,
+        count: Int,
+        responseModeForLast: String? = nil
+    ) -> Value {
+        .array((0 ..< count).map { index in
+            var lane: [String: Value] = [
+                "message": .string("Batch lane \(index)"),
+                "model": .string(fixture.preset.id.uuidString),
+                "mode": .string("chat"),
+                "chat_name": .string("Batch \(index)")
+            ]
+            if index == count - 1, let responseModeForLast {
+                lane["response_mode"] = .string(responseModeForLast)
+            }
+            return .object(lane)
+        })
     }
 
     // MARK: - Validation before any send
@@ -1046,39 +1107,755 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
         }
     }
 
-    // MARK: - Batch admission (Step B)
+    // MARK: - Bounded resumable batches (Step C)
 
-    func testBatchRejectsWaitControlsAndRequiresIdleTabNamingRunningOperations() async throws {
+    func testBatchValidationRejectsInvalidShapesAtomicallyBeforeAnyReceipt() async throws {
         try await withFixture { fixture in
-            let consultations: Value = .array([
-                .object(["message": .string("lane"), "model": .string(fixture.preset.name)])
-            ])
-            for control in ["timeout_seconds", "request_id"] {
+            let invalidBatches: [[String: Value]] = [
+                ["consultations": .array([]), "timeout_seconds": .int(0)],
+                ["consultations": batchConsultations(fixture: fixture, count: 17), "timeout_seconds": .int(0)],
+                [
+                    "consultations": batchConsultations(fixture: fixture, count: 1),
+                    "timeout_seconds": .int(0),
+                    "request_id": .string(UUID().uuidString)
+                ],
+                [
+                    "consultations": .array([
+                        .object([
+                            "message": .string("lane"),
+                            "model": .string(fixture.preset.id.uuidString),
+                            "request_id": .string(UUID().uuidString)
+                        ])
+                    ]),
+                    "timeout_seconds": .int(0)
+                ]
+            ]
+
+            for args in invalidBatches {
                 do {
-                    _ = try await fixture.call([
-                        "consultations": consultations,
-                        control: control == "timeout_seconds" ? .int(0) : .string(UUID().uuidString)
-                    ])
-                    XCTFail("batch must reject \(control)")
+                    _ = try await fixture.call(args)
+                    XCTFail("invalid batch must fail before admission")
                 } catch {
-                    XCTAssertTrue(error.localizedDescription.contains(control), error.localizedDescription)
-                    XCTAssertTrue(error.localizedDescription.contains("timeout_seconds:0"), error.localizedDescription)
+                    XCTAssertFalse(error.localizedDescription.isEmpty)
                 }
+                XCTAssertEqual(fixture.store.test_recordCount(), 0)
+                XCTAssertEqual(fixture.harness.openedStreamCount, 0)
             }
+        }
+    }
+
+    func testBatchSelectorValidationRejectsMixedUnknownAndAmbiguousNamesAtomically() async throws {
+        try await withFixture { fixture in
+            do {
+                _ = try await fixture.call([
+                    "consultations": .array([
+                        .object([
+                            "message": .string("valid lane"),
+                            "model": .string(fixture.preset.id.uuidString)
+                        ]),
+                        .object([
+                            "message": .string("invalid lane"),
+                            "model": .string("misspelled-preset")
+                        ])
+                    ]),
+                    "timeout_seconds": .int(0)
+                ])
+                XCTFail("unknown selector must reject the entire batch")
+            } catch {
+                XCTAssertTrue(
+                    error.localizedDescription.contains("consultations[1].model"),
+                    error.localizedDescription
+                )
+            }
+            XCTAssertEqual(fixture.store.test_recordCount(), 0)
+            XCTAssertEqual(fixture.window.oracleViewModel.sessions.count, 0)
             XCTAssertEqual(fixture.harness.openedStreamCount, 0)
 
-            let pending = try await fixture.ask(["timeout_seconds": .int(0)])
-            let operationID = try operationID(in: pending)
-            try await fixture.harness.waitUntilOpen(count: 1)
+            let duplicate = ModelPreset(
+                name: fixture.preset.name,
+                model: .customProviderUser(name: "ambiguous-selector"),
+                supportedModes: SupportedModes(chat: true, plan: true, review: true)
+            )
+            ModelPresetsManager.shared.presets = [fixture.preset, duplicate]
             do {
-                _ = try await fixture.call(["consultations": consultations])
-                XCTFail("batch requires an idle tab")
+                _ = try await fixture.call([
+                    "consultations": .array([
+                        .object([
+                            "message": .string("ambiguous lane"),
+                            "model": .string(fixture.preset.name)
+                        ])
+                    ]),
+                    "timeout_seconds": .int(0)
+                ])
+                XCTFail("ambiguous selector must reject the entire batch")
             } catch {
-                XCTAssertTrue(error.localizedDescription.contains(ChatToolErrorCode.oracleBatchRequiresIdleTab.rawValue), error.localizedDescription)
-                XCTAssertTrue(error.localizedDescription.contains(operationID.uuidString), error.localizedDescription)
-                XCTAssertTrue(error.localizedDescription.contains("No lanes were started"), error.localizedDescription)
+                XCTAssertTrue(
+                    error.localizedDescription.contains("unambiguous name"),
+                    error.localizedDescription
+                )
             }
-            XCTAssertEqual(fixture.harness.openedStreamCount, 1, "a rejected batch spends nothing")
+            XCTAssertEqual(fixture.store.test_recordCount(), 0)
+            XCTAssertEqual(fixture.window.oracleViewModel.sessions.count, 0)
+            XCTAssertEqual(fixture.harness.openedStreamCount, 0)
+        }
+    }
+
+    func testBatchPlanningModelSentinelRemainsValidWithoutUsablePresets() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let settings = GlobalSettingsStore.shared
+            let previousPlanningModelName = fixture.window.promptManager.planningModelName
+            defer {
+                fixture.window.promptManager.planningModelName = previousPlanningModelName
+            }
+            settings.setMCPShowModelPresets(false, commit: false)
+            settings.setMCPTemporarilyDisablePresets(false, commit: false)
+            fixture.window.promptManager.planningModelName = fixture.model.rawValue
+
+            let batch = try await fixture.call([
+                "consultations": .array([
+                    .object([
+                        "message": .string("planning sentinel lane"),
+                        "model": .string("current_chat_model")
+                    ])
+                ]),
+                "timeout_seconds": .int(0)
+            ])
+            let operationID = try XCTUnwrap(
+                try lanes(in: batch).first?["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            try await fixture.harness.waitUntilOpen(count: 1)
+            let replyContext = try XCTUnwrap(fixture.store.replyContext(operationID))
+            XCTAssertEqual(replyContext.modelSource, "planning_model")
+            XCTAssertEqual(replyContext.modelRawID, fixture.model.rawValue)
+
+            fixture.harness.finish(index: 0, text: "planning sentinel answer")
+            try await fixture.waitUntilTerminal(operationID)
+        }
+    }
+
+    func testBatchReturnsStableIndexedReceiptsAndQueuesBehindActualStreamCapacity() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 3),
+                "timeout_seconds": .int(0)
+            ])
+            let admitted = try lanes(in: batch)
+            XCTAssertEqual(admitted.map { $0["index"]?.intValue }, [0, 1, 2])
+            let operationIDs = try admitted.map {
+                try XCTUnwrap($0["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            }
+            XCTAssertEqual(batch["wait"]?.objectValue?["result"]?.stringValue, "polled")
+            XCTAssertEqual(batch["wait_policy"]?.objectValue?["mode"]?.stringValue, "poll")
+
+            try await fixture.harness.waitUntilOpen(count: 2)
+            let polled = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array(operationIDs.map { .string($0.uuidString) }),
+                "timeout_seconds": .int(0)
+            ])
+            let lanes = try lanes(in: polled)
+            XCTAssertEqual(lanes.map { $0["index"]?.intValue }, [0, 1, 2])
+            XCTAssertEqual(lanes[0]["pending"]?.objectValue?["stream_state"]?.stringValue, "streaming")
+            XCTAssertEqual(lanes[1]["pending"]?.objectValue?["stream_state"]?.stringValue, "streaming")
+            XCTAssertEqual(lanes[2]["pending"]?.objectValue?["stream_state"]?.stringValue, "queued")
+            XCTAssertNotNil(lanes[2]["chat_id"], "unbound batch receipts explicitly carry null chat_id")
+            XCTAssertNotNil(lanes[2]["query_id"], "unbound batch receipts explicitly carry null query_id")
+
+            fixture.harness.finish(index: 0, text: "lane zero")
+            try await fixture.harness.waitUntilOpen(count: 3)
+            XCTAssertEqual(fixture.store.snapshot(operationIDs[2])?.phase, .running)
+            fixture.harness.finish(index: 1, text: "lane one")
+            fixture.harness.finish(index: 2, text: "lane two")
+        }
+    }
+
+    func testBatchSameSessionRunRotationUsesCurrentRunAndRetainsOrigin() async throws {
+        try await withFixture { fixture in
+            let sessionID = UUID()
+            try fixture.activateAgentRunForBatch(
+                sessionID: sessionID,
+                activeRunID: fixture.runID
+            )
+            let gate = TestReleaseFence(name: "batch same-session rotation final gate")
+            defer { gate.release() }
+            fixture.window.oracleViewModel.setOracleRequestPreparedObserverForTesting {
+                await gate.enterAndWait()
+            }
+
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 1),
+                "timeout_seconds": .int(0)
+            ])
+            let operationID = try XCTUnwrap(
+                try lanes(in: batch).first?["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            await gate.waitUntilEntered()
+            XCTAssertEqual(fixture.store.snapshot(operationID)?.owner.originatingRunID, fixture.runID)
+
+            let rotatedRunID = UUID()
+            let session = fixture.window.agentModeViewModel.session(for: fixture.tabID)
+            session.runID = rotatedRunID
+            session.runState = .running
+            gate.release()
+
+            try await fixture.harness.waitUntilOpen(count: 1)
+            try await AsyncTestWait.waitUntil("rotated batch lane bound", timeout: 5) {
+                await MainActor.run { fixture.store.snapshot(operationID)?.phase == .running }
+            }
+            let replyContext = try XCTUnwrap(fixture.store.replyContext(operationID))
+            XCTAssertEqual(replyContext.agentModeSessionID, sessionID)
+            XCTAssertEqual(replyContext.agentModeRunID, rotatedRunID)
+            XCTAssertEqual(fixture.store.snapshot(operationID)?.owner.originatingRunID, fixture.runID)
+
+            fixture.harness.finish(index: 0, text: "rotated run answer")
+            try await fixture.waitUntilTerminal(operationID)
+        }
+    }
+
+    func testDelegatedBatchRejectsSameSessionRunRotationAtFinalReservationGate() async throws {
+        try await withFixture { fixture in
+            let sessionID = UUID()
+            try fixture.activateAgentRunForBatch(
+                sessionID: sessionID,
+                activeRunID: fixture.runID
+            )
+            let viewModel = fixture.window.agentModeViewModel
+            _ = try await viewModel.mcpActivateControlContext(
+                forTabID: fixture.tabID,
+                sessionID: sessionID,
+                originatingConnectionID: fixture.connectionID,
+                startPending: true
+            )
+            let session = viewModel.session(for: fixture.tabID)
+            session.runID = fixture.runID
+            session.runState = .running
+            viewModel.setAgentRunActive(fixture.tabID, isActive: true)
+
+            let workspace = try XCTUnwrap(fixture.window.workspaceManager.activeWorkspace)
+            let source = AgentRunOracleReviewSource.captured(.init(
+                sourceTabID: fixture.tabID,
+                workspaceID: workspace.id,
+                sourceSelectionRevision: fixture.window.workspaceManager.selectionRevisionForMCP(
+                    workspaceID: workspace.id,
+                    tabID: fixture.tabID
+                ),
+                promptText: "frozen delegated review source",
+                selection: StoredSelection(),
+                lookupContext: .visibleWorkspace,
+                reviewGitContext: .automaticOnly(
+                    base: "HEAD",
+                    workspaceRootPaths: workspace.repoPaths
+                ),
+                sourceAgentSessionID: sessionID,
+                sourceAgentRunID: fixture.runID,
+                sourceWorktreeBindings: []
+            ))
+            try viewModel.mcpStageAgentRunOracleReviewSource(
+                source,
+                targetTabID: fixture.tabID,
+                targetSessionID: sessionID,
+                expectedParentSessionID: session.parentSessionID
+            )
+            XCTAssertNotNil(
+                viewModel.mcpBindPendingAgentRunOracleReviewContext(
+                    tabID: fixture.tabID,
+                    runID: fixture.runID
+                )
+            )
+
+            let gate = TestReleaseFence(name: "delegated batch originating-run final gate")
+            defer { gate.release() }
+            fixture.window.oracleViewModel.setOracleRequestPreparedObserverForTesting {
+                await gate.enterAndWait()
+            }
+            let batch = try await fixture.call([
+                "consultations": .array([
+                    .object([
+                        "message": .string("Review the delegated source"),
+                        "model": .string(fixture.preset.id.uuidString),
+                        "mode": .string("review")
+                    ])
+                ]),
+                "timeout_seconds": .int(0)
+            ])
+            let operationID = try XCTUnwrap(
+                try lanes(in: batch).first?["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            await gate.waitUntilEntered()
+
+            session.runID = UUID()
+            session.runState = .running
+            gate.release()
+
+            try await fixture.waitUntilTerminal(operationID)
+            XCTAssertEqual(fixture.harness.openedStreamCount, 0)
+            let collected = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array([.string(operationID.uuidString)]),
+                "timeout_seconds": .int(0)
+            ])
+            let terminal = try XCTUnwrap(try lanes(in: collected).first)
+            XCTAssertEqual(terminal["consultation_started"]?.boolValue, false)
+            XCTAssertEqual(
+                terminal["error"]?.objectValue?["code"]?.stringValue,
+                ChatToolErrorCode.notStartedOwnerInactive.rawValue
+            )
+        }
+    }
+
+    func testBatchFIFOAcrossInvocationsAndPostBindActivationDoesNotSerialize() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let gate = TestReleaseFence(name: "first batch post-bind activation")
+            defer { gate.release() }
+            var postBindCount = 0
+            fixture.window.mcpServer.setOraclePostBindObserverForTesting { _, _ in
+                postBindCount += 1
+                if postBindCount == 1 {
+                    await gate.enterAndWait()
+                }
+            }
+
+            let firstBatch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 2),
+                "timeout_seconds": .int(0)
+            ])
+            let firstIDs = try lanes(in: firstBatch).map {
+                try XCTUnwrap($0["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            }
+            await gate.waitUntilEntered()
+            try await fixture.harness.waitUntilOpen(count: 2)
+            XCTAssertEqual(postBindCount, 2, "the next lane binds while prior post-bind activation is parked")
+            XCTAssertTrue(firstIDs.allSatisfy { fixture.store.snapshot($0)?.phase == .running })
+
+            let secondBatch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 2),
+                "timeout_seconds": .int(0)
+            ])
+            let secondIDs = try lanes(in: secondBatch).map {
+                try XCTUnwrap($0["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            }
+            XCTAssertEqual(fixture.store.test_batchQueue(fixture.tabID), secondIDs)
+            XCTAssertTrue(secondIDs.allSatisfy { fixture.store.snapshot($0)?.phase == .queued })
+            gate.release()
+
+            fixture.harness.finish(index: 0, text: "first batch lane zero")
+            try await fixture.harness.waitUntilOpen(count: 3)
+            XCTAssertEqual(fixture.store.snapshot(secondIDs[0])?.phase, .running)
+            XCTAssertEqual(fixture.store.snapshot(secondIDs[1])?.phase, .queued)
+
+            fixture.harness.finish(index: 1, text: "first batch lane one")
+            try await fixture.harness.waitUntilOpen(count: 4)
+            XCTAssertEqual(fixture.store.snapshot(secondIDs[1])?.phase, .running)
+
+            fixture.harness.finish(index: 2, text: "second batch lane zero")
+            fixture.harness.finish(index: 3, text: "second batch lane one")
+            for operationID in firstIDs + secondIDs {
+                try await fixture.waitUntilTerminal(operationID)
+            }
+        }
+    }
+
+    func testBatchSchedulerRespectsLegacyOracleSendActualStreamOccupancy() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            async let legacyResult = fixture.legacySend(message: "legacy occupancy")
+            try await fixture.harness.waitUntilOpen(count: 1)
+
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 2),
+                "timeout_seconds": .int(0)
+            ])
+            let admitted = try lanes(in: batch)
+            let operationIDs = try admitted.map {
+                try XCTUnwrap($0["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            }
+
+            try await fixture.harness.waitUntilOpen(count: 2)
+            XCTAssertEqual(fixture.store.snapshot(operationIDs[0])?.phase, .running)
+            XCTAssertEqual(fixture.store.snapshot(operationIDs[1])?.phase, .queued)
+            XCTAssertEqual(
+                fixture.harness.openedStreamCount,
+                2,
+                "one legacy stream leaves capacity for exactly one batch lane"
+            )
+
+            fixture.harness.finish(index: 0, text: "legacy complete")
+            _ = try await legacyResult
+            try await fixture.harness.waitUntilOpen(count: 3)
+            XCTAssertEqual(fixture.store.snapshot(operationIDs[1])?.phase, .running)
+
+            fixture.harness.finish(index: 1, text: "batch zero")
+            fixture.harness.finish(index: 2, text: "batch one")
+            try await fixture.waitUntilTerminal(operationIDs[0])
+            try await fixture.waitUntilTerminal(operationIDs[1])
+        }
+    }
+
+    func testBatchLateReservationRaceParksPreparedLaneWithoutRepackaging() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let gate = TestReleaseFence(name: "batch post-packaging reservation gate")
+            defer { gate.release() }
+            var preparedCount = 0
+            var shouldBlockFirst = true
+            fixture.window.oracleViewModel.setOracleRequestPreparedObserverForTesting {
+                preparedCount += 1
+                if shouldBlockFirst {
+                    shouldBlockFirst = false
+                    await gate.enterAndWait()
+                }
+            }
+
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 1),
+                "timeout_seconds": .int(0)
+            ])
+            let batchLane = try XCTUnwrap(try lanes(in: batch).first)
+            let batchOperationID = try XCTUnwrap(
+                batchLane["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            await gate.waitUntilEntered()
+
+            let firstSingle = try await fixture.ask(["timeout_seconds": .int(0)], message: "occupy one")
+            let secondSingle = try await fixture.ask(["timeout_seconds": .int(0)], message: "occupy two")
+            let firstSingleID = try operationID(in: firstSingle)
+            let secondSingleID = try operationID(in: secondSingle)
+            try await fixture.harness.waitUntilOpen(count: 2)
+
+            gate.release()
+            try await AsyncTestWait.waitUntil("prepared batch lane parks after capacity race", timeout: 5) {
+                await MainActor.run {
+                    fixture.store.snapshot(batchOperationID)?.phase == .queued
+                }
+            }
+            XCTAssertEqual(fixture.harness.openedStreamCount, 2)
+            XCTAssertEqual(preparedCount, 3, "the batch lane and two singles package exactly once each")
+
+            fixture.harness.finish(index: 0, text: "free capacity")
+            try await fixture.harness.waitUntilOpen(count: 3)
+            XCTAssertEqual(fixture.store.snapshot(batchOperationID)?.phase, .running)
+            XCTAssertEqual(preparedCount, 3, "capacity wake must reuse the prepared request")
+            fixture.harness.finish(index: 1, text: "second single")
+            fixture.harness.finish(index: 2, text: "batch")
+            try await fixture.waitUntilTerminal(firstSingleID)
+            try await fixture.waitUntilTerminal(secondSingleID)
+        }
+    }
+
+    func testBatchCancellationAfterPackagingFailsFinalGateWithoutSpend() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let gate = TestReleaseFence(name: "batch cancellation after packaging")
+            defer { gate.release() }
+            fixture.window.oracleViewModel.setOracleRequestPreparedObserverForTesting {
+                await gate.enterAndWaitIgnoringCancellationUntilRelease()
+            }
+            let initialSessionIDs = fixture.window.oracleViewModel.sessions.map(\.id)
+
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 1),
+                "timeout_seconds": .int(0)
+            ])
+            let operationID = try XCTUnwrap(
+                try lanes(in: batch).first?["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            await gate.waitUntilEntered()
+            let startupTask = try XCTUnwrap(fixture.store.test_startupTask(operationID))
+
+            let cancelled = try await fixture.call([
+                "op": .string("cancel"),
+                "operation_ids": .array([.string(operationID.uuidString)])
+            ])
+            XCTAssertEqual(try lanes(in: cancelled).first?["cancel"]?.stringValue, "requested")
+            gate.release()
+            let startupError = await startupTask.value
+
+            XCTAssertEqual(startupError?.code, .internalError)
+            XCTAssertEqual(
+                startupError?.message,
+                "ask_oracle batch lane could not be reserved because its accepted receipt is no longer eligible"
+            )
+            XCTAssertEqual(fixture.store.snapshot(operationID)?.phase, .cancelled)
+            XCTAssertNil(fixture.store.snapshot(operationID)?.chatID)
+            XCTAssertNil(fixture.store.snapshot(operationID)?.queryID)
+            XCTAssertFalse(fixture.store.test_ownsPin(operationID))
+            XCTAssertEqual(fixture.window.oracleViewModel.sessions.map(\.id), initialSessionIDs)
+            XCTAssertEqual(
+                fixture.window.oracleViewModel.mcpActiveOracleStreamCount(forTabID: fixture.tabID),
+                0
+            )
+            XCTAssertEqual(fixture.harness.openedStreamCount, 0)
+        }
+    }
+
+    func testBatchPurgedCancelledReceiptFailsClosedBeforeSendPreparation() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let gate = TestReleaseFence(name: "batch purged cancelled receipt")
+            defer { gate.release() }
+            fixture.window.mcpServer.setBeforeAskOraclePreparationForTesting {
+                await gate.enterAndWaitIgnoringCancellationUntilRelease()
+            }
+            let initialSessionIDs = fixture.window.oracleViewModel.sessions.map(\.id)
+
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 1),
+                "timeout_seconds": .int(0)
+            ])
+            let operationID = try XCTUnwrap(
+                try lanes(in: batch).first?["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            await gate.waitUntilEntered()
+            let startupTask = try XCTUnwrap(fixture.store.test_startupTask(operationID))
+
+            _ = try await fixture.call([
+                "op": .string("cancel"),
+                "operation_ids": .array([.string(operationID.uuidString)])
+            ])
+            fixture.store.purge(
+                now: Date().addingTimeInterval(
+                    OracleMCPOperationStore.undeliveredRetentionSeconds + 1
+                )
+            )
+            XCTAssertNil(fixture.store.snapshot(operationID))
+
+            gate.release()
+            let startupError = await startupTask.value
+            XCTAssertEqual(startupError?.code, .internalError)
+            XCTAssertEqual(
+                startupError?.message,
+                "ask_oracle operation receipt is no longer available before send preparation"
+            )
+            XCTAssertEqual(fixture.window.oracleViewModel.sessions.map(\.id), initialSessionIDs)
+            XCTAssertEqual(
+                fixture.window.oracleViewModel.mcpActiveOracleStreamCount(forTabID: fixture.tabID),
+                0
+            )
+            XCTAssertEqual(fixture.harness.openedStreamCount, 0)
+
+            let expired = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array([.string(operationID.uuidString)]),
+                "timeout_seconds": .int(0)
+            ])
+            let expiredLane = try XCTUnwrap(try lanes(in: expired).first)
+            XCTAssertEqual(expiredLane["status"]?.stringValue, "unknown")
+            XCTAssertEqual(
+                expiredLane["error"]?.objectValue?["code"]?.stringValue,
+                ChatToolErrorCode.oracleOperationExpired.rawValue
+            )
+        }
+    }
+
+    func testBatchTeardownAfterPackagingReturnsTypedNoSpendFailure() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let gate = TestReleaseFence(name: "batch teardown after packaging")
+            defer { gate.release() }
+            fixture.window.oracleViewModel.setOracleRequestPreparedObserverForTesting {
+                await gate.enterAndWaitIgnoringCancellationUntilRelease()
+            }
+            let initialSessionIDs = fixture.window.oracleViewModel.sessions.map(\.id)
+
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 1),
+                "timeout_seconds": .int(0)
+            ])
+            let operationID = try XCTUnwrap(
+                try lanes(in: batch).first?["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            await gate.waitUntilEntered()
+            let startupTask = try XCTUnwrap(fixture.store.test_startupTask(operationID))
+
+            fixture.store.teardown()
+            gate.release()
+            let startupError = await startupTask.value
+            try await fixture.waitUntilTerminal(operationID)
+            XCTAssertEqual(startupError?.code, .internalError)
+            XCTAssertEqual(
+                startupError?.message,
+                "ask_oracle batch lane could not be reserved because its accepted receipt is no longer eligible"
+            )
+            XCTAssertEqual(fixture.harness.openedStreamCount, 0)
+            XCTAssertNil(fixture.store.snapshot(operationID)?.chatID)
+            XCTAssertNil(fixture.store.snapshot(operationID)?.queryID)
+            XCTAssertFalse(fixture.store.test_ownsPin(operationID))
+            XCTAssertEqual(fixture.window.oracleViewModel.sessions.map(\.id), initialSessionIDs)
+            XCTAssertEqual(
+                fixture.window.oracleViewModel.mcpActiveOracleStreamCount(forTabID: fixture.tabID),
+                0
+            )
+
+            let collected = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array([.string(operationID.uuidString)]),
+                "timeout_seconds": .int(0)
+            ])
+            let terminal = try XCTUnwrap(try lanes(in: collected).first)
+            XCTAssertEqual(terminal["consultation_started"]?.boolValue, false)
+            XCTAssertEqual(
+                terminal["error"]?.objectValue?["code"]?.stringValue,
+                ChatToolErrorCode.internalError.rawValue
+            )
+            XCTAssertEqual(
+                terminal["error"]?.objectValue?["message"]?.stringValue,
+                "ask_oracle batch lane could not be reserved because its accepted receipt is no longer eligible"
+            )
+        }
+    }
+
+    func testExplicitSendBatchPlanLaneUsesSharedBatchPackaging() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let batch = try await fixture.call([
+                "op": .string("send"),
+                "consultations": .array([
+                    .object([
+                        "message": .string("Plan through the shared batch source"),
+                        "model": .string(fixture.preset.id.uuidString),
+                        "mode": .string("plan")
+                    ])
+                ]),
+                "timeout_seconds": .int(0)
+            ])
+            let lane = try XCTUnwrap(try lanes(in: batch).first)
+            let operationID = try XCTUnwrap(
+                lane["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            XCTAssertEqual(lane["index"]?.intValue, 0)
+            try await fixture.harness.waitUntilOpen(count: 1)
+            XCTAssertEqual(fixture.store.snapshot(operationID)?.finalization.mode, "plan")
+            XCTAssertEqual(fixture.store.replyContext(operationID)?.mode, "plan")
+
+            fixture.harness.finish(index: 0, text: "plan answer")
+            try await fixture.waitUntilTerminal(operationID)
+        }
+    }
+
+    func testQueuedBatchCancellationSpendsNothingAndDeliversIndexedTerminalLane() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(
+                    fixture: fixture,
+                    count: 3,
+                    responseModeForLast: "tail"
+                ),
+                "timeout_seconds": .int(0)
+            ])
+            let admitted = try lanes(in: batch)
+            let operationIDs = try admitted.map {
+                try XCTUnwrap($0["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            }
+            try await fixture.harness.waitUntilOpen(count: 2)
+            XCTAssertEqual(fixture.store.snapshot(operationIDs[2])?.phase, .queued)
+
+            let cancelled = try await fixture.call([
+                "op": .string("cancel"),
+                "operation_ids": .array([.string(operationIDs[2].uuidString)])
+            ])
+            let cancelLane = try XCTUnwrap(try lanes(in: cancelled).first)
+            XCTAssertEqual(cancelLane["index"]?.intValue, 2)
+            XCTAssertEqual(cancelLane["cancel"]?.stringValue, "requested")
+            XCTAssertEqual(
+                cancelled["resume"]?.objectValue?["operation_ids"]?.arrayValue?.compactMap(\.stringValue),
+                [operationIDs[2].uuidString]
+            )
+
+            let collected = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array([.string(operationIDs[2].uuidString)]),
+                "timeout_seconds": .int(0)
+            ])
+            let terminal = try XCTUnwrap(try lanes(in: collected).first)
+            XCTAssertEqual(terminal["index"]?.intValue, 2)
+            XCTAssertEqual(terminal["status"]?.stringValue, "cancelled")
+            XCTAssertEqual(terminal["consultation_started"]?.boolValue, false)
+            XCTAssertEqual(terminal["export_skipped"]?.stringValue, "cancelled")
+            XCTAssertNil(terminal["response"])
+
+            fixture.harness.finish(index: 0, text: "first")
+            fixture.harness.finish(index: 1, text: "second")
+            try await fixture.waitUntilTerminal(operationIDs[0])
+            try await fixture.waitUntilTerminal(operationIDs[1])
+            XCTAssertEqual(fixture.harness.openedStreamCount, 2, "cancelled queued work never starts a provider")
+        }
+    }
+
+    func testBatchOwnerBecomingInactiveAfterPreparationFailsBeforeReservation() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            let gate = TestReleaseFence(name: "batch owner liveness final gate")
+            defer { gate.release() }
+            var shouldBlockFirst = true
+            fixture.window.oracleViewModel.setOracleRequestPreparedObserverForTesting {
+                if shouldBlockFirst {
+                    shouldBlockFirst = false
+                    await gate.enterAndWait()
+                }
+            }
+
+            let batch = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 1),
+                "timeout_seconds": .int(0)
+            ])
+            let lane = try XCTUnwrap(try lanes(in: batch).first)
+            let operationID = try XCTUnwrap(
+                lane["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            await gate.waitUntilEntered()
+
+            let session = fixture.window.agentModeViewModel.session(for: fixture.tabID)
+            session.runState = .completed
+            fixture.window.agentModeViewModel.setAgentRunActive(fixture.tabID, isActive: false)
+            gate.release()
+
+            try await fixture.waitUntilTerminal(operationID)
+            XCTAssertEqual(fixture.harness.openedStreamCount, 0)
+            let collected = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array([.string(operationID.uuidString)]),
+                "timeout_seconds": .int(0)
+            ])
+            let terminal = try XCTUnwrap(try lanes(in: collected).first)
+            XCTAssertEqual(terminal["index"]?.intValue, 0)
+            XCTAssertEqual(terminal["consultation_started"]?.boolValue, false)
+            XCTAssertEqual(
+                terminal["error"]?.objectValue?["code"]?.stringValue,
+                ChatToolErrorCode.notStartedOwnerInactive.rawValue
+            )
+        }
+    }
+
+    func testIDLessWaitRecoversMoreThanSixteenBatchLanesWithSafeResumeArgs() async throws {
+        try await withFixture { fixture in
+            try fixture.activateAgentRunForBatch()
+            _ = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 16),
+                "timeout_seconds": .int(0)
+            ])
+            _ = try await fixture.call([
+                "consultations": batchConsultations(fixture: fixture, count: 1),
+                "timeout_seconds": .int(0)
+            ])
+
+            let recovered = try await fixture.call([
+                "op": .string("wait"),
+                "timeout_seconds": .int(0)
+            ])
+            XCTAssertEqual(try lanes(in: recovered).count, 17)
+            XCTAssertEqual(
+                recovered["wait"]?.objectValue?["pending_operation_ids"]?.arrayValue?.count,
+                17
+            )
+            XCTAssertEqual(recovered["resume"]?.objectValue?["op"]?.stringValue, "wait")
+            XCTAssertNil(
+                recovered["resume"]?.objectValue?["operation_ids"],
+                "resume must omit an invalid >16 explicit handle list"
+            )
         }
     }
 

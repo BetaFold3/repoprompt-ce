@@ -44,8 +44,8 @@ public enum MCPTimeoutPolicy {
     /// Default CLI-side deadline for ordinary tool responses.
     public static let cliDefaultToolCallTimeoutSeconds: TimeInterval = 300
     /// Long-running tools whose provider/run cancellation contract is authoritative.
-    /// `ask_oracle` is classified from its arguments by the owned CLI because
-    /// single sends and waits are bounded while Step B batches remain blocking.
+    /// `ask_oracle` is classified from its arguments by the owned CLI because every
+    /// send (single or batch) and wait has a bounded response envelope.
     public static let cliDefaultUnboundedToolNames: Set<String> = [
         "context_builder"
     ]

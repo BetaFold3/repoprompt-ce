@@ -564,6 +564,8 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
     }
 
     func testOracleOperationPresentationDistinguishesFrozenStatesAndMultiHandleEnvelopes() throws {
+        XCTAssertEqual(OracleToolCardState.queued.visualStatus, .warning)
+        XCTAssertEqual(OracleToolCardState.preparing.visualStatus, .warning)
         XCTAssertEqual(OracleToolCardState.pending.visualStatus, .warning)
         XCTAssertEqual(OracleToolCardState.cancelling.visualStatus, .warning)
         XCTAssertEqual(OracleToolCardState.completed.visualStatus, .success)
@@ -572,6 +574,7 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
 
         let pendingRaw = jsonString([
             "status": "pending",
+            "index": 2,
             "operation_id": "11111111-1111-1111-1111-111111111111",
             "chat_id": "pending-chat",
             "mode": "plan",
@@ -593,6 +596,7 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         )
 
         XCTAssertEqual(pendingDTO.status, "pending")
+        XCTAssertEqual(pendingDTO.index, 2)
         XCTAssertEqual(pendingDTO.operationID, "11111111-1111-1111-1111-111111111111")
         XCTAssertEqual(pendingDTO.pending?.reason, "timed_out")
         XCTAssertEqual(pendingDTO.pending?.streamState, "streaming")
@@ -602,9 +606,27 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertEqual(pendingDTO.waitPolicy?.parentFamily, "claude")
         XCTAssertEqual(pendingPresentation.state, .pending)
         XCTAssertEqual(pendingPresentation.waitLabel, "wait ≤3m")
-        XCTAssertTrue(pendingPresentation.subtitle.contains("Last reported pending"), pendingPresentation.subtitle)
-        XCTAssertFalse(pendingPresentation.subtitle.lowercased().contains("running"), pendingPresentation.subtitle)
+        XCTAssertTrue(pendingPresentation.subtitle.contains("Last reported running"), pendingPresentation.subtitle)
         XCTAssertEqual(pendingPresentation.singleChatID, "pending-chat")
+
+        for (streamState, expectedState) in [
+            ("queued", OracleToolCardState.queued),
+            ("starting", OracleToolCardState.preparing)
+        ] {
+            let raw = jsonString([
+                "status": "pending",
+                "operation_id": UUID().uuidString,
+                "pending": ["stream_state": streamState]
+            ])
+            let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: raw))
+            XCTAssertEqual(
+                OracleToolCardPresentation(
+                    dto: dto,
+                    resultObject: ToolJSON.structuredResultObject(from: raw)
+                ).state,
+                expectedState
+            )
+        }
 
         let cancellingRaw = jsonString([
             "status": "pending",
@@ -738,7 +760,7 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertEqual(envelopePresentation.state, .failed)
         XCTAssertEqual(envelopePresentation.waitLabel, "poll")
         XCTAssertTrue(envelopePresentation.subtitle.contains("1 failed"), envelopePresentation.subtitle)
-        XCTAssertTrue(envelopePresentation.subtitle.contains("1 last reported pending"), envelopePresentation.subtitle)
+        XCTAssertTrue(envelopePresentation.subtitle.contains("1 last reported running"), envelopePresentation.subtitle)
         XCTAssertEqual(
             envelopePresentation.uniqueChatIDs,
             ["completed-chat", "pending-chat", "cancelled-chat"]
@@ -764,7 +786,8 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             queryID: UUID(),
             mode: "review",
             modelPresetName: "Oracle",
-            terminalReason: nil
+            terminalReason: nil,
+            batchIndex: nil
         )
         let runningPresentation = OracleToolCardLivePresentation(
             summary: running,
@@ -786,7 +809,8 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             queryID: UUID(),
             mode: "review",
             modelPresetName: "Oracle",
-            terminalReason: nil
+            terminalReason: nil,
+            batchIndex: nil
         )
         let readyPresentation = OracleToolCardLivePresentation(summary: ready)
         XCTAssertEqual(readyPresentation.text, "Oracle finished — not yet collected")
@@ -805,7 +829,8 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             queryID: UUID(),
             mode: "review",
             modelPresetName: "Oracle",
-            terminalReason: nil
+            terminalReason: nil,
+            batchIndex: nil
         )
         XCTAssertEqual(
             OracleToolCardLivePresentation(summary: collected).text,
@@ -825,7 +850,8 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             queryID: UUID(),
             mode: "review",
             modelPresetName: "Oracle",
-            terminalReason: nil
+            terminalReason: nil,
+            batchIndex: nil
         )
         XCTAssertEqual(
             OracleToolCardLivePresentation(

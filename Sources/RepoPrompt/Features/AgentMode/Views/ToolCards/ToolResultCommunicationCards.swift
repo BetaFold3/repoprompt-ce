@@ -37,6 +37,8 @@ private func nonEmptyOracleToolCardText(_ value: String?) -> String? {
 }
 
 enum OracleToolCardState: String, Equatable, Hashable {
+    case queued
+    case preparing
     case pending
     case cancelling
     case completed
@@ -45,7 +47,9 @@ enum OracleToolCardState: String, Equatable, Hashable {
 
     var displayLabel: String {
         switch self {
-        case .pending: "Last reported pending"
+        case .queued: "Last reported queued"
+        case .preparing: "Last reported preparing"
+        case .pending: "Last reported running"
         case .cancelling: "Cancelling"
         case .completed: "Completed"
         case .cancelled: "Cancelled"
@@ -55,7 +59,7 @@ enum OracleToolCardState: String, Equatable, Hashable {
 
     var visualStatus: ToolCardStatus {
         switch self {
-        case .pending, .cancelling, .cancelled: .warning
+        case .queued, .preparing, .pending, .cancelling, .cancelled: .warning
         case .completed: .success
         case .failed: .failure
         }
@@ -97,6 +101,14 @@ struct OracleToolCardLanePresentation: Equatable {
         {
             return .cancelling
         }
+        switch dto.pending?.streamState?.lowercased() {
+        case "queued":
+            return .queued
+        case "starting":
+            return .preparing
+        default:
+            break
+        }
         switch dto.status?.lowercased() {
         case "pending", "running", "starting":
             return .pending
@@ -128,6 +140,8 @@ struct OracleToolCardPresentation: Equatable {
         if lanes.contains(where: { $0.state == .failed }) { return .failed }
         if lanes.contains(where: { $0.state == .cancelling }) { return .cancelling }
         if lanes.contains(where: { $0.state == .pending }) { return .pending }
+        if lanes.contains(where: { $0.state == .preparing }) { return .preparing }
+        if lanes.contains(where: { $0.state == .queued }) { return .queued }
         if lanes.contains(where: { $0.state == .cancelled }) { return .cancelled }
         return .completed
     }
@@ -138,7 +152,15 @@ struct OracleToolCardPresentation: Equatable {
             base = lanes[0].subtitle
         } else {
             let counts = Dictionary(grouping: lanes, by: \.state).mapValues(\.count)
-            let order: [OracleToolCardState] = [.failed, .cancelling, .pending, .cancelled, .completed]
+            let order: [OracleToolCardState] = [
+                .failed,
+                .cancelling,
+                .pending,
+                .preparing,
+                .queued,
+                .cancelled,
+                .completed
+            ]
             base = order.compactMap { state in
                 guard let count = counts[state] else { return nil }
                 return "\(count) \(state.displayLabel.lowercased())"
@@ -174,7 +196,11 @@ struct OracleToolCardLivePresentation: Equatable, Identifiable {
             "Collected"
         } else {
             switch summary.phase {
-            case .starting, .running:
+            case .queued:
+                "Oracle queued · \(Self.elapsedLabel(summary.elapsed(at: now)))"
+            case .starting:
+                "Oracle preparing · \(Self.elapsedLabel(summary.elapsed(at: now)))"
+            case .running:
                 "Oracle running · \(Self.elapsedLabel(summary.elapsed(at: now)))"
             case .cancelling:
                 "Oracle cancelling · \(Self.elapsedLabel(summary.elapsed(at: now)))"
@@ -214,9 +240,12 @@ private struct OracleToolCardLiveSidecar: View {
     private func presentations(at now: Date) -> [OracleToolCardLivePresentation] {
         _ = operationStore.phaseRevision
         return lanes.compactMap { lane in
-            guard lane.state == .pending || lane.state == .cancelling,
-                  let operationID = lane.operationID.flatMap({ UUID(uuidString: $0) }),
-                  let summary = operationStore.summary(for: operationID)
+            guard lane.state == .queued
+                || lane.state == .preparing
+                || lane.state == .pending
+                || lane.state == .cancelling,
+                let operationID = lane.operationID.flatMap({ UUID(uuidString: $0) }),
+                let summary = operationStore.summary(for: operationID)
             else {
                 return nil
             }

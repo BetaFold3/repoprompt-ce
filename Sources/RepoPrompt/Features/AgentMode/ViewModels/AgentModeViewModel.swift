@@ -17503,6 +17503,25 @@ final class AgentModeViewModel: ObservableObject {
         tabsWithActiveAgentRun.contains(tabID)
     }
 
+    /// Synchronous, non-hydrating owner-liveness read for queued Oracle reservation.
+    /// Session-owned work may follow a run rotation in the same durable session; run-only
+    /// work remains bound to the exact captured run.
+    func mcpOracleActiveRunID(
+        tabID: UUID,
+        ownerSessionID: UUID?,
+        ownerRunID: UUID?
+    ) -> UUID? {
+        guard ownerSessionID != nil || ownerRunID != nil,
+              let session = sessions[tabID],
+              session.runState.isActive,
+              let activeRunID = session.runID
+        else { return nil }
+        if let ownerSessionID {
+            return session.activeAgentSessionID == ownerSessionID ? activeRunID : nil
+        }
+        return activeRunID == ownerRunID ? activeRunID : nil
+    }
+
     func runState(for tabID: UUID) -> AgentSessionRunState {
         sessions[tabID]?.runState ?? .idle
     }

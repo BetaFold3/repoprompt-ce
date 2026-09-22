@@ -1076,6 +1076,7 @@ enum ToolResultDTOs {
 
         let ok: Bool?
         let status: String?
+        let index: Int?
         let operationID: String?
         let queryID: String?
         let pending: Pending?
@@ -1108,6 +1109,7 @@ enum ToolResultDTOs {
         private enum CodingKeys: String, CodingKey {
             case ok
             case status
+            case index
             case operationID = "operation_id"
             case queryID = "query_id"
             case pending
@@ -1145,6 +1147,7 @@ enum ToolResultDTOs {
             errors: [String]?,
             ok: Bool? = nil,
             status: String? = nil,
+            index: Int? = nil,
             operationID: String? = nil,
             queryID: String? = nil,
             pending: Pending? = nil,
@@ -1169,6 +1172,7 @@ enum ToolResultDTOs {
         ) {
             self.ok = ok
             self.status = status
+            self.index = index
             self.operationID = operationID
             self.queryID = queryID
             self.pending = pending
@@ -1201,6 +1205,7 @@ enum ToolResultDTOs {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             ok = try container.decodeIfPresent(Bool.self, forKey: .ok)
             status = try container.decodeIfPresent(String.self, forKey: .status)
+            index = try container.decodeIfPresent(Int.self, forKey: .index)
             operationID = try container.decodeIfPresent(String.self, forKey: .operationID)
             queryID = try container.decodeIfPresent(String.self, forKey: .queryID)
             pending = try container.decodeIfPresent(Pending.self, forKey: .pending)
@@ -1246,6 +1251,7 @@ enum ToolResultDTOs {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encodeIfPresent(ok, forKey: .ok)
             try container.encodeIfPresent(status, forKey: .status)
+            try container.encodeIfPresent(index, forKey: .index)
             try container.encodeIfPresent(operationID, forKey: .operationID)
             try container.encodeIfPresent(queryID, forKey: .queryID)
             try container.encodeIfPresent(pending, forKey: .pending)

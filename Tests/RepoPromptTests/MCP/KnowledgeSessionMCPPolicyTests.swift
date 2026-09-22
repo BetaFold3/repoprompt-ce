@@ -164,7 +164,9 @@ final class KnowledgeSessionMCPPolicyTests: XCTestCase {
             XCTAssertTrue(projected.contains("op:wait"))
             XCTAssertTrue(projected.contains("without operation_ids"))
             XCTAssertTrue(projected.contains("does not warm a prompt cache"))
-            XCTAssertTrue(projected.contains("consultations batches remain blocking"))
+            XCTAssertTrue(projected.contains("consultations batches accept 1...16 lanes"))
+            XCTAssertTrue(projected.contains("stable indexed operation receipts"))
+            XCTAssertTrue(projected.contains("Resume or cancel pending lanes"))
             XCTAssertTrue(projected.contains("not persisted across app relaunch"))
 
             let unrelated = await manager.debugAdvertisedToolDescription(

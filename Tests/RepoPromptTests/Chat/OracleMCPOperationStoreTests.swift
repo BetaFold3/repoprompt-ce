@@ -23,6 +23,16 @@ private final class WeakOracleReference: @unchecked Sendable {
     }
 }
 
+private final class BatchStartupCapture {}
+
+private final class WeakBatchStartupCaptureReference {
+    weak var value: BatchStartupCapture?
+
+    init(_ value: BatchStartupCapture) {
+        self.value = value
+    }
+}
+
 /// Oracle resumable wait plan §5: store receipts, park primitive, single-flight delivery,
 /// terminal-reason classification, owner matching, eviction, and teardown — with fake
 /// dependencies so no stream, chat, or view model is involved.
@@ -39,6 +49,7 @@ final class OracleMCPOperationStoreTests: XCTestCase {
         var repliesByQueryID: [UUID: [String: Value]] = [:]
         var captureFailures: Set<UUID> = []
         var chatNames: [UUID: String] = [:]
+        var activeStreamCount = 0
         var now = Date(timeIntervalSince1970: 1_700_000_000)
         /// Queries whose wait returns even though the message is neither finalized nor missing.
         var unobservedQueryIDs: Set<UUID> = []
@@ -68,6 +79,7 @@ final class OracleMCPOperationStoreTests: XCTestCase {
                 self?.unpinCounts[chatID, default: 0] += 1
             },
             chatName: { [weak self] chatID in self?.chatNames[chatID] },
+            activeStreamCount: { [weak self] _ in self?.activeStreamCount ?? 0 },
             now: { [weak self] in self?.now ?? Date() }
         ))
 
@@ -266,6 +278,147 @@ final class OracleMCPOperationStoreTests: XCTestCase {
             }
             XCTAssertNil(candidate.weak.value)
         }
+    }
+
+    func testAdmissionBoundIsAtomicAcrossOwnersAndKeyedReplayStillWorksAtLimit() throws {
+        let harness = Harness()
+        harness.activeStreamCount = OracleViewModel.maxConcurrentMCPOracleStreamsPerTab
+        let ownerA = makeOwner(sessionID: UUID(), runID: UUID())
+        let ownerB = makeOwner(sessionID: UUID(), runID: UUID())
+        let requestKey = OracleMCPOperationStore.RequestKey(owner: ownerA, requestID: UUID())
+        let keyed = try harness.store.reserve(
+            owner: ownerA,
+            finalization: makeFinalization(),
+            requestKey: requestKey,
+            intentDigest: "same"
+        )
+        guard case let .reserved(keyedOperationID) = keyed else {
+            return XCTFail("expected keyed reservation")
+        }
+        for _ in 1 ..< 31 {
+            _ = try harness.store.reserve(owner: ownerA, finalization: makeFinalization())
+        }
+        XCTAssertEqual(harness.store.test_recordCount(), 31)
+
+        let submission = OracleMCPOperationStore.BatchSubmission(
+            finalization: makeFinalization(),
+            activeRunProvider: { UUID() },
+            startup: { _ in nil }
+        )
+        do {
+            _ = try harness.store.admitBatch(owner: ownerB, submissions: [submission, submission])
+            XCTFail("the all-or-nothing batch must not partially cross the tab bound")
+        } catch let error as ChatToolError {
+            XCTAssertEqual(error.code, .oracleOperationLimit)
+            XCTAssertEqual(error.details?["current_count"], "31")
+            XCTAssertEqual(error.details?["requested_count"], "2")
+            XCTAssertNil(error.details?["running_operation_ids"], "cross-owner IDs must not leak")
+        }
+        XCTAssertEqual(harness.store.test_recordCount(), 31)
+
+        let admitted = try harness.store.admitBatch(owner: ownerB, submissions: [submission])
+        XCTAssertEqual(admitted.count, 1)
+        XCTAssertEqual(harness.store.test_recordCount(), 32)
+
+        let replay = try harness.store.reserve(
+            owner: ownerA,
+            finalization: makeFinalization(),
+            requestKey: requestKey,
+            intentDigest: "same"
+        )
+        XCTAssertEqual(replay, .existing(keyedOperationID), "keyed replay resolves before the bound")
+
+        do {
+            _ = try harness.store.reserve(owner: ownerA, finalization: makeFinalization())
+            XCTFail("a new single must count against the same 32-operation tab bound")
+        } catch let error as ChatToolError {
+            XCTAssertEqual(error.code, .oracleOperationLimit)
+            let visible = error.details?["running_operation_ids"]?
+                .split(separator: ",")
+                .map(String.init) ?? []
+            XCTAssertEqual(visible.count, 31, "only owner A's nonterminal IDs are disclosed")
+            XCTAssertFalse(visible.contains(admitted[0].uuidString))
+        }
+        XCTAssertEqual(harness.store.test_recordCount(), 32)
+    }
+
+    func testBatchBindReleasesCapturedStartupState() async throws {
+        let harness = Harness()
+        let owner = makeOwner(sessionID: UUID(), runID: UUID())
+        let ticket = makeTicket()
+
+        func admit(capture: BatchStartupCapture) throws -> UUID {
+            let submission = OracleMCPOperationStore.BatchSubmission(
+                finalization: makeFinalization(),
+                activeRunProvider: {
+                    _ = capture
+                    return owner.originatingRunID
+                },
+                startup: { operationID in
+                    _ = capture
+                    XCTAssertTrue(
+                        harness.store.bind(
+                            operationID,
+                            ticket: ticket,
+                            chatShortID: "captured-startup"
+                        )
+                    )
+                    return nil
+                }
+            )
+            return try XCTUnwrap(
+                harness.store.admitBatch(owner: owner, submissions: [submission]).first
+            )
+        }
+
+        var capture: BatchStartupCapture? = BatchStartupCapture()
+        let weakCapture = try WeakBatchStartupCaptureReference(XCTUnwrap(capture))
+        let operationID = try admit(capture: XCTUnwrap(capture))
+        capture = nil
+
+        try await AsyncTestWait.waitUntil("bound batch startup state released", timeout: 2) {
+            await MainActor.run {
+                harness.store.snapshot(operationID)?.phase == .running
+                    && !harness.store.test_hasStartupTask(operationID)
+            }
+        }
+        XCTAssertFalse(harness.store.test_hasBatchStartupState(operationID))
+        XCTAssertNil(weakCapture.value)
+    }
+
+    func testDelegatedBatchRejectsRunRotationAtFinalReservationGate() async throws {
+        let harness = Harness()
+        let originatingRunID = UUID()
+        let rotatedRunID = UUID()
+        let owner = makeOwner(sessionID: UUID(), runID: originatingRunID)
+        var observedDecision: OracleMCPOperationStore.BatchReservationDecision?
+        let submission = OracleMCPOperationStore.BatchSubmission(
+            finalization: makeFinalization(mode: "review"),
+            activeRunProvider: { rotatedRunID },
+            startup: { operationID in
+                observedDecision = harness.store.authorizeBatchReservation(
+                    operationID,
+                    requiresOriginatingRun: true
+                )
+                return nil
+            }
+        )
+        let operationID = try XCTUnwrap(
+            harness.store.admitBatch(owner: owner, submissions: [submission]).first
+        )
+
+        try await AsyncTestWait.waitUntil("delegated rotation rejected", timeout: 2) {
+            await MainActor.run { harness.store.snapshot(operationID)?.phase == .failed }
+        }
+        XCTAssertEqual(observedDecision, .ownerInactive)
+        XCTAssertEqual(
+            harness.store.baseLane(operationID)?["error"]?.objectValue?["code"]?.stringValue,
+            ChatToolErrorCode.notStartedOwnerInactive.rawValue
+        )
+        XCTAssertEqual(
+            harness.store.baseLane(operationID)?["consultation_started"]?.boolValue,
+            false
+        )
     }
 
     // MARK: - Park primitive
@@ -840,9 +993,9 @@ final class OracleMCPOperationStoreTests: XCTestCase {
         let harness = Harness()
         let (operationID, ticket) = try reserveAndBind(harness)
         let other = makeTicket()
-        harness.store.bind(operationID, ticket: other, chatShortID: "other")
+        XCTAssertFalse(harness.store.bind(operationID, ticket: other, chatShortID: "other"))
         XCTAssertEqual(harness.store.snapshot(operationID)?.queryID, ticket.queryID)
-        harness.store.bind(UUID(), ticket: other, chatShortID: "other")
+        XCTAssertFalse(harness.store.bind(UUID(), ticket: other, chatShortID: "other"))
         XCTAssertEqual(harness.store.test_recordCount(), 1)
         XCTAssertEqual(harness.unpinCount(other.chatID), 0, "an ignored bind leaves the caller's pin with the caller")
     }
@@ -1050,6 +1203,39 @@ final class OracleMCPOperationStoreTests: XCTestCase {
         XCTAssertGreaterThan(afterTerminal, afterBind)
         _ = try await harness.store.deliver(operationID) { _, _ in }
         XCTAssertGreaterThan(harness.store.phaseRevision, afterTerminal)
+    }
+
+    func testTeardownStopsBatchAdmissionAndResumesPreparedCapacityWaiters() async throws {
+        let harness = Harness()
+        harness.activeStreamCount = OracleViewModel.maxConcurrentMCPOracleStreamsPerTab
+        let owner = makeOwner(sessionID: UUID(), runID: UUID())
+        let submission = OracleMCPOperationStore.BatchSubmission(
+            finalization: makeFinalization(),
+            activeRunProvider: { owner.originatingRunID },
+            startup: { _ in nil }
+        )
+        let operationID = try XCTUnwrap(
+            harness.store.admitBatch(owner: owner, submissions: [submission]).first
+        )
+        let capacityTask = Task { @MainActor in
+            await harness.store.awaitBatchCapacity(operationID)
+        }
+        try await AsyncTestWait.waitUntil("batch capacity waiter parked", timeout: 2) {
+            await MainActor.run { harness.store.test_batchCapacityWaiterCount() == 1 }
+        }
+
+        harness.store.teardown()
+
+        let capacityResult = await capacityTask.value
+        XCTAssertFalse(capacityResult)
+        XCTAssertEqual(harness.store.test_batchCapacityWaiterCount(), 0)
+        XCTAssertTrue(harness.store.test_batchQueue(owner.tabID).isEmpty)
+        do {
+            _ = try harness.store.admitBatch(owner: owner, submissions: [submission])
+            XCTFail("teardown must permanently stop batch admission")
+        } catch let error as ChatToolError {
+            XCTAssertEqual(error.code, .internalError)
+        }
     }
 
     func testTeardownCancelsObserversResumesWaitersAndReleasesPins() async throws {

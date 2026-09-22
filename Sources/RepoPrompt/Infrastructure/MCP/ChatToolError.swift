@@ -17,8 +17,10 @@ enum ChatToolErrorCode: String, Codable {
     /// The handle (or `request_id` key) was known but has been evicted; recovery is
     /// `oracle_chat_log` with the `chat_id` the caller already holds, never a resend.
     case oracleOperationExpired = "oracle_operation_expired"
-    /// Step B batch admission: `consultations` require an idle tab (plan §3.7).
-    case oracleBatchRequiresIdleTab = "oracle_batch_requires_idle_tab"
+    /// Aggregate nonterminal operation admission bound for one tab.
+    case oracleOperationLimit = "oracle_operation_limit"
+    /// A queued batch lane lost its authenticated active Agent Mode owner before reservation.
+    case notStartedOwnerInactive = "not_started_owner_inactive"
 }
 
 struct ChatToolError: LocalizedError, Codable {
@@ -62,14 +64,32 @@ struct ChatToolError: LocalizedError, Codable {
         .init(code: .oracleOperationExpired, message: "oracle_operation_expired: \(msg)", details: details)
     }
 
-    static func oracleBatchRequiresIdleTab(runningOperationIDs: [String]) -> Self {
-        let running = runningOperationIDs.isEmpty
-            ? "Another Oracle stream is running in this tab."
-            : "Running operation_ids you own: \(runningOperationIDs.joined(separator: ", "))."
+    static func oracleOperationLimit(
+        limit: Int,
+        currentCount: Int,
+        requestedCount: Int,
+        runningOperationIDs: [String]
+    ) -> Self {
+        var details = [
+            "limit": String(limit),
+            "current_count": String(currentCount),
+            "requested_count": String(requestedCount)
+        ]
+        if !runningOperationIDs.isEmpty {
+            details["running_operation_ids"] = runningOperationIDs.joined(separator: ",")
+        }
         return .init(
-            code: .oracleBatchRequiresIdleTab,
-            message: "oracle_batch_requires_idle_tab: consultations require an idle tab in this release. \(running) Collect them with ask_oracle op:\"wait\" (or stop them with op:\"cancel\") before starting a batch, or run the bounded pattern instead: two single sends with timeout_seconds:0, then one op:\"wait\" with both operation_ids. No lanes were started.",
-            details: runningOperationIDs.isEmpty ? nil : ["running_operation_ids": runningOperationIDs.joined(separator: ",")]
+            code: .oracleOperationLimit,
+            message: "oracle_operation_limit: this tab already has \(currentCount) nonterminal ask_oracle operations; admitting \(requestedCount) would exceed the limit of \(limit). Wait for or cancel operations you own before starting new work.",
+            details: details
+        )
+    }
+
+    static func notStartedOwnerInactive() -> Self {
+        .init(
+            code: .notStartedOwnerInactive,
+            message: "not_started_owner_inactive: the Agent Mode owner is no longer active; the Oracle consultation was not started.",
+            details: ["consultation_started": "false"]
         )
     }
 

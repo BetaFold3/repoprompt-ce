@@ -10,6 +10,10 @@ extension OracleViewModel {
         case explicitSlices = "explicit_slices"
     }
 
+    private enum BatchReservationGateError: Error {
+        case waitForCapacity
+    }
+
     struct OracleMCPSendReplyContext {
         let mode: String
         let tabID: UUID?
@@ -1682,6 +1686,7 @@ extension OracleViewModel {
                     conversationSessionID
                 )
             }
+            await oracleRequestPreparedObserverForTesting?()
         #endif
         return OraclePreparedRequestSnapshot(
             message: packagedMessage,
@@ -1777,6 +1782,22 @@ extension OracleViewModel {
         let allPresets = presetsManager.allPresets()
 
         let tabID = tabContext?.tabID ?? promptVM.activeComposeTabID
+        let batchOperationID: UUID?
+        if let operationID {
+            guard let receipt = mcpOperationStore.snapshot(operationID) else {
+                throw ChatToolError.internalError(
+                    "ask_oracle operation receipt is no longer available before send preparation"
+                )
+            }
+            guard receipt.phase == .starting else {
+                throw ChatToolError.internalError(
+                    "ask_oracle operation receipt is no longer eligible for send preparation"
+                )
+            }
+            batchOperationID = receipt.batchIndex == nil ? nil : operationID
+        } else {
+            batchOperationID = nil
+        }
 
         // Implicit-continuation candidate selection depends on the activation flag, so a value is
         // needed before model selection. It is deliberately NOT reused for `locateOrCreateChat`:
@@ -1890,6 +1911,8 @@ extension OracleViewModel {
         let createdFreshChat: Bool
         let sendStart: SendStart
         let outputReserveTokens: Int?
+        var acceptedAgentModeRunID = tabContext?.agentModeRunID
+        var preboundBatchTicket: OracleMCPSendTicket?
         let effectiveMode = PromptViewModel.PlanActMode(rawValue: mode.capitalized) ?? .chat
         #if DEBUG
             let packagingTrace = OracleReviewPackagingDiagnostics.makeTraceContext(
@@ -2034,15 +2057,45 @@ extension OracleViewModel {
             }
             outputReserveTokens = preparedRequest?.budget.outputReserveTokens
 
-            // Choose and reserve must share one sync turn — no await between them.
-            let performAtomicChooseAndReserve: () throws -> (UUID, Bool, SendStart) = {
+            // The batch gate, chat choice, provider reservation, ticket construction, and
+            // receipt bind share one synchronous MainActor segment. A capacity race parks the
+            // already-packaged request and retries this segment without repackaging.
+            let requiresOriginatingRun = if let provenance = tabContext?.packaging.provenance {
+                switch provenance {
+                case .direct: false
+                case .delegated: true
+                }
+            } else {
+                false
+            }
+            typealias AtomicStart = (UUID, Bool, SendStart, UUID?, OracleMCPSendTicket?)
+            let performAtomicChooseAndReserve: () throws -> AtomicStart = {
+                var effectiveRunID = tabContext?.agentModeRunID
+                if let batchOperationID {
+                    switch self.mcpOperationStore.authorizeBatchReservation(
+                        batchOperationID,
+                        requiresOriginatingRun: requiresOriginatingRun
+                    ) {
+                    case let .authorized(activeRunID):
+                        effectiveRunID = activeRunID
+                    case .waitForCapacity:
+                        throw BatchReservationGateError.waitForCapacity
+                    case .ownerInactive:
+                        throw ChatToolError.notStartedOwnerInactive()
+                    case .unavailable:
+                        throw ChatToolError.internalError(
+                            "ask_oracle batch lane could not be reserved because its accepted receipt is no longer eligible"
+                        )
+                    }
+                }
+
                 let choice = try self.chooseMCPChatForSendSync(
                     desiredName: chatName,
                     forceNew: newChat,
                     tabID: tabID,
                     activateInUI: shouldActivate,
                     agentModeSessionID: tabContext?.agentModeSessionID,
-                    agentModeRunID: tabContext?.agentModeRunID,
+                    agentModeRunID: effectiveRunID,
                     expectedImplicitCandidateID: preparedContinuationSessionID,
                     enforceExpectedImplicitCandidate: !newChat
                 )
@@ -2082,25 +2135,81 @@ extension OracleViewModel {
                         .conversationRevision,
                     origin: .mcp
                 )
-                return (choice.chatID, choice.createdFresh, started)
-            }
-            #if DEBUG
-                let atomic = try await OracleReviewPackagingDiagnostics.withTrace(packagingTrace) {
-                    try performAtomicChooseAndReserve()
+
+                var boundTicket: OracleMCPSendTicket?
+                if let batchOperationID, case let .started(queryID) = started {
+                    let ticket = OracleMCPSendTicket(
+                        chatID: choice.chatID,
+                        queryID: queryID,
+                        createdFreshChat: choice.createdFresh,
+                        replyContext: OracleMCPSendReplyContext(
+                            mode: mode,
+                            tabID: tabID,
+                            agentModeSessionID: tabContext?.agentModeSessionID,
+                            agentModeRunID: effectiveRunID,
+                            model: selectedModel,
+                            modelRawID: selectedModel.rawValue,
+                            modelDisplayName: selectedModel.displayName,
+                            modelSelection: modelSelection.selectionKind.rawValue,
+                            modelSource: modelSelection.modelSource,
+                            modelPresetID: modelSelection.modelPresetID,
+                            modelPresetName: modelSelection.modelPresetName,
+                            outputReserveTokens: outputReserveTokens
+                        )
+                    )
+                    guard self.mcpOperationStore.bind(
+                        batchOperationID,
+                        ticket: ticket,
+                        chatShortID: self.sessions.first(where: { $0.id == choice.chatID })?.shortID
+                    ) else {
+                        self.unpinSession(choice.chatID)
+                        self.mcpOperationStore.discardUnstarted(batchOperationID)
+                        throw ChatToolError.internalError(
+                            "ask_oracle batch lane could not bind its accepted ticket"
+                        )
+                    }
+                    boundTicket = ticket
                 }
-            #else
-                let atomic = try performAtomicChooseAndReserve()
-            #endif
+                return (choice.chatID, choice.createdFresh, started, effectiveRunID, boundTicket)
+            }
+
+            var atomicResult: AtomicStart?
+            while atomicResult == nil {
+                do {
+                    #if DEBUG
+                        atomicResult = try await OracleReviewPackagingDiagnostics.withTrace(packagingTrace) {
+                            try performAtomicChooseAndReserve()
+                        }
+                    #else
+                        atomicResult = try performAtomicChooseAndReserve()
+                    #endif
+                } catch BatchReservationGateError.waitForCapacity {
+                    guard let batchOperationID,
+                          await mcpOperationStore.awaitBatchCapacity(batchOperationID)
+                    else {
+                        throw ChatToolError.internalError(
+                            "ask_oracle batch lane could not be reserved because its accepted receipt is no longer eligible"
+                        )
+                    }
+                }
+            }
+            guard let atomic = atomicResult else {
+                throw ChatToolError.internalError(
+                    "ask_oracle batch lane could not be reserved because its accepted receipt is no longer eligible"
+                )
+            }
             chatID = atomic.0
             createdFreshChat = atomic.1
             sendStart = atomic.2
+            acceptedAgentModeRunID = atomic.3
+            preboundBatchTicket = atomic.4
         }
         let ticket: OracleMCPSendTicket
         switch sendStart {
         case let .started(startedQueryID):
-            // Step B binds its operation at this first synchronous point after the
-            // reservation, before any continuation activation or ownership awaits.
-            ticket = OracleMCPSendTicket(
+            // Batch reservations construct and bind their ticket inside the uninterrupted
+            // late-reservation segment. Singles retain the existing immediate bind here.
+            ticket = preboundBatchTicket ?? OracleMCPSendTicket(
                 chatID: chatID,
                 queryID: startedQueryID,
                 createdFreshChat: createdFreshChat,
@@ -2108,7 +2217,7 @@ extension OracleViewModel {
                     mode: mode,
                     tabID: tabID,
                     agentModeSessionID: tabContext?.agentModeSessionID,
-                    agentModeRunID: tabContext?.agentModeRunID,
+                    agentModeRunID: acceptedAgentModeRunID,
                     model: selectedModel,
                     modelRawID: selectedModel.rawValue,
                     modelDisplayName: selectedModel.displayName,
@@ -2120,11 +2229,13 @@ extension OracleViewModel {
                 )
             )
             if let operationID {
-                mcpOperationStore.bind(
-                    operationID,
-                    ticket: ticket,
-                    chatShortID: sessions.first(where: { $0.id == chatID })?.shortID
-                )
+                if preboundBatchTicket == nil {
+                    mcpOperationStore.bind(
+                        operationID,
+                        ticket: ticket,
+                        chatShortID: sessions.first(where: { $0.id == chatID })?.shortID
+                    )
+                }
                 #if DEBUG
                     await oraclePostBindObserverForTesting?(operationID, startedQueryID)
                 #endif

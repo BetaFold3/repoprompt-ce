@@ -3467,15 +3467,18 @@ import XCTest
                 do {
                     try await activateWorkspace(fixture.contextA)
                     let endpoint = try fixture.endpointA()
+                    let frozenContext = makeFrozenContext(
+                        fixture: fixture,
+                        selection: StoredSelection(codemapAutoEnabled: false),
+                        bindings: [],
+                        activeAgentSessionID: nil
+                    )
                     try await configureAgentModeEndpoint(
                         endpoint,
-                        context: makeFrozenContext(
-                            fixture: fixture,
-                            selection: StoredSelection(codemapAutoEnabled: false),
-                            bindings: []
-                        ),
+                        context: frozenContext,
                         fixture: fixture
                     )
+                    try activateRunOnlyBatchOwner(context: frozenContext, fixture: fixture)
                     let first = ModelPreset(
                         name: "BatchOracleA",
                         model: .claudeCodeSonnet,
@@ -3493,7 +3496,7 @@ import XCTest
                     var seenModels: [String] = []
                     fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting { args, _, _ in
                         let model = args["model"]?.stringValue ?? ""
-                        let selectedPreset = model == first.name ? first : second
+                        let selectedPreset = model == first.id.uuidString ? first : second
                         seenModels.append(model)
                         let rawResult: [String: Value] = [
                             "chat_id": .string("chat-\(model)"),
@@ -3501,8 +3504,8 @@ import XCTest
                             "mode": .string("chat"),
                             "response": .string("answer for \(model)"),
                             "model_source": .string("preset"),
-                            "model_preset_id": .string(model == first.name ? first.id.uuidString : second.id.uuidString),
-                            "model_preset_name": .string(model),
+                            "model_preset_id": .string(selectedPreset.id.uuidString),
+                            "model_preset_name": .string(selectedPreset.name),
                             "model_selection": .string("explicit"),
                             "model_id": .string(selectedPreset.model.rawValue),
                             "model_name": .string(selectedPreset.model.displayName),
@@ -3542,7 +3545,9 @@ import XCTest
                     XCTAssertEqual(results.count, 2)
                     XCTAssertEqual(results[0].objectValue?["ok"]?.boolValue, true)
                     XCTAssertEqual(results[1].objectValue?["ok"]?.boolValue, true)
-                    XCTAssertEqual(results[0].objectValue?["chat_id"]?.stringValue, "chat-\(first.name)")
+                    XCTAssertEqual(results[0].objectValue?["index"]?.intValue, 0)
+                    XCTAssertEqual(results[1].objectValue?["index"]?.intValue, 1)
+                    XCTAssertEqual(results[0].objectValue?["chat_id"]?.stringValue, "chat-\(first.id.uuidString)")
                     XCTAssertEqual(results[1].objectValue?["chat_id"]?.stringValue, "chat-\(second.id.uuidString)")
                     XCTAssertEqual(results[0].objectValue?["model_preset_name"]?.stringValue, first.name)
                     XCTAssertEqual(results[1].objectValue?["model_preset_id"]?.stringValue, second.id.uuidString)
@@ -3555,7 +3560,7 @@ import XCTest
                     XCTAssertNil(nestedLegacy?["model_name"])
                     XCTAssertNil(nestedLegacy?["ui_model_id"])
                     XCTAssertNil(nestedLegacy?["ui_model_name"])
-                    XCTAssertEqual(Set(seenModels), Set([first.name, second.id.uuidString]))
+                    XCTAssertEqual(seenModels, [first.id.uuidString, second.id.uuidString])
                     let agentSession = fixture.contextA.window.agentModeViewModel.session(
                         for: fixture.contextA.tabID
                     )
@@ -3735,15 +3740,18 @@ import XCTest
                 do {
                     try await activateWorkspace(fixture.contextA)
                     let endpoint = try fixture.endpointA()
+                    let frozenContext = makeFrozenContext(
+                        fixture: fixture,
+                        selection: StoredSelection(codemapAutoEnabled: false),
+                        bindings: [],
+                        activeAgentSessionID: nil
+                    )
                     try await configureAgentModeEndpoint(
                         endpoint,
-                        context: makeFrozenContext(
-                            fixture: fixture,
-                            selection: StoredSelection(codemapAutoEnabled: false),
-                            bindings: []
-                        ),
+                        context: frozenContext,
                         fixture: fixture
                     )
+                    try activateRunOnlyBatchOwner(context: frozenContext, fixture: fixture)
                     let preset = ModelPreset(
                         name: "ExportFailureOracle",
                         model: .claudeCodeSonnet,
@@ -3817,7 +3825,7 @@ import XCTest
             }
         }
 
-        func testAskOracleBatchQueuesBeyondTwoCap() async throws {
+        func testAskOracleBatchTrimmedExportUsesFrozenSourceWorkspaceWhenVisibleWorkspaceDiffers() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let presetsManager = ModelPresetsManager.shared
@@ -3825,134 +3833,269 @@ import XCTest
                 let previousPresets = presetsManager.presets
                 let previousShowPresets = settings.mcpShowModelPresets()
                 let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                var alternateWorkspaceID: UUID?
+                defer {
+                    presetsManager.presets = previousPresets
+                    settings.setMCPShowModelPresets(previousShowPresets, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(
+                        previousTemporaryDisable,
+                        commit: false
+                    )
+                    fixture.contextA.window.mcpServer
+                        .setOracleChatSendOverrideForTesting(nil)
+                    fixture.contextA.window.mcpServer
+                        .setOracleExportOverrideForTesting(nil)
+                    if let source = fixture.contextA.window.workspaceManager.workspace(
+                        withID: fixture.contextA.workspaceID
+                    ) {
+                        fixture.contextA.window.workspaceManager.activeWorkspace = source
+                    }
+                    if let alternateWorkspaceID {
+                        fixture.contextA.window.workspaceManager.workspaces.removeAll {
+                            $0.id == alternateWorkspaceID
+                        }
+                    }
+                }
+
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let endpoint = try fixture.endpointA()
+                    let frozenContext = makeFrozenContext(
+                        fixture: fixture,
+                        selection: StoredSelection(codemapAutoEnabled: false),
+                        bindings: [],
+                        activeAgentSessionID: nil
+                    )
+                    try await configureAgentModeEndpoint(
+                        endpoint,
+                        context: frozenContext,
+                        fixture: fixture
+                    )
+                    try activateRunOnlyBatchOwner(
+                        context: frozenContext,
+                        fixture: fixture
+                    )
+                    let preset = ModelPreset(
+                        name: "FrozenExportWorkspaceOracle",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    presetsManager.presets = [preset]
+                    settings.setMCPShowModelPresets(true, commit: false)
+                    settings.setMCPTemporarilyDisablePresets(false, commit: false)
+
+                    var alternate = WorkspaceModel(
+                        name: "Visible Alternate Export Workspace",
+                        repoPaths: [fixture.contextB.rootURL.path]
+                    )
+                    alternate.isEphemeral = true
+                    alternate.composeTabs = [ComposeTabState(id: UUID())]
+                    alternate.activeComposeTabID = alternate.composeTabs.first?.id
+                    alternateWorkspaceID = alternate.id
+                    fixture.contextA.window.workspaceManager.workspaces.append(alternate)
+                    fixture.contextA.window.workspaceManager.activeWorkspace = alternate
+
+                    fixture.contextA.window.mcpServer
+                        .setOracleChatSendOverrideForTesting { _, _, _ in
+                            [
+                                "chat_id": .string("frozen-export-chat"),
+                                "mode": .string("chat"),
+                                "response": .string(
+                                    String(repeating: "frozen response ", count: 200)
+                                )
+                            ]
+                        }
+                    let exportCapture = OracleExportDestinationCapture()
+                    fixture.contextA.window.mcpServer
+                        .setOracleExportOverrideForTesting { request in
+                            exportCapture.record(request)
+                            return OracleExportFile(
+                                path: "/tmp/frozen-export.md",
+                                instruction: "read frozen export"
+                            )
+                        }
+
+                    let value = try await ServerNetworkManager.withConnectionID(
+                        endpoint.connectionID
+                    ) {
+                        try await fixture.contextA.window.mcpServer
+                            .executeAskOracleForTesting(args: [
+                                "consultations": .array([
+                                    .object([
+                                        "message": .string("Trim against the frozen workspace"),
+                                        "model": .string(preset.id.uuidString),
+                                        "response_mode": .string("tail")
+                                    ])
+                                ])
+                            ])
+                    }
+                    let item = try XCTUnwrap(
+                        value.objectValue?["results"]?.arrayValue?.first?.objectValue
+                    )
+                    XCTAssertEqual(item["ok"]?.boolValue, true)
+                    XCTAssertEqual(item["export_path"]?.stringValue, "/tmp/frozen-export.md")
+                    let destination = try XCTUnwrap(exportCapture.destinations.first)
+                    XCTAssertEqual(destination.workspaceID, fixture.contextA.workspaceID)
+                    XCTAssertEqual(destination.tabID, fixture.contextA.tabID)
+                    XCTAssertEqual(
+                        destination.primaryRootPath,
+                        fixture.contextA.rootURL.standardizedFileURL.path
+                    )
+                    XCTAssertNotEqual(destination.workspaceID, alternate.id)
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAskOracleBatchQueuedStartupSurvivesConnectionRemovalWithCapturedSource() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let presetsManager = ModelPresetsManager.shared
+                let settings = GlobalSettingsStore.shared
+                let apiSettings = try XCTUnwrap(
+                    fixture.contextA.window.promptManager.apiSettingsViewModel
+                )
+                let previousPresets = presetsManager.presets
+                let previousShowPresets = settings.mcpShowModelPresets()
+                let previousTemporaryDisable = settings.mcpTemporarilyDisablePresets()
+                let previousClaudeCodeConnected = apiSettings.isClaudeCodeConnected
                 defer {
                     presetsManager.presets = previousPresets
                     settings.setMCPShowModelPresets(previousShowPresets, commit: false)
                     settings.setMCPTemporarilyDisablePresets(previousTemporaryDisable, commit: false)
-                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting(nil)
+                    apiSettings.isClaudeCodeConnected = previousClaudeCodeConnected
+                    fixture.contextA.window.mcpServer
+                        .setBeforeAskOraclePreparationForTesting(nil)
+                    fixture.contextA.window.mcpServer
+                        .setOraclePostPackagingTransportOverrideForTesting(nil)
                 }
                 do {
                     try await activateWorkspace(fixture.contextA)
-                    let endpoint = try fixture.endpointA()
-                    try await configureAgentModeEndpoint(
-                        endpoint,
-                        context: makeFrozenContext(
-                            fixture: fixture,
-                            selection: StoredSelection(codemapAutoEnabled: false),
-                            bindings: []
+                    let originatingEndpoint = try fixture.endpointA()
+                    let recoveryEndpoint = try fixture.endpointB()
+                    let frozenContext = makeFrozenContext(
+                        fixture: fixture,
+                        selection: StoredSelection(
+                            selectedPaths: [fixture.contextA.fileURL.path],
+                            codemapAutoEnabled: false
                         ),
+                        bindings: [],
+                        activeAgentSessionID: nil
+                    )
+                    try await configureAgentModeEndpoint(
+                        originatingEndpoint,
+                        context: frozenContext,
                         fixture: fixture
                     )
-                    let presets = (0 ..< 3).map { index in
-                        ModelPreset(
-                            name: "QueueOracle\(index)",
-                            model: .customProviderUser(name: "queue-\(index)"),
-                            supportedModes: SupportedModes(chat: true, plan: true, review: true)
-                        )
-                    }
-                    presetsManager.presets = presets
+                    try activateRunOnlyBatchOwner(
+                        context: frozenContext,
+                        fixture: fixture
+                    )
+                    let preset = ModelPreset(
+                        name: "ConnectionIndependentBatchOracle",
+                        model: .claudeCodeSonnet,
+                        supportedModes: SupportedModes(chat: true, plan: true, review: true)
+                    )
+                    presetsManager.presets = [preset]
                     settings.setMCPShowModelPresets(true, commit: false)
                     settings.setMCPTemporarilyDisablePresets(false, commit: false)
+                    apiSettings.isClaudeCodeConnected = true
 
-                    final class QueueGate: @unchecked Sendable {
-                        private let lock = NSLock()
-                        private var continuations: [CheckedContinuation<Void, Never>] = []
-                        private var opened = false
-                        private(set) var inFlight = 0
-                        private(set) var peak = 0
-                        private(set) var started: [String] = []
-
-                        func enter(_ model: String) {
-                            lock.lock()
-                            inFlight += 1
-                            peak = max(peak, inFlight)
-                            started.append(model)
-                            lock.unlock()
+                    let gate = OracleWorktreeGate()
+                    fixture.contextA.window.mcpServer
+                        .setBeforeAskOraclePreparationForTesting {
+                            await gate.markStartedAndWaitForRelease()
                         }
-
-                        func leave() {
-                            lock.lock()
-                            inFlight -= 1
-                            lock.unlock()
-                        }
-
-                        func waitIfNeeded() async {
-                            await withCheckedContinuation { cont in
-                                lock.lock()
-                                if opened {
-                                    lock.unlock()
-                                    cont.resume()
-                                } else {
-                                    continuations.append(cont)
-                                    lock.unlock()
-                                }
+                    let transport = OracleTransportInvocationCapture()
+                    fixture.contextA.window.mcpServer
+                        .setOraclePostPackagingTransportOverrideForTesting { message, model in
+                            transport.record(message: message, model: model)
+                            let stream = AsyncThrowingStream<ChatStreamOutput, Error> {
+                                continuation in
+                                continuation.yield(ChatStreamOutput(
+                                    text: "connection-independent answer",
+                                    reasoning: nil,
+                                    tokens: ChatTokenInfo(),
+                                    isFinal: true
+                                ))
+                                continuation.finish()
                             }
+                            return (UUID(), stream)
                         }
 
-                        func open() {
-                            lock.lock()
-                            opened = true
-                            let waiting = continuations
-                            continuations.removeAll()
-                            lock.unlock()
-                            for cont in waiting {
-                                cont.resume()
-                            }
-                        }
+                    let initial = try await ServerNetworkManager.withConnectionID(
+                        originatingEndpoint.connectionID
+                    ) {
+                        try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                            "consultations": .array([
+                                .object([
+                                    "message": .string("Use the frozen source after disconnect"),
+                                    "model": .string(preset.id.uuidString)
+                                ])
+                            ]),
+                            "timeout_seconds": .int(0)
+                        ])
+                    }
+                    let receipt = try XCTUnwrap(
+                        initial.objectValue?["results"]?.arrayValue?.first?.objectValue
+                    )
+                    let operationID = try XCTUnwrap(
+                        receipt["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+                    )
+                    XCTAssertEqual(receipt["index"]?.intValue, 0)
+                    let didStart = await gate.waitUntilStarted()
+                    XCTAssertTrue(didStart)
 
-                        func snapshot() -> (peak: Int, started: [String], inFlight: Int) {
-                            lock.lock()
-                            defer { lock.unlock() }
-                            return (peak, started, inFlight)
-                        }
-                    }
+                    originatingEndpoint.client.close()
+                    await originatingEndpoint.connectionManager.stop()
+                    await fixture.networkManager.debugRemoveConnection(
+                        originatingEndpoint.connectionID
+                    )
+                    await fixture.networkManager.debugClearPersistedRoutingState(
+                        for: originatingEndpoint.clientName
+                    )
+                    fixture.contextA.window.mcpServer.removeTabContext(
+                        forConnectionID: originatingEndpoint.connectionID,
+                        clientName: originatingEndpoint.clientName,
+                        windowID: nil,
+                        runID: nil
+                    )
 
-                    let gate = QueueGate()
-                    fixture.contextA.window.mcpServer.setOracleChatSendOverrideForTesting { args, _, _ in
-                        let model = args["model"]?.stringValue ?? ""
-                        gate.enter(model)
-                        defer { gate.leave() }
-                        // Hold every lane until open — with max concurrency 2, the third
-                        // waits in the batch queue and never enters send until a slot frees.
-                        await gate.waitIfNeeded()
-                        return [
-                            "chat_id": .string("chat-\(model)"),
-                            "mode": .string("chat"),
-                            "response": .string("ok"),
-                            "model_source": .string("preset"),
-                            "model_preset_name": .string(model),
-                            "model_selection": .string("explicit")
-                        ]
-                    }
+                    try await configureAgentModeEndpoint(
+                        recoveryEndpoint,
+                        context: frozenContext,
+                        fixture: fixture
+                    )
+                    await gate.release()
 
-                    let task = Task { @MainActor in
-                        try await ServerNetworkManager.withConnectionID(endpoint.connectionID) {
-                            try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
-                                "consultations": .array(presets.map { preset in
-                                    .object([
-                                        "message": .string("queue \(preset.name)"),
-                                        "model": .string(preset.name)
-                                    ])
-                                })
-                            ])
-                        }
+                    let collected = try await ServerNetworkManager.withConnectionID(
+                        recoveryEndpoint.connectionID
+                    ) {
+                        try await fixture.contextA.window.mcpServer.executeAskOracleForTesting(args: [
+                            "op": .string("wait"),
+                            "operation_ids": .array([.string(operationID.uuidString)])
+                        ])
                     }
-                    // Wait until two lanes are in-flight inside sendChat.
-                    for _ in 0 ..< 50 {
-                        let snap = gate.snapshot()
-                        if snap.inFlight == 2 { break }
-                        try await Task.sleep(nanoseconds: 20_000_000)
-                    }
-                    let before = gate.snapshot()
-                    XCTAssertEqual(before.inFlight, 2)
-                    XCTAssertEqual(before.started.count, 2)
-                    XCTAssertEqual(before.peak, 2)
-                    gate.open()
-                    let value = try await task.value
-                    let results = try XCTUnwrap(value.objectValue?["results"]?.arrayValue)
-                    XCTAssertEqual(results.count, 3)
-                    XCTAssertTrue(results.allSatisfy { $0.objectValue?["ok"]?.boolValue == true })
-                    XCTAssertEqual(gate.snapshot().peak, 2)
+                    let result = try XCTUnwrap(
+                        collected.objectValue?["results"]?.arrayValue?.first?.objectValue
+                    )
+                    XCTAssertEqual(result["ok"]?.boolValue, true)
+                    XCTAssertEqual(
+                        result["response"]?.stringValue,
+                        "connection-independent answer"
+                    )
+                    XCTAssertEqual(transport.invocationCount, 1)
+                    XCTAssertEqual(transport.models, [preset.model])
+                    let packagedFiles = try XCTUnwrap(transport.messages.first)
+                        .fileBlocks.joined(separator: "\n")
+                    XCTAssertTrue(
+                        packagedFiles.contains(fixture.contextA.sentinel),
+                        packagedFiles
+                    )
 
                     await fixture.cleanup()
                 } catch {
@@ -4290,6 +4433,20 @@ import XCTest
                 worktreeBindings: bindings,
                 worktreeBindingState: bindingState,
                 explicitlyBound: false
+            )
+        }
+
+        private func activateRunOnlyBatchOwner(
+            context: MCPServerViewModel.TabContextSnapshot,
+            fixture: PersistentMCPTestFixture
+        ) throws {
+            let runID = try XCTUnwrap(context.runID)
+            let session = fixture.contextA.window.agentModeViewModel.session(for: context.tabID)
+            session.runID = runID
+            session.runState = .running
+            fixture.contextA.window.agentModeViewModel.setAgentRunActive(
+                context.tabID,
+                isActive: true
             )
         }
 
@@ -4752,11 +4909,30 @@ import XCTest
     }
 
     @MainActor
+    private final class OracleExportDestinationCapture {
+        private(set) var destinations: [OracleExportDestination] = []
+
+        func record(_ request: OracleExportRequest) {
+            if let destination = request.destination {
+                destinations.append(destination)
+            }
+        }
+    }
+
+    @MainActor
     private final class OracleTransportInvocationCapture {
         private(set) var invocationCount = 0
+        private(set) var messages: [AIMessage] = []
+        private(set) var models: [AIModel] = []
 
         func recordInvocation() {
             invocationCount += 1
+        }
+
+        func record(message: AIMessage, model: AIModel) {
+            invocationCount += 1
+            messages.append(message)
+            models.append(model)
         }
     }
 

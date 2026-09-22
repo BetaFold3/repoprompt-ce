@@ -988,16 +988,12 @@ actor InteractiveMCPClientSession {
         }
     }
 
-    /// Step B `ask_oracle` keeps request-owned batches blocking while giving every
-    /// single send and wait an owned client response envelope. Invalid/control combinations
-    /// retain the ordinary deadline so the server can reject them promptly.
+    /// Every `ask_oracle` send (single or batch) and wait gets an owned client
+    /// response envelope. Invalid/control combinations retain the ordinary deadline so the
+    /// server can reject them promptly.
     private static func resolvedAskOracleDefaultTimeout(
         arguments: [String: Value]
     ) -> TimeInterval? {
-        if arguments["consultations"] != nil {
-            return nil
-        }
-
         let operation: String
         if let rawOperation = arguments["op"] {
             if case .null = rawOperation {

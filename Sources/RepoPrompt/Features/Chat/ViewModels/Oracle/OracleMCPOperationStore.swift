@@ -18,6 +18,7 @@ final class OracleMCPOperationStore: ObservableObject {
     // MARK: - Public types
 
     enum Phase: String, Equatable {
+        case queued
         case starting
         case running
         case cancelling
@@ -28,7 +29,7 @@ final class OracleMCPOperationStore: ObservableObject {
         var isTerminal: Bool {
             switch self {
             case .ready, .failed, .cancelled: true
-            case .starting, .running, .cancelling: false
+            case .queued, .starting, .running, .cancelling: false
             }
         }
     }
@@ -111,6 +112,19 @@ final class OracleMCPOperationStore: ObservableObject {
         case existing(UUID)
     }
 
+    struct BatchSubmission {
+        let finalization: FinalizationRequest
+        let activeRunProvider: @MainActor () -> UUID?
+        let startup: @MainActor (_ operationID: UUID) async -> ChatToolError?
+    }
+
+    enum BatchReservationDecision: Equatable {
+        case authorized(activeRunID: UUID)
+        case waitForCapacity
+        case ownerInactive
+        case unavailable
+    }
+
     enum WaitOutcome: String, Equatable {
         case settled
         case steering
@@ -150,6 +164,7 @@ final class OracleMCPOperationStore: ObservableObject {
         let requestID: UUID?
         let modelPresetName: String?
         let cancelRequested: Bool
+        let batchIndex: Int?
     }
 
     /// Card-facing summary (plan §3.11). Published on phase/delivery transitions only.
@@ -167,6 +182,7 @@ final class OracleMCPOperationStore: ObservableObject {
         let mode: String
         let modelPresetName: String?
         let terminalReason: TerminalReason?
+        let batchIndex: Int?
 
         var isTerminal: Bool {
             phase.isTerminal
@@ -189,6 +205,7 @@ final class OracleMCPOperationStore: ObservableObject {
         let chatShortID: String?
         let requestKey: RequestKey?
         let intentDigest: String?
+        let batchIndex: Int?
         let evictedAt: Date
     }
 
@@ -205,6 +222,7 @@ final class OracleMCPOperationStore: ObservableObject {
         var captureReply: @MainActor (_ ticket: OracleViewModel.OracleMCPSendTicket) throws -> [String: Value]
         var unpinSession: @MainActor (_ chatID: UUID) -> Void
         var chatName: @MainActor (_ chatID: UUID) -> String?
+        var activeStreamCount: @MainActor (_ tabID: UUID) -> Int
         var now: @MainActor () -> Date
 
         init(
@@ -213,6 +231,7 @@ final class OracleMCPOperationStore: ObservableObject {
             captureReply: @escaping @MainActor (_ ticket: OracleViewModel.OracleMCPSendTicket) throws -> [String: Value],
             unpinSession: @escaping @MainActor (_ chatID: UUID) -> Void,
             chatName: @escaping @MainActor (_ chatID: UUID) -> String? = { _ in nil },
+            activeStreamCount: @escaping @MainActor (_ tabID: UUID) -> Int = { _ in 0 },
             now: @escaping @MainActor () -> Date = { Date() }
         ) {
             self.waitUntilMessageFinalised = waitUntilMessageFinalised
@@ -220,6 +239,7 @@ final class OracleMCPOperationStore: ObservableObject {
             self.captureReply = captureReply
             self.unpinSession = unpinSession
             self.chatName = chatName
+            self.activeStreamCount = activeStreamCount
             self.now = now
         }
     }
@@ -230,6 +250,8 @@ final class OracleMCPOperationStore: ObservableObject {
     static let undeliveredRetentionSeconds: TimeInterval = 24 * 60 * 60
     static let maxTerminalRecords = 128
     static let maxTombstones = 512
+    static let maxNonterminalOperationsPerTab = 32
+    static let maxBatchLaneCount = 16
 
     // MARK: - Private state
 
@@ -270,6 +292,9 @@ final class OracleMCPOperationStore: ObservableObject {
         var delivery: Delivery = .undelivered
         var startupTask: Task<ChatToolError?, Never>?
         var completionTask: Task<Void, Never>?
+        let batchIndex: Int?
+        var batchActiveRunProvider: (@MainActor () -> UUID?)?
+        var batchStartup: (@MainActor (_ operationID: UUID) async -> ChatToolError?)?
 
         init(
             operationID: UUID,
@@ -277,7 +302,10 @@ final class OracleMCPOperationStore: ObservableObject {
             owner: OwnerScope,
             finalization: FinalizationRequest,
             requestKey: RequestKey?,
-            intentDigest: String?
+            intentDigest: String?,
+            batchIndex: Int? = nil,
+            batchActiveRunProvider: (@MainActor () -> UUID?)? = nil,
+            batchStartup: (@MainActor (_ operationID: UUID) async -> ChatToolError?)? = nil
         ) {
             self.operationID = operationID
             self.createdAt = createdAt
@@ -285,6 +313,12 @@ final class OracleMCPOperationStore: ObservableObject {
             self.finalization = finalization
             self.requestKey = requestKey
             self.intentDigest = intentDigest
+            self.batchIndex = batchIndex
+            self.batchActiveRunProvider = batchActiveRunProvider
+            self.batchStartup = batchStartup
+            if batchIndex != nil {
+                phase = .queued
+            }
         }
     }
 
@@ -292,6 +326,12 @@ final class OracleMCPOperationStore: ObservableObject {
         let operationID: UUID
         let chatShortID: String?
         let intentDigest: String?
+    }
+
+    private struct BatchQueueState {
+        var operationIDs: [UUID] = []
+        var preparingOperationID: UUID?
+        var drainScheduled = false
     }
 
     private struct Waiter {
@@ -313,6 +353,8 @@ final class OracleMCPOperationStore: ObservableObject {
     private var tombstoneOrder: [UUID] = []
     private var tombstoneByRequestKey: [RequestKey: UUID] = [:]
     private var waiters: [UUID: Waiter] = [:]
+    private var batchQueuesByTabID: [UUID: BatchQueueState] = [:]
+    private var batchCapacityWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
     private var isTornDown = false
 
     /// Bumped on phase and delivery transitions only — never per streamed token.
@@ -334,6 +376,9 @@ final class OracleMCPOperationStore: ObservableObject {
         intentDigest: String? = nil
     ) throws -> ReserveOutcome {
         purge()
+        guard !isTornDown else {
+            throw ChatToolError.internalError("ask_oracle operation storage is unavailable")
+        }
         if let requestKey {
             if let existingID = recordIDByRequestKey[requestKey], let existing = records[existingID] {
                 guard existing.intentDigest == intentDigest else {
@@ -361,6 +406,7 @@ final class OracleMCPOperationStore: ObservableObject {
                 )
             }
         }
+        try enforceNonterminalLimit(owner: owner, requestedCount: 1)
         let operationID = UUID()
         let record = Record(
             operationID: operationID,
@@ -379,10 +425,71 @@ final class OracleMCPOperationStore: ObservableObject {
         return .reserved(operationID)
     }
 
+    /// Atomically admits every batch lane and appends it to the tab-wide FIFO.
+    func admitBatch(owner: OwnerScope, submissions: [BatchSubmission]) throws -> [UUID] {
+        purge()
+        guard !isTornDown else {
+            throw ChatToolError.internalError("ask_oracle operation storage is unavailable")
+        }
+        guard !submissions.isEmpty, submissions.count <= Self.maxBatchLaneCount else {
+            throw ChatToolError.invalidParams(
+                "consultations must contain between 1 and \(Self.maxBatchLaneCount) lanes"
+            )
+        }
+        try enforceNonterminalLimit(owner: owner, requestedCount: submissions.count)
+
+        let createdAt = dependencies.now()
+        let operationIDs = submissions.enumerated().map { index, submission in
+            let operationID = UUID()
+            let record = Record(
+                operationID: operationID,
+                createdAt: createdAt,
+                owner: owner,
+                finalization: submission.finalization,
+                requestKey: nil,
+                intentDigest: nil,
+                batchIndex: index,
+                batchActiveRunProvider: submission.activeRunProvider,
+                batchStartup: submission.startup
+            )
+            records[operationID] = record
+            creationOrder.append(operationID)
+            return operationID
+        }
+        var queue = batchQueuesByTabID[owner.tabID] ?? BatchQueueState()
+        queue.operationIDs.append(contentsOf: operationIDs)
+        batchQueuesByTabID[owner.tabID] = queue
+        bumpRevision()
+        requestBatchDrain(tabID: owner.tabID)
+        return operationIDs
+    }
+
+    private func enforceNonterminalLimit(owner: OwnerScope, requestedCount: Int) throws {
+        let currentCount = records.values.reduce(into: 0) { count, record in
+            if record.owner.tabID == owner.tabID, !record.phase.isTerminal {
+                count += 1
+            }
+        }
+        guard currentCount + requestedCount <= Self.maxNonterminalOperationsPerTab else {
+            let ownedIDs = runningOperationIDs(owner: owner).map(\.uuidString)
+            throw ChatToolError.oracleOperationLimit(
+                limit: Self.maxNonterminalOperationsPerTab,
+                currentCount: currentCount,
+                requestedCount: requestedCount,
+                runningOperationIDs: ownedIDs
+            )
+        }
+    }
+
     /// Removes a receipt whose start was rejected before any chat or query existed. The same
     /// `request_id` may then be retried; nothing was spent.
     func discardUnstarted(_ operationID: UUID) {
-        guard let record = records[operationID], record.phase == .starting, record.queryID == nil else { return }
+        guard let record = records[operationID],
+              record.phase == .queued || record.phase == .starting,
+              record.queryID == nil
+        else { return }
+        removeBatchEligibility(record)
+        releaseBatchStartupState(record)
         record.startupTask = nil
         remove(record, tombstone: false)
         bumpRevision()
@@ -394,7 +501,12 @@ final class OracleMCPOperationStore: ObservableObject {
     /// handle. No consultation was accepted, so the request key is released for a real retry
     /// while the operation ID remains deliverable with the original structured error.
     func rejectStartup(_ operationID: UUID, error: ChatToolError) {
-        guard let record = records[operationID], record.phase == .starting, record.queryID == nil else { return }
+        guard let record = records[operationID],
+              record.phase == .queued || record.phase == .starting,
+              record.queryID == nil
+        else { return }
+        removeBatchEligibility(record)
+        releaseBatchStartupState(record)
         if let requestKey = record.requestKey, recordIDByRequestKey[requestKey] == operationID {
             recordIDByRequestKey.removeValue(forKey: requestKey)
             record.rejectedRequestKeyWasReleased = true
@@ -412,12 +524,17 @@ final class OracleMCPOperationStore: ObservableObject {
     }
 
     func updateFinalization(_ operationID: UUID, finalization: FinalizationRequest) {
-        guard let record = records[operationID], record.phase == .starting else { return }
+        guard let record = records[operationID],
+              record.phase == .queued || record.phase == .starting
+        else { return }
         record.finalization = finalization
     }
 
     func installStartupTask(_ operationID: UUID, task: Task<ChatToolError?, Never>) {
-        guard let record = records[operationID], record.phase == .starting else {
+        guard let record = records[operationID],
+              record.batchIndex == nil,
+              record.phase == .starting
+        else {
             task.cancel()
             return
         }
@@ -437,15 +554,18 @@ final class OracleMCPOperationStore: ObservableObject {
     /// Binds the accepted send at the first synchronous point after `.started` (plan §3.4).
     /// Transfers the ticket's single pin to the operation and spawns the one completion
     /// observer that will write the terminal phase.
+    @discardableResult
     func bind(
         _ operationID: UUID,
         ticket: OracleViewModel.OracleMCPSendTicket,
         chatShortID: String?
-    ) {
+    ) -> Bool {
         guard let record = records[operationID], record.phase == .starting, record.queryID == nil else {
             // Unknown or already bound: the caller keeps the pin it holds.
-            return
+            return false
         }
+        removeBatchEligibility(record)
+        releaseBatchStartupState(record)
         record.phase = .running
         record.chatID = ticket.chatID
         record.chatShortID = chatShortID
@@ -475,6 +595,226 @@ final class OracleMCPOperationStore: ObservableObject {
             self?.completeObservation(operationID, observerCancelled: observerCancelled)
         }
         bumpRevision()
+        return true
+    }
+
+    // MARK: - Batch scheduling
+
+    private func requestBatchDrain(tabID: UUID) {
+        guard !isTornDown,
+              var queue = batchQueuesByTabID[tabID],
+              !queue.operationIDs.isEmpty,
+              !queue.drainScheduled
+        else { return }
+        queue.drainScheduled = true
+        batchQueuesByTabID[tabID] = queue
+        Task { @MainActor [weak self] in
+            self?.drainBatchQueue(tabID: tabID)
+        }
+    }
+
+    private func drainBatchQueue(tabID: UUID) {
+        guard !isTornDown, var queue = batchQueuesByTabID[tabID] else { return }
+        queue.drainScheduled = false
+        batchQueuesByTabID[tabID] = queue
+
+        while var current = batchQueuesByTabID[tabID] {
+            while let head = current.operationIDs.first {
+                guard let record = records[head],
+                      record.batchIndex != nil,
+                      record.queryID == nil,
+                      !record.phase.isTerminal
+                else {
+                    current.operationIDs.removeFirst()
+                    if current.preparingOperationID == head {
+                        current.preparingOperationID = nil
+                    }
+                    continue
+                }
+                break
+            }
+            batchQueuesByTabID[tabID] = current
+            guard let operationID = current.operationIDs.first,
+                  let record = records[operationID]
+            else {
+                batchQueuesByTabID.removeValue(forKey: tabID)
+                return
+            }
+            guard current.preparingOperationID == nil else { return }
+            guard record.batchActiveRunProvider?() != nil else {
+                rejectStartup(operationID, error: .notStartedOwnerInactive())
+                continue
+            }
+            guard dependencies.activeStreamCount(tabID) < OracleViewModel.maxConcurrentMCPOracleStreamsPerTab else {
+                return
+            }
+            guard let startup = record.batchStartup else {
+                rejectStartup(
+                    operationID,
+                    error: .internalError("queued ask_oracle lane is missing its startup work")
+                )
+                continue
+            }
+
+            record.phase = .starting
+            current.preparingOperationID = operationID
+            batchQueuesByTabID[tabID] = current
+            let task = Task<ChatToolError?, Never> { @MainActor [weak self] in
+                let error = await startup(operationID)
+                guard let self else { return error }
+                if let snapshot = snapshot(operationID),
+                   snapshot.queryID == nil,
+                   !snapshot.phase.isTerminal
+                {
+                    rejectStartup(
+                        operationID,
+                        error: error ?? .internalError("queued ask_oracle lane ended before reservation")
+                    )
+                }
+                finishStartupTask(operationID)
+                return error
+            }
+            record.startupTask = task
+            bumpRevision()
+            return
+        }
+    }
+
+    /// Decisive synchronous gate called after packaging immediately before chat creation and
+    /// reservation. The caller must reserve and bind in the same MainActor segment.
+    func authorizeBatchReservation(
+        _ operationID: UUID,
+        requiresOriginatingRun: Bool
+    ) -> BatchReservationDecision {
+        guard !isTornDown,
+              let record = records[operationID],
+              record.batchIndex != nil,
+              record.queryID == nil,
+              !record.phase.isTerminal,
+              let queue = batchQueuesByTabID[record.owner.tabID],
+              queue.operationIDs.first == operationID,
+              queue.preparingOperationID == operationID,
+              let activeRunID = record.batchActiveRunProvider?()
+        else {
+            if !isTornDown,
+               let record = records[operationID],
+               record.batchIndex != nil,
+               record.queryID == nil,
+               !record.phase.isTerminal,
+               record.batchActiveRunProvider?() == nil
+            {
+                rejectStartup(operationID, error: .notStartedOwnerInactive())
+                return .ownerInactive
+            }
+            return .unavailable
+        }
+        if requiresOriginatingRun, activeRunID != record.owner.originatingRunID {
+            rejectStartup(operationID, error: .notStartedOwnerInactive())
+            return .ownerInactive
+        }
+        if dependencies.activeStreamCount(record.owner.tabID) >= OracleViewModel.maxConcurrentMCPOracleStreamsPerTab {
+            if record.phase != .queued {
+                record.phase = .queued
+                bumpRevision()
+            }
+            return .waitForCapacity
+        }
+        if record.phase != .starting {
+            record.phase = .starting
+            bumpRevision()
+        }
+        return .authorized(activeRunID: activeRunID)
+    }
+
+    /// Parks a prepared lane without repackaging. Registration performs a same-turn capacity
+    /// check so a retirement cannot be lost between the miss and waiter installation.
+    func awaitBatchCapacity(_ operationID: UUID) async -> Bool {
+        guard !isTornDown,
+              let record = records[operationID],
+              record.batchIndex != nil,
+              record.queryID == nil,
+              !record.phase.isTerminal
+        else { return false }
+        if dependencies.activeStreamCount(record.owner.tabID) < OracleViewModel.maxConcurrentMCPOracleStreamsPerTab {
+            return true
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard !isTornDown,
+                      let current = records[operationID],
+                      current.batchIndex != nil,
+                      current.queryID == nil,
+                      !current.phase.isTerminal
+                else {
+                    continuation.resume()
+                    return
+                }
+                if dependencies.activeStreamCount(current.owner.tabID) < OracleViewModel.maxConcurrentMCPOracleStreamsPerTab {
+                    continuation.resume()
+                    return
+                }
+                batchCapacityWaiters.removeValue(forKey: operationID)?.resume()
+                batchCapacityWaiters[operationID] = continuation
+            }
+            return !isTornDown && !Task.isCancelled
+                && (records[operationID].map { !$0.phase.isTerminal && $0.queryID == nil } ?? false)
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.resumeBatchCapacityWaiter(operationID)
+            }
+        }
+    }
+
+    func noteActualStreamCapacityChanged(tabID: UUID) {
+        guard !isTornDown else { return }
+        if let preparingID = batchQueuesByTabID[tabID]?.preparingOperationID {
+            resumeBatchCapacityWaiter(preparingID)
+        }
+        requestBatchDrain(tabID: tabID)
+    }
+
+    private func resumeBatchCapacityWaiter(_ operationID: UUID) {
+        batchCapacityWaiters.removeValue(forKey: operationID)?.resume()
+    }
+
+    private func removeBatchEligibility(_ record: Record) {
+        guard record.batchIndex != nil else { return }
+        let tabID = record.owner.tabID
+        if var queue = batchQueuesByTabID[tabID] {
+            queue.operationIDs.removeAll { $0 == record.operationID }
+            if queue.preparingOperationID == record.operationID {
+                queue.preparingOperationID = nil
+            }
+            if queue.operationIDs.isEmpty {
+                batchQueuesByTabID.removeValue(forKey: tabID)
+            } else {
+                batchQueuesByTabID[tabID] = queue
+            }
+        }
+        resumeBatchCapacityWaiter(record.operationID)
+        requestBatchDrain(tabID: tabID)
+    }
+
+    /// Cancels a queued or pre-bind preparing batch lane without starting a provider request.
+    func cancelUnboundBatch(_ operationID: UUID) -> Bool {
+        guard let record = records[operationID],
+              record.batchIndex != nil,
+              record.queryID == nil,
+              record.phase == .queued || record.phase == .starting
+        else { return false }
+        let startupTask = record.startupTask
+        removeBatchEligibility(record)
+        releaseBatchStartupState(record)
+        record.cancelRequested = true
+        record.terminalReason = .cancelled
+        record.terminalDetail = "cancelled_before_start"
+        record.terminalAt = dependencies.now()
+        record.phase = .cancelled
+        record.startupTask = nil
+        startupTask?.cancel()
+        bumpRevision()
+        resumeWaitersSettled(by: operationID)
+        return true
     }
 
     // MARK: - Stream lifecycle inputs
@@ -592,7 +932,8 @@ final class OracleMCPOperationStore: ObservableObject {
             queryID: record.queryID,
             mode: record.finalization.mode,
             modelPresetName: record.ticket?.replyContext.modelPresetName,
-            terminalReason: record.terminalReason
+            terminalReason: record.terminalReason,
+            batchIndex: record.batchIndex
         )
     }
 
@@ -825,6 +1166,7 @@ final class OracleMCPOperationStore: ObservableObject {
     }
 
     private func remove(_ record: Record, tombstone: Bool, now: Date? = nil) {
+        releaseBatchStartupState(record)
         records.removeValue(forKey: record.operationID)
         creationOrder.removeAll { $0 == record.operationID }
         if let queryID = record.queryID {
@@ -833,6 +1175,7 @@ final class OracleMCPOperationStore: ObservableObject {
         if let requestKey = record.requestKey {
             recordIDByRequestKey.removeValue(forKey: requestKey)
         }
+        removeBatchEligibility(record)
         record.startupTask?.cancel()
         record.completionTask?.cancel()
         if record.ownsPin, let chatID = record.chatID {
@@ -846,6 +1189,7 @@ final class OracleMCPOperationStore: ObservableObject {
             chatShortID: record.chatShortID,
             requestKey: record.requestKey,
             intentDigest: record.intentDigest,
+            batchIndex: record.batchIndex,
             evictedAt: now ?? dependencies.now()
         )
         tombstones[record.operationID] = stone
@@ -866,7 +1210,13 @@ final class OracleMCPOperationStore: ObservableObject {
     /// Cancels every completion observer and resumes parked waiters. Streams are untouched.
     func teardown() {
         isTornDown = true
+        batchQueuesByTabID.removeAll()
+        for continuation in batchCapacityWaiters.values {
+            continuation.resume()
+        }
+        batchCapacityWaiters.removeAll()
         for record in records.values {
+            releaseBatchStartupState(record)
             record.startupTask?.cancel()
             record.startupTask = nil
             record.completionTask?.cancel()
@@ -878,6 +1228,11 @@ final class OracleMCPOperationStore: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    private func releaseBatchStartupState(_ record: Record) {
+        record.batchActiveRunProvider = nil
+        record.batchStartup = nil
+    }
 
     private func bumpRevision() {
         phaseRevision &+= 1
@@ -904,13 +1259,17 @@ final class OracleMCPOperationStore: ObservableObject {
             terminalReason: record.terminalReason,
             requestID: record.requestKey?.requestID,
             modelPresetName: record.ticket?.replyContext.modelPresetName,
-            cancelRequested: record.cancelRequested
+            cancelRequested: record.cancelRequested,
+            batchIndex: record.batchIndex
         )
     }
 
     private func makeBaseLane(_ record: Record) -> [String: Value] {
         var lane: [String: Value] = record.rawReply ?? [:]
         lane["operation_id"] = .string(record.operationID.uuidString)
+        if let batchIndex = record.batchIndex {
+            lane["index"] = .int(batchIndex)
+        }
         if lane["chat_id"] == nil, let chatShortID = record.chatShortID {
             lane["chat_id"] = .string(chatShortID)
         }
@@ -923,6 +1282,9 @@ final class OracleMCPOperationStore: ObservableObject {
         switch record.phase {
         case .ready:
             lane["status"] = .string("completed")
+            if record.batchIndex != nil {
+                lane["ok"] = .bool(true)
+            }
         case .cancelled, .failed:
             let partial = lane.removeValue(forKey: "response")?.stringValue?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -933,6 +1295,9 @@ final class OracleMCPOperationStore: ObservableObject {
             }
             if record.finalization.requestsExport {
                 lane["export_skipped"] = .string(record.phase.rawValue)
+            }
+            if record.batchIndex != nil, record.queryID == nil {
+                lane["consultation_started"] = .bool(false)
             }
             if let rejection = record.startupRejection {
                 var errorObject: [String: Value] = [
@@ -957,7 +1322,7 @@ final class OracleMCPOperationStore: ObservableObject {
                 }
                 lane["error"] = .object(["code": .string(code), "message": .string(message)])
             }
-        case .starting, .running, .cancelling:
+        case .queued, .starting, .running, .cancelling:
             break
         }
         return lane
@@ -989,7 +1354,11 @@ final class OracleMCPOperationStore: ObservableObject {
             chatShortID: String?,
             result: [String: Value]
         ) {
-            guard let record = records[operationID], record.phase == .starting else { return }
+            guard let record = records[operationID],
+                  record.phase == .queued || record.phase == .starting
+            else { return }
+            removeBatchEligibility(record)
+            releaseBatchStartupState(record)
             record.phase = .ready
             record.chatID = ticket.chatID
             record.chatShortID = chatShortID
@@ -1030,8 +1399,33 @@ final class OracleMCPOperationStore: ObservableObject {
             records[operationID]?.completionTask != nil
         }
 
+        func test_hasStartupTask(_ operationID: UUID) -> Bool {
+            records[operationID]?.startupTask != nil
+        }
+
+        func test_startupTask(_ operationID: UUID) -> Task<ChatToolError?, Never>? {
+            records[operationID]?.startupTask
+        }
+
+        func test_hasBatchStartupState(_ operationID: UUID) -> Bool {
+            guard let record = records[operationID] else { return false }
+            return record.batchActiveRunProvider != nil || record.batchStartup != nil
+        }
+
         func test_creationOrder() -> [UUID] {
             creationOrder
+        }
+
+        func test_batchQueue(_ tabID: UUID) -> [UUID] {
+            batchQueuesByTabID[tabID]?.operationIDs ?? []
+        }
+
+        func test_batchPreparingOperationID(_ tabID: UUID) -> UUID? {
+            batchQueuesByTabID[tabID]?.preparingOperationID
+        }
+
+        func test_batchCapacityWaiterCount() -> Int {
+            batchCapacityWaiters.count
         }
     #endif
 }
