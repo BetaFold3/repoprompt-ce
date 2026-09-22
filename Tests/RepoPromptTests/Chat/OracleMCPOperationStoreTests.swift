@@ -49,6 +49,7 @@ final class OracleMCPOperationStoreTests: XCTestCase {
         var repliesByQueryID: [UUID: [String: Value]] = [:]
         var captureFailures: Set<UUID> = []
         var chatNames: [UUID: String] = [:]
+        var progressByQueryID: [UUID: OracleViewModel.OracleMCPProgressSnapshot] = [:]
         var activeStreamCount = 0
         var now = Date(timeIntervalSince1970: 1_700_000_000)
         /// Queries whose wait returns even though the message is neither finalized nor missing.
@@ -80,6 +81,7 @@ final class OracleMCPOperationStoreTests: XCTestCase {
             },
             chatName: { [weak self] chatID in self?.chatNames[chatID] },
             activeStreamCount: { [weak self] _ in self?.activeStreamCount ?? 0 },
+            progressSnapshot: { [weak self] queryID in self?.progressByQueryID[queryID] },
             now: { [weak self] in self?.now ?? Date() }
         ))
 
@@ -1159,6 +1161,10 @@ final class OracleMCPOperationStoreTests: XCTestCase {
         let harness = Harness()
         let ticket = makeTicket(mode: "plan")
         harness.chatNames[ticket.chatID] = "Duel lane A"
+        harness.progressByQueryID[ticket.queryID] = OracleViewModel.OracleMCPProgressSnapshot(
+            outputChars: 12480,
+            lastActivityAt: harness.now.addingTimeInterval(-4)
+        )
         let (operationID, _) = try reserveAndBind(harness, finalization: makeFinalization(mode: "plan"), ticket: ticket)
         let running = try XCTUnwrap(harness.store.summary(for: operationID))
         XCTAssertEqual(running.phase, .running)
@@ -1168,6 +1174,9 @@ final class OracleMCPOperationStoreTests: XCTestCase {
         XCTAssertEqual(running.chatName, "Duel lane A")
         XCTAssertEqual(running.mode, "plan")
         XCTAssertEqual(running.modelPresetName, "Store_Preset")
+        XCTAssertEqual(running.progress?.outputChars, 12480)
+        XCTAssertEqual(running.progress?.lastActivitySecondsAgo, 4)
+        XCTAssertNil(running.progress?.queuePosition)
         XCTAssertEqual(running.elapsed(at: harness.now.addingTimeInterval(720)), 720, accuracy: 0.001)
         harness.now = harness.now.addingTimeInterval(37)
         XCTAssertEqual(harness.store.elapsedSeconds(for: operationID), 37)
@@ -1180,6 +1189,7 @@ final class OracleMCPOperationStoreTests: XCTestCase {
         XCTAssertEqual(ready.phase, .ready)
         XCTAssertTrue(ready.isTerminal)
         XCTAssertFalse(ready.isCollected)
+        XCTAssertNil(ready.progress, "terminal rows never expose advisory pending progress")
         XCTAssertEqual(ready.elapsed(at: harness.now.addingTimeInterval(1000)), 10, accuracy: 0.001, "elapsed freezes at the terminal timestamp")
 
         _ = try await harness.store.deliver(operationID) { _, _ in }

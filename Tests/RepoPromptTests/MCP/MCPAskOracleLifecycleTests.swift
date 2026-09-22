@@ -51,6 +51,11 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             continuations[index].yield(ChatStreamOutput(text: text, reasoning: nil, tokens: ChatTokenInfo(), isFinal: false))
         }
 
+        func yieldReasoning(index: Int, reasoning: String) {
+            guard continuations.indices.contains(index) else { return }
+            continuations[index].yield(ChatStreamOutput(text: "", reasoning: reasoning, tokens: ChatTokenInfo(), isFinal: false))
+        }
+
         func fail(index: Int, error: Error) {
             guard continuations.indices.contains(index) else { return }
             continuations[index].finish(throwing: error)
@@ -424,7 +429,12 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
 
     func testPollSendReturnsPendingStubUnderCeilingAndWaitDeliversExactlyOnce() async throws {
         try await withFixture { fixture in
-            let pending = try await fixture.ask(["timeout_seconds": .int(0)])
+            let requestID = UUID().uuidString
+            let pendingArgs: [String: Value] = [
+                "timeout_seconds": .int(0),
+                "request_id": .string(requestID)
+            ]
+            let pending = try await fixture.ask(pendingArgs)
             XCTAssertEqual(pending["status"]?.stringValue, "pending")
             XCTAssertNil(pending["response"], "a pending result never carries a response")
             XCTAssertNotNil(pending["chat_id"])
@@ -437,6 +447,11 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             XCTAssertEqual(pendingInfo["reason"]?.stringValue, "polled")
             XCTAssertEqual(pendingInfo["stream_state"]?.stringValue, "streaming")
             XCTAssertNotNil(pendingInfo["elapsed_seconds"]?.intValue)
+            let initialProgress = try XCTUnwrap(pendingInfo["progress"]?.objectValue)
+            XCTAssertEqual(initialProgress["output_chars"]?.intValue, 0)
+            XCTAssertNil(initialProgress["last_activity_seconds_ago"], "activity age is omitted until stream activity is observed")
+            XCTAssertNil(initialProgress["queue_position"], "single sends are never queued")
+            XCTAssertEqual(Set(initialProgress.keys), ["output_chars"], "progress never leaks text or extra stream state")
             XCTAssertEqual(pending["note"]?.stringValue, MCPOracleToolService.pendingNote)
             XCTAssertNil(pending["_meta"], "wake_reason is present only for a steering wake")
             let operationID = try operationID(in: pending)
@@ -461,6 +476,50 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             XCTAssertEqual(fixture.window.oracleViewModel.oracleSessionPinCountForTesting(chatID), 1, "the operation owns the ticket pin")
             XCTAssertEqual(fixture.window.oracleViewModel.mcpActiveOracleStreamCount(forTabID: fixture.tabID), 1, "pending operations still occupy the two-stream cap")
 
+            let queryID = try XCTUnwrap(pending["query_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
+            let reasoningText = "Private reasoning must stay private"
+            fixture.harness.yieldReasoning(index: 0, reasoning: reasoningText)
+            try await AsyncTestWait.waitUntil("Oracle progress snapshot observes reasoning-only activity", timeout: 2) {
+                await MainActor.run {
+                    guard let snapshot = fixture.window.oracleViewModel.oracleMCPProgressSnapshot(for: queryID) else {
+                        return false
+                    }
+                    return snapshot.outputChars == 0 && snapshot.lastActivityAt != nil
+                }
+            }
+            let reasoningOnly = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array([.string(operationID.uuidString)]),
+                "timeout_seconds": .int(0)
+            ])
+            let reasoningLane = try XCTUnwrap(try lanes(in: reasoningOnly).first)
+            let reasoningProgress = try XCTUnwrap(
+                reasoningLane["pending"]?.objectValue?["progress"]?.objectValue
+            )
+            XCTAssertEqual(reasoningProgress["output_chars"]?.intValue, 0)
+            XCTAssertNotNil(reasoningProgress["last_activity_seconds_ago"]?.intValue)
+            XCTAssertNil(reasoningProgress["queue_position"])
+            XCTAssertEqual(Set(reasoningProgress.keys), ["output_chars", "last_activity_seconds_ago"])
+            XCTAssertFalse(
+                ToolOutputFormatter.rawJSONString(.object(reasoningOnly)).contains(reasoningText),
+                "reasoning-only activity must never expose reasoning text"
+            )
+
+            let partialText = "Partial 🔒 output"
+            let phaseRevisionBeforeProgress = fixture.store.phaseRevision
+            fixture.harness.yield(index: 0, text: partialText)
+            try await AsyncTestWait.waitUntil("Oracle progress snapshot observes streamed output", timeout: 2) {
+                await MainActor.run {
+                    fixture.window.oracleViewModel.oracleMCPProgressSnapshot(for: queryID)?.outputChars
+                        == partialText.count
+                }
+            }
+            XCTAssertEqual(
+                fixture.store.phaseRevision,
+                phaseRevisionBeforeProgress,
+                "stream deltas do not publish operation-store phase revisions"
+            )
+
             let polled = try await fixture.call([
                 "op": .string("wait"),
                 "operation_ids": .array([.string(operationID.uuidString)]),
@@ -471,8 +530,43 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             XCTAssertEqual(polledLane["status"]?.stringValue, "pending")
             XCTAssertNil(polledLane["wait_policy"], "lanes never carry their own wait_policy")
             XCTAssertNil(polledLane["resume"])
+            let sampledProgress = try XCTUnwrap(
+                polledLane["pending"]?.objectValue?["progress"]?.objectValue
+            )
+            XCTAssertEqual(sampledProgress["output_chars"]?.intValue, partialText.count)
+            XCTAssertNotNil(sampledProgress["last_activity_seconds_ago"]?.intValue)
+            XCTAssertNil(sampledProgress["queue_position"])
+            XCTAssertEqual(
+                Set(sampledProgress.keys),
+                ["output_chars", "last_activity_seconds_ago"],
+                "advisory progress exposes counts only, never response text or reasoning"
+            )
+            XCTAssertFalse(
+                ToolOutputFormatter.rawJSONString(.object(sampledProgress)).contains(partialText),
+                "progress metadata must not contain streamed text"
+            )
             XCTAssertEqual(polled["wait_policy"]?.objectValue?["mode"]?.stringValue, "poll")
             XCTAssertNotNil(polled["resume"])
+
+            let progressedReplay = try await fixture.ask(pendingArgs)
+            XCTAssertEqual(try self.operationID(in: progressedReplay), operationID)
+            XCTAssertEqual(progressedReplay["status"]?.stringValue, "pending")
+            XCTAssertEqual(progressedReplay["wait_policy"]?.objectValue?["mode"]?.stringValue, "poll")
+            XCTAssertNotNil(progressedReplay["resume"])
+            XCTAssertEqual(progressedReplay["note"]?.stringValue, MCPOracleToolService.pendingNote)
+            let replayProgress = try XCTUnwrap(
+                progressedReplay["pending"]?.objectValue?["progress"]?.objectValue
+            )
+            XCTAssertEqual(replayProgress["output_chars"]?.intValue, partialText.count)
+            XCTAssertNotNil(replayProgress["last_activity_seconds_ago"]?.intValue)
+            XCTAssertEqual(Set(replayProgress.keys), ["output_chars", "last_activity_seconds_ago"])
+            let progressedReplayByteCount = try encodedByteCount(progressedReplay)
+            XCTAssertLessThanOrEqual(
+                progressedReplayByteCount,
+                MCPOracleToolService.pendingStubByteCeiling,
+                "progressed keyed single-result stub measured \(progressedReplayByteCount) bytes"
+            )
+            XCTAssertEqual(fixture.harness.openedStreamCount, 1, "keyed progress replay never resends")
 
             fixture.harness.finish(index: 0, text: "Final Oracle answer")
             let completed = try await fixture.call([
@@ -490,7 +584,7 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             let lane = try XCTUnwrap(try lanes(in: completed).first)
             XCTAssertEqual(lane["status"]?.stringValue, "completed")
             XCTAssertEqual(lane["operation_id"]?.stringValue, operationID.uuidString)
-            XCTAssertEqual(lane["response"]?.stringValue, "Final Oracle answer")
+            XCTAssertEqual(lane["response"]?.stringValue, partialText + "Final Oracle answer")
             XCTAssertEqual(lane["model_preset_name"]?.stringValue, fixture.preset.name)
             XCTAssertNil(lane["wait_policy"])
             XCTAssertEqual(fixture.window.oracleViewModel.oracleSessionPinCountForTesting(chatID), 0, "the observer released the pin exactly once")
@@ -502,7 +596,7 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
                 "timeout_seconds": .int(7)
             ])
             let replayLane = try XCTUnwrap(try lanes(in: replay).first)
-            XCTAssertEqual(replayLane["response"]?.stringValue, "Final Oracle answer")
+            XCTAssertEqual(replayLane["response"]?.stringValue, partialText + "Final Oracle answer")
             XCTAssertEqual(replay["wait_policy"]?.objectValue?["mode"]?.stringValue, "explicit")
             XCTAssertEqual(replay["wait_policy"]?.objectValue?["timeout_seconds"]?.intValue, 7)
             XCTAssertEqual(fixture.harness.openedStreamCount, 1, "waits never resend")
@@ -803,6 +897,7 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             await gate.waitUntilEntered()
             let operationID = try XCTUnwrap(fixture.store.test_creationOrder().first)
             XCTAssertEqual(fixture.store.snapshot(operationID)?.phase, .running)
+            try await fixture.harness.waitUntilOpen(count: 1)
 
             fixture.harness.finish(index: 0, text: "Completed before post-bind activation")
             try await fixture.waitUntilTerminal(operationID)
@@ -854,9 +949,10 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             XCTAssertTrue(fixture.window.mcpServer.test_oracleWaitScopeExists(executionID: execution.executionID))
             XCTAssertTrue(fixture.window.mcpServer.hasActiveToolExecutions(runID: fixture.runID))
 
+            let requestID = UUID().uuidString
             let askTask = Task { @MainActor in
                 try await MCPServerViewModel.$currentToolExecutionID.withValue(execution.executionID) {
-                    try await fixture.ask()
+                    try await fixture.ask(["request_id": .string(requestID)])
                 }
             }
             try await fixture.harness.waitUntilOpen(count: 1)
@@ -864,6 +960,17 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             let server = fixture.window.mcpServer
             try await AsyncTestWait.waitUntil("observer subscribed to wake scope", timeout: 5) {
                 await MainActor.run { server.test_oracleWaitScopeHasParkedObserver(executionID: execution.executionID) }
+            }
+
+            let operationID = try XCTUnwrap(fixture.store.test_creationOrder().first)
+            let queryID = try XCTUnwrap(fixture.store.snapshot(operationID)?.queryID)
+            let steeringText = String(repeating: "s", count: 12480)
+            fixture.harness.yield(index: 0, text: steeringText)
+            try await AsyncTestWait.waitUntil("steering stub observes streamed output", timeout: 2) {
+                await MainActor.run {
+                    fixture.window.oracleViewModel.oracleMCPProgressSnapshot(for: queryID)?.outputChars
+                        == steeringText.count
+                }
             }
 
             await fixture.window.mcpServer.wakeAgentRunWaitersOwnedByActiveRun(
@@ -877,7 +984,25 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
             XCTAssertEqual(woken["_meta"]?.objectValue?["wake_reason"]?.stringValue, MCPOracleToolService.steeringWakeReason)
             XCTAssertNil(woken["response"])
             XCTAssertFalse((woken["note"]?.stringValue ?? "").lowercased().contains("cancel"), "the steering note never mentions cancel")
-            let operationID = try operationID(in: woken)
+            XCTAssertEqual(try self.operationID(in: woken), operationID)
+            XCTAssertEqual(woken["wait_policy"]?.objectValue?["mode"]?.stringValue, "automatic")
+            XCTAssertEqual(woken["wait_policy"]?.objectValue?["parent_family"]?.stringValue, "unresolved")
+            let steeringProgress = try XCTUnwrap(
+                woken["pending"]?.objectValue?["progress"]?.objectValue
+            )
+            XCTAssertEqual(steeringProgress["output_chars"]?.intValue, steeringText.count)
+            XCTAssertNotNil(steeringProgress["last_activity_seconds_ago"]?.intValue)
+            XCTAssertEqual(Set(steeringProgress.keys), ["output_chars", "last_activity_seconds_ago"])
+            XCTAssertFalse(
+                ToolOutputFormatter.rawJSONString(.object(woken)).contains(steeringText),
+                "steering progress must not include output text"
+            )
+            let steeringStubByteCount = try encodedByteCount(woken)
+            XCTAssertLessThanOrEqual(
+                steeringStubByteCount,
+                MCPOracleToolService.pendingStubByteCeiling,
+                "automatic steering stub measured \(steeringStubByteCount) bytes"
+            )
             XCTAssertEqual(fixture.store.snapshot(operationID)?.phase, .running)
 
             // The tool result has been produced; cleanup unregisters and the flush waiter drains.
@@ -917,7 +1042,7 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
                 "operation_ids": .array([.string(operationID.uuidString)])
             ])
             XCTAssertEqual(collected["wait"]?.objectValue?["result"]?.stringValue, "completed")
-            XCTAssertEqual(try lanes(in: collected).first?["response"]?.stringValue, "Collected after steer")
+            XCTAssertEqual(try lanes(in: collected).first?["response"]?.stringValue, steeringText + "Collected after steer")
             XCTAssertEqual(fixture.harness.openedStreamCount, 1)
         }
     }
@@ -1237,12 +1362,14 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
     func testBatchReturnsStableIndexedReceiptsAndQueuesBehindActualStreamCapacity() async throws {
         try await withFixture { fixture in
             try fixture.activateAgentRunForBatch()
+            let preparationGate = TestReleaseFence(name: "queued position preparing-head gate")
+            defer { preparationGate.release() }
             let batch = try await fixture.call([
-                "consultations": batchConsultations(fixture: fixture, count: 3),
+                "consultations": batchConsultations(fixture: fixture, count: 5),
                 "timeout_seconds": .int(0)
             ])
             let admitted = try lanes(in: batch)
-            XCTAssertEqual(admitted.map { $0["index"]?.intValue }, [0, 1, 2])
+            XCTAssertEqual(admitted.map { $0["index"]?.intValue }, [0, 1, 2, 3, 4])
             let operationIDs = try admitted.map {
                 try XCTUnwrap($0["operation_id"]?.stringValue.flatMap(UUID.init(uuidString:)))
             }
@@ -1256,18 +1383,99 @@ final class MCPAskOracleLifecycleTests: XCTestCase {
                 "timeout_seconds": .int(0)
             ])
             let lanes = try lanes(in: polled)
-            XCTAssertEqual(lanes.map { $0["index"]?.intValue }, [0, 1, 2])
+            XCTAssertEqual(lanes.map { $0["index"]?.intValue }, [0, 1, 2, 3, 4])
             XCTAssertEqual(lanes[0]["pending"]?.objectValue?["stream_state"]?.stringValue, "streaming")
             XCTAssertEqual(lanes[1]["pending"]?.objectValue?["stream_state"]?.stringValue, "streaming")
-            XCTAssertEqual(lanes[2]["pending"]?.objectValue?["stream_state"]?.stringValue, "queued")
+            XCTAssertEqual(
+                lanes[2 ... 4].map { $0["pending"]?.objectValue?["stream_state"]?.stringValue },
+                ["queued", "queued", "queued"]
+            )
+            let initialQueuePositions = try lanes[2 ... 4].map { lane in
+                let progress = try XCTUnwrap(lane["pending"]?.objectValue?["progress"]?.objectValue)
+                XCTAssertNil(progress["output_chars"])
+                XCTAssertNil(progress["last_activity_seconds_ago"])
+                XCTAssertEqual(Set(progress.keys), ["queue_position"])
+                return try XCTUnwrap(progress["queue_position"]?.intValue)
+            }
+            XCTAssertEqual(initialQueuePositions, [0, 1, 2])
             XCTAssertNotNil(lanes[2]["chat_id"], "unbound batch receipts explicitly carry null chat_id")
             XCTAssertNotNil(lanes[2]["query_id"], "unbound batch receipts explicitly carry null query_id")
 
+            let cancelled = try await fixture.call([
+                "op": .string("cancel"),
+                "operation_ids": .array([.string(operationIDs[2].uuidString)])
+            ])
+            let cancelledLane = try XCTUnwrap(try self.lanes(in: cancelled).first)
+            XCTAssertEqual(cancelledLane["index"]?.intValue, 2)
+            XCTAssertEqual(cancelledLane["cancel"]?.stringValue, "requested")
+
+            let afterCancel = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array(operationIDs[3 ... 4].map { .string($0.uuidString) }),
+                "timeout_seconds": .int(0)
+            ])
+            let afterCancelLanes = try self.lanes(in: afterCancel)
+            XCTAssertEqual(afterCancelLanes.map { $0["index"]?.intValue }, [3, 4])
+            let afterCancelPositions = try afterCancelLanes.map { lane in
+                try XCTUnwrap(
+                    lane["pending"]?.objectValue?["progress"]?.objectValue?["queue_position"]?.intValue
+                )
+            }
+            XCTAssertEqual(afterCancelPositions, [0, 1], "cancelling the queued head shifts later FIFO positions")
+
+            var shouldBlockNextPreparation = true
+            fixture.window.oracleViewModel.setOracleRequestPreparedObserverForTesting {
+                if shouldBlockNextPreparation {
+                    shouldBlockNextPreparation = false
+                    await preparationGate.enterAndWait()
+                }
+            }
             fixture.harness.finish(index: 0, text: "lane zero")
+            await preparationGate.waitUntilEntered()
+            XCTAssertEqual(fixture.store.snapshot(operationIDs[3])?.phase, .starting)
+
+            let whilePreparing = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array(operationIDs[3 ... 4].map { .string($0.uuidString) }),
+                "timeout_seconds": .int(0)
+            ])
+            let preparingLanes = try self.lanes(in: whilePreparing)
+            XCTAssertEqual(preparingLanes.map { $0["index"]?.intValue }, [3, 4])
+            XCTAssertEqual(preparingLanes[0]["pending"]?.objectValue?["stream_state"]?.stringValue, "starting")
+            XCTAssertNil(
+                preparingLanes[0]["pending"]?.objectValue?["progress"],
+                "a preparing head reports no progress of its own"
+            )
+            XCTAssertEqual(
+                preparingLanes[1]["pending"]?.objectValue?["progress"]?.objectValue?["queue_position"]?.intValue,
+                1,
+                "a queued lane counts an earlier unbound preparing head"
+            )
+
+            preparationGate.release()
             try await fixture.harness.waitUntilOpen(count: 3)
-            XCTAssertEqual(fixture.store.snapshot(operationIDs[2])?.phase, .running)
+            XCTAssertEqual(fixture.store.snapshot(operationIDs[3])?.phase, .running)
+            let afterBind = try await fixture.call([
+                "op": .string("wait"),
+                "operation_ids": .array(operationIDs[3 ... 4].map { .string($0.uuidString) }),
+                "timeout_seconds": .int(0)
+            ])
+            let afterBindLanes = try self.lanes(in: afterBind)
+            XCTAssertEqual(afterBindLanes.map { $0["index"]?.intValue }, [3, 4])
+            XCTAssertEqual(afterBindLanes[0]["pending"]?.objectValue?["stream_state"]?.stringValue, "streaming")
+            XCTAssertEqual(
+                afterBindLanes[1]["pending"]?.objectValue?["progress"]?.objectValue?["queue_position"]?.intValue,
+                0,
+                "binding the preparing head removes it from the unbound FIFO position"
+            )
+
             fixture.harness.finish(index: 1, text: "lane one")
-            fixture.harness.finish(index: 2, text: "lane two")
+            try await fixture.harness.waitUntilOpen(count: 4)
+            fixture.harness.finish(index: 2, text: "lane three")
+            fixture.harness.finish(index: 3, text: "lane four")
+            for operationID in [operationIDs[0], operationIDs[1], operationIDs[3], operationIDs[4]] {
+                try await fixture.waitUntilTerminal(operationID)
+            }
         }
     }
 

@@ -36,6 +36,30 @@ private func nonEmptyOracleToolCardText(_ value: String?) -> String? {
     return value
 }
 
+private func oracleProgressSummary(
+    outputChars: Int?,
+    lastActivitySecondsAgo: Int?,
+    queuePosition: Int?,
+    activityAgeAtLastReport: Bool
+) -> String? {
+    var parts: [String] = []
+    if let queuePosition {
+        parts.append("queue position \(queuePosition)")
+    }
+    if let outputChars {
+        parts.append("\(outputChars) chars")
+    }
+    if let lastActivitySecondsAgo {
+        let age = max(0, lastActivitySecondsAgo)
+        if activityAgeAtLastReport {
+            parts.append("activity age at last report: \(age)s")
+        } else {
+            parts.append("activity observed \(age)s ago")
+        }
+    }
+    return parts.isEmpty ? nil : parts.joined(separator: " · ")
+}
+
 enum OracleToolCardState: String, Equatable, Hashable {
     case queued
     case preparing
@@ -70,12 +94,19 @@ struct OracleToolCardLanePresentation: Equatable {
     let operationID: String?
     let chatID: String?
     let state: OracleToolCardState
+    let progressSummary: String?
     let contextSummary: String
 
     init(dto: ToolResultDTOs.ChatSendDTO) {
         operationID = nonEmptyOracleToolCardText(dto.operationID)
         chatID = nonEmptyOracleToolCardText(dto.chatID)
         state = Self.state(for: dto)
+        progressSummary = oracleProgressSummary(
+            outputChars: dto.pending?.progress?.outputChars,
+            lastActivitySecondsAgo: dto.pending?.progress?.lastActivitySecondsAgo,
+            queuePosition: dto.pending?.progress?.queuePosition,
+            activityAgeAtLastReport: true
+        )
         contextSummary = chatSendResultSummary(dto)
     }
 
@@ -120,7 +151,7 @@ struct OracleToolCardLanePresentation: Equatable {
     }
 
     var subtitle: String {
-        [state.displayLabel, nonEmptyOracleToolCardText(contextSummary)]
+        [state.displayLabel, progressSummary, nonEmptyOracleToolCardText(contextSummary)]
             .compactMap(\.self)
             .joined(separator: " • ")
     }
@@ -209,10 +240,19 @@ struct OracleToolCardLivePresentation: Equatable, Identifiable {
             }
         }
 
+        let progressText = summary.progress.flatMap {
+            oracleProgressSummary(
+                outputChars: $0.outputChars,
+                lastActivitySecondsAgo: $0.lastActivitySecondsAgo,
+                queuePosition: $0.queuePosition,
+                activityAgeAtLastReport: false
+            )
+        }
+        let detailedStatus = [statusText, progressText].compactMap(\.self).joined(separator: " · ")
         if let chatName = nonEmptyOracleToolCardText(summary.chatName) {
-            text = "\(statusText) • \(chatName)"
+            text = "\(detailedStatus) • \(chatName)"
         } else {
-            text = statusText
+            text = detailedStatus
         }
     }
 

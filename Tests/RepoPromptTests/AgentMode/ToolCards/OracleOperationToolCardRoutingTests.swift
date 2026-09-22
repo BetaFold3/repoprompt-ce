@@ -581,7 +581,11 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             "pending": [
                 "reason": "timed_out",
                 "stream_state": "streaming",
-                "elapsed_seconds": 181
+                "elapsed_seconds": 181,
+                "progress": [
+                    "output_chars": 12480,
+                    "last_activity_seconds_ago": 4
+                ]
             ],
             "wait_policy": [
                 "mode": "automatic",
@@ -601,12 +605,18 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         XCTAssertEqual(pendingDTO.pending?.reason, "timed_out")
         XCTAssertEqual(pendingDTO.pending?.streamState, "streaming")
         XCTAssertEqual(pendingDTO.pending?.elapsedSeconds, 181)
+        XCTAssertEqual(pendingDTO.pending?.progress?.outputChars, 12480)
+        XCTAssertEqual(pendingDTO.pending?.progress?.lastActivitySecondsAgo, 4)
+        XCTAssertNil(pendingDTO.pending?.progress?.queuePosition)
         XCTAssertEqual(pendingDTO.waitPolicy?.mode, "automatic")
         XCTAssertEqual(pendingDTO.waitPolicy?.timeoutSeconds, 180)
         XCTAssertEqual(pendingDTO.waitPolicy?.parentFamily, "claude")
         XCTAssertEqual(pendingPresentation.state, .pending)
         XCTAssertEqual(pendingPresentation.waitLabel, "wait ≤3m")
         XCTAssertTrue(pendingPresentation.subtitle.contains("Last reported running"), pendingPresentation.subtitle)
+        XCTAssertTrue(pendingPresentation.subtitle.contains("12480 chars"), pendingPresentation.subtitle)
+        XCTAssertTrue(pendingPresentation.subtitle.contains("activity age at last report: 4s"), pendingPresentation.subtitle)
+        XCTAssertFalse(pendingPresentation.subtitle.localizedCaseInsensitiveContains("stalled"))
         XCTAssertEqual(pendingPresentation.singleChatID, "pending-chat")
 
         for (streamState, expectedState) in [
@@ -619,6 +629,7 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
                 "pending": ["stream_state": streamState]
             ])
             let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ChatSendDTO.self, from: raw))
+            XCTAssertNil(dto.pending?.progress, "progress is additive and optional for historical results")
             XCTAssertEqual(
                 OracleToolCardPresentation(
                     dto: dto,
@@ -773,6 +784,31 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
         let operationID = UUID()
         let chatID = UUID()
         let createdAt = Date(timeIntervalSinceReferenceDate: 1000)
+        let queued = OracleMCPOperationStore.Summary(
+            operationID: UUID(),
+            phase: .queued,
+            delivery: .undelivered,
+            createdAt: createdAt,
+            terminalAt: nil,
+            deliveredAt: nil,
+            chatID: nil,
+            chatShortID: nil,
+            chatName: nil,
+            queryID: nil,
+            mode: "review",
+            modelPresetName: "Oracle",
+            terminalReason: nil,
+            batchIndex: 2,
+            progress: OracleMCPOperationStore.Progress(
+                outputChars: nil,
+                lastActivitySecondsAgo: nil,
+                queuePosition: 0
+            )
+        )
+        XCTAssertEqual(
+            OracleToolCardLivePresentation(summary: queued, now: createdAt).text,
+            "Oracle queued · 0s · queue position 0"
+        )
         let running = OracleMCPOperationStore.Summary(
             operationID: operationID,
             phase: .running,
@@ -787,13 +823,22 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             mode: "review",
             modelPresetName: "Oracle",
             terminalReason: nil,
-            batchIndex: nil
+            batchIndex: nil,
+            progress: OracleMCPOperationStore.Progress(
+                outputChars: 12480,
+                lastActivitySecondsAgo: 4,
+                queuePosition: nil
+            )
         )
         let runningPresentation = OracleToolCardLivePresentation(
             summary: running,
             now: createdAt.addingTimeInterval(12 * 60 + 4)
         )
-        XCTAssertEqual(runningPresentation.text, "Oracle running · 12m • Deep review")
+        XCTAssertEqual(
+            runningPresentation.text,
+            "Oracle running · 12m · 12480 chars · activity observed 4s ago • Deep review"
+        )
+        XCTAssertFalse(runningPresentation.text.localizedCaseInsensitiveContains("stalled"))
         XCTAssertEqual(runningPresentation.chatID, "short-chat")
 
         let ready = OracleMCPOperationStore.Summary(
@@ -810,7 +855,8 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             mode: "review",
             modelPresetName: "Oracle",
             terminalReason: nil,
-            batchIndex: nil
+            batchIndex: nil,
+            progress: nil
         )
         let readyPresentation = OracleToolCardLivePresentation(summary: ready)
         XCTAssertEqual(readyPresentation.text, "Oracle finished — not yet collected")
@@ -830,7 +876,8 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             mode: "review",
             modelPresetName: "Oracle",
             terminalReason: nil,
-            batchIndex: nil
+            batchIndex: nil,
+            progress: nil
         )
         XCTAssertEqual(
             OracleToolCardLivePresentation(summary: collected).text,
@@ -851,14 +898,19 @@ final class OracleOperationToolCardRoutingTests: XCTestCase {
             mode: "review",
             modelPresetName: "Oracle",
             terminalReason: nil,
-            batchIndex: nil
+            batchIndex: nil,
+            progress: OracleMCPOperationStore.Progress(
+                outputChars: 2048,
+                lastActivitySecondsAgo: 61,
+                queuePosition: nil
+            )
         )
         XCTAssertEqual(
             OracleToolCardLivePresentation(
                 summary: cancelling,
                 now: createdAt.addingTimeInterval(61)
             ).text,
-            "Oracle cancelling · 1m"
+            "Oracle cancelling · 1m · 2048 chars · activity observed 61s ago"
         )
     }
 

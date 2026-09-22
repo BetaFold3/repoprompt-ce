@@ -367,6 +367,13 @@ class OracleViewModel: ObservableObject {
         case failed
     }
 
+    /// Advisory snapshot sampled from the existing active query state. This is not a
+    /// completion or provider-liveness authority.
+    struct OracleMCPProgressSnapshot: Equatable {
+        let outputChars: Int
+        let lastActivityAt: Date?
+    }
+
     /// Notification seam for abnormal Oracle stream outcomes from every send origin.
     /// One observer slot is supported (the latest setter wins). A query may emit more than
     /// once, and duplicate emissions may disagree when providers report cancellation as
@@ -841,6 +848,23 @@ class OracleViewModel: ObservableObject {
         runStateBySession[sessionID]?.activeQueryId == queryID
     }
 
+    /// Samples progress from the active query's existing message and stream-activity state.
+    /// The timestamp records observed stream activity; it does not prove provider liveness.
+    @MainActor
+    func oracleMCPProgressSnapshot(for queryID: UUID) -> OracleMCPProgressSnapshot? {
+        guard let sessionID = sessionIDByMessageId[queryID],
+              runStateBySession[sessionID]?.activeQueryId == queryID,
+              let message = messageStore[sessionID]?.first(where: { $0.id == queryID }),
+              !message.isFinalized
+        else {
+            return nil
+        }
+        return OracleMCPProgressSnapshot(
+            outputChars: message.content.count,
+            lastActivityAt: lastAnyStreamActivityAt[queryID] ?? lastTextStreamActivityAt[queryID]
+        )
+    }
+
     @MainActor
     func setOracleMCPStreamTerminalObserver(_ observer: OracleMCPStreamTerminalObserver?) {
         oracleMCPStreamTerminalObserver = observer
@@ -896,6 +920,9 @@ class OracleViewModel: ObservableObject {
                 },
                 activeStreamCount: { [weak self] tabID in
                     self?.activeMCPOracleStreamCount(forTabID: tabID) ?? 0
+                },
+                progressSnapshot: { [weak self] queryID in
+                    self?.oracleMCPProgressSnapshot(for: queryID)
                 }
             )
         )

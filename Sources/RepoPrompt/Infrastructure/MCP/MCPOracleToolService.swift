@@ -202,7 +202,7 @@ struct MCPOracleToolService {
     /// Byte ceiling for a pending single-send result, asserted by `MCPAskOracleLifecycleTests`.
     static let pendingStubByteCeiling = 700
 
-    static let pendingNote = "Oracle is still running; nothing was resent. Call ask_oracle with the resume args. Do not re-send the question."
+    static let pendingNote = "Oracle still running; nothing was resent. Use ask_oracle with resume args. Never resend."
     private static let cancelNote = "Cancel never delivers a result. Collect each lane's final state with ask_oracle op:\"wait\"."
     static let steeringWakeReason = "steering_requested"
 
@@ -428,6 +428,7 @@ struct MCPOracleToolService {
             parkedMS: parkedMS,
             operationCount: 1,
             stubBytes: stubBytes,
+            progressPresent: result["pending"]?.objectValue?["progress"] != nil,
             wakeReason: outcome == .steering ? Self.steeringWakeReason : nil
         )
 
@@ -650,11 +651,27 @@ struct MCPOracleToolService {
         case .cancelling: "cancelling"
         case .ready, .failed, .cancelled: "terminal"
         }
-        stub["pending"] = .object([
+        var pending: [String: Value] = [
             "reason": .string(reason),
             "stream_state": .string(streamState),
             "elapsed_seconds": .int(operationStore.elapsedSeconds(for: operationID) ?? 0)
-        ])
+        ]
+        if let progress = operationStore.progress(for: operationID) {
+            var progressFields: [String: Value] = [:]
+            if let outputChars = progress.outputChars {
+                progressFields["output_chars"] = .int(outputChars)
+            }
+            if let activityAge = progress.lastActivitySecondsAgo {
+                progressFields["last_activity_seconds_ago"] = .int(activityAge)
+            }
+            if let queuePosition = progress.queuePosition {
+                progressFields["queue_position"] = .int(queuePosition)
+            }
+            if !progressFields.isEmpty {
+                pending["progress"] = .object(progressFields)
+            }
+        }
+        stub["pending"] = .object(pending)
         if includeResume {
             stub["resume"] = Self.resumeValue([operationID])
             stub["note"] = .string(Self.pendingNote)
@@ -869,6 +886,7 @@ struct MCPOracleToolService {
         var pendingIDs: [UUID] = []
         var retryableIDs: [UUID] = []
         var stubBytes = 0
+        var progressPresent = false
         let laneReason = Self.pendingReason(outcome: outcome, selection: selection)
         for id in observable {
             switch operationStore.lookup(id, caller: caller) {
@@ -885,6 +903,7 @@ struct MCPOracleToolService {
                 pendingIDs.append(id)
                 let stub = pendingStub(id, reason: laneReason, includeResume: false, steering: false)
                 stubBytes += Self.approximateByteCount(.object(stub))
+                progressPresent = progressPresent || stub["pending"]?.objectValue?["progress"] != nil
                 lanesByID[id] = .object(stub)
             case let .expired(tombstone):
                 lanesByID[id] = Self.expiredLane(tombstone)
@@ -934,6 +953,7 @@ struct MCPOracleToolService {
             parkedMS: parkedMS,
             operationCount: targetIDs.count,
             stubBytes: stubBytes,
+            progressPresent: progressPresent,
             wakeReason: outcome == .steering ? Self.steeringWakeReason : nil
         )
         return Self.agentFacingOracleResult(AgentMCPWaitPolicy.attaching(selection, to: .object(envelope)))
@@ -1048,6 +1068,7 @@ struct MCPOracleToolService {
         parkedMS: Int,
         operationCount: Int,
         stubBytes: Int,
+        progressPresent: Bool,
         wakeReason: String?
     ) {
         var fields: [String: String] = [
@@ -1058,7 +1079,8 @@ struct MCPOracleToolService {
             "outcome": outcome,
             "parked_ms": String(parkedMS),
             "operation_count": String(operationCount),
-            "stub_bytes": String(stubBytes)
+            "stub_bytes": String(stubBytes),
+            "progress_present": progressPresent ? "1" : "0"
         ]
         if let wakeReason {
             fields["wake_reason"] = wakeReason

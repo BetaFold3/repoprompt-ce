@@ -1031,14 +1031,28 @@ enum ToolResultDTOs {
         }
 
         struct Pending: Codable, Equatable {
+            struct Progress: Codable, Equatable {
+                let outputChars: Int?
+                let lastActivitySecondsAgo: Int?
+                let queuePosition: Int?
+
+                private enum CodingKeys: String, CodingKey {
+                    case outputChars = "output_chars"
+                    case lastActivitySecondsAgo = "last_activity_seconds_ago"
+                    case queuePosition = "queue_position"
+                }
+            }
+
             let reason: String?
             let streamState: String?
             let elapsedSeconds: Double?
+            let progress: Progress?
 
             private enum CodingKeys: String, CodingKey {
                 case reason
                 case streamState = "stream_state"
                 case elapsedSeconds = "elapsed_seconds"
+                case progress
             }
         }
 

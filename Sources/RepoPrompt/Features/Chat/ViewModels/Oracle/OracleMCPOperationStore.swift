@@ -167,6 +167,14 @@ final class OracleMCPOperationStore: ObservableObject {
         let batchIndex: Int?
     }
 
+    /// Advisory progress sampled from existing query state or derived from the FIFO.
+    /// It is never stored as a second stream-state authority.
+    struct Progress: Equatable {
+        let outputChars: Int?
+        let lastActivitySecondsAgo: Int?
+        let queuePosition: Int?
+    }
+
     /// Card-facing summary (plan §3.11). Published on phase/delivery transitions only.
     struct Summary: Equatable {
         let operationID: UUID
@@ -183,6 +191,7 @@ final class OracleMCPOperationStore: ObservableObject {
         let modelPresetName: String?
         let terminalReason: TerminalReason?
         let batchIndex: Int?
+        let progress: Progress?
 
         var isTerminal: Bool {
             phase.isTerminal
@@ -223,6 +232,7 @@ final class OracleMCPOperationStore: ObservableObject {
         var unpinSession: @MainActor (_ chatID: UUID) -> Void
         var chatName: @MainActor (_ chatID: UUID) -> String?
         var activeStreamCount: @MainActor (_ tabID: UUID) -> Int
+        var progressSnapshot: @MainActor (_ queryID: UUID) -> OracleViewModel.OracleMCPProgressSnapshot?
         var now: @MainActor () -> Date
 
         init(
@@ -232,6 +242,7 @@ final class OracleMCPOperationStore: ObservableObject {
             unpinSession: @escaping @MainActor (_ chatID: UUID) -> Void,
             chatName: @escaping @MainActor (_ chatID: UUID) -> String? = { _ in nil },
             activeStreamCount: @escaping @MainActor (_ tabID: UUID) -> Int = { _ in 0 },
+            progressSnapshot: @escaping @MainActor (_ queryID: UUID) -> OracleViewModel.OracleMCPProgressSnapshot? = { _ in nil },
             now: @escaping @MainActor () -> Date = { Date() }
         ) {
             self.waitUntilMessageFinalised = waitUntilMessageFinalised
@@ -240,6 +251,7 @@ final class OracleMCPOperationStore: ObservableObject {
             self.unpinSession = unpinSession
             self.chatName = chatName
             self.activeStreamCount = activeStreamCount
+            self.progressSnapshot = progressSnapshot
             self.now = now
         }
     }
@@ -917,6 +929,37 @@ final class OracleMCPOperationStore: ObservableObject {
         return Int(max(0, (record.terminalAt ?? dependencies.now()).timeIntervalSince(record.createdAt)))
     }
 
+    /// Samples advisory progress without publishing or retaining per-token state.
+    func progress(for operationID: UUID) -> Progress? {
+        guard let record = records[operationID], !record.phase.isTerminal else { return nil }
+        switch record.phase {
+        case .queued:
+            guard record.batchIndex != nil,
+                  let queue = batchQueuesByTabID[record.owner.tabID]
+            else { return nil }
+            let unboundOperationIDs = queue.operationIDs.filter { queuedID in
+                guard let queued = records[queuedID] else { return false }
+                return queued.batchIndex != nil && queued.queryID == nil && !queued.phase.isTerminal
+            }
+            guard let position = unboundOperationIDs.firstIndex(of: operationID) else { return nil }
+            return Progress(outputChars: nil, lastActivitySecondsAgo: nil, queuePosition: position)
+        case .running, .cancelling:
+            guard let queryID = record.queryID,
+                  let snapshot = dependencies.progressSnapshot(queryID)
+            else { return nil }
+            let activityAge = snapshot.lastActivityAt.map {
+                Int(max(0, dependencies.now().timeIntervalSince($0)))
+            }
+            return Progress(
+                outputChars: snapshot.outputChars,
+                lastActivitySecondsAgo: activityAge,
+                queuePosition: nil
+            )
+        case .starting, .ready, .failed, .cancelled:
+            return nil
+        }
+    }
+
     func summary(for operationID: UUID) -> Summary? {
         guard let record = records[operationID] else { return nil }
         return Summary(
@@ -933,7 +976,8 @@ final class OracleMCPOperationStore: ObservableObject {
             mode: record.finalization.mode,
             modelPresetName: record.ticket?.replyContext.modelPresetName,
             terminalReason: record.terminalReason,
-            batchIndex: record.batchIndex
+            batchIndex: record.batchIndex,
+            progress: progress(for: operationID)
         )
     }
 
