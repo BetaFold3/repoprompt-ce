@@ -2581,7 +2581,24 @@ extension ToolOutputFormatter {
         return lines.joined(separator: "\n")
     }
 
+    private static func isResumableAskOracleResult(_ value: Value) -> Bool {
+        guard let object = value.objectValue else { return false }
+        if object["operation_id"] != nil
+            || object["wait"] != nil
+            || object["wait_policy"] != nil
+        {
+            return true
+        }
+        return object["results"]?.arrayValue?.contains {
+            $0.objectValue?["operation_id"] != nil
+        } ?? false
+    }
+
     static func formatAskOracle(args: [String: Value], value: Value, emitResources: Bool) -> [MCP.Tool.Content] {
+        if isResumableAskOracleResult(value) {
+            return [.text(rawJSONString(value))]
+        }
+
         if let results = value.objectValue?["results"]?.arrayValue {
             var blocks: [MCP.Tool.Content] = [
                 .text("## Ask Oracle Batch \(statusIcon(success: true))\n- **Results**: \(results.count)")

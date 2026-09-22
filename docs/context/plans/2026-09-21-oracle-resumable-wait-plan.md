@@ -66,6 +66,8 @@ Line references identify the checkout inspected on 2026-09-21; they are not a gu
 
 `response_mode` and `export_response` are frozen at send; wait and cancel reject all send args. Private `_`-prefixed routing args keep their current handling.
 
+The native MCP text projection must preserve resumable values losslessly as one compact JSON text block, without Markdown fences or duplicated response bodies. `ToolOutputFormatter` recognizes a root `operation_id`, `wait`, or `wait_policy`, or `results` containing operation IDs; legacy non-resumable results keep their Markdown presentation. Service-level receipt tests alone do not establish this formatter boundary. The post-live correction is implemented, tested, and approved by OracleB and the user-authorized OracleE replacement; the live gates recorded in §13 remain open.
+
 **Completed single send**: today's flat result plus `status:"completed"`, `operation_id`, and a root `wait_policy`.
 
 **Pending single send** (representative deterministic fixture shapes remain within the asserted 700-byte ceiling; measured evidence and its limits are in §12):
@@ -293,7 +295,7 @@ Final OracleE/B reviews on 2026-09-22 approved the scoped code and closed the st
 
 ## 11. Step C implementation and release status
 
-**Status: implementation and scoped code review complete; release qualification in progress.** The implemented contract is §3.7. No P0/P1 remains open in the reviewed scope, but the full root suite is not green and the live gates in §5 remain unrun.
+**Status: implementation and scoped code review complete; release qualification in progress.** The implemented contract is §3.7. No P0/P1 remains open in the reviewed scope, but the full root suite is not green and the live gates in §5 remain open; §13 records the first live attempt and its blocker.
 
 ### Implementation and review
 
@@ -317,7 +319,7 @@ Final OracleE/B reviews on 2026-09-22 approved the scoped code and closed the st
 
 Both reviewers explicitly treated the remaining suggestions as nonblocking: pre-admission preset availability checks in addition to exact identity; the analogous single-send export-workspace capture; defensive handling of the currently unreachable bind-failure path after reservation; optional shared planning-selector logic; and strengthening the disconnect test by changing live-source sentinels and releasing startup before recovery routing is installed. These are recorded rather than extending the remediation loop.
 
-Claude Code/Codex live steering and batch behavior, relaunch recovery, and long-consultation cache measurements remain **unrun**; deterministic tests do not establish these results. No app lifecycle action was performed for validation. Keep this plan active until the separately approved release gates and broader validation blockers are resolved; do not claim release readiness or archive the plan yet.
+Claude Code/Codex live batch controls are **partially qualified** by the post-fix pass in §13. Live steering wake, active-operation relaunch recovery, and long-consultation cache measurements remain unqualified; deterministic tests do not establish these results. Section 13 records the first live blocker, correction, authorized relaunch, and bounded post-fix evidence. Keep this plan active until the remaining release gates and broader validation blockers are resolved; do not claim release readiness or archive the plan yet.
 
 ## 12. Step D progress-hint implementation and validation status
 
@@ -366,6 +368,66 @@ Conductor `job status` verified that all logs named below are under `/Users/tngu
 
 ### Usage and release caveats
 
-Scoped code review is complete through OracleB and the user-authorized OracleC replacement. Relevant changes are staged; no commit was created. After the user reported rebuilding and relaunching on 2026-09-22, health-only checks reached the running app: conductor `app status` passed (ticket `249ed7d2-0cc8-4d1b-bbc7-c3c6083695d1`), `rpce-cli-debug --version` reported 1.0.29, the native `ask_oracle` schema exposed `send`/`wait`/`cancel` and `timeout_seconds`, and an empty owned `op:"wait", timeout_seconds:0` poll returned zero results. This verifies the live control surface, not a provider consultation or recovery of a pre-relaunch operation.
+The original Step D progress-hint code review is complete through OracleB and the user-authorized OracleC replacement; it does not cover the subsequent formatter correction in §13. During the live pass, HEAD was observed at `f51d1e8d6a47060798dd91085f0e2d1210839aee` (`feat(oracle): add advisory progress hints to resumable waits`); the agent did not create that commit. After the user reported rebuilding and relaunching on 2026-09-22, health-only checks reached the running app: conductor `app status` passed (ticket `249ed7d2-0cc8-4d1b-bbc7-c3c6083695d1`), `rpce-cli-debug --version` reported 1.0.29, the native `ask_oracle` schema exposed `send`/`wait`/`cancel` and `timeout_seconds`, and an empty owned `op:"wait", timeout_seconds:0` poll returned zero results. This verifies the live control surface, not a provider consultation or recovery of a pre-relaunch operation.
 
-The general `make dev-smoke` attempt failed before Oracle: its default `repoprompt-ce` workspace switch hit the 120-second `manage_workspaces` execution timeout (ticket `b04adfb2-909a-415d-8b85-11e121b486fb`). A subsequent window check still showed `repoprompt-ce-personal-touch`; the switch was not retried. The bounded paid-probe approval request timed out without an answer, so no new provider consultation was started for live qualification. Claude/Codex parent steering, live batch behavior, relaunch recovery, and cache-warmth measurements remain unverified. The agent did not launch, relaunch, or stop the app. Keep the plan active and the remaining deferred items explicit.
+The general `make dev-smoke` attempt failed before Oracle: its default `repoprompt-ce` workspace switch hit the 120-second `manage_workspaces` execution timeout (ticket `b04adfb2-909a-415d-8b85-11e121b486fb`). A subsequent window check still showed `repoprompt-ce-personal-touch`; the switch was not retried. The first bounded paid-probe approval request timed out without an answer. The user subsequently approved the pass; §13 supersedes that health-only status. During that health-only check, the agent did not launch, relaunch, or stop the app; the later explicitly authorized relaunch is recorded in §13. Keep the plan active and the remaining deferred items explicit.
+
+## 13. Approved live pass and native formatter correction
+
+**Status: formatter blocker corrected, built, tested, and approved by OracleB and the user-authorized OracleE replacement; basic post-fix live batch controls passed under both Claude Code and Codex parents.** This bounded pass does not establish the outstanding steering, recovery, or cache-warmth release gates.
+
+### Live evidence on 2026-09-22
+
+- The user approved two provider-parent sessions, at most six small consultation lanes, and a 30-minute limit. Claude Code session `B5B929F5-5767-4F42-9612-430A3B9FE104` and Codex session `E72D0451-C5F3-4360-AE3F-664239E5DF63` each submitted one accepted three-lane batch using the discovered exact OracleB preset. The initial Codex call mistakenly included the single-send-only `selection_mode`; it was rejected before admission. Only after that rejection was the corrected batch submitted, not a retry of accepted work.
+- Both parent transcripts reported the same unusable pending text: `Ask Oracle Batch`, `Results: 3`, and three `Lane` headings, without operation IDs, pending state, progress, wait policy, or resume controls. Targeted cancellation and ID-based waiting were therefore impossible. Root independently reproduced the missing structured error/status fields with an unknown-ID no-spend wait and verified that `ToolOutputFormatter.formatAskOracle` discarded the control fields while rendering Markdown.
+- Omitted-ID recovery collected the already accepted work without resending. The Claude worker reported all three lanes completed, including the intended cancellation target; no no-spend cancellation claim is made. The Codex worker reported two completed lanes and a third terminal `not_started_owner_inactive` lane after the parent had ended. Both subsequently reported empty recovery and completed. These reports establish the observed control-surface failure, not actual stream occupancy or a steering wake.
+- That first pass ended without further consultation sends or an app lifecycle action. Automatic parent-family timeout metadata and queued cancellation were subsequently observed in the separately approved post-fix pass below; the remaining live gates are still explicit.
+
+### Focused correction and validation
+
+- `Sources/RepoPrompt/Infrastructure/MCP/ToolOutputFormatter.swift` adds a 17-line recognition/bypass for canonical resumable values. It emits the original `MCP.Value` as one compact JSON text block instead of reconstructing a subset of fields. Non-resumable legacy Markdown behavior is unchanged; no admission, provider, scheduling, ownership, or delivery authority changed.
+- `Tests/RepoPromptTests/MCP/ToolOutputFormatterAskOracleTests.swift` adds four public `buildContentBlocks` boundary tests. They assert exact compact serialization and round-trip `MCP.Value` equality for pending progress with no response, mixed terminal/pending/error values with stable nonsequential indexes and newline/backtick reply text, empty wait and cancel/error envelopes, plus legacy Markdown compatibility. Four surgical rows were added to `Scripts/Fixtures/test-suite-contract-ledger.tsv`.
+- `make dev-test FILTER=RepoPromptTests.ToolOutputFormatterAskOracleTests` passed **4/4**, ticket `0c7c73d5-39c4-4eaa-9223-fe301b9c6f93`. Root's combined `ToolOutputFormatterAskOracleTests|OracleOperationToolCardRoutingTests|OracleResponsePresentationTests` run passed **23/23**, ticket `a82d22d6-e6cf-404b-9a10-67423bdeb34a`.
+- `make dev-format-check` passed with **0/1,914** files requiring formatting, ticket `471d358c-a681-45ae-96b6-71b1792f3e6c`; `make dev-lint` passed, ticket `d7bb66c1-58ac-4fd3-b9dd-100d031be5f4`. `make dev-test-list` passed, ticket `25b27edc-c6d7-4adb-b58c-530dcd9ba3bc`; the worker verified all four new test IDs while repository-wide ledger drift remained **295 missing and three stale**.
+- `make dev-build` passed, ticket `fb727d1d-038e-406c-8914-7467f28dbdbd`, packaging the debug bundle at `/Users/tnguyen/Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app`. This artifact was subsequently relaunched with explicit approval as recorded below. The earlier full-root failures and unrelated contribution blockers remain; no new full-root or core run was performed for this formatter-only delta.
+
+### Review stops and authorized replacement approval
+
+Fresh independent `ask_oracle mode:"review"` calls explicitly targeted OracleB (`7CDD523E-1D7C-47EA-98FE-D5FEA24D2D8C`) and OracleC (`6FC689D2-03FA-43F1-A0BF-56570ADF836B`) together after validation. Both were rejected before review because the orchestrator supplied `selection_mode:"none"` with `new_chat:true`. The exact runtime error was: `Invalid params: selection_mode is only valid for continuation sends with an explicit chat_id`.
+
+Neither initial lane produced a review, chat ID, model-selection result, or verdict. That rejection was a caller-parameter failure, not evidence of a model/provider outage. The orchestrator stopped without retry or reviewer substitution until the user explicitly authorized corrected fresh requests.
+
+The authorized retry sent both independent fresh `mode:"review"` requests together with the exact same source/test/ledger delta and verbatim live finding, omitting the invalid continuation argument. Both returned the requested exact preset IDs/names with `model_selection: explicit`:
+
+- **OracleB**, chat `formatter-fix-corrected--948D4D`, approved the scoped delta, explicitly closed the stated formatter finding at the code level, and found no P0/P1. It did not claim live qualification. Export: `prompt-exports/oracle-review-2026-09-22-194450-formatter-fix-correc-bc78.md` (local review evidence, not staged).
+- **OracleC**, chat `formatter-fix-corrected--9BDF5F`, returned `ok:false` and `The Oracle stream failed before it completed.` A read-only `oracle_chat_log` check identified an OpenAI Responses HTTP **401** with code **`invalid_api_key`**. No review verdict was produced; this is an authentication failure, not a negative code review. No credential was changed, no substitute reviewer was used, and no further review was attempted after this failure.
+
+OracleB's new P2 suggestions are recorded without another remediation loop: confirm the discriminator covers every valid empty resumable envelope; consider explicit handling of the pre-existing JSON encoder `{}` failure fallback; pin `_meta` and legacy batch compatibility in fixtures; and clarify that decoded-value equality, not merely matching the serializer, establishes losslessness. No code changed after this review.
+
+After the authentication failure, the user explicitly authorized OracleE in place of OracleC and reported entering OracleC's API key. No credential was read, changed, or tested by the agent. OracleE received a fresh independent `mode:"review"` request with the verbatim live finding, identical source/test/ledger delta, and validation evidence; other reviewers' opinions were not supplied.
+
+**OracleE**, chat `formatter-fix-replacemen-E063E9`, returned the requested preset `95F2BD07-4A94-417C-AAAF-17CAB847EC35` with `model_selection: explicit`. It approved the scoped delta, explicitly closed the original finding at code level, and identified no blocking defect or fix-induced regression. Export: `prompt-exports/oracle-review-2026-09-22-201237-formatter-fix-replac-1196.md` (local evidence, not staged). Its nonblocking P2 recommends explicit `_meta`, additional numeric round-trip, and `emitResources:true` diff fixtures. These suggestions are recorded without another edit/re-review loop; the integer-only production progress contract is unchanged.
+
+The required scoped code-review gate is complete through OracleB and the authorized OracleE replacement. No source changed between their reviews or during the post-fix live pass. Relevant files are staged separately from `f51d1e8d`; no commit was made by the agent.
+
+### Authorized post-fix relaunch and bounded live results
+
+The user approved a fresh relaunch and a second bounded pass: two parent sessions, at most six accepted consultation lanes, and 30 minutes (13:20–13:50 UTC on 2026-09-22). Conductor `app relaunch` completed successfully under ticket `4cdbb726-7148-4446-9dd9-fc648a296898`, confirmed the prior app stopped, and launched the corrected debug bundle as PID 21672. The user also confirmed relaunch. Conductor warned that this debug run uses ephemeral in-memory secure storage; credential and permission changes in that storage will not persist.
+
+Root independently observed compact JSON from a native unknown-ID `op:"wait", timeout_seconds:0` call, including the operation ID, `status:"unknown"`, `oracle_operation_not_found`, and wait policy. A read-only `oracle_chat_log` call recovered the completed, pre-relaunch OracleE review chat `formatter-fix-replacemen-E063E9`. This establishes completed-chat persistence, not recovery of active or queued operations.
+
+Both delegated workers performed evidence gathering only, not code review. Each submitted exactly one three-lane batch with the discovered exact OracleB preset, cancelled index 2, waited on the original IDs without resending, repeated the explicit-ID wait, and made an omitted-ID recovery poll:
+
+| Parent | Session | Completed operation IDs | Cancelled-before-start operation ID | Automatic wait metadata |
+| --- | --- | --- | --- | --- |
+| Claude Code | `36320C36-E5D0-4E58-84C5-4434AB7329BD` | `B89D756D-A351-4810-A34E-AACE47D4F49B`, `A561F09D-CB86-42E0-8D93-E1D370515D82` | `1DF851DB-3E14-4E05-A1C6-A012582A57F4` | `parent_family:"claude", timeout_seconds:180` |
+| Codex | `253535A4-C2B7-45D0-A4E5-994259B77404` | `1642FBBA-C82C-4987-B222-1CBD7A6524C0`, `071A16D6-05C8-4596-A77F-B0F84DEBF10F` | `0E6AEF27-4C60-4C42-8D3C-38B22F621EEF` | `parent_family:"codex", timeout_seconds:600` |
+
+- Initial receipts preserved all three operation IDs, immutable indexes 0/1/2, pending status, resume controls, and poll policy. Index 0 was `starting` without progress; indexes 1 and 2 were `queued` with `queue_position:1` and `queue_position:2`.
+- Each targeted cancel returned `cancel:"requested", delivered:false`. Subsequent collection returned `status:"cancelled"`, `consultation_started:false`, and `oracle_cancelled` with `cancelled_before_start` for that lane. The other two lanes completed with their requested final markers and exact OracleB preset UUID/name with explicit selection.
+- Explicit-ID repeat waits returned the same terminal records and response bodies. Omitted-ID recovery returned `results:[]` with no pending IDs after delivery. Root inspected the workers' call sequences and directly verified native JSON projection; the session reports preserve the detailed receipts.
+- All six accepted lanes reached terminal states: four completed and two cancelled before provider start. Both worker runs completed, all accepted work was collected, and no consultations were resent. The six-lane allocation is exhausted; no further paid probes were started.
+- **Steering wake was not exercised successfully.** The Claude worker did not emit the requested readiness marker, so no steering was injected. The Codex steering message was delivered, but its first wait had already completed; no `steering_requested` wake or `interrupted_by_steering` pending result was observed. These are limitations of this probe, not evidence that steering is broken.
+- The 180/600-second values above are observed policy metadata, not measured timeout expirations. No bound-output/activity pending sample was captured because the first automatic waits returned terminal results. Admission/preparing-stage steering, mixed immediate/legacy physical occupancy, same-session rotation with queued work, connection-loss survival, active/queued relaunch recovery, and 20–60-minute cache-warmth measurements remain unqualified.
+
+The corrected build is running and its basic resumable batch controls are usable under both tested parents. The broader plan remains active: these bounded successes do not resolve the outstanding live gates, earlier full-root failures, repository-wide ledger drift, or unrelated contribution-check blockers.
