@@ -1,3 +1,13 @@
+# Outcome and decision summary
+
+Status: **Completed.** Implemented in commit `a2522001`.
+
+RepoPrompt now persists a default-off Codex computer-use opt-in in Global Settings, exposes it through `app_settings` key `agent_mode.codex_computer_use_enabled`, and requires an explicit `/computer-use` turn. Safe Managed and Knowledge sessions reject or clamp the capability off. The implementation deliberately shipped without a Settings-screen toggle.
+
+See the [technical implementation report](../../../technical_implementation_reports/2026-09-03-codex-computer-use-enablement-report.html) for implementation and validation evidence. The original plan follows intact below.
+
+---
+
 # Codex Computer-Use Enablement Plan
 
 Date: 2026-09-03

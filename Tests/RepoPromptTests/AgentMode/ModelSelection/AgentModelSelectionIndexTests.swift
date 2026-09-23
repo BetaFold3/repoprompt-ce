@@ -158,16 +158,16 @@ final class AgentModelSelectionIndexTests: XCTestCase {
 
     func testRankingUsesEffortWordScoresANDTokensAndCatalogOrder() {
         let plain = AgentModelOption(
-            rawValue: "gpt-9.9-sol",
-            displayName: "GPT-9.9 Sol",
+            rawValue: "gpt-5.6-sol",
+            displayName: "GPT-5.6 Sol",
             description: nil,
             isDefault: true,
             supportedReasoningEfforts: [.high, .xhigh],
             defaultReasoningEffort: .high
         )
         let fast = AgentModelOption(
-            rawValue: "gpt-9.9-sol-fast",
-            displayName: "GPT-9.9 Sol Fast",
+            rawValue: "gpt-5.6-sol-fast",
+            displayName: "GPT-5.6 Sol Fast",
             description: nil,
             isDefault: false,
             supportedReasoningEfforts: [.high, .xhigh],
@@ -209,12 +209,12 @@ final class AgentModelSelectionIndexTests: XCTestCase {
         let solMatches = index.ranked(query: "sol xhigh")
         XCTAssertEqual(solMatches.count, 2)
         XCTAssertEqual(solMatches.map(\.id.modelRaw), [
-            "gpt-9.9-sol",
-            "gpt-9.9-sol-fast"
+            "gpt-5.6-sol",
+            "gpt-5.6-sol-fast"
         ])
         XCTAssertTrue(solMatches[1].showsWarning)
         XCTAssertTrue(index.ranked(query: "sol missing").isEmpty)
-        XCTAssertFalse(index.ranked(query: "codexexec gpt-9.9-sol").isEmpty)
+        XCTAssertFalse(index.ranked(query: "codexexec gpt-5.6-sol").isEmpty)
 
         let emptyQuery = index.ranked(query: "")
         XCTAssertEqual(emptyQuery.map(\.catalogOrder), emptyQuery.map(\.catalogOrder).sorted())

@@ -3,6 +3,21 @@ import Foundation
 actor AgentRunSessionStore {
     static let shared = AgentRunSessionStore()
 
+    #if DEBUG
+        /// Process-global waiter-timeout fence for deterministic serial tests; reset in tearDown.
+        nonisolated(unsafe) static var waiterTimeoutSleepOverride: (@Sendable (UInt64) async throws -> Void)?
+    #endif
+
+    private static func sleepForWaiterTimeout(nanoseconds: UInt64) async throws {
+        #if DEBUG
+            if let override = waiterTimeoutSleepOverride {
+                try await override(nanoseconds)
+                return
+            }
+        #endif
+        try await Task.sleep(nanoseconds: nanoseconds)
+    }
+
     private static func timeoutNanoseconds(_ timeoutSeconds: TimeInterval) -> UInt64 {
         guard timeoutSeconds.isFinite, timeoutSeconds > 0 else { return 0 }
         let maxSeconds = Double(UInt64.max) / 1_000_000_000
@@ -423,7 +438,7 @@ actor AgentRunSessionStore {
                 let timeoutTask: Task<Void, Never>? = timeoutSeconds.map { timeout in
                     Task { [weak self] in
                         do {
-                            try await Task.sleep(
+                            try await Self.sleepForWaiterTimeout(
                                 nanoseconds: Self.timeoutNanoseconds(timeout)
                             )
                             await self?.timeoutWaiter(sessionID: cursor.registration.sessionID, waiterID: waiterID)

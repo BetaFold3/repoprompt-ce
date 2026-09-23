@@ -514,8 +514,14 @@ final class RemoteAgentSessionTests: XCTestCase {
 
         scheduler.advance(by: 1)
         await waitForDeterministicRemoteAgentSessionCondition {
+            let rows = await recorder.upsertedTranscriptRows()
+            let runStates = await recorder.recordedRunStates()
+            return rows.map(\.text) == ["Prompt", "Completed reply"] && runStates.last == .completed
+        }
+        await waitForDeterministicRemoteAgentSessionCondition {
             await connection.commandCount(type: "get_log") == 3
         }
+        await assertCommandCount(connection, type: "get_log", equals: 3)
 
         let binding = await controller.currentBinding()
         let rows = await recorder.upsertedTranscriptRows()

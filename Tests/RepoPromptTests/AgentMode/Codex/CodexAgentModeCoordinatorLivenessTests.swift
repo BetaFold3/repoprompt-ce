@@ -1685,7 +1685,10 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             expectedOwnerSessionID: session.activeAgentSessionID
         )
         XCTAssertTrue(projection.presentation.readoutText.hasSuffix(" partial"))
-        XCTAssertTrue(try XCTUnwrap(projection.coverageDetail).contains("unmeasured, not zero"))
+        XCTAssertTrue(
+            try XCTUnwrap(projection.coverageDetail)
+                .contains(AgentUsageAccumulator.codexUnmeasuredTurnDiagnostic)
+        )
     }
 
     /// Enables fixture-local Codex usage accounting without mutating the prepared run's persistent

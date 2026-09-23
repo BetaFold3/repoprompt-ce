@@ -1027,7 +1027,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
                 "inboundChannel = InboundChannel(capacity: receiveBufferCapacity)",
                 "closeChannel = CloseChannel()",
                 "let inboundChannel = inboundChannel",
-                "inboundChannel.gate.offer(frame, to: inboundChannel.continuation)",
+                "inboundChannel.gate.offer(sdkFrame, to: inboundChannel.continuation)",
                 "inboundChannel.continuation.finish",
                 "closeChannel.continuation.finish()"
             ],

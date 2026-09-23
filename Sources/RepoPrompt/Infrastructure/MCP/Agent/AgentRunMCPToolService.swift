@@ -235,10 +235,11 @@ struct AgentRunMCPToolService {
             return deadlineUptimeNanoseconds > now ? deadlineUptimeNanoseconds - now : 0
         }
 
-        /// Process-global DEBUG seam for fast status-update tests; reset in tearDown.
+        /// Process-global DEBUG seams for fast, deterministic status-update tests; reset in tearDown.
         /// Safe under serial XCTest execution only — would race if wait suites ever
         /// run parallel in-process.
         nonisolated(unsafe) static var statusUpdateSliceSecondsOverride: TimeInterval?
+        nonisolated(unsafe) static var waitClockNowOverride: (@Sendable () -> ContinuousClock.Instant)?
     #endif
 
     nonisolated static func normalizedStatusTextKey(_ text: String?) -> String? {
@@ -265,6 +266,15 @@ struct AgentRunMCPToolService {
             }
         #endif
         return statusUpdateSliceSeconds
+    }
+
+    private nonisolated static func resolvedWaitClockNow(_ clock: ContinuousClock) -> ContinuousClock.Instant {
+        #if DEBUG
+            if let override = waitClockNowOverride {
+                return override()
+            }
+        #endif
+        return clock.now
     }
 
     /// Plan §6.1/§6.4: omission is automatic for the frozen parent family, explicit `0` is a poll,
@@ -2133,7 +2143,7 @@ struct AgentRunMCPToolService {
             throw MCPError.invalidParams(agentRunExpiredHandleRecoveryNote)
         }
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
+        let deadline = Self.resolvedWaitClockNow(clock).advanced(by: .seconds(timeoutSeconds))
         // Accepted staleness window (plan §2/Q3): a status change landing between a
         // prior wait's return and this baseline capture is absorbed into the baseline
         // and only surfaces at the next change or the timeout sample. Deliberate —
@@ -2156,7 +2166,7 @@ struct AgentRunMCPToolService {
                     if Task.isCancelled {
                         throw CancellationError()
                     }
-                    let remaining = Self.timeInterval(from: clock.now.duration(to: deadline))
+                    let remaining = Self.timeInterval(from: Self.resolvedWaitClockNow(clock).duration(to: deadline))
                     guard remaining > 0 else {
                         let value = await timedOutWaitValue(sessionID: sessionID, agentModeVM: agentModeVM)
                         let result = Self.waitResult(from: value) ?? "timed_out"
@@ -2233,7 +2243,9 @@ struct AgentRunMCPToolService {
                     case let .terminalPublicationRejected(_, reason):
                         throw MCPError.internalError("The agent run terminal state could not be published: \(reason)")
                     case .timedOut:
-                        let remainingAfterSlice = Self.timeInterval(from: clock.now.duration(to: deadline))
+                        let remainingAfterSlice = Self.timeInterval(
+                            from: Self.resolvedWaitClockNow(clock).duration(to: deadline)
+                        )
                         if includeStatusUpdates, remainingAfterSlice > 0 {
                             let latest = await AgentRunSessionStore.snapshot(for: cursor)
                             if Self.shouldReturnStatusUpdate(baselineKey: baselineKey, latest: latest) {

@@ -13,6 +13,7 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
         }
 
         override func tearDown() async throws {
+            AgentRunSessionStore.waiterTimeoutSleepOverride = nil
             OhMyPiAgentModeSmokeGate.shared.resetForTesting()
             await OMPQualificationSharedGateTestIsolation.shared.release()
             try await super.tearDown()
@@ -47,59 +48,167 @@ final class AgentManageMCPToolServiceResumeTests: XCTestCase {
             registration: initialContext.registration,
             epoch: initialEpoch
         )
+        let originalWaitTimeoutGate = AgentRunSessionStoreTimeoutGate()
+        AgentRunSessionStore.waiterTimeoutSleepOverride = { nanoseconds in
+            await originalWaitTimeoutGate.sleep(nanoseconds: nanoseconds)
+        }
         let originalWait = Task {
             await AgentRunSessionStore.waitUntilInteresting(
                 cursor: initialCursor,
                 timeoutSeconds: 1
             )
         }
-        try await waitForAgentRunSessionStoreWaiter(registration: initialContext.registration)
-
-        let service = makeService(window: window, connectionID: resumedConnectionID)
-        _ = try await service.execute(args: [
-            "op": .string("resume_session"),
-            "session_id": .string(sessionID.uuidString)
-        ])
-
-        let resumedContext = try XCTUnwrap(session.mcpControlContext)
-        XCTAssertEqual(resumedContext.activationID, initialContext.activationID)
-        XCTAssertEqual(resumedContext.registration, initialContext.registration)
-        XCTAssertEqual(resumedContext.taskLabelKind, .pair)
-        let currentRegistration = await AgentRunSessionStore.currentRegistration(for: sessionID)
-        XCTAssertEqual(currentRegistration, initialContext.registration)
-
-        session.runState = .cancelled
-        try await viewModel.withMCPRunEpochTransition(sessionID: sessionID, kind: .steering) {
-            await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        defer {
+            AgentRunSessionStore.waiterTimeoutSleepOverride = nil
+            originalWaitTimeoutGate.release()
+            originalWait.cancel()
         }
-        let steeredContext = try XCTUnwrap(session.mcpControlContext)
-        let steeredEpoch = try XCTUnwrap(steeredContext.currentEpoch)
-        XCTAssertEqual(steeredContext.registration, initialContext.registration)
-        XCTAssertEqual(steeredEpoch.transitionKind, .steering)
 
-        let firstDisposition = await originalWait.value
-        XCTAssertEqual(firstDisposition, .epochAdvanced(steeredEpoch, .steering))
+        do {
+            try await waitForAgentRunSessionStoreWaiter(registration: initialContext.registration)
+            let requestedTimeoutNanoseconds = try await originalWaitTimeoutGate.waitForRequestedTimeout()
+            XCTAssertEqual(requestedTimeoutNanoseconds, 1_000_000_000)
+            AgentRunSessionStore.waiterTimeoutSleepOverride = nil
 
-        let steeredCursor = AgentRunSessionStore.WaitCursor(
-            registration: initialContext.registration,
-            epoch: steeredEpoch
+            let service = makeService(window: window, connectionID: resumedConnectionID)
+            _ = try await service.execute(args: [
+                "op": .string("resume_session"),
+                "session_id": .string(sessionID.uuidString)
+            ])
+
+            let resumedContext = try XCTUnwrap(session.mcpControlContext)
+            XCTAssertEqual(resumedContext.activationID, initialContext.activationID)
+            XCTAssertEqual(resumedContext.registration, initialContext.registration)
+            XCTAssertEqual(resumedContext.taskLabelKind, .pair)
+            let currentRegistration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+            XCTAssertEqual(currentRegistration, initialContext.registration)
+
+            session.runState = .cancelled
+            try await viewModel.withMCPRunEpochTransition(sessionID: sessionID, kind: .steering) {
+                await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+            }
+            let steeredContext = try XCTUnwrap(session.mcpControlContext)
+            let steeredEpoch = try XCTUnwrap(steeredContext.currentEpoch)
+            XCTAssertEqual(steeredContext.registration, initialContext.registration)
+            XCTAssertEqual(steeredEpoch.transitionKind, .steering)
+
+            let firstDisposition = try await waitForBoundedFixtureTaskValue(
+                originalWait,
+                description: "pre-resume waiter steering wake",
+                cleanupBeforeCancellation: {
+                    originalWaitTimeoutGate.release()
+                }
+            )
+            originalWaitTimeoutGate.release()
+            XCTAssertEqual(firstDisposition, .epochAdvanced(steeredEpoch, .steering))
+
+            let steeredCursor = AgentRunSessionStore.WaitCursor(
+                registration: initialContext.registration,
+                epoch: steeredEpoch
+            )
+            let steeredWait = Task {
+                await AgentRunSessionStore.waitUntilInteresting(
+                    cursor: steeredCursor,
+                    timeoutSeconds: 1
+                )
+            }
+            try await waitForAgentRunSessionStoreWaiter(registration: initialContext.registration)
+            let cancelled = makeSnapshot(sessionID: sessionID, status: .cancelled)
+            await AgentRunSessionStore.signalSnapshot(cancelled, cursor: steeredCursor)
+            let terminalDisposition = await steeredWait.value
+            XCTAssertEqual(terminalDisposition, .snapshotReady(cancelled))
+
+            await viewModel.mcpDeactivateControlContext(
+                sessionID: sessionID,
+                cleanupSessionStore: true
+            )
+        } catch {
+            originalWaitTimeoutGate.release()
+            originalWait.cancel()
+            _ = await originalWait.result
+            throw error
+        }
+    }
+
+    func testBoundedWaitObservationFailsAndDrainsWhenSteeringWakeIsMissing() async throws {
+        let window = try await makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let viewModel = window.agentModeViewModel
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: UUID(),
+            taskLabelKind: .pair,
+            startPending: true
         )
-        let steeredWait = Task {
+        await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        _ = session.beginRunAttempt(source: "test.resume.missing-steering-wake")
+        session.runState = .running
+        viewModel.publishMCPStateChange(for: session)
+
+        let context = try XCTUnwrap(session.mcpControlContext)
+        let epoch = try XCTUnwrap(context.currentEpoch)
+        let cursor = AgentRunSessionStore.WaitCursor(
+            registration: context.registration,
+            epoch: epoch
+        )
+        let timeoutGate = AgentRunSessionStoreTimeoutGate()
+        AgentRunSessionStore.waiterTimeoutSleepOverride = { nanoseconds in
+            await timeoutGate.sleep(nanoseconds: nanoseconds)
+        }
+        let waitTask = Task {
             await AgentRunSessionStore.waitUntilInteresting(
-                cursor: steeredCursor,
+                cursor: cursor,
                 timeoutSeconds: 1
             )
         }
-        try await waitForAgentRunSessionStoreWaiter(registration: initialContext.registration)
-        let cancelled = makeSnapshot(sessionID: sessionID, status: .cancelled)
-        await AgentRunSessionStore.signalSnapshot(cancelled, cursor: steeredCursor)
-        let terminalDisposition = await steeredWait.value
-        XCTAssertEqual(terminalDisposition, .snapshotReady(cancelled))
+        defer {
+            AgentRunSessionStore.waiterTimeoutSleepOverride = nil
+            timeoutGate.release()
+            waitTask.cancel()
+        }
 
-        await viewModel.mcpDeactivateControlContext(
-            sessionID: sessionID,
-            cleanupSessionStore: true
-        )
+        do {
+            try await waitForAgentRunSessionStoreWaiter(registration: context.registration)
+            let requestedTimeoutNanoseconds = try await timeoutGate.waitForRequestedTimeout()
+            XCTAssertEqual(requestedTimeoutNanoseconds, 1_000_000_000)
+
+            do {
+                _ = try await waitForBoundedFixtureTaskValue(
+                    waitTask,
+                    description: "missing steering wake",
+                    timeout: 0.05,
+                    cleanupBeforeCancellation: {
+                        timeoutGate.release()
+                    }
+                )
+                XCTFail("Expected bounded observation to time out without a steering wake")
+            } catch let error as AsyncTestConditionTimeout {
+                XCTAssertEqual(error.description, "missing steering wake")
+                XCTAssertEqual(error.timeout, 0.05)
+            }
+
+            _ = await waitTask.result
+            try await waitForAgentRunSessionStoreWaiter(
+                registration: context.registration,
+                expectedCount: 0
+            )
+            XCTAssertEqual(timeoutGate.parkedSleepCount, 0)
+
+            AgentRunSessionStore.waiterTimeoutSleepOverride = nil
+            await AgentRunSessionStore.cleanup(registration: context.registration)
+        } catch {
+            timeoutGate.release()
+            waitTask.cancel()
+            _ = await waitTask.result
+            AgentRunSessionStore.waiterTimeoutSleepOverride = nil
+            await AgentRunSessionStore.cleanup(registration: context.registration)
+            throw error
+        }
     }
 
     func testResumeAcceptsConnectedOhMyPiWithoutQualificationLease() async throws {

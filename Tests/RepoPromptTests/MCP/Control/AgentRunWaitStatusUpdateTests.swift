@@ -7,6 +7,8 @@ import XCTest
 final class AgentRunWaitStatusUpdateTests: XCTestCase {
     override func tearDown() {
         AgentRunMCPToolService.statusUpdateSliceSecondsOverride = nil
+        AgentRunMCPToolService.waitClockNowOverride = nil
+        AgentRunSessionStore.waiterTimeoutSleepOverride = nil
         super.tearDown()
     }
 
@@ -33,7 +35,7 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
                 "include_status_updates": .bool(true)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
 
         let updated = makeSnapshot(sessionID: fixture.sessionID, status: .running, statusText: "Thinking…")
         await liveSnapshots.set(updated)
@@ -70,7 +72,7 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
                 "include_status_updates": .bool(true)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
 
         let updated = makeSnapshot(sessionID: fixture.sessionID, status: .running, statusText: "Waiting…")
         await liveSnapshots.set(updated)
@@ -112,7 +114,7 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
                 "include_status_updates": .bool(true)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
 
         let updated = makeSnapshot(sessionID: fixture.sessionID, status: .running, statusText: nil)
         await liveSnapshots.set(updated)
@@ -147,7 +149,7 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
                 "timeout": .double(0.08)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
 
         let updated = makeSnapshot(sessionID: fixture.sessionID, status: .running, statusText: "Thinking…")
         await liveSnapshots.set(updated)
@@ -173,6 +175,12 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
         )
         defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
         let service = makeService(window: window, viewModel: viewModel, liveSnapshots: liveSnapshots, recorder: recorder)
+        let clock = ControlledAgentRunWaitClock()
+        let timeoutGate = AgentRunSessionStoreTimeoutGate()
+        AgentRunMCPToolService.waitClockNowOverride = { clock.now() }
+        AgentRunSessionStore.waiterTimeoutSleepOverride = { nanoseconds in
+            await timeoutGate.sleep(nanoseconds: nanoseconds)
+        }
 
         let waitTask = Task { @MainActor in
             try await service.execute(args: [
@@ -182,14 +190,57 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
                 "include_status_updates": .bool(true)
             ])
         }
-        try await waitForWaiter(registration: fixture.registration)
+        defer {
+            timeoutGate.release()
+            waitTask.cancel()
+        }
 
-        let updated = makeSnapshot(sessionID: fixture.sessionID, status: .running, statusText: "Thinking…")
-        await liveSnapshots.set(updated)
-        await AgentRunSessionStore.signalSnapshot(updated, cursor: fixture.cursor)
+        do {
+            try await waitForAgentRunSessionStoreWaiter(registration: fixture.registration)
+            let requestedTimeoutNanoseconds = try await timeoutGate.waitForRequestedTimeout()
+            let requestedTimeoutSeconds = TimeInterval(requestedTimeoutNanoseconds) / 1_000_000_000
+            XCTAssertGreaterThan(requestedTimeoutSeconds, 0)
+            XCTAssertLessThan(requestedTimeoutSeconds, 0.2)
+            XCTAssertEqual(requestedTimeoutSeconds, 0.03, accuracy: 0.001)
 
-        let value = try await waitTask.value
-        XCTAssertEqual(value.objectValue?["_meta"]?.objectValue?["wait_result"]?.stringValue, "timed_out")
+            clock.advance(by: .seconds(1))
+            let updated = makeSnapshot(sessionID: fixture.sessionID, status: .running, statusText: "Thinking…")
+            await liveSnapshots.set(updated)
+            await AgentRunSessionStore.signalSnapshot(updated, cursor: fixture.cursor)
+            timeoutGate.release()
+
+            let value = try await waitForBoundedFixtureTaskValue(
+                waitTask,
+                description: "status-update deadline completion",
+                cleanupBeforeCancellation: {
+                    timeoutGate.release()
+                }
+            )
+            XCTAssertEqual(value.objectValue?["_meta"]?.objectValue?["wait_result"]?.stringValue, "timed_out")
+        } catch {
+            timeoutGate.release()
+            waitTask.cancel()
+            _ = await waitTask.result
+            throw error
+        }
+    }
+
+    func testTimeoutGateWithoutRequestThrowsBoundedErrorAndLeavesNoParkedSleep() async {
+        let timeoutGate = AgentRunSessionStoreTimeoutGate()
+
+        do {
+            _ = try await timeoutGate.waitForRequestedTimeout(timeout: 0.03)
+            XCTFail("Expected bounded timeout-request observation to fail when no request arrives")
+        } catch let error as AsyncTestConditionTimeout {
+            XCTAssertEqual(error.description, "AgentRunSessionStore timeout request")
+            XCTAssertEqual(error.timeout, 0.03)
+        } catch {
+            XCTFail("Unexpected timeout-request observation error: \(error)")
+        }
+
+        timeoutGate.release()
+        XCTAssertTrue(timeoutGate.isReleased)
+        XCTAssertEqual(timeoutGate.parkedSleepCount, 0)
     }
 
     func testMultiSessionWaitReturnsFirstStatusTextChange() async throws {
@@ -228,8 +279,8 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
                 "include_status_updates": .bool(true)
             ])
         }
-        try await waitForWaiter(registration: first.registration)
-        try await waitForWaiter(registration: second.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: first.registration)
+        try await waitForAgentRunSessionStoreWaiter(registration: second.registration)
 
         let updated = makeSnapshot(sessionID: second.sessionID, status: .running, statusText: "Thinking…")
         await liveSnapshots.set(updated)
@@ -377,20 +428,6 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
         return service
     }
 
-    private func waitForWaiter(
-        registration: AgentRunSessionStore.Registration,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) async throws {
-        for _ in 0 ..< 300 {
-            if await AgentRunSessionStore.shared.test_waiterCount(registration: registration) == 1 {
-                return
-            }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
-        XCTFail("Timed out waiting for store waiter", file: file, line: line)
-    }
-
     private func makeSnapshot(
         sessionID: UUID,
         runID: UUID? = nil,
@@ -418,6 +455,23 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
             worktreeBindings: [],
             activeWorktreeMerges: []
         )
+    }
+}
+
+private final class ControlledAgentRunWaitClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant = ContinuousClock().now
+
+    func now() -> ContinuousClock.Instant {
+        lock.lock()
+        defer { lock.unlock() }
+        return instant
+    }
+
+    func advance(by duration: Duration) {
+        lock.lock()
+        instant = instant.advanced(by: duration)
+        lock.unlock()
     }
 }
 

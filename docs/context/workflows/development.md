@@ -70,6 +70,16 @@ rpce-cli-debug -w 1 -e 'tree --type roots'
 rpce-cli-debug -w 1 -c agent_manage -j '{"op":"list_agents","roles_only":true}'
 ```
 
+### Enable Codex computer use for one explicit turn
+
+Codex computer use is a persisted, default-off opt-in exposed through `app_settings` key `agent_mode.codex_computer_use_enabled`; there is no Settings-screen toggle. Enabling the key only makes an explicit `/computer-use` turn eligible:
+
+```bash
+rpce-cli-debug -w <window-id> -c app_settings -j '{"op":"set","key":"agent_mode.codex_computer_use_enabled","value":true}'
+```
+
+The production admission path rejects `/computer-use` in Safe Managed and Knowledge sessions and independently clamps the controller capability off for both. See the [computer-use implementation report](../../technical_implementation_reports/2026-09-03-codex-computer-use-enablement-report.html) for the implementation, safety, and validation record.
+
 ### Diagnose missing native Codex MCP tools
 
 If every RepoPrompt tool is missing, inspect the Codex MCP startup error before

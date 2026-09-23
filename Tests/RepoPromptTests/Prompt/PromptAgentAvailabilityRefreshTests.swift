@@ -5,41 +5,38 @@ import XCTest
 @MainActor
 final class PromptAgentAvailabilityRefreshTests: XCTestCase {
     func testSavingGLMSecretRefreshesAgentAvailability() async throws {
-        let restoredDefaults = preserveDefaults(Self.availabilityDefaultsKeys)
-        defer { restoreDefaults(restoredDefaults) }
-        resetAvailabilityDefaults(glmConfigured: false)
+        let fixture = try makeAvailabilityFixture(glmConfigured: false)
+        defer { fixture.cleanup() }
 
-        let viewModel = makeViewModel()
+        let viewModel = makeViewModel(fixture: fixture)
         XCTAssertFalse(viewModel.agentAvailability.zaiConfigured)
 
         try await viewModel.saveCompatibleBackendSecret("zai-test-key", for: .glmZAI)
 
         XCTAssertTrue(viewModel.agentAvailability.zaiConfigured)
         XCTAssertTrue(viewModel.compatibleBackendHasSecret(.glmZAI))
-        XCTAssertTrue(ClaudeCodeGLMIntegration.isConfigured())
+        XCTAssertTrue(ClaudeCodeGLMIntegration.isConfigured(defaults: fixture.defaults))
     }
 
-    func testLoadingPreconfiguredZAIKeyRefreshesAgentAvailability() async {
-        let restoredDefaults = preserveDefaults(Self.availabilityDefaultsKeys)
-        defer { restoreDefaults(restoredDefaults) }
-        resetAvailabilityDefaults(glmConfigured: true)
+    func testLoadingPreconfiguredZAIKeyRefreshesAgentAvailability() async throws {
+        let fixture = try makeAvailabilityFixture(glmConfigured: true)
+        defer { fixture.cleanup() }
 
-        let viewModel = makeViewModel()
+        let viewModel = makeViewModel(fixture: fixture)
         XCTAssertFalse(viewModel.agentAvailability.zaiConfigured)
 
         await viewModel.loadStoredData(accessMode: .nonInteractive(reason: .test))
 
         XCTAssertTrue(viewModel.agentAvailability.zaiConfigured)
         XCTAssertTrue(viewModel.compatibleBackendHasSecret(.glmZAI))
-        XCTAssertTrue(ClaudeCodeGLMIntegration.isConfigured())
+        XCTAssertTrue(ClaudeCodeGLMIntegration.isConfigured(defaults: fixture.defaults))
     }
 
-    func testPromptRefreshesAvailableAgentKindsWhenPreconfiguredZAIKeyLoadsWithStaleSecretPresenceMirror() async {
-        let restoredDefaults = preserveDefaults(Self.availabilityDefaultsKeys)
-        defer { restoreDefaults(restoredDefaults) }
-        resetAvailabilityDefaults(glmConfigured: true)
+    func testPromptRefreshesAvailableAgentKindsWhenPreconfiguredZAIKeyLoadsWithStaleSecretPresenceMirror() async throws {
+        let fixture = try makeAvailabilityFixture(glmConfigured: true)
+        defer { fixture.cleanup() }
 
-        let apiSettings = makeViewModel()
+        let apiSettings = makeViewModel(fixture: fixture)
         let prompt = PromptViewModel(
             fileManager: WorkspaceFilesViewModel(),
             apiSettingsViewModel: apiSettings,
@@ -60,12 +57,11 @@ final class PromptAgentAvailabilityRefreshTests: XCTestCase {
         )
     }
 
-    func testLateConstructedPromptViewModelSeesPreconfiguredZAIAvailability() async {
-        let restoredDefaults = preserveDefaults(Self.availabilityDefaultsKeys)
-        defer { restoreDefaults(restoredDefaults) }
-        resetAvailabilityDefaults(glmConfigured: true)
+    func testLateConstructedPromptViewModelSeesPreconfiguredZAIAvailability() async throws {
+        let fixture = try makeAvailabilityFixture(glmConfigured: true)
+        defer { fixture.cleanup() }
 
-        let apiSettings = makeViewModel()
+        let apiSettings = makeViewModel(fixture: fixture)
         await apiSettings.loadStoredData(accessMode: .nonInteractive(reason: .test))
         XCTAssertTrue(apiSettings.agentAvailability.zaiConfigured)
 
@@ -86,43 +82,46 @@ final class PromptAgentAvailabilityRefreshTests: XCTestCase {
         )
     }
 
-    private static var availabilityDefaultsKeys: [String] {
-        [
-            "ClaudeCodeConnected",
-            "CodexCLIConnected",
-            "OpenCodeCLIConnected",
-            "CursorCLIConnected",
-            ClaudeCodeGLMIntegration.configuredDefaultsKey,
-            ClaudeCodeCompatibleBackendStore.configsDefaultsKey
-        ] + ClaudeCodeCompatibleBackendID.allCases.map {
-            ClaudeCodeCompatibleBackendStore.shared.configuredDefaultsKey(for: $0)
+    private struct AvailabilityFixture {
+        let suiteName: String
+        let defaults: UserDefaults
+        let secureService: SecureKeysService
+        let backendStore: ClaudeCodeCompatibleBackendStore
+
+        func cleanup() {
+            defaults.removePersistentDomain(forName: suiteName)
         }
     }
 
-    private func resetAvailabilityDefaults(glmConfigured: Bool) {
-        UserDefaults.standard.set(false, forKey: "ClaudeCodeConnected")
-        UserDefaults.standard.set(false, forKey: "CodexCLIConnected")
-        UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
-        UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
-        UserDefaults.standard.removeObject(forKey: ClaudeCodeCompatibleBackendStore.configsDefaultsKey)
-        for id in ClaudeCodeCompatibleBackendID.allCases {
-            UserDefaults.standard.set(
-                id == .glmZAI && glmConfigured,
-                forKey: ClaudeCodeCompatibleBackendStore.shared.configuredDefaultsKey(for: id)
-            )
-        }
-        UserDefaults.standard.set(glmConfigured, forKey: ClaudeCodeGLMIntegration.configuredDefaultsKey)
-    }
-
-    private func makeViewModel() -> APISettingsViewModel {
+    private func makeAvailabilityFixture(glmConfigured: Bool) throws -> AvailabilityFixture {
+        let suiteName = "PromptAgentAvailabilityRefreshTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
         let secureService = SecureKeysService(secureStorage: TestSecureStorageBackend(values: [
             .zAIAPI: "zai-test-key"
         ]))
-        let keyManager = KeyManager(secureService: secureService)
+        let backendStore = ClaudeCodeCompatibleBackendStore(
+            defaults: defaults,
+            secureService: secureService
+        )
+        for id in ClaudeCodeCompatibleBackendID.allCases {
+            backendStore.setConfigured(id == .glmZAI && glmConfigured, for: id)
+        }
+        return AvailabilityFixture(
+            suiteName: suiteName,
+            defaults: defaults,
+            secureService: secureService,
+            backendStore: backendStore
+        )
+    }
+
+    private func makeViewModel(fixture: AvailabilityFixture) -> APISettingsViewModel {
+        let keyManager = KeyManager(secureService: fixture.secureService)
         return APISettingsViewModel(
             aiQueriesService: AIQueriesService(keyManager: keyManager),
             keyManager: keyManager,
-            loadStoredDataOnInit: false
+            loadStoredDataOnInit: false,
+            compatibleBackendStore: fixture.backendStore
         )
     }
 
@@ -132,19 +131,5 @@ final class PromptAgentAvailabilityRefreshTests: XCTestCase {
             drained.fulfill()
         }
         await fulfillment(of: [drained], timeout: 1.0)
-    }
-
-    private func preserveDefaults(_ keys: [String]) -> [String: Any?] {
-        Dictionary(uniqueKeysWithValues: keys.map { ($0, UserDefaults.standard.object(forKey: $0)) })
-    }
-
-    private func restoreDefaults(_ snapshot: [String: Any?]) {
-        for (key, value) in snapshot {
-            if let value {
-                UserDefaults.standard.set(value, forKey: key)
-            } else {
-                UserDefaults.standard.removeObject(forKey: key)
-            }
-        }
     }
 }

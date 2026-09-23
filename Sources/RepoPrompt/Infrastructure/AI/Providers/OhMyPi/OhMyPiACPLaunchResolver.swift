@@ -52,6 +52,10 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
     private let probeMutex = AsyncMutex()
     private let lock = NSLock()
     private var cachedLaunchByKey: [String: OhMyPiACPResolvedLaunch] = [:]
+    #if DEBUG
+        /// Instance-local hermetic path seam. Set before first resolver use in serial tests only.
+        var testAdditionalPathHintsOverride: [String]?
+    #endif
 
     convenience init(
         environmentProvider: @escaping @Sendable (_ enableDebugLogging: Bool) async -> [String: String]
@@ -192,7 +196,7 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
                 shellEnvironmentSource: launchEnvironment.shellEnvironmentSource
             )
         }
-        let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
+        let effectiveHints = effectiveAdditionalPathHints(config.additionalPathHints)
         return try firstValidLaunch(
             candidates: launchCandidates(
                 additionalPathHints: effectiveHints,
@@ -214,7 +218,7 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
         guard configuredCommand.contains("/") else {
             throw OhMyPiACPLaunchResolutionError.environmentDiscoveryRequired(configuredCommand)
         }
-        let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
+        let effectiveHints = effectiveAdditionalPathHints(config.additionalPathHints)
         do {
             return try validatedLaunch(
                 entryPath: CommandPathResolver.expandPath(configuredCommand, environment: environment),
@@ -230,6 +234,15 @@ final class OhMyPiACPLaunchResolver: @unchecked Sendable {
             )
             throw Self.actionableEntryError(error, configuredCommand: configuredCommand)
         }
+    }
+
+    private func effectiveAdditionalPathHints(_ configuredHints: [String]) -> [String] {
+        #if DEBUG
+            if let testAdditionalPathHintsOverride {
+                return testAdditionalPathHintsOverride
+            }
+        #endif
+        return CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(configuredHints)
     }
 
     private func validatedConfiguredCommand(_ config: OhMyPiAgentConfig) throws -> String {

@@ -472,7 +472,7 @@ public class APISettingsViewModel: ObservableObject {
     @Published var compatibleBackendSecretPresence: [ClaudeCodeCompatibleBackendID: Bool] = [:]
     @Published private(set) var compatibleBackendLastTestResult: [ClaudeCodeCompatibleBackendID: ClaudeCompatibleBackendTestResult] = [:]
 
-    private let compatibleBackendStore: ClaudeCodeCompatibleBackendStore = .shared
+    private let compatibleBackendStore: ClaudeCodeCompatibleBackendStore
 
     private let defaultZAIModels = ["glm-5.2", "glm-5.1", "glm-5", "glm-5-turbo", "glm-4.7", "glm-4.7-flash", "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.5-flash"]
 
@@ -710,7 +710,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func refreshClaudeCodeGLMAvailability() {
-        ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
+        compatibleBackendStore.setConfigured(hasStoredZAIKey, for: .glmZAI)
         compatibleBackendSecretPresence[.glmZAI] = hasStoredZAIKey
         refreshAgentAvailability()
     }
@@ -1482,6 +1482,7 @@ public class APISettingsViewModel: ObservableObject {
         openAIModelMetadataResolver: OpenAIAPIModelMetadataResolver? = nil,
         openAIModelMetadataRegistry: OpenAIAPIModelMetadataRegistry = .shared,
         cliExecutableOverrideDefaults: UserDefaults = .standard,
+        compatibleBackendStore: ClaudeCodeCompatibleBackendStore = .shared,
         claudeExecutableDraftValidator: ((String) async -> ClaudeExecutableDraftAssessment)? = nil,
         claudeExecutableProbeOperation: ((CLIProcessConfiguration, TimeInterval) async -> ClaudeExecutableProbeOutcome)? = nil,
         cliResolvedCommandCacheInvalidator: (() async -> Void)? = nil,
@@ -1497,6 +1498,7 @@ public class APISettingsViewModel: ObservableObject {
         self.aiQueriesService = aiQueriesService
         self.keyManager = keyManager
         self.cliExecutableOverrideDefaults = cliExecutableOverrideDefaults
+        self.compatibleBackendStore = compatibleBackendStore
         self.claudeExecutableDraftValidator = claudeExecutableDraftValidator ?? { input in
             Self.assessClaudeExecutableDraft(input)
         }

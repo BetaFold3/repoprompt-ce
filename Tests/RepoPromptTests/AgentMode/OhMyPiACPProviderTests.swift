@@ -418,8 +418,9 @@ final class OhMyPiACPProviderTests: XCTestCase {
 
         let pathDirectory = try makeTestDirectory(name: "OhMyPiACPProviderTests-path-unavailable")
         let pathResolver = OhMyPiACPLaunchResolver(environmentProvider: { _ in
-            ["PATH": pathDirectory.path, "HOME": FileManager.default.homeDirectoryForCurrentUser.path]
+            ["PATH": pathDirectory.path, "HOME": pathDirectory.path]
         })
+        pathResolver.testAdditionalPathHintsOverride = []
         guard case let .unsupported(pathReason) = try await pathResolver.probeSupport(
             for: OhMyPiAgentConfig(commandName: "omp", additionalPathHints: [])
         ) else {
