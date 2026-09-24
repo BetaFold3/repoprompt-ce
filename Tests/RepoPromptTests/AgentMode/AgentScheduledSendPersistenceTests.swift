@@ -157,6 +157,75 @@ final class AgentScheduledSendPersistenceTests: XCTestCase {
         XCTAssertEqual(diskStub.lastScheduledDispatch, provenance)
     }
 
+    func testSchemaSixIndexIsInvalidatedAndRebuiltFromScheduleAwareStubs() async throws {
+        let service = AgentSessionDataService()
+        let workspace = makeTemporaryWorkspace()
+        let storagePath = try XCTUnwrap(workspace.customStoragePath)
+        defer { try? FileManager.default.removeItem(at: storagePath) }
+
+        let schedule = makeSchedule()
+        let receipt = makeProvenance(schedule: schedule)
+        let pending = AgentSession(
+            id: UUID(),
+            workspaceID: workspace.id,
+            composeTabID: UUID(),
+            name: "Pending",
+            itemCount: 0,
+            scheduledSend: .v1(schedule)
+        )
+        let unreadable = AgentSession(
+            id: UUID(),
+            workspaceID: workspace.id,
+            composeTabID: UUID(),
+            name: "Unreadable",
+            itemCount: 0,
+            scheduledSend: .unreadable(.object(["future": .bool(true)]))
+        )
+        let historical = AgentSession(
+            id: UUID(),
+            workspaceID: workspace.id,
+            composeTabID: UUID(),
+            name: "Historical",
+            itemCount: 0,
+            lastScheduledDispatch: receipt
+        )
+        var indexURL: URL?
+        for session in [pending, unreadable, historical] {
+            let fileURL = try await service.saveAgentSession(
+                session,
+                for: workspace,
+                preparation: .alreadyCanonicalTranscript,
+                trustedCanonicalItemCount: 0
+            )
+            indexURL = fileURL.deletingLastPathComponent().appendingPathComponent("AgentSessionIndex.json")
+        }
+        let indexFile = try XCTUnwrap(indexURL)
+        let staleIndex = AgentSessionMetadataIndex(schemaVersion: 6, entries: [])
+        try JSONEncoder().encode(staleIndex).write(to: indexFile, options: .atomic)
+
+        let freshService = AgentSessionDataService()
+        let staleFastResult = try await freshService.fastMetadataRecordsIfAvailable(for: workspace)
+        XCTAssertNil(staleFastResult)
+        let rebuilt = try await freshService.indexedAgentSessionMetadataRecords(for: workspace)
+        XCTAssertEqual(rebuilt.count, 3)
+        let byID = Dictionary(uniqueKeysWithValues: rebuilt.map { ($0.id, $0) })
+        XCTAssertEqual(byID[pending.id]?.scheduledSendSummary?.id, schedule.id)
+        XCTAssertEqual(byID[pending.id]?.scheduledSendSummary?.previewText, schedule.rawText)
+        XCTAssertTrue(try XCTUnwrap(byID[unreadable.id]).hasUnreadableScheduledSend)
+        XCTAssertEqual(byID[historical.id]?.lastScheduledDispatch, receipt)
+        XCTAssertNil(byID[historical.id]?.scheduledSendSummary)
+        XCTAssertEqual(try XCTUnwrap(byID[pending.id]).sidebarEntry()?.scheduledSendSummary?.id, schedule.id)
+        XCTAssertTrue(try XCTUnwrap(byID[unreadable.id]).sidebarEntry()?.hasUnreadableScheduledSend == true)
+        XCTAssertEqual(try XCTUnwrap(byID[historical.id]).sidebarEntry()?.lastScheduledDispatch, receipt)
+
+        let rewritten = try JSONDecoder().decode(
+            AgentSessionMetadataIndex.self,
+            from: Data(contentsOf: indexFile)
+        )
+        XCTAssertEqual(rewritten.schemaVersion, 7)
+        XCTAssertEqual(rewritten.entries.count, 3)
+    }
+
     func testStaleFullSessionSavePreservesNewerScheduleWhileSavingUnrelatedState() async throws {
         let service = AgentSessionDataService()
         let workspace = makeTemporaryWorkspace()

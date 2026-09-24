@@ -949,6 +949,7 @@ extension AgentModeViewModel {
         /// the session has an awaiting-approval, conflicted, or
         /// awaiting-commit merge operation; nil otherwise.
         let worktreeMergeAttention: AgentWorktreeMergeAttention?
+        let scheduledSendStatus: AgentSidebarScheduledSendStatus?
         let threadKey: AgentSidebarThreadKey?
         let hasThreadChildren: Bool
         let isThreadCollapsed: Bool
@@ -978,6 +979,7 @@ extension AgentModeViewModel {
             remoteControlDeviceDisplayName: String? = nil,
             worktree: AgentWorktreeIndicator? = nil,
             worktreeMergeAttention: AgentWorktreeMergeAttention? = nil,
+            scheduledSendStatus: AgentSidebarScheduledSendStatus? = nil,
             threadKey: AgentSidebarThreadKey? = nil,
             hasThreadChildren: Bool = false,
             isThreadCollapsed: Bool = false,
@@ -1002,6 +1004,7 @@ extension AgentModeViewModel {
             self.remoteControlDeviceDisplayName = remoteControlDeviceDisplayName
             self.worktree = worktree
             self.worktreeMergeAttention = worktreeMergeAttention
+            self.scheduledSendStatus = scheduledSendStatus
             self.threadKey = threadKey
             self.hasThreadChildren = hasThreadChildren
             self.isThreadCollapsed = isThreadCollapsed

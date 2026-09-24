@@ -118,6 +118,10 @@ extension AgentModeViewModel {
             isMCPControlled: entry?.isMCPOriginated == true,
             worktree: nil,
             mergeAttention: nil,
+            scheduledSendStatus: AgentSidebarScheduledSendStatus(
+                summary: entry?.scheduledSendSummary,
+                lastDispatch: entry?.lastScheduledDispatch
+            ),
             sessionID: stashedTab.tab.activeAgentSessionID ?? entry?.id,
             tabID: stashedTab.tab.id
         )
@@ -903,6 +907,7 @@ extension AgentModeViewModel {
             remoteControlDeviceDisplayName: row.remoteControlDeviceDisplayName,
             worktree: row.worktree,
             worktreeMergeAttention: row.worktreeMergeAttention,
+            scheduledSendStatus: row.scheduledSendStatus,
             threadKey: threadKey,
             hasThreadChildren: hasThreadChildren,
             isThreadCollapsed: isThreadCollapsed,

@@ -416,6 +416,7 @@ struct AgentModeSessionsListView: View {
                                 remoteControlDeviceDisplayName: session.remoteControlDeviceDisplayName,
                                 worktree: session.worktree,
                                 worktreeMergeAttention: session.worktreeMergeAttention,
+                                scheduledSendStatus: session.scheduledSendStatus,
                                 threadDepth: session.depth,
                                 hasThreadChildren: session.hasThreadChildren,
                                 isThreadCollapsed: session.isThreadCollapsed,

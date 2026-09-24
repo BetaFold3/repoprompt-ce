@@ -7480,7 +7480,9 @@ final class AgentModeViewModel: ObservableObject {
                 origin: AgentSessionOrigin.merged(existingEntry.origin, session.origin),
                 profile: existingEntry.profile,
                 worktreeBindingSummaries: existingEntry.worktreeBindingSummaries,
-                activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries
+                activeWorktreeMergeSummaries: existingEntry.activeWorktreeMergeSummaries,
+                scheduledSendSummary: existingEntry.scheduledSendSummary,
+                lastScheduledDispatch: existingEntry.lastScheduledDispatch
             )
             guard repairedEntry != existingEntry else { return }
             applyLocalSessionIndexUpsert(repairedEntry)
@@ -7504,7 +7506,9 @@ final class AgentModeViewModel: ObservableObject {
             profile: session.profile,
             remoteHostID: session.remoteHost?.hostID,
             remoteHostName: session.remoteHost?.hostDisplayName,
-            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID
+            remoteSessionID: session.remoteHost?.normalizedRemoteSessionID,
+            scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: session.scheduledSend),
+            lastScheduledDispatch: session.lastScheduledDispatch
         )
     }
 
@@ -11652,7 +11656,8 @@ final class AgentModeViewModel: ObservableObject {
         remoteHostName: String? = nil,
         remoteSessionID: String? = nil,
         activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary] = [],
-        scheduledSendSummary: AgentSessionScheduledSendSummary? = nil
+        scheduledSendSummary: AgentSessionScheduledSendSummary? = nil,
+        lastScheduledDispatch: AgentScheduledSendProvenance? = nil
     ) {
         applyLocalSessionIndexUpsert(AgentSessionIndexEntry(
             id: sessionID,
@@ -11676,7 +11681,8 @@ final class AgentModeViewModel: ObservableObject {
             profile: profile,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries,
-            scheduledSendSummary: scheduledSendSummary
+            scheduledSendSummary: scheduledSendSummary,
+            lastScheduledDispatch: lastScheduledDispatch
         ))
     }
 
@@ -13693,7 +13699,8 @@ final class AgentModeViewModel: ObservableObject {
                 remoteHostName: agentSession.remoteHost?.hostDisplayName,
                 remoteSessionID: agentSession.remoteHost?.normalizedRemoteSessionID,
                 activeWorktreeMergeSummaries: agentSession.worktreeMergeOperations.activeWorktreeMergeSummaries,
-                scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: agentSession.scheduledSend)
+                scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: agentSession.scheduledSend),
+                lastScheduledDispatch: agentSession.lastScheduledDispatch
             )
             #if DEBUG
                 if let diagnosticsStartMS {

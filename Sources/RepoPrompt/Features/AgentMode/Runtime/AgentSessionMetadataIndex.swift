@@ -1,7 +1,7 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 6
+    static let currentSchemaVersion = 7
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -155,6 +155,11 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var interActiveIntervalGapSeconds: [Int]
     var toolCallCount: Int
     var scheduledSendSummary: AgentSessionScheduledSendSummary?
+    var lastScheduledDispatch: AgentScheduledSendProvenance?
+
+    var hasUnreadableScheduledSend: Bool {
+        scheduledSendSummary?.isUnreadable == true
+    }
 
     /// Default idle threshold in minutes. Gaps between merged active intervals longer than this are idle.
     static let defaultIdleThresholdMinutes = 10
@@ -237,7 +242,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         coveredTurnDurationSeconds: Int = 0,
         interActiveIntervalGapSeconds: [Int] = [],
         toolCallCount: Int = 0,
-        scheduledSendSummary: AgentSessionScheduledSendSummary? = nil
+        scheduledSendSummary: AgentSessionScheduledSendSummary? = nil,
+        lastScheduledDispatch: AgentScheduledSendProvenance? = nil
     ) {
         self.id = id
         self.filename = filename
@@ -274,6 +280,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.interActiveIntervalGapSeconds = interActiveIntervalGapSeconds
         self.toolCallCount = toolCallCount
         self.scheduledSendSummary = scheduledSendSummary
+        self.lastScheduledDispatch = lastScheduledDispatch
     }
 
     enum CodingKeys: String, CodingKey {
@@ -312,6 +319,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case interActiveIntervalGapSeconds
         case toolCallCount
         case scheduledSendSummary
+        case lastScheduledDispatch
     }
 
     init(from decoder: Decoder) throws {
@@ -371,6 +379,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         interActiveIntervalGapSeconds = try container.decodeIfPresent([Int].self, forKey: .interActiveIntervalGapSeconds) ?? []
         toolCallCount = try container.decodeIfPresent(Int.self, forKey: .toolCallCount) ?? 0
         scheduledSendSummary = try container.decodeIfPresent(AgentSessionScheduledSendSummary.self, forKey: .scheduledSendSummary)
+        lastScheduledDispatch = try container.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .lastScheduledDispatch)
     }
 
     func sidebarEntry(tabID overrideTabID: UUID? = nil, displayName: String? = nil) -> AgentSessionIndexEntry? {
@@ -397,7 +406,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             profile: profile,
             worktreeBindingSummaries: worktreeBindingSummaries,
             activeWorktreeMergeSummaries: activeWorktreeMergeSummaries,
-            scheduledSendSummary: scheduledSendSummary
+            scheduledSendSummary: scheduledSendSummary,
+            lastScheduledDispatch: lastScheduledDispatch
         )
     }
 
@@ -457,6 +467,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && interActiveIntervalGapSeconds == other.interActiveIntervalGapSeconds
             && toolCallCount == other.toolCallCount
             && scheduledSendSummary == other.scheduledSendSummary
+            && lastScheduledDispatch == other.lastScheduledDispatch
     }
 
     static func record(
@@ -507,7 +518,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             coveredTurnDurationSeconds: durationPrimitives.coveredSeconds,
             interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
             toolCallCount: computedToolCallCount,
-            scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: session.scheduledSend)
+            scheduledSendSummary: AgentSessionScheduledSendSummary.make(from: session.scheduledSend),
+            lastScheduledDispatch: session.lastScheduledDispatch
         )
     }
 

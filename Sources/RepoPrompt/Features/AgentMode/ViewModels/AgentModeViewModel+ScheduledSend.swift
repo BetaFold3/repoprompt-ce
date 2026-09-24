@@ -236,12 +236,25 @@ extension AgentModeViewModel {
 
     private func refreshIndexScheduledSendSummaryFromDisk(sessionID: UUID) async {
         guard let workspace = persistenceWorkspace,
-              var entry = ownerValidatedSessionIndex[sessionID],
-              let persisted = try? await dataService.loadAgentSession(id: sessionID, for: workspace)
+              let owner = sessionIndexStore.sessionIndexOwner,
+              owner.workspaceID == workspace.id,
+              sessionIndexStore.isOwnerCurrent(owner),
+              ownerValidatedSessionIndex[sessionID] != nil
         else { return }
-        let summary = AgentSessionScheduledSendSummary.make(from: persisted.scheduledSend)
-        guard entry.scheduledSendSummary != summary else { return }
-        entry.scheduledSendSummary = summary
+        let storagePath = workspace.customStoragePath
+        // The index-only refresh needs header fields, not a full transcript decode.
+        guard let record = try? await dataService.metadataRecordForSessionID(sessionID, for: workspace),
+              record.id == sessionID,
+              sessionIndexStore.isOwnerCurrent(owner),
+              persistenceWorkspace?.id == workspace.id,
+              persistenceWorkspace?.customStoragePath == storagePath,
+              var entry = ownerValidatedSessionIndex[sessionID]
+        else { return }
+        guard entry.scheduledSendSummary != record.scheduledSendSummary
+            || entry.lastScheduledDispatch != record.lastScheduledDispatch
+        else { return }
+        entry.scheduledSendSummary = record.scheduledSendSummary
+        entry.lastScheduledDispatch = record.lastScheduledDispatch
         applyLocalSessionIndexUpsert(entry)
         scheduledSendCoordinator?.recordDidChange()
     }
@@ -1321,12 +1334,16 @@ extension AgentModeViewModel {
     }
 
     func updateLocalSessionIndexScheduledSendSummary(for session: TabSession) {
-        guard let sessionID = session.activeAgentSessionID,
+        guard session.hasLoadedPersistedState,
+              let sessionID = session.activeAgentSessionID,
               var entry = ownerValidatedSessionIndex[sessionID]
         else { return }
         let summary = AgentSessionScheduledSendSummary.make(from: session.scheduledSend)
-        guard entry.scheduledSendSummary != summary else { return }
+        guard entry.scheduledSendSummary != summary
+            || entry.lastScheduledDispatch != session.lastScheduledDispatch
+        else { return }
         entry.scheduledSendSummary = summary
+        entry.lastScheduledDispatch = session.lastScheduledDispatch
         applyLocalSessionIndexUpsert(entry)
     }
 
