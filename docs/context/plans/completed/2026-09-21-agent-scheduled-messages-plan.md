@@ -1,3 +1,15 @@
+# Completion outcome — 2026-09-24
+
+Outcome: Phases 1–4 were implemented. Identity-verified fresh OracleA and OracleB R1 reviews accepted Phase 4 at code-review level, closed P4-F1, P4-F2/G1, P4-F4, and P4-F5, found no remaining P0/P1, and required no further loop.
+
+Durable decisions: retain the app-wide coordinator and hydrated-record authority, immediate expected-revision persistence, durable dispatch-attempt fencing before user-item handoff, confirmation after uncertain sleep/closed crossings, identity-stable Send/Cancel scheduling, fresh relative custom-picker deadlines, and save-before-cleanup attachment removal. Current contracts and deferrals live in [Agent Mode scheduled messages](../../agent-scheduled-messages.md).
+
+Validation: dispatch **49** (`4dedb3e2-0e6a-4dea-98c7-b8d71dbaec27`), dashboard **9** (`0e3607ce-0622-4963-92fa-663a64ac74d2`), lint (`77ab3f94-265a-4e06-ad9f-aed2815e2446`), product build (`243a7962-4ec8-4d85-8bc7-ff84159e46a9`), and integrity-valid full root **6,037/6,037 across 568 suites** (`be1a63b9-1a43-4117-a4b1-9dfcf75f5109`) passed; three unrelated crash retries passed. Ledger reconciliation passed with **6,132 IDs**. No rendered UI, visible-app, live-provider/provider-runner, or physical sleep/wake/lid-close validation is claimed.
+
+The original 263-line plan is preserved verbatim below.
+
+---
+
 # Agent Mode scheduled (delayed) message sending plan
 
 Scope: read when the task touches Agent Mode scheduled or delayed message sending, the composer schedule control, scheduled-send persistence, the scheduled-send admission coordinator, sidebar or message scheduled badges, or the Scheduled Messages dashboard.

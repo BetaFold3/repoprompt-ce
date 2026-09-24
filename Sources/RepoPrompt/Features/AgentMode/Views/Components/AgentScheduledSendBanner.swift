@@ -17,15 +17,25 @@ struct AgentScheduledSendBanner: View {
     @State private var editorMode: EditorMode?
     @State private var editorText: String
     @State private var editorNotBefore: Date
+    @State private var editorDateRange: ClosedRange<Date>
     @State private var editorRunAlongside: Bool
+    @State private var editorRemovedImageIDs: Set<UUID> = []
+    @State private var editorRemovedTaggedFileIDs: Set<UUID> = []
     @State private var actionError: String?
     @State private var isActionInFlight = false
 
     init(props: AgentScheduledSendProps, actions: AgentScheduledSendActions) {
         self.props = props
         self.actions = actions
+        let now = Date()
         _editorText = State(initialValue: props.rawText)
         _editorNotBefore = State(initialValue: props.notBefore)
+        _editorDateRange = State(
+            initialValue: AgentScheduledSendTiming.editorRange(
+                originalNotBefore: props.notBefore,
+                now: now
+            )
+        )
         _editorRunAlongside = State(initialValue: props.runAlongsideOtherSessions)
     }
 
@@ -100,9 +110,16 @@ struct AgentScheduledSendBanner: View {
         }
         .onChange(of: props) { _, newProps in
             guard editorMode == nil else { return }
+            let now = Date()
             editorText = newProps.rawText
             editorNotBefore = newProps.notBefore
+            editorDateRange = AgentScheduledSendTiming.editorRange(
+                originalNotBefore: newProps.notBefore,
+                now: now
+            )
             editorRunAlongside = newProps.runAlongsideOtherSessions
+            editorRemovedImageIDs = []
+            editorRemovedTaggedFileIDs = []
         }
     }
 
@@ -141,11 +158,12 @@ struct AgentScheduledSendBanner: View {
                         .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
                 )
 
-            if props.attachments.hasAny {
+            if editorAttachments.hasAny {
                 AgentAttachmentsStrip(
-                    snapshot: props.attachments,
-                    disabled: true,
-                    allowsRemoval: false
+                    snapshot: editorAttachments,
+                    allowsRemoval: true,
+                    onRemoveImage: { editorRemovedImageIDs.insert($0) },
+                    onRemoveTaggedFile: { editorRemovedTaggedFileIDs.insert($0) }
                 )
                 .equatable()
             }
@@ -153,7 +171,7 @@ struct AgentScheduledSendBanner: View {
             DatePicker(
                 "Send after",
                 selection: $editorNotBefore,
-                in: Date() ... Date().addingTimeInterval(24 * 60 * 60),
+                in: editorDateRange,
                 displayedComponents: [.date, .hourAndMinute]
             )
 
@@ -177,16 +195,35 @@ struct AgentScheduledSendBanner: View {
         .frame(width: 400)
     }
 
+    private var editorAttachments: AgentAttachmentStripSnapshot {
+        AgentAttachmentStripSnapshot(
+            scopeTabID: props.attachments.scopeTabID,
+            imageAttachments: props.attachments.imageAttachments.filter {
+                !editorRemovedImageIDs.contains($0.id)
+            },
+            taggedFileAttachments: props.attachments.taggedFileAttachments.filter {
+                !editorRemovedTaggedFileIDs.contains($0.id)
+            }
+        )
+    }
+
     private var canSaveEditor: Bool {
         !editorText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || props.attachments.hasAny
+            || editorAttachments.hasAny
     }
 
     private func presentEditor(_ mode: EditorMode) {
+        let now = Date()
         actionError = nil
         editorText = props.rawText
         editorNotBefore = props.notBefore
+        editorDateRange = AgentScheduledSendTiming.editorRange(
+            originalNotBefore: props.notBefore,
+            now: now
+        )
         editorRunAlongside = props.runAlongsideOtherSessions
+        editorRemovedImageIDs = []
+        editorRemovedTaggedFileIDs = []
         editorMode = mode
     }
 
@@ -199,7 +236,9 @@ struct AgentScheduledSendBanner: View {
                 props.id,
                 editorText,
                 editorNotBefore,
-                editorRunAlongside
+                editorRunAlongside,
+                editorRemovedImageIDs,
+                editorRemovedTaggedFileIDs
             )
             isActionInFlight = false
             actionError = error

@@ -363,7 +363,9 @@ struct AgentScheduledSendActions {
         _ scheduleID: UUID,
         _ text: String,
         _ notBefore: Date,
-        _ runAlongsideOtherSessions: Bool
+        _ runAlongsideOtherSessions: Bool,
+        _ removingImageAttachmentIDs: Set<UUID>,
+        _ removingTaggedFileAttachmentIDs: Set<UUID>
     ) async -> String?
     let cancel: (_ tabID: UUID, _ scheduleID: UUID) async -> String?
     let sendNow: (

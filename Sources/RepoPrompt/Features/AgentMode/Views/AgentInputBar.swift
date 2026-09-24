@@ -209,13 +209,22 @@ struct AgentInputBar: View {
                         claim: claim
                     )
                 },
-                update: { tabID, scheduleID, text, notBefore, runAlongsideOtherSessions in
+                update: {
+                    tabID,
+                    scheduleID,
+                    text,
+                    notBefore,
+                    runAlongsideOtherSessions,
+                    removingImageAttachmentIDs,
+                    removingTaggedFileAttachmentIDs in
                     await agentModeVM.updateScheduledSend(
                         tabID: tabID,
                         scheduleID: scheduleID,
                         text: text,
                         notBefore: notBefore,
-                        runAlongsideOtherSessions: runAlongsideOtherSessions
+                        runAlongsideOtherSessions: runAlongsideOtherSessions,
+                        removingImageAttachmentIDs: removingImageAttachmentIDs,
+                        removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs
                     )
                 },
                 cancel: { tabID, scheduleID in
@@ -947,22 +956,10 @@ struct AgentComposerView: View, Equatable {
                     transaction.animation = nil
                 }
 
-                if let cancelTarget = props.cancelTarget {
-                    CancelButton(action: { cancelRun(cancelTarget) })
-                    ScheduleSendMenuButton(
-                        isEnabled: canScheduleToRenderedTarget,
-                        isNewSessionStart: isNewSessionScheduleTarget,
-                        hasExistingScheduledSend: renderedScheduledSend != nil,
-                        isDetached: true,
-                        onSchedule: { notBefore, runAlongsideOtherSessions in
-                            scheduleMessage(
-                                notBefore: notBefore,
-                                runAlongsideOtherSessions: runAlongsideOtherSessions
-                            )
-                        }
-                    )
-                } else {
-                    HStack(spacing: 0) {
+                HStack(spacing: props.cancelTarget == nil ? 0 : 8) {
+                    if let cancelTarget = props.cancelTarget {
+                        CancelButton(action: { cancelRun(cancelTarget) })
+                    } else {
                         SendOrResendButton(
                             inputText: localInputText,
                             hasMessages: false, // Disable resend in agent mode - just show greyed send button
@@ -976,28 +973,35 @@ struct AgentComposerView: View, Equatable {
 
                         Divider()
                             .frame(height: 24)
-
-                        ScheduleSendMenuButton(
-                            isEnabled: canScheduleToRenderedTarget,
-                            isNewSessionStart: isNewSessionScheduleTarget,
-                            hasExistingScheduledSend: renderedScheduledSend != nil,
-                            isDetached: false,
-                            onSchedule: { notBefore, runAlongsideOtherSessions in
-                                scheduleMessage(
-                                    notBefore: notBefore,
-                                    runAlongsideOtherSessions: runAlongsideOtherSessions
-                                )
-                            }
-                        )
                     }
-                    .background(Color.secondary.opacity(0.035), in: Capsule())
-                    .overlay(
+
+                    ScheduleSendMenuButton(
+                        isEnabled: canScheduleToRenderedTarget,
+                        isNewSessionStart: isNewSessionScheduleTarget,
+                        hasExistingScheduledSend: renderedScheduledSend != nil,
+                        isDetached: props.cancelTarget != nil,
+                        onSchedule: { notBefore, runAlongsideOtherSessions in
+                            scheduleMessage(
+                                notBefore: notBefore,
+                                runAlongsideOtherSessions: runAlongsideOtherSessions
+                            )
+                        }
+                    )
+                }
+                .background {
+                    if props.cancelTarget == nil {
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.035))
+                    }
+                }
+                .overlay {
+                    if props.cancelTarget == nil {
                         Capsule()
                             .stroke(Color.secondary.opacity(0.1), lineWidth: 0.5)
-                    )
-                    .transaction { transaction in
-                        transaction.animation = nil
                     }
+                }
+                .transaction { transaction in
+                    transaction.animation = nil
                 }
             }
             .fixedSize(horizontal: true, vertical: false)

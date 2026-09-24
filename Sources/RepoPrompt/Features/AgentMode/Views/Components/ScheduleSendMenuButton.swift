@@ -34,6 +34,8 @@ struct ScheduleSendMenuButton: View {
     let onSchedule: (_ notBefore: Date, _ runAlongsideOtherSessions: Bool) -> Void
 
     @State private var runAlongsideOtherSessions = false
+    @State private var isCustomPickerPresented = false
+    @State private var customStepCount = AgentScheduledSendTiming.customStepCountRange.lowerBound
 
     private let quickPicks: [QuickPick] = [
         QuickPick(title: "15 minutes", delay: 15 * 60),
@@ -60,6 +62,13 @@ struct ScheduleSendMenuButton: View {
                     Text("\(pick.title)  →  \(AgentScheduledSendDateFormatting.time(Date().addingTimeInterval(pick.delay)))")
                 }
             }
+
+            Divider()
+
+            Button("Custom…") {
+                customStepCount = AgentScheduledSendTiming.customStepCountRange.lowerBound
+                isCustomPickerPresented = true
+            }
         } label: {
             HStack(spacing: 3) {
                 Image(systemName: "clock")
@@ -80,6 +89,71 @@ struct ScheduleSendMenuButton: View {
         .opacity(isEnabled ? 1 : 0.55)
         .hoverTooltip(tooltip)
         .accessibilityLabel("Schedule message")
+        .popover(isPresented: $isCustomPickerPresented) {
+            customPicker
+        }
+    }
+
+    private var customPicker: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            customPickerContent(now: timeline.date)
+        }
+    }
+
+    private func customPickerContent(now: Date) -> some View {
+        let notBefore = AgentScheduledSendTiming.customNotBefore(
+            stepCount: customStepCount,
+            now: now
+        )
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("Schedule message")
+                .font(.headline)
+
+            Stepper(
+                customDelayText,
+                value: $customStepCount,
+                in: AgentScheduledSendTiming.customStepCountRange
+            )
+
+            Text(AgentScheduledSendDateFormatting.dateAndTime(notBefore))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            if isNewSessionStart {
+                Toggle("Run alongside other sessions", isOn: $runAlongsideOtherSessions)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") {
+                    isCustomPickerPresented = false
+                }
+                Button("Schedule") {
+                    onSchedule(
+                        notBefore,
+                        isNewSessionStart && runAlongsideOtherSessions
+                    )
+                    isCustomPickerPresented = false
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!isEnabled)
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+    }
+
+    private var customDelayText: String {
+        let minutes = AgentScheduledSendTiming.customDelayMinutes(stepCount: customStepCount)
+        if minutes < 60 {
+            return "Delay: \(minutes) minutes"
+        }
+        let hours = minutes / 60
+        let remainingMinutes = minutes % 60
+        if remainingMinutes == 0 {
+            return "Delay: \(hours) \(hours == 1 ? "hour" : "hours")"
+        }
+        return "Delay: \(hours)h \(remainingMinutes)m"
     }
 
     private var tooltip: String {

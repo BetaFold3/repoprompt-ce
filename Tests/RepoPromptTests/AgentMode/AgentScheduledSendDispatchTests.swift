@@ -74,6 +74,235 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertNil(afterCancel.lastScheduledDispatch)
     }
 
+    func testTimingBoundariesAndCustomStepperUseFifteenMinuteStepsThroughTwentyFourHours() {
+        let now = Date(timeIntervalSince1970: 10000)
+
+        XCTAssertEqual(AgentScheduledSendTiming.customStepCountRange, 1 ... 96)
+        XCTAssertEqual(AgentScheduledSendTiming.customDelay(stepCount: 0), 15 * 60)
+        XCTAssertEqual(AgentScheduledSendTiming.customDelay(stepCount: 2), 30 * 60)
+        XCTAssertEqual(AgentScheduledSendTiming.customDelay(stepCount: 96), 24 * 60 * 60)
+        XCTAssertEqual(AgentScheduledSendTiming.customDelay(stepCount: 97), 24 * 60 * 60)
+        XCTAssertEqual(AgentScheduledSendTiming.customDelayMinutes(stepCount: 2), 30)
+        XCTAssertEqual(AgentScheduledSendTiming.customDelayMinutes(stepCount: 96), 24 * 60)
+        XCTAssertEqual(
+            AgentScheduledSendTiming.customNotBefore(stepCount: 3, now: now),
+            now.addingTimeInterval(45 * 60)
+        )
+        let refreshedNow = now.addingTimeInterval(20 * 60)
+        XCTAssertEqual(
+            AgentScheduledSendTiming.customNotBefore(stepCount: 1, now: refreshedNow),
+            refreshedNow.addingTimeInterval(AgentScheduledSendTiming.step)
+        )
+
+        XCTAssertNil(
+            AgentScheduledSendTiming.validationMessage(
+                for: now.addingTimeInterval(-AgentScheduledSendTiming.pastGraceInterval),
+                now: now
+            )
+        )
+        XCTAssertNotNil(
+            AgentScheduledSendTiming.validationMessage(
+                for: now.addingTimeInterval(-AgentScheduledSendTiming.pastGraceInterval - 0.001),
+                now: now
+            )
+        )
+        XCTAssertNil(
+            AgentScheduledSendTiming.validationMessage(
+                for: now.addingTimeInterval(AgentScheduledSendTiming.maxDelay),
+                now: now
+            )
+        )
+        XCTAssertNotNil(
+            AgentScheduledSendTiming.validationMessage(
+                for: now.addingTimeInterval(AgentScheduledSendTiming.maxDelay + 0.001),
+                now: now
+            )
+        )
+
+        let originalPastDeadline = now.addingTimeInterval(-3600)
+        let range = AgentScheduledSendTiming.editorRange(
+            originalNotBefore: originalPastDeadline,
+            now: now
+        )
+        XCTAssertEqual(range.lowerBound, originalPastDeadline)
+        XCTAssertEqual(range.upperBound, now.addingTimeInterval(AgentScheduledSendTiming.maxDelay))
+        XCTAssertTrue(range.contains(originalPastDeadline))
+    }
+
+    func testAttachmentRemovalCommitsCanonicalSubsetCleansOnlyUnretainedFilesAndCannotRestoreFromStaleEditor() async throws {
+        let harness = try await makeHarness(windowID: 4376)
+        let removedURL = try makeManagedAttachmentFile(in: harness.storageURL, name: "removed.png")
+        let sharedURL = try makeManagedAttachmentFile(in: harness.storageURL, name: "shared.png")
+        let retainedURL = try makeManagedAttachmentFile(in: harness.storageURL, name: "retained.png")
+        let removed = AgentImageAttachment(source: .localFile(path: removedURL.path))
+        let sharedRemoved = AgentImageAttachment(source: .localFile(path: sharedURL.path))
+        let sharedRetained = AgentImageAttachment(source: .localFile(path: sharedURL.path))
+        let retained = AgentImageAttachment(source: .localFile(path: retainedURL.path))
+        let removedTag = AgentTaggedFileAttachment(relativePath: "Removed.swift", displayName: "Removed.swift")
+        let retainedTag = AgentTaggedFileAttachment(relativePath: "Retained.swift", displayName: "Retained.swift")
+        harness.session.pendingImageAttachments = [removed, sharedRemoved, sharedRetained, retained]
+        harness.session.pendingTaggedFileAttachments = [removedTag, retainedTag]
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "Keep the canonical subset",
+            on: harness.session,
+            notBefore: Date().addingTimeInterval(1800),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+
+        let error = await harness.viewModel.updateScheduledSend(
+            tabID: harness.tabID,
+            scheduleID: scheduleID,
+            text: "Keep the canonical subset",
+            notBefore: Date().addingTimeInterval(3600),
+            runAlongsideOtherSessions: false,
+            removingImageAttachmentIDs: [removed.id, sharedRemoved.id],
+            removingTaggedFileAttachmentIDs: [removedTag.id]
+        )
+        XCTAssertNil(error)
+        var persistedSession = try await harness.persistedSession()
+        var persisted = try XCTUnwrap(persistedSession.scheduledSend?.persistedValue)
+        XCTAssertEqual(persisted.attachments.map(\.id), [sharedRetained.id, retained.id])
+        XCTAssertEqual(persisted.taggedFileAttachments.map(\.id), [retainedTag.id])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: removedURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sharedURL.path), "A retained attachment still shares this managed file")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: retainedURL.path))
+
+        let staleEditorError = await harness.viewModel.updateScheduledSend(
+            tabID: harness.tabID,
+            scheduleID: scheduleID,
+            text: "Stale editor save",
+            notBefore: Date().addingTimeInterval(5400),
+            runAlongsideOtherSessions: false,
+            removingImageAttachmentIDs: [removed.id],
+            removingTaggedFileAttachmentIDs: [retainedTag.id]
+        )
+        XCTAssertNil(staleEditorError)
+        persistedSession = try await harness.persistedSession()
+        persisted = try XCTUnwrap(persistedSession.scheduledSend?.persistedValue)
+        XCTAssertEqual(persisted.attachments.map(\.id), [sharedRetained.id, retained.id])
+        XCTAssertTrue(persisted.taggedFileAttachments.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: removedURL.path), "A stale editor cannot restore a removed attachment")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sharedURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: retainedURL.path))
+    }
+
+    func testStaleAttachmentRemovalSavePreservesManagedFilesAndDurableRecord() async throws {
+        let harness = try await makeHarness(windowID: 4377)
+        let attachmentURL = try makeManagedAttachmentFile(in: harness.storageURL, name: "stale-save.png")
+        let attachment = AgentImageAttachment(source: .localFile(path: attachmentURL.path))
+        let taggedFile = AgentTaggedFileAttachment(relativePath: "Keep.swift", displayName: "Keep.swift")
+        harness.session.pendingImageAttachments = [attachment]
+        harness.session.pendingTaggedFileAttachments = [taggedFile]
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "Original",
+            on: harness.session,
+            notBefore: Date().addingTimeInterval(1800),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let persistedBeforePeerEdit = try await harness.persistedSession()
+        var peerRecord = try XCTUnwrap(persistedBeforePeerEdit.scheduledSend?.persistedValue)
+        let originalUpdatedAt = peerRecord.updatedAt
+        peerRecord.rawText = "Peer revision"
+        peerRecord.updatedAt = originalUpdatedAt.addingTimeInterval(1)
+        _ = try await harness.viewModel.test_dataService.mutateScheduledSend(
+            sessionID: sessionID,
+            for: harness.workspace,
+            mutation: .upsert(expectedUpdatedAt: originalUpdatedAt, value: peerRecord)
+        )
+
+        let error = await harness.viewModel.updateScheduledSend(
+            tabID: harness.tabID,
+            scheduleID: scheduleID,
+            text: "Stale local revision",
+            notBefore: Date().addingTimeInterval(3600),
+            runAlongsideOtherSessions: false,
+            removingImageAttachmentIDs: [attachment.id],
+            removingTaggedFileAttachmentIDs: [taggedFile.id]
+        )
+        XCTAssertNotNil(error)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachmentURL.path))
+        let persistedSession = try await harness.persistedSession()
+        let persisted = try XCTUnwrap(persistedSession.scheduledSend?.persistedValue)
+        XCTAssertEqual(persisted.rawText, "Peer revision")
+        XCTAssertEqual(persisted.attachments.map(\.id), [attachment.id])
+        XCTAssertEqual(persisted.taggedFileAttachments.map(\.id), [taggedFile.id])
+    }
+
+    func testRemovingLastAttachmentsRejectsEmptyEditedMessageWithoutMutationOrCleanup() async throws {
+        let harness = try await makeHarness(windowID: 4378)
+        let attachmentURL = try makeManagedAttachmentFile(in: harness.storageURL, name: "only.png")
+        let attachment = AgentImageAttachment(source: .localFile(path: attachmentURL.path))
+        let taggedFile = AgentTaggedFileAttachment(relativePath: "Only.swift", displayName: "Only.swift")
+        harness.session.pendingImageAttachments = [attachment]
+        harness.session.pendingTaggedFileAttachments = [taggedFile]
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "",
+            on: harness.session,
+            notBefore: Date().addingTimeInterval(1800),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+
+        let error = await harness.viewModel.updateScheduledSend(
+            tabID: harness.tabID,
+            scheduleID: scheduleID,
+            text: "   \n",
+            notBefore: Date().addingTimeInterval(3600),
+            runAlongsideOtherSessions: false,
+            removingImageAttachmentIDs: [attachment.id],
+            removingTaggedFileAttachmentIDs: [taggedFile.id]
+        )
+        XCTAssertNotNil(error)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: attachmentURL.path))
+        let persistedSession = try await harness.persistedSession()
+        let persisted = try XCTUnwrap(persistedSession.scheduledSend?.persistedValue)
+        XCTAssertEqual(persisted.attachments.map(\.id), [attachment.id])
+        XCTAssertEqual(persisted.taggedFileAttachments.map(\.id), [taggedFile.id])
+    }
+
+    func testDashboardRoutesAttachmentRemovalThroughDurableUpdate() async throws {
+        let harness = try await makeHarness(windowID: 4379)
+        harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)
+        let coordinator = AgentScheduledSendCoordinator()
+        harness.viewModel.attachScheduledSendCoordinator(coordinator)
+        let attachmentURL = try makeManagedAttachmentFile(in: harness.storageURL, name: "dashboard.png")
+        let attachment = AgentImageAttachment(source: .localFile(path: attachmentURL.path))
+        let taggedFile = AgentTaggedFileAttachment(relativePath: "Dashboard.swift", displayName: "Dashboard.swift")
+        harness.session.pendingImageAttachments = [attachment]
+        harness.session.pendingTaggedFileAttachments = [taggedFile]
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "Dashboard edit",
+            on: harness.session,
+            notBefore: Date().addingTimeInterval(1800),
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        let dashboard = AgentScheduledMessagesViewModel(
+            agentModeVM: harness.viewModel,
+            metadataRecords: { _ in [] }
+        )
+        await dashboard.reload()
+        let row = try XCTUnwrap(dashboard.rows.first { $0.props?.id == scheduleID })
+
+        let error = await dashboard.update(
+            row,
+            text: "Dashboard edit",
+            notBefore: Date().addingTimeInterval(3600),
+            runAlongsideOtherSessions: false,
+            removingImageAttachmentIDs: [attachment.id],
+            removingTaggedFileAttachmentIDs: [taggedFile.id]
+        )
+        XCTAssertNil(error)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: attachmentURL.path))
+        let persistedSession = try await harness.persistedSession()
+        let persisted = try XCTUnwrap(persistedSession.scheduledSend?.persistedValue)
+        XCTAssertTrue(persisted.attachments.isEmpty)
+        XCTAssertTrue(persisted.taggedFileAttachments.isEmpty)
+    }
+
     func testDashboardRowRoutesEditRescheduleAndCancelThroughDurableActions() async throws {
         let harness = try await makeHarness(windowID: 4302)
         harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)

@@ -53,14 +53,35 @@ enum AgentScheduledSendTiming {
     static let step: TimeInterval = 15 * 60
     static let maxDelay: TimeInterval = 24 * 60 * 60
     static let quickPickOffsets: [TimeInterval] = [15 * 60, 30 * 60, 60 * 60, 2 * 60 * 60, 4 * 60 * 60]
+    static let customStepCountRange = 1 ... Int(maxDelay / step)
     /// Tolerance for edits made a few seconds before the picked time elapses.
     static let pastGraceInterval: TimeInterval = 60
+
+    static func customDelay(stepCount: Int) -> TimeInterval {
+        let clampedStepCount = min(
+            max(stepCount, customStepCountRange.lowerBound),
+            customStepCountRange.upperBound
+        )
+        return TimeInterval(clampedStepCount) * step
+    }
+
+    static func customDelayMinutes(stepCount: Int) -> Int {
+        Int(customDelay(stepCount: stepCount) / 60)
+    }
+
+    static func customNotBefore(stepCount: Int, now: Date = Date()) -> Date {
+        now.addingTimeInterval(customDelay(stepCount: stepCount))
+    }
+
+    static func editorRange(originalNotBefore: Date, now: Date = Date()) -> ClosedRange<Date> {
+        min(originalNotBefore, now) ... max(originalNotBefore, now.addingTimeInterval(maxDelay))
+    }
 
     static func validationMessage(for notBefore: Date, now: Date = Date()) -> String? {
         if notBefore < now.addingTimeInterval(-pastGraceInterval) {
             return "Choose a time in the future for the scheduled message."
         }
-        if notBefore > now.addingTimeInterval(maxDelay + step) {
+        if notBefore > now.addingTimeInterval(maxDelay) {
             return "Scheduled messages can be delayed by at most 24 hours."
         }
         return nil
@@ -713,7 +734,9 @@ extension AgentModeViewModel {
         scheduleID: UUID,
         text: String,
         notBefore: Date,
-        runAlongsideOtherSessions: Bool
+        runAlongsideOtherSessions: Bool,
+        removingImageAttachmentIDs: Set<UUID> = [],
+        removingTaggedFileAttachmentIDs: Set<UUID> = []
     ) async -> String? {
         guard let session = sessions[tabID] else { return Self.scheduledSendMissingMessage }
         let token = session.activeAgentSessionID.flatMap { sessionID in
@@ -728,7 +751,13 @@ extension AgentModeViewModel {
                 return Self.scheduledSendDispatchingMessage
             }
             let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedText.isEmpty || !record.attachments.isEmpty || !record.taggedFileAttachments.isEmpty else {
+            let retainedAttachments = record.attachments.filter {
+                !removingImageAttachmentIDs.contains($0.id)
+            }
+            let retainedTaggedFiles = record.taggedFileAttachments.filter {
+                !removingTaggedFileAttachmentIDs.contains($0.id)
+            }
+            guard !trimmedText.isEmpty || !retainedAttachments.isEmpty || !retainedTaggedFiles.isEmpty else {
                 return "Type a message or keep an attachment before saving the scheduled message."
             }
             if let timingMessage = AgentScheduledSendTiming.validationMessage(for: notBefore) {
@@ -737,8 +766,13 @@ extension AgentModeViewModel {
             guard resolvedNativeSlashCommand(in: trimmedText, session: session) == nil else {
                 return "Native slash commands can't be scheduled. Send them directly instead."
             }
+            let removedAttachments = record.attachments.filter {
+                removingImageAttachmentIDs.contains($0.id)
+            }
             var updated = record
             updated.rawText = trimmedText
+            updated.attachments = retainedAttachments
+            updated.taggedFileAttachments = retainedTaggedFiles
             updated.notBefore = notBefore
             updated.runAlongsideOtherSessions = runAlongsideOtherSessions
             updated.state = .scheduled
@@ -749,6 +783,14 @@ extension AgentModeViewModel {
             if let message = await commitScheduledSendChange(updated, previous: record, session: session) {
                 return message
             }
+            clearScheduledSendAttachmentFiles(
+                removedAttachments.filter { removed in
+                    !retainedAttachments.contains { retained in
+                        Self.scheduledAttachmentLocalPath(retained)
+                            == Self.scheduledAttachmentLocalPath(removed)
+                    }
+                }
+            )
             if let token,
                scheduledSendCoordinator?.completeUserSupersession(token, committedRevision: session.scheduledSendPersistedUpdatedAt) == false
             {
@@ -1321,6 +1363,11 @@ extension AgentModeViewModel {
               let workspaceDirectory = attachmentWorkspaceDirectoryProvider()?.standardizedFileURL
         else { return }
         attachmentStore.clearConsumedLocalFiles(attachments, workspaceDirectory: workspaceDirectory)
+    }
+
+    private static func scheduledAttachmentLocalPath(_ attachment: AgentImageAttachment) -> String? {
+        guard case let .localFile(path) = attachment.source else { return nil }
+        return URL(fileURLWithPath: path).standardizedFileURL.path
     }
 
     private func removeUnsentScheduledUserItem(id itemID: UUID, from session: TabSession) {

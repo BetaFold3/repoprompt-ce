@@ -135,12 +135,20 @@ struct AgentScheduledMessagesView: View {
             executeSchedule: { _, _, _, _ in
                 .blocked(message: "Schedule from the composer instead.")
             },
-            update: { _, _, text, notBefore, runAlongside in
+            update: {
+                _, _,
+                text,
+                notBefore,
+                runAlongside,
+                removingImageAttachmentIDs,
+                removingTaggedFileAttachmentIDs in
                 await model.update(
                     row,
                     text: text,
                     notBefore: notBefore,
-                    runAlongsideOtherSessions: runAlongside
+                    runAlongsideOtherSessions: runAlongside,
+                    removingImageAttachmentIDs: removingImageAttachmentIDs,
+                    removingTaggedFileAttachmentIDs: removingTaggedFileAttachmentIDs
                 )
             },
             cancel: { _, _ in await model.cancel(row) },
