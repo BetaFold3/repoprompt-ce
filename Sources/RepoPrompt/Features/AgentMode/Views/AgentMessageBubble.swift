@@ -385,9 +385,26 @@ struct AgentMessageBubble: View {
                 .cornerRadius(20)
                 .opacity(item.isUndeliveredRemoteSend ? 0.65 : 1)
 
+                if let scheduledSend = item.scheduledSend {
+                    scheduledSendMarker(scheduledSend)
+                }
+
                 MessageFooterStrip(text: item.text, timestamp: item.timestamp, isTrailing: true, handoffConfig: handoffConfig, hasHandoffButton: handoffConfig != nil)
             }
         }
+    }
+
+    private func scheduledSendMarker(_ provenance: AgentScheduledSendProvenance) -> some View {
+        Label {
+            Text(
+                "Scheduled for \(AgentScheduledSendDateFormatting.dateAndTime(provenance.scheduledFor)) · "
+                    + "Sent \(AgentScheduledSendDateFormatting.dateAndTime(provenance.sentAt))"
+            )
+        } icon: {
+            Image(systemName: "clock")
+        }
+        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+        .foregroundStyle(.secondary.opacity(0.75))
     }
 
     private func codexGoalModeBadge(_ metadata: AgentCodexGoalModeMetadata, hasWorkflow: Bool) -> some View {

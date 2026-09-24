@@ -1921,6 +1921,15 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
                 members["providerUsage"] = rawProviderUsageMember
                 try JSONSerialization.data(withJSONObject: members, options: [.sortedKeys]).write(to: fileURL)
             }
+            // The tab becomes the owner of the seeded incarnation through one gate-held paired
+            // load (transcript, schedule projection, and persistence state together), which is what
+            // authorizes this tab's later saves over the seeded file. Runtime usage accounting is
+            // deliberately left untouched: these tests exercise controller-before-hydration paths and
+            // apply the usage hydration explicitly through `test_applyPersistedHydration`.
+            let adopted = await viewModel.test_adoptPersistedIncarnation(tabID: tabID)
+            XCTAssertTrue(adopted, "paired adoption establishes ownership of the seeded incarnation")
+            XCTAssertNotNil(session.persistenceState(for: sessionID))
+            XCTAssertNil(session.usageAccounting, "ownership adoption never installs usage accounting")
             return try await reloadPersistedSession()
         }
 
@@ -2005,7 +2014,7 @@ final class AgentUsageRuntimeIntegrationTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in LifecycleNoopCodexController(recorder: recorder) }
         )
         viewModel.test_setSidebarAutoArchiveDependencies(promptManager: prompt, workspaceManager: workspaceManager)
-        viewModel.test_setActiveWorkspaceIDForSessionIndex(workspace.id)
+        viewModel.test_establishPersistenceWorkspace(workspace)
         viewModel.test_setCurrentTabIDOverride(tabID)
 
         let session = AgentModeViewModel.TabSession(tabID: tabID)

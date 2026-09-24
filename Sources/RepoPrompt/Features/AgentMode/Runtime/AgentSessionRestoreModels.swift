@@ -24,6 +24,9 @@ struct AgentSessionIndexEntry: Identifiable, Equatable {
     var profile: AgentSessionProfile = .standard
     var worktreeBindingSummaries: [AgentSessionWorktreeBindingSummary]
     var activeWorktreeMergeSummaries: [AgentSessionWorktreeMergeSummary]
+    /// Pending scheduled-send discovery hint. Counts as conversation content for sidebar
+    /// visibility and titling; the coordinator revalidates it against the hydrated record.
+    var scheduledSendSummary: AgentSessionScheduledSendSummary?
 }
 
 struct AgentSessionSidebarBuildRequest {
@@ -72,6 +75,9 @@ struct AgentSessionHydrationRequest {
 struct AgentSessionHydrationPayload {
     let sessionID: UUID
     let persistedSession: AgentSession
+    /// Service-issued lifetime/reset state issued by the same gate-held load that produced
+    /// `persistedSession`; the owner adopts both together.
+    let persistenceState: AgentSessionPersistenceState
     let canonicalLiveItems: [AgentChatItem]
     let transcript: AgentTranscript
     let builtPresentation: AgentModeViewModel.BuiltTranscriptPresentation

@@ -73,7 +73,10 @@ struct AgentModeSidebarSessionBuilder {
     }
 
     static func sessionIndexEntryHasConversationContent(_ entry: AgentSessionIndexEntry) -> Bool {
-        entry.itemCount > 0 || entry.lastUserMessageAt != nil || entry.hasUnknownConversationContent
+        entry.itemCount > 0
+            || entry.lastUserMessageAt != nil
+            || entry.hasUnknownConversationContent
+            || entry.scheduledSendSummary != nil
     }
 
     private func makeBuildContext() -> BuildContext {
@@ -253,7 +256,8 @@ struct AgentModeSidebarSessionBuilder {
             origin: entry.origin,
             profile: entry.profile,
             worktreeBindingSummaries: entry.worktreeBindingSummaries,
-            activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries
+            activeWorktreeMergeSummaries: entry.activeWorktreeMergeSummaries,
+            scheduledSendSummary: entry.scheduledSendSummary
         )
     }
 
@@ -424,7 +428,8 @@ struct AgentModeSidebarSessionBuilder {
         }
         let hasTranscript = liveSession?.items.isEmpty == false
         let hasSentUserMessage = context.sortDateByTabID[tab.id] != nil
-        return (!hasTranscript && !hasSentUserMessage)
+        let hasScheduledSend = liveSession?.scheduledSend != nil
+        return (!hasTranscript && !hasSentUserMessage && !hasScheduledSend)
             ? emptySidebarTitle(named: context.tabNameByID[tab.id])
             : (context.tabNameByID[tab.id] ?? Self.normalizedSessionTitle(nil))
     }
@@ -439,7 +444,8 @@ struct AgentModeSidebarSessionBuilder {
         }
         let hasTranscript = (liveSession?.items.isEmpty == false) || entry.itemCount > 0
         let hasSentUserMessage = entry.lastUserMessageAt != nil
-        if !hasTranscript, !hasSentUserMessage, !entry.hasUnknownConversationContent {
+        let hasScheduledSend = liveSession?.scheduledSend != nil || entry.scheduledSendSummary != nil
+        if !hasTranscript, !hasSentUserMessage, !entry.hasUnknownConversationContent, !hasScheduledSend {
             return emptySidebarTitle(named: entry.name)
         }
         return Self.normalizedSessionTitle(entry.name)

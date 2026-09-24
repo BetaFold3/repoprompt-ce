@@ -22,7 +22,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     func testSyncPublishesTheActiveTabsPanelState() async throws {
         let viewModel = try makeViewModel()
         let tabID = id(1)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -41,8 +41,8 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
         let viewModel = try makeViewModel()
         let firstTabID = id(1)
         let secondTabID = id(2)
-        _ = await viewModel.ensureSessionReady(tabID: firstTabID)
-        _ = await viewModel.ensureSessionReady(tabID: secondTabID)
+        _ = try await viewModel.ensureSessionReady(tabID: firstTabID)
+        _ = try await viewModel.ensureSessionReady(tabID: secondTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
         viewModel.test_setCurrentTabIDOverride(firstTabID)
@@ -72,8 +72,8 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
         let viewModel = try makeViewModel()
         let activeTabID = id(1)
         let backgroundTabID = id(2)
-        _ = await viewModel.ensureSessionReady(tabID: activeTabID)
-        let backgroundSession = await viewModel.ensureSessionReady(tabID: backgroundTabID)
+        _ = try await viewModel.ensureSessionReady(tabID: activeTabID)
+        let backgroundSession = try await viewModel.ensureSessionReady(tabID: backgroundTabID)
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
         viewModel.syncUtilityPanelUIState()
@@ -93,7 +93,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     func testExpansionTogglesReportWhetherTheFileOpened() async throws {
         let viewModel = try makeViewModel()
         let tabID = id(1)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -109,7 +109,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     func testContextEscalationReturnsTheLevelToRequestFromTheDiffEngine() async throws {
         let viewModel = try makeViewModel()
         let tabID = id(1)
-        _ = await viewModel.ensureSessionReady(tabID: tabID)
+        _ = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -122,7 +122,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     func testTheArtifactBannerDeepLinkOpensThePreviewSegmentOnThatDocument() async throws {
         let viewModel = try makeViewModel()
         let tabID = id(1)
-        _ = await viewModel.ensureSessionReady(tabID: tabID)
+        _ = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
         let document = PreviewDocumentReference(rootID: UUID(), relativePath: "docs/impl-report.md")
@@ -137,8 +137,8 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
         let viewModel = try makeViewModel()
         let firstTabID = id(1)
         let secondTabID = id(2)
-        _ = await viewModel.ensureSessionReady(tabID: firstTabID)
-        _ = await viewModel.ensureSessionReady(tabID: secondTabID)
+        _ = try await viewModel.ensureSessionReady(tabID: firstTabID)
+        _ = try await viewModel.ensureSessionReady(tabID: secondTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
         viewModel.test_setCurrentTabIDOverride(firstTabID)
@@ -154,7 +154,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     func testTheLastUsedBaseBranchIsRecalledPerRepository() async throws {
         let viewModel = try makeViewModel()
         let tabID = id(1)
-        _ = await viewModel.ensureSessionReady(tabID: tabID)
+        _ = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -167,7 +167,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     func testTheCompareSelectionReachesTheRepositoryLayerOnlyOnceABaseIsNamed() async throws {
         let viewModel = try makeViewModel()
         let tabID = id(1)
-        _ = await viewModel.ensureSessionReady(tabID: tabID)
+        _ = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -187,7 +187,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     func testAnUnchangedSnapshotDoesNotRepublish() async throws {
         let viewModel = try makeViewModel()
         let tabID = id(1)
-        _ = await viewModel.ensureSessionReady(tabID: tabID)
+        _ = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
         viewModel.syncUtilityPanelUIState()
@@ -207,7 +207,7 @@ final class AgentUtilityPanelUIStoreTests: XCTestCase {
     func testSelectingTheSegmentAlreadyShownDoesNotRepublish() async throws {
         let viewModel = try makeViewModel()
         let tabID = id(1)
-        _ = await viewModel.ensureSessionReady(tabID: tabID)
+        _ = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
         viewModel.syncUtilityPanelUIState()

@@ -77,7 +77,7 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await makeRegisteredSession(in: window)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -126,7 +126,7 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await makeRegisteredSession(in: window)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -165,7 +165,7 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await makeRegisteredSession(in: window)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -196,7 +196,7 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await makeRegisteredSession(in: window)
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -286,12 +286,33 @@ final class MCPRequestIdempotencyAgentRunServiceTests: XCTestCase {
         )
     }
 
+    private func makeRegisteredSession(
+        in window: WindowState
+    ) async throws -> AgentModeViewModel.TabSession {
+        await window.promptManager.createBlankComposeTab(createAgentSession: false)
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        return try await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
+    }
+
     private func makeWindow() async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Request Idempotency \(UUID().uuidString.prefix(8))",
+            repoPaths: [FileManager.default.currentDirectoryPath],
+            ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "mcpRequestIdempotencyAgentRunServiceTests"
+        )
+        let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+        window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         return window
     }
 

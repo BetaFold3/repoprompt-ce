@@ -120,7 +120,7 @@ final class RemoteAgentModeCoordinatorSubmitResponseWiringTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in SubmitResponseNoopCodexController() }
         )
         viewModel.test_setCurrentTabIDOverride(tabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try! await viewModel.ensureSessionReady(tabID: tabID)
         session.remoteHost = makeBinding()
         let coordinator = RemoteAgentModeCoordinator()
         coordinator.attach(viewModel: viewModel)

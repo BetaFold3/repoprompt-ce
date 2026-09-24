@@ -19,7 +19,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             fetchedAt: Date(timeIntervalSinceReferenceDate: 40)
         )))
         let fixture = try await makeFixture(store: store)
-        let localSession = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let localSession = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         localSession.remoteHost = binding(
             host: fixture.host,
             remoteSessionID: localRemoteID
@@ -354,7 +354,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             destinationSessionID: destinationRemoteSessionID,
             advertisedFeatures: [RemoteWireFeatures.forkSession, RemoteWireFeatures.getLogHostRowIDs]
         )
-        let sourceSession = fixture.viewModel.session(for: fixture.initialTabID)
+        let sourceSession = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         sourceSession.remoteHost = binding(host: fixture.host, remoteSessionID: sourceRemoteSessionID)
         let controller = try RemoteAgentSessionController(
             binding: XCTUnwrap(sourceSession.remoteHost),
@@ -449,7 +449,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             destinationSessionID: UUID().uuidString,
             advertisedFeatures: [RemoteWireFeatures.forkSession, RemoteWireFeatures.getLogHostRowIDs]
         )
-        let sourceSession = fixture.viewModel.session(for: fixture.initialTabID)
+        let sourceSession = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         sourceSession.remoteHost = binding(host: fixture.host, remoteSessionID: sourceRemoteSessionID)
         fixture.viewModel.test_resetRemoteCatalogLoadState(hostID: fixture.host.id)
         XCTAssertNil(
@@ -533,7 +533,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             fetchedAt: Date()
         )))
         let capable = try await makeFixture(store: capableStore, catalogProvider: { _ in catalog })
-        let capableSession = capable.viewModel.session(for: capable.initialTabID)
+        let capableSession = try await capable.viewModel.ensureSessionReady(tabID: capable.initialTabID)
         let capableConnection = HandoffRecordingConnection(
             sourceSessionID: UUID().uuidString,
             hostRowID: UUID(),
@@ -576,7 +576,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             fetchedAt: Date()
         )))
         let legacy = try await makeFixture(store: legacyStore, catalogProvider: { _ in catalog })
-        let legacySession = legacy.viewModel.session(for: legacy.initialTabID)
+        let legacySession = try await legacy.viewModel.ensureSessionReady(tabID: legacy.initialTabID)
         let legacyConnection = HandoffRecordingConnection(
             sourceSessionID: UUID().uuidString,
             hostRowID: UUID(),
@@ -666,7 +666,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testClosedWorkspaceSendFailureUsesSystemCopyAndResetsRunState() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.selectedAgent = .codexExec
         session.selectedModelRaw = "gpt-5.4"
@@ -701,7 +701,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testTransportSendFailureOffersLocalFallbackAndSubsequentLocalSendSucceeds() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         // Failed INITIAL start: the host never adopted a session for this run,
         // so falling back locally cannot orphan a still-running host session.
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
@@ -747,7 +747,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testTransportSteerFailureWithAdoptedRemoteSessionDoesNotOfferLocalFallback() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         // Adopted host session (non-empty remoteSessionID): a steer transport
         // failure does not mean the host run stopped, so "Run locally instead"
         // would create a dual-execution hazard and must not be offered.
@@ -825,7 +825,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testResendFailedInitialStartDispatchesExactlyOneStart() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.runState = .failed
         var userItem = AgentChatItem.user("Retry initial start", sequenceIndex: session.nextSequenceIndex)
@@ -858,7 +858,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testResendFailedInitialStartWithAdoptedBindingClearsWithoutDispatch() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.runState = .failed
         var userItem = AgentChatItem.user("Possibly delivered", sequenceIndex: session.nextSequenceIndex)
@@ -895,7 +895,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testAlreadyDeliveredResendReconcilesRunStateViaAttachCatchUp() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "remote-adopted-catch-up")
         session.runState = .failed
         var userItem = AgentChatItem.user("Delivered before retry", sequenceIndex: session.nextSequenceIndex)
@@ -946,7 +946,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testUndeliveredUserBubblePresentationExposesResendAction() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "remote-presentation")
         var undelivered = AgentChatItem.user("Failed")
         undelivered.isUndeliveredRemoteSend = true
@@ -989,7 +989,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testSubmitUserTurnFailureCapturesDispatchedProviderTextAndMarksUndelivered() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "remote-real-failure")
         session.hasSentFirstMessage = true
         session.runState = .running
@@ -1040,7 +1040,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testResendPickerSelectedStartPreservesStoredWindowAndWorkspaceTarget() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         let userItem = AgentChatItem.user("Retry picked target", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(userItem)
@@ -1089,7 +1089,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testNonTargetFailureAfterWindowSelectionStoresPickedTargetWithNilWorkspaceName() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         let userItem = AgentChatItem.user("Retry selected target", sequenceIndex: session.nextSequenceIndex)
         session.appendItem(userItem)
@@ -1137,7 +1137,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testTargetFailureReopensPickerAndTerminalSelectionClearsRecoveryState() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.runState = .failed
         var userItem = AgentChatItem.user("Retry target picker", sequenceIndex: session.nextSequenceIndex)
@@ -1202,7 +1202,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testWorkspaceMismatchWithWindowCandidatesReopensPickerAndClearsStoredTarget() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.runState = .failed
         var userItem = AgentChatItem.user("Retry mismatched workspace", sequenceIndex: session.nextSequenceIndex)
@@ -1255,7 +1255,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testBindingRequiredWithWindowCandidatesReopensPickerAndClearsStoredTarget() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.runState = .failed
         var userItem = AgentChatItem.user("Retry after binding failure", sequenceIndex: session.nextSequenceIndex)
@@ -1308,7 +1308,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testResendStartAttributionMismatchSteersAdoptedSession() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "remote-attributed")
         session.runState = .failed
         session.locallyAttributedStartItemID = UUID()
@@ -1348,7 +1348,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testResendFailureAfterOptimisticRemovalSilentlyDropsRecoveryState() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "remote-midflight")
         session.runState = .failed
         var userItem = AgentChatItem.user("Removed during resend", sequenceIndex: session.nextSequenceIndex)
@@ -1391,7 +1391,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testRemoteResendFailureAfterOwnerTeardownDoesNotMutateDetachedSession() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "remote-detached-resend")
         session.runState = .failed
         var userItem = AgentChatItem.user("Detached resend", sequenceIndex: session.nextSequenceIndex)
@@ -1437,7 +1437,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testRunLocallyFallbackClearsAllUndeliveredRemoteRecoveryState() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.locallyAttributedStartItemID = UUID()
         session.runState = .running
@@ -1524,7 +1524,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         let teardownFixture = try await makeFixture(
             store: StubWorkspaceSessionCatalogStore(state: .error("unused"))
         )
-        let teardownSession = await teardownFixture.viewModel.ensureSessionReady(
+        let teardownSession = try await teardownFixture.viewModel.ensureSessionReady(
             tabID: teardownFixture.initialTabID
         )
         let teardownItem = AgentChatItem.user("Teardown pending start")
@@ -1573,7 +1573,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testV40CrossTabPickerDisplacementFailsAndReleasesDisplacedSend() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let displacedSession = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let displacedSession = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         displacedSession.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         displacedSession.runState = .waitingForUser
         var displacedItem = AgentChatItem.user("Displaced start")
@@ -1683,7 +1683,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testV41SamePickerPairRepresentsWithoutFailureSideEffects() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.runState = .waitingForUser
         var userItem = AgentChatItem.user("Same picker pair")
@@ -1743,7 +1743,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: storageDirectory) }
         fixture.workspaceManager.activeWorkspace?.customStoragePath = storageDirectory
 
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         let connection = ResendRecordingConnection(startErrors: [Self.pickerError(windowID: 51)])
         let remoteHost = try XCTUnwrap(session.remoteHost)
@@ -2220,7 +2220,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
     @MainActor
     func testV44PickerRecoveryRetainsOriginalWorkspaceNameWithoutMixingSelectors() async throws {
         let fixture = try await makeFixture(store: StubWorkspaceSessionCatalogStore(state: .error("unused")))
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         var userItem = AgentChatItem.user("Recover workspace name")
         userItem.isUndeliveredRemoteSend = true
@@ -2310,7 +2310,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         userItemID: UUID,
         connection: ResendRecordingConnection
     ) {
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try! await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "")
         session.runState = .waitingForUser
 
@@ -2360,7 +2360,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
         fixture: Fixture,
         text: String
     ) async throws -> (session: AgentModeViewModel.TabSession, userItemID: UUID, connection: ResendRecordingConnection) {
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try! await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         session.remoteHost = binding(host: fixture.host, remoteSessionID: "remote-abc123")
         session.hasSentFirstMessage = true
         session.runState = .running
@@ -2480,7 +2480,7 @@ final class RemoteWorkspaceSidebarTests: XCTestCase {
             promptManager: prompt,
             workspaceManager: workspaceManager
         )
-        viewModel.test_setActiveWorkspaceIDForSessionIndex(workspace.id)
+        viewModel.test_establishPersistenceWorkspace(workspace)
         viewModel.test_setCurrentTabIDOverride(initialTabID)
 
         return Fixture(

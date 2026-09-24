@@ -7,7 +7,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testActiveThreadSnapshotCountsAsWatchdogLivenessAndReconcilesWaitingFlags() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: ["waiting_for_user_input"]))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let waitingStatus = "Codex reports it is waiting for user input…"
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("progress"), session: session)
@@ -25,7 +27,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testStructuredLivenessAdvancesLifecycleWithoutTranscriptRows() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let baselineItems = session.items
         let previousSequence = session.activeRunLiveness?.lastAcceptedSequence ?? 0
 
@@ -52,7 +56,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testUnmatchedCompletionOnlyWebResultPreservesArgsForPersistenceAndReplay() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let invocationID = UUID()
         let argsJSON = #"{"action":"find_in_page","url":"https://example.com/docs","pattern":"install"}"#
         let resultJSON = #"{"status":"completed","match_count":2}"#
@@ -90,7 +96,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testStructuredRetryAndMissingMetadataFallbackRemainActiveWithoutRows() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let baselineItems = session.items
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -126,7 +134,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testStructuredFailedCompletionUsesOneTerminalCommitAndPreservesTail() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let baselineDrainGeneration = session.providerTerminalDrainGeneration
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -173,7 +183,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testTurnCompletionCoalescesBufferedAssistantTailBeforeTerminalSeal() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let baselineDrainGeneration = session.providerTerminalDrainGeneration
         session.appendItem(.user("question", sequenceIndex: session.nextSequenceIndex))
         let commandInvocationID = UUID()
@@ -238,7 +250,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testTurnCompletionWaitsForLateAssistantCompletionBeforeTerminalCommit() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-final"
@@ -280,7 +294,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testAssistantCompletionBeforeTurnCompletionUsesFastTerminalPath() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-final"
@@ -313,7 +329,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testTurnCompletionSettleTimeoutCommitsPartialAssistantWithoutHanging() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-final"
@@ -346,7 +364,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testTurnStartedDuringAssistantSettleCommitsPendingTerminalBeforeNewTurn() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-final"
@@ -381,7 +401,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testDifferentTurnCompletionDuringAssistantSettleCommitsPendingTerminal() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-final"
@@ -427,7 +449,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testSettleScopeRejectsMatchingItemFromDifferentThread() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-final"
@@ -466,7 +490,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testInterruptedTurnCompletionBypassesAssistantSettle() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-final"
@@ -496,7 +522,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testCanonicalAssistantCompletionReconcilesNoDeltaExactPrefixUTF8DuplicateAndEmpty() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         let noDeltaScope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
@@ -580,7 +608,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testCanonicalAssistantCompletionFlushesEarlierPendingScopeFirst() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let firstScope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-first"
@@ -607,7 +637,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testCanonicalAssistantNonPrefixCompletionReplacesMappedRowAcrossToolBoundary() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-before-tool"
@@ -639,7 +671,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testCanonicalMCPResultOnlyDoesNotOverwriteDifferentInvocation() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let firstInvocationID = UUID()
         let resultOnlyInvocationID = UUID()
 
@@ -670,7 +704,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testMismatchedBashMirrorInvocationStillReconcilesRunningRow() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let startedInvocationID = UUID()
         let completedInvocationID = UUID()
         let argsJSON = #"{"command":"printf probe"}"#
@@ -708,7 +744,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testReasoningSealsEarlierPendingAssistantBeforeMaterializing() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let assistantScope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-before-reasoning"
@@ -755,7 +793,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testCanonicalReasoningCompletionMaterializesReplacesAndRemovesSegments() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "reasoning-item"
@@ -823,7 +863,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testCanonicalReasoningCompletionInsertsMissingLowerIndexBeforeStreamedRow() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "reasoning-partial"
@@ -866,7 +908,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testCancellationClearsCanonicalAssistantAndReasoningReconciliationState() {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let scope = CodexNativeSessionController.ItemScope(
             turnID: "turn",
             itemID: "assistant-item"
@@ -893,7 +937,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testTurnCompletionClearsEmptyScheduledAssistantFlushBeforeBarrier() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let baselineDrainGeneration = session.providerTerminalDrainGeneration
         session.appendItem(.user("question", sequenceIndex: session.nextSequenceIndex))
 
@@ -925,7 +971,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testStaleStructuredScopeIsIgnored() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let baselineItems = session.items
         let baselineLiveness = session.activeRunLiveness
 
@@ -948,7 +996,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testScopedErrorWithoutAuthoritativeIdentityFailsClosed() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.codexAuthoritativeActiveTurn = nil
         let baselineItems = session.items
         let baselineOwnership = session.activeRunOwnership
@@ -971,7 +1021,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testWatchdogPauseRemainsRunningAndDoesNotAppendTranscriptFailure() async throws {
         let controller = LivenessFakeCodexController(snapshot: .idle, activeTurnIDs: [])
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let baselineItems = session.items
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("progress"), session: session)
@@ -996,7 +1048,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             pendingTurnFailure: .init(message: "explicit watchdog error")
         )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
             .assistantDelta("progress"),
@@ -1021,7 +1075,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testPendingRequestUserInputSuppressesWatchdogAndPreservesQueue() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let pending = makeUserInputRequest(id: "pending")
         let queued = makeUserInputRequest(id: "queued")
         session.pendingUserInputRequest = pending
@@ -1042,8 +1098,8 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         let inactiveTabID = UUID()
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
-        _ = await viewModel.ensureSessionReady(tabID: activeTabID)
-        let session = await viewModel.ensureSessionReady(tabID: inactiveTabID)
+        _ = try await viewModel.ensureSessionReady(tabID: activeTabID)
+        let session = try await viewModel.ensureSessionReady(tabID: inactiveTabID)
         session.selectedAgent = .codexExec
         session.runState = .running
         let invocationID = UUID()
@@ -1068,7 +1124,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testStaleCompletionBeforeObservedStartPreservesPendingTurnThenMatchingTurnFinalizes() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let ownership = session.activeRunOwnership
         session.codexAuthoritativeActiveTurn = nil
         session.codexAnonymousActiveTurn = nil
@@ -1109,7 +1167,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testMismatchedNonNilCompletionAfterStartPreservesCurrentCorrelation() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let ownership = session.activeRunOwnership
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -1127,7 +1187,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testMismatchedStartCannotReplaceAuthoritativeIdentityAndDuplicateIsIdempotent() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let originalIdentity = session.codexAuthoritativeActiveTurn
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -1149,7 +1211,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testNilCompletionAfterIdentifiedStartCompletesCurrentTurn() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         // Accounting (review R2, OracleA P1#2): the identified turn is dispatched and bound, and the
         // nil-ID completion that legitimately terminates it must close the known accounting turn.
         enableCodexUsageAccounting(session)
@@ -1180,7 +1244,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testNilStartFollowedByNilCompletionCompletesAnonymousTurn() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.codexAuthoritativeActiveTurn = nil
         session.codexAnonymousActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
@@ -1219,7 +1285,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testNilCompletionWithoutObservedStartIsRejectedAndPreservesPendingTurn() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let ownership = session.activeRunOwnership
         session.codexAuthoritativeActiveTurn = nil
         session.codexAnonymousActiveTurn = nil
@@ -1261,7 +1329,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             startError: CodexTurnStartPreflightError.invalidInput("test fixture rejected before transport submission")
         )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.runState = .idle
         session.codexAuthoritativeActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
@@ -1308,7 +1378,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             startError: CodexAppServerClient.ClientError.requestFailed(rejection)
         )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.runState = .idle
         session.codexAuthoritativeActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
@@ -1351,7 +1423,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             startError: CancellationError()
         )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.runState = .idle
         session.codexAuthoritativeActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
@@ -1391,7 +1465,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             startError: CodexAppServerClient.ClientError.requestFailed(timeout)
         )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.runState = .idle
         session.codexAuthoritativeActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
@@ -1437,11 +1513,13 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
                 )
                 return drained
             }
-            let session = preparedCodexSession(
+            guard let session = preparedCodexSession(
                 in: viewModel,
                 controller: controller,
                 runID: harness.parentRunID
-            )
+            ) else {
+                return XCTFail("Expected the Codex test session to materialize")
+            }
             session.codexRoutingObservedTurnID = "routing-hint-only"
 
             let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
@@ -1478,7 +1556,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testActiveCodexNativeSendFailsWithoutSendingWhenAgentRunDrainFails() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller) { _, _ in false }
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
 
         let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
             session: session,
@@ -1498,7 +1578,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testInactiveCodexNativeSendStartsTurnWithoutInstallingLifecycleIdentity() async {
         let controller = LivenessFakeCodexController(snapshot: .idle, activeTurnIDs: [])
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.runState = .idle
         session.codexAuthoritativeActiveTurn = nil
         session.codexRoutingObservedTurnID = nil
@@ -1519,7 +1601,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testActiveCodexNativeSendWithoutExactIdentityQueuesWithoutStarting() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.codexAuthoritativeActiveTurn = nil
         session.codexRoutingObservedTurnID = "routing-only-turn"
 
@@ -1549,7 +1633,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             steerError: CodexTurnSteerError.noActiveTurn(failure)
         )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let identity = session.codexAuthoritativeActiveTurn
 
         let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
@@ -1578,7 +1664,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             steerError: CodexTurnSteerError.noActiveTurn(failure)
         )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         viewModel.storeDraftText(for: session.tabID, "restore me")
 
         let result = viewModel.submitUserTurn(text: "restore me", tabID: session.tabID)
@@ -1599,7 +1687,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             steerDelayNanos: 50_000_000
         )
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         let sendTask = Task {
             await viewModel.test_codexCoordinator.sendCodexNativeMessage(
                 session: session,
@@ -1629,7 +1719,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
     func testDispatchedCodexTurnEndingWithoutUsageIsUnmeasuredAcrossInterruptLateUsageAndShutdown() async throws {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
-        let session = preparedCodexSession(in: viewModel, controller: controller)
+        guard let session = preparedCodexSession(in: viewModel, controller: controller) else {
+            return XCTFail("Expected the Codex test session to materialize")
+        }
         session.installPersistentSessionBinding(.init(tabID: session.tabID, sessionID: UUID()))
         session.codexPricingProvider = OpenAIPricingStore.transient(
             transport: NoNetworkPricingTransport(),
@@ -1740,8 +1832,11 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         in viewModel: AgentModeViewModel,
         controller: LivenessFakeCodexController,
         runID: UUID = UUID()
-    ) -> AgentModeViewModel.TabSession {
-        let session = viewModel.session(for: UUID())
+    ) -> AgentModeViewModel.TabSession? {
+        guard let session = viewModel.session(for: UUID(), createIfNeeded: true) else {
+            XCTFail("Expected the Codex test session to materialize")
+            return nil
+        }
         session.selectedAgent = .codexExec
         session.runID = runID
         session.runState = .running

@@ -593,7 +593,9 @@ extension AgentSessionDataService {
             #if DEBUG
                 let loadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
-            guard let agentSession = try await loadAgentSession(
+            // Paired editable load: the transcript and the persistence state the owner will save
+            // under come from one gate-held read.
+            guard let editableLoad = try await loadAgentSessionForEditing(
                 id: request.sessionID,
                 for: request.workspace
             ) else {
@@ -605,6 +607,7 @@ extension AgentSessionDataService {
                 #endif
                 return nil
             }
+            let agentSession = editableLoad.session
             #if DEBUG
                 if let loadStartMS {
                     loadDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: loadStartMS)
@@ -705,6 +708,7 @@ extension AgentSessionDataService {
             return AgentSessionHydrationPayload(
                 sessionID: request.sessionID,
                 persistedSession: agentSession,
+                persistenceState: editableLoad.persistenceState,
                 canonicalLiveItems: canonicalLiveItems,
                 transcript: compactedTranscript,
                 builtPresentation: builtPresentation,

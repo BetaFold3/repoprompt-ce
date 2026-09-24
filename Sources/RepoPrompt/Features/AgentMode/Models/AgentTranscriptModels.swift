@@ -89,6 +89,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
+    public var scheduledSend: AgentScheduledSendProvenance?
     public var isLocalControlPlaneEcho: Bool?
     public var isUndeliveredRemoteSend: Bool?
     public var isStreaming: Bool
@@ -108,6 +109,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         taggedFileAttachments: [AgentTaggedFileAttachment] = [],
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
+        scheduledSend: AgentScheduledSendProvenance? = nil,
         isLocalControlPlaneEcho: Bool? = nil,
         isUndeliveredRemoteSend: Bool? = nil,
         isStreaming: Bool = false,
@@ -126,6 +128,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         self.taggedFileAttachments = taggedFileAttachments
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
+        self.scheduledSend = scheduledSend
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
         self.isUndeliveredRemoteSend = isUndeliveredRemoteSend
         self.isStreaming = isStreaming
@@ -146,6 +149,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
         taggedFileAttachments = item.taggedFileAttachments
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
+        scheduledSend = item.scheduledSend
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho ? true : nil
         isUndeliveredRemoteSend = item.isUndeliveredRemoteSend ? true : nil
         isStreaming = item.isStreaming
@@ -173,6 +177,7 @@ public struct AgentTranscriptActivity: Codable, Identifiable, Sendable, Equatabl
             isStreaming: overrideStreaming ?? isStreaming,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
+            scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
             isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false
         )
@@ -238,6 +243,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
     public var taggedFileAttachments: [AgentTaggedFileAttachment]
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
+    public var scheduledSend: AgentScheduledSendProvenance?
     public var isLocalControlPlaneEcho: Bool?
     public var isUndeliveredRemoteSend: Bool?
 
@@ -250,6 +256,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
         taggedFileAttachments = item.taggedFileAttachments
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
+        scheduledSend = item.scheduledSend
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho ? true : nil
         isUndeliveredRemoteSend = item.isUndeliveredRemoteSend ? true : nil
     }
@@ -265,6 +272,7 @@ public struct AgentTranscriptRequestAnchor: Codable, Identifiable, Sendable, Equ
             sequenceIndex: sequenceIndex,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
+            scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho ?? false,
             isUndeliveredRemoteSend: isUndeliveredRemoteSend ?? false
         )

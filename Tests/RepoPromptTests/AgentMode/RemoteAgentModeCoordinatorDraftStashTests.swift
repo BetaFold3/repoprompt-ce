@@ -209,7 +209,7 @@ final class RemoteAgentModeCoordinatorDraftStashTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in DraftStashNoopCodexController() }
         )
         viewModel.test_setCurrentTabIDOverride(tabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try! await viewModel.ensureSessionReady(tabID: tabID)
         session.runState = .running
         session.remoteHost = makeBinding(remoteSessionID: "remote-session")
         let coordinator = RemoteAgentModeCoordinator()

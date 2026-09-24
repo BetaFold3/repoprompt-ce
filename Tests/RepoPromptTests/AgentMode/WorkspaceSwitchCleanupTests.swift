@@ -23,6 +23,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         )
         let fixture = makeWorkspaceFixture(workspaces: [workspace])
         fixture.manager.activeWorkspace = workspace
+        fixture.prompt.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
 
         let viewModel = makeViewModel()
         viewModel.test_setCurrentTabIDOverride(tabID)
@@ -34,7 +35,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
         await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
 
-        let session = viewModel.session(for: tabID)
+        let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         session.hasLoadedPersistedState = true
         session.replaceItems([.user("active", sequenceIndex: 0)])
@@ -57,7 +58,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         let provider = BlockingHeadlessProvider()
         let viewModel = makeViewModel()
         let tabID = UUID()
-        let session = viewModel.session(for: tabID)
+        let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         session.selectedAgent = .openCode
         session.provider = provider
         session.runID = UUID()
@@ -96,7 +97,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         XCTAssertEqual(ownedRoots.count, 1)
 
         let viewModel = makeViewModel(workspaceFileContextStore: store)
-        let session = viewModel.session(for: UUID())
+        let session = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
 
         await viewModel.handleWorkspaceSwitch(nil)
@@ -124,7 +125,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
                 return 1
             }
         )
-        let session = viewModel.session(for: UUID())
+        let session = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
         session.selectedAgent = .openCode
         session.runID = oldRunID
         session.runState = .running
@@ -148,13 +149,13 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
                 await routing.record(runID: runID, reason: reason)
             }
         )
-        let oldSession = viewModel.session(for: tabID)
+        let oldSession = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         oldSession.selectedAgent = .openCode
         oldSession.runID = oldRunID
         oldSession.mcpControlContext = makeMCPControlContext(sessionID: mcpSessionID)
 
         await viewModel.handleWorkspaceSwitch(nil)
-        let newSession = viewModel.session(for: tabID)
+        let newSession = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         newSession.selectedAgent = .openCode
         newSession.mcpControlContext = makeMCPControlContext(sessionID: mcpSessionID)
         viewModel.test_setMCPControlledTabIDs([tabID])
@@ -171,7 +172,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         let oldRunID = UUID()
         let newRunID = UUID()
         let viewModel = makeViewModel()
-        let oldSession = viewModel.session(for: tabID)
+        let oldSession = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         oldSession.selectedAgent = .openCode
         oldSession.provider = provider
         oldSession.providerSessionID = "old-provider-session"
@@ -179,7 +180,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         oldSession.runState = .running
 
         await viewModel.handleWorkspaceSwitch(nil)
-        let newSession = viewModel.session(for: tabID)
+        let newSession = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         newSession.selectedAgent = .openCode
         newSession.providerSessionID = "new-provider-session"
         newSession.runID = newRunID

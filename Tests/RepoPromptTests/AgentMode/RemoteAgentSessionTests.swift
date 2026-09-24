@@ -3072,7 +3072,7 @@ final class RemoteAgentSessionTests: XCTestCase {
             workspaceManager: workspaceManager
         )
         viewModel.test_setCurrentTabIDOverride(tabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try! await viewModel.ensureSessionReady(tabID: tabID)
         session.remoteHost = makeBinding()
         _ = viewModel.test_installPersistentSessionBinding(
             sessionID: sessionID,

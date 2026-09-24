@@ -2339,7 +2339,13 @@ struct MCPOracleToolService {
             )
         }
 
-        let hydratedSession = await agentModeViewModel.ensureSessionReady(tabID: tabID)
+        guard let hydratedSession = try? await agentModeViewModel.ensureSessionReady(tabID: tabID) else {
+            return AgentOracleOwner(
+                agentSessionID: storedSessionID,
+                runID: tabContext?.runID,
+                worktreeBindingState: .unavailable
+            )
+        }
         guard hydratedSession.activeAgentSessionID == storedSessionID else {
             return AgentOracleOwner(
                 agentSessionID: storedSessionID,

@@ -358,7 +358,7 @@ final class AgentRunWaitStatusUpdateTests: XCTestCase {
         initialStatusText: String?
     ) async throws -> RunningSessionFixture {
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try! await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,

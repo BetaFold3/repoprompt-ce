@@ -80,6 +80,23 @@ actor ApplyEditsApprovalStore: Sendable {
     private var autoEditOverridesByScope: [ApplyEditsApprovalScope: Bool] = [:]
     private var pendingByScope: [ApplyEditsApprovalScope: PendingRecord] = [:]
     private var subscriptions: [ApplyEditsApprovalScope: [UUID: SnapshotContinuation]] = [:]
+    private var ownershipGenerationByScope: [ApplyEditsApprovalScope: UInt64] = [:]
+    #if DEBUG
+        private var testConditionalCleanupHook: (@Sendable (ApplyEditsApprovalScope, UInt64) async -> Void)?
+        private var testInitialSetupHook: (@Sendable (ApplyEditsApprovalScope) async -> Void)?
+
+        func test_setInitialSetupHook(
+            _ hook: (@Sendable (ApplyEditsApprovalScope) async -> Void)?
+        ) {
+            testInitialSetupHook = hook
+        }
+
+        func test_setConditionalCleanupHook(
+            _ hook: (@Sendable (ApplyEditsApprovalScope, UInt64) async -> Void)?
+        ) {
+            testConditionalCleanupHook = hook
+        }
+    #endif
 
     func autoEditEnabled(for scope: ApplyEditsApprovalScope) -> Bool {
         autoEditOverridesByScope[scope] ?? Self.globalDefaultAutoEditEnabled()
@@ -95,6 +112,22 @@ actor ApplyEditsApprovalStore: Sendable {
             Self.setGlobalDefaultAutoEditEnabled(enabled)
         }
         publishSnapshot(for: scope)
+    }
+
+    @discardableResult
+    func setAutoEditEnabled(
+        _ enabled: Bool,
+        for scope: ApplyEditsApprovalScope,
+        ifOwnedBy generation: UInt64,
+        updateGlobalDefault: Bool
+    ) -> Bool {
+        guard ownershipGenerationByScope[scope] == generation else { return false }
+        autoEditOverridesByScope[scope] = enabled
+        if updateGlobalDefault {
+            Self.setGlobalDefaultAutoEditEnabled(enabled)
+        }
+        publishSnapshot(for: scope)
+        return true
     }
 
     func requestReview(
@@ -167,9 +200,28 @@ actor ApplyEditsApprovalStore: Sendable {
     }
 
     func cleanupScope(_ scope: ApplyEditsApprovalScope) {
+        ownershipGenerationByScope[scope, default: 0] &+= 1
         cancelPendingReview(scope: scope, reason: "Approval scope cleaned up")
         autoEditOverridesByScope.removeValue(forKey: scope)
         finishAndRemoveAllSubscriptions(for: scope)
+    }
+
+    @discardableResult
+    func cleanupScope(
+        _ scope: ApplyEditsApprovalScope,
+        ifOwnedBy generation: UInt64
+    ) async -> Bool {
+        #if DEBUG
+            if let testConditionalCleanupHook {
+                await testConditionalCleanupHook(scope, generation)
+            }
+        #endif
+        guard ownershipGenerationByScope[scope] == generation else { return false }
+        ownershipGenerationByScope[scope, default: 0] &+= 1
+        cancelPendingReview(scope: scope, reason: "Approval scope cleaned up")
+        autoEditOverridesByScope.removeValue(forKey: scope)
+        finishAndRemoveAllSubscriptions(for: scope)
+        return true
     }
 
     func cleanupWindowScopes(windowID: Int, reason: String) {
@@ -185,13 +237,44 @@ actor ApplyEditsApprovalStore: Sendable {
         }
         guard !scopesToCleanup.isEmpty else { return }
         for scope in scopesToCleanup {
+            ownershipGenerationByScope[scope, default: 0] &+= 1
             cancelPendingReview(scope: scope, reason: reason)
             autoEditOverridesByScope.removeValue(forKey: scope)
             finishAndRemoveAllSubscriptions(for: scope)
         }
     }
 
-    func subscribe(scope: ApplyEditsApprovalScope) -> (id: UUID, stream: AsyncStream<ApplyEditsApprovalSnapshot>) {
+    /// Setup claims the service generation before configuring or subscribing. There is no
+    /// suspension after the cancellation check, so a retired owner's held setup cannot claim
+    /// a replacement's scope after its task is cancelled.
+    func subscribeForInitialOwner(
+        scope: ApplyEditsApprovalScope,
+        autoEditEnabled: Bool
+    ) async -> (id: UUID, generation: UInt64, stream: AsyncStream<ApplyEditsApprovalSnapshot>)? {
+        #if DEBUG
+            if let testInitialSetupHook {
+                await testInitialSetupHook(scope)
+            }
+        #endif
+        guard !Task.isCancelled else { return nil }
+        let generation = (ownershipGenerationByScope[scope] ?? 0) &+ 1
+        ownershipGenerationByScope[scope] = generation
+        autoEditOverridesByScope[scope] = autoEditEnabled
+        let subscription = makeSubscription(scope: scope, generation: generation)
+        publishSnapshot(for: scope)
+        return subscription
+    }
+
+    func subscribe(scope: ApplyEditsApprovalScope) -> (id: UUID, generation: UInt64, stream: AsyncStream<ApplyEditsApprovalSnapshot>) {
+        let generation = (ownershipGenerationByScope[scope] ?? 0) &+ 1
+        ownershipGenerationByScope[scope] = generation
+        return makeSubscription(scope: scope, generation: generation)
+    }
+
+    private func makeSubscription(
+        scope: ApplyEditsApprovalScope,
+        generation: UInt64
+    ) -> (id: UUID, generation: UInt64, stream: AsyncStream<ApplyEditsApprovalSnapshot>) {
         let id = UUID()
         let streamPair = AsyncStream.makeStream(of: ApplyEditsApprovalSnapshot.self)
         let stream = streamPair.stream
@@ -205,7 +288,7 @@ actor ApplyEditsApprovalStore: Sendable {
                 await self.removeSubscription(scope: scope, id: id, finishContinuation: false)
             }
         }
-        return (id, stream)
+        return (id, generation, stream)
     }
 
     func unsubscribe(scope: ApplyEditsApprovalScope, id: UUID) {

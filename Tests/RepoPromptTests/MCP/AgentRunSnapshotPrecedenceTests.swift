@@ -70,7 +70,7 @@ final class AgentRunSnapshotPrecedenceTests: XCTestCase {
         let viewModel = makeViewModel(windowID: window.windowID)
         let service = makeService(window: window, viewModel: viewModel)
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,

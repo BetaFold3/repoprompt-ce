@@ -183,7 +183,7 @@ final class RemoteTerminalSettlementReversalTests: XCTestCase {
     }
 
     @MainActor
-    func testConsecutiveTerminalDiscoveryDebouncesUntilRunningRearmsImmediacy() async {
+    func testConsecutiveTerminalDiscoveryDebouncesUntilRunningRearmsImmediacy() async throws {
         let tabID = UUID()
         let viewModel = AgentModeViewModel(
             testWindowID: 1,
@@ -191,7 +191,7 @@ final class RemoteTerminalSettlementReversalTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in NoopCodexController() }
         )
         viewModel.test_setCurrentTabIDOverride(tabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.remoteHost = makeBinding(remoteSessionID: "remote-discovery")
         let coordinator = RemoteAgentModeCoordinator()
         coordinator.attach(viewModel: viewModel)

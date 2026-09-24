@@ -106,6 +106,22 @@ class WindowState: ObservableObject {
     /// Single shared MCP service instance across all windows
     private static let sharedMCPService = MCPService()
 
+    /// App-level scheduled-send admission coordinator shared by every window (plan §3.2).
+    /// Wiring only: hosts register here; the coordinator arms timers and issues leases.
+    private static let sharedScheduledSendCoordinator: AgentScheduledSendCoordinator = {
+        let coordinator = AgentScheduledSendCoordinator()
+        _ = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in
+                WindowState.sharedScheduledSendCoordinator.didWake()
+            }
+        }
+        return coordinator
+    }()
+
     // MARK: - Window identification
 
     private(set) static var windowCounter = 0
@@ -402,6 +418,9 @@ class WindowState: ObservableObject {
         aiQueriesService = composition.aiQueriesService
         chatDataService = composition.chatDataService
         workspaceManager = composition.workspaceManager
+
+        // Register this window's Agent Mode view model as a scheduled-send dispatch host.
+        agentModeViewModel.attachScheduledSendCoordinator(Self.sharedScheduledSendCoordinator)
 
         // Set up additional actions
         setupSendPromptAction()

@@ -5079,6 +5079,13 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let processID = try XCTUnwrap(pid_t(processIDText))
         let harness = makeHarness(recorder: recorder, workspacePathProvider: { _ in workspace.path })
+        let persistenceWorkspace = WorkspaceModel(
+            name: "Retained ACP",
+            repoPaths: [workspace.path],
+            customStoragePath: workspace,
+            ephemeralFlag: true
+        )
+        harness.host.test_establishPersistenceWorkspace(persistenceWorkspace)
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .openCode
         session.runID = UUID()

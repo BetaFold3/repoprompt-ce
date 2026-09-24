@@ -199,6 +199,10 @@ final class AgentModeRunService {
         #endif
     }
 
+    /// Reason carried by the `.stale` outcome when `providerHandoffAuthorization` revokes a start
+    /// immediately before the provider runner would be invoked. No run state is mutated.
+    static let providerHandoffRevokedReason = "scheduled_provider_handoff_revoked"
+
     @discardableResult
     func startRun(
         tabID: UUID,
@@ -206,7 +210,8 @@ final class AgentModeRunService {
         initialUserMessage: String,
         initialMessageForRun: String,
         attachments: [AgentImageAttachment],
-        codexFallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext? = nil
+        codexFallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext? = nil,
+        providerHandoffAuthorization: (@MainActor () -> Bool)? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         let selectedAgent = session.selectedAgent
@@ -277,6 +282,12 @@ final class AgentModeRunService {
             let message = Self.providerStartupFailureMessage(for: error)
             await failBeforeProviderStartup(session: session, message: message)
             return selectedAgent == .codexExec ? .failed(message: message) : nil
+        }
+
+        // Final authorization immediately before any provider runner is invoked: every
+        // asynchronous preparation above has completed and no run state has been mutated yet.
+        if let providerHandoffAuthorization, !providerHandoffAuthorization() {
+            return .stale(reason: Self.providerHandoffRevokedReason)
         }
 
         if selectedAgent == .codexExec {

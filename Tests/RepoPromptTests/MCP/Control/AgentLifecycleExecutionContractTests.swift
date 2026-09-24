@@ -160,7 +160,7 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         XCTAssertEqual(AgentMCPWaitPolicy.resolveParentFamily(runID: runID, candidates: [active, duplicate]), .unresolved)
     }
 
-    func testServerFreezesParentFamilyFromAuthenticatedRunBindingOnly() async {
+    func testServerFreezesParentFamilyFromAuthenticatedRunBindingOnly() async throws {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
@@ -172,14 +172,14 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
             windowID: window.windowID
         ))
 
-        let parent = await viewModel.ensureSessionReady(tabID: UUID())
+        let parent = try await makeRegisteredSession(in: window)
         parent.runID = runID
         parent.selectedAgent = .codexExec
         parent.runState = .running
         defer { parent.runState = .idle }
 
         // A differently configured worker session bound to another run must not influence the parent family.
-        let worker = await viewModel.ensureSessionReady(tabID: UUID())
+        let worker = try await makeRegisteredSession(in: window)
         worker.runID = UUID()
         worker.selectedAgent = .claudeCode
         worker.runState = .running
@@ -196,7 +196,7 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         XCTAssertEqual(bound.metadata.clientName, metadata.clientName)
 
         // Ambiguous: a second active session claiming the same run identity.
-        let duplicate = await viewModel.ensureSessionReady(tabID: UUID())
+        let duplicate = try await makeRegisteredSession(in: window)
         duplicate.runID = runID
         duplicate.selectedAgent = .claudeCode
         duplicate.runState = .running
@@ -230,7 +230,7 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
 
     /// Plan §6.3 provenance: the manager's cross-window run recovery must never let a connection
     /// without a direct binding in this window inherit the matching session's family.
-    func testServerManagerRunFallbackResolvesUnresolvedDespiteMatchingActiveCodexSession() async {
+    func testServerManagerRunFallbackResolvesUnresolvedDespiteMatchingActiveCodexSession() async throws {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let otherWindow = makeWindow()
@@ -252,7 +252,7 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         let managerRunID = await ServerNetworkManager.shared.runIDForConnection(connectionID)
         XCTAssertEqual(managerRunID, runID, "fixture: the manager fallback would name the run")
 
-        let parent = await window.agentModeViewModel.ensureSessionReady(tabID: UUID())
+        let parent = try await makeRegisteredSession(in: window)
         parent.runID = runID
         parent.selectedAgent = .codexExec
         parent.runState = .running
@@ -272,13 +272,13 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         XCTAssertEqual(direct.parentFamily, .codex)
     }
 
-    func testServerRemoteClientNeverInheritsParentFamilyEvenWithDirectBinding() async {
+    func testServerRemoteClientNeverInheritsParentFamilyEvenWithDirectBinding() async throws {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let connectionID = UUID()
         let runID = UUID()
         XCTAssertTrue(window.mcpServer.registerRunIDMapping(connectionID: connectionID, runID: runID, windowID: window.windowID))
-        let parent = await window.agentModeViewModel.ensureSessionReady(tabID: UUID())
+        let parent = try await makeRegisteredSession(in: window)
         parent.runID = runID
         parent.selectedAgent = .codexExec
         parent.runState = .running
@@ -311,11 +311,11 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
         XCTAssertEqual(localContext.parentFamily, .codex)
     }
 
-    func testServerActiveTabCompatibilityRoutingResolvesUnresolvedAndRecordsNoDiagnostic() async {
+    func testServerActiveTabCompatibilityRoutingResolvesUnresolvedAndRecordsNoDiagnostic() async throws {
         let window = makeWindow()
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         window.mcpServer.setActiveTabCompatibilityFallbackEnabled(true)
-        let parent = await window.agentModeViewModel.ensureSessionReady(tabID: UUID())
+        let parent = try await makeRegisteredSession(in: window)
         parent.runID = UUID()
         parent.selectedAgent = .codexExec
         parent.runState = .running
@@ -335,6 +335,27 @@ final class AgentLifecycleExecutionContractTests: XCTestCase {
             diagnosticsBefore,
             "A policy read must not record a compatibility-fallback diagnostic under a synthetic tool name"
         )
+    }
+
+    private func makeRegisteredSession(
+        in window: WindowState
+    ) async throws -> AgentModeViewModel.TabSession {
+        if window.workspaceManager.activeWorkspace == nil {
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Lifecycle Contract \(UUID().uuidString.prefix(8))",
+                repoPaths: [FileManager.default.currentDirectoryPath],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "agentLifecycleExecutionContractTests"
+            )
+            window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+        }
+        await window.promptManager.createBlankComposeTab(createAgentSession: false)
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        return try await window.agentModeViewModel.ensureSessionReady(tabID: tabID)
     }
 
     private func makeWindow() -> WindowState {

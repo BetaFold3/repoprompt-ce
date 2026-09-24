@@ -2591,7 +2591,11 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     /// Initialize expansion state from saved paths
     @MainActor
-    func restoreExpansionState(from paths: [String]) async {
+    func restoreExpansionState(
+        from paths: [String],
+        isActivationCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
+        guard isActivationCurrent?() ?? true else { return }
         #if DEBUG
             let restoreExpansionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             var restoreExpansionOutcome = "completed"
@@ -2655,7 +2659,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         if !collapseList.isEmpty {
             var index = 0
             while index < collapseList.count {
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, isActivationCurrent?() ?? true else {
                     #if DEBUG
                         restoreExpansionOutcome = "cancelled"
                     #endif
@@ -2663,6 +2667,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 }
                 let end = min(index + chunkSize, collapseList.count)
                 for path in collapseList[index ..< end] {
+                    guard isActivationCurrent?() ?? true else { return }
                     if let folder = foldersByFullPath[path], folder.isExpanded {
                         folder.setExpanded(false)
                         didChange = true
@@ -2677,7 +2682,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         if !expandList.isEmpty {
             var index = 0
             while index < expandList.count {
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, isActivationCurrent?() ?? true else {
                     #if DEBUG
                         restoreExpansionOutcome = "cancelled"
                     #endif
@@ -2685,6 +2690,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 }
                 let end = min(index + chunkSize, expandList.count)
                 for path in expandList[index ..< end] {
+                    guard isActivationCurrent?() ?? true else { return }
                     if let folder = foldersByFullPath[path] {
                         if expandParentChain(of: folder) {
                             didChange = true
@@ -2699,7 +2705,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         #if DEBUG
             restoreExpansionDidChange = didChange
         #endif
-        if didChange {
+        if didChange, isActivationCurrent?() ?? true {
             workspaceManager?.markWorkspaceDirty()
         }
     }
@@ -9487,7 +9493,11 @@ class WorkspaceFilesViewModel: ObservableObject {
     #endif
 
     @MainActor
-    func hydrateSlicesForActiveTab(from tabSelection: StoredSelection) async {
+    func hydrateSlicesForActiveTab(
+        from tabSelection: StoredSelection,
+        isActivationCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
+        guard isActivationCurrent?() ?? true else { return }
         #if DEBUG
             let hydrateSlicesStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             var hydrateSlicesOutcome = "completed"
@@ -9538,6 +9548,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         let normalizedSlices = standardizedStoredSelectionSlices(tabSelection.slices)
         if !normalizedSlices.isEmpty {
             _ = await findFiles(atPaths: Array(normalizedSlices.keys), profile: .mcpSelection)
+            guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
         }
         let sliceMetadata: [SliceHydrationMetadata] = normalizedSlices.compactMap { entry in
             let standardizedFull = entry.key
@@ -9629,7 +9640,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             hydrateSlicesPendingPersistFiles = pendingPersist.values.reduce(0) { $0 + $1.count }
         #endif
 
-        guard !Task.isCancelled else {
+        guard !Task.isCancelled, isActivationCurrent?() ?? true else {
             #if DEBUG
                 hydrateSlicesOutcome = "cancelled"
             #endif
@@ -9642,15 +9653,22 @@ class WorkspaceFilesViewModel: ObservableObject {
             return
         }
 
-        await applySlicesSnapshot(snapshot: snapshot, pendingPersist: pendingPersist, scope: scope)
+        await applySlicesSnapshot(
+            snapshot: snapshot,
+            pendingPersist: pendingPersist,
+            scope: scope,
+            isActivationCurrent: isActivationCurrent
+        )
     }
 
     @MainActor
     private func applySlicesSnapshot(
         snapshot: [String: [String: PartitionStore.StoredSlices]],
         pendingPersist: [String: [String: PartitionStore.SliceUpdate]],
-        scope: PartitionScope
+        scope: PartitionScope,
+        isActivationCurrent: (@MainActor () -> Bool)? = nil
     ) async {
+        guard isActivationCurrent?() ?? true else { return }
         #if DEBUG
             let applySlicesSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             defer {
@@ -9672,6 +9690,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         guard !pendingPersist.isEmpty else { return }
 
         for (rootPath, updates) in pendingPersist {
+            guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
             do {
                 _ = try await selectionSliceCoordinator.applyPartitionUpdates(
                     forRootPath: rootPath,
@@ -9711,7 +9730,8 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func onActiveTabChangedHeavy(
         for tabID: UUID,
-        selection: StoredSelection
+        selection: StoredSelection,
+        isActivationCurrent: (@MainActor () -> Bool)? = nil
     ) async {
         #if DEBUG
             let activeTabHeavyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -9729,26 +9749,29 @@ class WorkspaceFilesViewModel: ObservableObject {
                 )
             }
         #endif
-        guard currentTabID == tabID else {
+        guard currentTabID == tabID, isActivationCurrent?() ?? true else {
             #if DEBUG
                 activeTabHeavyOutcome = "staleTab"
             #endif
             return
         }
-        await applyStoredSelection(selection)
-        guard !Task.isCancelled else {
+        await applyStoredSelection(selection, isActivationCurrent: isActivationCurrent)
+        guard !Task.isCancelled, isActivationCurrent?() ?? true else {
             #if DEBUG
                 activeTabHeavyOutcome = "cancelled"
             #endif
             return
         }
-        guard currentTabID == tabID else {
+        guard currentTabID == tabID, isActivationCurrent?() ?? true else {
             #if DEBUG
                 activeTabHeavyOutcome = "staleTab"
             #endif
             return
         }
-        await hydrateSlicesForActiveTab(from: selection)
+        await hydrateSlicesForActiveTab(
+            from: selection,
+            isActivationCurrent: isActivationCurrent
+        )
     }
 
     @MainActor
@@ -11289,9 +11312,15 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
-    private func applySelectionSnapshot(paths: [String], allowEmpty: Bool) async {
+    private func applySelectionSnapshot(
+        paths: [String],
+        allowEmpty: Bool,
+        isActivationCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
+        guard isActivationCurrent?() ?? true else { return }
         if paths.isEmpty && !allowEmpty { return }
         let foundFiles = await findFiles(atPaths: paths)
+        guard isActivationCurrent?() ?? true else { return }
         let targetFiles = Array(foundFiles.values)
         let targetIDs = Set(targetFiles.map(\.id))
         let currentIDs = selectedFileIDs
@@ -11302,9 +11331,18 @@ extension WorkspaceFilesViewModel {
         let filesToDeselect = selectedFiles.filter { idsToDeselect.contains($0.id) }
         let filesToSelect = targetFiles.filter { idsToSelect.contains($0.id) }
 
-        await applySelectionDelta(filesToDeselect, selecting: false)
-        await applySelectionDelta(filesToSelect, selecting: true)
-        guard !Task.isCancelled else { return }
+        await applySelectionDelta(
+            filesToDeselect,
+            selecting: false,
+            isActivationCurrent: isActivationCurrent
+        )
+        guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
+        await applySelectionDelta(
+            filesToSelect,
+            selecting: true,
+            isActivationCurrent: isActivationCurrent
+        )
+        guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
 
         var parentIDs = Set<UUID>()
         var parents: [FolderViewModel] = []
@@ -11323,9 +11361,10 @@ extension WorkspaceFilesViewModel {
         let chunkSize = 500
         var index = 0
         while index < parents.count {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
             let end = min(index + chunkSize, parents.count)
             for parent in parents[index ..< end] {
+                guard isActivationCurrent?() ?? true else { return }
                 recomputeAncestorStates(startingAt: parent)
             }
             index = end
@@ -11334,16 +11373,21 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
-    private func applySelectionDelta(_ files: [FileViewModel], selecting: Bool) async {
+    private func applySelectionDelta(
+        _ files: [FileViewModel],
+        selecting: Bool,
+        isActivationCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
         guard !files.isEmpty else { return }
         let chunkSize = 500
         var index = 0
         while index < files.count {
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
             let end = min(index + chunkSize, files.count)
             let chunk = files[index ..< end]
             performSelectionBatch {
                 for file in chunk {
+                    guard isActivationCurrent?() ?? true else { return }
                     if selecting {
                         if !file.isChecked {
                             file.setIsChecked(true)
@@ -11359,7 +11403,11 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
-    func applyStoredSelection(_ stored: StoredSelection) async {
+    func applyStoredSelection(
+        _ stored: StoredSelection,
+        isActivationCurrent: (@MainActor () -> Bool)? = nil
+    ) async {
+        guard isActivationCurrent?() ?? true else { return }
         #if DEBUG
             let applyStoredSelectionStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             var applySelectionSnapshotDuration = "notMeasured"
@@ -11370,7 +11418,12 @@ extension WorkspaceFilesViewModel {
         #if DEBUG
             let applySelectionSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
-        await applySelectionSnapshot(paths: stored.selectedPaths, allowEmpty: true)
+        await applySelectionSnapshot(
+            paths: stored.selectedPaths,
+            allowEmpty: true,
+            isActivationCurrent: isActivationCurrent
+        )
+        guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
         #if DEBUG
             applySelectionSnapshotDuration = applySelectionSnapshotStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
             WorkspaceRestorePerfLog.event(
@@ -11387,6 +11440,7 @@ extension WorkspaceFilesViewModel {
             atPaths: stored.manualCodemapPaths,
             profile: .mcpSelection
         )
+        guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
         let selectedIDs = Set(selectedFiles.map(\.id))
         var manualFilesByFullPath: [String: FileViewModel] = [:]
         for file in manualFilesByPath.values {
@@ -11406,6 +11460,7 @@ extension WorkspaceFilesViewModel {
         let storedSlicePaths = Array(standardizedStoredSelectionSlices(stored.slices).keys)
         if !storedSlicePaths.isEmpty {
             _ = await findFiles(atPaths: storedSlicePaths, profile: .mcpSelection)
+            guard !Task.isCancelled, isActivationCurrent?() ?? true else { return }
         }
         replaceInMemorySliceMirror(from: stored)
 

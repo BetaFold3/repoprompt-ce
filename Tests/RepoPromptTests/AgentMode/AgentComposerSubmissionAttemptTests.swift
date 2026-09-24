@@ -83,6 +83,28 @@ final class AgentComposerSubmissionAttemptTests: XCTestCase {
         XCTAssertFalse(latch.isLatched(for: session.tabID))
     }
 
+    func testScheduledCompletionClearsOnlyUnchangedInput() throws {
+        var latch = AgentComposerSubmissionLatch()
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        latch.advanceInputRevision()
+        let attempt = try XCTUnwrap(
+            latch.begin(target: makeTarget(session: session), rawDraftSnapshot: "scheduled draft")
+        )
+
+        let scheduleID = UUID()
+        let effects = latch.complete(
+            attempt,
+            result: .scheduled(id: scheduleID),
+            currentTabID: session.tabID,
+            currentRawDraft: "scheduled draft"
+        )
+
+        XCTAssertTrue(effects.matchedAttempt)
+        XCTAssertTrue(effects.shouldClearInput)
+        XCTAssertNil(effects.blockedMessage)
+        XCTAssertFalse(latch.isLatched(for: session.tabID))
+    }
+
     func testNewerTypingAndDraftRestorationSurviveCompletion() throws {
         var latch = AgentComposerSubmissionLatch()
         let session = AgentModeViewModel.TabSession(tabID: UUID())

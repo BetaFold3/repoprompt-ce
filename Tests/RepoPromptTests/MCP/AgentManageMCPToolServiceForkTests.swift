@@ -238,7 +238,7 @@ final class AgentManageMCPToolServiceForkTests: XCTestCase {
             )
 
             let viewModel = window.agentModeViewModel
-            let sourceSession = viewModel.session(for: sourceTabID)
+            let sourceSession = try XCTUnwrap(viewModel.session(for: sourceTabID, createIfNeeded: true))
             sourceSession.hasLoadedPersistedState = true
             let sourceTexts = ["first request", "first reply", "second request", "second reply"]
             sourceSession.setItemsSilently(
@@ -252,7 +252,7 @@ final class AgentManageMCPToolServiceForkTests: XCTestCase {
             )
             viewModel.refreshDerivedTranscriptState(for: sourceSession)
 
-            let foregroundSession = viewModel.session(for: foregroundTabID)
+            let foregroundSession = try XCTUnwrap(viewModel.session(for: foregroundTabID, createIfNeeded: true))
             foregroundSession.hasLoadedPersistedState = true
             foregroundSession.setItemsSilently(
                 [.user("foreground", sequenceIndex: 0)],

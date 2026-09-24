@@ -327,6 +327,10 @@ struct AgentSession: Codable, Identifiable {
     var pendingHandoffSourceItemID: UUID?
     var pendingHandoffDefersProviderLockUntilSend: Bool
 
+    /// Pending delayed send and the most recent accepted scheduled dispatch.
+    var scheduledSend: AgentScheduledSendMember?
+    var lastScheduledDispatch: AgentScheduledSendProvenance?
+
     init(
         id: UUID = UUID(),
         serializationVersion: Int = AgentSession.currentSerializationVersion,
@@ -366,6 +370,8 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffCreatedAt: Date? = nil,
         pendingHandoffSourceItemID: UUID? = nil,
         pendingHandoffDefersProviderLockUntilSend: Bool = false,
+        scheduledSend: AgentScheduledSendMember? = nil,
+        lastScheduledDispatch: AgentScheduledSendProvenance? = nil,
         isMCPOriginated: Bool = false,
         origin: AgentSessionOrigin? = nil,
         profile: AgentSessionProfile = .standard,
@@ -410,6 +416,8 @@ struct AgentSession: Codable, Identifiable {
         self.pendingHandoffCreatedAt = pendingHandoffCreatedAt
         self.pendingHandoffSourceItemID = pendingHandoffSourceItemID
         self.pendingHandoffDefersProviderLockUntilSend = pendingHandoffDefersProviderLockUntilSend
+        self.scheduledSend = scheduledSend
+        self.lastScheduledDispatch = lastScheduledDispatch
         let resolvedOrigin = origin ?? AgentSessionOrigin(legacyIsMCPOriginated: isMCPOriginated)
         self.origin = resolvedOrigin
         self.isMCPOriginated = resolvedOrigin.isMCPOriginated
@@ -457,6 +465,8 @@ struct AgentSession: Codable, Identifiable {
         case pendingHandoffCreatedAt
         case pendingHandoffSourceItemID
         case pendingHandoffDefersProviderLockUntilSend
+        case scheduledSend
+        case lastScheduledDispatch
         case isMCPOriginated
         case origin
         case profile
@@ -520,6 +530,11 @@ struct AgentSession: Codable, Identifiable {
         pendingHandoffCreatedAt = try container.decodeIfPresent(Date.self, forKey: .pendingHandoffCreatedAt)
         pendingHandoffSourceItemID = try container.decodeIfPresent(UUID.self, forKey: .pendingHandoffSourceItemID)
         pendingHandoffDefersProviderLockUntilSend = try container.decodeIfPresent(Bool.self, forKey: .pendingHandoffDefersProviderLockUntilSend) ?? false
+        scheduledSend = try container.decodeIfPresent(AgentScheduledSendMember.self, forKey: .scheduledSend)
+        lastScheduledDispatch = try container.decodeIfPresent(
+            AgentScheduledSendProvenance.self,
+            forKey: .lastScheduledDispatch
+        )
         let legacyIsMCPOriginated = try container.decodeIfPresent(Bool.self, forKey: .isMCPOriginated) ?? false
         let decodedOrigin = try container.decodeIfPresent(AgentSessionOrigin.self, forKey: .origin)
             ?? AgentSessionOrigin(legacyIsMCPOriginated: legacyIsMCPOriginated)

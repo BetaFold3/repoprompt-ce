@@ -933,18 +933,18 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let worktree = try makeTemporaryDirectory(named: "worktree")
         let parentID = UUID()
         let viewModel = makeViewModel(workspacePath: root.path)
-        let parent = viewModel.session(for: UUID())
+        let parent = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
         parent.testInstallPersistentSessionBinding(sessionID: parentID)
         parent.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
 
-        let inheritedChild = viewModel.session(for: UUID())
+        let inheritedChild = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
         inheritedChild.testInstallPersistentSessionBinding(sessionID: UUID())
         viewModel.applySpawnParentSessionID(parentID, to: inheritedChild)
         XCTAssertEqual(inheritedChild.parentSessionID, parentID)
         XCTAssertEqual(inheritedChild.worktreeBindings, parent.worktreeBindings)
         XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: inheritedChild), worktree.path)
 
-        let optedOutChild = viewModel.session(for: UUID())
+        let optedOutChild = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
         optedOutChild.testInstallPersistentSessionBinding(sessionID: UUID())
         viewModel.applySpawnParentSessionID(parentID, to: optedOutChild, inheritWorktreeBindings: false)
         XCTAssertEqual(optedOutChild.parentSessionID, parentID)
@@ -958,7 +958,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let viewModel = window.agentModeViewModel
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let parentID = UUID()
-        let source = viewModel.session(for: sourceTabID)
+        let source = try await viewModel.ensureSessionReady(tabID: sourceTabID)
         source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.hasLoadedPersistedState = true
         source.mcpControlContext = nil
@@ -1008,7 +1008,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let parentID = UUID()
         let parentBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
-        let source = viewModel.session(for: sourceTabID)
+        let source = try await viewModel.ensureSessionReady(tabID: sourceTabID)
         source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.hasLoadedPersistedState = true
         source.worktreeBindings = [parentBinding]
@@ -1051,7 +1051,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let parentID = UUID()
         let parentBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
-        let source = viewModel.session(for: sourceTabID)
+        let source = try await viewModel.ensureSessionReady(tabID: sourceTabID)
         source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.hasLoadedPersistedState = true
         source.worktreeBindings = [parentBinding]
@@ -1115,13 +1115,18 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             if testCase.sourceIsMCPControlled {
                 installParentAgentSession(parentID, binding: parentBinding, sourceTabID: sourceTabID, in: window)
             } else {
-                let source = viewModel.session(for: sourceTabID)
+                let source = try await viewModel.ensureSessionReady(tabID: sourceTabID)
                 source.testInstallPersistentSessionBinding(sessionID: parentID)
                 source.worktreeBindings = [parentBinding]
                 XCTAssertNil(source.mcpControlContext, testCase.label)
             }
             if testCase.sourceIsMCPControlled, testCase.inherits {
-                let ambiguousParent = viewModel.session(for: UUID())
+                await window.promptManager.createBlankComposeTab(createAgentSession: false)
+                let ambiguousTabID = try XCTUnwrap(
+                    window.workspaceManager.activeWorkspace?.activeComposeTabID,
+                    testCase.label
+                )
+                let ambiguousParent = try await viewModel.ensureSessionReady(tabID: ambiguousTabID)
                 ambiguousParent.testInstallPersistentSessionBinding(sessionID: parentID)
                 ambiguousParent.worktreeBindings = [parentBinding]
             }
@@ -1399,7 +1404,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 oracleSourceWorktreeBindings: [sourceBinding]
             )
             service.testBeforeExplicitTabWorktreeValidation = {
-                let source = window.agentModeViewModel.session(for: sourceTabID)
+                guard let source = window.agentModeViewModel.session(for: sourceTabID, createIfNeeded: true) else {
+                    XCTFail("Expected explicit-tab source session to materialize")
+                    return
+                }
                 if testCase == "binding mutation" {
                     source.worktreeBindings = [replacementBinding]
                 } else {
@@ -1426,7 +1434,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let worktree = try makeTemporaryDirectory(named: "explicit-tab-empty-worktree")
         let window = try await makeWindow(root: root)
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
-        let source = window.agentModeViewModel.session(for: sourceTabID)
+        let source = try await window.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
         let sourceSessionID = UUID()
         source.testInstallPersistentSessionBinding(sessionID: sourceSessionID)
         source.worktreeBindings = []
@@ -1466,7 +1474,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             makeBinding(logicalRoot: firstRoot.path, worktreeRoot: firstWorktree.path, worktreeID: "multi-one"),
             makeBinding(logicalRoot: secondRoot.path, worktreeRoot: secondWorktree.path, worktreeID: "multi-two")
         ]
-        let source = window.agentModeViewModel.session(for: sourceTabID)
+        let source = try await window.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
         source.testInstallPersistentSessionBinding(sessionID: sourceSessionID)
         source.worktreeBindings = bindings
         let service = makeAgentRunStartService(
@@ -1513,7 +1521,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             } else {
                 sourceTabID = originalTabID
             }
-            let sourceSession = await viewModel.ensureSessionReady(tabID: sourceTabID)
+            let sourceSession = try await viewModel.ensureSessionReady(tabID: sourceTabID)
             sourceSession.selectedAgent = .codexExec
             viewModel.selectedAgent = .codexExec
             viewModel.selectInitialStartLocation(.newWorktree, for: sourceTabID)
@@ -1600,7 +1608,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let viewModel = window.agentModeViewModel
         window.apiSettingsViewModel.isCodexConnected = true
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
-        let sourceSession = await viewModel.ensureSessionReady(tabID: sourceTabID)
+        let sourceSession = try await viewModel.ensureSessionReady(tabID: sourceTabID)
         sourceSession.selectedAgent = .codexExec
         viewModel.selectedAgent = .codexExec
         viewModel.selectInitialStartLocation(.newWorktree, for: sourceTabID)
@@ -1626,7 +1634,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
         let createdLinkedTabID = await viewModel.createAndActivateSessionTab()
         let linkedTabID = try XCTUnwrap(createdLinkedTabID)
-        let linkedSession = await viewModel.ensureSessionReady(tabID: linkedTabID)
+        let linkedSession = try await viewModel.ensureSessionReady(tabID: linkedTabID)
         linkedSession.selectedAgent = .codexExec
         viewModel.selectInitialStartLocation(.newWorktree, for: linkedTabID)
         let linkedTarget = try XCTUnwrap(
@@ -1663,7 +1671,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let viewModel = window.agentModeViewModel
         window.apiSettingsViewModel.isCodexConnected = true
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
-        let sourceSession = await viewModel.ensureSessionReady(tabID: sourceTabID)
+        let sourceSession = try await viewModel.ensureSessionReady(tabID: sourceTabID)
         sourceSession.selectedAgent = .codexExec
         viewModel.selectedAgent = .codexExec
 
@@ -1712,7 +1720,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let viewModel = window.agentModeViewModel
         let createdTabID = await viewModel.createAndActivateSessionTab()
         let tabID = try XCTUnwrap(createdTabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         session.hasLoadedPersistedState = true
         session.hasSentFirstMessage = true
         session.selectedAgent = .codexExec
@@ -1799,7 +1807,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let viewModel = window.agentModeViewModel
         let createdTabID = await viewModel.createAndActivateSessionTab()
         let tabID = try XCTUnwrap(createdTabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         let sessionID = try XCTUnwrap(session.activeAgentSessionID)
         session.hasLoadedPersistedState = true
         session.hasSentFirstMessage = true
@@ -1867,7 +1875,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let viewModel = window.agentModeViewModel
         let createdTabID = await viewModel.createAndActivateSessionTab()
         let tabID = try XCTUnwrap(createdTabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         let sessionID = try XCTUnwrap(session.activeAgentSessionID)
         session.hasLoadedPersistedState = true
         session.runState = .running
@@ -1929,7 +1937,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let worktree = try makeTemporaryDirectory(named: "deferred-worktree")
         let viewModel = makeViewModel(workspacePath: root.path)
         let tabID = UUID()
-        let session = viewModel.session(for: tabID)
+        let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.hasLoadedPersistedState = true
         session.hasSentFirstMessage = true
@@ -1954,7 +1962,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let oldWorktree = try makeTemporaryDirectory(named: "old-worktree")
         let viewModel = makeViewModel(workspacePath: root.path)
         let tabID = UUID()
-        let session = viewModel.session(for: tabID)
+        let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         let sessionID = UUID()
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.hasLoadedPersistedState = true
@@ -2007,7 +2015,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let oldWorktree = try makeTemporaryDirectory(named: "managed-old-worktree")
         let newWorktree = try makeTemporaryDirectory(named: "managed-new-worktree")
         let viewModel = makeViewModel(workspacePath: root.path)
-        let session = viewModel.session(for: UUID())
+        let session = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
         let sessionID = UUID()
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.runState = .running
@@ -3197,7 +3205,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let window = try await makeWindow(root: fixture.repo)
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let parentID = UUID()
-        let source = window.agentModeViewModel.session(for: sourceTabID)
+        let source = try await window.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
         source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
         let recorder = ExploreStartRecorder()
@@ -3234,7 +3242,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             let workspace = try XCTUnwrap(window.workspaceManager.activeWorkspace, testCase.label)
             let sourceTabID = try XCTUnwrap(workspace.activeComposeTabID, testCase.label)
             let parentID = UUID()
-            let source = window.agentModeViewModel.session(for: sourceTabID)
+            let source = try await window.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
             source.testInstallPersistentSessionBinding(sessionID: parentID)
             source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
             let initialTabCount = workspace.composeTabs.count
@@ -3307,7 +3315,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let window = try await makeWindow(root: root)
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let parentID = UUID()
-        let source = window.agentModeViewModel.session(for: sourceTabID)
+        let source = try await window.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
         source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
 
@@ -3342,7 +3350,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let window = try await makeWindow(root: root)
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let parentID = UUID()
-        let source = window.agentModeViewModel.session(for: sourceTabID)
+        let source = try await window.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
         source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
         let recorder = ExploreStartRecorder()
@@ -3405,7 +3413,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         let window = try await makeWindow(root: root)
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let parentID = UUID()
-        let source = window.agentModeViewModel.session(for: sourceTabID)
+        let source = try await window.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
         source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
         let recorder = ExploreStartRecorder(activatesControlContext: true)
@@ -4213,8 +4221,8 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         service.resolveOracleReviewLaunchSource = { _, targetWindow in
             let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
             let packagingTabID = try XCTUnwrap(oracleLaunchSourceTabID ?? sourceTabID ?? workspace.activeComposeTabID)
-            let sourceSessionID = targetWindow.agentModeViewModel
-                .session(for: packagingTabID)
+            let sourceSessionID = try await targetWindow.agentModeViewModel
+                .ensureSessionReady(tabID: packagingTabID)
                 .activeAgentSessionID
             let snapshot = AgentRunOracleReviewLaunchSnapshot(
                 route: oracleLaunchRoute ?? (sourceTabID == nil ? .windowOnlyActiveCompose : .runScoped),
@@ -4274,7 +4282,10 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         sourceTabID: UUID,
         in window: WindowState
     ) {
-        let source = window.agentModeViewModel.session(for: sourceTabID)
+        guard let source = window.agentModeViewModel.session(for: sourceTabID, createIfNeeded: true) else {
+            XCTFail("Expected parent source session to materialize")
+            return
+        }
         source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
         source.worktreeBindings = [binding]

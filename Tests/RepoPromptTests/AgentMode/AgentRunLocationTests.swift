@@ -8,7 +8,7 @@ final class AgentRunLocationTests: XCTestCase {
         let registry = try makeRegistry(hosts: [])
         let viewModel = try makeViewModel(registry: registry)
         let tabID = id(1)
-        _ = await viewModel.ensureSessionReady(tabID: tabID)
+        _ = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -24,7 +24,7 @@ final class AgentRunLocationTests: XCTestCase {
         let registry = try makeRegistry(hosts: [host])
         let viewModel = try makeViewModel(registry: registry)
         let tabID = id(2)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -47,7 +47,7 @@ final class AgentRunLocationTests: XCTestCase {
         let registry = try makeRegistry(hosts: [host])
         let viewModel = try makeViewModel(registry: registry)
         let tabID = id(3)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
@@ -74,7 +74,7 @@ final class AgentRunLocationTests: XCTestCase {
         let registry = try makeRegistry(hosts: [host])
         let viewModel = try makeViewModel(registry: registry)
         let tabID = id(5)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
         let workspace = WorkspaceModel(
@@ -107,17 +107,17 @@ final class AgentRunLocationTests: XCTestCase {
         let registry = try makeRegistry(hosts: [firstHost, secondHost, revokedHost])
         let viewModel = try makeViewModel(registry: registry)
 
-        let alreadyBound = await viewModel.ensureSessionReady(tabID: id(6))
+        let alreadyBound = try await viewModel.ensureSessionReady(tabID: id(6))
         XCTAssertTrue(viewModel.applyHostRunLocation(hostID: firstHost.id, to: alreadyBound))
         XCTAssertFalse(viewModel.applyHostRunLocation(hostID: secondHost.id, to: alreadyBound))
         XCTAssertEqual(alreadyBound.remoteHost?.hostID, firstHost.id)
 
-        let submitted = await viewModel.ensureSessionReady(tabID: id(7))
+        let submitted = try await viewModel.ensureSessionReady(tabID: id(7))
         submitted.appendItem(.user("already sent", sequenceIndex: 0))
         XCTAssertFalse(viewModel.applyHostRunLocation(hostID: firstHost.id, to: submitted))
         XCTAssertNil(submitted.remoteHost)
 
-        let revoked = await viewModel.ensureSessionReady(tabID: id(8))
+        let revoked = try await viewModel.ensureSessionReady(tabID: id(8))
         XCTAssertFalse(viewModel.applyHostRunLocation(hostID: revokedHost.id, to: revoked))
         XCTAssertNil(revoked.remoteHost)
     }
@@ -127,7 +127,7 @@ final class AgentRunLocationTests: XCTestCase {
         let registry = try makeRegistry(hosts: [host])
         let viewModel = try makeViewModel(registry: registry)
         let tabID = id(9)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
         let workspace = WorkspaceModel(
@@ -171,7 +171,7 @@ final class AgentRunLocationTests: XCTestCase {
         let viewModel = try makeViewModel(registry: registry)
         let tabID = id(4)
         let sessionID = id(104)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try await viewModel.ensureSessionReady(tabID: tabID)
         viewModel.test_setCurrentTabIDOverride(tabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
@@ -243,7 +243,7 @@ final class AgentRunLocationTests: XCTestCase {
 
     func testUpdateBindingsRefreshesStatusSnapshotForRemoteHostOnlyTransitions() async throws {
         let fixture = try await makeWorkspaceFixture()
-        let session = await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
+        let session = try await fixture.viewModel.ensureSessionReady(tabID: fixture.initialTabID)
         XCTAssertEqual(fixture.viewModel.currentTabID, fixture.initialTabID)
         XCTAssertNil(session.remoteHost)
 
@@ -323,7 +323,7 @@ final class AgentRunLocationTests: XCTestCase {
         // MCP tool handlers materialize sessions through ensureSessionReady /
         // mcpResolveOrCreateSessionTarget — never the composer seam — and must
         // not inherit the workspace default run location.
-        let mcpSession = await fixture.viewModel.ensureSessionReady(tabID: mcpTabID)
+        let mcpSession = try await fixture.viewModel.ensureSessionReady(tabID: mcpTabID)
         XCTAssertNil(mcpSession.remoteHost)
         XCTAssertNotEqual(mcpSession.selectedModelRaw, RemoteHostAgentCatalog.hostDefaultModelID)
 

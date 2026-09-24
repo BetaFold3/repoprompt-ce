@@ -752,6 +752,9 @@ class WorkspaceManagerViewModel: ObservableObject {
     private var beforeSaveListeners: [BeforeSaveListener] = []
     private var composeTabApplyTask: Task<Void, Never>?
     private var composeTabApplyTaskID = UUID()
+    #if DEBUG
+        var composeTabApplyAfterContextHookForTesting: (@MainActor (UUID) async -> Void)?
+    #endif
 
     func composeTabSnapshotPublisher() -> AnyPublisher<ComposeTabState, Never> {
         composeTabSnapshotSubject.eraseToAnyPublisher()
@@ -1116,6 +1119,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private(set) var isSwitchingWorkspace = false
+    private(set) var isApplyingComposeTabRemoval = false
     private nonisolated let workspaceSearchReadinessFence = WorkspaceSearchReadinessFence()
     @Published private(set) var workspaceSearchReadinessState: WorkspaceSearchReadinessState = .idle {
         didSet {
@@ -2294,11 +2298,21 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     // MARK: - Switch
 
+    func beginSynchronousComposeTabRemovalMutation() -> Bool {
+        guard !isApplyingComposeTabRemoval, !isSwitchingWorkspace else { return false }
+        isApplyingComposeTabRemoval = true
+        return true
+    }
+
+    func endSynchronousComposeTabRemovalMutation() {
+        isApplyingComposeTabRemoval = false
+    }
+
     private func beginWorkspaceSwitchOperation(
         to newWorkspace: WorkspaceModel,
         reason: String
     ) -> UUID? {
-        guard activeWorkspaceSwitch == nil else { return nil }
+        guard activeWorkspaceSwitch == nil, !isApplyingComposeTabRemoval else { return nil }
         let operationID = UUID()
         let now = switchTimingPolicy.now()
         activeWorkspaceSwitch = WorkspaceSwitchActivity(
@@ -3991,8 +4005,15 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     @MainActor
-    func applyComposeTabState(_ tab: ComposeTabState) async {
-        await applyComposeTabStateInternal(tabID: tab.id, markWorkspaceDirtyAfterApply: false)
+    func applyComposeTabState(
+        _ tab: ComposeTabState,
+        isActivationCurrent: @escaping @MainActor () -> Bool = { true }
+    ) async {
+        await applyComposeTabStateInternal(
+            tabID: tab.id,
+            markWorkspaceDirtyAfterApply: false,
+            isActivationCurrent: isActivationCurrent
+        )
     }
 
     @MainActor
@@ -4021,9 +4042,12 @@ class WorkspaceManagerViewModel: ObservableObject {
     private func applyComposeTabStateInternal(
         tabID: UUID,
         markWorkspaceDirtyAfterApply: Bool,
-        performFinalRecount: Bool = true
+        performFinalRecount: Bool = true,
+        isActivationCurrent: @escaping @MainActor () -> Bool = { true }
     ) async {
-        guard let initialTab = composeTab(with: tabID) else { return }
+        guard isActivationCurrent(),
+              let initialTab = activeWorkspace?.composeTabs.first(where: { $0.id == tabID })
+        else { return }
         beginApplyingTabContext(forTabID: tabID)
         promptViewModel.tokenCountingViewModel.suspendAutomaticRecounts()
         defer {
@@ -4031,23 +4055,30 @@ class WorkspaceManagerViewModel: ObservableObject {
             endApplyingTabContext(forTabID: tabID)
         }
 
-        await applyComposeTabFastUIState(initialTab)
+        await applyComposeTabFastUIState(initialTab, isActivationCurrent: isActivationCurrent)
+        guard !Task.isCancelled, isActivationCurrent() else { return }
         await Task.yield()
-        guard !Task.isCancelled else { return }
-        guard let refreshedTab = composeTab(with: tabID) else { return }
-        await applyComposeTabHeavyFileState(refreshedTab)
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled,
+              isActivationCurrent(),
+              let refreshedTab = activeWorkspace?.composeTabs.first(where: { $0.id == tabID })
+        else { return }
+        await applyComposeTabHeavyFileState(refreshedTab, isActivationCurrent: isActivationCurrent)
+        guard !Task.isCancelled, isActivationCurrent() else { return }
         if performFinalRecount {
             await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
         }
-        guard markWorkspaceDirtyAfterApply else { return }
+        guard !Task.isCancelled, isActivationCurrent(), markWorkspaceDirtyAfterApply else { return }
         if markWorkspaceDirtyIfTabStillActive(tabID: tabID) {
             pollAndSaveState()
         }
     }
 
     @MainActor
-    private func applyComposeTabFastUIState(_ tab: ComposeTabState) async {
+    private func applyComposeTabFastUIState(
+        _ tab: ComposeTabState,
+        isActivationCurrent: @escaping @MainActor () -> Bool
+    ) async {
+        guard isActivationCurrent() else { return }
         promptViewModel.promptText = tab.promptText
         // NOTE: We no longer apply tab.selectedMetaPromptIDs here.
         // Prompt selection should follow the copy preset, not be overridden per-tab.
@@ -4058,16 +4089,39 @@ class WorkspaceManagerViewModel: ObservableObject {
         } else {
             promptViewModel.setFilesTabSelection(.followDefault, source: .workspaceApply)
         }
-        await promptViewModel.applyContextBuilderOverrides(tab.contextOverrides)
+        await promptViewModel.applyContextBuilderOverrides(
+            tab.contextOverrides,
+            isActivationCurrent: isActivationCurrent
+        )
+        guard isActivationCurrent() else { return }
+        #if DEBUG
+            await composeTabApplyAfterContextHookForTesting?(tab.id)
+            guard isActivationCurrent() else { return }
+        #endif
         fileManager.onActiveTabChangedFast(tab)
     }
 
     @MainActor
-    private func applyComposeTabHeavyFileState(_ tab: ComposeTabState) async {
-        guard !Task.isCancelled else { return }
-        guard let active = activeWorkspace, active.activeComposeTabID == tab.id else { return }
-        await fileManager.restoreExpansionState(from: tab.expandedFolders)
-        await fileManager.onActiveTabChangedHeavy(for: tab.id, selection: tab.selection)
+    private func applyComposeTabHeavyFileState(
+        _ tab: ComposeTabState,
+        isActivationCurrent: @escaping @MainActor () -> Bool
+    ) async {
+        guard !Task.isCancelled, isActivationCurrent(),
+              let active = activeWorkspace, active.activeComposeTabID == tab.id
+        else { return }
+        await fileManager.restoreExpansionState(
+            from: tab.expandedFolders,
+            isActivationCurrent: isActivationCurrent
+        )
+        guard !Task.isCancelled, isActivationCurrent(),
+              let currentTab = activeWorkspace?.composeTabs.first(where: { $0.id == tab.id })
+        else { return }
+        await fileManager.onActiveTabChangedHeavy(
+            for: tab.id,
+            selection: currentTab.selection,
+            isActivationCurrent: isActivationCurrent
+        )
+        guard !Task.isCancelled, isActivationCurrent() else { return }
         selectionCoordinator?.refreshDeferredUISelectionFence(forTabID: tab.id)
     }
 

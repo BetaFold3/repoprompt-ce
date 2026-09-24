@@ -152,6 +152,9 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     /// Codex goal-mode metadata for user bubbles that represent `/goal` control-plane actions.
     public var codexGoalMode: AgentCodexGoalModeMetadata?
 
+    /// Provenance for a user turn accepted from a persisted scheduled send.
+    public var scheduledSend: AgentScheduledSendProvenance?
+
     /// True for local control-plane echoes that should display in chat but are not provider-backed user turns.
     public var isLocalControlPlaneEcho: Bool
 
@@ -175,6 +178,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         isStreaming: Bool = false,
         workflow: AgentWorkflowDefinition? = nil,
         codexGoalMode: AgentCodexGoalModeMetadata? = nil,
+        scheduledSend: AgentScheduledSendProvenance? = nil,
         isLocalControlPlaneEcho: Bool = false,
         isUndeliveredRemoteSend: Bool = false
     ) {
@@ -194,6 +198,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         self.isStreaming = isStreaming
         self.workflow = workflow
         self.codexGoalMode = codexGoalMode
+        self.scheduledSend = scheduledSend
         self.isLocalControlPlaneEcho = isLocalControlPlaneEcho
         self.isUndeliveredRemoteSend = isUndeliveredRemoteSend
     }
@@ -220,6 +225,7 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
             isStreaming: isStreaming,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
+            scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
             isUndeliveredRemoteSend: isUndeliveredRemoteSend
         )
@@ -235,8 +241,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case id, timestamp, kind, text, attachments, taggedFileAttachments
         case toolName, toolInvocationID, toolArgsJSON, toolResultJSON, toolIsError
-        case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, isLocalControlPlaneEcho
-        case isUndeliveredRemoteSend
+        case reasoning, sequenceIndex, isStreaming, workflow, codexGoalMode, scheduledSend
+        case isLocalControlPlaneEcho, isUndeliveredRemoteSend
     }
 
     public init(from decoder: Decoder) throws {
@@ -257,14 +263,36 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         isStreaming = try c.decodeIfPresent(Bool.self, forKey: .isStreaming) ?? false
         workflow = try c.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try c.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
+        scheduledSend = try c.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .scheduledSend)
         isLocalControlPlaneEcho = try c.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
         isUndeliveredRemoteSend = try c.decodeIfPresent(Bool.self, forKey: .isUndeliveredRemoteSend) ?? false
     }
 
     // MARK: - Factory Methods
 
-    public static func user(_ text: String, attachments: [AgentImageAttachment] = [], taggedFileAttachments: [AgentTaggedFileAttachment] = [], sequenceIndex: Int = 0, workflow: AgentWorkflowDefinition? = nil, codexGoalMode: AgentCodexGoalModeMetadata? = nil, isLocalControlPlaneEcho: Bool = false) -> AgentChatItem {
-        AgentChatItem(kind: .user, text: text, attachments: attachments, taggedFileAttachments: taggedFileAttachments, sequenceIndex: sequenceIndex, workflow: workflow, codexGoalMode: codexGoalMode, isLocalControlPlaneEcho: isLocalControlPlaneEcho)
+    public static func user(
+        _ text: String,
+        id: UUID = UUID(),
+        attachments: [AgentImageAttachment] = [],
+        taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        sequenceIndex: Int = 0,
+        workflow: AgentWorkflowDefinition? = nil,
+        codexGoalMode: AgentCodexGoalModeMetadata? = nil,
+        scheduledSend: AgentScheduledSendProvenance? = nil,
+        isLocalControlPlaneEcho: Bool = false
+    ) -> AgentChatItem {
+        AgentChatItem(
+            id: id,
+            kind: .user,
+            text: text,
+            attachments: attachments,
+            taggedFileAttachments: taggedFileAttachments,
+            sequenceIndex: sequenceIndex,
+            workflow: workflow,
+            codexGoalMode: codexGoalMode,
+            scheduledSend: scheduledSend,
+            isLocalControlPlaneEcho: isLocalControlPlaneEcho
+        )
     }
 
     public static func assistant(_ text: String, reasoning: String? = nil, sequenceIndex: Int = 0, isStreaming: Bool = false) -> AgentChatItem {
@@ -315,6 +343,7 @@ extension AgentChatItem {
             isStreaming: isStreaming,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
+            scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
             isUndeliveredRemoteSend: isUndeliveredRemoteSend
         )
@@ -341,6 +370,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
     public var sequenceIndex: Int
     public var workflow: AgentWorkflowDefinition?
     public var codexGoalMode: AgentCodexGoalModeMetadata?
+    public var scheduledSend: AgentScheduledSendProvenance?
     public var isLocalControlPlaneEcho: Bool
     public var isUndeliveredRemoteSend: Bool
 
@@ -357,6 +387,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         sequenceIndex = item.sequenceIndex
         workflow = item.workflow
         codexGoalMode = item.codexGoalMode
+        scheduledSend = item.scheduledSend
         isLocalControlPlaneEcho = item.isLocalControlPlaneEcho
         isUndeliveredRemoteSend = item.isUndeliveredRemoteSend
         toolResultStatus = nil
@@ -431,6 +462,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
             isStreaming: false,
             workflow: workflow,
             codexGoalMode: codexGoalMode,
+            scheduledSend: scheduledSend,
             isLocalControlPlaneEcho: isLocalControlPlaneEcho,
             isUndeliveredRemoteSend: isUndeliveredRemoteSend
         )
@@ -478,6 +510,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         case sequenceIndex
         case workflow
         case codexGoalMode
+        case scheduledSend
         case isLocalControlPlaneEcho
         case isUndeliveredRemoteSend
     }
@@ -500,6 +533,7 @@ public struct AgentChatItemPersist: Codable, Identifiable, Sendable, Equatable {
         sequenceIndex = try container.decode(Int.self, forKey: .sequenceIndex)
         workflow = try container.decodeIfPresent(AgentWorkflowDefinition.self, forKey: .workflow)
         codexGoalMode = try container.decodeIfPresent(AgentCodexGoalModeMetadata.self, forKey: .codexGoalMode)
+        scheduledSend = try container.decodeIfPresent(AgentScheduledSendProvenance.self, forKey: .scheduledSend)
         isLocalControlPlaneEcho = try container.decodeIfPresent(Bool.self, forKey: .isLocalControlPlaneEcho) ?? false
         isUndeliveredRemoteSend = try container.decodeIfPresent(Bool.self, forKey: .isUndeliveredRemoteSend) ?? false
     }

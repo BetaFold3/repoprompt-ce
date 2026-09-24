@@ -57,6 +57,12 @@ final class RemoteAgentModeCoordinator {
     private let workspaceOpenConnectionProvider: @MainActor (String) throws -> any RemoteWorkspaceSessionCatalogConnection
     private var controllersByTabID: [UUID: RemoteAgentSessionController] = [:]
     private var eventTasksByTabID: [UUID: Task<Void, Never>] = [:]
+    /// Per-tab delivery generation: captured by each event task when its attachment starts,
+    /// advanced whenever the attachment is (re)started or stopped, and checked before an event is
+    /// applied. A delivery that belongs to a retired attachment can therefore never mutate the tab,
+    /// even if it was in flight across `stop(tabID:)` — the boundary stale-reset recovery relies on
+    /// before it replaces a retained conversation with authoritative state.
+    private var deliveryGenerationByTabID: [UUID: UInt64] = [:]
     private var hostIDByTabID: [UUID: String] = [:]
     private var forkCapabilityByHostID: [String: Bool] = [:]
     private var forkCapabilityProbeTasksByHostID: [String: Task<Void, Never>] = [:]
@@ -351,6 +357,18 @@ final class RemoteAgentModeCoordinator {
         submitResponse(session: session, interactionID: interactionID, payload: .mcpElicitation(response), restorable: restorable)
     }
 
+    /// Whether a live attachment (controller + event task) currently delivers into `tabID`.
+    func isAttached(tabID: UUID) -> Bool {
+        controllersByTabID[tabID] != nil
+    }
+
+    @discardableResult
+    private func advanceDeliveryGeneration(tabID: UUID) -> UInt64 {
+        let next = (deliveryGenerationByTabID[tabID] ?? 0) &+ 1
+        deliveryGenerationByTabID[tabID] = next
+        return next
+    }
+
     func stop(tabID: UUID) {
         let remoteBinding = viewModel?.sessions[tabID]?.remoteHost
         let storedDiscoveryKey = discoveryKeyByTabID.removeValue(forKey: tabID)
@@ -359,6 +377,9 @@ final class RemoteAgentModeCoordinator {
             cancelChildDiscovery(key: key)
         }
         eventTasksByTabID.removeValue(forKey: tabID)?.cancel()
+        // Retire the attachment's delivery generation: an event captured by the stopped event task
+        // (or any later delivery claiming it) is dropped by `handle(_:tabID:deliveryGeneration:)`.
+        advanceDeliveryGeneration(tabID: tabID)
         clearAskUserStash(tabID: tabID)
         surfacedChannelReasonsByTabID.removeValue(forKey: tabID)
         hostProvidedRunningStatusTabIDs.remove(tabID)
@@ -445,9 +466,10 @@ final class RemoteAgentModeCoordinator {
 
     private func startEventTask(for tabID: UUID, controller: RemoteAgentSessionController) {
         eventTasksByTabID[tabID]?.cancel()
+        let deliveryGeneration = advanceDeliveryGeneration(tabID: tabID)
         eventTasksByTabID[tabID] = Task { [weak self] in
             for await event in controller.events {
-                await self?.handle(event, tabID: tabID)
+                await self?.handle(event, tabID: tabID, deliveryGeneration: deliveryGeneration)
             }
         }
     }
@@ -548,7 +570,14 @@ final class RemoteAgentModeCoordinator {
         }
     }
 
-    private func handle(_ event: RemoteSessionEvent, tabID: UUID) {
+    /// Applies one remote event to the tab. `deliveryGeneration` is the generation captured by the
+    /// delivering event task; a delivery from a retired attachment (generation advanced by a stop
+    /// or a restart) is dropped so it can never mutate the tab after that attachment ended.
+    private func handle(_ event: RemoteSessionEvent, tabID: UUID, deliveryGeneration: UInt64? = nil) {
+        if let deliveryGeneration, deliveryGenerationByTabID[tabID] != deliveryGeneration {
+            Self.logger.debug("remote event dropped tab_id=\(tabID.uuidString, privacy: .public) reason=retired_delivery_generation")
+            return
+        }
         guard let session = viewModel?.sessions[tabID] else { return }
         let shouldRefreshActivity = Self.shouldRefreshActivity(for: event)
         if shouldRefreshActivity {
@@ -1831,6 +1860,15 @@ final class RemoteAgentModeCoordinator {
 
         func test_handleEvent(_ event: RemoteSessionEvent, tabID: UUID) {
             handle(event, tabID: tabID)
+        }
+
+        /// Delivers an event as if it came from the attachment that captured `deliveryGeneration`.
+        func test_handleEvent(_ event: RemoteSessionEvent, tabID: UUID, deliveryGeneration: UInt64) {
+            handle(event, tabID: tabID, deliveryGeneration: deliveryGeneration)
+        }
+
+        func test_deliveryGeneration(tabID: UUID) -> UInt64 {
+            deliveryGenerationByTabID[tabID] ?? 0
         }
 
         func test_applyTranscriptRows(

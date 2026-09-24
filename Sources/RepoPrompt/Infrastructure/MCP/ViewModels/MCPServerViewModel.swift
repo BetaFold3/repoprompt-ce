@@ -876,7 +876,12 @@ final class MCPServerViewModel: ObservableObject {
         let sourceSession: AgentModeViewModel.TabSession?
         let bindingState: AgentSessionWorktreeBindingState
         if let sourceSessionID {
-            let hydrated = await targetWindow.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
+            guard let hydrated = try? await targetWindow.agentModeViewModel.ensureSessionReady(tabID: sourceTabID) else {
+                return unavailable(
+                    "The launching Agent session became unavailable while its review context was being captured.",
+                    snapshot.routedRunID
+                )
+            }
             guard hydrated.activeAgentSessionID == sourceSessionID,
                   snapshot.routedRunID == nil || hydrated.runID == snapshot.routedRunID
             else {

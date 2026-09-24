@@ -75,18 +75,35 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
     }
 
     func switchSessionItems() -> [WorkspaceSwitchSessionItem] {
+        var items: [WorkspaceSwitchSessionItem] = []
         let count = activeAgentCount()
-        guard count > 0 else { return [] }
-        return [WorkspaceSwitchSessionItem(
-            id: "agent-mode",
-            count: count,
-            singularLabel: "active agent session",
-            pluralLabel: "active agent sessions"
-        )]
+        if count > 0 {
+            items.append(WorkspaceSwitchSessionItem(
+                id: "agent-mode",
+                count: count,
+                singularLabel: "active agent session",
+                pluralLabel: "active agent sessions"
+            ))
+        }
+        // A retained local conversation that cannot be saved (stale-reset recovery) is discarded
+        // by a workspace switch, window close, or quit: the same confirmation surfaces list it.
+        let unsavedCount = agentModeViewModel?.staleResetRecoveryTabIDs.count ?? 0
+        if unsavedCount > 0 {
+            items.append(WorkspaceSwitchSessionItem(
+                id: "agent-mode-unsaved-recovery",
+                count: unsavedCount,
+                singularLabel: "unsaved agent conversation awaiting reload",
+                pluralLabel: "unsaved agent conversations awaiting reload"
+            ))
+        }
+        return items
     }
 
     func cancelSwitchSessions() async {
         guard let agentModeViewModel else { return }
+        // The user confirmed the switch with the unsaved conversations listed: relinquish them
+        // before ordinary discard so no late recovery continuation touches the new owner.
+        agentModeViewModel.discardStaleResetRecoveriesForConfirmedLifecycle()
         let activeTabs = agentModeViewModel.tabsWithActiveAgentRun
         for tabID in activeTabs {
             await agentModeViewModel.cancelAgentRun(tabID: tabID, completion: .terminalPublished)

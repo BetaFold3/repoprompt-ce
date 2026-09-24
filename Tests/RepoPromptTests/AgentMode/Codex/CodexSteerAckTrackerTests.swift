@@ -362,7 +362,7 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         viewModel.test_initializeRunService()
         let tabID = UUID()
         let sessionID = UUID()
-        let session = viewModel.session(for: tabID)
+        let session = try XCTUnwrap(viewModel.session(for: tabID, createIfNeeded: true))
         let runID = UUID()
         session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.hasLoadedPersistedState = true

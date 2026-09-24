@@ -234,7 +234,7 @@
                 viewModel.test_setCurrentTabIDOverride(tabID)
                 defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-                let session = await viewModel.ensureSessionReady(tabID: tabID)
+                let session = try! await viewModel.ensureSessionReady(tabID: tabID)
                 let seed = try makeLongActiveCrawlFinalTurnItems(config: config)
                 defer {
                     session.saveDebounceTask?.cancel()

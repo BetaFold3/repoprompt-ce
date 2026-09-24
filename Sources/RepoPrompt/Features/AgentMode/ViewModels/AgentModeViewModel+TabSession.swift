@@ -162,7 +162,9 @@ extension AgentModeViewModel {
         }
 
         var applyEditsApprovalSubscriptionID: UUID?
+        var applyEditsApprovalScopeGeneration: UInt64?
         var applyEditsApprovalSubscriptionTask: Task<Void, Never>?
+        var applyEditsApprovalSetupID: UUID?
         var worktreeMergeReviewContinuation: CheckedContinuation<WorktreeMergeReviewDecision, Never>?
         var worktreeMergeReviewTimeoutTask: Task<Void, Never>?
         var mcpControlContext: AgentMCPControlContext?
@@ -522,8 +524,15 @@ extension AgentModeViewModel {
         var instructionTimeoutTask: Task<Void, Never>?
         var instructionWaitID: UUID?
 
-        // Agent run
-        var runID: UUID?
+        /// Agent run
+        var runID: UUID? {
+            didSet {
+                if let runID {
+                    lastObservedRunID = runID
+                }
+            }
+        }
+
         private(set) var runLifecycleTracker = AgentRunLifecycleTracker()
         var activeRunOwnership: AgentRunOwnership? {
             runLifecycleTracker.activeOwnership
@@ -1176,6 +1185,88 @@ extension AgentModeViewModel {
         /// Cleared only after the provider accepts the turn.
         var pendingHandoff: PendingHandoffState = .init()
 
+        /// Pending scheduled (delayed) send for this session. Mirrors the persisted
+        /// `AgentSession.scheduledSend` member; every durable change goes through the
+        /// data service CAS (`mutateScheduledSend`), never through the ordinary save.
+        var scheduledSend: AgentScheduledSendMember?
+        /// Most recent accepted scheduled dispatch (historical marker source).
+        var lastScheduledDispatch: AgentScheduledSendProvenance?
+        /// `updatedAt` of the scheduled-send record as last observed on disk. This is the
+        /// expected version handed to the CAS mutation; `nil` means no record is persisted.
+        var scheduledSendPersistedUpdatedAt: Date?
+        /// Serializes complete schedule actions (install, edit, cancel, send-now, dispatch,
+        /// coordinator persists) for this session so no two actions interleave their reads,
+        /// writes, rollbacks, or attachment cleanup.
+        var scheduledSendActionTask: Task<Void, Never>?
+        /// Workspace that owns the persisted schedule; persistence refuses any other target.
+        var scheduledSendWorkspaceID: UUID?
+        /// True while `dispatchScheduledSend` owns this session between the persisted
+        /// `.dispatching` attempt and the provider acceptance signal.
+        var isScheduledDispatchInFlight: Bool = false
+        /// Projection of a provider-accepted dispatch whose durable commit is owned by the process
+        /// coordinator's single recovery worker (see `AgentScheduledSendCoordinator`).
+        var scheduledSendPendingFinalization: ScheduledSendPendingFinalization?
+        /// Finalized scheduled markers explicitly removed by the user (conversation reset). The
+        /// next full save passes them atomically so persistence installs tombstones instead of
+        /// treating the absence as a stale snapshot; cleared once that save commits.
+        var pendingFinalizedScheduledSendItemRemovals: [AgentScheduledSendFinalizedItemRemoval] = []
+        /// Stable identity of an explicit conversation reset awaiting its committed save. Persistence
+        /// records the canonical post-reset snapshot under this receipt so accepted-send recovery after
+        /// accidental file loss never restores pre-reset history. Cleared once that save commits.
+        var pendingTranscriptResetReceipt: AgentSessionTranscriptResetReceipt?
+        /// Durable session ID whose file this tab has already written or hydrated in this process.
+        /// Saves targeting it require the existing incarnation (`.requireExisting`); a rebinding to a
+        /// different ID is an initial creation again.
+        var persistedIncarnationSessionID: UUID?
+        /// Captured, service-issued persistence state for the bound durable session (lifetime
+        /// stamp + transcript-reset generation). Acquired only through a full editable load or a
+        /// genuine initial creation and replaced only by this owner's own validated commits;
+        /// never refreshed after a deletion/missing failure or a schedule-only refresh.
+        var persistenceState: AgentSessionPersistenceState?
+        /// Durable session whose ownership was revoked (explicit deletion / stale lifetime). No
+        /// fresh state may be acquired for it by this tab.
+        var persistenceRevokedSessionID: UUID?
+
+        func persistenceState(for sessionID: UUID) -> AgentSessionPersistenceState? {
+            guard let persistenceState, persistenceState.stamp.sessionID == sessionID else { return nil }
+            return persistenceState
+        }
+
+        /// Exact `(itemID, receipt)` markers currently carried by working items and transcript
+        /// request anchors; captured before an explicit removal.
+        var finalizedScheduledSendItemMarkers: [AgentScheduledSendFinalizedItemRemoval] {
+            var markers: [AgentScheduledSendFinalizedItemRemoval] = []
+            var seen: Set<UUID> = []
+            for item in items where item.kind == .user {
+                guard let receipt = item.scheduledSend, seen.insert(item.id).inserted else { continue }
+                markers.append(AgentScheduledSendFinalizedItemRemoval(itemID: item.id, receipt: receipt))
+            }
+            for turn in transcript.turns {
+                guard let request = turn.request,
+                      let receipt = request.scheduledSend,
+                      seen.insert(request.id).inserted
+                else { continue }
+                markers.append(AgentScheduledSendFinalizedItemRemoval(itemID: request.id, receipt: receipt))
+            }
+            return markers
+        }
+
+        /// Last busy snapshot reported to the scheduled-send coordinator (change detection).
+        var lastReportedScheduledSendBusyState: AgentScheduledSendBusyState?
+        /// Most recent non-nil `runID`, retained so a terminal publication that clears the run
+        /// identity first can still be matched against a captured run.
+        private(set) var lastObservedRunID: UUID?
+
+        var pendingScheduledSendRecord: AgentScheduledSendPersist? {
+            scheduledSend?.persistedValue
+        }
+
+        /// True while this session owns provider work for a scheduled attempt (dispatch in
+        /// flight or acceptance awaiting its durable finalization).
+        var ownsLiveScheduledAttempt: Bool {
+            isScheduledDispatchInFlight || scheduledSendPendingFinalization != nil
+        }
+
         var isProviderSelectionLocked: Bool {
             hasSentFirstMessage && !pendingHandoff.defersProviderLockUntilSend
         }
@@ -1192,9 +1283,59 @@ extension AgentModeViewModel {
         var saveRequestGeneration: UInt64 = 0
         var parentSessionID: UUID?
         var hasLoadedPersistedState: Bool = false
+        /// How the most recent persisted load for this tab ended. Early exits that adopted
+        /// nothing (stale binding, cancellation, superseded revision) leave `.unresolved`, so
+        /// callers that need paired authority (remote materialization) validate this instead of
+        /// trusting `hasLoadedPersistedState` alone.
+        var persistedLoadDisposition: PersistedLoadDisposition?
+
+        enum PersistedLoadDisposition: Equatable {
+            /// The load exited before adopting anything (stale, cancelled, or superseded).
+            case unresolved
+            /// Persistence is suppressed for this launch.
+            case suppressed
+            /// The tab had no durable binding to load.
+            case unbound
+            /// No file exists for the bound session: the tab is a genuine creator.
+            case noPayload
+            /// Transcript and persistence state were adopted from one paired load.
+            case applied
+            /// Preparation or hydration threw.
+            case failed
+        }
+
+        /// Stop-and-retain recovery after a committed peer transcript reset (see
+        /// `AgentModeViewModel+StaleResetRecovery.swift`). While present: no save authority, not
+        /// loaded, the retained working view stays visible, and new work is refused.
+        var staleResetRecovery: StaleResetRecovery?
+        /// The single recovery orchestration task (stop attempt or confirmed reload) for this tab.
+        var staleResetRecoveryTask: Task<Void, Never>?
+        /// Removal admission recorded by the preflight; consumed at the final removal boundary.
+        var staleResetRemovalAdmission: StaleResetRemovalAdmission?
+
+        /// Whether this owner's working view may be presented: hydrated normally, or retained by
+        /// a stale-reset recovery (which deliberately keeps `hasLoadedPersistedState == false`).
+        var isPresentableForOwner: Bool {
+            hasLoadedPersistedState || staleResetRecovery != nil
+        }
+
+        /// Confirmed disposal or rebinding relinquishes the retained view: the marker is dropped so
+        /// any suspended stop/reload continuation fails its captured-owner check.
+        func invalidateStaleResetRecoveryForLifecycle() {
+            staleResetRecoveryTask?.cancel()
+            staleResetRecoveryTask = nil
+            staleResetRecovery = nil
+        }
+
         private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
         private(set) var authoritativeHydratedBindingTransitionGeneration: UInt64?
-        var persistedLoadTask: Task<Void, Never>?
+        /// The in-flight paired load. Its value is that operation's own outcome; callers that await
+        /// a load consume the returned disposition rather than session state, and cleanup only
+        /// clears the handle that still identifies the same invocation.
+        var persistedLoadTask: Task<PersistedLoadOutcome, Never>?
+        /// Identity of the most recent paired load attempt started for this tab; cleared when a
+        /// load is cancelled. Every publication and readiness change of a load is gated on it.
+        var currentPersistedLoadAttemptID: UUID?
         var lastActivityAt: Date = .init()
         var lastUserMessageAt: Date?
         var lastCommandOutputSaveAt: Date?
@@ -1272,7 +1413,9 @@ extension AgentModeViewModel {
             codexEventTaskRunID = nil
             applyEditsApprovalSubscriptionTask?.cancel()
             applyEditsApprovalSubscriptionTask = nil
+            applyEditsApprovalSetupID = nil
             applyEditsApprovalSubscriptionID = nil
+            applyEditsApprovalScopeGeneration = nil
             // The usage-accounting forwarder is deliberately not touched here: this method keeps
             // `claudeController` attached, and cancelling the forwarder would finish that
             // controller's evidence stream irreversibly (every later launch/dispatch/result would be
@@ -1301,7 +1444,7 @@ extension AgentModeViewModel {
         }
 
         func markCurrentBindingHydrated() {
-            guard hasLoadedPersistedState, !bindingTransitionInProgress else { return }
+            guard isPresentableForOwner, !bindingTransitionInProgress else { return }
             authoritativeHydratedBinding = persistentSessionBindingIdentity
             authoritativeHydratedBindingTransitionGeneration = bindingTransitionGeneration
         }

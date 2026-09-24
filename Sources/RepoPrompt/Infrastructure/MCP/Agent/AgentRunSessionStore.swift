@@ -6,6 +6,11 @@ actor AgentRunSessionStore {
     #if DEBUG
         /// Process-global waiter-timeout fence for deterministic serial tests; reset in tearDown.
         nonisolated(unsafe) static var waiterTimeoutSleepOverride: (@Sendable (UInt64) async throws -> Void)?
+        private var testCleanupHook: (@Sendable (Registration) async -> Void)?
+
+        func test_setCleanupHook(_ hook: (@Sendable (Registration) async -> Void)?) {
+            testCleanupHook = hook
+        }
     #endif
 
     private static func sleepForWaiterTimeout(nanoseconds: UInt64) async throws {
@@ -493,7 +498,12 @@ actor AgentRunSessionStore {
         records[sessionID] != nil
     }
 
-    func cleanup(registration: Registration) {
+    func cleanup(registration: Registration) async {
+        #if DEBUG
+            if let testCleanupHook {
+                await testCleanupHook(registration)
+            }
+        #endif
         guard let record = currentRecord(for: registration, operation: "cleanup") else { return }
         records.removeValue(forKey: registration.sessionID)
         record.expiryTask?.cancel()

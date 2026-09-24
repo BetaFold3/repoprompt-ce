@@ -7,7 +7,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testTerminalPublicationDuringEpochBeginContextGapDoesNotLoseSessionWait() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -95,7 +95,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testConcurrentPreparationDoesNotAdoptStaleEpochResult() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -142,7 +142,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testCanonicalTerminalEnvelopeRemainsTerminalWhileSessionProjectionIsRunning() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -209,7 +209,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testScopedInactiveSteeringCreatesOneSteeringEpochWithoutReplacingActivation() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -240,7 +240,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testScopedSteeringWithNilCurrentEpochCreatesSteeringEpoch() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -272,7 +272,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testInactiveSteeringReRegistersWaitTrackingAfterTerminalRecordExpires() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -335,7 +335,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testExpiredRegistrationRecoveryCannotOverwriteReplacementActivation() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -396,7 +396,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testExpiredRegistrationRecoveryCleansStoreRecordAfterDeactivation() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -447,7 +447,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testActiveRunPreparationDoesNotCreateSteeringEpoch() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -477,7 +477,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         viewModel.test_setCurrentTabIDOverride(activeTabID)
         defer { viewModel.test_setCurrentTabIDOverride(nil) }
 
-        let activeSession = await viewModel.ensureSessionReady(tabID: activeTabID)
+        let activeSession = try await viewModel.ensureSessionReady(tabID: activeTabID)
         activeSession.replaceItems([
             .user("foreground question", sequenceIndex: 0),
             .assistant("foreground answer.", sequenceIndex: 1)
@@ -487,7 +487,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         let activePresentation = viewModel.activeTranscriptPresentation
 
         let sessionID = UUID()
-        let backgroundSession = await viewModel.ensureSessionReady(tabID: backgroundTabID)
+        let backgroundSession = try await viewModel.ensureSessionReady(tabID: backgroundTabID)
         _ = viewModel.test_installPersistentSessionBinding(
             sessionID: sessionID,
             on: backgroundSession
@@ -572,7 +572,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         #if DEBUG
             let viewModel = makeViewModel()
             let sessionID = UUID()
-            let session = await viewModel.ensureSessionReady(tabID: UUID())
+            let session = try await viewModel.ensureSessionReady(tabID: UUID())
             _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
             try await viewModel.mcpActivateControlContext(
                 forTabID: session.tabID,
@@ -614,7 +614,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testStaleTranscriptDoesNotOverrideAuthoritativeSourceWithoutAssistantTail() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -656,7 +656,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testControlledTerminalPublicationRejectsMissingCanonicalEnvelope() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -689,7 +689,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testMCPSnapshotUpdatedAtIsStableAcrossUnchangedReads() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,
@@ -712,7 +712,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
     func testSemanticMutationIsAcceptedBySessionStoreAndSerializedAtStableTimeBoundary() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()
-        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        let session = try await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
         try await viewModel.mcpActivateControlContext(
             forTabID: session.tabID,

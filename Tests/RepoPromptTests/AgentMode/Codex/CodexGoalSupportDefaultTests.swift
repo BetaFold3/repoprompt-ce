@@ -151,13 +151,13 @@ final class CodexGoalSupportDefaultTests: XCTestCase {
         wait(for: [notification], timeout: 0.1)
     }
 
-    func testSafeManagedComputerUseIsRejectedBeforeDispatch() {
+    func testSafeManagedComputerUseIsRejectedBeforeDispatch() throws {
         let viewModel = AgentModeViewModel(
             codexControllerFactory: { _, _, _, _, _, _ in
                 fatalError("Controller creation is not expected for availability validation.")
             }
         )
-        let session = viewModel.session(for: UUID())
+        let session = try XCTUnwrap(viewModel.session(for: UUID(), createIfNeeded: true))
         session.selectedAgent = .codexExec
         session.permissionProfile = .mcpSafeDefaults
 

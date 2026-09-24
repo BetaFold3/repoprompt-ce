@@ -184,7 +184,7 @@ final class RemoteAgentModeCoordinatorRespondRecoveryTests: XCTestCase {
             codexControllerFactory: { _, _, _, _, _, _ in RecoveryNoopCodexController() }
         )
         viewModel.test_setCurrentTabIDOverride(tabID)
-        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let session = try! await viewModel.ensureSessionReady(tabID: tabID)
         let coordinator = RemoteAgentModeCoordinator()
         coordinator.attach(viewModel: viewModel)
         return RecoveryFixture(tabID: tabID, viewModel: viewModel, session: session, coordinator: coordinator)
