@@ -1705,6 +1705,21 @@ private final class ScheduledSendActionResultBox<T> {
 // MARK: - Coordinator host
 
 extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
+    func scheduledSendSessionName(tabID: UUID) -> String? {
+        guard let session = sessions[tabID], session.activeAgentSessionID != nil else { return nil }
+        return resolvedSessionDisplayName(for: tabID)
+    }
+
+    func scheduledSendBusySessionName(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> String? {
+        guard persistenceWorkspace?.id == workspaceID else { return nil }
+        let busySessions = sessions.values.filter {
+            $0.activeAgentSessionID != sessionID && scheduledSendBusyState(tabID: $0.tabID).isBusy
+        }
+        guard let session = busySessions.sorted(by: { $0.tabID.uuidString < $1.tabID.uuidString }).first
+        else { return nil }
+        return resolvedSessionDisplayName(for: session.tabID)
+    }
+
     func scheduledSendCandidates() -> [AgentScheduledSendCandidate] {
         guard let workspaceID = persistenceWorkspace?.id else { return [] }
         var candidates: [AgentScheduledSendCandidate] = []
@@ -1983,6 +1998,12 @@ extension AgentModeViewModel: AgentScheduledSendCoordinatorHost {
             }
             return .failedBeforeHandoff
         }
+
+        #if DEBUG
+            if let hook = test_scheduledSendAfterDispatchCommitHook {
+                await hook(session)
+            }
+        #endif
 
         // Freshness after persistence: the coordinator's final handoff validator aggregates the
         // process-wide gates (lease revision/epoch/deadline, owning registration and tab, this

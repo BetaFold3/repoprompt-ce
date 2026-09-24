@@ -4,6 +4,38 @@ import XCTest
 
 @MainActor
 final class AgentScheduledSendCoordinatorTests: XCTestCase {
+    func testDashboardNotificationCoalescesAndSkipsUnchangedEvaluation() async {
+        let start = Date(timeIntervalSince1970: 900)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        let host = FakeScheduledSendHost()
+        let record = makeRecord(createdAt: start, notBefore: start.addingTimeInterval(600))
+        host.addScheduledSession(record: record)
+        let counter = DashboardChangeCounter()
+        let observer = NotificationCenter.default.addObserver(
+            forName: .agentScheduledSendDashboardDidChange,
+            object: coordinator,
+            queue: nil
+        ) { _ in counter.increment() }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        coordinator.register(host)
+        await drainTasks()
+        let initial = counter.value
+        XCTAssertEqual(initial, 1)
+
+        coordinator.evaluate()
+        coordinator.recordDidChange()
+        await drainTasks()
+        XCTAssertEqual(counter.value, initial, "An unchanged evaluation does not invalidate the dashboard")
+
+        host.updateRecord(scheduleID: record.id) { $0.updatedAt = start.addingTimeInterval(1) }
+        coordinator.recordDidChange()
+        coordinator.evaluate()
+        await drainTasks()
+        XCTAssertEqual(counter.value, initial + 1, "One turn of changes posts only once")
+    }
+
     func testNotBeforeTimerDoesNotDispatchEarly() async {
         let start = Date(timeIntervalSince1970: 1000)
         let clock = FakeScheduledSendClock(now: start)
@@ -23,6 +55,42 @@ final class AgentScheduledSendCoordinatorTests: XCTestCase {
         clock.advance(to: start.addingTimeInterval(60))
         await drainTasks()
         XCTAssertEqual(host.dispatches.count, 1)
+    }
+
+    func testLeavingWorkspaceAcrossDeadlineRequiresConfirmationOnReturn() async throws {
+        let start = Date(timeIntervalSince1970: 1500)
+        let clock = FakeScheduledSendClock(now: start)
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        let host = FakeScheduledSendHost()
+        let record = makeRecord(
+            createdAt: start.addingTimeInterval(1),
+            notBefore: start.addingTimeInterval(60)
+        )
+        let workspaceID = UUID()
+        let tabID = host.addScheduledSession(workspaceID: workspaceID, record: record)
+        coordinator.register(host)
+        await drainTasks()
+
+        // The workspace is no longer represented by a live host at the deadline.
+        host.setCandidateSuppressed(true, tabID: tabID)
+        coordinator.recordDidChange()
+        clock.advance(to: record.notBefore.addingTimeInterval(1))
+        await drainTasks()
+        XCTAssertTrue(host.dispatches.isEmpty)
+
+        host.holdMutations = true
+        host.setCandidateSuppressed(false, tabID: tabID)
+        coordinator.workspaceDidLoad()
+        try await waitUntil("confirmation write held") { host.heldMutationCount == 1 }
+        XCTAssertEqual(coordinator.dashboardPendingConfirmations(in: workspaceID).map(\.scheduleID), [record.id])
+        XCTAssertTrue(coordinator.dashboardPendingConfirmations(in: UUID()).isEmpty)
+        XCTAssertTrue(host.dispatches.isEmpty)
+
+        host.releaseHeldMutation(with: nil)
+        await drainTasks()
+        XCTAssertEqual(host.record(scheduleID: record.id)?.state, .needsConfirmation)
+        XCTAssertEqual(host.record(scheduleID: record.id)?.confirmationReason, .destinationUnavailable)
+        XCTAssertTrue(host.dispatches.isEmpty)
     }
 
     func testWaitingForUserPendingInstructionsAndCancellationSettlingBlockFollowUp() async throws {
@@ -1923,6 +1991,11 @@ final class AgentScheduledSendCoordinatorTests: XCTestCase {
         }
         XCTAssertNotNil(coordinator.activeAdmission(sessionID: fixture.sessionID), "Reserved ownership never lapses silently")
         XCTAssertEqual(coordinator.recoveryStatus(sessionID: fixture.sessionID)?.hasAcceptedPayload, false)
+        XCTAssertEqual(
+            coordinator.dashboardRecoveryStatuses(in: fixture.workspace.id).map(\.key.sessionID),
+            [fixture.sessionID]
+        )
+        XCTAssertTrue(coordinator.dashboardRecoveryStatuses(in: UUID()).isEmpty)
         XCTAssertFalse(coordinator.retryRecovery(sessionID: fixture.sessionID), "No payload: nothing to persist, nothing to re-send")
         coordinator.recordDidChange()
         await drainTasks()
@@ -2565,5 +2638,18 @@ private final class FakeScheduledSendHost: AgentScheduledSendCoordinatorHost {
             session.record = record
         }
         sessions[tabID] = session
+    }
+}
+
+private final class DashboardChangeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.withLock { count }
+    }
+
+    func increment() {
+        lock.withLock { count += 1 }
     }
 }

@@ -74,6 +74,118 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertNil(afterCancel.lastScheduledDispatch)
     }
 
+    func testDashboardRowRoutesEditRescheduleAndCancelThroughDurableActions() async throws {
+        let harness = try await makeHarness(windowID: 4302)
+        harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)
+        let coordinator = AgentScheduledSendCoordinator()
+        harness.viewModel.attachScheduledSendCoordinator(coordinator)
+        let initialTime = Date().addingTimeInterval(1800)
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "Initial draft",
+            on: harness.session,
+            notBefore: initialTime,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        let dashboard = AgentScheduledMessagesViewModel(
+            agentModeVM: harness.viewModel,
+            metadataRecords: { _ in [] }
+        )
+        await dashboard.reload()
+        let row = try XCTUnwrap(dashboard.rows.first { $0.props?.id == scheduleID })
+        XCTAssertTrue(row.isActionable, "The production reload must expose the durable action host")
+        let editedTime = Date().addingTimeInterval(3600)
+        let editError = await dashboard.update(
+            row,
+            text: "Edited draft",
+            notBefore: editedTime,
+            runAlongsideOtherSessions: false
+        )
+        XCTAssertNil(editError)
+        var persisted = try await harness.persistedSession()
+        XCTAssertEqual(persisted.scheduledSend?.persistedValue?.id, scheduleID)
+        XCTAssertEqual(persisted.scheduledSend?.persistedValue?.rawText, "Edited draft")
+        XCTAssertEqual(persisted.scheduledSend?.persistedValue?.notBefore, editedTime)
+
+        let rescheduledTime = Date().addingTimeInterval(7200)
+        let rescheduledRow = try XCTUnwrap(dashboard.rows.first { $0.props?.id == scheduleID })
+        let rescheduleError = await dashboard.update(
+            rescheduledRow,
+            text: "Edited draft",
+            notBefore: rescheduledTime,
+            runAlongsideOtherSessions: false
+        )
+        XCTAssertNil(rescheduleError)
+        persisted = try await harness.persistedSession()
+        XCTAssertEqual(persisted.scheduledSend?.persistedValue?.notBefore, rescheduledTime)
+
+        dashboard.scope = .allWorkspaces
+        let readOnlyError = await dashboard.sendNow(row, runAlongsideOtherSessions: false)
+        XCTAssertNotNil(readOnlyError)
+        XCTAssertNil(harness.session.pendingScheduledSendRecord?.attempt)
+        dashboard.scope = .currentWorkspace
+        let foreignWorkspace = WorkspaceModel(
+            name: "Foreign",
+            repoPaths: [harness.storageURL.appendingPathComponent("foreign").path],
+            customStoragePath: harness.storageURL.appendingPathComponent("foreign")
+        )
+        harness.viewModel.test_establishPersistenceWorkspace(foreignWorkspace)
+        let staleActionError = await dashboard.cancel(row)
+        XCTAssertNotNil(staleActionError, "A captured A row must not act after this window moves to B")
+        let stillScheduled = try await harness.persistedSession()
+        XCTAssertNotNil(stillScheduled.scheduledSend)
+        harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)
+        await dashboard.reload()
+        let cancelRow = try XCTUnwrap(dashboard.rows.first { $0.props?.id == scheduleID })
+        let cancelError = await dashboard.cancel(cancelRow)
+        XCTAssertNil(cancelError)
+        let afterCancel = try await harness.persistedSession()
+        XCTAssertNil(afterCancel.scheduledSend)
+    }
+
+    func testDashboardSendNowRunAlongsideDispatchesWithBusyWorkspace() async throws {
+        let harness = try await makeHarness(windowID: 4308)
+        harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)
+        let clock = DispatchFakeClock(now: Date())
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        harness.viewModel.attachScheduledSendCoordinator(coordinator)
+        let blockerTabID = UUID()
+        let blocker = try await harness.viewModel.ensureSessionReady(tabID: blockerTabID)
+        blocker.runID = UUID()
+        blocker.runState = .running
+        harness.viewModel.setAgentRunActive(blockerTabID, isActive: true)
+
+        let notBefore = clock.now.addingTimeInterval(3600)
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "Run beside blocker",
+            on: harness.session,
+            notBefore: notBefore,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: true
+        ).get()
+        let probe = DispatchProbe()
+        harness.viewModel.scheduledDispatchRunStarter = { [probe] _, _, _, _ in
+            probe.startCount += 1
+            return .sent
+        }
+        let dashboard = AgentScheduledMessagesViewModel(
+            agentModeVM: harness.viewModel,
+            metadataRecords: { _ in [] }
+        )
+        await dashboard.reload()
+        let row = try XCTUnwrap(dashboard.rows.first { $0.props?.id == scheduleID })
+        XCTAssertTrue(row.isActionable)
+
+        let message = await dashboard.sendNow(row, runAlongsideOtherSessions: true)
+        XCTAssertNil(message)
+        try await waitUntil("dashboard run-alongside accepted") {
+            harness.session.lastScheduledDispatch?.scheduleID == scheduleID
+        }
+        XCTAssertEqual(probe.startCount, 1)
+        XCTAssertEqual(blocker.runState, .running, "The override does not affect the blocking run")
+        XCTAssertNil(harness.session.scheduledSend)
+    }
+
     // MARK: - Composer entry point (both routes)
 
     func testComposerScheduleOnLinkedUntouchedSessionIsNewSessionStartAndClearsDraft() async throws {
@@ -517,6 +629,7 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
 
     func testUnreadableScheduledSendIsProjectedAndCanBeDiscarded() async throws {
         let harness = try await makeHarness(windowID: 4312)
+        harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)
         let sessionID = try XCTUnwrap(harness.viewModel.ensureSessionBoundToTab(harness.session))
         let unreadableJSON = AgentScheduledSendJSONValue.object([
             "schemaVersion": .number(2),
@@ -545,12 +658,76 @@ final class AgentScheduledSendDispatchTests: XCTestCase {
         XCTAssertEqual(props.status, .unreadable)
         XCTAssertNotNil(props.recoveryMessage)
 
-        let message = await harness.viewModel.discardUnreadableScheduledSend(tabID: harness.tabID)
+        let dashboard = AgentScheduledMessagesViewModel(
+            agentModeVM: harness.viewModel,
+            metadataRecords: { _ in [] }
+        )
+        await dashboard.reload()
+        let row = try XCTUnwrap(dashboard.rows.first { $0.sessionID == sessionID })
+        XCTAssertEqual(row.props?.status, .unreadable)
+        XCTAssertTrue(row.isActionable)
+        let message = await dashboard.discardUnreadable(row)
         XCTAssertNil(message)
         XCTAssertNil(harness.session.scheduledSend)
         XCTAssertTrue(harness.viewModel.canScheduleSend(tabID: harness.tabID, session: harness.session))
         let reloaded = try await harness.persistedSession()
         XCTAssertNil(reloaded.scheduledSend)
+    }
+
+    func testDashboardKeepsHydratedDispatchingRowWhileRecoveryPreparationIsHeld() async throws {
+        let harness = try await makeHarness(windowID: 4309)
+        harness.viewModel.test_establishPersistenceWorkspace(harness.workspace)
+        let clock = DispatchFakeClock(now: Date())
+        let coordinator = AgentScheduledSendCoordinator(clock: clock.clock)
+        harness.viewModel.attachScheduledSendCoordinator(coordinator)
+        let notBefore = clock.now.addingTimeInterval(60)
+        let scheduleID = try await harness.viewModel.installScheduledSend(
+            text: "Still preparing",
+            on: harness.session,
+            notBefore: notBefore,
+            runAlongsideOtherSessions: false,
+            isNewSessionStart: false
+        ).get()
+        let sessionID = try XCTUnwrap(harness.session.activeAgentSessionID)
+        let gate = DispatchGate()
+        harness.viewModel.test_scheduledSendAfterDispatchCommitHook = { [gate] _ in
+            await gate.waitForRelease()
+        }
+        defer {
+            harness.viewModel.test_scheduledSendAfterDispatchCommitHook = nil
+            gate.release()
+        }
+        let probe = DispatchProbe()
+        harness.viewModel.scheduledDispatchRunStarter = { [probe] _, _, _, _ in
+            probe.startCount += 1
+            return .sent
+        }
+        clock.advance(to: notBefore.addingTimeInterval(1))
+        try await waitUntil("recovery preparation held after dispatch commit") { gate.isWaiting }
+
+        let persistedDuringPreparation = try await harness.persistedSession()
+        XCTAssertEqual(persistedDuringPreparation.scheduledSend?.persistedValue?.state, .dispatching)
+        XCTAssertTrue(harness.session.ownsLiveScheduledAttempt)
+        XCTAssertTrue(harness.viewModel.scheduledSendCandidates().isEmpty)
+        XCTAssertNotNil(coordinator.activeAdmission(sessionID: sessionID))
+        XCTAssertNil(coordinator.recoveryStatus(sessionID: sessionID))
+        let dashboard = AgentScheduledMessagesViewModel(
+            agentModeVM: harness.viewModel,
+            metadataRecords: { _ in [] }
+        )
+        await dashboard.reload()
+        let row = try XCTUnwrap(dashboard.rows.first { $0.sessionID == sessionID })
+        XCTAssertEqual(dashboard.rows.count { $0.sessionID == sessionID }, 1)
+        XCTAssertEqual(row.previewText, "Still preparing")
+        XCTAssertEqual(row.props?.id, scheduleID)
+        XCTAssertEqual(row.props?.status, .dispatching)
+        XCTAssertTrue(row.isActionable)
+        XCTAssertEqual(AgentScheduledMessagesViewModel.currentWorkspaceCount(agentModeVM: harness.viewModel), 1)
+        XCTAssertEqual(probe.startCount, 0, "Presentation never starts a second handoff")
+
+        gate.release()
+        try await waitUntil("held dispatch completed") { harness.session.lastScheduledDispatch != nil }
+        XCTAssertEqual(probe.startCount, 1)
     }
 
     func testCandidatesExcludeLiveAttemptsAndBusyStateReflectsQueuedInstructionsAndMCPControl() async throws {

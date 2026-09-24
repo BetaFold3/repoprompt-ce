@@ -106,6 +106,16 @@ struct AgentScheduledSendCandidate: Equatable {
     let isHydrated: Bool
 }
 
+/// Read-only dashboard projection. Mutations still go through the owning host's existing
+/// durable scheduled-send actions, never through this discovery snapshot.
+struct AgentScheduledSendDashboardCandidate {
+    let candidate: AgentScheduledSendCandidate
+    let host: any AgentScheduledSendCoordinatorHost
+    let pendingConfirmation: AgentScheduledSendPendingConfirmationStatus?
+    let recovery: AgentScheduledSendRecoveryStatus?
+    let hasActiveAdmission: Bool
+}
+
 struct AgentScheduledSendBusyState: Equatable {
     var runID: UUID?
     var runState: AgentSessionRunState
@@ -223,6 +233,8 @@ protocol AgentScheduledSendCoordinatorHost: AnyObject {
         excludingDispatchReservationForTabID tabID: UUID?
     ) -> Bool
     func scheduledSendProjectionNeedsRefresh(tabID: UUID, sessionID: UUID)
+    func scheduledSendSessionName(tabID: UUID) -> String?
+    func scheduledSendBusySessionName(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> String?
     func ownsScheduledSendDestination(tabID: UUID, sessionID: UUID) -> Bool
     /// Whether any tab on this host bound to the durable `sessionID` is busy. The owning host's
     /// dispatching tab is evaluated without its own dispatch reservation; foreign hosts pass `nil`.
@@ -249,6 +261,14 @@ protocol AgentScheduledSendCoordinatorHost: AnyObject {
 extension AgentScheduledSendCoordinatorHost {
     func isBusy(tabID: UUID) -> Bool {
         scheduledSendBusyState(tabID: tabID).isBusy
+    }
+
+    func scheduledSendSessionName(tabID: UUID) -> String? {
+        nil
+    }
+
+    func scheduledSendBusySessionName(inWorkspace workspaceID: UUID, excluding sessionID: UUID) -> String? {
+        nil
     }
 }
 
@@ -312,6 +332,9 @@ extension Notification.Name {
     /// `userInfo`: `sessionID`, `scheduleID`. Observers read `pendingConfirmationStatus`.
     static let agentScheduledSendPendingConfirmationDidChange =
         Notification.Name("AgentScheduledSendCoordinator.pendingConfirmationDidChange")
+    /// Coalesced when the coordinator's dashboard-visible projection actually changes.
+    static let agentScheduledSendDashboardDidChange =
+        Notification.Name("AgentScheduledSendCoordinator.dashboardDidChange")
 }
 
 @MainActor
@@ -358,6 +381,7 @@ final class AgentScheduledSendCoordinator {
     /// supersession. Process-local; survives hydration, timer, and epoch churn.
     private struct PendingConfirmation {
         let sessionID: UUID
+        let workspaceID: UUID
         let scheduleID: UUID
         let decisionID: UUID
         let epoch: UInt64
@@ -484,6 +508,8 @@ final class AgentScheduledSendCoordinator {
     private var isEvaluating = false
     private var needsRerun = false
     private var lastEvaluationAt: Date
+    private var dashboardNotificationScheduled = false
+    private var lastPublishedDashboardSignature: [String] = []
 
     init(
         clock: SchedulerClock? = nil,
@@ -554,6 +580,56 @@ final class AgentScheduledSendCoordinator {
             }
         }
         evaluate()
+    }
+
+    /// One representative per durable session, using the same revision ordering as admission.
+    /// An index-only candidate is a discovery hint, not an actionable or sending state.
+    func dashboardCandidates(in workspaceID: UUID) -> [AgentScheduledSendDashboardCandidate] {
+        authoritativeCandidates(from: collectCandidates())
+            .filter { $0.representative.candidate.workspaceID == workspaceID }
+            .sorted { candidatePrecedes($0.representative, $1.representative) }
+            .map { authority in
+                let owner = authority.matchingEntries.first(where: { $0.candidate.isHydrated })
+                    ?? authority.representative
+                let candidate = owner.candidate
+                return AgentScheduledSendDashboardCandidate(
+                    candidate: candidate,
+                    host: owner.host,
+                    pendingConfirmation: pendingConfirmationStatus(scheduleID: candidate.scheduledSend.id),
+                    recovery: recoveryStatus(sessionID: candidate.sessionID),
+                    hasActiveAdmission: activeAdmission(sessionID: candidate.sessionID) != nil
+                )
+            }
+    }
+
+    /// Names an active blocker only; an old first-eligibility timestamp is not proof
+    /// that the destination remains busy.
+    func dashboardBlockingSessionName(for snapshot: AgentScheduledSendDashboardCandidate) -> String? {
+        let candidate = snapshot.candidate
+        let record = candidate.scheduledSend
+        guard record.firstEligibleAt != nil else { return nil }
+        if !record.isNewSessionStart {
+            guard snapshot.host.scheduledSendBusyState(tabID: candidate.tabID).isBusy else { return nil }
+            return snapshot.host.scheduledSendSessionName(tabID: candidate.tabID)
+        }
+        guard !record.runAlongsideOtherSessions else { return nil }
+        return registrations.compactMap { registration in
+            registration.host?.scheduledSendBusySessionName(
+                inWorkspace: candidate.workspaceID,
+                excluding: candidate.sessionID
+            )
+        }.first
+    }
+
+    /// Retained accepted attempts may outlive their live or index record. Keep them discoverable
+    /// without reopening a provider handoff or claiming a completed send.
+    func dashboardRecoveryStatuses(in workspaceID: UUID) -> [AgentScheduledSendRecoveryStatus] {
+        retainedAttemptsBySessionID.keys.compactMap { sessionID in
+            guard let status = recoveryStatus(sessionID: sessionID),
+                  status.lease.workspaceID == workspaceID
+            else { return nil }
+            return status
+        }
     }
 
     func workspaceDidLoad() {
@@ -664,6 +740,12 @@ final class AgentScheduledSendCoordinator {
     }
 
     // MARK: Pending confirmation obligations (durable acknowledgement)
+
+    func dashboardPendingConfirmations(in workspaceID: UUID) -> [AgentScheduledSendPendingConfirmationStatus] {
+        pendingConfirmationsByScheduleID.values
+            .filter { $0.workspaceID == workspaceID }
+            .map(status(for:))
+    }
 
     func pendingConfirmationStatus(sessionID: UUID) -> AgentScheduledSendPendingConfirmationStatus? {
         guard let pending = pendingConfirmationsByScheduleID.values.first(where: { $0.sessionID == sessionID }) else {
@@ -1045,6 +1127,48 @@ final class AgentScheduledSendCoordinator {
             evaluatePass()
         } while needsRerun
         isEvaluating = false
+        requestDashboardNotification()
+    }
+
+    private func requestDashboardNotification() {
+        guard !dashboardNotificationScheduled else { return }
+        dashboardNotificationScheduled = true
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            dashboardNotificationScheduled = false
+            let signature = dashboardSignature()
+            guard signature != lastPublishedDashboardSignature else { return }
+            lastPublishedDashboardSignature = signature
+            NotificationCenter.default.post(name: .agentScheduledSendDashboardDidChange, object: self)
+        }
+    }
+
+    private func dashboardSignature() -> [String] {
+        var parts = authoritativeCandidates(from: collectCandidates()).map { authority in
+            let owner = authority.matchingEntries.first(where: { $0.candidate.isHydrated })
+                ?? authority.representative
+            let candidate = owner.candidate
+            let record = candidate.scheduledSend
+            let snapshot = AgentScheduledSendDashboardCandidate(
+                candidate: candidate,
+                host: owner.host,
+                pendingConfirmation: pendingConfirmationStatus(scheduleID: record.id),
+                recovery: recoveryStatus(sessionID: candidate.sessionID),
+                hasActiveAdmission: activeAdmission(sessionID: candidate.sessionID) != nil
+            )
+            return "candidate:\(candidate.workspaceID):\(candidate.sessionID):\(record.id):\(record.updatedAt):\(record.state.rawValue):\(record.notBefore):\(String(describing: record.firstEligibleAt)):\(candidate.isHydrated):\(ObjectIdentifier(owner.host)):\(dashboardBlockingSessionName(for: snapshot) ?? "")"
+        }
+        parts += pendingConfirmationsByScheduleID.values.map { pending in
+            "confirmation:\(pending.workspaceID):\(String(describing: status(for: pending)))"
+        }
+        parts += retainedAttemptsBySessionID.keys.compactMap { sessionID in
+            recoveryStatus(sessionID: sessionID).map { "recovery:\(String(describing: $0))" }
+        }
+        parts += admissionsBySessionID.values.map { admission in
+            "admission:\(admission.lease.sessionID):\(admission.lease.scheduleID):\(admission.lease.id)"
+        }
+        return parts.sorted()
     }
 
     private func evaluatePass() {
@@ -1817,6 +1941,7 @@ final class AgentScheduledSendCoordinator {
         workspaceID: UUID,
         key: AgentScheduledSendRecoveryKey
     ) {
+        requestDashboardNotification()
         NotificationCenter.default.post(
             name: .agentScheduledSendRecoveryDidChange,
             object: nil,
@@ -1863,6 +1988,7 @@ final class AgentScheduledSendCoordinator {
         // longer clear this newer decision.
         let pending = PendingConfirmation(
             sessionID: first.candidate.sessionID,
+            workspaceID: first.candidate.workspaceID,
             scheduleID: scheduleID,
             decisionID: UUID(),
             epoch: armingEpoch,
@@ -2098,6 +2224,7 @@ final class AgentScheduledSendCoordinator {
     }
 
     private func postPendingConfirmationChange(_ pending: PendingConfirmation) {
+        requestDashboardNotification()
         NotificationCenter.default.post(
             name: .agentScheduledSendPendingConfirmationDidChange,
             object: nil,

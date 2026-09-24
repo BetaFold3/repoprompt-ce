@@ -695,6 +695,8 @@ final class AgentModeViewModel: ObservableObject {
         /// Test seam: a non-nil error fails the authoritative schedule resync read for that
         /// durable session as if the storage read had thrown.
         var test_scheduledSendResyncReadFailureInjector: (@MainActor (UUID) -> Error?)?
+        /// Holds an admitted dispatch after the attempt commit and before recovery preparation.
+        var test_scheduledSendAfterDispatchCommitHook: (@MainActor (TabSession) async -> Void)?
     #endif
 
     /// Workspace that owns session persistence for this view model.

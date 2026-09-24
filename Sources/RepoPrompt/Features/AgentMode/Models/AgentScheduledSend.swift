@@ -23,6 +23,17 @@ struct AgentScheduledSendPersist: Codable, Equatable {
         case runNotCompleted
         case deliveryUnknown
         case destinationUnavailable
+
+        var displayText: String {
+            switch self {
+            case .missedWhileClosed: "app was closed; confirmation required"
+            case .missedDuringSleep: "Mac was asleep; confirmation required"
+            case .clockChanged: "system clock changed; confirmation required"
+            case .runNotCompleted: "the blocking run did not complete; confirmation required"
+            case .deliveryUnknown: "delivery unconfirmed"
+            case .destinationUnavailable: "destination unavailable"
+            }
+        }
     }
 
     struct Attempt: Codable, Equatable {

@@ -18,6 +18,7 @@ struct AgentModeSessionsSidebarView: View {
     @State private var isCollapseAllThreadsButtonHovered = false
     @State private var isCollapseAllThreadsButtonFlashing = false
     @State private var collapseAllThreadsButtonClickTick = 0
+    @State private var showingScheduledMessages = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -88,6 +89,9 @@ struct AgentModeSessionsSidebarView: View {
             HStack(spacing: topBarSpacing) {
                 sessionSearchBox
                     .frame(maxWidth: .infinity)
+                ScheduledMessagesSidebarButton(agentModeVM: agentModeVM, hitSize: collapseButtonHitSize) {
+                    showingScheduledMessages = true
+                }
                 collapseAllThreadsButton
             }
             .padding(.horizontal, topBarHorizontalPadding)
@@ -140,6 +144,9 @@ struct AgentModeSessionsSidebarView: View {
                     }
                 )
             )
+        }
+        .sheet(isPresented: $showingScheduledMessages) {
+            AgentScheduledMessagesView(agentModeVM: agentModeVM)
         }
         .task(id: agentModeVM.remoteWorkspaceSidebarRefreshKey()) {
             guard agentModeVM.remoteWorkspaceSidebarRefreshKey() != nil else { return }
@@ -1063,4 +1070,38 @@ struct ArchivedSessionsPagedList: View {
             AgentModePerfDiagnostics.increment("ui.body.archivedSessionsPagedList")
         }
     #endif
+}
+
+private struct ScheduledMessagesSidebarButton: View {
+    let agentModeVM: AgentModeViewModel
+    let hitSize: CGFloat
+    let open: () -> Void
+    @State private var revision = 0
+
+    var body: some View {
+        let _ = revision
+        let count = AgentScheduledMessagesViewModel.currentWorkspaceCount(agentModeVM: agentModeVM)
+        Button(action: open) {
+            ZStack(alignment: .topTrailing) {
+                Image(systemName: "clock")
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(width: hitSize, height: hitSize)
+                if count > 0 {
+                    Text(count > 99 ? "99+" : String(count))
+                        .font(.system(size: 9, weight: .bold))
+                        .padding(.horizontal, 3)
+                        .background(.tint, in: Capsule())
+                        .foregroundStyle(.white)
+                        .offset(x: 8, y: -4)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverTooltip("Scheduled Messages")
+        .accessibilityLabel("Scheduled Messages, \(count)")
+        .onReceive(NotificationCenter.default.publisher(for: .agentScheduledSendDashboardDidChange)) { _ in
+            revision &+= 1
+        }
+    }
 }

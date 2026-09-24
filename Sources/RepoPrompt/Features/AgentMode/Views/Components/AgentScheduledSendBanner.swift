@@ -349,21 +349,6 @@ struct AgentScheduledSendBanner: View {
     private func confirmationText(
         _ reason: AgentScheduledSendPersist.ConfirmationReason?
     ) -> String {
-        switch reason {
-        case .missedWhileClosed:
-            "app was closed; confirmation required"
-        case .missedDuringSleep:
-            "Mac was asleep; confirmation required"
-        case .clockChanged:
-            "system clock changed; confirmation required"
-        case .runNotCompleted:
-            "the blocking run did not complete; confirmation required"
-        case .deliveryUnknown:
-            "delivery unconfirmed"
-        case .destinationUnavailable:
-            "destination unavailable"
-        case nil:
-            "confirmation required"
-        }
+        reason?.displayText ?? "confirmation required"
     }
 }
