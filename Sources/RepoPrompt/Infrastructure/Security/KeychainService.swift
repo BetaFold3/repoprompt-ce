@@ -65,6 +65,14 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     static let officialV2Shared = KeychainService(serviceName: officialV2ServiceName)
     static let debugShared = KeychainService(serviceName: debugServiceName)
 
+    static func appleDevelopmentDebug(teamIdentifier: String) -> KeychainService {
+        precondition(RuntimeCodeSigningPolicy.appleDevelopmentDebugTeamIdentifiers.contains(teamIdentifier))
+        if teamIdentifier == RuntimeCodeSigningPolicy.signingTeamIdentifier {
+            return debugShared
+        }
+        return KeychainService(serviceName: "\(debugServiceName).team.\(teamIdentifier)")
+    }
+
     static func localSelfSignedServiceName(fingerprint: String, generation: Int) -> String {
         let normalizedFingerprint = fingerprint.filter(\.isHexDigit).lowercased()
         precondition(normalizedFingerprint.count == 64, "Local certificate fingerprint must be SHA-256")

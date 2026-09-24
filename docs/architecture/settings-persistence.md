@@ -114,6 +114,21 @@ session. The store owns dismissal across workspace windows and clears it when th
 changes or persistence unblocks. It is never stored in `UserDefaults`. The Settings
 window always shows the active warning and recovery controls.
 
+## XCTest isolation
+
+In DEBUG processes with XCTest loaded, `GlobalSettingsStore.shared` uses a unique
+`RepoPromptCE-XCTest/<UUID>/Settings/globalSettings.json` directory under the process
+temporary directory and a unique `RepoPromptCE.XCTest.<UUID>` defaults suite. Failure
+to create either resource fails closed rather than falling back to user storage.
+Normal process exit removes only that process's owned test directory and defaults domain.
+Normal app launches and explicitly constructed stores retain their existing paths.
+
+This prevents integration tests from overwriting user preferences through incidental
+whole-document saves. `commit:false` means “do not save now,” not “exclude this value
+from future saves”: a later committed mutation serializes the temporary value too.
+Restoring it in memory without committing does not repair an earlier disk write.
+The isolation applies only to this singleton, not every app store or test subsystem.
+
 ## Agent Models profiles
 
 Agent Models settings cover the controls shown on Settings → Agent Models:

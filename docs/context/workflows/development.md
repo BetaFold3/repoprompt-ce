@@ -37,7 +37,7 @@ Use `make dev-run` for the ordinary queued build/package/launch path. Use `make 
 
 A build/package failure before lifecycle activation does not replace or stop the running bundle. Don't assume an in-flight run or smoke job survives an overriding stop or relaunch; inspect its ticket.
 
-Debug signing and secure-storage behavior are documented in the [local-build README](../../../README.md#build-and-launch-locally). An explicit `DEBUG_SECURE_STORAGE_BACKEND=keychain` is also supported for a signed debug app with a TeamIdentifier; otherwise debug builds use ephemeral in-memory storage. Release builds follow the [release workflow](../../releasing.md).
+Debug signing and secure-storage behavior are documented in the [local-build README](../../../README.md#build-and-launch-locally). An explicit `DEBUG_SECURE_STORAGE_BACKEND=keychain` is supported only for a strictly verified Apple Development debug signature with the exact debug bundle ID and a source-authorized team (`648A27MST5` or `AM9B9Y6HBV`). A package marker alone does not authorize persistence. The original team retains its existing debug Keychain service; `AM9B9Y6HBV` uses a separate `.team.AM9B9Y6HBV` service. Official release trust remains pinned to `648A27MST5`. Ad-hoc, unapproved, or mismatched signatures use ephemeral in-memory storage; keys saved there must be re-entered after restarting into an authorized build. Release builds follow the [release workflow](../../releasing.md).
 
 The generated Xcode workspace is disposable. Follow the [Xcode workspace workflow](../../architecture/xcode-workspace.md); don't edit or commit `.build/xcode`.
 

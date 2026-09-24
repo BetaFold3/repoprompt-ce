@@ -88,17 +88,20 @@ struct RuntimeSecureStorageDecision: Equatable {
     let rejectionReason: RuntimeSecureStorageRejectionReason?
     let localCertificateFingerprint: String?
     let localServiceGeneration: Int?
+    let debugTeamIdentifier: String?
 
     init(
         domain: RuntimeSecureStorageDomain,
         rejectionReason: RuntimeSecureStorageRejectionReason?,
         localCertificateFingerprint: String? = nil,
-        localServiceGeneration: Int? = nil
+        localServiceGeneration: Int? = nil,
+        debugTeamIdentifier: String? = nil
     ) {
         self.domain = domain
         self.rejectionReason = rejectionReason
         self.localCertificateFingerprint = localCertificateFingerprint
         self.localServiceGeneration = localServiceGeneration
+        self.debugTeamIdentifier = debugTeamIdentifier
     }
 }
 
@@ -106,13 +109,21 @@ enum RuntimeCodeSigningPolicy {
     static let developerIDBundleIdentifier = "com.pvncher.repoprompt.ce"
     static let appleDevelopmentDebugBundleIdentifier = "com.pvncher.repoprompt.ce.debug"
     static let signingTeamIdentifier = "648A27MST5"
+    // Explicitly authorized debug signers only; never infer trust from the running binary.
+    static let appleDevelopmentDebugTeamIdentifiers: Set<String> = [signingTeamIdentifier, "AM9B9Y6HBV"]
     static let localSelfSignedCertificateName = "RepoPrompt CE Local Self-Signed Code Signing"
 
     static let developerIDRequirement =
         "anchor apple generic and identifier \"\(developerIDBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(signingTeamIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
 
-    static let appleDevelopmentDebugRequirement =
-        "anchor apple generic and identifier \"\(appleDevelopmentDebugBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(signingTeamIdentifier)\" and certificate leaf[field.1.2.840.113635.100.6.1.12] exists"
+    static let appleDevelopmentDebugRequirement: String = {
+        let teams = appleDevelopmentDebugTeamIdentifiers.sorted().map {
+            "certificate leaf[subject.OU] = \"\($0)\""
+        }.joined(separator: " or ")
+        // An empty allowlist must never remove the team constraint.
+        let teamRequirement = teams.isEmpty ? "never" : "(\(teams))"
+        return "anchor apple generic and identifier \"\(appleDevelopmentDebugBundleIdentifier)\" and \(teamRequirement) and certificate leaf[field.1.2.840.113635.100.6.1.12] exists"
+    }()
 
     private static let signingModePlistKey = "RepoPromptSigningMode"
     private static let debugStoragePlistKey = "RepoPromptDebugSecureStorageBackend"
@@ -233,15 +244,22 @@ enum RuntimeCodeSigningPolicy {
             case nil:
                 return ephemeral(.missingDebugStorageMarker)
             case "keychain":
-                guard matches(
-                    signingInfo,
-                    domain: .appleDevelopmentDebug,
-                    identifier: appleDevelopmentDebugBundleIdentifier,
-                    teamIdentifier: signingTeamIdentifier
-                ) else {
+                guard let team = signingInfo.teamIdentifier,
+                      appleDevelopmentDebugTeamIdentifiers.contains(team),
+                      matches(
+                          signingInfo,
+                          domain: .appleDevelopmentDebug,
+                          identifier: appleDevelopmentDebugBundleIdentifier,
+                          teamIdentifier: team
+                      )
+                else {
                     return ephemeral(.markerSignatureMismatch)
                 }
-                return RuntimeSecureStorageDecision(domain: .appleDevelopmentDebug, rejectionReason: nil)
+                return RuntimeSecureStorageDecision(
+                    domain: .appleDevelopmentDebug,
+                    rejectionReason: nil,
+                    debugTeamIdentifier: team
+                )
             default:
                 return ephemeral(.unknownDebugStorageMarker)
             }

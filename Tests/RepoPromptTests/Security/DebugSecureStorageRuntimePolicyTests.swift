@@ -1,4 +1,5 @@
 @testable import RepoPromptApp
+import Security
 import XCTest
 
 final class RuntimeCodeSigningPolicyTests: XCTestCase {
@@ -45,7 +46,8 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
             marker: "debug-apple-development",
             debugMarker: "keychain",
             signingInfo: debug,
-            expectedDomain: .appleDevelopmentDebug
+            expectedDomain: .appleDevelopmentDebug,
+            expectedDebugTeamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier
         )
 
         XCTAssertTrue(
@@ -67,7 +69,11 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
         )
         XCTAssertTrue(
             SecureKeyValueStorageFactory.selection(
-                for: RuntimeSecureStorageDecision(domain: .appleDevelopmentDebug, rejectionReason: nil)
+                for: RuntimeSecureStorageDecision(
+                    domain: .appleDevelopmentDebug,
+                    rejectionReason: nil,
+                    debugTeamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier
+                )
             ).backend === KeychainService.debugShared
         )
     }
@@ -202,6 +208,89 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
         XCTAssertTrue(RuntimeCodeSigningPolicy.appleDevelopmentDebugRequirement.contains("1.2.840.113635.100.6.1.12"))
     }
 
+    func testAdditionalDebugTeamRequiresVerifiedIdentityAndUsesIsolatedKeychain() throws {
+        let team = "AM9B9Y6HBV"
+        let debug = RuntimeCodeSigningInfo.synthetic(
+            codeIdentifier: RuntimeCodeSigningPolicy.appleDevelopmentDebugBundleIdentifier,
+            teamIdentifier: team,
+            validatedDomains: [.appleDevelopmentDebug]
+        )
+        let decision = RuntimeCodeSigningPolicy.decision(
+            signingModeMarker: "debug-apple-development",
+            debugStorageMarker: "keychain",
+            signingInfo: debug
+        )
+        XCTAssertEqual(decision.domain, .appleDevelopmentDebug)
+        XCTAssertEqual(decision.debugTeamIdentifier, team)
+        let selection = SecureKeyValueStorageFactory.selection(for: decision)
+        let backend = try XCTUnwrap(selection.backend as? KeychainService)
+        XCTAssertTrue(backend.persistsValuesAcrossLaunches)
+        XCTAssertEqual(backend.serviceName, "\(KeychainService.debugServiceName).team.\(team)")
+        XCTAssertNotEqual(backend.serviceName, KeychainService.debugShared.serviceName)
+        XCTAssertNotEqual(backend.serviceName, KeychainService.officialV2Shared.serviceName)
+        XCTAssertEqual(
+            KeychainService.appleDevelopmentDebug(teamIdentifier: team).serviceName,
+            backend.serviceName
+        )
+
+        let invalidIdentities: [RuntimeCodeSigningInfo] = [
+            .synthetic(codeIdentifier: debug.codeIdentifier, teamIdentifier: nil, validatedDomains: [.appleDevelopmentDebug]),
+            .synthetic(codeIdentifier: debug.codeIdentifier, teamIdentifier: "OTHERTEAM", validatedDomains: [.appleDevelopmentDebug]),
+            .synthetic(codeIdentifier: "com.example.other", teamIdentifier: team, validatedDomains: [.appleDevelopmentDebug]),
+            .synthetic(codeIdentifier: debug.codeIdentifier, teamIdentifier: team, isAdHoc: true, validatedDomains: [.appleDevelopmentDebug]),
+            .synthetic(codeIdentifier: debug.codeIdentifier, teamIdentifier: team)
+        ]
+        for identity in invalidIdentities {
+            assertDecision(
+                marker: "debug-apple-development",
+                debugMarker: "keychain",
+                signingInfo: identity,
+                expectedDomain: .ephemeral,
+                expectedReason: .markerSignatureMismatch
+            )
+        }
+        // Authorization for this debug signer must never authorize official-release storage.
+        assertDecision(
+            marker: "developer-id",
+            debugMarker: "keychain",
+            signingInfo: .synthetic(
+                codeIdentifier: RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
+                teamIdentifier: team,
+                validatedDomains: [.developerID]
+            ),
+            expectedDomain: .ephemeral,
+            expectedReason: .markerSignatureMismatch
+        )
+        assertDecision(
+            marker: "debug-apple-development",
+            debugMarker: "alternate-in-memory",
+            signingInfo: debug,
+            expectedDomain: .ephemeral,
+            expectedReason: .debugEphemeralRequested
+        )
+        for malformedTeam: String? in [nil, "OTHERTEAM"] {
+            let rejected = SecureKeyValueStorageFactory.selection(for: RuntimeSecureStorageDecision(
+                domain: .appleDevelopmentDebug,
+                rejectionReason: nil,
+                debugTeamIdentifier: malformedTeam
+            ))
+            XCTAssertEqual(rejected.decision.domain, .ephemeral)
+            XCTAssertEqual(rejected.decision.rejectionReason, .markerSignatureMismatch)
+            XCTAssertFalse(rejected.backend.persistsValuesAcrossLaunches)
+        }
+
+        // Exercise the Security framework parser, not merely requirement string contents.
+        var requirement: SecRequirement?
+        XCTAssertEqual(
+            SecRequirementCreateWithString(
+                RuntimeCodeSigningPolicy.appleDevelopmentDebugRequirement as CFString,
+                [], &requirement
+            ),
+            errSecSuccess
+        )
+        XCTAssertNotNil(requirement)
+    }
+
     private func assertDecision(
         marker: String?,
         debugMarker: String?,
@@ -210,7 +299,8 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
         expectedDomain: RuntimeSecureStorageDomain,
         expectedReason: RuntimeSecureStorageRejectionReason? = nil,
         expectedLocalCertificateFingerprint: String? = nil,
-        expectedLocalServiceGeneration: Int? = nil
+        expectedLocalServiceGeneration: Int? = nil,
+        expectedDebugTeamIdentifier: String? = nil
     ) {
         XCTAssertEqual(
             RuntimeCodeSigningPolicy.decision(
@@ -223,7 +313,8 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
                 domain: expectedDomain,
                 rejectionReason: expectedReason,
                 localCertificateFingerprint: expectedLocalCertificateFingerprint,
-                localServiceGeneration: expectedLocalServiceGeneration
+                localServiceGeneration: expectedLocalServiceGeneration,
+                debugTeamIdentifier: expectedDebugTeamIdentifier
             )
         )
     }

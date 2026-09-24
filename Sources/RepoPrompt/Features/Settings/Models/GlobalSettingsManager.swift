@@ -303,7 +303,53 @@ struct GlobalSettingsWriteDiagnostic: Equatable {
 /// Windows use WindowSettingsManager to maintain local overlays.
 @MainActor
 class GlobalSettingsStore: ObservableObject {
-    static let shared = GlobalSettingsStore()
+    static let shared = makeSharedStore()
+
+    private static func makeSharedStore() -> GlobalSettingsStore {
+        #if DEBUG
+            // Direct xctest and SwiftPM runners need not set XCTestConfigurationFilePath.
+            // A temporary commit:false mutation can enter a later whole-document save,
+            // so integration tests must never share the user's settings file or defaults.
+            if NSClassFromString("XCTestCase") != nil || NSClassFromString("XCTest.XCTestCase") != nil {
+                let identifier = UUID().uuidString
+                let root = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("RepoPromptCE-XCTest", isDirectory: true)
+                    .appendingPathComponent(identifier, isDirectory: true)
+                let directory = root.appendingPathComponent("Settings", isDirectory: true)
+                let suiteName = "RepoPromptCE.XCTest.\(identifier)"
+                do {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                } catch {
+                    preconditionFailure("Cannot create isolated XCTest settings directory")
+                }
+                guard let defaults = UserDefaults(suiteName: suiteName) else {
+                    try? FileManager.default.removeItem(at: root)
+                    preconditionFailure("Cannot create isolated XCTest settings defaults")
+                }
+                // Keep storage alive for all singleton consumers, then remove only this
+                // process's owned resources on normal exit (never another worker's).
+                let cleanup: @convention(block) () -> Void = {
+                    UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
+                    try? FileManager.default.removeItem(at: root)
+                }
+                guard atexit_b(cleanup) == 0 else {
+                    cleanup()
+                    preconditionFailure("Cannot register isolated XCTest settings cleanup")
+                }
+                return GlobalSettingsStore(
+                    defaults: defaults,
+                    fileStore: GlobalSettingsFileStore(fileURL: directory.appendingPathComponent("globalSettings.json"))
+                )
+            }
+        #endif
+        return GlobalSettingsStore()
+    }
+
+    #if DEBUG
+        var persistenceFileURLForTesting: URL {
+            fileStore.fileURL
+        }
+    #endif
 
     private let defaults: UserDefaults
     private let fileStore: GlobalSettingsFileStoring

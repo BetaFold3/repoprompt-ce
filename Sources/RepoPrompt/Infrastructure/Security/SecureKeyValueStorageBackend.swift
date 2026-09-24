@@ -48,22 +48,32 @@ enum SecureKeyValueStorageFactory {
     }
 
     static func selection(for decision: RuntimeSecureStorageDecision) -> SecureKeyValueStorageSelection {
-        let backend: SecureKeyValueStorageBackend = switch decision.domain {
+        let backend: SecureKeyValueStorageBackend
+        switch decision.domain {
         case .officialDeveloperID:
-            KeychainService.officialV2Shared
+            backend = KeychainService.officialV2Shared
         case .localSelfSigned:
             if let fingerprint = decision.localCertificateFingerprint,
                let generation = decision.localServiceGeneration,
                generation > 0
             {
-                KeychainService.localSelfSigned(fingerprint: fingerprint, generation: generation)
+                backend = KeychainService.localSelfSigned(fingerprint: fingerprint, generation: generation)
             } else {
-                EphemeralSecureKeyValueStore.shared
+                backend = EphemeralSecureKeyValueStore.shared
             }
         case .appleDevelopmentDebug:
-            KeychainService.debugShared
+            if let team = decision.debugTeamIdentifier,
+               RuntimeCodeSigningPolicy.appleDevelopmentDebugTeamIdentifiers.contains(team)
+            {
+                backend = KeychainService.appleDevelopmentDebug(teamIdentifier: team)
+            } else {
+                return SecureKeyValueStorageSelection(
+                    decision: RuntimeSecureStorageDecision(domain: .ephemeral, rejectionReason: .markerSignatureMismatch),
+                    backend: EphemeralSecureKeyValueStore.shared
+                )
+            }
         case .ephemeral:
-            EphemeralSecureKeyValueStore.shared
+            backend = EphemeralSecureKeyValueStore.shared
         }
         return SecureKeyValueStorageSelection(decision: decision, backend: backend)
     }

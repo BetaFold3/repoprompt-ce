@@ -5,6 +5,51 @@ import XCTest
 
 @MainActor
 final class SettingsJSONOnlyPersistenceTests: XCTestCase {
+    #if DEBUG
+        func testSharedSettingsStoreIsIsolatedFromUserSettingsUnderXCTest() {
+            let actual = GlobalSettingsStore.shared.persistenceFileURLForTesting
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            let testRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("RepoPromptCE-XCTest", isDirectory: true)
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            let liveDirectory = GlobalSettingsFileStore.defaultFileURL().deletingLastPathComponent()
+                .resolvingSymlinksInPath().standardizedFileURL.path
+            XCTAssertTrue(actual.hasPrefix(testRoot + "/"), actual)
+            XCTAssertFalse(actual.hasPrefix(liveDirectory + "/"), actual)
+        }
+    #endif
+
+    func testMCPModelPresetSelectionSurvivesStoreRecreation() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        for enabled in [true, false, true] {
+            store.setMCPShowModelPresets(enabled)
+            let reloaded = try makeStore(at: fileURL)
+            XCTAssertNil(store.persistenceBlockReason)
+            XCTAssertEqual(reloaded.mcpShowModelPresets(), enabled)
+        }
+    }
+
+    func testDeferredMCPMutationCanBeCapturedByUnrelatedWholeDocumentCommit() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let store = try makeStore(at: fileURL)
+        store.setMCPShowModelPresets(true)
+        XCTAssertTrue(try makeStore(at: fileURL).mcpShowModelPresets())
+
+        // Reproduce the integration-test pattern without touching the user's file:
+        // commit:false defers persistence, but does not exclude a value from later saves.
+        store.setMCPShowModelPresets(false, commit: false)
+        store.setMCPAutoStart(!store.mcpAutoStart())
+        store.setMCPShowModelPresets(true, commit: false)
+
+        XCTAssertTrue(store.mcpShowModelPresets())
+        XCTAssertFalse(try makeStore(at: fileURL).mcpShowModelPresets())
+    }
+
     func testDefaultGlobalSettingsPathUsesCESupportRoot() {
         let path = GlobalSettingsFileStore.defaultFileURL().path
         XCTAssertTrue(path.contains("/Application Support/RepoPrompt CE/Settings/globalSettings.json"), path)
